@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Repository scans now use descriptor-pinned roots, unified parser/generated
+  work budgets, serialized latest-only sidecars, cancellation-safe admission,
+  and async-by-default local registration. The legacy append-only repo
+  codegraph emitter now fails startup when requested instead of accumulating
+  stale edges and ID histories without a bound.
+
 - **Relicensed to Apache-2.0 — Crux Daemon is now open source.** The CueCrux
   Community Licence (CCL v1.0), a source-available BSL-style licence, is
   replaced by the **Apache License, Version 2.0** across the repository. The CCL
@@ -57,6 +63,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   licence condition.
 
 ### Fixed
+
+- **Repository scans are contained, bounded, and stale-safe.** Local
+  `root_path` registrations require cross-tenant operator authority and a
+  canonical descendant of the explicit
+  `CORECRUXD_REPO_SCAN_ALLOWED_ROOTS`; MCP binds target tenants to authenticated
+  tenant authority and defaults local scans to async. The operator
+  `CORECRUXD_WORKSPACE_PATH` remains separate and never expands tenant scan
+  authority. Starting and reading the self-scan require cross-tenant operator
+  authority; the persisted result redacts the absolute host root. An empty
+  allowlist disables local repo scans. Inline scans, queued jobs, and bounded
+  polling watchers revalidate at execution time, reject symlinks, hard links,
+  non-regular files and cycles, and share configurable depth, entry, byte,
+  per-file, output and cooperative elapsed-work limits. One process-wide permit
+  is held through encoding/persistence; queues are capped globally and per
+  tenant. Async/watch completions are registration-generation-bound so stale
+  results cannot land after delete/recreate. Watchers use secure content
+  digests, full replacement scans, retry-safe snapshots, and fixed global and
+  tenant caps. Secure reads are Unix-only and native non-Unix daemons fail
+  closed before opening; Windows operators should use WSL2.
 
 - **Standalone self-update now authenticates its manifest before trusting it.**
   `crux self update` resolves an immutable release tag, bounds the manifest and

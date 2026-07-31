@@ -37,6 +37,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+#[path = "../src/repo_scan_policy.rs"]
+mod repo_scan_policy;
 #[path = "../src/symbol_resolve.rs"]
 mod symbol_resolve;
 #[path = "../src/workspace_scan.rs"]
@@ -65,7 +67,10 @@ fn main() {
         .expect("workspace root");
     println!("root: {}", root.display());
 
-    let scan = workspace_scan_ast::run_scan_ast_at(root).expect("ast scan");
+    let policy = repo_scan_policy::RepoScanPolicy::for_exact_root(root).expect("scan policy");
+    let scan = policy
+        .execute(root, workspace_scan_ast::run_scan_ast_at)
+        .expect("ast scan");
     let resolver = SymbolResolver::from_scan(&scan);
     println!("symbols indexed: {}", resolver.len());
 

@@ -494,7 +494,9 @@ fn load_latest_workspace_blocking(store: &FactStore) -> Option<crate::workspace_
     let fact = latest
         .into_iter()
         .find(|f| f.entity == crate::workspace_scan::LATEST_SCAN_ENTITY && f.key == crate::workspace_scan::SCAN_KEY)?;
-    serde_json::from_str::<crate::workspace_scan::WorkspaceScan>(&fact.value).ok()
+    let mut scan = serde_json::from_str::<crate::workspace_scan::WorkspaceScan>(&fact.value).ok()?;
+    crate::workspace_scan::redact_self_workspace_paths(&mut scan);
+    Some(scan)
 }
 
 /// Fold a workspace scan into the project graph. Adds module / file (and

@@ -97,6 +97,7 @@ mod relations;
 mod repo_allowance;
 mod repo_codegraph;
 mod repo_registry;
+mod repo_scan_policy;
 mod repo_watch;
 mod self_update;
 mod session_bindings;
@@ -274,6 +275,43 @@ The only recognised flags are:\n\
     )
 }
 
+fn feature_flag_enabled(key: &str) -> bool {
+    std::env::var(key).ok().is_some_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true")
+    })
+}
+
+fn validate_fact_persistence_posture(
+    fact_persistence_enabled: bool,
+    legal_holds_enabled: bool,
+    repo_watch_enabled: bool,
+) -> Result<(), String> {
+    if !fact_persistence_enabled && legal_holds_enabled {
+        return Err(
+            "CORECRUXD_FEATURE_LEGAL_HOLD requires CORECRUXD_FACT_PERSISTENCE=1; ephemeral holds cannot make durable preservation claims"
+                .to_string(),
+        );
+    }
+    if !fact_persistence_enabled && repo_watch_enabled {
+        return Err(
+            "CORECRUXD_REPO_WATCH requires CORECRUXD_FACT_PERSISTENCE=1; ephemeral selectors cannot own durable scan sidecars"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_fact_journal_replay(corruption_detected: bool) -> std::io::Result<()> {
+    if corruption_detected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "facts.jsonl contains a malformed committed record; quarantine or repair the journal before daemon startup",
+        ));
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Short-circuit --version / --help BEFORE load_config() so they never start
@@ -305,6 +343,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let config = load_config();
+    validate_fact_persistence_posture(
+        config.fact_persistence_enabled,
+        feature_flag_enabled("CORECRUXD_FEATURE_LEGAL_HOLD"),
+        crate::repo_watch::enabled_from_env(),
+    )
+    .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
     if let Err(message) = config.validate_embedding_selection() {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, message).into());
     }
@@ -658,11 +702,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
-    let fact_store = Arc::new(RwLock::new(if config.fact_persistence_enabled {
+    // Reject the unsafe legacy codegraph writer before replaying either the
+    // fact journal or the append-only relation store.
+    crate::repo_codegraph::validate_runtime_configuration()?;
+    let mut initial_fact_store = if config.fact_persistence_enabled {
         corecrux_memory::FactStore::with_persistence(&config.data_dir)?
     } else {
         corecrux_memory::FactStore::new()
-    }));
+    };
+    validate_fact_journal_replay(initial_fact_store.journal_replay_corruption_detected())?;
+    let repo_scan_recovery = crate::repo_registry::recover_repo_scan_storage_on_startup(
+        &config.data_dir,
+        &mut initial_fact_store,
+        config.fact_persistence_enabled,
+    )?;
+    let oversized_legacy_scan_records = initial_fact_store.oversized_legacy_scan_records_skipped();
+    let repo_recovery_requests_compaction = repo_scan_recovery.registrations_compacted > 0
+        || repo_scan_recovery.legacy_scans_migrated > 0
+        || oversized_legacy_scan_records > 0;
+    if config.fact_persistence_enabled && repo_recovery_requests_compaction {
+        // Recovery may make legacy repo-control rows redundant in memory, but
+        // the general FactStore compactor is also the GDPR hard-erasure
+        // primitive for every unrelated soft-deleted fact. Startup has no
+        // receipt or operator intent authorizing that global rewrite.
+        tracing::warn!(
+            replay_corruption_detected = initial_fact_store.journal_replay_corruption_detected(),
+            "repo-scan-legacy-journal-rewrite-deferred-to-explicit-receipted-compaction"
+        );
+    }
+    tracing::info!(
+        registrations_compacted = repo_scan_recovery.registrations_compacted,
+        legacy_scans_migrated = repo_scan_recovery.legacy_scans_migrated,
+        legacy_scans_quarantined = repo_scan_recovery.legacy_scans_quarantined,
+        oversized_legacy_scan_records,
+        orphan_files_removed = repo_scan_recovery.orphan_files_removed,
+        "repo-scan-storage-recovered"
+    );
+    let fact_store = Arc::new(RwLock::new(initial_fact_store));
 
     // Cost-report persistence (console-surfaces-remediation M5): replay any
     // journalled `/v1/cost/report` posts into the in-memory cost store so cost
@@ -677,10 +753,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         Arc::new(RwLock::new(ps))
     };
+    let repo_scan_policy = Arc::new(crate::repo_scan_policy::RepoScanPolicy::from_env()?);
+    let repo_scan_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    tracing::info!(
+        allowed_roots = repo_scan_policy.allowed_root_count(),
+        max_depth = repo_scan_policy.limits().max_depth,
+        max_files = repo_scan_policy.limits().max_files,
+        max_bytes = repo_scan_policy.limits().max_bytes,
+        max_file_bytes = repo_scan_policy.limits().max_file_bytes,
+        timeout_secs = repo_scan_policy.limits().timeout.as_secs(),
+        "repository scan policy frozen"
+    );
+    if repo_scan_policy.allowed_root_count() == 0 {
+        tracing::warn!(
+            env = crate::repo_scan_policy::ALLOWED_ROOTS_ENV,
+            "local-path repository scans are disabled"
+        );
+    }
     let repo_watch = crate::repo_watch::RepoWatchService::maybe_new(
         fact_store.clone(),
         projection_state.clone(),
         config.data_dir.clone(),
+        repo_scan_policy.clone(),
+        repo_scan_semaphore.clone(),
     );
 
     if config.sync_mutual_auth && config.sync_peer_trust_root.is_none() {
@@ -774,7 +869,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         scrub_sample_rate: config.scrub_sample_rate,
         admin_actions: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
         repo_scan_jobs: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
-        repo_scan_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+        repo_scan_semaphore,
+        repo_scan_policy,
         corruption_detected,
         capacity,
         admin_force_seal_enabled: config.admin_force_seal_enabled,
@@ -885,18 +981,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     state.session_store.write().await.set_event_bus(state.event_bus.clone());
     {
         let mut store = state.fact_store.write().await;
-        match crate::repo_registry::fail_incomplete_scans(
+        let count = crate::repo_registry::fail_incomplete_scans(
             &mut store,
             "daemon restarted before scan completed",
             crate::ops_events::now_unix_ms(),
-        ) {
-            Ok(count) if count > 0 => {
-                tracing::warn!(count, "repo-scan-incomplete-jobs-marked-failed-after-restart");
-            }
-            Ok(_) => {}
-            Err(err) => {
-                tracing::warn!(?err, "repo-scan-restart-recovery-failed");
-            }
+        )?;
+        if count > 0 {
+            tracing::warn!(count, "repo-scan-incomplete-jobs-marked-failed-after-restart");
         }
     }
     if let Some(watcher) = &state.repo_watch {
@@ -1116,11 +1207,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(ring) = crate::trace_span_ring() {
             let ring = std::sync::Arc::clone(ring);
             let fact_store = state.fact_store.clone();
+            let repo_scan_admission = state.repo_scan_semaphore.clone();
             let path = config.data_dir.join("traces").join("spans.jsonl");
             let interval_secs = crate::trace_store::flush_interval_secs();
             let max_records = crate::trace_store::max_records();
             let repo_id = std::env::var("CORECRUXD_TRACE_REPO_ID").unwrap_or_else(|_| "crux".to_string());
             let tenant_id = std::env::var("CORECRUXD_TRACE_TENANT_ID").unwrap_or_else(|_| "local".to_string());
+            let scan_data_dir = config.data_dir.clone();
             let mut rx = shutdown_tx.subscribe();
             match crate::trace_store::TraceStore::open(path.clone(), max_records) {
                 Ok(store) => {
@@ -1133,10 +1226,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 _ = interval.tick() => {
                                     let spans = ring.drain();
                                     if spans.is_empty() { continue; }
-                                    let resolver = {
-                                        let store_guard = fact_store.read().await;
-                                        cache.get(&store_guard, &tenant_id, &repo_id)
-                                    };
+                                    let resolver = cache
+                                        .get(
+                                            &fact_store,
+                                            repo_scan_admission.clone(),
+                                            &scan_data_dir,
+                                            &tenant_id,
+                                            &repo_id,
+                                        )
+                                        .await;
                                     match store.append_resolved(spans, resolver.as_deref(), &tenant_id) {
                                         Ok(r) => info!(
                                             drained = r.spans_drained, resolved = r.resolved,
@@ -1153,10 +1251,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     // discard the last interval's spans.
                                     let spans = ring.drain();
                                     if !spans.is_empty() {
-                                        let resolver = {
-                                            let store_guard = fact_store.read().await;
-                                            cache.get(&store_guard, &tenant_id, &repo_id)
-                                        };
+                                        let resolver = cache
+                                            .get(
+                                                &fact_store,
+                                                repo_scan_admission.clone(),
+                                                &scan_data_dir,
+                                                &tenant_id,
+                                                &repo_id,
+                                            )
+                                            .await;
                                         let _ = store.append_resolved(spans, resolver.as_deref(), &tenant_id);
                                     }
                                     break;
@@ -2872,8 +2975,8 @@ fn anonymous_passport_claim_body(public_key_hex: &str, daemon_version: &str) -> 
 mod tests {
     use super::{
         anonymous_passport_claim_body, parse_cli_arg, reconcile_control_from_evidence, shard_map_advertise_addr,
-        validate_mcp_bind_posture, validate_network_auth_posture, version_line, CliAction, ControlCheckpointRecord,
-        ControlMutationRecord,
+        validate_fact_journal_replay, validate_fact_persistence_posture, validate_mcp_bind_posture,
+        validate_network_auth_posture, version_line, CliAction, ControlCheckpointRecord, ControlMutationRecord,
     };
     use crate::auth::AuthMode;
     use crate::config::CommitLevel;
@@ -2923,6 +3026,26 @@ mod tests {
         assert!(line.starts_with("corecruxd "), "got: {line}");
         assert!(line.contains(env!("CARGO_PKG_VERSION")), "got: {line}");
         assert!(line.contains('('), "got: {line}");
+    }
+
+    #[test]
+    fn ephemeral_fact_mode_rejects_durability_claiming_features() {
+        let legal_hold =
+            validate_fact_persistence_posture(false, true, false).expect_err("legal holds require durable facts");
+        assert!(legal_hold.contains("CORECRUXD_FEATURE_LEGAL_HOLD"));
+        let watcher =
+            validate_fact_persistence_posture(false, false, true).expect_err("repo watcher requires durable selectors");
+        assert!(watcher.contains("CORECRUXD_REPO_WATCH"));
+        validate_fact_persistence_posture(false, false, false).expect("plain ephemeral mode remains supported");
+        validate_fact_persistence_posture(true, true, true).expect("durable mode supports both features");
+    }
+
+    #[test]
+    fn malformed_fact_journal_blocks_daemon_startup_before_recovery() {
+        let error = validate_fact_journal_replay(true).expect_err("malformed replay must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("facts.jsonl"));
+        validate_fact_journal_replay(false).expect("clean replay may continue");
     }
 
     #[test]
@@ -4729,6 +4852,7 @@ mod tests {
             admin_actions: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new())),
             repo_scan_jobs: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new())),
             repo_scan_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            repo_scan_policy: std::sync::Arc::new(crate::repo_scan_policy::RepoScanPolicy::allow_any_for_tests()),
             corruption_detected: std::sync::Arc::new(tokio::sync::RwLock::new(false)),
             capacity: std::sync::Arc::new(tokio::sync::RwLock::new(crate::http::CapacityState::default())),
             admin_force_seal_enabled: false,

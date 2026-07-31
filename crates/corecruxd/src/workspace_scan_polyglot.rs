@@ -28,18 +28,21 @@
 //!   diagnosed.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, ParseOptions, Parser};
 
 use crate::workspace_scan::{
-    parse_file_doc_header, parse_internal_path_deps, walk_dir, CrateInfo, DepEdge, FileInfo, FileReference, RouteHit,
-    ScanDiagnostics, ScanError, ScanStats, SymbolInfo, UnresolvedRoute, V3SkippedFile, WorkspaceScan,
+    parse_file_doc_header, walk_dir, CrateInfo, DepEdge, FileInfo, FileReference, RouteHit, ScanDiagnostics, ScanError,
+    ScanStats, SymbolInfo, UnresolvedRoute, V3SkippedFile, WorkspaceScan,
 };
 
 const POLYGLOT_V2_ENV: &str = "CORECRUXD_POLYGLOT_V2";
 const POLYGLOT_V3_ENV: &str = "CORECRUXD_POLYGLOT_V3";
 pub(crate) const POLYGLOT_AST_MAX_DEPTH: usize = 512;
+const MAX_DJANGO_EXPANSION_STATES: usize = 1024;
 pub(crate) const POLYGLOT_JS_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) const POLYGLOT_JS_MAX_LINE_BYTES: usize = 10_000;
 pub(crate) const POLYGLOT_JAVA_MAX_BYTES: usize = 1024 * 1024;
@@ -167,6 +170,75 @@ enum DjangoIncludeTarget {
     Dynamic(String),
 }
 
+impl ExtractedFile {
+    fn push_dep(&mut self, dep: DepEdge) {
+        let bytes = dep
+            .from_crate
+            .len()
+            .saturating_add(dep.from_file.len())
+            .saturating_add(dep.to_module.len())
+            .saturating_add(dep.raw.len());
+        if crate::repo_scan_policy::charge_generated_work(1, bytes, "polyglot dependency intermediate").is_ok() {
+            self.deps.push(dep);
+        }
+    }
+
+    fn push_call(&mut self, call: CallSite) {
+        let bytes = call
+            .name
+            .len()
+            .saturating_add(call.from_symbol.as_deref().map_or(0, str::len));
+        if crate::repo_scan_policy::charge_generated_work(1, bytes, "polyglot call intermediate").is_ok() {
+            self.calls.push(call);
+        }
+    }
+
+    fn push_route(&mut self, route: RouteCandidate) {
+        let handler_bytes = match &route.handler {
+            RouteHandler::Inline => 0,
+            RouteHandler::Named(name) | RouteHandler::Django(name) => name.len(),
+            RouteHandler::Resolved { name, file, .. } => name.len().saturating_add(file.len()),
+        };
+        let bytes = route
+            .method
+            .len()
+            .saturating_add(route.path.len())
+            .saturating_add(route.framework.as_deref().map_or(0, str::len))
+            .saturating_add(route.source_file.len())
+            .saturating_add(handler_bytes);
+        if crate::repo_scan_policy::charge_generated_work(1, bytes, "polyglot route intermediate").is_ok() {
+            self.routes.push(route);
+        }
+    }
+
+    fn push_django_include(&mut self, include: DjangoIncludeCandidate) {
+        let target_bytes = match &include.target {
+            DjangoIncludeTarget::Module(target) | DjangoIncludeTarget::Dynamic(target) => target.len(),
+        };
+        let bytes = include
+            .prefix
+            .len()
+            .saturating_add(include.source_file.len())
+            .saturating_add(target_bytes);
+        if crate::repo_scan_policy::charge_generated_work(1, bytes, "Django include intermediate").is_ok() {
+            self.django_includes.push(include);
+        }
+    }
+
+    fn push_unresolved_route(&mut self, route: UnresolvedRoute) {
+        let bytes = route
+            .method
+            .len()
+            .saturating_add(route.path.len())
+            .saturating_add(route.handler_fn.len())
+            .saturating_add(route.source_file.len())
+            .saturating_add(route.reason.len());
+        if crate::repo_scan_policy::charge_generated_work(1, bytes, "unresolved route intermediate").is_ok() {
+            self.unresolved_routes.push(route);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct AstWalkGuard {
     depth_limit_hits: usize,
@@ -174,6 +246,11 @@ struct AstWalkGuard {
 
 impl AstWalkGuard {
     fn allow_depth(&mut self, depth: usize) -> bool {
+        if crate::repo_scan_policy::check_deadline().is_err()
+            || crate::repo_scan_policy::charge_generated_work(1, 32, "polyglot AST walk node").is_err()
+        {
+            return false;
+        }
         if depth <= POLYGLOT_AST_MAX_DEPTH {
             return true;
         }
@@ -182,44 +259,84 @@ impl AstWalkGuard {
     }
 }
 
+fn parse_with_scan_budget(parser: &mut Parser, src: &str) -> Result<Option<tree_sitter::Tree>, ScanError> {
+    crate::repo_scan_policy::check_deadline()?;
+    crate::repo_scan_policy::charge_source_parse_work(src, "polyglot AST parser work")?;
+    let bytes = src.as_bytes();
+    let mut progress = |_state: &tree_sitter::ParseState| match crate::repo_scan_policy::check_deadline() {
+        Ok(()) => ControlFlow::Continue(()),
+        Err(_) => ControlFlow::Break(()),
+    };
+    let options = ParseOptions::new().progress_callback(&mut progress);
+    let tree = parser.parse_with_options(
+        &mut |offset, _point| bytes.get(offset..).unwrap_or_default(),
+        None,
+        Some(options),
+    );
+    crate::repo_scan_policy::check_deadline()?;
+    Ok(tree)
+}
+
+#[cfg(test)]
 pub(crate) fn run_repo_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
+    let policy = crate::repo_scan_policy::RepoScanPolicy::for_exact_root(root)?;
+    run_repo_scan_at_with_policy(root, &policy)
+}
+
+pub(crate) fn run_repo_scan_at_with_policy(
+    root: &Path,
+    policy: &crate::repo_scan_policy::RepoScanPolicy,
+) -> Result<WorkspaceScan, ScanError> {
+    policy.execute(root, run_repo_scan_in_context)
+}
+
+pub(crate) fn run_repo_scan_in_context(root: &Path) -> Result<WorkspaceScan, ScanError> {
     let options = PolyglotScanOptions::from_env();
-    let mut scan = if should_use_rust_workspace_scan_with_options(root, options) {
-        crate::workspace_scan::run_scan_at(root)?
-    } else if has_rust_workspace(root) {
+    let mut scan = if should_use_rust_workspace_scan_with_options(root, options)? {
+        crate::workspace_scan::run_scan_at_in_context(root)?
+    } else if has_rust_workspace(root)? {
         // Cargo workspace + polyglot files: scan the cargo tree natively so
         // crate structure and route extraction survive, then merge the
         // tree-sitter extraction of the non-Rust files on top. Without this a
         // single stray .ts/.py file used to flatten a 28-crate workspace into
         // one package with zero routes.
-        let mut scan = crate::workspace_scan::run_scan_at(root)?;
+        let mut scan = crate::workspace_scan::run_scan_at_in_context(root)?;
         let poly = run_polyglot_scan_inner(root, false, options)?;
-        merge_polyglot_scan(&mut scan, poly, options);
+        merge_polyglot_scan(&mut scan, poly, options)?;
         scan
     } else {
         run_polyglot_scan_inner(root, true, options)?
     };
-    crate::workspace_scan_manifests::attach_external_deps_if_enabled(root, &mut scan);
+    crate::workspace_scan_manifests::attach_external_deps_if_enabled(root, &mut scan)?;
     Ok(scan)
 }
 
-pub(crate) fn has_rust_workspace(root: &Path) -> bool {
-    root.join("Cargo.toml").exists() && has_supported_file(root, &[Some("rs")])
+pub(crate) fn has_rust_workspace(root: &Path) -> Result<bool, ScanError> {
+    let manifest = root.join("Cargo.toml");
+    if crate::repo_scan_policy::scan_file_metadata(&manifest)?.is_none() {
+        return Ok(false);
+    }
+    has_supported_file(root, &[Some("rs")])
 }
 
-pub(crate) fn should_use_rust_workspace_scan(root: &Path) -> bool {
+#[cfg(test)]
+pub(crate) fn should_use_rust_workspace_scan(root: &Path) -> Result<bool, ScanError> {
     should_use_rust_workspace_scan_with_options(root, PolyglotScanOptions::from_env())
 }
 
-fn should_use_rust_workspace_scan_with_options(root: &Path, options: PolyglotScanOptions) -> bool {
-    has_rust_workspace(root) && !has_polyglot_non_rust_files(root, options)
+fn should_use_rust_workspace_scan_with_options(root: &Path, options: PolyglotScanOptions) -> Result<bool, ScanError> {
+    Ok(has_rust_workspace(root)? && !has_polyglot_non_rust_files(root, options)?)
 }
 
 /// Fold a rust-excluded polyglot scan into a native Rust workspace scan.
 /// Crates, routes, stubs and dead-code stay authoritative from the Rust side;
 /// files/symbols/deps are unioned and the stats re-rolled from the merged
 /// contents.
-fn merge_polyglot_scan(scan: &mut WorkspaceScan, poly: WorkspaceScan, options: PolyglotScanOptions) {
+fn merge_polyglot_scan(
+    scan: &mut WorkspaceScan,
+    poly: WorkspaceScan,
+    options: PolyglotScanOptions,
+) -> Result<(), ScanError> {
     let existing: std::collections::BTreeSet<String> = scan.crates.iter().map(|c| c.name.clone()).collect();
     scan.crates
         .extend(poly.crates.into_iter().filter(|c| !existing.contains(&c.name)));
@@ -232,19 +349,23 @@ fn merge_polyglot_scan(scan: &mut WorkspaceScan, poly: WorkspaceScan, options: P
             .unresolved_routes
             .extend(poly.diagnostics.unresolved_routes);
     }
-    if options.v3_enabled {
-        scan.diagnostics
-            .v3_skipped_files
-            .extend(poly.diagnostics.v3_skipped_files);
-    }
+    // The field predates baseline TS and V2 JS pre-parse guards, but those
+    // guards now use the same durable omission diagnostic. Preserve it even
+    // when V3 extraction is disabled so hybrid Rust scans cannot look complete.
+    scan.diagnostics
+        .v3_skipped_files
+        .extend(poly.diagnostics.v3_skipped_files);
     scan.duration_ms += poly.duration_ms;
     scan.finished_at_unix_ms = scan.finished_at_unix_ms.max(poly.finished_at_unix_ms);
-    roll_up_stats(scan);
+    roll_up_stats(scan)
 }
 
 #[cfg(test)]
 pub(crate) fn run_polyglot_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
-    run_polyglot_scan_inner(root, true, PolyglotScanOptions::from_env())
+    let policy = crate::repo_scan_policy::RepoScanPolicy::for_exact_root(root)?;
+    policy.execute(root, |canonical| {
+        run_polyglot_scan_inner(canonical, true, PolyglotScanOptions::from_env())
+    })
 }
 
 fn run_polyglot_scan_inner(
@@ -260,16 +381,30 @@ fn run_polyglot_scan_inner(
     let files = supported_files(root, include_rust, options)?;
     let mut extracted = Vec::new();
     let mut v3_skipped_files = Vec::new();
-    for (abs, lang) in files {
+    for (file_index, (abs, lang)) in files.into_iter().enumerate() {
+        if file_index % 256 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
         if let Some(file) =
             extract_file_recording_skips(root, &abs, lang, &package_name, options, &mut v3_skipped_files)?
         {
+            crate::repo_scan_policy::charge_generated_work(
+                1,
+                file.rel_path
+                    .len()
+                    .saturating_add(file.package_name.len())
+                    .saturating_add(file.module_path.len())
+                    .saturating_add(file.doc_summary.as_deref().map_or(0, str::len))
+                    .saturating_add(file.doc_full.as_deref().map_or(0, str::len))
+                    .saturating_add(std::mem::size_of::<ExtractedFile>()),
+                "polyglot extracted-file collection",
+            )?;
             extracted.push(file);
         }
     }
 
     let mut scan = WorkspaceScan {
-        scan_id: format!("ws_{started_ms}"),
+        scan_id: format!("ws_{started_ms}_{}", uuid::Uuid::new_v4().simple()),
         root_path: root.display().to_string(),
         started_at_unix_ms: started_ms,
         diagnostics: ScanDiagnostics {
@@ -281,8 +416,27 @@ fn run_polyglot_scan_inner(
     let mut file_idx_by_path = HashMap::new();
     let mut symbol_by_name: HashMap<String, Vec<SymbolInfo>> = HashMap::new();
 
-    for file in &extracted {
+    for (file_index, file) in extracted.iter().enumerate() {
+        if file_index % 256 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
+        crate::repo_scan_policy::charge_generated_work(
+            1,
+            file.rel_path
+                .len()
+                .saturating_add(file.package_name.len())
+                .saturating_add(file.module_path.len())
+                .saturating_add(file.doc_full.as_deref().map_or(0, str::len)),
+            "scan output",
+        )?;
+        crate::repo_scan_policy::charge_generated_work(1, file.rel_path.len(), "polyglot file-path index")?;
         file_idx_by_path.insert(file.rel_path.clone(), scan.files.len());
+        let define_bytes = file.symbols.iter().map(|symbol| symbol.name.len()).sum();
+        crate::repo_scan_policy::charge_generated_work(
+            file.symbols.len(),
+            define_bytes,
+            "polyglot file definition output",
+        )?;
         scan.files.push(FileInfo {
             rel_path: file.rel_path.clone(),
             crate_name: file.package_name.clone(),
@@ -297,8 +451,31 @@ fn run_polyglot_scan_inner(
             referenced_by: Vec::new(),
             is_test_file: file.is_test_file,
         });
-        scan.deps.extend(file.deps.iter().cloned());
-        for symbol in &file.symbols {
+        for dep in &file.deps {
+            crate::repo_scan_policy::charge_generated_work(
+                1,
+                dep.from_crate
+                    .len()
+                    .saturating_add(dep.from_file.len())
+                    .saturating_add(dep.to_module.len())
+                    .saturating_add(dep.raw.len()),
+                "polyglot dependency output",
+            )?;
+            scan.deps.push(dep.clone());
+        }
+        for (symbol_index, symbol) in file.symbols.iter().enumerate() {
+            if symbol_index % 256 == 0 {
+                crate::repo_scan_policy::check_deadline()?;
+            }
+            crate::repo_scan_policy::charge_generated_work(
+                2,
+                symbol
+                    .name
+                    .len()
+                    .saturating_add(symbol.file_rel_path.len())
+                    .saturating_mul(2),
+                "polyglot symbol index and output",
+            )?;
             symbol_by_name
                 .entry(symbol.name.clone())
                 .or_default()
@@ -307,16 +484,16 @@ fn run_polyglot_scan_inner(
         }
     }
 
-    resolve_polyglot_references(&mut scan, &extracted, &file_idx_by_path, &symbol_by_name);
-    build_referenced_by(&mut scan);
-    scan.crates = package_infos(root, &scan, &package_name);
+    resolve_polyglot_references(&mut scan, &extracted, &file_idx_by_path, &symbol_by_name)?;
+    build_referenced_by(&mut scan)?;
+    scan.crates = package_infos(root, &scan, &package_name)?;
     if options.v2_enabled || options.v3_enabled {
-        resolve_polyglot_routes(&mut scan, &extracted, &symbol_by_name);
+        resolve_polyglot_routes(&mut scan, &extracted, &symbol_by_name)?;
     }
     if options.v3_enabled {
-        collect_file_based_routes(root, &extracted, &mut scan);
+        collect_file_based_routes(root, &extracted, &mut scan)?;
     }
-    roll_up_stats(&mut scan);
+    roll_up_stats(&mut scan)?;
     let elapsed_ms = started_inst.elapsed().as_millis() as u64;
     scan.finished_at_unix_ms = scan.started_at_unix_ms + elapsed_ms;
     scan.duration_ms = elapsed_ms;
@@ -329,16 +506,31 @@ fn supported_files(
     options: PolyglotScanOptions,
 ) -> Result<Vec<(PathBuf, LanguageKind)>, ScanError> {
     let mut files = Vec::new();
+    let mut discovery_error = None;
     walk_dir(root, root, &mut |rel, abs| {
+        if discovery_error.is_some() {
+            return;
+        }
         if should_skip_generated_polyglot_file(rel, options) {
             return;
         }
         if let Some(lang) = language_for_path(abs, options) {
             if include_rust || lang != LanguageKind::Rust {
+                if let Err(error) = crate::repo_scan_policy::charge_generated_work(
+                    1,
+                    abs.as_os_str().as_encoded_bytes().len(),
+                    "polyglot supported-file index",
+                ) {
+                    discovery_error = Some(error);
+                    return;
+                }
                 files.push((abs.to_path_buf(), lang));
             }
         }
     })?;
+    if let Some(error) = discovery_error {
+        return Err(error);
+    }
     files.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(files)
 }
@@ -428,19 +620,29 @@ fn extract_file_recording_skips(
     v3_skipped_files: &mut Vec<V3SkippedFile>,
 ) -> Result<Option<ExtractedFile>, ScanError> {
     let rel_path = rel_string(root, abs);
-    if let Some(reason) = pathological_v3_size_skip_reason(&rel_path, abs, lang, options) {
+    if let Some(reason) = pathological_v3_size_skip_reason(&rel_path, abs, lang, options)? {
+        crate::repo_scan_policy::charge_generated_work(
+            1,
+            rel_path.len().saturating_add(reason.len()),
+            "polyglot skipped-file diagnostic",
+        )?;
         v3_skipped_files.push(V3SkippedFile {
             rel_path,
             reason: reason.to_string(),
         });
         return Ok(None);
     }
-    let src = std::fs::read_to_string(abs).unwrap_or_default();
+    let src = crate::workspace_scan::read_scan_to_string(abs)?;
     if should_skip_pathological_v2_js(&rel_path, &src, options) {
         return Ok(None);
     }
     let lang = language_for_source(lang, abs, &src);
     if let Some(reason) = pathological_v3_source_skip_reason(&rel_path, &src, lang, options) {
+        crate::repo_scan_policy::charge_generated_work(
+            1,
+            rel_path.len().saturating_add(reason.len()),
+            "polyglot skipped-file diagnostic",
+        )?;
         v3_skipped_files.push(V3SkippedFile {
             rel_path,
             reason: reason.to_string(),
@@ -479,7 +681,7 @@ fn extract_file_recording_skips(
     let mut guard = AstWalkGuard::default();
 
     match lang {
-        LanguageKind::Rust => extract_rust_file(&src, &mut file, &mut guard),
+        LanguageKind::Rust => extract_rust_file(&src, &mut file, &mut guard)?,
         LanguageKind::TypeScript => extract_ts_block(&src, 0, false, &mut file, options, &mut guard)?,
         LanguageKind::Tsx => extract_ts_block(&src, 0, true, &mut file, options, &mut guard)?,
         LanguageKind::Python => extract_python_file(&src, &mut file, options, &mut guard)?,
@@ -505,14 +707,13 @@ fn extract_file_recording_skips(
         LanguageKind::Swift => extract_swift_file(&src, &mut file, &mut guard)?,
         LanguageKind::Php => extract_php_file(&src, &mut file, &mut guard)?,
     }
+    crate::repo_scan_policy::check_deadline()?;
     file.ast_depth_limit_hits = guard.depth_limit_hits;
     if file.ast_depth_limit_hits > 0 {
-        tracing::warn!(
-            file = %file.rel_path,
-            max_depth = POLYGLOT_AST_MAX_DEPTH,
-            depth_limit_hits = file.ast_depth_limit_hits,
-            "polyglot ast walk depth limit reached; stopped descending"
-        );
+        return Err(ScanError::Policy(format!(
+            "polyglot AST walk for {} exceeded depth {}; partial extraction is not persisted",
+            file.rel_path, POLYGLOT_AST_MAX_DEPTH
+        )));
     }
     Ok(Some(file))
 }
@@ -549,6 +750,9 @@ fn is_v2_js_path(path: &str) -> bool {
 
 fn v3_source_limits(lang: LanguageKind) -> Option<(usize, usize)> {
     match lang {
+        LanguageKind::TypeScript | LanguageKind::Tsx | LanguageKind::Python | LanguageKind::Vue | LanguageKind::Go => {
+            Some((POLYGLOT_JS_MAX_BYTES, POLYGLOT_JS_MAX_LINE_BYTES))
+        }
         LanguageKind::Java => Some((POLYGLOT_JAVA_MAX_BYTES, POLYGLOT_JAVA_MAX_LINE_BYTES)),
         LanguageKind::C => Some((POLYGLOT_C_MAX_BYTES, POLYGLOT_C_MAX_LINE_BYTES)),
         LanguageKind::Cpp => Some((POLYGLOT_CPP_MAX_BYTES, POLYGLOT_CPP_MAX_LINE_BYTES)),
@@ -561,30 +765,33 @@ fn v3_source_limits(lang: LanguageKind) -> Option<(usize, usize)> {
     }
 }
 
+fn source_limits_enabled(lang: LanguageKind, options: PolyglotScanOptions) -> bool {
+    matches!(
+        lang,
+        LanguageKind::TypeScript | LanguageKind::Tsx | LanguageKind::Python | LanguageKind::Vue
+    ) || (lang == LanguageKind::Go && options.v2_enabled)
+        || options.v3_enabled
+}
+
 fn pathological_v3_size_skip_reason(
     rel_path: &str,
     abs: &Path,
     lang: LanguageKind,
     options: PolyglotScanOptions,
-) -> Option<&'static str> {
-    if !options.v3_enabled {
-        return None;
+) -> Result<Option<&'static str>, ScanError> {
+    if !source_limits_enabled(lang, options) {
+        return Ok(None);
     }
-    let (max_bytes, _) = v3_source_limits(lang)?;
-    let metadata = match std::fs::symlink_metadata(abs) {
-        Ok(metadata) => metadata,
-        Err(err) => {
-            tracing::warn!(file = %rel_path, ?err, "polyglot v3 file skipped before reading; metadata unavailable");
-            return Some("metadata_unavailable");
-        }
+    let Some((max_bytes, _)) = v3_source_limits(lang) else {
+        return Ok(None);
     };
-    if !metadata.file_type().is_file() {
+    let Some(metadata) = crate::repo_scan_policy::scan_file_metadata_for_admission(abs)? else {
         tracing::warn!(file = %rel_path, "polyglot v3 non-regular file skipped before reading");
-        return Some("non_regular_file");
-    }
+        return Ok(Some("non_regular_file"));
+    };
     let byte_len = metadata.len();
     if byte_len <= max_bytes as u64 {
-        return None;
+        return Ok(None);
     }
     tracing::warn!(
         file = %rel_path,
@@ -592,7 +799,7 @@ fn pathological_v3_size_skip_reason(
         max_bytes,
         "polyglot v3 file skipped before reading or parsing"
     );
-    Some("max_bytes")
+    Ok(Some("max_bytes"))
 }
 
 fn pathological_v3_source_skip_reason(
@@ -601,7 +808,7 @@ fn pathological_v3_source_skip_reason(
     lang: LanguageKind,
     options: PolyglotScanOptions,
 ) -> Option<&'static str> {
-    if !options.v3_enabled {
+    if !source_limits_enabled(lang, options) {
         return None;
     }
     let (max_bytes, max_line_bytes) = v3_source_limits(lang)?;
@@ -645,7 +852,6 @@ fn max_source_delimiter_depth(src: &str, stop_after: usize, lang: LanguageKind) 
     }
 
     let bytes = src.as_bytes();
-    let include_angle_brackets = matches!(lang, LanguageKind::Java | LanguageKind::Cpp | LanguageKind::CSharp);
     let mut state = LexState::Code;
     let mut escaped = false;
     let mut depth = 0_usize;
@@ -686,13 +892,7 @@ fn max_source_delimiter_depth(src: &str, stop_after: usize, lang: LanguageKind) 
                         state = LexState::DoubleQuoted;
                         escaped = false;
                     } else {
-                        update_source_delimiter_depth(
-                            byte,
-                            include_angle_brackets,
-                            &mut depth,
-                            &mut angle_depth,
-                            &mut max_depth,
-                        );
+                        update_source_delimiter_depth(bytes, index, lang, &mut depth, &mut angle_depth, &mut max_depth);
                         if max_depth > stop_after {
                             return max_depth;
                         }
@@ -708,13 +908,7 @@ fn max_source_delimiter_depth(src: &str, stop_after: usize, lang: LanguageKind) 
                     escaped = false;
                 }
                 _ => {
-                    update_source_delimiter_depth(
-                        byte,
-                        include_angle_brackets,
-                        &mut depth,
-                        &mut angle_depth,
-                        &mut max_depth,
-                    );
+                    update_source_delimiter_depth(bytes, index, lang, &mut depth, &mut angle_depth, &mut max_depth);
                     if max_depth > stop_after {
                         return max_depth;
                     }
@@ -759,34 +953,67 @@ fn max_source_delimiter_depth(src: &str, stop_after: usize, lang: LanguageKind) 
 }
 
 fn update_source_delimiter_depth(
-    byte: u8,
-    include_angle_brackets: bool,
+    bytes: &[u8],
+    index: usize,
+    lang: LanguageKind,
     depth: &mut usize,
     angle_depth: &mut usize,
     max_depth: &mut usize,
 ) {
+    let byte = bytes[index];
     match byte {
         b'(' | b'[' | b'{' => {
-            if include_angle_brackets && byte == b'{' {
-                *angle_depth = 0;
-            }
             *depth += 1;
             *max_depth = (*max_depth).max(*depth);
-        }
-        b')' | b']' | b'}' => {
-            if include_angle_brackets && byte == b'}' {
+            if byte == b'{' {
                 *angle_depth = 0;
             }
-            *depth = depth.saturating_sub(1);
         }
-        b'<' if include_angle_brackets => {
+        b')' | b']' | b'}' => {
+            *depth = depth.saturating_sub(1);
+            if byte == b'}' {
+                *angle_depth = 0;
+            }
+        }
+        b'<' if tracks_generic_angle_nesting(lang) && looks_like_generic_open(bytes, index) => {
             *angle_depth += 1;
             *max_depth = (*max_depth).max(*angle_depth);
         }
-        b'>' if include_angle_brackets => *angle_depth = angle_depth.saturating_sub(1),
-        b';' if include_angle_brackets => *angle_depth = 0,
+        b'>' if tracks_generic_angle_nesting(lang) && *angle_depth > 0 => {
+            *angle_depth = angle_depth.saturating_sub(1);
+        }
+        b';' if tracks_generic_angle_nesting(lang) => *angle_depth = 0,
+        b'&' if tracks_generic_angle_nesting(lang) && bytes.get(index + 1) == Some(&b'&') => {
+            *angle_depth = 0;
+        }
+        b'|' if tracks_generic_angle_nesting(lang) && bytes.get(index + 1) == Some(&b'|') => {
+            *angle_depth = 0;
+        }
         _ => {}
     }
+}
+
+fn tracks_generic_angle_nesting(lang: LanguageKind) -> bool {
+    matches!(lang, LanguageKind::Java | LanguageKind::Cpp | LanguageKind::CSharp)
+}
+
+fn looks_like_generic_open(bytes: &[u8], index: usize) -> bool {
+    if bytes.get(index + 1).is_some_and(|byte| matches!(*byte, b'<' | b'='))
+        || bytes.get(index.wrapping_sub(1)) == Some(&b'<')
+    {
+        return false;
+    }
+    let previous = bytes[..index]
+        .iter()
+        .rev()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace());
+    let next = bytes[index + 1..]
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace());
+    previous.is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'>' | b')' | b']'))
+        && next.is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'(' | b'[' | b'?'))
 }
 
 fn is_c_family_digit_separator(bytes: &[u8], index: usize) -> bool {
@@ -822,11 +1049,18 @@ fn cpp_raw_string_end(bytes: &[u8], start: usize) -> Option<usize> {
     Some(bytes.len().saturating_sub(1))
 }
 
-fn extract_rust_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkGuard) {
+fn extract_rust_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkGuard) -> Result<(), ScanError> {
+    crate::repo_scan_policy::check_deadline()?;
+    crate::workspace_scan::validate_rust_syntax_complexity(src)?;
+    crate::repo_scan_policy::charge_source_parse_work(src, "polyglot Rust parser work")?;
     let Ok(parsed) = syn::parse_file(src) else {
-        return;
+        return Ok(());
     };
+    crate::repo_scan_policy::check_deadline()?;
     for item in &parsed.items {
+        if crate::repo_scan_policy::check_deadline().is_err() {
+            break;
+        }
         match item {
             syn::Item::Fn(f) => push_symbol(
                 file,
@@ -871,18 +1105,35 @@ fn extract_rust_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkGua
                 is_pub(&c.vis),
             ),
             syn::Item::Use(u) => {
-                for raw in rust_use_paths(&u.tree, guard) {
+                visit_rust_use_paths(&u.tree, guard, &mut |parts| {
+                    let module_bytes = parts
+                        .iter()
+                        .map(String::len)
+                        .sum::<usize>()
+                        .saturating_add(parts.len().saturating_sub(1).saturating_mul(2));
+                    crate::repo_scan_policy::charge_generated_work(
+                        1,
+                        file.package_name
+                            .len()
+                            .saturating_add(file.rel_path.len())
+                            .saturating_add(module_bytes.saturating_mul(2))
+                            .saturating_add("use ;".len()),
+                        "Rust use dependency intermediate",
+                    )?;
+                    let raw = parts.join("::");
                     file.deps.push(DepEdge {
                         from_crate: file.package_name.clone(),
                         from_file: file.rel_path.clone(),
                         to_module: raw.clone(),
                         raw: format!("use {raw};"),
                     });
-                }
+                    Ok(())
+                })?;
             }
             _ => {}
         }
     }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -895,9 +1146,9 @@ struct TsWalkContext<'src, 'guard> {
 
 #[derive(Debug, Clone)]
 struct TsWalkState {
-    current_fn: Option<String>,
+    current_fn: Option<Arc<str>>,
     exported: bool,
-    controller_prefix: Option<String>,
+    controller_prefix: Option<Arc<str>>,
     top_level: bool,
     depth: usize,
 }
@@ -919,7 +1170,7 @@ fn extract_ts_block(
     parser
         .set_language(&language.into())
         .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
-    let Some(tree) = parser.parse(src, None) else {
+    let Some(tree) = parse_with_scan_budget(&mut parser, src)? else {
         return Ok(());
     };
     let bytes = src.as_bytes();
@@ -971,7 +1222,7 @@ fn walk_ts_node(node: Node<'_>, ctx: &mut TsWalkContext<'_, '_>, file: &mut Extr
                     ctx,
                     file,
                     TsWalkState {
-                        current_fn: Some(name),
+                        current_fn: Some(Arc::from(name)),
                         exported: is_export,
                         controller_prefix: state.controller_prefix,
                         top_level: false,
@@ -998,7 +1249,7 @@ fn walk_ts_node(node: Node<'_>, ctx: &mut TsWalkContext<'_, '_>, file: &mut Extr
                     ctx,
                     file,
                     TsWalkState {
-                        current_fn: Some(name),
+                        current_fn: Some(Arc::from(name)),
                         exported: is_export,
                         controller_prefix: state.controller_prefix,
                         top_level: false,
@@ -1019,7 +1270,9 @@ fn walk_ts_node(node: Node<'_>, ctx: &mut TsWalkContext<'_, '_>, file: &mut Extr
                 );
             }
             let nested_controller_prefix = if options.v2_enabled {
-                nest_controller_prefix(node, src).or(state.controller_prefix)
+                nest_controller_prefix(node, src)
+                    .map(Arc::from)
+                    .or(state.controller_prefix)
             } else {
                 state.controller_prefix
             };
@@ -1087,7 +1340,7 @@ fn walk_ts_node(node: Node<'_>, ctx: &mut TsWalkContext<'_, '_>, file: &mut Extr
         }
         "import_statement" => {
             if let Some(module) = quoted_child_text(node, src, ctx.guard, state.depth + 1) {
-                file.deps.push(DepEdge {
+                file.push_dep(DepEdge {
                     from_crate: file.package_name.clone(),
                     from_file: file.rel_path.clone(),
                     to_module: module,
@@ -1099,14 +1352,14 @@ fn walk_ts_node(node: Node<'_>, ctx: &mut TsWalkContext<'_, '_>, file: &mut Extr
             if let Some(function) = node.child_by_field_name("function") {
                 let name = last_ident_text(function, src);
                 if !name.is_empty() {
-                    file.calls.push(CallSite {
+                    file.push_call(CallSite {
                         name: name.clone(),
-                        from_symbol: state.current_fn.clone(),
+                        from_symbol: state.current_fn.as_deref().map(str::to_owned),
                     });
                 }
                 if options.v2_enabled && name == "require" {
                     if let Some(module) = first_arg_string(node, src) {
-                        file.deps.push(DepEdge {
+                        file.push_dep(DepEdge {
                             from_crate: file.package_name.clone(),
                             from_file: file.rel_path.clone(),
                             to_module: module,
@@ -1156,7 +1409,7 @@ fn extract_python_file(
     parser
         .set_language(&tree_sitter_python::LANGUAGE.into())
         .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
-    let Some(tree) = parser.parse(src, None) else {
+    let Some(tree) = parse_with_scan_budget(&mut parser, src)? else {
         return Ok(());
     };
     let bytes = src.as_bytes();
@@ -1171,7 +1424,7 @@ fn walk_py_node(
     node: Node<'_>,
     src: &[u8],
     file: &mut ExtractedFile,
-    current_fn: Option<String>,
+    current_fn: Option<Arc<str>>,
     options: PolyglotScanOptions,
     guard: &mut AstWalkGuard,
     depth: usize,
@@ -1188,7 +1441,7 @@ fn walk_py_node(
         "function_definition" => {
             if let Some(name) = field_ident(node, src, "name") {
                 push_symbol(file, "fn", &name, node.start_position().row + 1, !name.starts_with('_'));
-                walk_py_children(node, src, file, Some(name), options, guard, depth + 1);
+                walk_py_children(node, src, file, Some(Arc::from(name)), options, guard, depth + 1);
                 return;
             }
         }
@@ -1206,7 +1459,7 @@ fn walk_py_node(
         "import_statement" | "import_from_statement" => {
             let raw = node_text(node, src);
             if let Some(module) = python_import_module(&raw) {
-                file.deps.push(DepEdge {
+                file.push_dep(DepEdge {
                     from_crate: file.package_name.clone(),
                     from_file: file.rel_path.clone(),
                     to_module: module,
@@ -1218,9 +1471,9 @@ fn walk_py_node(
             if let Some(function) = node.child_by_field_name("function") {
                 let name = last_ident_text(function, src);
                 if !name.is_empty() {
-                    file.calls.push(CallSite {
+                    file.push_call(CallSite {
                         name,
-                        from_symbol: current_fn.clone(),
+                        from_symbol: current_fn.as_deref().map(str::to_owned),
                     });
                 }
             }
@@ -1237,7 +1490,7 @@ fn walk_py_children(
     node: Node<'_>,
     src: &[u8],
     file: &mut ExtractedFile,
-    current_fn: Option<String>,
+    current_fn: Option<Arc<str>>,
     options: PolyglotScanOptions,
     guard: &mut AstWalkGuard,
     depth: usize,
@@ -1261,7 +1514,7 @@ fn extract_go_file(
     parser
         .set_language(&tree_sitter_go::LANGUAGE.into())
         .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
-    let Some(tree) = parser.parse(src, None) else {
+    let Some(tree) = parse_with_scan_budget(&mut parser, src)? else {
         return Ok(());
     };
     let bytes = src.as_bytes();
@@ -1269,7 +1522,7 @@ fn extract_go_file(
         file.package_name = package_name;
         file.module_path = module_path(&file.package_name, &file.rel_path);
     }
-    let group_prefixes = collect_go_group_prefixes(tree.root_node(), bytes, guard);
+    let group_prefixes = collect_go_group_prefixes(tree.root_node(), bytes, guard)?;
     let mut ctx = GoWalkContext {
         src: bytes,
         options,
@@ -1298,7 +1551,7 @@ struct GoWalkContext<'src, 'groups, 'guard> {
 
 #[derive(Debug, Clone)]
 struct GoWalkState {
-    current_fn: Option<String>,
+    current_fn: Option<Arc<str>>,
     depth: usize,
 }
 
@@ -1317,7 +1570,7 @@ fn walk_go_node(node: Node<'_>, ctx: &mut GoWalkContext<'_, '_, '_>, file: &mut 
                     ctx,
                     file,
                     GoWalkState {
-                        current_fn: Some(name),
+                        current_fn: Some(Arc::from(name)),
                         depth: state.depth + 1,
                     },
                 );
@@ -1339,7 +1592,7 @@ fn walk_go_node(node: Node<'_>, ctx: &mut GoWalkContext<'_, '_, '_>, file: &mut 
                     ctx,
                     file,
                     GoWalkState {
-                        current_fn: Some(symbol_name),
+                        current_fn: Some(Arc::from(symbol_name)),
                         depth: state.depth + 1,
                     },
                 );
@@ -1356,9 +1609,9 @@ fn walk_go_node(node: Node<'_>, ctx: &mut GoWalkContext<'_, '_, '_>, file: &mut 
             if let Some(function) = node.child_by_field_name("function") {
                 let name = last_ident_text(function, src);
                 if !name.is_empty() {
-                    file.calls.push(CallSite {
+                    file.push_call(CallSite {
                         name,
-                        from_symbol: state.current_fn.clone(),
+                        from_symbol: state.current_fn.as_deref().map(str::to_owned),
                     });
                 }
             }
@@ -1394,7 +1647,7 @@ fn extract_java_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkGua
     parser
         .set_language(&tree_sitter_java::LANGUAGE.into())
         .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
-    let Some(tree) = parser.parse(src, None) else {
+    let Some(tree) = parse_with_scan_budget(&mut parser, src)? else {
         return Ok(());
     };
     let bytes = src.as_bytes();
@@ -1530,7 +1783,7 @@ fn extract_c_family_file(
     parser
         .set_language(&language.into())
         .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
-    let Some(tree) = parser.parse(src, None) else {
+    let Some(tree) = parse_with_scan_budget(&mut parser, src)? else {
         return Ok(());
     };
     walk_c_family_node(
@@ -1820,7 +2073,7 @@ fn collect_django_pattern_list(value: Node<'_>, src: &[u8], file: &mut Extracted
                 || DjangoIncludeTarget::Dynamic(node_text(target_node, src).trim().to_string()),
                 DjangoIncludeTarget::Module,
             );
-            file.django_includes.push(DjangoIncludeCandidate {
+            file.push_django_include(DjangoIncludeCandidate {
                 prefix: path,
                 target,
                 source_file: file.rel_path.clone(),
@@ -1913,7 +2166,7 @@ fn collect_spring_controller(class: Node<'_>, src: &[u8], file: &mut ExtractedFi
                 SpringAnnotationPaths::Static(paths) => paths,
                 SpringAnnotationPaths::Dynamic => {
                     for http_method in &methods {
-                        file.unresolved_routes.push(UnresolvedRoute {
+                        file.push_unresolved_route(UnresolvedRoute {
                             method: http_method.clone(),
                             path: class_paths.first().cloned().unwrap_or_default(),
                             handler_fn: format!("{class_name}.{method_name}"),
@@ -2114,7 +2367,7 @@ fn extract_csharp_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkG
     parser
         .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
         .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
-    let Some(tree) = parser.parse(src, None) else {
+    let Some(tree) = parse_with_scan_budget(&mut parser, src)? else {
         return Ok(());
     };
     let root = tree.root_node();
@@ -2280,7 +2533,7 @@ fn extract_ruby_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkGua
     parser
         .set_language(&tree_sitter_ruby::LANGUAGE.into())
         .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
-    let Some(tree) = parser.parse(src, None) else {
+    let Some(tree) = parse_with_scan_budget(&mut parser, src)? else {
         return Ok(());
     };
     walk_ruby_node(tree.root_node(), src.as_bytes(), file, guard, RubyWalkState::default());
@@ -2436,7 +2689,7 @@ fn extract_swift_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkGu
     parser
         .set_language(&tree_sitter_swift::LANGUAGE.into())
         .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
-    let Some(tree) = parser.parse(src, None) else {
+    let Some(tree) = parse_with_scan_budget(&mut parser, src)? else {
         return Ok(());
     };
     walk_swift_node(tree.root_node(), src.as_bytes(), file, guard, SwiftWalkState::default());
@@ -2562,7 +2815,7 @@ fn extract_php_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkGuar
     parser
         .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
         .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
-    let Some(tree) = parser.parse(src, None) else {
+    let Some(tree) = parse_with_scan_budget(&mut parser, src)? else {
         return Ok(());
     };
     let root = tree.root_node();
@@ -3504,7 +3757,7 @@ fn push_unresolved_route_at(
     source_line: usize,
     reason: &str,
 ) {
-    file.unresolved_routes.push(UnresolvedRoute {
+    file.push_unresolved_route(UnresolvedRoute {
         method: method.to_string(),
         path: path.to_string(),
         handler_fn: handler.to_string(),
@@ -3604,14 +3857,12 @@ fn collect_python_routes(node: Node<'_>, src: &[u8], file: &mut ExtractedFile, g
         return;
     };
     for decorator in decorators {
-        for (method, path) in parse_python_route_decorator(decorator, src, guard, depth + 1) {
-            push_route_candidate(
-                file,
-                method,
-                path,
-                RouteHandler::Named(handler_name.clone()),
-                decorator.start_position().row + 1,
-            );
+        let Some((path, methods)) = parse_python_route_decorator(decorator, src, guard, depth + 1) else {
+            continue;
+        };
+        let handler = RouteHandler::Named(handler_name.clone());
+        for method in methods {
+            push_route_candidate_borrowed(file, &method, &path, &handler, decorator.start_position().row + 1);
         }
     }
 }
@@ -3621,33 +3872,25 @@ fn parse_python_route_decorator(
     src: &[u8],
     guard: &mut AstWalkGuard,
     depth: usize,
-) -> Vec<(String, String)> {
-    let Some(call) = first_node_by_kind(decorator, "call", guard, depth + 1) else {
-        return Vec::new();
-    };
-    let Some(function) = call.child_by_field_name("function") else {
-        return Vec::new();
-    };
+) -> Option<(String, Vec<String>)> {
+    let call = first_node_by_kind(decorator, "call", guard, depth + 1)?;
+    let function = call.child_by_field_name("function")?;
     let method_name = last_ident_text(function, src);
     let method_lower = method_name.to_ascii_lowercase();
     let args = argument_nodes(call);
-    let Some(path) = python_route_path_from_args(&args, src) else {
-        return Vec::new();
-    };
+    let path = python_route_path_from_args(&args, src)?;
     if !path.starts_with('/') {
-        return Vec::new();
+        return None;
     }
-    match method_lower.as_str() {
+    let methods = match method_lower.as_str() {
         "get" | "post" | "put" | "delete" | "patch" | "head" | "options" => {
-            vec![(method_lower.to_ascii_uppercase(), path)]
+            vec![method_lower.to_ascii_uppercase()]
         }
-        "websocket" => vec![("WS".to_string(), path)],
-        "route" => python_route_methods(&args, src, &["GET"])
-            .into_iter()
-            .map(|method| (method, path.clone()))
-            .collect(),
-        _ => Vec::new(),
-    }
+        "websocket" => vec!["WS".to_string()],
+        "route" => python_route_methods(&args, src, &["GET"]),
+        _ => return None,
+    };
+    Some((path, methods))
 }
 
 fn collect_python_add_url_rule(node: Node<'_>, src: &[u8], file: &mut ExtractedFile) {
@@ -3675,13 +3918,7 @@ fn collect_python_add_url_rule(node: Node<'_>, src: &[u8], file: &mut ExtractedF
         return;
     };
     for method in python_route_methods(&args, src, &["ANY"]) {
-        push_route_candidate(
-            file,
-            method,
-            path.clone(),
-            handler.clone(),
-            node.start_position().row + 1,
-        );
+        push_route_candidate_borrowed(file, &method, &path, &handler, node.start_position().row + 1);
     }
 }
 
@@ -3721,7 +3958,14 @@ fn python_route_methods(args: &[Node<'_>], src: &[u8], default_methods: &[&str])
         };
         return python_methods_list(value, src).unwrap_or_else(|| vec!["ANY".to_string()]);
     }
-    default_methods.iter().map(|method| (*method).to_string()).collect()
+    default_methods
+        .iter()
+        .filter_map(|method| {
+            crate::repo_scan_policy::charge_generated_work(1, method.len(), "Python route-method intermediate")
+                .ok()
+                .map(|()| (*method).to_string())
+        })
+        .collect()
 }
 
 fn python_methods_list(value: Node<'_>, src: &[u8]) -> Option<Vec<String>> {
@@ -3732,6 +3976,10 @@ fn python_methods_list(value: Node<'_>, src: &[u8]) -> Option<Vec<String>> {
     let mut cursor = value.walk();
     for child in value.named_children(&mut cursor) {
         let method = string_literal_value(child, src, false)?;
+        if crate::repo_scan_policy::charge_generated_work(1, method.len(), "Python route-method intermediate").is_err()
+        {
+            return None;
+        }
         methods.push(method.to_ascii_uppercase());
     }
     (!methods.is_empty()).then_some(methods)
@@ -3951,7 +4199,10 @@ fn collect_go_route(
                 }
             }
             "call_expression" => {
-                let Some(prefix) = go_group_call_prefix(operand, src, group_prefixes, guard, depth + 1) else {
+                let Some(prefix) = go_group_call_prefix(operand, src, group_prefixes, guard, depth + 1)
+                    .ok()
+                    .flatten()
+                else {
                     return;
                 };
                 route_prefix = prefix;
@@ -3975,7 +4226,11 @@ fn collect_go_route(
     }
 }
 
-fn collect_go_group_prefixes(root: Node<'_>, src: &[u8], guard: &mut AstWalkGuard) -> HashMap<String, String> {
+fn collect_go_group_prefixes(
+    root: Node<'_>,
+    src: &[u8],
+    guard: &mut AstWalkGuard,
+) -> Result<HashMap<String, String>, ScanError> {
     let mut assignments = Vec::new();
     collect_go_group_assignment_nodes(root, src, &mut assignments, guard, 0);
     let mut prefixes = HashMap::new();
@@ -3986,13 +4241,18 @@ fn collect_go_group_prefixes(root: Node<'_>, src: &[u8], guard: &mut AstWalkGuar
             if prefixes.contains_key(name) {
                 continue;
             }
-            if let Some(prefix) = go_group_call_prefix(*call, src, &prefixes, guard, 0) {
+            if let Some(prefix) = go_group_call_prefix(*call, src, &prefixes, guard, 0)? {
+                crate::repo_scan_policy::charge_generated_work(
+                    1,
+                    name.len().saturating_add(prefix.len()),
+                    "Go route-group prefix index",
+                )?;
                 prefixes.insert(name.clone(), prefix);
                 changed = true;
             }
         }
     }
-    prefixes
+    Ok(prefixes)
 }
 
 fn collect_go_group_assignment_nodes<'a>(
@@ -4010,7 +4270,15 @@ fn collect_go_group_assignment_nodes<'a>(
         "short_var_declaration" | "assignment_statement" | "var_spec"
     ) {
         if let Some((name, call)) = go_group_assignment_node(node, src, guard, depth + 1) {
-            out.push((name, call));
+            if crate::repo_scan_policy::charge_generated_work(
+                1,
+                name.len().saturating_add(std::mem::size_of::<Node<'a>>()),
+                "Go route-group assignment index",
+            )
+            .is_ok()
+            {
+                out.push((name, call));
+            }
         }
     }
     let mut cursor = node.walk();
@@ -4075,38 +4343,59 @@ fn go_group_call_prefix(
     group_prefixes: &HashMap<String, String>,
     guard: &mut AstWalkGuard,
     depth: usize,
-) -> Option<String> {
+) -> Result<Option<String>, ScanError> {
     if !guard.allow_depth(depth) {
-        return None;
+        return Ok(None);
     }
     if call.kind() != "call_expression" {
-        return None;
+        return Ok(None);
     }
-    let function = call.child_by_field_name("function")?;
-    if function.kind() != "selector_expression" || go_selector_field(function, src)? != "Group" {
-        return None;
+    let Some(function) = call.child_by_field_name("function") else {
+        return Ok(None);
+    };
+    if function.kind() != "selector_expression" || go_selector_field(function, src).as_deref() != Some("Group") {
+        return Ok(None);
     }
-    let object = function.child_by_field_name("operand")?;
+    let Some(object) = function.child_by_field_name("operand") else {
+        return Ok(None);
+    };
     let base_prefix = match object.kind() {
         "identifier" => {
             let receiver = node_text(object, src);
             if let Some(prefix) = group_prefixes.get(&receiver) {
+                crate::repo_scan_policy::charge_generated_work(1, prefix.len(), "Go route-group prefix intermediate")?;
                 prefix.clone()
             } else if go_route_receiver_allowed(&receiver) {
                 String::new()
             } else {
-                return None;
+                return Ok(None);
             }
         }
-        "call_expression" => go_group_call_prefix(object, src, group_prefixes, guard, depth + 1)?,
-        _ => return None,
+        "call_expression" => {
+            let Some(prefix) = go_group_call_prefix(object, src, group_prefixes, guard, depth + 1)? else {
+                return Ok(None);
+            };
+            prefix
+        }
+        _ => return Ok(None),
     };
     let args = argument_nodes(call);
-    let path = args
+    let Some(path) = args
         .first()
         .copied()
-        .and_then(|arg| string_literal_value(arg, src, true))?;
-    path.starts_with('/').then(|| join_route_paths(&base_prefix, &path))
+        .and_then(|arg| string_literal_value(arg, src, true))
+    else {
+        return Ok(None);
+    };
+    if !path.starts_with('/') {
+        return Ok(None);
+    }
+    crate::repo_scan_policy::charge_generated_work(
+        1,
+        base_prefix.len().saturating_add(path.len()).saturating_add(1),
+        "Go route-group joined prefix",
+    )?;
+    Ok(Some(join_route_paths(&base_prefix, &path)))
 }
 
 fn collect_go_types(node: Node<'_>, src: &[u8], file: &mut ExtractedFile, guard: &mut AstWalkGuard, depth: usize) {
@@ -4137,7 +4426,7 @@ fn collect_go_imports(node: Node<'_>, src: &[u8], file: &mut ExtractedFile, guar
         let Some(module) = string_literal_value(path_node, src, true) else {
             continue;
         };
-        file.deps.push(DepEdge {
+        file.push_dep(DepEdge {
             from_crate: file.package_name.clone(),
             from_file: file.rel_path.clone(),
             to_module: module,
@@ -4153,7 +4442,7 @@ fn go_package_name(node: Node<'_>, src: &[u8], guard: &mut AstWalkGuard) -> Opti
     let mut cursor = package.walk();
     for child in package.named_children(&mut cursor) {
         if child.kind() == "package_identifier" {
-            return Some(node_text(child, src));
+            return bounded_package_name(&node_text(child, src));
         }
     }
     None
@@ -4189,10 +4478,40 @@ fn push_route_candidate(
     handler: RouteHandler,
     source_line: usize,
 ) {
-    file.routes.push(RouteCandidate {
+    file.push_route(RouteCandidate {
         method,
         path,
         handler,
+        framework: None,
+        source_file: file.rel_path.clone(),
+        source_line,
+    });
+}
+
+fn push_route_candidate_borrowed(
+    file: &mut ExtractedFile,
+    method: &str,
+    path: &str,
+    handler: &RouteHandler,
+    source_line: usize,
+) {
+    let handler_bytes = match handler {
+        RouteHandler::Inline => 0,
+        RouteHandler::Named(name) | RouteHandler::Django(name) => name.len(),
+        RouteHandler::Resolved { name, file, .. } => name.len().saturating_add(file.len()),
+    };
+    let bytes = method
+        .len()
+        .saturating_add(path.len())
+        .saturating_add(file.rel_path.len())
+        .saturating_add(handler_bytes);
+    if crate::repo_scan_policy::charge_generated_work(1, bytes, "polyglot route intermediate").is_err() {
+        return;
+    }
+    file.routes.push(RouteCandidate {
+        method: method.to_string(),
+        path: path.to_string(),
+        handler: handler.clone(),
         framework: None,
         source_file: file.rel_path.clone(),
         source_line,
@@ -4207,7 +4526,7 @@ fn push_framework_route_candidate(
     handler: RouteHandler,
     source_line: usize,
 ) {
-    file.routes.push(RouteCandidate {
+    file.push_route(RouteCandidate {
         method,
         path,
         handler,
@@ -4218,7 +4537,10 @@ fn push_framework_route_candidate(
 }
 
 fn push_local_binding(file: &mut ExtractedFile, name: &str, line: usize) {
-    if name.is_empty() {
+    if name.is_empty() || file.local_bindings.contains_key(name) {
+        return;
+    }
+    if crate::repo_scan_policy::charge_generated_work(1, name.len(), "polyglot local-binding index").is_err() {
         return;
     }
     file.local_bindings
@@ -4405,7 +4727,7 @@ fn literal_text_value(text: &str, allow_backtick: bool) -> Option<String> {
     let body_start = quote_idx + 1;
     let body = &trimmed[body_start..];
     let end_idx = find_closing_quote(body, quote)?;
-    Some(body[..end_idx].to_string())
+    (end_idx <= crate::workspace_scan::SCAN_METADATA_MAX_BYTES).then(|| body[..end_idx].to_string())
 }
 
 fn find_closing_quote(text: &str, quote: u8) -> Option<usize> {
@@ -4453,6 +4775,15 @@ fn vue_script_blocks(src: &str) -> Vec<SourceBlock> {
         };
         let body_end = body_start + end_rel;
         let start_line_offset = src[..body_start].bytes().filter(|b| *b == b'\n').count();
+        if crate::repo_scan_policy::charge_generated_work(
+            1,
+            body_end.saturating_sub(body_start),
+            "Vue script-block intermediate",
+        )
+        .is_err()
+        {
+            break;
+        }
         blocks.push(SourceBlock {
             text: src[body_start..body_end].to_string(),
             start_line_offset,
@@ -4464,6 +4795,22 @@ fn vue_script_blocks(src: &str) -> Vec<SourceBlock> {
 
 fn push_symbol(file: &mut ExtractedFile, kind: &str, name: &str, line: usize, is_pub: bool) {
     if name.is_empty() {
+        return;
+    }
+    let generated_bytes = file
+        .package_name
+        .len()
+        .saturating_add(file.module_path.len())
+        .saturating_add(file.rel_path.len())
+        .saturating_add(kind.len())
+        .saturating_add(name.len());
+    if crate::repo_scan_policy::charge_generated_work(
+        2,
+        generated_bytes.saturating_mul(2),
+        "polyglot symbol and dedup index",
+    )
+    .is_err()
+    {
         return;
     }
     let key = (kind.to_string(), name.to_string());
@@ -4486,13 +4833,19 @@ fn resolve_polyglot_references(
     extracted: &[ExtractedFile],
     file_idx_by_path: &HashMap<String, usize>,
     symbol_by_name: &HashMap<String, Vec<SymbolInfo>>,
-) {
-    for file in extracted {
+) -> Result<(), ScanError> {
+    for (file_index, file) in extracted.iter().enumerate() {
+        if file_index % 256 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
         let Some(from_idx) = file_idx_by_path.get(&file.rel_path).copied() else {
             continue;
         };
         let mut edges: BTreeMap<(String, String, Option<String>), usize> = BTreeMap::new();
-        for call in &file.calls {
+        for (call_index, call) in file.calls.iter().enumerate() {
+            if call_index % 256 == 0 {
+                crate::repo_scan_policy::check_deadline()?;
+            }
             let Some(candidates) = symbol_by_name.get(&call.name) else {
                 continue;
             };
@@ -4500,15 +4853,38 @@ fn resolve_polyglot_references(
                 continue;
             }
             let target = &candidates[0];
-            *edges
-                .entry((
-                    target.file_rel_path.clone(),
-                    target.name.clone(),
-                    call.from_symbol.clone(),
-                ))
-                .or_insert(0) += 1;
+            let key = (
+                target.file_rel_path.clone(),
+                target.name.clone(),
+                call.from_symbol.clone(),
+            );
+            match edges.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let (to_file, to_symbol, from_symbol) = entry.key();
+                    crate::repo_scan_policy::charge_generated_work(
+                        1,
+                        to_file
+                            .len()
+                            .saturating_add(to_symbol.len())
+                            .saturating_add(from_symbol.as_deref().map_or(0, str::len)),
+                        "polyglot reference-edge index",
+                    )?;
+                    entry.insert(1);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    *entry.get_mut() += 1;
+                }
+            }
         }
         for ((to_file, to_symbol, from_symbol), call_count) in edges {
+            crate::repo_scan_policy::charge_generated_work(
+                1,
+                to_file
+                    .len()
+                    .saturating_add(to_symbol.len())
+                    .saturating_add(from_symbol.as_deref().map_or(0, str::len)),
+                "polyglot reference output",
+            )?;
             scan.files[from_idx].references.push(FileReference {
                 same_file: to_file == file.rel_path,
                 to_file,
@@ -4518,24 +4894,58 @@ fn resolve_polyglot_references(
             });
         }
     }
+    Ok(())
 }
 
 fn resolve_polyglot_routes(
     scan: &mut WorkspaceScan,
     extracted: &[ExtractedFile],
     symbol_by_name: &HashMap<String, Vec<SymbolInfo>>,
-) {
-    for file in extracted {
-        scan.diagnostics
-            .unresolved_routes
-            .extend(file.unresolved_routes.iter().cloned());
+) -> Result<(), ScanError> {
+    for (file_index, file) in extracted.iter().enumerate() {
+        if file_index % 256 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
+        for route in &file.unresolved_routes {
+            crate::repo_scan_policy::charge_generated_work(
+                1,
+                route
+                    .method
+                    .len()
+                    .saturating_add(route.path.len())
+                    .saturating_add(route.handler_fn.len())
+                    .saturating_add(route.source_file.len())
+                    .saturating_add(route.reason.len()),
+                "unresolved route output",
+            )?;
+            scan.diagnostics.unresolved_routes.push(route.clone());
+        }
     }
-    resolve_django_routes(scan, extracted, symbol_by_name);
-    for file in extracted {
-        for route in &file.routes {
+    resolve_django_routes(scan, extracted, symbol_by_name)?;
+    for (file_index, file) in extracted.iter().enumerate() {
+        if file_index % 256 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
+        for (route_index, route) in file.routes.iter().enumerate() {
+            if route_index % 256 == 0 {
+                crate::repo_scan_policy::check_deadline()?;
+            }
             if route.framework.as_deref() == Some("django") {
                 continue;
             }
+            crate::repo_scan_policy::charge_generated_work(
+                1,
+                route
+                    .path
+                    .len()
+                    .saturating_add(route.source_file.len())
+                    .saturating_add(match &route.handler {
+                        RouteHandler::Inline => 8,
+                        RouteHandler::Named(name) | RouteHandler::Django(name) => name.len(),
+                        RouteHandler::Resolved { name, file, .. } => name.len().saturating_add(file.len()),
+                    }),
+                "scan output",
+            )?;
             match &route.handler {
                 RouteHandler::Inline => {
                     scan.routes.push(RouteHit {
@@ -4550,8 +4960,19 @@ fn resolve_polyglot_routes(
                     });
                 }
                 RouteHandler::Named(handler_fn) => {
-                    let (handler_file, handler_line, reason) = resolve_route_handler(handler_fn, file, symbol_by_name);
+                    let (handler_file, handler_line, reason) = resolve_route_handler(handler_fn, file, symbol_by_name)?;
                     if let Some(reason) = reason {
+                        crate::repo_scan_policy::charge_generated_work(
+                            1,
+                            route
+                                .method
+                                .len()
+                                .saturating_add(route.path.len())
+                                .saturating_add(handler_fn.len())
+                                .saturating_add(route.source_file.len())
+                                .saturating_add(reason.len()),
+                            "unresolved named-route output",
+                        )?;
                         scan.diagnostics.unresolved_routes.push(UnresolvedRoute {
                             method: route.method.clone(),
                             path: route.path.clone(),
@@ -4588,51 +5009,99 @@ fn resolve_polyglot_routes(
             }
         }
     }
+    Ok(())
 }
 
 fn resolve_django_routes(
     scan: &mut WorkspaceScan,
     extracted: &[ExtractedFile],
     symbol_by_name: &HashMap<String, Vec<SymbolInfo>>,
-) {
-    let django_files: Vec<&ExtractedFile> = extracted
-        .iter()
-        .filter(|file| {
-            file.routes
-                .iter()
-                .any(|route| route.framework.as_deref() == Some("django"))
-                || !file.django_includes.is_empty()
-        })
-        .collect();
-    if django_files.is_empty() {
-        return;
+) -> Result<(), ScanError> {
+    let mut django_files = Vec::new();
+    for file in extracted.iter().filter(|file| {
+        file.routes
+            .iter()
+            .any(|route| route.framework.as_deref() == Some("django"))
+            || !file.django_includes.is_empty()
+    }) {
+        crate::repo_scan_policy::charge_generated_work(1, std::mem::size_of::<&ExtractedFile>(), "Django file index")?;
+        django_files.push(file);
     }
-    let mut claimed_files = HashSet::new();
-    let mut dynamic_include_sources = HashSet::new();
-    for file in &django_files {
-        for include in &file.django_includes {
+    if django_files.is_empty() {
+        return Ok(());
+    }
+    let module_index = django_module_index(&django_files)?;
+    let mut extracted_paths = HashSet::new();
+    for file in extracted {
+        crate::repo_scan_policy::charge_generated_work(1, std::mem::size_of::<&str>(), "Django extracted-path lookup")?;
+        extracted_paths.insert(file.rel_path.as_str());
+    }
+    let mut claimed_files: HashSet<usize> = HashSet::new();
+    let mut dynamic_include_sources: HashSet<usize> = HashSet::new();
+    for (file_index, file) in django_files.iter().enumerate() {
+        if file_index % 256 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
+        for (include_index, include) in file.django_includes.iter().enumerate() {
+            if include_index % 256 == 0 {
+                crate::repo_scan_policy::check_deadline()?;
+            }
             match &include.target {
                 DjangoIncludeTarget::Module(module) => {
-                    let matches = django_module_matches(module, &django_files);
-                    claimed_files.extend(matches.iter().map(|target| target.rel_path.clone()));
+                    let matches = module_index.get(module).map(Vec::as_slice).unwrap_or_default();
+                    for index in matches {
+                        crate::repo_scan_policy::charge_generated_work(
+                            1,
+                            std::mem::size_of::<usize>(),
+                            "Django claimed-file index",
+                        )?;
+                        claimed_files.insert(*index);
+                    }
                     if matches.len() != 1 {
+                        let reason = if matches.is_empty() {
+                            "include_not_found"
+                        } else {
+                            "include_ambiguous"
+                        };
+                        crate::repo_scan_policy::charge_generated_work(
+                            1,
+                            "ANY"
+                                .len()
+                                .saturating_add(include.prefix.len())
+                                .saturating_add("include(\"\")".len())
+                                .saturating_add(module.len())
+                                .saturating_add(include.source_file.len())
+                                .saturating_add(reason.len()),
+                            "Django unresolved-include output",
+                        )?;
                         scan.diagnostics.unresolved_routes.push(UnresolvedRoute {
                             method: "ANY".to_string(),
                             path: include.prefix.clone(),
                             handler_fn: format!("include(\"{module}\")"),
                             source_file: include.source_file.clone(),
                             source_line: include.source_line,
-                            reason: if matches.is_empty() {
-                                "include_not_found"
-                            } else {
-                                "include_ambiguous"
-                            }
-                            .to_string(),
+                            reason: reason.to_string(),
                         });
                     }
                 }
                 DjangoIncludeTarget::Dynamic(expression) => {
-                    dynamic_include_sources.insert(include.source_file.clone());
+                    crate::repo_scan_policy::charge_generated_work(
+                        1,
+                        std::mem::size_of::<usize>(),
+                        "Django dynamic-include source index",
+                    )?;
+                    dynamic_include_sources.insert(file_index);
+                    crate::repo_scan_policy::charge_generated_work(
+                        1,
+                        "ANY"
+                            .len()
+                            .saturating_add(include.prefix.len())
+                            .saturating_add("include()".len())
+                            .saturating_add(expression.len())
+                            .saturating_add(include.source_file.len())
+                            .saturating_add("include_dynamic".len()),
+                        "Django unresolved-include output",
+                    )?;
                     scan.diagnostics.unresolved_routes.push(UnresolvedRoute {
                         method: "ANY".to_string(),
                         path: include.prefix.clone(),
@@ -4645,137 +5114,243 @@ fn resolve_django_routes(
             }
         }
     }
-    let settings_roots: Vec<&ExtractedFile> = django_files
-        .iter()
-        .copied()
-        .filter(|file| has_sibling_settings(file, extracted))
-        .collect();
-    let roots: Vec<&ExtractedFile> = if settings_roots.is_empty() {
-        django_files
-            .iter()
-            .copied()
-            .filter(|file| {
-                !claimed_files.contains(&file.rel_path)
-                    && (dynamic_include_sources.is_empty() || dynamic_include_sources.contains(&file.rel_path))
-            })
-            .collect()
+    let mut settings_roots = Vec::new();
+    for (index, file) in django_files.iter().enumerate() {
+        if has_sibling_settings(file, &extracted_paths) {
+            crate::repo_scan_policy::charge_generated_work(
+                1,
+                std::mem::size_of::<usize>(),
+                "Django settings-root index",
+            )?;
+            settings_roots.push(index);
+        }
+    }
+    let roots: Vec<usize> = if settings_roots.is_empty() {
+        let mut roots = Vec::new();
+        for index in 0..django_files.len() {
+            if !claimed_files.contains(&index)
+                && (dynamic_include_sources.is_empty() || dynamic_include_sources.contains(&index))
+            {
+                crate::repo_scan_policy::charge_generated_work(
+                    1,
+                    std::mem::size_of::<usize>(),
+                    "Django route-root index",
+                )?;
+                roots.push(index);
+            }
+        }
+        roots
     } else {
         settings_roots
     };
-    for root in roots {
-        let mut stack = HashSet::new();
-        expand_django_routes(root, "", &django_files, symbol_by_name, scan, &mut stack);
+    for root_index in roots {
+        crate::repo_scan_policy::check_deadline()?;
+        expand_django_routes_iterative(root_index, &django_files, &module_index, symbol_by_name, scan)?;
     }
+    Ok(())
 }
 
-fn has_sibling_settings(file: &ExtractedFile, extracted: &[ExtractedFile]) -> bool {
+fn has_sibling_settings(file: &ExtractedFile, extracted_paths: &HashSet<&str>) -> bool {
     let settings = Path::new(&file.rel_path)
         .parent()
         .unwrap_or_else(|| Path::new(""))
         .join("settings.py")
         .display()
         .to_string();
-    extracted.iter().any(|candidate| candidate.rel_path == settings)
+    extracted_paths.contains(settings.as_str())
 }
 
-fn expand_django_routes(
-    file: &ExtractedFile,
-    prefix: &str,
+fn django_module_index(files: &[&ExtractedFile]) -> Result<HashMap<String, Vec<usize>>, ScanError> {
+    let mut index: HashMap<String, Vec<usize>> = HashMap::new();
+    for (file_index, file) in files.iter().enumerate() {
+        if file_index % 256 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
+        let Some(without_extension) = file.rel_path.strip_suffix(".py") else {
+            continue;
+        };
+        let component_count = without_extension.split('/').count();
+        crate::repo_scan_policy::charge_generated_work(
+            component_count,
+            component_count.saturating_mul(std::mem::size_of::<&str>()),
+            "Django module path components",
+        )?;
+        let components: Vec<&str> = without_extension.split('/').collect();
+        for start in 0..components.len() {
+            let key_len = components[start..]
+                .iter()
+                .map(|component| component.len())
+                .sum::<usize>()
+                .saturating_add(components.len().saturating_sub(start + 1));
+            crate::repo_scan_policy::charge_generated_work(
+                1,
+                key_len.saturating_add(std::mem::size_of::<usize>()),
+                "Django module suffix index",
+            )?;
+            index.entry(components[start..].join(".")).or_default().push(file_index);
+        }
+    }
+    Ok(index)
+}
+
+enum DjangoExpansionWork {
+    Enter {
+        file_index: usize,
+        prefix: String,
+        depth: usize,
+    },
+    Exit {
+        file_index: usize,
+    },
+}
+
+fn expand_django_routes_iterative(
+    root_index: usize,
     django_files: &[&ExtractedFile],
+    module_index: &HashMap<String, Vec<usize>>,
     symbol_by_name: &HashMap<String, Vec<SymbolInfo>>,
     scan: &mut WorkspaceScan,
-    stack: &mut HashSet<String>,
-) {
-    if !stack.insert(file.rel_path.clone()) {
-        return;
-    }
-    for route in file
-        .routes
-        .iter()
-        .filter(|route| route.framework.as_deref() == Some("django"))
-    {
-        let RouteHandler::Django(handler) = &route.handler else {
-            continue;
-        };
-        let (handler_file, handler_line, reason) = resolve_django_handler(handler, file, symbol_by_name);
-        let path = join_django_paths(prefix, &route.path);
-        if let Some(reason) = reason {
-            scan.diagnostics.unresolved_routes.push(UnresolvedRoute {
-                method: route.method.clone(),
-                path: path.clone(),
-                handler_fn: handler.clone(),
-                source_file: route.source_file.clone(),
-                source_line: route.source_line,
-                reason: reason.to_string(),
-            });
+) -> Result<(), ScanError> {
+    crate::repo_scan_policy::charge_generated_work(1, 0, "Django route expansion")?;
+    let mut work = vec![DjangoExpansionWork::Enter {
+        file_index: root_index,
+        prefix: String::new(),
+        depth: 0,
+    }];
+    let mut active = HashSet::new();
+    let mut expansion_states = 0_usize;
+
+    while let Some(next) = work.pop() {
+        crate::repo_scan_policy::check_deadline()?;
+        match next {
+            DjangoExpansionWork::Exit { file_index } => {
+                active.remove(&file_index);
+            }
+            DjangoExpansionWork::Enter {
+                file_index,
+                prefix,
+                depth,
+            } => {
+                expansion_states = expansion_states.saturating_add(1);
+                if expansion_states > MAX_DJANGO_EXPANSION_STATES {
+                    return Err(ScanError::Policy(format!(
+                        "Django route expansion exceeded {MAX_DJANGO_EXPANSION_STATES} states"
+                    )));
+                }
+                crate::repo_scan_policy::check_depth(depth)?;
+                if !active.insert(file_index) {
+                    continue;
+                }
+                let file = django_files[file_index];
+                work.push(DjangoExpansionWork::Exit { file_index });
+
+                for (route_index, route) in file
+                    .routes
+                    .iter()
+                    .filter(|route| route.framework.as_deref() == Some("django"))
+                    .enumerate()
+                {
+                    if route_index % 256 == 0 {
+                        crate::repo_scan_policy::check_deadline()?;
+                    }
+                    let RouteHandler::Django(handler) = &route.handler else {
+                        continue;
+                    };
+                    crate::repo_scan_policy::charge_generated_work(
+                        1,
+                        prefix
+                            .len()
+                            .saturating_add(route.path.len())
+                            .saturating_add(handler.len())
+                            .saturating_add(route.source_file.len()),
+                        "Django route expansion",
+                    )?;
+                    let (handler_file, handler_line, reason) = resolve_django_handler(handler, file, symbol_by_name)?;
+                    let path = join_django_paths(&prefix, &route.path);
+                    if let Some(reason) = reason {
+                        crate::repo_scan_policy::charge_generated_work(
+                            1,
+                            route
+                                .method
+                                .len()
+                                .saturating_add(path.len())
+                                .saturating_add(handler.len())
+                                .saturating_add(route.source_file.len())
+                                .saturating_add(reason.len()),
+                            "unresolved Django-route output",
+                        )?;
+                        scan.diagnostics.unresolved_routes.push(UnresolvedRoute {
+                            method: route.method.clone(),
+                            path: path.clone(),
+                            handler_fn: handler.clone(),
+                            source_file: route.source_file.clone(),
+                            source_line: route.source_line,
+                            reason: reason.to_string(),
+                        });
+                    }
+                    scan.routes.push(RouteHit {
+                        method: route.method.clone(),
+                        path,
+                        handler_fn: handler.clone(),
+                        framework: Some("django".to_string()),
+                        handler_file,
+                        handler_line,
+                        source_file: route.source_file.clone(),
+                        source_line: route.source_line,
+                    });
+                }
+
+                for include in file.django_includes.iter().rev() {
+                    crate::repo_scan_policy::check_deadline()?;
+                    let DjangoIncludeTarget::Module(module) = &include.target else {
+                        continue;
+                    };
+                    let matches = module_index.get(module).map(Vec::as_slice).unwrap_or_default();
+                    if matches.len() != 1 {
+                        continue;
+                    }
+                    let estimated_bytes = prefix
+                        .len()
+                        .saturating_add(include.prefix.len())
+                        .saturating_add(module.len());
+                    crate::repo_scan_policy::charge_generated_work(1, estimated_bytes, "Django route expansion")?;
+                    work.push(DjangoExpansionWork::Enter {
+                        file_index: matches[0],
+                        prefix: join_django_paths(&prefix, &include.prefix),
+                        depth: depth.saturating_add(1),
+                    });
+                }
+            }
         }
-        scan.routes.push(RouteHit {
-            method: route.method.clone(),
-            path,
-            handler_fn: handler.clone(),
-            framework: Some("django".to_string()),
-            handler_file,
-            handler_line,
-            source_file: route.source_file.clone(),
-            source_line: route.source_line,
-        });
     }
-    for include in &file.django_includes {
-        let DjangoIncludeTarget::Module(module) = &include.target else {
-            continue;
-        };
-        let matches = django_module_matches(module, django_files);
-        if matches.len() == 1 {
-            let target = matches[0];
-            expand_django_routes(
-                target,
-                &join_django_paths(prefix, &include.prefix),
-                django_files,
-                symbol_by_name,
-                scan,
-                stack,
-            );
-        }
-    }
-    stack.remove(&file.rel_path);
+    Ok(())
 }
 
-fn django_module_matches<'a>(module: &str, files: &'a [&ExtractedFile]) -> Vec<&'a ExtractedFile> {
-    let expected = format!("{}.py", module.replace('.', "/"));
-    files
-        .iter()
-        .copied()
-        .filter(|file| file.rel_path == expected || file.rel_path.ends_with(&format!("/{expected}")))
-        .collect()
-}
+type HandlerResolution = (Option<String>, Option<usize>, Option<&'static str>);
 
 fn resolve_django_handler(
     handler: &str,
     source_file: &ExtractedFile,
     symbol_by_name: &HashMap<String, Vec<SymbolInfo>>,
-) -> (Option<String>, Option<usize>, Option<&'static str>) {
+) -> Result<HandlerResolution, ScanError> {
     let trimmed = handler.trim();
     let expression = trimmed
         .find(".as_view(")
         .map_or(trimmed, |as_view_index| &trimmed[..as_view_index]);
     let lookup = expression.rsplit('.').next().unwrap_or(expression);
     let Some(candidates) = symbol_by_name.get(lookup) else {
-        return (None, None, Some("not_found"));
+        return Ok((None, None, Some("not_found")));
     };
     if let Some(module_hint) = expression
         .rsplit_once('.')
         .map(|(module, _)| module.rsplit('.').next().unwrap_or(module))
     {
         let expected = format!("/{module_hint}.py");
-        let hinted: Vec<&SymbolInfo> = candidates
-            .iter()
-            .filter(|symbol| {
-                (symbol.file_rel_path.ends_with(&expected) || symbol.file_rel_path == format!("{module_hint}.py"))
-                    && symbol.crate_name == source_file.package_name
-            })
-            .collect();
-        if hinted.len() == 1 {
-            return (Some(hinted[0].file_rel_path.clone()), Some(hinted[0].line), None);
+        if let Some(hinted) = unique_symbol_candidate(candidates, |symbol| {
+            (symbol.file_rel_path.ends_with(&expected) || symbol.file_rel_path == format!("{module_hint}.py"))
+                && symbol.crate_name == source_file.package_name
+        })? {
+            return Ok((Some(hinted.file_rel_path.clone()), Some(hinted.line), None));
         }
     }
     resolve_route_handler(lookup, source_file, symbol_by_name)
@@ -4799,39 +5374,52 @@ fn resolve_route_handler(
     handler_fn: &str,
     source_file: &ExtractedFile,
     symbol_by_name: &HashMap<String, Vec<SymbolInfo>>,
-) -> (Option<String>, Option<usize>, Option<&'static str>) {
+) -> Result<HandlerResolution, ScanError> {
     if let Some(binding) = source_file.local_bindings.get(handler_fn) {
-        return (Some(source_file.rel_path.clone()), Some(binding.line), None);
+        return Ok((Some(source_file.rel_path.clone()), Some(binding.line), None));
     }
     let Some(candidates) = symbol_by_name.get(handler_fn) else {
-        return (None, None, Some("not_found"));
+        return Ok((None, None, Some("not_found")));
     };
-    let same_file: Vec<&SymbolInfo> = candidates
-        .iter()
-        .filter(|symbol| symbol.file_rel_path == source_file.rel_path)
-        .collect();
-    let pick = match same_file.len().cmp(&1) {
-        std::cmp::Ordering::Equal => Some(same_file[0]),
-        std::cmp::Ordering::Greater => None,
-        std::cmp::Ordering::Less => {
-            let same_package: Vec<&SymbolInfo> = candidates
-                .iter()
-                .filter(|symbol| same_route_resolution_package(source_file, symbol))
-                .collect();
-            if same_package.len() == 1 {
-                Some(same_package[0])
-            } else if !is_go_path(&source_file.rel_path) && candidates.len() == 1 {
-                Some(&candidates[0])
-            } else {
-                None
-            }
+    let same_file = unique_symbol_candidate(candidates, |symbol| symbol.file_rel_path == source_file.rel_path)?;
+    let pick = if same_file.is_some() {
+        same_file
+    } else {
+        let same_package =
+            unique_symbol_candidate(candidates, |symbol| same_route_resolution_package(source_file, symbol))?;
+        if same_package.is_some() {
+            same_package
+        } else if !is_go_path(&source_file.rel_path) && candidates.len() == 1 {
+            candidates.first()
+        } else {
+            None
         }
     };
     if let Some(symbol) = pick {
-        (Some(symbol.file_rel_path.clone()), Some(symbol.line), None)
+        Ok((Some(symbol.file_rel_path.clone()), Some(symbol.line), None))
     } else {
-        (None, None, Some("ambiguous"))
+        Ok((None, None, Some("ambiguous")))
     }
+}
+
+fn unique_symbol_candidate(
+    candidates: &[SymbolInfo],
+    predicate: impl Fn(&SymbolInfo) -> bool,
+) -> Result<Option<&SymbolInfo>, ScanError> {
+    let mut found = None;
+    for (candidate_index, candidate) in candidates.iter().enumerate() {
+        if candidate_index % 256 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
+        if !predicate(candidate) {
+            continue;
+        }
+        if found.is_some() {
+            return Ok(None);
+        }
+        found = Some(candidate);
+    }
+    Ok(found)
 }
 
 fn same_route_resolution_package(source_file: &ExtractedFile, symbol: &SymbolInfo) -> bool {
@@ -4852,25 +5440,45 @@ fn path_dir(path: &str) -> &str {
     path.rsplit_once(['/', '\\']).map_or("", |(dir, _)| dir)
 }
 
-fn build_referenced_by(scan: &mut WorkspaceScan) {
-    let mut inverse: HashMap<String, Vec<String>> = HashMap::new();
-    for file in &scan.files {
-        for reference in &file.references {
+fn build_referenced_by(scan: &mut WorkspaceScan) -> Result<(), ScanError> {
+    let mut inverse: HashMap<String, HashSet<String>> = HashMap::new();
+    for (file_index, file) in scan.files.iter().enumerate() {
+        if file_index % 256 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
+        for (reference_index, reference) in file.references.iter().enumerate() {
+            if reference_index % 256 == 0 {
+                crate::repo_scan_policy::check_deadline()?;
+            }
             if !reference.same_file {
+                crate::repo_scan_policy::charge_generated_work(
+                    1,
+                    reference.to_file.len().saturating_add(file.rel_path.len()),
+                    "polyglot inverse-reference index",
+                )?;
                 inverse
                     .entry(reference.to_file.clone())
                     .or_default()
-                    .push(file.rel_path.clone());
+                    .insert(file.rel_path.clone());
             }
         }
     }
-    for file in &mut scan.files {
-        if let Some(mut refs) = inverse.remove(&file.rel_path) {
+    for (file_index, file) in scan.files.iter_mut().enumerate() {
+        if file_index % 256 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
+        if let Some(refs) = inverse.remove(&file.rel_path) {
+            crate::repo_scan_policy::charge_generated_work(
+                refs.len(),
+                refs.len().saturating_mul(std::mem::size_of::<String>()),
+                "polyglot inverse-reference output index",
+            )?;
+            let mut refs: Vec<String> = refs.into_iter().collect();
             refs.sort();
-            refs.dedup();
             file.referenced_by = refs;
         }
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -4880,75 +5488,96 @@ struct FileRouteFrameworks {
     sveltekit: bool,
 }
 
-#[derive(Debug, Clone)]
-struct FileRouteScope {
-    directory: PathBuf,
-    frameworks: FileRouteFrameworks,
-}
-
 /// File-route precision bar: path conventions activate only below a package
 /// scope whose dependency maps name the corresponding framework. Dynamic
 /// `[param]` segments stay verbatim; route/server methods narrow only when an
 /// exported HTTP-verb symbol was already extracted from that same file.
-fn collect_file_based_routes(root: &Path, extracted: &[ExtractedFile], scan: &mut WorkspaceScan) {
-    let package_scopes = package_framework_scopes(root);
-    for file in extracted {
-        let Some(scope) = framework_scope_for_file(&file.rel_path, &package_scopes) else {
+fn collect_file_based_routes(
+    root: &Path,
+    extracted: &[ExtractedFile],
+    scan: &mut WorkspaceScan,
+) -> Result<(), ScanError> {
+    let package_scopes = package_framework_scopes(root)?;
+    for (file_index, file) in extracted.iter().enumerate() {
+        if file_index % 256 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
+        let Some((scope_directory, frameworks)) = framework_scope_for_file(&file.rel_path, &package_scopes)? else {
             continue;
         };
         let scope_relative = Path::new(&file.rel_path)
-            .strip_prefix(&scope.directory)
+            .strip_prefix(scope_directory)
             .unwrap_or_else(|_| Path::new(&file.rel_path))
             .display()
             .to_string();
-        if scope.frameworks.nextjs {
+        if frameworks.nextjs {
             if let Some((path, narrow_methods)) = nextjs_file_route(&scope_relative) {
-                push_file_route_hits(scan, file, "nextjs", path, narrow_methods);
+                push_file_route_hits(scan, file, "nextjs", path, narrow_methods)?;
             }
         }
-        if scope.frameworks.nuxt {
+        if frameworks.nuxt {
             if let Some(path) = nuxt_file_route(&scope_relative) {
-                push_file_route_hits(scan, file, "nuxt", path, false);
+                push_file_route_hits(scan, file, "nuxt", path, false)?;
             }
         }
-        if scope.frameworks.sveltekit {
+        if frameworks.sveltekit {
             if let Some((path, narrow_methods)) = sveltekit_file_route(&scope_relative) {
-                push_file_route_hits(scan, file, "sveltekit", path, narrow_methods);
+                push_file_route_hits(scan, file, "sveltekit", path, narrow_methods)?;
             }
         }
     }
+    Ok(())
 }
 
-fn package_framework_scopes(root: &Path) -> Vec<FileRouteScope> {
-    let mut scopes = Vec::new();
-    let _ = walk_dir(root, root, &mut |rel, abs| {
+fn package_framework_scopes(root: &Path) -> Result<HashMap<PathBuf, FileRouteFrameworks>, ScanError> {
+    let mut manifests = Vec::new();
+    let mut discovery_error = None;
+    walk_dir(root, root, &mut |rel, abs| {
+        if discovery_error.is_some() {
+            return;
+        }
         if rel.file_name().and_then(|name| name.to_str()) != Some("package.json") {
             return;
         }
-        let directory = rel.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
-        scopes.push(FileRouteScope {
-            directory,
-            frameworks: package_json_frameworks(abs),
-        });
-    });
-    scopes.sort_by(|left, right| {
-        right
-            .directory
-            .components()
-            .count()
-            .cmp(&left.directory.components().count())
-    });
-    scopes
+        let bytes = rel
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .as_os_str()
+            .as_encoded_bytes()
+            .len()
+            .saturating_add(abs.as_os_str().as_encoded_bytes().len());
+        if let Err(error) = crate::repo_scan_policy::charge_generated_work(1, bytes, "package manifest discovery index")
+        {
+            discovery_error = Some(error);
+            return;
+        }
+        manifests.push((
+            rel.parent().unwrap_or_else(|| Path::new("")).to_path_buf(),
+            abs.to_path_buf(),
+        ));
+    })?;
+    if let Some(error) = discovery_error {
+        return Err(error);
+    }
+    let mut scopes = HashMap::with_capacity(manifests.len());
+    for (directory, manifest) in manifests {
+        crate::repo_scan_policy::charge_generated_work(
+            1,
+            directory.as_os_str().as_encoded_bytes().len(),
+            "file-route package scope",
+        )?;
+        scopes.insert(directory, package_json_frameworks(&manifest)?);
+    }
+    Ok(scopes)
 }
 
-fn package_json_frameworks(path: &Path) -> FileRouteFrameworks {
-    let Some(json) = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-    else {
-        return FileRouteFrameworks::default();
+fn package_json_frameworks(path: &Path) -> Result<FileRouteFrameworks, ScanError> {
+    let text = crate::workspace_scan::read_scan_to_string(path)?;
+    crate::repo_scan_policy::charge_source_parse_work(&text, "package.json parser document")?;
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(FileRouteFrameworks::default());
     };
-    let mut names = HashSet::new();
+    let mut frameworks = FileRouteFrameworks::default();
     for section in [
         "dependencies",
         "devDependencies",
@@ -4956,21 +5585,27 @@ fn package_json_frameworks(path: &Path) -> FileRouteFrameworks {
         "optionalDependencies",
     ] {
         if let Some(dependencies) = json.get(section).and_then(serde_json::Value::as_object) {
-            names.extend(dependencies.keys().cloned());
+            frameworks.nextjs |= dependencies.contains_key("next");
+            frameworks.nuxt |= dependencies.contains_key("nuxt");
+            frameworks.sveltekit |= dependencies.contains_key("@sveltejs/kit");
         }
     }
-    FileRouteFrameworks {
-        nextjs: names.contains("next"),
-        nuxt: names.contains("nuxt"),
-        sveltekit: names.contains("@sveltejs/kit"),
-    }
+    Ok(frameworks)
 }
 
-fn framework_scope_for_file<'a>(rel_path: &str, scopes: &'a [FileRouteScope]) -> Option<&'a FileRouteScope> {
-    let path = Path::new(rel_path);
-    scopes
-        .iter()
-        .find(|scope| scope.directory.as_os_str().is_empty() || path.starts_with(&scope.directory))
+fn framework_scope_for_file<'path, 'scope>(
+    rel_path: &'path str,
+    scopes: &'scope HashMap<PathBuf, FileRouteFrameworks>,
+) -> Result<Option<(&'path Path, &'scope FileRouteFrameworks)>, ScanError> {
+    let mut directory = Path::new(rel_path).parent();
+    while let Some(candidate) = directory {
+        crate::repo_scan_policy::check_deadline()?;
+        if let Some(frameworks) = scopes.get(candidate) {
+            return Ok(Some((candidate, frameworks)));
+        }
+        directory = candidate.parent();
+    }
+    Ok(None)
 }
 
 fn nextjs_file_route(rel_path: &str) -> Option<(String, bool)> {
@@ -5103,53 +5738,74 @@ fn push_file_route_hits(
     framework: &str,
     path: String,
     narrow_methods: bool,
-) {
-    let methods = if narrow_methods {
-        exported_http_methods(file)
-    } else {
-        Vec::new()
-    };
-    let methods = if methods.is_empty() {
-        vec![("ANY".to_string(), 1)]
-    } else {
-        methods
-    };
-    for (method, line) in methods {
-        scan.routes.push(RouteHit {
-            method,
-            path: path.clone(),
-            handler_fn: file.rel_path.clone(),
-            framework: Some(framework.to_string()),
-            handler_file: Some(file.rel_path.clone()),
-            handler_line: Some(line),
-            source_file: file.rel_path.clone(),
-            source_line: line,
-        });
-    }
-}
-
-fn exported_http_methods(file: &ExtractedFile) -> Vec<(String, usize)> {
-    // Re-export-only handlers (`export { GET } from "./shared"`) do not create
-    // a definition symbol in this file, so the deliberate fallback is ANY.
+) -> Result<(), ScanError> {
     const METHODS: [&str; 7] = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
-    METHODS
-        .iter()
-        .filter_map(|method| {
-            file.symbols
+    let mut emitted = false;
+    if narrow_methods {
+        for method in METHODS {
+            if let Some(symbol) = file
+                .symbols
                 .iter()
-                .find(|symbol| symbol.is_pub && symbol.name == *method)
-                .map(|symbol| ((*method).to_string(), symbol.line))
-        })
-        .collect()
+                .find(|symbol| symbol.is_pub && symbol.name == method)
+            {
+                push_one_file_route(scan, file, framework, &path, method, symbol.line)?;
+                emitted = true;
+            }
+        }
+    }
+    if !emitted {
+        push_one_file_route(scan, file, framework, &path, "ANY", 1)?;
+    }
+    Ok(())
 }
 
-fn roll_up_stats(scan: &mut WorkspaceScan) {
+fn push_one_file_route(
+    scan: &mut WorkspaceScan,
+    file: &ExtractedFile,
+    framework: &str,
+    path: &str,
+    method: &str,
+    line: usize,
+) -> Result<(), ScanError> {
+    crate::repo_scan_policy::charge_generated_work(
+        1,
+        method
+            .len()
+            .saturating_add(path.len())
+            .saturating_add(framework.len())
+            .saturating_add(file.rel_path.len().saturating_mul(3)),
+        "file-route output",
+    )?;
+    scan.routes.push(RouteHit {
+        method: method.to_string(),
+        path: path.to_string(),
+        handler_fn: file.rel_path.clone(),
+        framework: Some(framework.to_string()),
+        handler_file: Some(file.rel_path.clone()),
+        handler_line: Some(line),
+        source_file: file.rel_path.clone(),
+        source_line: line,
+    });
+    Ok(())
+}
+
+fn roll_up_stats(scan: &mut WorkspaceScan) -> Result<(), ScanError> {
     let mut routes_by_crate = BTreeMap::new();
-    for route in &scan.routes {
-        if let Some(file) = route.handler_file.as_deref() {
-            if let Some(info) = scan.files.iter().find(|f| f.rel_path == file) {
-                *routes_by_crate.entry(info.crate_name.clone()).or_insert(0) += 1;
-            }
+    let crate_by_file: HashMap<&str, &str> = scan
+        .files
+        .iter()
+        .map(|file| (file.rel_path.as_str(), file.crate_name.as_str()))
+        .collect();
+    for (route_index, route) in scan.routes.iter().enumerate() {
+        if route_index % 256 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
+        if let Some(crate_name) = route
+            .handler_file
+            .as_deref()
+            .and_then(|handler_file| crate_by_file.get(handler_file))
+        {
+            *routes_by_crate.entry((*crate_name).to_string()).or_insert(0) += 1;
         }
     }
     scan.stats = ScanStats {
@@ -5166,26 +5822,46 @@ fn roll_up_stats(scan: &mut WorkspaceScan) {
         doc_coverage_files: scan.files.iter().filter(|f| f.doc_summary.is_some()).count(),
         routes_by_crate,
     };
+    Ok(())
 }
 
-fn package_infos(root: &Path, scan: &WorkspaceScan, default_name: &str) -> Vec<CrateInfo> {
+fn package_infos(root: &Path, scan: &WorkspaceScan, default_name: &str) -> Result<Vec<CrateInfo>, ScanError> {
     let mut packages: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-    for file in &scan.files {
+    for (file_index, file) in scan.files.iter().enumerate() {
+        if file_index % 256 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
+        crate::repo_scan_policy::charge_generated_work(1, file.crate_name.len(), "polyglot package aggregation index")?;
         let entry = packages.entry(file.crate_name.clone()).or_insert((0, 0));
         entry.0 += 1;
         entry.1 += file.loc;
     }
     if packages.is_empty() {
+        crate::repo_scan_policy::charge_generated_work(1, default_name.len(), "polyglot package aggregation index")?;
         packages.insert(default_name.to_string(), (0, 0));
     }
+    crate::repo_scan_policy::charge_generated_work(
+        1,
+        root.as_os_str().as_encoded_bytes().len(),
+        "polyglot package root path",
+    )?;
+    let root_path = root.display().to_string();
     packages
         .into_iter()
-        .map(|(name, (file_count, total_loc))| CrateInfo {
-            rel_path: root.display().to_string(),
-            internal_deps: parse_internal_path_deps(""),
-            name,
-            file_count,
-            total_loc,
+        .map(|(name, (file_count, total_loc))| {
+            crate::repo_scan_policy::check_deadline()?;
+            crate::repo_scan_policy::charge_generated_work(
+                1,
+                name.len().saturating_add(root_path.len()),
+                "polyglot package output",
+            )?;
+            Ok(CrateInfo {
+                rel_path: root_path.clone(),
+                internal_deps: Vec::new(),
+                name,
+                file_count,
+                total_loc,
+            })
         })
         .collect()
 }
@@ -5202,40 +5878,57 @@ fn discover_package_name(root: &Path) -> String {
     }
     root.file_name()
         .and_then(|n| n.to_str())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && s.len() <= crate::workspace_scan::SCAN_METADATA_MAX_BYTES)
         .unwrap_or("repo")
         .to_string()
 }
 
+fn bounded_package_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && value.len() <= crate::workspace_scan::SCAN_METADATA_MAX_BYTES).then(|| value.to_string())
+}
+
 fn package_json_name(path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
-    json.get("name").and_then(|v| v.as_str()).map(ToString::to_string)
+    let text = crate::workspace_scan::read_optional_scan_to_string(path).ok()??;
+    crate::repo_scan_policy::charge_source_parse_work(&text, "package.json metadata parser").ok()?;
+    #[derive(serde::Deserialize)]
+    struct PackageName {
+        name: Option<String>,
+    }
+    serde_json::from_str::<PackageName>(&text)
+        .ok()?
+        .name
+        .as_deref()
+        .and_then(bounded_package_name)
 }
 
 fn pyproject_name(path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = crate::workspace_scan::read_optional_scan_to_string(path).ok()??;
+    crate::repo_scan_policy::charge_source_parse_work(&text, "pyproject.toml metadata parser").ok()?;
     let mut in_project = false;
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
             in_project = trimmed == "[project]";
         } else if in_project && trimmed.starts_with("name") {
-            return quoted_value(trimmed);
+            return quoted_value(trimmed).and_then(|value| bounded_package_name(&value));
         }
     }
     None
 }
 
 fn setup_cfg_name(path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = crate::workspace_scan::read_optional_scan_to_string(path).ok()??;
+    crate::repo_scan_policy::charge_source_parse_work(&text, "setup.cfg metadata parser").ok()?;
     let mut in_metadata = false;
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
             in_metadata = trimmed == "[metadata]";
         } else if in_metadata && trimmed.starts_with("name") {
-            return trimmed.split_once('=').map(|(_, v)| v.trim().to_string());
+            return trimmed
+                .split_once('=')
+                .and_then(|(_, value)| bounded_package_name(value));
         }
     }
     None
@@ -5246,19 +5939,19 @@ fn quoted_value(line: &str) -> Option<String> {
     Some(value.trim().trim_matches('"').trim_matches('\'').to_string())
 }
 
-fn has_supported_file(root: &Path, exts: &[Option<&str>]) -> bool {
+fn has_supported_file(root: &Path, exts: &[Option<&str>]) -> Result<bool, ScanError> {
     let mut found = false;
-    let _ = walk_dir(root, root, &mut |_rel, abs| {
+    walk_dir(root, root, &mut |_rel, abs| {
         if found {
             return;
         }
         let ext = abs.extension().and_then(|e| e.to_str());
         found = exts.contains(&ext);
-    });
-    found
+    })?;
+    Ok(found)
 }
 
-fn has_polyglot_non_rust_files(root: &Path, options: PolyglotScanOptions) -> bool {
+fn has_polyglot_non_rust_files(root: &Path, options: PolyglotScanOptions) -> Result<bool, ScanError> {
     let mut extensions = vec![Some("ts"), Some("tsx"), Some("py"), Some("vue")];
     if options.v2_enabled {
         extensions.extend([Some("js"), Some("jsx"), Some("mjs"), Some("cjs"), Some("go")]);
@@ -5325,7 +6018,8 @@ fn node_text(node: Node<'_>, src: &[u8]) -> String {
 }
 
 fn field_ident(node: Node<'_>, src: &[u8], field: &str) -> Option<String> {
-    node.child_by_field_name(field).map(|n| node_text(n, src))
+    let text = node.child_by_field_name(field)?.utf8_text(src).ok()?.trim();
+    (!text.is_empty() && text.len() <= crate::workspace_scan::SCAN_METADATA_MAX_BYTES).then(|| text.to_string())
 }
 
 fn quoted_child_text(node: Node<'_>, src: &[u8], guard: &mut AstWalkGuard, depth: usize) -> Option<String> {
@@ -5334,7 +6028,12 @@ fn quoted_child_text(node: Node<'_>, src: &[u8], guard: &mut AstWalkGuard, depth
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        let text = node_text(child, src);
+        let Ok(text) = child.utf8_text(src) else {
+            continue;
+        };
+        if text.len() > crate::workspace_scan::SCAN_METADATA_MAX_BYTES {
+            continue;
+        }
         if (text.starts_with('"') && text.ends_with('"')) || (text.starts_with('\'') && text.ends_with('\'')) {
             return Some(text.trim_matches('"').trim_matches('\'').to_string());
         }
@@ -5351,7 +6050,11 @@ fn identifiers_under(node: Node<'_>, src: &[u8], guard: &mut AstWalkGuard, depth
     }
     let mut out = Vec::new();
     if node.kind() == "identifier" {
-        out.push(node_text(node, src));
+        if let Ok(text) = node.utf8_text(src) {
+            if !text.is_empty() && text.len() <= crate::workspace_scan::SCAN_METADATA_MAX_BYTES {
+                out.push(text.to_string());
+            }
+        }
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -5389,8 +6092,15 @@ fn single_identifier_under(node: Node<'_>, src: &[u8], guard: &mut AstWalkGuard,
 }
 
 fn last_ident_text(node: Node<'_>, src: &[u8]) -> String {
-    let text = node_text(node, src);
-    text.rsplit(['.', ':']).next().unwrap_or(&text).trim().to_string()
+    let Ok(text) = node.utf8_text(src) else {
+        return String::new();
+    };
+    let ident = text.rsplit(['.', ':']).next().unwrap_or(text).trim();
+    if ident.is_empty() || ident.len() > crate::workspace_scan::SCAN_METADATA_MAX_BYTES {
+        String::new()
+    } else {
+        ident.to_string()
+    }
 }
 
 fn python_import_module(raw: &str) -> Option<String> {
@@ -5405,48 +6115,58 @@ fn python_import_module(raw: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn rust_use_paths(tree: &syn::UseTree, guard: &mut AstWalkGuard) -> Vec<String> {
+fn visit_rust_use_paths(
+    tree: &syn::UseTree,
+    guard: &mut AstWalkGuard,
+    visitor: &mut impl FnMut(&[String]) -> Result<(), ScanError>,
+) -> Result<(), ScanError> {
     fn walk(
         prefix: &mut Vec<String>,
         tree: &syn::UseTree,
-        out: &mut Vec<String>,
         guard: &mut AstWalkGuard,
+        visitor: &mut impl FnMut(&[String]) -> Result<(), ScanError>,
         depth: usize,
-    ) {
+    ) -> Result<(), ScanError> {
         if !guard.allow_depth(depth) {
-            return;
+            return Ok(());
         }
         match tree {
             syn::UseTree::Path(p) => {
-                prefix.push(p.ident.to_string());
-                walk(prefix, &p.tree, out, guard, depth + 1);
+                let ident = p.ident.to_string();
+                crate::repo_scan_policy::charge_generated_work(1, ident.len(), "Rust use prefix stack")?;
+                prefix.push(ident);
+                walk(prefix, &p.tree, guard, visitor, depth + 1)?;
                 prefix.pop();
             }
             syn::UseTree::Name(n) => {
-                let mut parts = prefix.clone();
-                parts.push(n.ident.to_string());
-                out.push(parts.join("::"));
+                let ident = n.ident.to_string();
+                crate::repo_scan_policy::charge_generated_work(1, ident.len(), "Rust use leaf")?;
+                prefix.push(ident);
+                visitor(prefix)?;
+                prefix.pop();
             }
             syn::UseTree::Rename(r) => {
-                let mut parts = prefix.clone();
-                parts.push(r.ident.to_string());
-                out.push(parts.join("::"));
+                let ident = r.ident.to_string();
+                crate::repo_scan_policy::charge_generated_work(1, ident.len(), "Rust use leaf")?;
+                prefix.push(ident);
+                visitor(prefix)?;
+                prefix.pop();
             }
             syn::UseTree::Glob(_) => {
-                let mut parts = prefix.clone();
-                parts.push("*".to_string());
-                out.push(parts.join("::"));
+                crate::repo_scan_policy::charge_generated_work(1, 1, "Rust use leaf")?;
+                prefix.push("*".to_string());
+                visitor(prefix)?;
+                prefix.pop();
             }
             syn::UseTree::Group(g) => {
                 for item in &g.items {
-                    walk(prefix, item, out, guard, depth + 1);
+                    walk(prefix, item, guard, visitor, depth + 1)?;
                 }
             }
         }
+        Ok(())
     }
-    let mut out = Vec::new();
-    walk(&mut Vec::new(), tree, &mut out, guard, 0);
-    out
+    walk(&mut Vec::new(), tree, guard, visitor, 0)
 }
 
 fn is_pub(vis: &syn::Visibility) -> bool {
@@ -5464,6 +6184,53 @@ mod tests {
     use super::*;
     use crate::test_support::EnvVarGuard;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn configured_scan_budget_allows_bounded_repo_and_rejects_entry_overflow() {
+        let root = tempfile::tempdir().expect("root");
+        std::fs::write(root.path().join("package.json"), "{\"name\":\"bounded\"}").expect("package");
+        std::fs::write(root.path().join("app.ts"), "export function bounded() { return 1; }\n").expect("source");
+        let canonical = root.path().canonicalize().expect("canonical root");
+        let policy = crate::repo_scan_policy::RepoScanPolicy::for_test_roots(
+            vec![canonical.clone()],
+            crate::repo_scan_policy::RepoScanLimits {
+                max_depth: 4,
+                max_files: 2,
+                max_bytes: 1024 * 1024,
+                max_file_bytes: 1024 * 1024,
+                timeout: std::time::Duration::from_secs(5),
+                ..crate::repo_scan_policy::RepoScanLimits::default()
+            },
+        );
+        let scan = run_repo_scan_at_with_policy(&canonical, &policy).expect("bounded scan");
+        assert!(scan.files.iter().any(|file| file.rel_path == "app.ts"));
+
+        let tight = crate::repo_scan_policy::RepoScanPolicy::for_test_roots(
+            vec![canonical.clone()],
+            crate::repo_scan_policy::RepoScanLimits {
+                max_files: 1,
+                ..policy.limits()
+            },
+        );
+        let error = run_repo_scan_at_with_policy(&canonical, &tight).expect_err("entry overflow");
+        assert!(error.to_string().contains("filesystem entries"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn no_cargo_polyglot_rust_scan_rejects_excessive_generic_nesting() {
+        let _v3 = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let root = tempfile::tempdir().expect("root");
+        let nested = format!(
+            "type Deep = {}u8{};\n",
+            "Vec<".repeat(crate::workspace_scan::RUST_SYNTAX_MAX_DEPTH + 1),
+            ">".repeat(crate::workspace_scan::RUST_SYNTAX_MAX_DEPTH + 1)
+        );
+        std::fs::write(root.path().join("nested.rs"), nested).expect("nested source");
+
+        let error = run_repo_scan_at(root.path()).expect_err("polyglot Rust scan must reject nesting");
+        assert!(error.to_string().contains("Rust syntax nesting"));
+    }
 
     fn route_set(scan: &WorkspaceScan) -> BTreeSet<(String, String, String)> {
         scan.routes
@@ -5514,6 +6281,31 @@ mod tests {
             src.push_str(")\n");
         }
         src
+    }
+
+    fn write_branching_django_fixture(root: &Path, levels: usize) {
+        assert!(levels > 0);
+        std::fs::create_dir_all(root.join("project")).expect("project");
+        std::fs::write(root.join("project/settings.py"), "ROOT_URLCONF = 'project.urls'\n").expect("settings");
+        std::fs::write(
+            root.join("project/urls.py"),
+            "from django.urls import include, path\nurlpatterns = [path('a/', include('level1.urls')), path('b/', include('level1.urls'))]\n",
+        )
+        .expect("root urls");
+        for level in 1..=levels {
+            let directory = root.join(format!("level{level}"));
+            std::fs::create_dir_all(&directory).expect("level dir");
+            let source = if level == levels {
+                "from django.urls import path\nurlpatterns = [path('leaf/', views.leaf)]\n".to_string()
+            } else {
+                format!(
+                    "from django.urls import include, path\nurlpatterns = [path('a/', include('level{}.urls')), path('b/', include('level{}.urls'))]\n",
+                    level + 1,
+                    level + 1
+                )
+            };
+            std::fs::write(directory.join("urls.py"), source).expect("level urls");
+        }
     }
 
     fn stable_scan_json(mut scan: WorkspaceScan) -> String {
@@ -6275,6 +7067,57 @@ int utility() { return 1; }
             max_source_delimiter_depth(&comparisons, POLYGLOT_AST_MAX_DEPTH, LanguageKind::Cpp)
                 < POLYGLOT_AST_MAX_DEPTH
         );
+        let comparison_chain = format!(
+            "bool ordered = {};",
+            std::iter::repeat_n("left < right", POLYGLOT_AST_MAX_DEPTH + 100)
+                .collect::<Vec<_>>()
+                .join(" && ")
+        );
+        assert!(
+            max_source_delimiter_depth(&comparison_chain, POLYGLOT_AST_MAX_DEPTH, LanguageKind::Cpp)
+                < POLYGLOT_AST_MAX_DEPTH
+        );
+        let grouped_comparisons = format!(
+            "bool ordered = ({}) && ({});",
+            std::iter::repeat_n("a<b", POLYGLOT_AST_MAX_DEPTH + 100)
+                .collect::<Vec<_>>()
+                .join(" && "),
+            std::iter::repeat_n("c>d", POLYGLOT_AST_MAX_DEPTH + 100)
+                .collect::<Vec<_>>()
+                .join(" && ")
+        );
+        assert!(
+            max_source_delimiter_depth(&grouped_comparisons, POLYGLOT_AST_MAX_DEPTH, LanguageKind::Cpp)
+                < POLYGLOT_AST_MAX_DEPTH
+        );
+        let multiline_templates = format!(
+            "{}int{};",
+            "box<\n".repeat(POLYGLOT_AST_MAX_DEPTH + 100),
+            ">\n".repeat(POLYGLOT_AST_MAX_DEPTH + 100)
+        );
+        assert!(
+            max_source_delimiter_depth(&multiline_templates, POLYGLOT_AST_MAX_DEPTH, LanguageKind::Cpp)
+                > POLYGLOT_AST_MAX_DEPTH,
+            "nested C++ templates must be rejected before native parsing"
+        );
+        let exact_template_boundary = format!(
+            "{}int{};",
+            "box<".repeat(POLYGLOT_AST_MAX_DEPTH),
+            ">".repeat(POLYGLOT_AST_MAX_DEPTH)
+        );
+        assert_eq!(
+            max_source_delimiter_depth(&exact_template_boundary, POLYGLOT_AST_MAX_DEPTH, LanguageKind::Cpp,),
+            POLYGLOT_AST_MAX_DEPTH
+        );
+        let java_wildcard_storm = format!(
+            "class Deep {{ {}String{} value; }}",
+            "java.util.List<? extends ".repeat(POLYGLOT_AST_MAX_DEPTH + 1),
+            ">".repeat(POLYGLOT_AST_MAX_DEPTH + 1)
+        );
+        assert!(
+            max_source_delimiter_depth(&java_wildcard_storm, POLYGLOT_AST_MAX_DEPTH, LanguageKind::Java)
+                > POLYGLOT_AST_MAX_DEPTH
+        );
 
         let digit_separator_then_depth = format!("1'000;\n{}", "{\n".repeat(POLYGLOT_AST_MAX_DEPTH + 1));
         assert!(
@@ -6459,20 +7302,13 @@ int utility() { return 1; }
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn polyglot_v3_symlink_to_device_is_skipped_without_reading() {
+    fn polyglot_v3_symlink_to_device_is_rejected_without_reading() {
         let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
         let tmp = tempfile::tempdir().expect("tempdir");
         std::os::unix::fs::symlink("/dev/zero", tmp.path().join("zero.c")).expect("device symlink");
 
-        let scan = run_repo_scan_at(tmp.path()).expect("scan");
-        assert!(scan.files.is_empty());
-        assert_eq!(
-            scan.diagnostics.v3_skipped_files,
-            vec![V3SkippedFile {
-                rel_path: "zero.c".to_string(),
-                reason: "non_regular_file".to_string(),
-            }]
-        );
+        let error = run_repo_scan_at(tmp.path()).expect_err("symlink must fail closed");
+        assert!(error.to_string().contains("rejects symlink"));
     }
 
     #[test]
@@ -6503,6 +7339,35 @@ int utility() { return 1; }
         let json = serde_json::to_string(&scan).expect("scan json");
         assert!(json.contains("v3_skipped_files"));
         assert!(json.contains("max_bytes"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn baseline_ts_skip_diagnostics_survive_rust_hybrid_merge() {
+        let _v2 = EnvVarGuard::unset(POLYGLOT_V2_ENV);
+        let _v3 = EnvVarGuard::unset(POLYGLOT_V3_ENV);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\nmembers = [\"mini\"]\n").expect("workspace");
+        let member = tmp.path().join("mini");
+        std::fs::create_dir_all(member.join("src")).expect("src");
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"mini\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(member.join("src/lib.rs"), "pub fn rust_fn() {}\n").expect("rust");
+        std::fs::write(tmp.path().join("deep.ts"), deep_call_source(POLYGLOT_AST_MAX_DEPTH + 1))
+            .expect("deep TypeScript");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("hybrid scan");
+        assert!(scan.files.iter().any(|file| file.rel_path == "mini/src/lib.rs"));
+        assert_eq!(
+            scan.diagnostics.v3_skipped_files,
+            vec![V3SkippedFile {
+                rel_path: "deep.ts".to_string(),
+                reason: "max_delimiter_depth".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -6634,6 +7499,125 @@ urlpatterns = [
         assert_eq!(scan.diagnostics.unresolved_routes.len(), 1);
         assert_eq!(scan.diagnostics.unresolved_routes[0].reason, "include_dynamic");
         assert_eq!(scan.diagnostics.unresolved_routes[0].handler_fn, "include(blog_urls)");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_django_branching_expansion_is_output_bounded() {
+        let _v3 = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_branching_django_fixture(tmp.path(), 10);
+        let canonical = tmp.path().canonicalize().expect("canonical");
+        let policy = crate::repo_scan_policy::RepoScanPolicy::for_test_roots(
+            vec![canonical.clone()],
+            crate::repo_scan_policy::RepoScanLimits {
+                max_depth: 16,
+                max_files: 64,
+                max_bytes: 1024 * 1024,
+                max_file_bytes: 128 * 1024,
+                timeout: std::time::Duration::from_secs(5),
+                ..crate::repo_scan_policy::RepoScanLimits::default()
+            },
+        );
+
+        let error = run_repo_scan_at_with_policy(&canonical, &policy).expect_err("branching expansion must be capped");
+        assert!(error.to_string().contains("Django route expansion"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_django_branching_below_expansion_cap_succeeds() {
+        let _v3 = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_branching_django_fixture(tmp.path(), 9);
+
+        let scan = run_repo_scan_at(tmp.path()).expect("bounded branching scan");
+        assert_eq!(scan.routes.len(), 512);
+        assert!(scan
+            .routes
+            .iter()
+            .all(|route| route.framework.as_deref() == Some("django")));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_django_include_cycle_is_path_local_and_finite() {
+        let _v3 = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for directory in ["project", "app"] {
+            std::fs::create_dir_all(tmp.path().join(directory)).expect("urlconf dir");
+        }
+        std::fs::write(
+            tmp.path().join("project/settings.py"),
+            "ROOT_URLCONF = 'project.urls'\n",
+        )
+        .expect("settings");
+        std::fs::write(
+            tmp.path().join("project/urls.py"),
+            "from django.urls import include, path\nurlpatterns = [path('home/', views.home), path('app/', include('app.urls'))]\n",
+        )
+        .expect("project urls");
+        std::fs::write(
+            tmp.path().join("app/urls.py"),
+            "from django.urls import include, path\nurlpatterns = [path('child/', views.child), path('back/', include('project.urls'))]\n",
+        )
+        .expect("app urls");
+
+        let scan = run_repo_scan_at(tmp.path()).expect("cycle-safe scan");
+        let django_routes: Vec<_> = scan
+            .routes
+            .iter()
+            .filter(|route| route.framework.as_deref() == Some("django"))
+            .collect();
+        assert_eq!(django_routes.len(), 2);
+        assert!(django_routes.iter().any(|route| route.path == "home/"));
+        assert!(django_routes.iter().any(|route| route.path == "app/child/"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_v3_django_include_chain_respects_depth_limit() {
+        let _v3 = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("project")).expect("project");
+        std::fs::write(
+            tmp.path().join("project/settings.py"),
+            "ROOT_URLCONF = 'project.urls'\n",
+        )
+        .expect("settings");
+        std::fs::write(
+            tmp.path().join("project/urls.py"),
+            "from django.urls import include, path\nurlpatterns = [path('next/', include('level1.urls'))]\n",
+        )
+        .expect("root urls");
+        for level in 1..=6 {
+            let directory = tmp.path().join(format!("level{level}"));
+            std::fs::create_dir_all(&directory).expect("level dir");
+            let source = if level == 6 {
+                "from django.urls import path\nurlpatterns = [path('leaf/', views.leaf)]\n".to_string()
+            } else {
+                format!(
+                    "from django.urls import include, path\nurlpatterns = [path('next/', include('level{}.urls'))]\n",
+                    level + 1
+                )
+            };
+            std::fs::write(directory.join("urls.py"), source).expect("level urls");
+        }
+        let canonical = tmp.path().canonicalize().expect("canonical");
+        let policy = crate::repo_scan_policy::RepoScanPolicy::for_test_roots(
+            vec![canonical.clone()],
+            crate::repo_scan_policy::RepoScanLimits {
+                max_depth: 3,
+                max_files: 128,
+                max_bytes: 1024 * 1024,
+                max_file_bytes: 128 * 1024,
+                timeout: std::time::Duration::from_secs(5),
+                ..crate::repo_scan_policy::RepoScanLimits::default()
+            },
+        );
+
+        let error = run_repo_scan_at_with_policy(&canonical, &policy).expect_err("deep include chain must fail");
+        assert!(error.to_string().contains("directory depth 3"));
     }
 
     #[test]
@@ -7155,29 +8139,20 @@ export function run(input: Thing) { return helper(input.id); }
     }
 
     #[test]
-    fn ts_deep_walk_is_bounded_and_ts_is_not_pathology_skipped() {
+    fn ts_deep_source_is_skipped_before_native_parse() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("package.json"), r#"{"name":"deep-ts"}"#).expect("package");
         let deep_src = deep_call_source(POLYGLOT_AST_MAX_DEPTH + 256);
         std::fs::write(tmp.path().join("deep.ts"), &deep_src).expect("deep ts");
-        let long_ts = format!(
-            "export const longValue = \"{}\";\n",
-            "x".repeat(POLYGLOT_JS_MAX_LINE_BYTES + 1)
-        );
-        assert!(long_ts.lines().next().map_or(0, str::len) > POLYGLOT_JS_MAX_LINE_BYTES);
-        std::fs::write(tmp.path().join("long.ts"), long_ts).expect("long ts");
-
         let scan = run_polyglot_scan_at(tmp.path()).expect("scan");
-        assert!(scan.files.iter().any(|file| file.rel_path == "deep.ts"));
-        assert!(scan.files.iter().any(|file| file.rel_path == "long.ts"));
-        assert!(scan
-            .symbols
-            .iter()
-            .any(|symbol| symbol.name == "shallow" && symbol.file_rel_path == "deep.ts"));
-        assert!(scan
-            .symbols
-            .iter()
-            .any(|symbol| symbol.name == "longValue" && symbol.file_rel_path == "long.ts"));
+        assert!(scan.files.is_empty());
+        assert_eq!(
+            scan.diagnostics.v3_skipped_files,
+            vec![V3SkippedFile {
+                rel_path: "deep.ts".to_string(),
+                reason: "max_delimiter_depth".to_string(),
+            }]
+        );
 
         let extracted = extract_file(
             tmp.path(),
@@ -7189,12 +8164,8 @@ export function run(input: Thing) { return helper(input.id); }
                 v3_enabled: false,
             },
         )
-        .expect("extract")
-        .expect("not skipped");
-        assert!(
-            extracted.ast_depth_limit_hits > 0,
-            "deep TypeScript should hit the walker depth cap"
-        );
+        .expect("deep TypeScript admission");
+        assert!(extracted.is_none());
     }
 
     #[test]
@@ -7385,7 +8356,7 @@ app.get("/dist", handler);
 
     #[test]
     #[serial_test::serial]
-    fn polyglot_v2_deep_js_walk_is_depth_bounded_without_minified_skip() {
+    fn polyglot_v2_deep_js_is_skipped_before_native_parse() {
         let _env = EnvVarGuard::set(POLYGLOT_V2_ENV, "1");
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("package.json"), r#"{"name":"deep-js"}"#).expect("package");
@@ -7395,12 +8366,14 @@ app.get("/dist", handler);
         std::fs::write(tmp.path().join("app.js"), &src).expect("js");
 
         let scan = run_repo_scan_at(tmp.path()).expect("scan");
-        assert!(scan.files.iter().any(|file| file.rel_path == "app.js"));
-        assert!(scan
-            .symbols
-            .iter()
-            .any(|symbol| symbol.name == "shallow" && symbol.file_rel_path == "app.js"));
-        assert!(scan.symbols.len() <= 2);
+        assert!(scan.files.is_empty());
+        assert_eq!(
+            scan.diagnostics.v3_skipped_files,
+            vec![V3SkippedFile {
+                rel_path: "app.js".to_string(),
+                reason: "max_delimiter_depth".to_string(),
+            }]
+        );
 
         let extracted = extract_file(
             tmp.path(),
@@ -7412,12 +8385,8 @@ app.get("/dist", handler);
                 v3_enabled: false,
             },
         )
-        .expect("extract")
-        .expect("not skipped");
-        assert!(
-            extracted.ast_depth_limit_hits > 0,
-            "deep multiline JS should hit the walker depth cap"
-        );
+        .expect("deep multiline JS admission");
+        assert!(extracted.is_none());
     }
 
     #[test]
@@ -7730,7 +8699,7 @@ func setup() {
         )
         .expect("go");
 
-        assert!(!should_use_rust_workspace_scan(tmp.path()));
+        assert!(!should_use_rust_workspace_scan(tmp.path()).expect("scan mode"));
         let scan = run_repo_scan_at(tmp.path()).expect("scan");
         assert!(scan.crates.iter().any(|krate| krate.name == "mini"));
         assert!(scan.crates.iter().any(|krate| krate.name == "main"));
@@ -7941,8 +8910,8 @@ function useWidget() {
         std::fs::create_dir_all(&web).expect("web");
         std::fs::write(web.join("app.ts"), "export function tsFn() {}\n").expect("ts");
 
-        assert!(!should_use_rust_workspace_scan(tmp.path()));
-        assert!(has_rust_workspace(tmp.path()));
+        assert!(!should_use_rust_workspace_scan(tmp.path()).expect("scan mode"));
+        assert!(has_rust_workspace(tmp.path()).expect("rust workspace"));
 
         let scan = run_repo_scan_at(tmp.path()).expect("scan");
         assert!(

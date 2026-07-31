@@ -84,6 +84,9 @@ pub(super) async fn post_auto(
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
         return problem.into_response();
     }
+    if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
+        return problem.into_response();
+    }
     let agent = extract_passport_id(&headers);
     let now = now_unix_ms();
     // The same window /v1/code-intel/dead-code answers from. Empty unless
@@ -323,6 +326,9 @@ pub(super) async fn list_dossiers(
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
     }
+    if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
+        return problem.into_response();
+    }
     let ids = list_dossier_ids_internal(&state.fact_store, &project_id).await;
     let total = ids.len();
     let mut summaries: Vec<serde_json::Value> = ids
@@ -384,6 +390,9 @@ pub(super) async fn get_dossier(
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
     }
+    if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
+        return problem.into_response();
+    }
     match load_dossier(&state.fact_store, &project_id, &dossier_id).await {
         Some(d) => (StatusCode::OK, Json(budget_dossier(d, q.token_budget))).into_response(),
         None => problem_response(StatusCode::NOT_FOUND, "dossier not found"),
@@ -404,6 +413,9 @@ pub(super) async fn get_diff(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
         return problem.into_response();
     }
     let a = match load_dossier(&state.fact_store, &project_id, &q.a).await {
@@ -517,6 +529,9 @@ pub(super) async fn get_reconciliation(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
         return problem.into_response();
     }
     // For reconciliation, prefer the LATEST dossier per agent (so an agent

@@ -10,6 +10,7 @@
 
 use crate::dispatch::McpContext;
 use crate::protocol::{JsonRpcError, INTERNAL_ERROR, INVALID_PARAMS};
+use crate::tools::loopback_auth::{request_loopback_authority, RequestLoopbackAuthority};
 use serde_json::{json, Value};
 use std::io::Read;
 
@@ -52,6 +53,17 @@ pub fn input_schema() -> Value {
     })
 }
 
+fn workspace_storyline_authority(ctx: &McpContext) -> Result<RequestLoopbackAuthority, JsonRpcError> {
+    if ctx.scope_tenant() != "*" {
+        return Err(JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "get_workspace_storyline: workspace scans require a global MCP operator context".to_string(),
+            data: None,
+        });
+    }
+    request_loopback_authority(ctx, &["admin:read"])
+}
+
 pub async fn handle_get_workspace_storyline(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let Some(base_url) = ctx.daemon_base_url.as_deref() else {
         return Err(JsonRpcError {
@@ -73,6 +85,7 @@ pub async fn handle_get_workspace_storyline(args: &Value, ctx: &McpContext) -> R
     }
     let endpoint = args.get("endpoint").and_then(Value::as_str).map(|s| s.to_string());
     let include_tests = args.get("include_tests").and_then(Value::as_bool).unwrap_or(false);
+    let authority = workspace_storyline_authority(ctx)?;
 
     // Build the URL with manual query encoding (no extra dep needed).
     let mut url = format!(
@@ -98,7 +111,10 @@ pub async fn handle_get_workspace_storyline(args: &Value, ctx: &McpContext) -> R
         let _ = write!(url, "&root={encoded}");
     }
 
-    let bearer = crate::tools::loopback_auth::loopback_bearer_token();
+    let bearer = authority.bearer;
+    let agent_proof = authority.agent_proof;
+    let passport_header = authority.passport_header;
+    let tenant = authority.tenant;
     let response = tokio::task::spawn_blocking(move || {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(15)))
@@ -115,6 +131,13 @@ pub async fn handle_get_workspace_storyline(args: &Value, ctx: &McpContext) -> R
         if let Some(token) = &bearer {
             req = req.header("Authorization", &format!("Bearer {token}"));
         }
+        if let Some(proof) = &agent_proof {
+            req = req.header(crate::agent::INTERNAL_LOOPBACK_AGENT_PROOF_HEADER, proof);
+        }
+        if let Some(passport_id) = &passport_header {
+            req = req.header("X-Corecrux-Passport-Id", passport_id);
+        }
+        req = req.header("X-Corecrux-Tenant-Id", &tenant);
         req.call()
             .map(|mut r| {
                 let status = r.status().as_u16();
@@ -209,5 +232,25 @@ mod tests {
             .await
             .expect_err("must reject");
         assert!(err.message.contains("format must be"), "msg was: {}", err.message);
+    }
+
+    #[tokio::test]
+    async fn tenant_scoped_caller_is_rejected_before_loopback() {
+        let mut ctx =
+            McpContext::new_default("test-node").with_request_authority(Some("tenant-admin".to_string()), "tenant-a");
+        ctx.daemon_base_url = Some("http://127.0.0.1:1".to_string());
+        let err = handle_get_workspace_storyline(&json!({}), &ctx)
+            .await
+            .expect_err("tenant caller must not become a global loopback principal");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("global MCP operator"));
+    }
+
+    #[test]
+    fn global_caller_retains_global_request_authority() {
+        let ctx = McpContext::new_default("test-node").with_request_authority(Some("global-operator".to_string()), "*");
+        let authority = workspace_storyline_authority(&ctx).expect("global authority");
+        assert_eq!(authority.tenant, "*");
+        assert_eq!(authority.passport_header.as_deref(), Some("global-operator"));
     }
 }

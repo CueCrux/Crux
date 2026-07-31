@@ -3,6 +3,12 @@
 // Licensed under the Apache License, Version 2.0.
 // See LICENSE in the repository root.
 
+// The legacy append-only writer remains compiled so its persisted read format
+// and migration fixtures stay testable while production startup rejects both
+// writer feature flags. Remove this allowance with the writer implementation
+// when bounded repo-owned edge snapshots replace it.
+#![cfg_attr(not(test), allow(dead_code))]
+
 //! Emit repository workspace scans into the tenant-scoped relation graph.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,6 +42,10 @@ pub(crate) enum CodeGraphError {
     Json(#[from] serde_json::Error),
     #[error("shared codegraph id allocator exhausted")]
     SharedIdsExhausted,
+    #[error(
+        "repository codegraph emission is disabled until repo-owned bounded snapshots replace the legacy append-only relation store"
+    )]
+    UnsafeLegacyPersistenceDisabled,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -92,6 +102,15 @@ pub(crate) fn external_enabled_from_env() -> bool {
     crate::workspace_scan_manifests::env_flag_enabled(CODEGRAPH_EXTERNAL_ENV)
 }
 
+pub(crate) fn validate_runtime_configuration() -> Result<(), CodeGraphError> {
+    if enabled_from_env() || external_enabled_from_env() {
+        Err(CodeGraphError::UnsafeLegacyPersistenceDisabled)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 pub(crate) async fn maybe_emit_codegraph_edges(
     fact_store: &Arc<RwLock<FactStore>>,
     projection_state: &Arc<RwLock<ProjectionState>>,
@@ -106,6 +125,21 @@ pub(crate) async fn maybe_emit_codegraph_edges(
     let mut store = fact_store.write().await;
     let mut projection = projection_state.write().await;
     emit_codegraph_edges(&mut store, &mut projection, data_dir, tenant_id, repo_id, scan).map(Some)
+}
+
+pub(crate) fn maybe_emit_codegraph_edges_for_registration(
+    _fact_store: &Arc<RwLock<FactStore>>,
+    _projection_state: &Arc<RwLock<ProjectionState>>,
+    _data_dir: &Path,
+    _tenant_id: &str,
+    _repo_id: &str,
+    _expected_generation: &str,
+    _scan: &WorkspaceScan,
+) -> Result<Option<CodeGraphEmitReport>, CodeGraphError> {
+    if !enabled_from_env() && !external_enabled_from_env() {
+        return Ok(None);
+    }
+    Err(CodeGraphError::UnsafeLegacyPersistenceDisabled)
 }
 
 pub(crate) fn emit_codegraph_edges(
@@ -724,6 +758,32 @@ mod tests {
     use corecrux_projections::query::graph_expand::{graph_expand, GraphExpandRequest};
     use corecrux_projections::tenant_hash_xxhash64;
 
+    #[test]
+    #[serial_test::serial]
+    fn production_configuration_rejects_legacy_codegraph_writers() {
+        {
+            let _edges = EnvVarGuard::unset(CODEGRAPH_ENV);
+            let _external = EnvVarGuard::unset(CODEGRAPH_EXTERNAL_ENV);
+            validate_runtime_configuration().expect("disabled legacy writers are safe");
+        }
+        {
+            let _edges = EnvVarGuard::set(CODEGRAPH_ENV, "1");
+            let _external = EnvVarGuard::unset(CODEGRAPH_EXTERNAL_ENV);
+            assert!(matches!(
+                validate_runtime_configuration(),
+                Err(CodeGraphError::UnsafeLegacyPersistenceDisabled)
+            ));
+        }
+        {
+            let _edges = EnvVarGuard::unset(CODEGRAPH_ENV);
+            let _external = EnvVarGuard::set(CODEGRAPH_EXTERNAL_ENV, "1");
+            assert!(matches!(
+                validate_runtime_configuration(),
+                Err(CodeGraphError::UnsafeLegacyPersistenceDisabled)
+            ));
+        }
+    }
+
     fn sample_scan() -> WorkspaceScan {
         WorkspaceScan {
             scan_id: "scan-1".to_string(),
@@ -1154,7 +1214,8 @@ mod tests {
 
         let _scan_off = EnvVarGuard::unset("CORECRUXD_EXTERNAL_DEPS");
         let mut scan_without = sample_scan();
-        crate::workspace_scan_manifests::attach_external_deps_if_enabled(fixture.path(), &mut scan_without);
+        crate::workspace_scan_manifests::attach_external_deps_if_enabled(fixture.path(), &mut scan_without)
+            .expect("attach deps");
         assert!(scan_without.external_deps.is_empty());
         let without = emit_codegraph_edges(
             &mut store,
@@ -1171,7 +1232,8 @@ mod tests {
         drop(_scan_off);
         let _scan_on = EnvVarGuard::set("CORECRUXD_EXTERNAL_DEPS", "1");
         let mut scan_with = sample_scan();
-        crate::workspace_scan_manifests::attach_external_deps_if_enabled(fixture.path(), &mut scan_with);
+        crate::workspace_scan_manifests::attach_external_deps_if_enabled(fixture.path(), &mut scan_with)
+            .expect("attach deps");
         assert!(!scan_with.external_deps.is_empty());
         let with = emit_codegraph_edges(
             &mut store,
@@ -1200,7 +1262,8 @@ mod tests {
         )
         .expect("package json");
         let mut scan = sample_scan();
-        crate::workspace_scan_manifests::attach_external_deps_if_enabled(fixture.path(), &mut scan);
+        crate::workspace_scan_manifests::attach_external_deps_if_enabled(fixture.path(), &mut scan)
+            .expect("attach deps");
         assert!(!scan.external_deps.is_empty());
 
         let tmp = tempfile::tempdir().expect("data dir");
@@ -1297,6 +1360,7 @@ mod tests {
                 languages: vec!["typescript".to_string()],
                 enabled: true,
                 added_at_unix_ms: 1,
+                generation_id: "fixture-generation".to_string(),
                 last_scan_id: None,
                 scan_status: None,
                 scan_error: None,

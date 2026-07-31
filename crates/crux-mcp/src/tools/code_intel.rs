@@ -25,7 +25,7 @@
 
 use serde_json::{json, Value};
 
-use super::repos::{encode_query, loopback_json};
+use super::repos::{encode_query, loopback_json, requested_tenant};
 use crate::dispatch::McpContext;
 use crate::protocol::{JsonRpcError, INTERNAL_ERROR, INVALID_PARAMS};
 
@@ -284,7 +284,7 @@ fn base_url(ctx: &McpContext, tool: &'static str) -> Result<String, JsonRpcError
 pub async fn handle_code_path(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     const TOOL: &str = "code_path";
     let base = base_url(ctx, TOOL)?;
-    let tenant = required_string(args, "tenant_id", TOOL)?;
+    let tenant = requested_tenant(args, ctx, TOOL)?;
     let entry_point = required_string(args, "entry_point", TOOL)?;
     let budget = token_budget(args, TOOL)?;
     let url = format!(
@@ -292,13 +292,13 @@ pub async fn handle_code_path(args: &Value, ctx: &McpContext) -> Result<Value, J
         encode_query(&tenant),
         encode_query(&entry_point)
     );
-    loopback_json(TOOL, "GET", url, None, SCOPE).await
+    loopback_json(TOOL, "GET", url, None, SCOPE, ctx).await
 }
 
 pub async fn handle_code_blast_radius(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     const TOOL: &str = "code_blast_radius";
     let base = base_url(ctx, TOOL)?;
-    let tenant = required_string(args, "tenant_id", TOOL)?;
+    let tenant = requested_tenant(args, ctx, TOOL)?;
     let symbol = required_string(args, "symbol", TOOL)?;
     let budget = token_budget(args, TOOL)?;
     let url = format!(
@@ -307,13 +307,13 @@ pub async fn handle_code_blast_radius(args: &Value, ctx: &McpContext) -> Result<
         encode_query(&symbol),
         repo_param(args)
     );
-    loopback_json(TOOL, "GET", url, None, SCOPE).await
+    loopback_json(TOOL, "GET", url, None, SCOPE, ctx).await
 }
 
 pub async fn handle_code_liveness(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     const TOOL: &str = "code_liveness";
     let base = base_url(ctx, TOOL)?;
-    let tenant = required_string(args, "tenant_id", TOOL)?;
+    let tenant = requested_tenant(args, ctx, TOOL)?;
     let symbol = required_string(args, "symbol", TOOL)?;
     let budget = token_budget(args, TOOL)?;
     let url = format!(
@@ -322,13 +322,13 @@ pub async fn handle_code_liveness(args: &Value, ctx: &McpContext) -> Result<Valu
         encode_query(&symbol),
         repo_param(args)
     );
-    loopback_json(TOOL, "GET", url, None, SCOPE).await
+    loopback_json(TOOL, "GET", url, None, SCOPE, ctx).await
 }
 
 pub async fn handle_code_trace_diff(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     const TOOL: &str = "code_trace_diff";
     let base = base_url(ctx, TOOL)?;
-    let tenant = required_string(args, "tenant_id", TOOL)?;
+    let tenant = requested_tenant(args, ctx, TOOL)?;
     let trace_a = required_u64(args, "trace_a", TOOL)?;
     let trace_b = required_u64(args, "trace_b", TOOL)?;
     let budget = token_budget(args, TOOL)?;
@@ -336,13 +336,13 @@ pub async fn handle_code_trace_diff(args: &Value, ctx: &McpContext) -> Result<Va
         "{base}/v1/code-intel/trace-diff?tenant_id={}&trace_a={trace_a}&trace_b={trace_b}&token_budget={budget}",
         encode_query(&tenant)
     );
-    loopback_json(TOOL, "GET", url, None, SCOPE).await
+    loopback_json(TOOL, "GET", url, None, SCOPE, ctx).await
 }
 
 pub async fn handle_code_dead_code(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     const TOOL: &str = "code_dead_code";
     let base = base_url(ctx, TOOL)?;
-    let tenant = required_string(args, "tenant_id", TOOL)?;
+    let tenant = requested_tenant(args, ctx, TOOL)?;
     let budget = token_budget(args, TOOL)?;
     let symbol = optional_string(args, "symbol").map_or_else(String::new, |s| format!("&symbol={}", encode_query(&s)));
     let url = format!(
@@ -350,7 +350,7 @@ pub async fn handle_code_dead_code(args: &Value, ctx: &McpContext) -> Result<Val
         encode_query(&tenant),
         repo_param(args)
     );
-    loopback_json(TOOL, "GET", url, None, SCOPE).await
+    loopback_json(TOOL, "GET", url, None, SCOPE, ctx).await
 }
 
 /// `&repo_id=…`, or empty so corecruxd applies its own default.

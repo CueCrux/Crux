@@ -45,6 +45,49 @@ for the Crux Daemon.
 - BLAKE3 hashes ensure **integrity** (tamper detection), not **confidentiality**.
 - Data at rest is **not encrypted**. Use filesystem-level encryption (LUKS, dm-crypt) if
   required by your threat model.
+- Local repository paths supplied through HTTP/MCP are not ambient filesystem
+  authority. Their canonical roots must fall below the startup-frozen
+  `CORECRUXD_REPO_SCAN_ALLOWED_ROOTS` set. `CORECRUXD_WORKSPACE_PATH` is a
+  separate operator self-scan root and does not grant tenant scan authority.
+  Nominating any local `root_path`, starting the self-scan, and reading its full
+  scan/storyline all require cross-tenant operator authority. MCP additionally
+  binds the requested tenant to the authenticated MCP tenant unless the caller
+  has a global (`*`) operator context. The absolute self-scan root is replaced
+  with `.` before persistence. An empty allowed-root set disables local-path
+  registration.
+
+  Registration and execution both revalidate the root. Walkers and secure
+  reads reject symlinks, hard-linked or non-regular files, root escapes, and
+  repeated canonical directories; opened-file identity, length, mtime and
+  ctime are verified before and after reads. Async jobs and watchers carry an
+  opaque registration generation so a result from a deleted/recreated repo ID
+  is discarded. A single process-wide admission permit and shared
+  depth/entry/byte/per-file/deadline budget cover detection, every scanner
+  lane, output construction, encoding and persistence. The async queue is
+  bounded globally and to eight active jobs per tenant. Generated state and
+  durable sidecars share a fixed 64 MiB ceiling; deterministic overflow stops
+  a watcher instead of rebuilding the same unpersistable scan every poll.
+
+  Scan sidecars live below daemon-owned `repo-scans-v1` directories created
+  with private permissions. Startup, runtime reads, publication, and cleanup
+  reject linked storage roots or per-repository parents before path-based I/O.
+  This protects against stale or accidental links; a principal able to mutate
+  the daemon's private data directory is inside the trusted local-storage
+  boundary and must be controlled with filesystem ownership and isolation.
+
+  Watching uses fixed 30-second bounded polling, not an OS recursive watcher.
+  Relevant files receive secure content digests so same-length and
+  timestamp-preserving edits are detected; changes trigger a full replacement
+  scan. Busy polls coalesce, failures retain the prior snapshot, and watcher
+  counts are capped at 16 process-wide and four per tenant.
+
+  Operators must mount allowed roots read-only and source-only. Configuring `/`
+  deliberately grants scan visibility across the host. The elapsed timeout is
+  cooperative: tree-sitter exposes an interrupt callback, but bounded `syn`,
+  serde/TOML parsers and filesystem syscalls are atomic and can return after a
+  deadline before the next check rejects the scan. Secure opened-file identity
+  verification is Unix-only; non-Unix builds reject before opening (Windows
+  operators should use WSL2).
 - Daemon control records (passports, grants, work/gates, coordination, receipts,
   tenant metadata, and related internal state) occupy reserved fact namespaces.
   Generic HTTP/MCP writes and deletes, candidate promotion, extension/WASM

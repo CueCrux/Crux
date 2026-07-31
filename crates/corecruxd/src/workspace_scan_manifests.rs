@@ -39,17 +39,40 @@ pub(crate) fn external_deps_enabled_from_env() -> bool {
     env_flag_enabled(EXTERNAL_DEPS_ENV)
 }
 
-pub(crate) fn attach_external_deps_if_enabled(root: &Path, scan: &mut crate::workspace_scan::WorkspaceScan) {
+pub(crate) fn attach_external_deps_if_enabled(
+    root: &Path,
+    scan: &mut crate::workspace_scan::WorkspaceScan,
+) -> Result<(), crate::workspace_scan::ScanError> {
     if external_deps_enabled_from_env() {
-        scan.external_deps = scan_external_deps(root);
+        scan.external_deps = if crate::repo_scan_policy::active_root().is_some() {
+            scan_external_deps_in_context(root)?
+        } else {
+            let policy = crate::repo_scan_policy::RepoScanPolicy::for_exact_root(root)?;
+            policy.execute(root, scan_external_deps_in_context)?
+        };
         scan.stats.external_dep_count = scan.external_deps.len();
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub fn scan_external_deps(root: &Path) -> Vec<ExternalDep> {
+    let result = crate::repo_scan_policy::RepoScanPolicy::for_exact_root(root)
+        .and_then(|policy| policy.execute(root, scan_external_deps_in_context));
+    match result {
+        Ok(deps) => deps,
+        Err(error) => {
+            tracing::warn!(root=%root.display(), ?error, "external dependency scan rejected");
+            Vec::new()
+        }
     }
 }
 
-pub fn scan_external_deps(root: &Path) -> Vec<ExternalDep> {
-    let manifests = discover_manifests(root);
+fn scan_external_deps_in_context(root: &Path) -> Result<Vec<ExternalDep>, crate::workspace_scan::ScanError> {
+    let manifests = discover_manifests(root)?;
     let mut deps = Vec::new();
     for (idx, manifest) in manifests.iter().enumerate() {
+        crate::repo_scan_policy::check_deadline()?;
         if idx >= MAX_MANIFESTS {
             tracing::warn!(
                 root = %root.display(),
@@ -84,60 +107,37 @@ pub fn scan_external_deps(root: &Path) -> Vec<ExternalDep> {
     dedup_and_sort(deps)
 }
 
-fn discover_manifests(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![(root.to_path_buf(), 0usize)];
-    while let Some((dir, depth)) = stack.pop() {
-        let read_dir = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(err) => {
-                tracing::warn!(path = %dir.display(), ?err, "failed to read directory for external dependency scan");
-                continue;
-            }
+fn discover_manifests(root: &Path) -> Result<Vec<PathBuf>, crate::workspace_scan::ScanError> {
+    let mut pre_m2 = BTreeSet::new();
+    let mut m2 = BTreeSet::new();
+    let mut m4 = BTreeSet::new();
+    crate::workspace_scan::walk_dir_filtered(root, root, Some(MAX_DEPTH), should_skip_dir, &mut |_rel, path| {
+        if !is_manifest_path(path) {
+            return;
+        }
+        let tier = if is_pre_m2_manifest_path(path) {
+            &mut pre_m2
+        } else if is_m2_manifest_path(path) {
+            &mut m2
+        } else {
+            &mut m4
         };
-        let mut entries = Vec::new();
-        for entry in read_dir {
-            match entry {
-                Ok(entry) => entries.push(entry),
-                Err(err) => tracing::warn!(path = %dir.display(), ?err, "failed to read directory entry"),
-            }
-        }
-        entries.sort_by_key(std::fs::DirEntry::path);
-        for entry in entries {
-            let path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(err) => {
-                    tracing::warn!(path = %path.display(), ?err, "failed to read file type");
-                    continue;
-                }
-            };
-            if file_type.is_symlink() {
-                continue;
-            }
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-            if file_type.is_dir() {
-                if should_skip_dir(name) {
-                    continue;
-                }
-                if depth >= MAX_DEPTH {
-                    tracing::warn!(path = %path.display(), max_depth = MAX_DEPTH, "external dependency scan depth cap reached");
-                    continue;
-                }
-                stack.push((path, depth + 1));
-            } else if file_type.is_file() && is_manifest_path(&path) {
-                out.push(path);
-            }
-        }
-    }
-    out.sort();
+        insert_bounded_manifest(tier, path.to_path_buf());
+    })?;
     // Preserve the pre-M2 cap surface: manifests supported before this
     // milestone always claim slots before newly supported ecosystems.
-    let (mut pre_m2, later): (Vec<_>, Vec<_>) = out.into_iter().partition(|path| is_pre_m2_manifest_path(path));
-    let (m2, m4): (Vec<_>, Vec<_>) = later.into_iter().partition(|path| is_m2_manifest_path(path));
-    pre_m2.extend(m2);
-    pre_m2.extend(m4);
-    pre_m2
+    Ok(pre_m2.into_iter().chain(m2).chain(m4).collect())
+}
+
+fn insert_bounded_manifest(manifests: &mut BTreeSet<PathBuf>, path: PathBuf) {
+    if manifests.len() < MAX_MANIFESTS {
+        manifests.insert(path);
+        return;
+    }
+    if manifests.last().is_some_and(|last| path < *last) {
+        manifests.pop_last();
+        manifests.insert(path);
+    }
 }
 
 fn should_skip_dir(name: &str) -> bool {
@@ -167,11 +167,34 @@ fn is_requirements_file(name: &str) -> bool {
     name.starts_with("requirements") && Path::new(name).extension().and_then(|ext| ext.to_str()) == Some("txt")
 }
 
-fn is_manifest_path(path: &Path) -> bool {
+pub(crate) fn is_manifest_path(path: &Path) -> bool {
     let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
     is_manifest_name(name)
         || is_requirements_path(path)
         || path.extension().and_then(|ext| ext.to_str()) == Some("csproj")
+}
+
+/// Files whose contents can change the external-dependency projection.
+///
+/// Lock files are deliberately included even though they are not declaration
+/// manifests: watcher snapshots must notice a locked-version-only change.
+pub(crate) fn is_dependency_input_path(path: &Path) -> bool {
+    if is_manifest_path(path) {
+        return true;
+    }
+    matches!(
+        path.file_name().and_then(|name| name.to_str()).unwrap_or_default(),
+        "Cargo.lock"
+            | "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "poetry.lock"
+            | "uv.lock"
+            | "go.sum"
+            | "Gemfile.lock"
+            | "packages.lock.json"
+            | "Package.resolved"
+            | "composer.lock"
+    )
 }
 
 fn is_pre_m2_manifest_path(path: &Path) -> bool {
@@ -208,34 +231,45 @@ fn read_utf8_lockfile(path: &Path, label: &str) -> Option<String> {
 }
 
 fn read_utf8_file_with_cap(path: &Path, label: &str, max_bytes: u64) -> Option<String> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+    let effective_max_bytes = max_bytes.min(crate::repo_scan_policy::max_file_bytes());
+    let metadata = match crate::repo_scan_policy::scan_file_metadata_for_admission(path) {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => {
+            tracing::warn!(path = %path.display(), file_kind = %label, "external dependency input is not a regular file");
+            return None;
+        }
         Err(err) => {
-            tracing::warn!(path = %path.display(), ?err, file_kind = %label, "failed to stat external dependency file");
+            tracing::warn!(path = %path.display(), ?err, file_kind = %label, "failed to admit external dependency file");
             return None;
         }
     };
-    if metadata.file_type().is_symlink() {
-        tracing::warn!(path = %path.display(), file_kind = %label, "skipping symlinked external dependency file");
-        return None;
-    }
-    if metadata.len() > max_bytes {
+    if metadata.len() > effective_max_bytes {
         tracing::warn!(
             path = %path.display(),
             file_kind = %label,
             bytes = metadata.len(),
-            max_bytes,
-            "external dependency file exceeds size cap"
+            max_bytes = effective_max_bytes,
+            "external dependency file exceeds its effective read ceiling"
         );
         return None;
     }
-    let bytes = match std::fs::read(path) {
+    let bytes = match crate::workspace_scan::read_scan_bytes(path) {
         Ok(bytes) => bytes,
         Err(err) => {
             tracing::warn!(path = %path.display(), ?err, file_kind = %label, "failed to read external dependency file");
             return None;
         }
     };
+    if bytes.len() as u64 > effective_max_bytes {
+        tracing::warn!(
+            path = %path.display(),
+            file_kind = %label,
+            bytes = bytes.len(),
+            max_bytes = effective_max_bytes,
+            "external dependency file exceeds size cap"
+        );
+        return None;
+    }
     match String::from_utf8(bytes) {
         Ok(contents) => Some(contents),
         Err(err) => {
@@ -253,21 +287,44 @@ fn rel_path(root: &Path, path: &Path) -> Option<String> {
     })
 }
 
-fn dedup_and_sort(deps: Vec<ExternalDep>) -> Vec<ExternalDep> {
-    let mut by_key: BTreeMap<(String, String, String), ExternalDep> = BTreeMap::new();
-    for dep in deps {
-        let key = (dep.source_manifest.clone(), dep.ecosystem.clone(), dep.name.clone());
-        by_key.entry(key).or_insert(dep);
+fn dedup_and_sort(mut deps: Vec<ExternalDep>) -> Result<Vec<ExternalDep>, crate::workspace_scan::ScanError> {
+    crate::repo_scan_policy::check_deadline()?;
+    deps.sort_by(|left, right| {
+        (&left.source_manifest, &left.ecosystem, &left.name).cmp(&(
+            &right.source_manifest,
+            &right.ecosystem,
+            &right.name,
+        ))
+    });
+    deps.dedup_by(|left, right| {
+        left.source_manifest == right.source_manifest && left.ecosystem == right.ecosystem && left.name == right.name
+    });
+    crate::repo_scan_policy::check_deadline()?;
+    Ok(deps)
+}
+
+fn push_external_dep(deps: &mut Vec<ExternalDep>, dep: ExternalDep) {
+    let generated_bytes = dep
+        .name
+        .len()
+        .saturating_add(dep.ecosystem.len())
+        .saturating_add(dep.version_req.as_deref().map_or(0, str::len))
+        .saturating_add(dep.version_locked.as_deref().map_or(0, str::len))
+        .saturating_add(dep.source_manifest.len())
+        .saturating_add(dep.kind.len());
+    if crate::repo_scan_policy::charge_generated_work(1, generated_bytes, "external dependency output").is_ok() {
+        deps.push(dep);
     }
-    by_key.into_values().collect()
 }
 
 fn find_nearest_file(start_dir: &Path, root: &Path, file_name: &str) -> Option<PathBuf> {
     let mut current = Some(start_dir);
     while let Some(dir) = current {
         let candidate = dir.join(file_name);
-        if candidate.is_file() {
-            return Some(candidate);
+        match crate::repo_scan_policy::scan_path_is_file(&candidate) {
+            Ok(true) => return Some(candidate),
+            Ok(false) => {}
+            Err(_) => return None,
         }
         if dir == root {
             break;
@@ -278,6 +335,9 @@ fn find_nearest_file(start_dir: &Path, root: &Path, file_name: &str) -> Option<P
 }
 
 fn parse_toml(contents: &str, path: &Path, label: &str) -> Option<toml::Value> {
+    if !charge_manifest_document(contents, label) {
+        return None;
+    }
     // toml 1.x: `Value: FromStr` parses a single TOML value expression, not a
     // document — documents must go through `Table: FromStr`.
     match contents.parse::<toml::Table>() {
@@ -287,6 +347,45 @@ fn parse_toml(contents: &str, path: &Path, label: &str) -> Option<toml::Value> {
             None
         }
     }
+}
+
+fn charge_manifest_document(contents: &str, label: &str) -> bool {
+    let structural_items = contents
+        .bytes()
+        .filter(|byte| {
+            matches!(
+                byte,
+                b'\n' | b'{' | b'}' | b'[' | b']' | b',' | b':' | b'=' | b'<' | b'>' | b'/' | b'"' | b'\''
+            )
+        })
+        .count()
+        .saturating_add(1);
+    let estimated_bytes = contents
+        .len()
+        .saturating_add(structural_items.saturating_mul(std::mem::size_of::<serde_json::Value>()));
+    crate::repo_scan_policy::charge_generated_work(
+        structural_items,
+        estimated_bytes,
+        &format!("{label} parser document"),
+    )
+    .is_ok()
+}
+
+fn parse_json(contents: &str, path: &Path, label: &str) -> Option<serde_json::Value> {
+    if !charge_manifest_document(contents, label) {
+        return None;
+    }
+    match serde_json::from_str(contents) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            tracing::warn!(path = %path.display(), ?err, file_kind = %label, "failed to parse json external dependency file");
+            None
+        }
+    }
+}
+
+fn charge_manifest_index(name: &str, version: &str, label: &str) -> bool {
+    crate::repo_scan_policy::charge_generated_work(1, name.len().saturating_add(version.len()), label).is_ok()
 }
 
 fn table_at<'a>(value: &'a toml::Value, path: &[&str]) -> Option<&'a toml::Table> {
@@ -372,13 +471,17 @@ fn nearest_workspace_cargo_deps(root: &Path, start_dir: &Path) -> Option<toml::T
     let mut current = Some(start_dir);
     while let Some(dir) = current {
         let manifest = dir.join("Cargo.toml");
-        if manifest.exists() {
-            let workspace_table = read_utf8_file(&manifest, "Cargo.toml")
-                .and_then(|contents| parse_toml(&contents, &manifest, "Cargo.toml"))
-                .and_then(|value| table_at(&value, &["workspace", "dependencies"]).cloned());
-            if let Some(table) = workspace_table {
-                return Some(table);
+        match crate::repo_scan_policy::scan_path_is_file(&manifest) {
+            Ok(true) => {
+                let workspace_table = read_utf8_file(&manifest, "Cargo.toml")
+                    .and_then(|contents| parse_toml(&contents, &manifest, "Cargo.toml"))
+                    .and_then(|value| table_at(&value, &["workspace", "dependencies"]).cloned());
+                if let Some(table) = workspace_table {
+                    return Some(table);
+                }
             }
+            Ok(false) => {}
+            Err(_) => return None,
         }
         if dir == root {
             break;
@@ -405,6 +508,9 @@ fn parse_cargo_lock(lock: &Path) -> Option<BTreeMap<String, Option<String>>> {
         ) else {
             continue;
         };
+        if !charge_manifest_index(name, version, "external dependency lock index") {
+            return None;
+        }
         versions
             .entry(name.to_string())
             .and_modify(|existing| *existing = None)
@@ -430,14 +536,17 @@ fn add_cargo_section(
         };
         let kind = if spec.optional { "optional" } else { base_kind };
         let version_locked = lock_versions.and_then(|versions| versions.get(&spec.lock_name).cloned().flatten());
-        deps.push(ExternalDep {
-            name: name.clone(),
-            ecosystem: "cargo".to_string(),
-            version_req: spec.version_req,
-            version_locked,
-            source_manifest: source_manifest.to_string(),
-            kind: kind.to_string(),
-        });
+        push_external_dep(
+            deps,
+            ExternalDep {
+                name: name.clone(),
+                ecosystem: "cargo".to_string(),
+                version_req: spec.version_req,
+                version_locked,
+                source_manifest: source_manifest.to_string(),
+                kind: kind.to_string(),
+            },
+        );
     }
 }
 
@@ -517,12 +626,8 @@ fn parse_package_json(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>)
     let Some(contents) = read_utf8_file(manifest, "package.json") else {
         return;
     };
-    let value = match serde_json::from_str::<serde_json::Value>(&contents) {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::warn!(path = %manifest.display(), ?err, "failed to parse package.json for external dependency scan");
-            return;
-        }
+    let Some(value) = parse_json(&contents, manifest, "package.json") else {
+        return;
     };
     let Some(source_manifest) = rel_path(root, manifest) else {
         return;
@@ -576,14 +681,17 @@ fn add_package_json_section(
         {
             continue;
         }
-        deps.push(ExternalDep {
-            name: name.clone(),
-            ecosystem: "npm".to_string(),
-            version_req: Some(version_req.to_string()),
-            version_locked: lock_versions.and_then(|versions| versions.get(name).cloned()),
-            source_manifest: source_manifest.to_string(),
-            kind: kind.to_string(),
-        });
+        push_external_dep(
+            deps,
+            ExternalDep {
+                name: name.clone(),
+                ecosystem: "npm".to_string(),
+                version_req: Some(version_req.to_string()),
+                version_locked: lock_versions.and_then(|versions| versions.get(name).cloned()),
+                source_manifest: source_manifest.to_string(),
+                kind: kind.to_string(),
+            },
+        );
     }
 }
 
@@ -596,13 +704,7 @@ fn npm_lock_versions(root: &Path, manifest_dir: &Path) -> Option<BTreeMap<String
 
 fn package_lock_versions(lock: &Path) -> Option<BTreeMap<String, String>> {
     let contents = read_utf8_lockfile(lock, "package-lock.json")?;
-    let value = match serde_json::from_str::<serde_json::Value>(&contents) {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::warn!(path = %lock.display(), ?err, "failed to parse package-lock.json for external dependency scan");
-            return None;
-        }
-    };
+    let value = parse_json(&contents, lock, "package-lock.json")?;
     let mut versions: BTreeMap<String, String> = BTreeMap::new();
     let Some(packages) = value.get("packages").and_then(serde_json::Value::as_object) else {
         if let Some(dependencies) = value.get("dependencies").and_then(serde_json::Value::as_object) {
@@ -610,6 +712,9 @@ fn package_lock_versions(lock: &Path) -> Option<BTreeMap<String, String>> {
                 let Some(version) = package.get("version").and_then(serde_json::Value::as_str) else {
                     continue;
                 };
+                if !charge_manifest_index(name, version, "external dependency lock index") {
+                    return None;
+                }
                 versions.insert(name.to_string(), version.to_string());
             }
         }
@@ -622,6 +727,9 @@ fn package_lock_versions(lock: &Path) -> Option<BTreeMap<String, String>> {
         let Some(version) = package.get("version").and_then(serde_json::Value::as_str) else {
             continue;
         };
+        if !charge_manifest_index(name, version, "external dependency lock index") {
+            return None;
+        }
         versions.insert(name.to_string(), version.to_string());
     }
     Some(versions)
@@ -629,6 +737,9 @@ fn package_lock_versions(lock: &Path) -> Option<BTreeMap<String, String>> {
 
 fn pnpm_lock_versions(lock: &Path, manifest_dir: &Path) -> Option<BTreeMap<String, String>> {
     let contents = read_utf8_lockfile(lock, "pnpm-lock.yaml")?;
+    if !charge_manifest_document(&contents, "pnpm-lock.yaml") {
+        return None;
+    }
     let value = match serde_yaml::from_str::<serde_yaml::Value>(&contents) {
         Ok(value) => value,
         Err(err) => {
@@ -663,7 +774,11 @@ fn pnpm_lock_versions(lock: &Path, manifest_dir: &Path) -> Option<BTreeMap<Strin
                 })
                 .or_else(|| dep_value.as_str());
             if let Some(version) = version {
-                versions.insert(name.to_string(), strip_pnpm_peer_suffix(version).to_string());
+                let version = strip_pnpm_peer_suffix(version);
+                if !charge_manifest_index(name, version, "external dependency lock index") {
+                    return None;
+                }
+                versions.insert(name.to_string(), version.to_string());
             }
         }
     }
@@ -705,16 +820,19 @@ fn parse_requirements_txt(root: &Path, manifest: &Path, deps: &mut Vec<ExternalD
         let Some((name, version_req)) = parse_requirement_line(line, manifest) else {
             continue;
         };
-        deps.push(ExternalDep {
-            name: name.clone(),
-            ecosystem: "pypi".to_string(),
-            version_req,
-            version_locked: lock_versions
-                .as_ref()
-                .and_then(|versions| versions.get(&normalize_pypi_name(&name)).cloned()),
-            source_manifest: source_manifest.clone(),
-            kind: "normal".to_string(),
-        });
+        push_external_dep(
+            deps,
+            ExternalDep {
+                name: name.clone(),
+                ecosystem: "pypi".to_string(),
+                version_req,
+                version_locked: lock_versions
+                    .as_ref()
+                    .and_then(|versions| versions.get(&normalize_pypi_name(&name)).cloned()),
+                source_manifest: source_manifest.clone(),
+                kind: "normal".to_string(),
+            },
+        );
     }
 }
 
@@ -738,16 +856,19 @@ fn parse_pyproject_toml(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep
                 continue;
             };
             if let Some((name, version_req)) = parse_requirement_line(raw, manifest) {
-                deps.push(ExternalDep {
-                    name: name.clone(),
-                    ecosystem: "pypi".to_string(),
-                    version_req,
-                    version_locked: lock_versions
-                        .as_ref()
-                        .and_then(|versions| versions.get(&normalize_pypi_name(&name)).cloned()),
-                    source_manifest: source_manifest.clone(),
-                    kind: "normal".to_string(),
-                });
+                push_external_dep(
+                    deps,
+                    ExternalDep {
+                        name: name.clone(),
+                        ecosystem: "pypi".to_string(),
+                        version_req,
+                        version_locked: lock_versions
+                            .as_ref()
+                            .and_then(|versions| versions.get(&normalize_pypi_name(&name)).cloned()),
+                        source_manifest: source_manifest.clone(),
+                        kind: "normal".to_string(),
+                    },
+                );
             }
         }
     }
@@ -761,16 +882,19 @@ fn parse_pyproject_toml(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep
                     continue;
                 };
                 if let Some((name, version_req)) = parse_requirement_line(raw, manifest) {
-                    deps.push(ExternalDep {
-                        name: name.clone(),
-                        ecosystem: "pypi".to_string(),
-                        version_req,
-                        version_locked: lock_versions
-                            .as_ref()
-                            .and_then(|versions| versions.get(&normalize_pypi_name(&name)).cloned()),
-                        source_manifest: source_manifest.clone(),
-                        kind: "optional".to_string(),
-                    });
+                    push_external_dep(
+                        deps,
+                        ExternalDep {
+                            name: name.clone(),
+                            ecosystem: "pypi".to_string(),
+                            version_req,
+                            version_locked: lock_versions
+                                .as_ref()
+                                .and_then(|versions| versions.get(&normalize_pypi_name(&name)).cloned()),
+                            source_manifest: source_manifest.clone(),
+                            kind: "optional".to_string(),
+                        },
+                    );
                 }
             }
         }
@@ -785,16 +909,19 @@ fn parse_pyproject_toml(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep
                 tracing::warn!(dependency = %name, "skipping unsupported poetry dependency value");
                 continue;
             }
-            deps.push(ExternalDep {
-                name: name.clone(),
-                ecosystem: "pypi".to_string(),
-                version_req,
-                version_locked: lock_versions
-                    .as_ref()
-                    .and_then(|versions| versions.get(&normalize_pypi_name(name)).cloned()),
-                source_manifest: source_manifest.clone(),
-                kind: if optional { "optional" } else { "normal" }.to_string(),
-            });
+            push_external_dep(
+                deps,
+                ExternalDep {
+                    name: name.clone(),
+                    ecosystem: "pypi".to_string(),
+                    version_req,
+                    version_locked: lock_versions
+                        .as_ref()
+                        .and_then(|versions| versions.get(&normalize_pypi_name(name)).cloned()),
+                    source_manifest: source_manifest.clone(),
+                    kind: if optional { "optional" } else { "normal" }.to_string(),
+                },
+            );
         }
     }
 }
@@ -825,6 +952,9 @@ fn parse_pypi_toml_lock(lock: &Path, label: &str) -> Option<BTreeMap<String, Str
         ) else {
             continue;
         };
+        if !charge_manifest_index(name, version, "external dependency lock index") {
+            return None;
+        }
         versions.insert(normalize_pypi_name(name), version.to_string());
     }
     Some(versions)
@@ -1002,16 +1132,19 @@ fn parse_go_require_line(
     let (Some(name), Some(version)) = (parts.next(), parts.next()) else {
         return;
     };
-    deps.push(ExternalDep {
-        name: name.to_string(),
-        ecosystem: "go".to_string(),
-        version_req: Some(version.to_string()),
-        version_locked: lock_versions
-            .and_then(|versions| versions.get(name))
-            .and_then(|versions| versions.contains(version).then(|| version.to_string())),
-        source_manifest: source_manifest.to_string(),
-        kind: if indirect { "indirect" } else { "normal" }.to_string(),
-    });
+    push_external_dep(
+        deps,
+        ExternalDep {
+            name: name.to_string(),
+            ecosystem: "go".to_string(),
+            version_req: Some(version.to_string()),
+            version_locked: lock_versions
+                .and_then(|versions| versions.get(name))
+                .and_then(|versions| versions.contains(version).then(|| version.to_string())),
+            source_manifest: source_manifest.to_string(),
+            kind: if indirect { "indirect" } else { "normal" }.to_string(),
+        },
+    );
 }
 
 fn parse_go_sum(lock: &Path) -> Option<BTreeMap<String, BTreeSet<String>>> {
@@ -1026,6 +1159,9 @@ fn parse_go_sum(lock: &Path) -> Option<BTreeMap<String, BTreeSet<String>>> {
             continue;
         }
         let version = raw_version;
+        if !charge_manifest_index(name, version, "external dependency lock index") {
+            return None;
+        }
         versions
             .entry(name.to_string())
             .or_default()
@@ -1038,6 +1174,9 @@ fn parse_maven_pom(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
     let Some(contents) = read_utf8_file(manifest, "pom.xml") else {
         return;
     };
+    if !charge_manifest_document(&contents, "pom.xml") {
+        return;
+    }
     let document = match roxmltree::Document::parse(&contents) {
         Ok(document) => document,
         Err(err) => {
@@ -1053,7 +1192,12 @@ fn parse_maven_pom(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
     if let Some(property_node) = xml_child(project, "properties") {
         for property in property_node.children().filter(roxmltree::Node::is_element) {
             if let Some(value) = property.text() {
-                properties.insert(property.tag_name().name().to_string(), value.trim().to_string());
+                let name = property.tag_name().name();
+                let value = value.trim();
+                if !charge_manifest_index(name, value, "manifest property index") {
+                    return;
+                }
+                properties.insert(name.to_string(), value.to_string());
             }
         }
     }
@@ -1083,14 +1227,17 @@ fn parse_maven_pom(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
         } else {
             "normal"
         };
-        deps.push(ExternalDep {
-            name: format!("{group}:{artifact}"),
-            ecosystem: "maven".to_string(),
-            version_req,
-            version_locked: None,
-            source_manifest: source_manifest.clone(),
-            kind: kind.to_string(),
-        });
+        push_external_dep(
+            deps,
+            ExternalDep {
+                name: format!("{group}:{artifact}"),
+                ecosystem: "maven".to_string(),
+                version_req,
+                version_locked: None,
+                source_manifest: source_manifest.clone(),
+                kind: kind.to_string(),
+            },
+        );
     }
 }
 
@@ -1166,19 +1313,22 @@ fn parse_gradle_manifest(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDe
         {
             continue;
         }
-        deps.push(ExternalDep {
-            name: format!("{}:{}", parts[0], parts[1]),
-            ecosystem: "maven".to_string(),
-            version_req: Some(parts[2].to_string()),
-            version_locked: None,
-            source_manifest: source_manifest.clone(),
-            kind: if configuration.as_str().to_ascii_lowercase().contains("test") {
-                "dev"
-            } else {
-                "normal"
-            }
-            .to_string(),
-        });
+        push_external_dep(
+            deps,
+            ExternalDep {
+                name: format!("{}:{}", parts[0], parts[1]),
+                ecosystem: "maven".to_string(),
+                version_req: Some(parts[2].to_string()),
+                version_locked: None,
+                source_manifest: source_manifest.clone(),
+                kind: if configuration.as_str().to_ascii_lowercase().contains("test") {
+                    "dev"
+                } else {
+                    "normal"
+                }
+                .to_string(),
+            },
+        );
     }
 }
 
@@ -1248,6 +1398,9 @@ fn parse_gemfile(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
             continue;
         }
         if line.starts_with("group ") || line.starts_with("group(") {
+            if crate::repo_scan_policy::charge_generated_work(1, 1, "Gemfile block stack").is_err() {
+                return;
+            }
             block_stack.push(line.contains(":test") || line.contains(":development"));
             continue;
         }
@@ -1256,6 +1409,9 @@ fn parse_gemfile(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
             continue;
         }
         if line.ends_with(" do") {
+            if crate::repo_scan_policy::charge_generated_work(1, 1, "Gemfile block stack").is_err() {
+                return;
+            }
             block_stack.push(false);
         }
         let Some(rest) = line
@@ -1269,21 +1425,24 @@ fn parse_gemfile(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
             continue;
         };
         let version_req = gem_version_req(rest, &quoted);
-        deps.push(ExternalDep {
-            name: name.value.clone(),
-            ecosystem: "rubygems".to_string(),
-            version_req,
-            version_locked: lock_versions
-                .as_ref()
-                .and_then(|versions| versions.get(&name.value).cloned()),
-            source_manifest: source_manifest.clone(),
-            kind: if block_stack.iter().any(|is_dev| *is_dev) {
-                "dev"
-            } else {
-                "normal"
-            }
-            .to_string(),
-        });
+        push_external_dep(
+            deps,
+            ExternalDep {
+                name: name.value.clone(),
+                ecosystem: "rubygems".to_string(),
+                version_req,
+                version_locked: lock_versions
+                    .as_ref()
+                    .and_then(|versions| versions.get(&name.value).cloned()),
+                source_manifest: source_manifest.clone(),
+                kind: if block_stack.iter().any(|is_dev| *is_dev) {
+                    "dev"
+                } else {
+                    "normal"
+                }
+                .to_string(),
+            },
+        );
     }
 }
 
@@ -1295,27 +1454,52 @@ struct RubyQuotedLiteral {
 
 fn ruby_quoted_literals(value: &str) -> Vec<RubyQuotedLiteral> {
     let mut values = Vec::new();
-    let mut chars = value.char_indices().peekable();
-    while let Some((start, ch)) = chars.next() {
-        if ch != '\'' && ch != '"' {
+    let bytes = value.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() && values.len() < 64 {
+        let quote = bytes[cursor];
+        if quote != b'\'' && quote != b'"' {
+            cursor += 1;
             continue;
         }
-        let quote = ch;
-        let mut literal = String::new();
+        let start = cursor;
+        let content_start = cursor + 1;
+        cursor = content_start;
         let mut escaped = false;
-        for (_, next) in chars.by_ref() {
+        let mut end = None;
+        while cursor < bytes.len() {
+            let next = bytes[cursor];
             if escaped {
-                literal.push(next);
                 escaped = false;
-            } else if next == '\\' {
+            } else if next == b'\\' {
                 escaped = true;
             } else if next == quote {
-                values.push(RubyQuotedLiteral { value: literal, start });
+                end = Some(cursor);
+                cursor += 1;
                 break;
+            }
+            cursor += 1;
+        }
+        let Some(end) = end else {
+            break;
+        };
+        let raw = &value[content_start..end];
+        if crate::repo_scan_policy::charge_generated_work(1, raw.len(), "Gemfile quoted literal").is_err() {
+            break;
+        }
+        let mut literal = String::with_capacity(raw.len());
+        let mut escaped = false;
+        for ch in raw.chars() {
+            if escaped {
+                literal.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
             } else {
-                literal.push(next);
+                literal.push(ch);
             }
         }
+        values.push(RubyQuotedLiteral { value: literal, start });
     }
     values
 }
@@ -1377,6 +1561,9 @@ fn parse_gemfile_lock(lock: &Path) -> Option<BTreeMap<String, String>> {
         };
         let name = name.as_str();
         let version = version.as_str();
+        if !charge_manifest_index(name, version, "external dependency lock index") {
+            return None;
+        }
         versions
             .entry(name.to_string())
             .and_modify(|existing| {
@@ -1403,6 +1590,9 @@ fn parse_csproj(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
     let Some(contents) = read_utf8_file(manifest, "csproj") else {
         return;
     };
+    if !charge_manifest_document(&contents, "csproj") {
+        return;
+    }
     let document = match roxmltree::Document::parse(&contents) {
         Ok(document) => document,
         Err(err) => {
@@ -1435,19 +1625,25 @@ fn parse_csproj(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
                     .as_ref()
                     .and_then(|versions| versions.get(&key).cloned())
             });
-        deps.push(ExternalDep {
-            name: name.to_string(),
-            ecosystem: "nuget".to_string(),
-            version_req,
-            version_locked: lock_versions.as_ref().and_then(|versions| versions.get(&key).cloned()),
-            source_manifest: source_manifest.clone(),
-            kind: "normal".to_string(),
-        });
+        push_external_dep(
+            deps,
+            ExternalDep {
+                name: name.to_string(),
+                ecosystem: "nuget".to_string(),
+                version_req,
+                version_locked: lock_versions.as_ref().and_then(|versions| versions.get(&key).cloned()),
+                source_manifest: source_manifest.clone(),
+                kind: "normal".to_string(),
+            },
+        );
     }
 }
 
 fn parse_nuget_central_versions(props: &Path) -> Option<BTreeMap<String, String>> {
     let contents = read_utf8_file(props, "Directory.Packages.props")?;
+    if !charge_manifest_document(&contents, "Directory.Packages.props") {
+        return None;
+    }
     let document = match roxmltree::Document::parse(&contents) {
         Ok(document) => document,
         Err(err) => {
@@ -1465,6 +1661,9 @@ fn parse_nuget_central_versions(props: &Path) -> Option<BTreeMap<String, String>
             .map(ToString::to_string)
             .or_else(|| xml_child_text(package, "Version"));
         if let Some(version) = version {
+            if !charge_manifest_index(name, &version, "external dependency lock index") {
+                return None;
+            }
             versions.insert(name.to_ascii_lowercase(), version);
         }
     }
@@ -1473,13 +1672,7 @@ fn parse_nuget_central_versions(props: &Path) -> Option<BTreeMap<String, String>
 
 fn parse_nuget_lock(lock: &Path) -> Option<BTreeMap<String, String>> {
     let contents = read_utf8_lockfile(lock, "packages.lock.json")?;
-    let value = match serde_json::from_str::<serde_json::Value>(&contents) {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::warn!(path = %lock.display(), ?err, "failed to parse packages.lock.json");
-            return None;
-        }
-    };
+    let value = parse_json(&contents, lock, "packages.lock.json")?;
     let mut versions = BTreeMap::new();
     let Some(frameworks) = value.get("dependencies").and_then(serde_json::Value::as_object) else {
         return Some(versions);
@@ -1492,6 +1685,9 @@ fn parse_nuget_lock(lock: &Path) -> Option<BTreeMap<String, String>> {
             let Some(version) = package.get("resolved").and_then(serde_json::Value::as_str) else {
                 continue;
             };
+            if !charge_manifest_index(name, version, "external dependency lock index") {
+                return None;
+            }
             versions.insert(name.to_ascii_lowercase(), version.to_string());
         }
     }
@@ -1543,16 +1739,19 @@ fn parse_swift_package(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>
                 Some(format!("{label}: {value}"))
             })
         });
-        deps.push(ExternalDep {
-            name: name.clone(),
-            ecosystem: "swiftpm".to_string(),
-            version_req,
-            version_locked: lock_versions
-                .as_ref()
-                .and_then(|versions| versions.get(&name.to_ascii_lowercase()).cloned()),
-            source_manifest: source_manifest.clone(),
-            kind: "normal".to_string(),
-        });
+        push_external_dep(
+            deps,
+            ExternalDep {
+                name: name.clone(),
+                ecosystem: "swiftpm".to_string(),
+                version_req,
+                version_locked: lock_versions
+                    .as_ref()
+                    .and_then(|versions| versions.get(&name.to_ascii_lowercase()).cloned()),
+                source_manifest: source_manifest.clone(),
+                kind: "normal".to_string(),
+            },
+        );
     }
 }
 
@@ -1564,13 +1763,7 @@ fn package_name_from_url(url: &str) -> Option<String> {
 
 fn parse_swift_package_resolved(lock: &Path) -> Option<BTreeMap<String, String>> {
     let contents = read_utf8_lockfile(lock, "Package.resolved")?;
-    let value = match serde_json::from_str::<serde_json::Value>(&contents) {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::warn!(path = %lock.display(), ?err, "failed to parse Package.resolved");
-            return None;
-        }
-    };
+    let value = parse_json(&contents, lock, "Package.resolved")?;
     let mut versions = BTreeMap::new();
     let pins = value
         .get("pins")
@@ -1600,6 +1793,9 @@ fn parse_swift_package_resolved(lock: &Path) -> Option<BTreeMap<String, String>>
             .and_then(|state| state.get("version"))
             .and_then(serde_json::Value::as_str);
         if let (Some(name), Some(version)) = (name, version) {
+            if !charge_manifest_index(&name, version, "external dependency lock index") {
+                return None;
+            }
             versions.insert(name.to_ascii_lowercase(), version.to_string());
         }
     }
@@ -1610,12 +1806,8 @@ fn parse_composer_manifest(root: &Path, manifest: &Path, deps: &mut Vec<External
     let Some(contents) = read_utf8_file(manifest, "composer.json") else {
         return;
     };
-    let value = match serde_json::from_str::<serde_json::Value>(&contents) {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::warn!(path = %manifest.display(), ?err, "failed to parse composer.json");
-            return;
-        }
+    let Some(value) = parse_json(&contents, manifest, "composer.json") else {
+        return;
     };
     let Some(source_manifest) = rel_path(root, manifest) else {
         return;
@@ -1635,16 +1827,19 @@ fn parse_composer_manifest(root: &Path, manifest: &Path, deps: &mut Vec<External
                 tracing::warn!(path = %manifest.display(), dependency = %name, "skipping non-string Composer requirement");
                 continue;
             };
-            deps.push(ExternalDep {
-                name: name.clone(),
-                ecosystem: "composer".to_string(),
-                version_req: Some(version_req.to_string()),
-                version_locked: lock_versions
-                    .as_ref()
-                    .and_then(|versions| versions.get(&lower).cloned()),
-                source_manifest: source_manifest.clone(),
-                kind: kind.to_string(),
-            });
+            push_external_dep(
+                deps,
+                ExternalDep {
+                    name: name.clone(),
+                    ecosystem: "composer".to_string(),
+                    version_req: Some(version_req.to_string()),
+                    version_locked: lock_versions
+                        .as_ref()
+                        .and_then(|versions| versions.get(&lower).cloned()),
+                    source_manifest: source_manifest.clone(),
+                    kind: kind.to_string(),
+                },
+            );
         }
     }
 }
@@ -1667,13 +1862,7 @@ fn is_composer_platform_package(name: &str) -> bool {
 
 fn parse_composer_lock(lock: &Path) -> Option<BTreeMap<String, String>> {
     let contents = read_utf8_lockfile(lock, "composer.lock")?;
-    let value = match serde_json::from_str::<serde_json::Value>(&contents) {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::warn!(path = %lock.display(), ?err, "failed to parse composer.lock");
-            return None;
-        }
-    };
+    let value = parse_json(&contents, lock, "composer.lock")?;
     let mut versions = BTreeMap::new();
     for section in ["packages", "packages-dev"] {
         let Some(packages) = value.get(section).and_then(serde_json::Value::as_array) else {
@@ -1686,6 +1875,9 @@ fn parse_composer_lock(lock: &Path) -> Option<BTreeMap<String, String>> {
             ) else {
                 continue;
             };
+            if !charge_manifest_index(name, version, "external dependency lock index") {
+                return None;
+            }
             versions.insert(name.to_ascii_lowercase(), version.to_string());
         }
     }
@@ -1701,6 +1893,26 @@ mod tests {
         deps.iter()
             .find(|dep| dep.ecosystem == ecosystem && dep.source_manifest == source_manifest && dep.name == name)
             .expect("dependency")
+    }
+
+    #[test]
+    fn manifest_discovery_uses_the_shared_entry_budget() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for name in ["a.json", "b.json", "c.json"] {
+            std::fs::write(tmp.path().join(name), "{}").expect("fixture");
+        }
+        let canonical = tmp.path().canonicalize().expect("canonical root");
+        let policy = crate::repo_scan_policy::RepoScanPolicy::for_test_roots(
+            vec![canonical.clone()],
+            crate::repo_scan_policy::RepoScanLimits {
+                max_files: 2,
+                ..crate::repo_scan_policy::RepoScanLimits::default()
+            },
+        );
+        let error = policy
+            .execute(&canonical, scan_external_deps_in_context)
+            .expect_err("manifest walker entry cap");
+        assert!(error.to_string().contains("filesystem entries"));
     }
 
     #[test]
@@ -2764,16 +2976,14 @@ let package = Package(
 
     #[cfg(unix)]
     #[test]
-    fn symlink_loop_is_skipped() {
+    fn symlink_loop_rejects_the_manifest_scan() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let nested = tmp.path().join("a/b");
         std::fs::create_dir_all(&nested).expect("nested dirs");
         std::os::unix::fs::symlink(tmp.path(), nested.join("loop")).expect("symlink");
         std::fs::write(tmp.path().join("package.json"), r#"{"dependencies":{"left-pad":"1"}}"#).expect("package");
 
-        let deps = scan_external_deps(tmp.path());
-        assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0].name, "left-pad");
+        assert!(scan_external_deps(tmp.path()).is_empty());
     }
 
     #[test]

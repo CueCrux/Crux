@@ -20,6 +20,52 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+const MAX_FACT_JOURNAL_RECORD_BYTES: usize = 64 * 1024 * 1024;
+const LATEST_ONLY_COMPACTION_STALE_BYTES: u64 = 64 * 1024 * 1024;
+const LATEST_ONLY_COMPACTION_STALE_EVENTS: usize = 128;
+
+#[derive(Debug)]
+struct DurabilityIndeterminate {
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for DurabilityIndeterminate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "fact journal append durability is indeterminate; restart required: {}",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for DurabilityIndeterminate {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn indeterminate_durability_error(source: std::io::Error) -> std::io::Error {
+    std::io::Error::other(DurabilityIndeterminate { source })
+}
+
+pub fn is_durability_indeterminate(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<DurabilityIndeterminate>())
+}
+
+fn serialize_journal_event_with_limit(event: &JournalEvent, max_bytes: usize) -> std::io::Result<String> {
+    let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
+    if line.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("fact journal record exceeds the {max_bytes}-byte append ceiling"),
+        ));
+    }
+    Ok(line)
+}
+
 /// Journal event for fact persistence.
 //
 // `large_enum_variant`: `Store` legitimately carries a whole `Fact` and is the
@@ -35,6 +81,11 @@ use thiserror::Error;
 enum JournalEvent {
     #[serde(rename = "store")]
     Store { fact: Fact },
+    /// Latest-only replacement for bounded control-plane records. Unlike a
+    /// versioned store, replay removes the named predecessors from all indexes
+    /// before inserting `fact`, so churn cannot accumulate resident history.
+    #[serde(rename = "replace_latest")]
+    ReplaceLatest { fact: Fact, replaced_fact_ids: Vec<String> },
     #[serde(rename = "store_batch")]
     StoreBatch { facts: Vec<Fact> },
     #[serde(rename = "delete")]
@@ -495,6 +546,25 @@ pub struct FactStore {
     consolidation_sources: HashMap<String, Vec<String>>,
     /// Path to the JSONL journal file. `None` for pure in-memory mode.
     journal_path: Option<PathBuf>,
+    /// A newline-complete durable append whose fsync outcome is unknown may
+    /// replay after restart even though its caller received an error. Block
+    /// every later authority-changing durable append so a retry cannot create
+    /// a competing history from stale resident state.
+    durability_poisoned: std::sync::atomic::AtomicBool,
+    /// Number of pre-sidecar `__repo_scan__` journal records skipped by the
+    /// bounded replay reader. Each such record is at least 64 MiB, so a scalar
+    /// keeps resident recovery state constant-size.
+    oversized_legacy_scan_records_skipped: std::sync::atomic::AtomicUsize,
+    /// Approximate value bytes and event count made obsolete by latest-only
+    /// daemon-control replacements since the last successful compaction.
+    latest_only_pruned_bytes: std::sync::atomic::AtomicU64,
+    latest_only_pruned_events: std::sync::atomic::AtomicUsize,
+    /// A malformed newline-delimited event was skipped during replay. Automatic
+    /// compaction must not erase that evidence; only explicit operator
+    /// compaction may choose to do so.
+    journal_replay_corruption_detected: std::sync::atomic::AtomicBool,
+    #[cfg(any(test, feature = "test-support"))]
+    fail_next_durable_append_after_write: std::sync::atomic::AtomicBool,
     /// Optional event bus for real-time mutation notifications.
     event_bus: Option<crate::events::EventBus>,
     /// Optional embedder for dense vector retrieval. Any [`crate::embeddings::Embedder`]:
@@ -530,6 +600,10 @@ pub struct NearDuplicate {
 /// completed its record delimiter and therefore may not have returned success
 /// to the caller. Newline-terminated corruption remains fail-visible.
 fn repair_torn_journal_tail(path: &Path) -> std::io::Result<()> {
+    repair_torn_journal_tail_with_limit(path, MAX_FACT_JOURNAL_RECORD_BYTES as u64)
+}
+
+fn repair_torn_journal_tail_with_limit(path: &Path, max_quarantine_bytes: u64) -> std::io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
@@ -562,24 +636,46 @@ fn repair_torn_journal_tail(path: &Path) -> std::io::Result<()> {
         cursor = start;
     }
     let tail_len = len.saturating_sub(tail_start);
-    const MAX_RECOVERY_TAIL_BYTES: u64 = 64 * 1024 * 1024;
-    if tail_len > MAX_RECOVERY_TAIL_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("unterminated fact journal tail is {tail_len} bytes"),
-        ));
-    }
-    let mut tail = vec![0_u8; tail_len as usize];
-    file.seek(SeekFrom::Start(tail_start))?;
-    file.read_exact(&mut tail)?;
-    let quarantine = path.with_extension(format!("jsonl.torn.{}", uuid::Uuid::new_v4().simple()));
+    let oversized = tail_len > max_quarantine_bytes;
+    let quarantine_suffix = if oversized {
+        format!("jsonl.torn.{}.metadata.json", uuid::Uuid::new_v4().simple())
+    } else {
+        format!("jsonl.torn.{}", uuid::Uuid::new_v4().simple())
+    };
+    let quarantine = path.with_extension(quarantine_suffix);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
     let mut torn = options.open(&quarantine)?;
-    torn.write_all(&tail)?;
+    if oversized {
+        serde_json::to_writer(
+            &mut torn,
+            &serde_json::json!({
+                "schema_version": 1,
+                "tail_start": tail_start,
+                "tail_len": tail_len,
+                "capture_limit_bytes": max_quarantine_bytes,
+                "reason": "oversized_unterminated_uncommitted_record",
+            }),
+        )
+        .map_err(std::io::Error::other)?;
+        torn.write_all(b"\n")?;
+    } else {
+        let tail_size = usize::try_from(tail_len)
+            .map_err(|_| std::io::Error::other("torn fact journal tail length does not fit usize"))?;
+        let mut tail = vec![0_u8; tail_size];
+        file.seek(SeekFrom::Start(tail_start))?;
+        file.read_exact(&mut tail)?;
+        torn.write_all(&tail)?;
+    }
     torn.sync_all()?;
+    // Fence the quarantine directory entry before destructively truncating
+    // the source. A crash must never lose both the uncommitted tail and its
+    // quarantine/metadata record.
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
     file.set_len(tail_start)?;
     file.sync_all()?;
     if let Some(parent) = path.parent() {
@@ -588,15 +684,103 @@ fn repair_torn_journal_tail(path: &Path) -> std::io::Result<()> {
     tracing::error!(
         journal = %path.display(),
         quarantine = %quarantine.display(),
-        bytes = tail.len(),
+        bytes = tail_len,
+        payload_captured = !oversized,
         "quarantined torn fact-journal tail before durable append"
     );
     Ok(())
 }
 
+#[derive(Debug)]
+enum BoundedJournalRecord {
+    Json(Vec<u8>),
+    OversizedLegacyScan,
+}
+
+fn read_bounded_journal_record(
+    reader: &mut impl BufRead,
+    max_bytes: usize,
+) -> std::io::Result<Option<BoundedJournalRecord>> {
+    let mut line = Vec::with_capacity(max_bytes.min(64 * 1024));
+    let mut oversized_legacy_scan = false;
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return if line.is_empty() && !oversized_legacy_scan {
+                Ok(None)
+            } else if oversized_legacy_scan {
+                Ok(Some(BoundedJournalRecord::OversizedLegacyScan))
+            } else {
+                Ok(Some(BoundedJournalRecord::Json(line)))
+            };
+        }
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let payload_len = newline.unwrap_or(buffer.len());
+        if !oversized_legacy_scan {
+            if payload_len <= max_bytes.saturating_sub(line.len()) {
+                line.extend_from_slice(&buffer[..payload_len]);
+            } else {
+                let remaining = max_bytes.saturating_sub(line.len());
+                line.extend_from_slice(&buffer[..remaining]);
+                let is_store_event = line.starts_with(br#"{"op":"store","fact":{"#);
+                let legacy_scan_markers = [
+                    br#""entity":"__repo_scan__::"#.as_slice(),
+                    br#""entity":"__workspace_scan__::"#.as_slice(),
+                ];
+                let is_legacy_scan = is_store_event
+                    && legacy_scan_markers
+                        .iter()
+                        .any(|marker| line.windows(marker.len()).any(|window| window == *marker));
+                if !is_legacy_scan {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("fact journal record exceeds the {max_bytes}-byte replay ceiling"),
+                    ));
+                }
+                oversized_legacy_scan = true;
+                line.clear();
+                line.shrink_to_fit();
+            }
+        }
+        let consumed = newline.map_or(buffer.len(), |index| index + 1);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return if oversized_legacy_scan {
+                Ok(Some(BoundedJournalRecord::OversizedLegacyScan))
+            } else {
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                Ok(Some(BoundedJournalRecord::Json(line)))
+            };
+        }
+    }
+}
+
 impl FactStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether mutations are backed by the durable JSONL journal.
+    pub fn persistence_enabled(&self) -> bool {
+        self.journal_path.is_some()
+    }
+
+    /// Whether a durable append may have committed on disk without being
+    /// reflected in resident state.
+    ///
+    /// Callers that coordinate destructive cleanup with FactStore authority
+    /// must treat this as a global preservation barrier until restart/replay.
+    pub fn journal_durability_poisoned(&self) -> bool {
+        self.durability_poisoned.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fail_next_durable_append_after_write_for_test(&self) {
+        self.fail_next_durable_append_after_write
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Attach an event bus so that `store()` and `delete()` emit real-time events.
@@ -774,6 +958,13 @@ impl FactStore {
             key_index: HashMap::new(),
             consolidation_sources: HashMap::new(),
             journal_path: Some(journal_path.clone()),
+            durability_poisoned: std::sync::atomic::AtomicBool::new(false),
+            oversized_legacy_scan_records_skipped: std::sync::atomic::AtomicUsize::new(0),
+            latest_only_pruned_bytes: std::sync::atomic::AtomicU64::new(0),
+            latest_only_pruned_events: std::sync::atomic::AtomicUsize::new(0),
+            journal_replay_corruption_detected: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-support"))]
+            fail_next_durable_append_after_write: std::sync::atomic::AtomicBool::new(false),
             event_bus: None,
             embedder: None,
             embeddings: HashMap::new(),
@@ -781,6 +972,11 @@ impl FactStore {
             near_duplicates: Vec::new(),
         };
         if journal_path.exists() {
+            // A record is committed only after its newline-delimited append
+            // completed. Repair before replay so a parseable but unterminated
+            // crash tail cannot resurrect control state whose caller never
+            // observed a successful durable write.
+            repair_torn_journal_tail(&journal_path)?;
             store.replay_journal(&journal_path)?;
         }
         Ok(store)
@@ -791,7 +987,7 @@ impl FactStore {
         if let Some(path) = &self.journal_path {
             repair_torn_journal_tail(path)?;
             let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-            let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
+            let line = serialize_journal_event_with_limit(event, MAX_FACT_JOURNAL_RECORD_BYTES)?;
             writeln!(file, "{}", line)?;
         }
         Ok(())
@@ -805,13 +1001,41 @@ impl FactStore {
         let Some(path) = &self.journal_path else {
             return Ok(());
         };
+        if self.durability_poisoned.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(std::io::Error::other(
+                "fact journal durable mutation plane is poisoned; restart required",
+            ));
+        }
         repair_torn_journal_tail(path)?;
         let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-        let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
-        writeln!(file, "{}", line)?;
-        file.sync_all()?;
+        let line = serialize_journal_event_with_limit(event, MAX_FACT_JOURNAL_RECORD_BYTES)?;
+        if let Err(error) = writeln!(file, "{}", line) {
+            self.durability_poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(indeterminate_durability_error(error));
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if self
+            .fail_next_durable_append_after_write
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.durability_poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(indeterminate_durability_error(std::io::Error::other(
+                "injected failure after newline write",
+            )));
+        }
+        if let Err(error) = file.sync_all() {
+            self.durability_poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(indeterminate_durability_error(error));
+        }
         if let Some(parent) = path.parent() {
-            std::fs::File::open(parent)?.sync_all()?;
+            if let Err(error) = std::fs::File::open(parent).and_then(|directory| directory.sync_all()) {
+                self.durability_poisoned
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(indeterminate_durability_error(error));
+            }
         }
         Ok(())
     }
@@ -819,20 +1043,59 @@ impl FactStore {
     /// Replay a JSONL journal file to rebuild in-memory state.
     /// Corrupted or blank lines are skipped with a warning.
     fn replay_journal(&mut self, path: &Path) -> std::io::Result<()> {
+        self.replay_journal_with_record_limit(path, MAX_FACT_JOURNAL_RECORD_BYTES)
+    }
+
+    fn replay_journal_with_record_limit(&mut self, path: &Path, record_limit: usize) -> std::io::Result<()> {
         let file = std::fs::File::open(path)?;
-        let reader = std::io::BufReader::new(file);
-        for (line_no, line) in reader.lines().enumerate() {
-            let line = line?;
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
+        let mut reader = std::io::BufReader::new(file);
+        let mut line_no = 0usize;
+        while let Some(record) = read_bounded_journal_record(&mut reader, record_limit)? {
+            line_no = line_no.saturating_add(1);
+            let BoundedJournalRecord::Json(line) = record else {
+                self.oversized_legacy_scan_records_skipped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    line_no,
+                    max_bytes = record_limit,
+                    "oversized-legacy-scan-journal-record-quarantined-from-replay"
+                );
+                continue;
+            };
+            if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            match serde_json::from_str::<JournalEvent>(trimmed) {
-                Ok(JournalEvent::Store { fact }) => {
+            match serde_json::from_slice::<JournalEvent>(&line) {
+                Ok(JournalEvent::Store { mut fact }) => {
+                    crate::fact_privacy::enforce_global_fact(&mut fact);
+                    self.prune_replayed_latest_only_control_predecessors(&fact);
+                    let _ = self.replay_journal_insert(fact);
+                }
+                Ok(JournalEvent::ReplaceLatest {
+                    mut fact,
+                    replaced_fact_ids,
+                }) => {
+                    crate::fact_privacy::enforce_global_fact(&mut fact);
+                    for fact_id in replaced_fact_ids {
+                        let matching = self.facts.get(&fact_id).is_some_and(|previous| {
+                            previous.tenant_hash == fact.tenant_hash
+                                && previous.entity == fact.entity
+                                && previous.key == fact.key
+                        });
+                        if matching {
+                            if let Some(previous) = self.facts.get(&fact_id) {
+                                self.record_latest_only_pruned_fact(previous);
+                            }
+                            self.hard_remove_fact(&fact_id);
+                        }
+                    }
+                    self.prune_replayed_latest_only_control_predecessors(&fact);
                     let _ = self.replay_journal_insert(fact);
                 }
                 Ok(JournalEvent::StoreBatch { facts }) => {
-                    for fact in facts {
+                    for mut fact in facts {
+                        crate::fact_privacy::enforce_global_fact(&mut fact);
+                        self.prune_replayed_latest_only_control_predecessors(&fact);
                         let _ = self.replay_journal_insert(fact);
                     }
                 }
@@ -1021,12 +1284,69 @@ impl FactStore {
                     }
                 }
                 Err(err) => {
-                    tracing::warn!(line_no = line_no + 1, ?err, "fact-journal-parse-skip");
+                    self.journal_replay_corruption_detected
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    tracing::warn!(line_no, ?err, "fact-journal-parse-skip");
                 }
             }
         }
         self.sanitize_replayed_links();
         Ok(())
+    }
+
+    pub fn oversized_legacy_scan_records_skipped(&self) -> usize {
+        self.oversized_legacy_scan_records_skipped
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn journal_replay_corruption_detected(&self) -> bool {
+        self.journal_replay_corruption_detected
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn prune_replayed_latest_only_control_predecessors(&mut self, fact: &Fact) {
+        if !Self::is_latest_only_control_fact(fact) {
+            return;
+        }
+        let chain_key = (fact.tenant_hash.clone(), fact.entity.clone(), fact.key.clone());
+        let previous_ids = self.key_index.get(&chain_key).cloned().unwrap_or_default();
+        for fact_id in previous_ids {
+            if let Some(previous) = self.facts.get(&fact_id) {
+                self.record_latest_only_pruned_fact(previous);
+            }
+            self.hard_remove_fact(&fact_id);
+        }
+    }
+
+    fn is_latest_only_control_fact(fact: &Fact) -> bool {
+        fact.private
+            && fact.key == "content"
+            && (fact.entity.starts_with("__repo_registry__::")
+                || fact.entity.starts_with("__repo_scan__::")
+                || fact.entity.starts_with("__workspace_scan__::"))
+    }
+
+    fn record_latest_only_pruned_fact(&self, fact: &Fact) {
+        if !Self::is_latest_only_control_fact(fact) {
+            return;
+        }
+        let approximate_bytes = (fact.value.len() as u64)
+            .saturating_add(fact.entity.len() as u64)
+            .saturating_add(fact.key.len() as u64)
+            .saturating_add(fact.fact_id.len() as u64)
+            .saturating_add(512);
+        self.latest_only_pruned_bytes
+            .fetch_add(approximate_bytes, std::sync::atomic::Ordering::Relaxed);
+        self.latest_only_pruned_events
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn latest_only_compaction_required(&self) -> bool {
+        let stale_bytes = self.latest_only_pruned_bytes.load(std::sync::atomic::Ordering::Acquire);
+        let stale_events = self
+            .latest_only_pruned_events
+            .load(std::sync::atomic::Ordering::Acquire);
+        stale_bytes >= LATEST_ONLY_COMPACTION_STALE_BYTES || stale_events >= LATEST_ONLY_COMPACTION_STALE_EVENTS
     }
 
     /// Remove legacy/malicious cross-tenant chain edges after replay without
@@ -1446,6 +1766,108 @@ impl FactStore {
         Ok(fact)
     }
 
+    /// Store one authority-bearing fact only after synchronizing its journal
+    /// event and parent directory. Kept crate-private so ordinary fact writes
+    /// do not accidentally opt into one-fsync-per-fact latency.
+    pub(crate) fn try_store_durable(&mut self, mut req: StoreFact) -> std::io::Result<Fact> {
+        crate::fact_privacy::enforce_global(&mut req);
+        let fact = self.build_fact(req);
+        self.append_journal_durable(&JournalEvent::Store { fact: fact.clone() })?;
+        self.insert_fact_indexes(&fact);
+        self.supersede_prior_version(&fact);
+        self.after_fact_stored(&fact);
+        Ok(fact)
+    }
+
+    /// Atomically replace every resident version of one `(tenant, entity,
+    /// key)` with a single latest value. The journal records one replayable
+    /// replacement event, so superseded control-plane snapshots do not remain
+    /// resident after restart.
+    ///
+    /// This is for bounded daemon control state whose history is not a domain
+    /// audit artifact. Ordinary facts should continue to use [`Self::store`].
+    pub fn try_replace_latest_daemon_control(&mut self, mut req: StoreFact) -> std::io::Result<Fact> {
+        const LATEST_ONLY_CONTROL_PREFIXES: &[&str] =
+            &["__repo_registry__::", "__repo_scan__::", "__workspace_scan__::"];
+        if !req.private
+            || !LATEST_ONLY_CONTROL_PREFIXES
+                .iter()
+                .any(|prefix| req.entity.starts_with(prefix))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "latest-only replacement is restricted to private daemon-control snapshots",
+            ));
+        }
+        crate::fact_privacy::enforce_global(&mut req);
+        if self.latest_only_compaction_required() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "latest-only fact journal reached its stale-history ceiling; run explicit fact journal compaction before another replacement",
+            ));
+        }
+        let chain_key = (req.tenant_hash.clone(), req.entity.clone(), req.key.clone());
+        let replaced_fact_ids = self.key_index.get(&chain_key).cloned().unwrap_or_default();
+        if !replaced_fact_ids.is_empty()
+            && self
+                .active_legal_holds()
+                .iter()
+                .any(|hold| hold.covers_stored_or_logical_repo_control(&req.tenant_hash, &req.entity))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "latest-only replacement blocked by an active legal hold",
+            ));
+        }
+        let mut fact = self.build_fact(req);
+        fact.supersedes = None;
+        self.append_journal_durable(&JournalEvent::ReplaceLatest {
+            fact: fact.clone(),
+            replaced_fact_ids: replaced_fact_ids.clone(),
+        })?;
+        for fact_id in replaced_fact_ids {
+            if let Some(previous) = self.facts.get(&fact_id) {
+                self.record_latest_only_pruned_fact(previous);
+            }
+            self.hard_remove_fact(&fact_id);
+        }
+        self.insert_fact_indexes(&fact);
+        self.after_fact_stored(&fact);
+        Ok(fact)
+    }
+
+    fn hard_remove_fact(&mut self, fact_id: &str) {
+        let Some(fact) = self.facts.remove(fact_id) else {
+            return;
+        };
+        let remove_entity_index = if let Some(ids) = self.entity_index.get_mut(&fact.entity) {
+            ids.retain(|candidate| candidate != fact_id);
+            ids.is_empty()
+        } else {
+            false
+        };
+        if remove_entity_index {
+            self.entity_index.remove(&fact.entity);
+        }
+        let key = (fact.tenant_hash.clone(), fact.entity.clone(), fact.key.clone());
+        let remove_key_index = if let Some(ids) = self.key_index.get_mut(&key) {
+            ids.retain(|candidate| candidate != fact_id);
+            ids.is_empty()
+        } else {
+            false
+        };
+        if remove_key_index {
+            self.key_index.remove(&key);
+        }
+        self.embeddings.remove(fact_id);
+        self.near_duplicates
+            .retain(|candidate| candidate.fact_id != fact_id && candidate.similar_to != fact_id);
+        self.consolidation_sources.remove(fact_id);
+        for sources in self.consolidation_sources.values_mut() {
+            sources.retain(|candidate| candidate != fact_id);
+        }
+    }
+
     /// Retire the immediate predecessor of a freshly-stored `(entity, key)`
     /// version in the recall plane. [`Self::build_fact`] sets `fact.supersedes`
     /// to the prior non-deleted version's id when a chain already exists;
@@ -1553,7 +1975,7 @@ impl FactStore {
         {
             return Ok(false);
         }
-        self.append_journal(&JournalEvent::Delete {
+        self.append_journal_durable(&JournalEvent::Delete {
             fact_id: fact_id.to_string(),
             deleted_at: Utc::now().to_rfc3339(),
         })?;
@@ -1641,6 +2063,37 @@ impl FactStore {
             .into_iter()
             .filter(|f| f.tenant_hash == tenant_hash)
             .collect()
+    }
+
+    /// Internal control-plane lookup that returns exactly one live latest row
+    /// per key-chain beneath `entity_prefix`, without relevance ranking or a
+    /// `top_k` truncation before deduplication.
+    pub fn latest_by_entity_prefix<'a>(
+        &'a self,
+        tenant_hash: &str,
+        entity_prefix: &str,
+        key_filter: Option<&str>,
+    ) -> Vec<&'a Fact> {
+        let mut latest = Vec::new();
+        for ((tenant, entity, key), ids) in &self.key_index {
+            if tenant != tenant_hash
+                || !entity.starts_with(entity_prefix)
+                || key_filter.is_some_and(|filter| key != filter)
+            {
+                continue;
+            }
+            if let Some(fact) = ids
+                .iter()
+                .rev()
+                .filter_map(|fact_id| self.facts.get(fact_id))
+                .filter(|fact| !fact.deleted)
+                .max_by_key(|fact| fact.version)
+            {
+                latest.push(fact);
+            }
+        }
+        latest.sort_by(|left, right| left.entity.cmp(&right.entity).then_with(|| left.key.cmp(&right.key)));
+        latest
     }
 
     /// Query facts by keyword match (simple substring search).
@@ -2202,7 +2655,15 @@ impl FactStore {
     /// Returns a [`CompactionReport`] describing what was removed. No-op (returns
     /// a zeroed report) when the store has no journal (pure in-memory mode).
     pub fn compact_journal(&self) -> std::io::Result<CompactionReport> {
-        let covered = self.deleted_facts_covered_by_legal_holds();
+        self.require_unpoisoned_journal_for_compaction()?;
+        if self.oversized_legacy_scan_records_skipped() > 0 && !self.active_legal_holds().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "hard erasure of oversized legacy scan records is blocked while any legal hold is active",
+            ));
+        }
+        let mut covered = self.deleted_facts_covered_by_legal_holds();
+        covered.extend(self.pruned_control_facts_covered_by_legal_holds()?);
         if !covered.is_empty() {
             let hold_ids: std::collections::BTreeSet<&str> = covered
                 .iter()
@@ -2229,13 +2690,21 @@ impl FactStore {
         &self,
         receipt: &crate::legal_hold::LegalHoldReceiptV1,
     ) -> std::io::Result<CompactionReport> {
+        self.require_unpoisoned_journal_for_compaction()?;
         if receipt.kind != crate::legal_hold::LegalHoldReceiptKind::Overridden {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "legal-hold override requires a legal_hold_overridden receipt",
             ));
         }
-        let covered = self.deleted_facts_covered_by_legal_holds();
+        if self.oversized_legacy_scan_records_skipped() > 0 && !self.active_legal_holds().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "oversized legacy scan records require hold-preserving manual recovery before compaction",
+            ));
+        }
+        let mut covered = self.deleted_facts_covered_by_legal_holds();
+        covered.extend(self.pruned_control_facts_covered_by_legal_holds()?);
         let receipt_fact_ids: std::collections::BTreeSet<&str> = receipt.fact_ids.iter().map(String::as_str).collect();
         let receipt_hold_ids: std::collections::BTreeSet<&str> = receipt.hold_ids.iter().map(String::as_str).collect();
         let fully_covered = covered.iter().all(|(fact_id, hold_ids)| {
@@ -2253,7 +2722,99 @@ impl FactStore {
         self.compact_journal_unchecked()
     }
 
+    fn pruned_control_facts_covered_by_legal_holds(&self) -> std::io::Result<Vec<(String, Vec<String>)>> {
+        let holds = self.active_legal_holds();
+        let Some(path) = self.journal_path.as_deref() else {
+            return Ok(Vec::new());
+        };
+        if holds.is_empty() || !path.exists() {
+            return Ok(Vec::new());
+        }
+
+        // Latest-only control snapshots deliberately do not retain one
+        // metadata allocation per historical replacement in resident memory.
+        // When compaction is actually requested under a legal hold, recover
+        // the exact value-free ids from the journal in one streaming pass.
+        let mut covered: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut record = |fact_id: &str, tenant_hash: &str, entity: &str| {
+            let hold_ids = holds
+                .iter()
+                .filter(|hold| hold.covers_stored_or_logical_repo_control(tenant_hash, entity))
+                .map(|hold| hold.hold_id.clone())
+                .collect::<Vec<_>>();
+            if !hold_ids.is_empty() {
+                covered.entry(fact_id.to_string()).or_default().extend(hold_ids);
+            }
+        };
+        let is_control = |fact: &Fact| {
+            fact.key == "content"
+                && (fact.entity.starts_with("__repo_registry__::")
+                    || fact.entity.starts_with("__repo_scan__::")
+                    || fact.entity.starts_with("__workspace_scan__::"))
+        };
+        let reader = std::io::BufReader::new(std::fs::File::open(path)?);
+        for (line_no, line) in reader.lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event = serde_json::from_str::<JournalEvent>(&line).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "cannot verify legal-hold coverage for fact journal line {}: {error}",
+                        line_no + 1
+                    ),
+                )
+            })?;
+            match event {
+                JournalEvent::Store { fact } if is_control(&fact) => {
+                    if !self.facts.contains_key(&fact.fact_id) {
+                        record(&fact.fact_id, &fact.tenant_hash, &fact.entity);
+                    }
+                }
+                JournalEvent::ReplaceLatest {
+                    fact,
+                    replaced_fact_ids,
+                } if is_control(&fact) => {
+                    for fact_id in replaced_fact_ids {
+                        if !self.facts.contains_key(&fact_id) {
+                            record(&fact_id, &fact.tenant_hash, &fact.entity);
+                        }
+                    }
+                    if !self.facts.contains_key(&fact.fact_id) {
+                        record(&fact.fact_id, &fact.tenant_hash, &fact.entity);
+                    }
+                }
+                JournalEvent::StoreBatch { facts } => {
+                    for fact in facts {
+                        if is_control(&fact) && !self.facts.contains_key(&fact.fact_id) {
+                            record(&fact.fact_id, &fact.tenant_hash, &fact.entity);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(covered
+            .into_iter()
+            .map(|(fact_id, mut hold_ids)| {
+                hold_ids.sort();
+                hold_ids.dedup();
+                (fact_id, hold_ids)
+            })
+            .collect())
+    }
+
     fn compact_journal_unchecked(&self) -> std::io::Result<CompactionReport> {
+        self.compact_journal_unchecked_with_record_limit(MAX_FACT_JOURNAL_RECORD_BYTES)
+    }
+
+    fn compact_journal_unchecked_with_record_limit(
+        &self,
+        max_record_bytes: usize,
+    ) -> std::io::Result<CompactionReport> {
+        self.require_unpoisoned_journal_for_compaction()?;
         let Some(path) = self.journal_path.clone() else {
             return Ok(CompactionReport::default());
         };
@@ -2287,7 +2848,7 @@ impl FactStore {
             uuid::Uuid::new_v4().to_string().replace('-', "")
         ));
 
-        {
+        let write_result = (|| -> std::io::Result<()> {
             let tmp_file = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -2297,7 +2858,7 @@ impl FactStore {
 
             for fact in &live {
                 let event = JournalEvent::Store { fact: (*fact).clone() };
-                let line = serde_json::to_string(&event).map_err(std::io::Error::other)?;
+                let line = serialize_journal_event_with_limit(&event, max_record_bytes)?;
                 writeln!(writer, "{}", line)?;
                 // Preserve cross-entity supersession state for live facts so a
                 // replay of the compacted journal re-derives `superseded_by`.
@@ -2307,7 +2868,7 @@ impl FactStore {
                         by_fact_id: by.clone(),
                         superseded_at: Utc::now().to_rfc3339(),
                     };
-                    let line = serde_json::to_string(&sup).map_err(std::io::Error::other)?;
+                    let line = serialize_journal_event_with_limit(&sup, max_record_bytes)?;
                     writeln!(writer, "{}", line)?;
                 }
             }
@@ -2327,7 +2888,7 @@ impl FactStore {
                     tenant_hash: canonical.tenant_hash.clone(),
                     recorded_at: Utc::now().to_rfc3339(),
                 };
-                let line = serde_json::to_string(&event).map_err(std::io::Error::other)?;
+                let line = serialize_journal_event_with_limit(&event, max_record_bytes)?;
                 writeln!(writer, "{}", line)?;
             }
 
@@ -2340,7 +2901,7 @@ impl FactStore {
                     fact_id: (*fact_id).clone(),
                     deleted_at: Utc::now().to_rfc3339(),
                 };
-                let line = serde_json::to_string(&event).map_err(std::io::Error::other)?;
+                let line = serialize_journal_event_with_limit(&event, max_record_bytes)?;
                 writeln!(writer, "{}", line)?;
             }
 
@@ -2348,6 +2909,19 @@ impl FactStore {
             // fsync the file contents before the rename so a crash can't leave a
             // half-written replacement that the rename then publishes.
             writer.get_ref().sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            if let Err(cleanup_error) = std::fs::remove_file(&tmp_path) {
+                if cleanup_error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        ?cleanup_error,
+                        path = %tmp_path.display(),
+                        "failed-to-remove-aborted-fact-journal-compaction"
+                    );
+                }
+            }
+            return Err(error);
         }
 
         // Atomic publish.
@@ -2359,6 +2933,14 @@ impl FactStore {
         // below claimed the compaction landed.
         let dir = std::fs::File::open(parent)?;
         dir.sync_all()?;
+        self.oversized_legacy_scan_records_skipped
+            .store(0, std::sync::atomic::Ordering::Release);
+        self.latest_only_pruned_bytes
+            .store(0, std::sync::atomic::Ordering::Release);
+        self.latest_only_pruned_events
+            .store(0, std::sync::atomic::Ordering::Release);
+        self.journal_replay_corruption_detected
+            .store(false, std::sync::atomic::Ordering::Release);
 
         tracing::info!(
             facts_dropped = report.facts_dropped,
@@ -2369,6 +2951,15 @@ impl FactStore {
         );
 
         Ok(report)
+    }
+
+    fn require_unpoisoned_journal_for_compaction(&self) -> std::io::Result<()> {
+        if self.durability_poisoned.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(std::io::Error::other(
+                "fact journal durable mutation plane is poisoned; restart required before compaction",
+            ));
+        }
+        Ok(())
     }
 
     /// Mark facts whose `stored_at` is older than `cutoff` as deletion-eligible
@@ -5317,6 +5908,125 @@ mod tests {
     }
 
     #[test]
+    fn startup_quarantines_parseable_unterminated_tail_before_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("facts.jsonl");
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            store
+                .try_store(StoreFact {
+                    tenant_hash: "default".to_string(),
+                    entity: "committed".into(),
+                    key: "record".into(),
+                    value: "committed".into(),
+                    source_receipt: None,
+                    confidence: 1.0,
+                    private: true,
+                    horizon_class: Some(HorizonClass::None),
+                    actor: None,
+                })
+                .unwrap();
+        }
+        let tail_fact = FactStore::new()
+            .try_store(StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "__repo_registry__::tenant::uncommitted".into(),
+                key: "content".into(),
+                value: "parseable but not newline-committed".into(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: true,
+                horizon_class: Some(HorizonClass::None),
+                actor: None,
+            })
+            .unwrap();
+        let tail = serde_json::to_vec(&JournalEvent::Store { fact: tail_fact }).unwrap();
+        {
+            let mut journal = std::fs::OpenOptions::new().append(true).open(&journal_path).unwrap();
+            journal.write_all(&tail).unwrap();
+            journal.sync_all().unwrap();
+        }
+
+        let replayed = FactStore::with_persistence(dir.path()).unwrap();
+        assert_eq!(replayed.get_by_entity("committed").len(), 1);
+        assert!(replayed
+            .get_by_entity("__repo_registry__::tenant::uncommitted")
+            .is_empty());
+        let quarantined_tail = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().contains("jsonl.torn."))
+            .map(|entry| std::fs::read(entry.path()).unwrap())
+            .expect("quarantined tail");
+        assert_eq!(quarantined_tail, tail);
+    }
+
+    #[test]
+    fn startup_truncates_oversized_legacy_workspace_torn_tail_with_bounded_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("facts.jsonl");
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            store
+                .try_store(StoreFact {
+                    tenant_hash: "default".to_string(),
+                    entity: "committed-before-workspace-tail".into(),
+                    key: "record".into(),
+                    value: "committed".into(),
+                    source_receipt: None,
+                    confidence: 1.0,
+                    private: true,
+                    horizon_class: Some(HorizonClass::None),
+                    actor: None,
+                })
+                .unwrap();
+        }
+        let committed_len = std::fs::metadata(&journal_path).unwrap().len();
+        let tail_fact = FactStore::new()
+            .try_store(StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "__workspace_scan__::latest".into(),
+                key: "content".into(),
+                value: "x".repeat(2048),
+                source_receipt: None,
+                confidence: 1.0,
+                private: true,
+                horizon_class: Some(HorizonClass::None),
+                actor: None,
+            })
+            .unwrap();
+        let tail = serde_json::to_vec(&JournalEvent::Store { fact: tail_fact }).unwrap();
+        assert!(tail.len() > 512);
+        {
+            let mut journal = std::fs::OpenOptions::new().append(true).open(&journal_path).unwrap();
+            journal.write_all(&tail).unwrap();
+            journal.sync_all().unwrap();
+        }
+
+        repair_torn_journal_tail_with_limit(&journal_path, 512).unwrap();
+
+        assert_eq!(std::fs::metadata(&journal_path).unwrap().len(), committed_len);
+        let marker_path = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.to_string_lossy().contains("jsonl.torn.") && path.extension().is_some_and(|v| v == "json")
+            })
+            .expect("bounded torn-tail metadata");
+        let marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(marker_path).unwrap()).expect("decode metadata");
+        assert_eq!(marker["tail_start"], committed_len);
+        assert_eq!(marker["tail_len"], tail.len() as u64);
+        assert_eq!(marker["capture_limit_bytes"], 512);
+        assert_eq!(marker["reason"], "oversized_unterminated_uncommitted_record");
+
+        let replayed = FactStore::with_persistence(dir.path()).unwrap();
+        assert_eq!(replayed.get_by_entity("committed-before-workspace-tail").len(), 1);
+        assert!(replayed.get_by_entity("__workspace_scan__::latest").is_empty());
+    }
+
+    #[test]
     fn test_in_memory_mode_no_file() {
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("facts.jsonl");
@@ -5811,6 +6521,647 @@ mod tests {
             "auto-supersede marker must survive journal replay"
         );
         assert!(store.get(&v2_id).unwrap().superseded_by.is_none());
+    }
+
+    #[test]
+    fn latest_only_replacement_removes_resident_history_and_survives_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_id;
+        let latest_id;
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let request = |value: &str| StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "__repo_registry__::fixture::one".into(),
+                key: "content".into(),
+                value: value.to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: true,
+                horizon_class: None,
+                actor: None,
+            };
+            let first = store.try_replace_latest_daemon_control(request("first")).unwrap();
+            let latest = store.try_replace_latest_daemon_control(request("latest")).unwrap();
+            first_id = first.fact_id;
+            latest_id = latest.fact_id;
+            assert!(store.get(&first_id).is_none());
+            assert_eq!(store.get_by_entity("__repo_registry__::fixture::one").len(), 1);
+            assert_eq!(store.get(&latest_id).unwrap().value, "latest");
+        }
+        let store = FactStore::with_persistence(dir.path()).unwrap();
+        assert!(store.get(&first_id).is_none());
+        assert_eq!(store.get_by_entity("__repo_registry__::fixture::one").len(), 1);
+        assert_eq!(store.get(&latest_id).unwrap().value, "latest");
+    }
+
+    #[test]
+    fn latest_only_replacement_churn_is_backpressured_until_explicit_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let entity = "__workspace_scan__::latest";
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            store
+                .place_legal_hold(crate::legal_hold::PlaceLegalHold {
+                    tenant_id: "unrelated-tenant".to_string(),
+                    entity_prefixes: vec!["unrelated::evidence".to_string()],
+                    reason: "must not disable exact compaction elsewhere".to_string(),
+                    actor: Some("fixture".to_string()),
+                })
+                .unwrap();
+            for version in 0..=LATEST_ONLY_COMPACTION_STALE_EVENTS {
+                store
+                    .try_replace_latest_daemon_control(StoreFact {
+                        tenant_hash: "default".to_string(),
+                        entity: entity.to_string(),
+                        key: "content".to_string(),
+                        value: format!("bounded-workspace-scan-{version}"),
+                        source_receipt: None,
+                        confidence: 1.0,
+                        private: true,
+                        horizon_class: None,
+                        actor: None,
+                    })
+                    .unwrap();
+            }
+            assert_eq!(store.get_by_entity(entity).len(), 1);
+            let blocked = store
+                .try_replace_latest_daemon_control(StoreFact {
+                    tenant_hash: "default".to_string(),
+                    entity: entity.to_string(),
+                    key: "content".to_string(),
+                    value: "blocked-at-ceiling".to_string(),
+                    source_receipt: None,
+                    confidence: 1.0,
+                    private: true,
+                    horizon_class: None,
+                    actor: None,
+                })
+                .expect_err("stale-history ceiling must stop further journal growth");
+            assert_eq!(blocked.kind(), std::io::ErrorKind::WouldBlock);
+        }
+
+        let journal_path = dir.path().join("facts.jsonl");
+        let journal_records = std::io::BufReader::new(std::fs::File::open(&journal_path).unwrap())
+            .lines()
+            .count();
+        assert!(
+            journal_records <= LATEST_ONLY_COMPACTION_STALE_EVENTS + 2,
+            "hard backpressure must bound latest-only replay work; got {journal_records} records"
+        );
+        let mut replayed = FactStore::with_persistence(dir.path()).unwrap();
+        let resident = replayed.get_by_entity(entity);
+        assert_eq!(resident.len(), 1);
+        assert_eq!(
+            resident[0].value,
+            format!("bounded-workspace-scan-{LATEST_ONLY_COMPACTION_STALE_EVENTS}")
+        );
+        let blocked = replayed
+            .try_replace_latest_daemon_control(StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: entity.to_string(),
+                key: "content".to_string(),
+                value: "still-blocked-after-replay".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: true,
+                horizon_class: None,
+                actor: None,
+            })
+            .expect_err("replay must reconstruct the stale-history ceiling");
+        assert_eq!(blocked.kind(), std::io::ErrorKind::WouldBlock);
+
+        replayed
+            .compact_journal()
+            .expect("explicit compaction is exact and unrelated hold does not block it");
+        replayed
+            .try_replace_latest_daemon_control(StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: entity.to_string(),
+                key: "content".to_string(),
+                value: "after-explicit-compaction".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: true,
+                horizon_class: None,
+                actor: None,
+            })
+            .expect("explicit compaction releases backpressure");
+    }
+
+    #[test]
+    fn replay_corruption_is_preserved_when_stale_history_backpressure_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("facts.jsonl");
+        let entity = "__workspace_scan__::latest";
+        {
+            let mut writer = std::io::BufWriter::new(std::fs::File::create(&journal_path).unwrap());
+            writeln!(writer, "{{malformed-journal-event").unwrap();
+            for version in 0..=LATEST_ONLY_COMPACTION_STALE_EVENTS {
+                let fact = FactStore::new()
+                    .try_store(StoreFact {
+                        tenant_hash: "default".to_string(),
+                        entity: entity.to_string(),
+                        key: "content".to_string(),
+                        value: format!("legacy-scan-{version}"),
+                        source_receipt: None,
+                        confidence: 1.0,
+                        private: true,
+                        horizon_class: None,
+                        actor: None,
+                    })
+                    .unwrap();
+                writeln!(
+                    writer,
+                    "{}",
+                    serde_json::to_string(&JournalEvent::Store { fact }).unwrap()
+                )
+                .unwrap();
+            }
+            writer.flush().unwrap();
+            writer.get_ref().sync_all().unwrap();
+        }
+        let original_journal = std::fs::read(&journal_path).unwrap();
+
+        let mut replayed = FactStore::with_persistence(dir.path()).unwrap();
+
+        assert_eq!(std::fs::read(&journal_path).unwrap(), original_journal);
+        assert_eq!(replayed.get_by_entity(entity).len(), 1);
+        let blocked = replayed
+            .try_replace_latest_daemon_control(StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: entity.to_string(),
+                key: "content".to_string(),
+                value: "must-not-append".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: true,
+                horizon_class: None,
+                actor: None,
+            })
+            .expect_err("stale-history ceiling must backpressure writes while corruption is quarantined");
+        assert_eq!(blocked.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), original_journal);
+    }
+
+    #[test]
+    fn workspace_scan_latest_only_replacement_survives_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_id;
+        let latest_id;
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let request = |value: &str| StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "__workspace_scan__::latest".into(),
+                key: "content".into(),
+                value: value.to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: true,
+                horizon_class: None,
+                actor: None,
+            };
+            first_id = store
+                .try_replace_latest_daemon_control(request("first"))
+                .unwrap()
+                .fact_id;
+            latest_id = store
+                .try_replace_latest_daemon_control(request("latest"))
+                .unwrap()
+                .fact_id;
+            assert!(store.get(&first_id).is_none());
+            assert_eq!(store.get_by_entity("__workspace_scan__::latest").len(), 1);
+        }
+
+        let store = FactStore::with_persistence(dir.path()).unwrap();
+        assert!(store.get(&first_id).is_none());
+        assert_eq!(store.get_by_entity("__workspace_scan__::latest").len(), 1);
+        assert_eq!(store.get(&latest_id).unwrap().value, "latest");
+    }
+
+    #[test]
+    fn latest_only_replacement_is_control_scoped_and_legal_hold_aware() {
+        let request = |entity: &str, value: &str| StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: entity.to_string(),
+            key: "content".into(),
+            value: value.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: None,
+        };
+        let mut store = FactStore::new();
+        let error = store
+            .try_replace_latest_daemon_control(request("ordinary", "value"))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(store
+            .try_replace_latest_daemon_control(request("__workspace_scan__::latest", "bounded scan"))
+            .is_ok());
+
+        let entity = "__repo_registry__::tenant::held";
+        let original = store
+            .try_replace_latest_daemon_control(request(entity, "original"))
+            .unwrap();
+        store
+            .place_legal_hold(crate::legal_hold::PlaceLegalHold {
+                tenant_id: "tenant".to_string(),
+                entity_prefixes: vec!["__repo_registry__::tenant".to_string()],
+                reason: "fixture hold".to_string(),
+                actor: Some("fixture-operator".to_string()),
+            })
+            .unwrap();
+        let error = store
+            .try_replace_latest_daemon_control(request(entity, "replacement"))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(store.get(&original.fact_id).unwrap().value, "original");
+    }
+
+    #[test]
+    fn indeterminate_durable_append_poison_blocks_competing_retry_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = |value: &str| StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "__repo_registry__::tenant::indeterminate".to_string(),
+            key: "content".to_string(),
+            value: value.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: None,
+        };
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            store
+                .fail_next_durable_append_after_write
+                .store(true, std::sync::atomic::Ordering::Release);
+            let first = store.try_replace_latest_daemon_control(request("first")).unwrap_err();
+            assert!(first.to_string().contains("indeterminate"));
+            assert!(
+                store.journal_durability_poisoned(),
+                "indeterminate append must expose a preservation barrier to coordinated cleanup"
+            );
+            assert!(
+                store
+                    .get_by_entity("__repo_registry__::tenant::indeterminate")
+                    .is_empty(),
+                "failed caller must not see a resident commit"
+            );
+            let journal_path = dir.path().join("facts.jsonl");
+            let indeterminate_journal = std::fs::read(&journal_path).unwrap();
+            let compaction = store
+                .compact_journal()
+                .expect_err("poisoned resident state must never replace the journal");
+            assert!(compaction.to_string().contains("poisoned"));
+            assert_eq!(std::fs::read(&journal_path).unwrap(), indeterminate_journal);
+            let retry = store.try_replace_latest_daemon_control(request("retry")).unwrap_err();
+            assert!(retry.to_string().contains("poisoned"));
+        }
+
+        let replayed = FactStore::with_persistence(dir.path()).unwrap();
+        assert!(
+            !replayed.journal_durability_poisoned(),
+            "successful restart replay resolves the indeterminate resident state"
+        );
+        let facts = replayed.get_by_entity("__repo_registry__::tenant::indeterminate");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].value, "first");
+    }
+
+    #[test]
+    fn bounded_replay_skips_only_structural_legacy_scan_records_and_compacts_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("facts.jsonl");
+        let mut builder = FactStore::new();
+        let oversized_scan = builder
+            .try_store(StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "__repo_scan__::tenant::repo::latest".to_string(),
+                key: "content".to_string(),
+                value: "x".repeat(4096),
+                source_receipt: None,
+                confidence: 1.0,
+                private: true,
+                horizon_class: None,
+                actor: None,
+            })
+            .unwrap();
+        let oversized_workspace_scan = builder
+            .try_store(StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "__workspace_scan__::latest".to_string(),
+                key: "content".to_string(),
+                value: "y".repeat(4096),
+                source_receipt: None,
+                confidence: 1.0,
+                private: true,
+                horizon_class: None,
+                actor: None,
+            })
+            .unwrap();
+        let ordinary = builder
+            .try_store(StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "ordinary".to_string(),
+                key: "content".to_string(),
+                value: "survives".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            })
+            .unwrap();
+        let scan_line = serde_json::to_string(&JournalEvent::Store { fact: oversized_scan }).unwrap();
+        let workspace_scan_line = serde_json::to_string(&JournalEvent::Store {
+            fact: oversized_workspace_scan,
+        })
+        .unwrap();
+        let ordinary_line = serde_json::to_string(&JournalEvent::Store { fact: ordinary.clone() }).unwrap();
+        std::fs::write(
+            &journal_path,
+            format!("{scan_line}\n{workspace_scan_line}\n{ordinary_line}\n"),
+        )
+        .unwrap();
+
+        let mut replayed = FactStore {
+            journal_path: Some(journal_path.clone()),
+            ..FactStore::default()
+        };
+        replayed.replay_journal_with_record_limit(&journal_path, 512).unwrap();
+        assert_eq!(replayed.oversized_legacy_scan_records_skipped(), 2);
+        assert!(replayed.get_by_entity("__repo_scan__::tenant::repo::latest").is_empty());
+        assert!(replayed.get_by_entity("__workspace_scan__::latest").is_empty());
+        assert_eq!(replayed.get(&ordinary.fact_id).unwrap().value, "survives");
+
+        replayed.compact_journal().unwrap();
+        assert_eq!(replayed.oversized_legacy_scan_records_skipped(), 0);
+        let compacted = std::fs::read_to_string(&journal_path).unwrap();
+        assert!(!compacted.contains("__repo_scan__::tenant::repo::latest"));
+        assert!(!compacted.contains("__workspace_scan__::latest"));
+        assert!(compacted.contains("\"entity\":\"ordinary\""));
+    }
+
+    #[test]
+    fn bounded_replay_never_misclassifies_ordinary_value_text_as_scan_entity() {
+        let mut builder = FactStore::new();
+        let ordinary = builder
+            .try_store(StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "ordinary".to_string(),
+                key: "content".to_string(),
+                value: format!("__repo_scan__::{}", "x".repeat(4096)),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            })
+            .unwrap();
+        let line = serde_json::to_string(&JournalEvent::Store { fact: ordinary }).unwrap();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(format!("{line}\n")));
+        let error = read_bounded_journal_record(&mut reader, 512).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn bounded_replay_never_misclassifies_workspace_marker_in_ordinary_value() {
+        let mut builder = FactStore::new();
+        let ordinary = builder
+            .try_store(StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "ordinary".to_string(),
+                key: "content".to_string(),
+                value: format!("__workspace_scan__::{}", "x".repeat(4096)),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            })
+            .unwrap();
+        let line = serde_json::to_string(&JournalEvent::Store { fact: ordinary }).unwrap();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(format!("{line}\n")));
+        let error = read_bounded_journal_record(&mut reader, 512).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn append_and_replay_share_the_same_record_boundary() {
+        let mut builder = FactStore::new();
+        let fact = builder
+            .try_store(StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "boundary".to_string(),
+                key: "content".to_string(),
+                value: "value".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            })
+            .unwrap();
+        let event = JournalEvent::Store { fact };
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert!(serialize_journal_event_with_limit(&event, encoded.len()).is_ok());
+        assert!(serialize_journal_event_with_limit(&event, encoded.len() - 1).is_err());
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(format!("{encoded}\n")));
+        assert!(matches!(
+            read_bounded_journal_record(&mut reader, encoded.len()).unwrap(),
+            Some(BoundedJournalRecord::Json(_))
+        ));
+    }
+
+    #[test]
+    fn compaction_rejects_oversized_resident_fact_without_replacing_valid_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("facts.jsonl");
+        let mut store = FactStore::with_persistence(dir.path()).unwrap();
+        let durable = store
+            .try_store(StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "durable".to_string(),
+                key: "content".to_string(),
+                value: "survives".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            })
+            .unwrap();
+        let original_journal = std::fs::read(&journal_path).unwrap();
+
+        // Model the infallible `store()` failure mode: its append can reject a
+        // record while the already-built fact remains resident. Compaction
+        // must apply the same ceiling and leave the last valid journal intact.
+        let oversized = store.build_fact(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "resident-only".to_string(),
+            key: "content".to_string(),
+            value: "x".repeat(4096),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        store.insert_fact_indexes(&oversized);
+        let error = store
+            .compact_journal_unchecked_with_record_limit(1024)
+            .expect_err("oversized resident fact must abort compaction");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), original_journal);
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".compact-")),
+            "aborted compaction must remove its temporary journal"
+        );
+
+        drop(store);
+        let replayed = FactStore::with_persistence(dir.path()).unwrap();
+        assert_eq!(replayed.get(&durable.fact_id).unwrap().value, "survives");
+        assert!(replayed.get(&oversized.fact_id).is_none());
+    }
+
+    #[test]
+    fn replay_bounds_legacy_scan_history_and_preserves_later_hold_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_id;
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let request = |value: &str| StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "__repo_scan__::tenant::repo::latest".to_string(),
+                key: "content".to_string(),
+                value: value.to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: true,
+                horizon_class: None,
+                actor: None,
+            };
+            first_id = store.try_store(request("first")).unwrap().fact_id;
+            store.try_store(request("latest")).unwrap();
+        }
+
+        let mut store = FactStore::with_persistence(dir.path()).unwrap();
+        assert!(store.get(&first_id).is_none());
+        assert_eq!(store.get_by_entity("__repo_scan__::tenant::repo::latest").len(), 1);
+        store
+            .place_legal_hold(crate::legal_hold::PlaceLegalHold {
+                tenant_id: "tenant".to_string(),
+                entity_prefixes: vec!["__repo_scan__::tenant::repo".to_string()],
+                reason: "fixture hold".to_string(),
+                actor: Some("fixture-operator".to_string()),
+            })
+            .unwrap();
+        let error = store.compact_journal().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn replay_bounds_legacy_registry_churn_and_preserves_later_hold_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("facts.jsonl");
+        let mut journal = std::io::BufWriter::new(std::fs::File::create(&journal_path).unwrap());
+        let mut first_id = String::new();
+        let mut latest_id = String::new();
+        for version in 0..64 {
+            let mut fact = FactStore::new()
+                .try_store(StoreFact {
+                    tenant_hash: "default".to_string(),
+                    entity: "__repo_registry__::tenant::high-churn".to_string(),
+                    key: "content".to_string(),
+                    value: format!("registration-{version}"),
+                    source_receipt: None,
+                    confidence: 1.0,
+                    // Exercise upgrade replay of rows written before this
+                    // daemon namespace became born-private.
+                    private: false,
+                    horizon_class: None,
+                    actor: None,
+                })
+                .unwrap();
+            fact.private = false;
+            if version == 0 {
+                first_id.clone_from(&fact.fact_id);
+            }
+            latest_id.clone_from(&fact.fact_id);
+            writeln!(
+                journal,
+                "{}",
+                serde_json::to_string(&JournalEvent::Store { fact }).unwrap()
+            )
+            .unwrap();
+        }
+        journal.flush().unwrap();
+        journal.get_ref().sync_all().unwrap();
+        drop(journal);
+
+        let mut store = FactStore::with_persistence(dir.path()).unwrap();
+        let resident = store.get_by_entity("__repo_registry__::tenant::high-churn");
+        assert_eq!(resident.len(), 1);
+        assert_eq!(resident[0].fact_id, latest_id);
+        assert_eq!(resident[0].value, "registration-63");
+        assert!(resident[0].private);
+        assert!(store.get(&first_id).is_none());
+
+        store
+            .place_legal_hold(crate::legal_hold::PlaceLegalHold {
+                tenant_id: "tenant".to_string(),
+                entity_prefixes: vec!["__repo_registry__::tenant::high-churn".to_string()],
+                reason: "fixture hold after bounded replay".to_string(),
+                actor: Some("fixture-operator".to_string()),
+            })
+            .unwrap();
+        let error = store.compact_journal().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn replay_bounds_legacy_workspace_scan_history_and_preserves_later_hold_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_id;
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let request = |value: &str| StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "__workspace_scan__::latest".to_string(),
+                key: "content".to_string(),
+                value: value.to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: true,
+                horizon_class: None,
+                actor: None,
+            };
+            first_id = store.try_store(request("first")).unwrap().fact_id;
+            store.try_store(request("latest")).unwrap();
+        }
+
+        let mut store = FactStore::with_persistence(dir.path()).unwrap();
+        assert!(store.get(&first_id).is_none());
+        assert_eq!(store.get_by_entity("__workspace_scan__::latest").len(), 1);
+        store
+            .place_legal_hold(crate::legal_hold::PlaceLegalHold {
+                tenant_id: "default".to_string(),
+                entity_prefixes: vec!["__workspace_scan__::".to_string()],
+                reason: "fixture hold".to_string(),
+                actor: Some("fixture-operator".to_string()),
+            })
+            .unwrap();
+        let error = store.compact_journal().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]

@@ -568,6 +568,11 @@ pub(super) async fn get_context_graph(
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
     }
+    if q.include_workspace {
+        if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
+            return problem.into_response();
+        }
+    }
     let store = state.fact_store.read().await;
     let graph = crate::context_graph::build_for_project_with_opts(
         &store,

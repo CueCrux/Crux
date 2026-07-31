@@ -1213,7 +1213,7 @@ pub(super) async fn execute_admin_action(
                             admin_action_error(format!("legal-hold override receipt encode failed: {err}"))
                         })?,
                     };
-                    let (signed_receipt, _) = super::observations::append_one(
+                    let (signed_receipt, _) = super::observations::append_one_durable(
                         state,
                         "__governance__::legal-holds",
                         &actor,
@@ -1481,10 +1481,14 @@ pub(super) async fn post_admin_action(
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
-    let authenticated_passport = match http_scope_context(&state.auth, &headers) {
-        Ok(context) => context.passport_id.unwrap_or_else(|| state.passport_fpr.clone()),
+    let scope_context = match http_scope_context(&state.auth, &headers) {
+        Ok(context) => context,
         Err(problem) => return problem.into_response(),
     };
+    let authenticated_passport = scope_context
+        .passport_id
+        .clone()
+        .unwrap_or_else(|| state.passport_fpr.clone());
 
     let action_type = req.action_type.trim();
     if action_type.is_empty() {
@@ -1496,6 +1500,12 @@ pub(super) async fn post_admin_action(
             format!(
                 "unknown actionType '{action_type}' (expected verify-store|scrub-now|snapshot-verify|projection-rebuild|parity-pack|runtime-knob-update|force-seal)"
             ),
+        );
+    }
+    if action_type == "compact-facts" && scope_context.auth_enforced() && !scope_context.has_global_tenant_authority() {
+        return problem_response(
+            StatusCode::FORBIDDEN,
+            "compact-facts requires cross-tenant operator authority",
         );
     }
 
@@ -2907,6 +2917,54 @@ mod compact_facts_tests {
     }
 
     #[tokio::test]
+    async fn tenant_bound_admin_cannot_enqueue_global_fact_compaction() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        const SECRET: &str = "0123456789abcdef0123456789abcdef";
+        let mut state = crate::http::tests::test_app_state(4);
+        state.auth = crate::auth::Authz::test_hs256(SECRET.as_bytes(), "corecrux-test", "corecrux");
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &serde_json::json!({
+                "exp": chrono::Utc::now().timestamp() + 3600,
+                "iss": "corecrux-test",
+                "aud": "corecrux",
+                "scope": "admin:write",
+                "tenants": ["tenant-a"],
+                "passport_id": "p_tenant_a_admin",
+            }),
+            &EncodingKey::from_secret(SECRET.as_bytes()),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+
+        let response = post_admin_action(
+            State(state.clone()),
+            headers,
+            Json(PostAdminActionRequest {
+                action_id: Some("act-cross-tenant-compaction".to_string()),
+                action_type: "compact-facts".to_string(),
+                actor: None,
+                reason: Some("cross-tenant denial fixture".to_string()),
+                params: Some(serde_json::json!({
+                    "reason": "operator compaction",
+                    "gdprFullTenantErasure": true,
+                    "tenantId": "tenant-b",
+                })),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(state.admin_actions.read().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn held_hard_erasure_override_is_signed_and_bound_to_authenticated_passport() {
         let dir = tempfile::tempdir().unwrap();
         let journal = dir.path().join("facts.jsonl");
@@ -3006,6 +3064,78 @@ mod compact_facts_tests {
         let override_record: serde_json::Value = serde_json::from_str(records.lines().last().unwrap()).unwrap();
         assert_eq!(override_record["principal"], authenticated_passport);
         assert_eq!(override_record["payload"]["actor"], authenticated_passport);
+    }
+
+    #[tokio::test]
+    async fn held_hard_erasure_stops_before_compaction_when_override_receipt_sync_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("facts.jsonl");
+        let mut state = crate::http::tests::test_app_state_with_auth(4, crate::auth::AuthMode::DevScopes);
+        let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).unwrap();
+        state.passport_fpr = key.passport_fpr().to_string();
+        state.passport_public_key_hex = key.public_key_hex().to_string();
+        let mut fs = FactStore::with_persistence(dir.path()).unwrap();
+        let held = fs.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "customer::sync-failure::profile".to_string(),
+            key: "pii".to_string(),
+            value: "held-content-must-survive-sync-failure".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        fs.place_legal_hold(corecrux_memory::PlaceLegalHold {
+            tenant_id: "default".to_string(),
+            entity_prefixes: vec!["customer::sync-failure::".to_string()],
+            reason: "litigation".to_string(),
+            actor: Some("p_legal".to_string()),
+        })
+        .unwrap();
+        assert!(fs.delete("default", &held.fact_id));
+        state.fact_store = std::sync::Arc::new(tokio::sync::RwLock::new(fs));
+
+        let override_log =
+            crate::http::observations::observation_file_path(&state.data_dir, "__governance__::legal-holds");
+        let sync_failure_marker = override_log.with_extension("sync-fail");
+        std::fs::create_dir_all(sync_failure_marker.parent().unwrap()).unwrap();
+        std::fs::write(&sync_failure_marker, b"inject sync failure").unwrap();
+
+        let params = serde_json::json!({
+            "reason": "GDPR Article 17 full-tenant erasure",
+            "gdprFullTenantErasure": true,
+            "tenantId": "default",
+        });
+        let error = execute_admin_action(
+            &state,
+            "act-held-sync-failure",
+            "compact-facts",
+            Some(&params),
+            None,
+            None,
+            Some("p_authenticated_dpo"),
+        )
+        .await
+        .expect_err("receipt fsync failure must abort before hard erasure");
+        assert!(error.contains("sync observation"), "{error}");
+        assert!(
+            std::fs::read_to_string(&journal)
+                .unwrap()
+                .contains("held-content-must-survive-sync-failure"),
+            "held plaintext must remain until the signed override receipt is crash-durable"
+        );
+        assert!(
+            state
+                .fact_store
+                .read()
+                .await
+                .deleted_facts_covered_by_legal_holds()
+                .iter()
+                .any(|(fact_id, _)| fact_id == &held.fact_id),
+            "failed receipt durability must leave the held tombstone eligible to block compaction"
+        );
+        std::fs::remove_file(sync_failure_marker).unwrap();
     }
 
     #[tokio::test]

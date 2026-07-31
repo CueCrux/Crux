@@ -62,6 +62,9 @@ pub(super) async fn post_generate(
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
         return problem.into_response();
     }
+    if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
+        return problem.into_response();
+    }
     let by_passport = extract_passport_id(&headers);
     let now_ms = now_unix_ms();
 
@@ -307,6 +310,9 @@ pub(super) async fn get_latest(
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
     }
+    if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
+        return problem.into_response();
+    }
     let versions = list_storybook_versions_internal(&state.fact_store, &project_id).await;
     let latest_ts = match versions.first() {
         Some(t) => *t,
@@ -332,6 +338,9 @@ pub(super) async fn list_versions(
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
     }
+    if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
+        return problem.into_response();
+    }
     let versions = list_storybook_versions_internal(&state.fact_store, &project_id).await;
     (
         StatusCode::OK,
@@ -352,6 +361,9 @@ pub(super) async fn get_version(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
         return problem.into_response();
     }
     match load_storybook(&state.fact_store, &project_id, ts).await {
@@ -377,6 +389,9 @@ pub(super) async fn get_diff(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
         return problem.into_response();
     }
     let a = match load_storybook(&state.fact_store, &project_id, q.a).await {

@@ -291,11 +291,32 @@ pub(super) fn load_spans(state: &AppState, tenant_id: &str) -> Vec<crate::trace_
     })
 }
 
-async fn load_scan(state: &AppState, tenant_id: &str, repo_id: &str) -> Option<crate::workspace_scan::WorkspaceScan> {
-    let store = state.fact_store.read().await;
-    let json = crate::repo_registry::load_scan_json(&store, tenant_id, repo_id)?;
-    drop(store);
-    serde_json::from_str(&json).ok()
+async fn load_scan(
+    state: &AppState,
+    tenant_id: &str,
+    repo_id: &str,
+) -> Result<Option<crate::repo_registry::LoadedRepoScan>, crate::repo_registry::RepoRegistryError> {
+    super::repos::load_repo_scan(state, tenant_id, repo_id).await
+}
+
+fn scan_load_problem(error: crate::repo_registry::RepoRegistryError) -> axum::response::Response {
+    if matches!(
+        &error,
+        crate::repo_registry::RepoRegistryError::Io(io)
+            if io.kind() == std::io::ErrorKind::WouldBlock
+    ) {
+        let mut response = problem_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string());
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("1"),
+        );
+        response
+    } else {
+        problem_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("persisted scan failed to load: {error}"),
+        )
+    }
 }
 
 /// `GET /v1/code-intel/path` — what actually executes for an entry point.
@@ -330,11 +351,16 @@ pub(super) async fn get_blast_radius(
         return problem_response(StatusCode::BAD_REQUEST, "symbol is required");
     };
     let repo_id = q.repo_id.as_deref().unwrap_or("crux");
-    let Some(scan) = load_scan(&state, &q.tenant_id, repo_id).await else {
+    let loaded = match load_scan(&state, &q.tenant_id, repo_id).await {
+        Ok(Some(loaded)) => loaded,
+        Ok(None) => return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first"),
+        Err(error) => return scan_load_problem(error),
+    };
+    let Some(scan) = loaded.scan.as_ref() else {
         return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
     };
     let spans = load_spans(&state, &q.tenant_id);
-    let radius = crate::code_intel::blast_radius(&scan, &spans, symbol, q.token_budget);
+    let radius = crate::code_intel::blast_radius(scan, &spans, symbol, q.token_budget);
     (StatusCode::OK, Json(radius)).into_response()
 }
 
@@ -352,11 +378,16 @@ pub(super) async fn get_liveness(
         return problem_response(StatusCode::BAD_REQUEST, "symbol is required");
     };
     let repo_id = q.repo_id.as_deref().unwrap_or("crux");
-    let Some(scan) = load_scan(&state, &q.tenant_id, repo_id).await else {
+    let loaded = match load_scan(&state, &q.tenant_id, repo_id).await {
+        Ok(Some(loaded)) => loaded,
+        Ok(None) => return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first"),
+        Err(error) => return scan_load_problem(error),
+    };
+    let Some(scan) = loaded.scan.as_ref() else {
         return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
     };
     let spans = load_spans(&state, &q.tenant_id);
-    let l = crate::code_intel::liveness(&scan, &spans, symbol);
+    let l = crate::code_intel::liveness(scan, &spans, symbol);
     (StatusCode::OK, Json(l)).into_response()
 }
 
@@ -397,11 +428,16 @@ pub(super) async fn get_dead_code_ladder(
         return problem.into_response();
     }
     let repo_id = q.repo_id.as_deref().unwrap_or("crux");
-    let Some(scan) = load_scan(&state, &q.tenant_id, repo_id).await else {
+    let loaded = match load_scan(&state, &q.tenant_id, repo_id).await {
+        Ok(Some(loaded)) => loaded,
+        Ok(None) => return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first"),
+        Err(error) => return scan_load_problem(error),
+    };
+    let Some(scan) = loaded.scan.as_ref() else {
         return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
     };
     let spans = load_spans(&state, &q.tenant_id);
-    let ladder = crate::code_intel::dead_code_ladder(&scan, &spans, q.symbol.as_deref(), q.token_budget);
+    let ladder = crate::code_intel::dead_code_ladder(scan, &spans, q.symbol.as_deref(), q.token_budget);
     (StatusCode::OK, Json(ladder)).into_response()
 }
 
@@ -421,10 +457,15 @@ pub(super) async fn get_repo_spatial(
     if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
         return problem.into_response();
     }
-    let Some(scan) = load_scan(&state, &q.tenant_id, &repo_id).await else {
+    let loaded = match load_scan(&state, &q.tenant_id, &repo_id).await {
+        Ok(Some(loaded)) => loaded,
+        Ok(None) => return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first"),
+        Err(error) => return scan_load_problem(error),
+    };
+    let Some(scan) = loaded.scan.as_ref() else {
         return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
     };
     let spans = load_spans(&state, &q.tenant_id);
-    let map = crate::code_intel::spatial_map(&scan, &spans);
+    let map = crate::code_intel::spatial_map(scan, &spans);
     (StatusCode::OK, Json(map)).into_response()
 }

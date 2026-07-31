@@ -8,6 +8,7 @@ license.workspace = true
 [features]
 default = []
 llm = []
+test-support = []
 # buyer-fit M3.4: optional real CPU embedding model (fastembed / ONNX Runtime).
 # OFF by default — the default binary stays lean and the always-on pure-Rust
 # LocalHashEmbedder is the offline default. Enable for higher-quality vectors

@@ -15,53 +15,149 @@ use super::{problem_response, require_http_scopes, AppState, HeaderMap, IntoResp
 
 use crate::workspace_scan::{LATEST_SCAN_ENTITY, SCAN_KEY};
 
+struct CappedWorkspaceJson {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl std::io::Write for CappedWorkspaceJson {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "workspace scan exceeds its serialized-byte ceiling",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode_workspace_scan_with_limit(
+    scan: &crate::workspace_scan::WorkspaceScan,
+    limit: usize,
+) -> std::io::Result<String> {
+    let mut writer = CappedWorkspaceJson {
+        bytes: Vec::with_capacity(limit.min(64 * 1024)),
+        limit,
+    };
+    serde_json::to_writer(&mut writer, scan)
+        .map_err(|error| std::io::Error::new(error.io_error_kind().unwrap_or(std::io::ErrorKind::Other), error))?;
+    String::from_utf8(writer.bytes).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+#[allow(clippy::result_large_err)]
+pub(super) fn require_workspace_scan_global_authority(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), crate::problem::ProblemResponse> {
+    let context = crate::auth::passport_bound_context(&state.auth, headers)?;
+    if context.auth_enforced() && !context.has_global_tenant_authority() {
+        return Err(crate::problem::ProblemResponse(
+            corecrux_types::ProblemDetails::forbidden("workspace scanning requires cross-tenant operator authority")
+                .with_extensions(serde_json::json!({
+                    "code": "GLOBAL_TENANT_AUTHORITY_REQUIRED",
+                })),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn require_workspace_scan_operator(
+    state: &AppState,
+    headers: &HeaderMap,
+    scopes: &[&str],
+) -> Result<(), crate::problem::ProblemResponse> {
+    require_http_scopes(&state.auth, headers, scopes)?;
+    require_workspace_scan_global_authority(state, headers)
+}
+
 /// `POST /v1/workspace/scan` — kick off a scan of the configured workspace
 /// path. Returns the scan summary (no file contents) inline; full payload is
 /// persisted as a fact.
 #[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_scan(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
+    if let Err(problem) = require_workspace_scan_operator(&state, &headers, &["admin:write"]) {
         return problem.into_response();
     }
-    let scan_result = tokio::task::spawn_blocking(crate::workspace_scan::run_scan).await;
-    let scan = match scan_result {
-        Ok(Ok(s)) => s,
+    let permit = match state.repo_scan_semaphore.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return problem_response(StatusCode::SERVICE_UNAVAILABLE, "repository scan admission is busy"),
+    };
+    let scan_policy = state.repo_scan_policy.clone();
+    let scan_result = tokio::task::spawn_blocking(move || {
+        crate::workspace_scan::run_scan_with_policy(&scan_policy).map(|scan| (scan, permit))
+    })
+    .await;
+    let (scan, scan_permit) = match scan_result {
+        Ok(Ok(result)) => result,
         Ok(Err(crate::workspace_scan::ScanError::NotConfigured)) => {
             return problem_response(
                 StatusCode::PRECONDITION_FAILED,
                 "workspace path not configured. Set CORECRUXD_WORKSPACE_PATH (or use docker-compose.dev.yml which mounts ./crates → /src/crates).",
             );
         }
-        Ok(Err(crate::workspace_scan::ScanError::PathMissing(p))) => {
-            return problem_response(
-                StatusCode::PRECONDITION_FAILED,
-                format!("workspace path '{p}' does not exist inside the daemon"),
-            );
-        }
         Ok(Err(err)) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, format!("join: {err}")),
     };
 
-    // Persist the full scan as a single private fact.
-    let value = match serde_json::to_string(&scan) {
-        Ok(v) => v,
-        Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {err}")),
+    // Encoding can traverse tens of MiB of generated state, so keep it on the
+    // blocking pool and retain global scan admission until publication.
+    let encoded = tokio::task::spawn_blocking(move || {
+        encode_workspace_scan_with_limit(&scan, crate::repo_scan_policy::MAX_DURABLE_SCAN_OUTPUT_BYTES as usize)
+            .map(|value| (scan, value, scan_permit))
+    })
+    .await;
+    let (scan, value, _scan_permit) = match encoded {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::InvalidData => {
+            return problem_response(StatusCode::PAYLOAD_TOO_LARGE, error.to_string())
+        }
+        Ok(Err(error)) => {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("workspace scan encode failed: {error}"),
+            )
+        }
+        Err(error) => {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("workspace scan encode task failed: {error}"),
+            )
+        }
     };
+
+    // Persist only the latest full scan. A durable latest-only replacement
+    // bounds resident/replay history and refuses to erase held predecessors.
     {
         let mut store = state.fact_store.write().await;
-        let mut sf = corecrux_memory::fact_store::StoreFact {
+        let sf = corecrux_memory::fact_store::StoreFact {
             tenant_hash: "default".to_string(),
             entity: LATEST_SCAN_ENTITY.to_string(),
             key: SCAN_KEY.to_string(),
             value,
             source_receipt: None,
             confidence: 1.0,
-            private: false,
+            private: true,
             horizon_class: None,
             actor: None,
         };
-        crate::fact_privacy::enforce_global(&mut sf);
-        store.store(sf);
+        if let Err(error) = store.try_replace_latest_daemon_control(sf) {
+            return match error.kind() {
+                std::io::ErrorKind::InvalidData => problem_response(StatusCode::PAYLOAD_TOO_LARGE, error.to_string()),
+                std::io::ErrorKind::PermissionDenied => problem_response(StatusCode::LOCKED, error.to_string()),
+                std::io::ErrorKind::WouldBlock => problem_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+                _ => problem_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("workspace scan persistence failed: {error}"),
+                ),
+            };
+        }
     }
 
     let summary = serde_json::json!({
@@ -106,7 +202,7 @@ pub(super) async fn get_mcp_tools(State(state): State<AppState>, headers: Header
 /// `GET /v1/workspace/scan` — return the latest persisted scan in full.
 #[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_scan(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_workspace_scan_operator(&state, &headers, &["admin:read"]) {
         return problem.into_response();
     }
     match crate::workspace_scan::load_latest(&state.fact_store).await {
@@ -158,7 +254,7 @@ pub(super) async fn get_storyline(
     headers: HeaderMap,
     axum::extract::Query(q): axum::extract::Query<StorylineQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_workspace_scan_operator(&state, &headers, &["admin:read"]) {
         return problem.into_response();
     }
     let scan = match crate::workspace_scan::load_latest(&state.fact_store).await {
@@ -231,4 +327,20 @@ pub(super) async fn get_storyline(
         }
     }
     ([(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")], out).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_scan_encoding_is_bounded_before_fact_persistence() {
+        let scan = crate::workspace_scan::WorkspaceScan {
+            root_path: "x".repeat(256),
+            ..Default::default()
+        };
+        let error = encode_workspace_scan_with_limit(&scan, 128).expect_err("oversized JSON must be bounded");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(encode_workspace_scan_with_limit(&crate::workspace_scan::WorkspaceScan::default(), 4096).is_ok());
+    }
 }

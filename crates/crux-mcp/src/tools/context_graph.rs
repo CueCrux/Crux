@@ -423,8 +423,11 @@ async fn proxy(
     url: String,
     body: Option<Value>,
     scope: &'static str,
+    ctx: &McpContext,
 ) -> Result<Value, JsonRpcError> {
-    loopback_json(tool, method, url, body, scope).await.map(as_mcp_content)
+    loopback_json(tool, method, url, body, scope, ctx)
+        .await
+        .map(as_mcp_content)
 }
 
 pub async fn handle_get_project_storybook(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
@@ -443,7 +446,7 @@ pub async fn handle_get_project_storybook(args: &Value, ctx: &McpContext) -> Res
     if let Some(section) = optional_string(args, "section") {
         let _ = write!(url, "&section={}", encode_query(&section));
     }
-    proxy(TOOL, "GET", url, None, READ_SCOPE).await
+    proxy(TOOL, "GET", url, None, READ_SCOPE, ctx).await
 }
 
 pub async fn handle_generate_project_storybook(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
@@ -451,7 +454,7 @@ pub async fn handle_generate_project_storybook(args: &Value, ctx: &McpContext) -
     let base = base_url(ctx, TOOL)?;
     let project = required_string(args, "project_id", TOOL)?;
     let url = format!("{base}/v1/projects/{}/storybook", encode_query(&project));
-    proxy(TOOL, "POST", url, None, WRITE_SCOPE).await
+    proxy(TOOL, "POST", url, None, WRITE_SCOPE, ctx).await
 }
 
 pub async fn handle_diff_project_storybook(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
@@ -464,7 +467,7 @@ pub async fn handle_diff_project_storybook(args: &Value, ctx: &McpContext) -> Re
         "{base}/v1/projects/{}/storybook/diff?a={a}&b={b}",
         encode_query(&project)
     );
-    proxy(TOOL, "GET", url, None, READ_SCOPE).await
+    proxy(TOOL, "GET", url, None, READ_SCOPE, ctx).await
 }
 
 pub async fn handle_get_project_dossiers(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
@@ -484,7 +487,7 @@ pub async fn handle_get_project_dossiers(args: &Value, ctx: &McpContext) -> Resu
             encode_query(&project)
         ),
     };
-    proxy(TOOL, "GET", url, None, READ_SCOPE).await
+    proxy(TOOL, "GET", url, None, READ_SCOPE, ctx).await
 }
 
 pub async fn handle_generate_project_dossier(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
@@ -492,7 +495,7 @@ pub async fn handle_generate_project_dossier(args: &Value, ctx: &McpContext) -> 
     let base = base_url(ctx, TOOL)?;
     let project = required_string(args, "project_id", TOOL)?;
     let url = format!("{base}/v1/projects/{}/dossiers/auto", encode_query(&project));
-    proxy(TOOL, "POST", url, None, WRITE_SCOPE).await
+    proxy(TOOL, "POST", url, None, WRITE_SCOPE, ctx).await
 }
 
 pub async fn handle_publish_project_dossier(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
@@ -520,7 +523,7 @@ pub async fn handle_publish_project_dossier(args: &Value, ctx: &McpContext) -> R
     }
 
     let url = format!("{base}/v1/projects/{}/dossiers", encode_query(&project));
-    proxy(TOOL, "POST", url, Some(dossier), WRITE_SCOPE).await
+    proxy(TOOL, "POST", url, Some(dossier), WRITE_SCOPE, ctx).await
 }
 
 pub async fn handle_reconcile_project_dossiers(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
@@ -532,7 +535,7 @@ pub async fn handle_reconcile_project_dossiers(args: &Value, ctx: &McpContext) -
         "{base}/v1/projects/{}/dossiers/reconcile?token_budget={budget}",
         encode_query(&project)
     );
-    proxy(TOOL, "GET", url, None, READ_SCOPE).await
+    proxy(TOOL, "GET", url, None, READ_SCOPE, ctx).await
 }
 
 pub async fn handle_diff_project_dossiers(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
@@ -547,7 +550,7 @@ pub async fn handle_diff_project_dossiers(args: &Value, ctx: &McpContext) -> Res
         encode_query(&a),
         encode_query(&b)
     );
-    proxy(TOOL, "GET", url, None, READ_SCOPE).await
+    proxy(TOOL, "GET", url, None, READ_SCOPE, ctx).await
 }
 
 #[cfg(test)]

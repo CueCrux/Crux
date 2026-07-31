@@ -26,17 +26,23 @@
 //! into the project graph.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+#[cfg(unix)]
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::workspace_scan_manifests::ExternalDep;
+
+pub(crate) const SCAN_METADATA_MAX_BYTES: usize = 256;
+pub(crate) const RUST_SYNTAX_MAX_DEPTH: usize = 128;
+const RUST_SOURCE_MAX_LINE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScanError {
     #[error("workspace path not configured (CORECRUXD_WORKSPACE_PATH unset or empty)")]
     NotConfigured,
-    #[error("workspace path '{0}' does not exist")]
-    PathMissing(String),
+    #[error("scan policy: {0}")]
+    Policy(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -89,8 +95,10 @@ pub struct ScanDiagnostics {
     /// `reason` so the human / agent surface can explain the gap.
     #[serde(default)]
     pub unresolved_routes: Vec<UnresolvedRoute>,
-    /// V3 source files deliberately omitted before parsing by a safety cap or
-    /// non-regular-file check. Empty/off remains absent from serialized scans.
+    /// Source files deliberately omitted before parsing by a safety cap or
+    /// non-regular-file check. The field name is retained for schema
+    /// compatibility, but baseline TypeScript and V2 JavaScript guards also
+    /// report here. Empty/off remains absent from serialized scans.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub v3_skipped_files: Vec<V3SkippedFile>,
 }
@@ -279,21 +287,57 @@ pub struct DeadSymbol {
     pub note: String,
 }
 
-/// Run a scan against the configured workspace path. Synchronous (sub-second
-/// for the Crux workspace).
-pub fn run_scan() -> Result<WorkspaceScan, ScanError> {
-    let path = std::env::var("CORECRUXD_WORKSPACE_PATH")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .ok_or(ScanError::NotConfigured)?;
-    let root = PathBuf::from(&path);
-    if !root.exists() {
-        return Err(ScanError::PathMissing(path));
-    }
-    run_scan_at(&root)
+pub(crate) fn run_scan_with_policy(
+    policy: &crate::repo_scan_policy::RepoScanPolicy,
+) -> Result<WorkspaceScan, ScanError> {
+    policy.execute_workspace(|canonical| {
+        let mut scan = run_scan_at_in_context(canonical)?;
+        crate::workspace_scan_manifests::attach_external_deps_if_enabled(canonical, &mut scan)?;
+        redact_self_workspace_paths(&mut scan);
+        Ok(scan)
+    })
 }
 
+pub(crate) fn redact_self_workspace_paths(scan: &mut WorkspaceScan) {
+    let previous_root = PathBuf::from(&scan.root_path);
+    for crate_info in &mut scan.crates {
+        let path = Path::new(&crate_info.rel_path);
+        if !path.is_absolute() {
+            continue;
+        }
+        crate_info.rel_path = if previous_root.is_absolute() {
+            path.strip_prefix(&previous_root)
+                .ok()
+                .filter(|relative| !relative.as_os_str().is_empty())
+                .map_or_else(|| ".".to_string(), |relative| relative.display().to_string())
+        } else {
+            ".".to_string()
+        };
+    }
+    // The self-workspace graph is intentionally shared code intelligence, but
+    // the host's absolute checkout path is deployment metadata.
+    scan.root_path = ".".to_string();
+}
+
+#[cfg(test)]
 pub fn run_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
+    let policy = crate::repo_scan_policy::RepoScanPolicy::for_exact_root(root)?;
+    run_scan_at_with_policy(root, &policy)
+}
+
+#[cfg(test)]
+fn run_scan_at_with_policy(
+    root: &Path,
+    policy: &crate::repo_scan_policy::RepoScanPolicy,
+) -> Result<WorkspaceScan, ScanError> {
+    policy.execute(root, |canonical| {
+        let mut scan = run_scan_at_in_context(canonical)?;
+        crate::workspace_scan_manifests::attach_external_deps_if_enabled(canonical, &mut scan)?;
+        Ok(scan)
+    })
+}
+
+pub(crate) fn run_scan_at_in_context(root: &Path) -> Result<WorkspaceScan, ScanError> {
     if ast_scan_enabled_from_env() {
         return crate::workspace_scan_ast::run_scan_ast_at(root);
     }
@@ -307,12 +351,878 @@ pub(crate) fn ast_scan_enabled_from_env() -> bool {
     })
 }
 
+/// Reject source shapes that can drive `syn` or its recursive visitors beyond
+/// a bounded stack before parsing. This is a lexical admission guard, not a
+/// syntax validator; `syn` remains authoritative after it passes.
+pub(crate) fn validate_rust_syntax_complexity(src: &str) -> Result<(), ScanError> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum LexState {
+        Code,
+        LineComment,
+        BlockComment,
+        Quoted(u8),
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum AngleContext {
+        None,
+        TypeAlias,
+        Aggregate,
+        Signature,
+        Annotation,
+        Impl,
+        Cast,
+    }
+    #[derive(Clone, Copy)]
+    struct AngleSuspension {
+        depth: usize,
+        context: AngleContext,
+        context_base_depth: usize,
+        generic_depth: usize,
+        annotation_expected: bool,
+        cast_scope_base_depth: Option<usize>,
+    }
+
+    let bytes = src.as_bytes();
+    let mut state = LexState::Code;
+    let mut escaped = false;
+    let mut block_depth = 0usize;
+    let mut syntax_depth = 0usize;
+    let mut generic_depth = 0usize;
+    let mut prefix_run = 0usize;
+    let mut path_segments = 0usize;
+    let mut assignment_depth = 0usize;
+    let mut angle_context = AngleContext::None;
+    let mut angle_context_base_depth = 0usize;
+    let mut aggregate_brace_depth = None;
+    let mut aggregate_discriminant_depth = None;
+    let mut suspended_angles: Vec<AngleSuspension> = Vec::new();
+    let mut attribute_angle = None;
+    let mut annotation_expected = false;
+    let mut cast_scope_base_depth = None;
+    let mut closure_parameter_depth = None;
+    let mut line_bytes = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if index % 4096 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        if byte == b'\n' {
+            line_bytes = 0;
+        } else {
+            line_bytes = line_bytes.saturating_add(1);
+            if line_bytes > RUST_SOURCE_MAX_LINE_BYTES {
+                return Err(ScanError::Policy(format!(
+                    "Rust source line exceeds {RUST_SOURCE_MAX_LINE_BYTES} bytes"
+                )));
+            }
+        }
+        match state {
+            LexState::Code => {
+                if byte == b'/' && next == Some(b'/') {
+                    state = LexState::LineComment;
+                    index += 1;
+                } else if byte == b'/' && next == Some(b'*') {
+                    state = LexState::BlockComment;
+                    block_depth = 1;
+                    index += 1;
+                } else if let Some(end) = rust_raw_string_end(bytes, index)? {
+                    index = end;
+                    prefix_run = 0;
+                } else if byte == b'"' {
+                    state = LexState::Quoted(b'"');
+                    escaped = false;
+                    prefix_run = 0;
+                } else if byte == b'\'' && rust_char_literal_end(bytes, index).is_some() {
+                    state = LexState::Quoted(b'\'');
+                    escaped = false;
+                    prefix_run = 0;
+                } else {
+                    let angle_isolated = attribute_angle.is_some();
+                    let previous = index.checked_sub(1).and_then(|offset| bytes.get(offset)).copied();
+                    let assignment_operator = byte == b'='
+                        && next != Some(b'=')
+                        && next != Some(b'>')
+                        && !matches!(previous, Some(b'=' | b'!' | b'<' | b'>'));
+                    if assignment_operator && !angle_isolated {
+                        assignment_depth = assignment_depth.saturating_add(1);
+                    }
+                    let starts_identifier = (byte.is_ascii_alphabetic() || byte == b'_')
+                        && !bytes
+                            .get(index.wrapping_sub(1))
+                            .is_some_and(|previous| previous.is_ascii_alphanumeric() || *previous == b'_')
+                        && !bytes[..index].ends_with(b"r#");
+                    if starts_identifier && !angle_isolated {
+                        let end = bytes[index..]
+                            .iter()
+                            .position(|candidate| !(candidate.is_ascii_alphanumeric() || *candidate == b'_'))
+                            .map_or(bytes.len(), |offset| index + offset);
+                        match &bytes[index..end] {
+                            b"type" => {
+                                angle_context = AngleContext::TypeAlias;
+                                angle_context_base_depth = syntax_depth;
+                            }
+                            b"struct" | b"enum" | b"union" | b"trait" => {
+                                angle_context = AngleContext::Aggregate;
+                                angle_context_base_depth = syntax_depth;
+                            }
+                            b"fn" => {
+                                angle_context = AngleContext::Signature;
+                                angle_context_base_depth = syntax_depth;
+                            }
+                            b"impl" | b"where" => {
+                                angle_context = AngleContext::Impl;
+                                angle_context_base_depth = syntax_depth;
+                            }
+                            b"let" | b"const" | b"static" => {
+                                annotation_expected = true;
+                            }
+                            b"as" if generic_depth == 0 => {
+                                angle_context = AngleContext::Cast;
+                                angle_context_base_depth = syntax_depth;
+                                cast_scope_base_depth = Some(syntax_depth);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !angle_isolated
+                        && matches!(byte, b'&' | b'*')
+                        && rust_type_prefix_run(bytes, index) > RUST_SYNTAX_MAX_DEPTH
+                    {
+                        return Err(ScanError::Policy(format!(
+                            "Rust type-prefix nesting exceeds {RUST_SYNTAX_MAX_DEPTH}"
+                        )));
+                    }
+                    let cast_angle_open = byte == b'<'
+                        && angle_context == AngleContext::Cast
+                        && rust_angle_has_matching_close(bytes, index)?;
+                    match byte {
+                        b'(' | b'[' | b'{' => {
+                            syntax_depth = syntax_depth.saturating_add(1);
+                            if byte == b'[' && attribute_angle.is_none() && rust_attribute_open(bytes, index) {
+                                attribute_angle = Some(AngleSuspension {
+                                    depth: syntax_depth,
+                                    context: angle_context,
+                                    context_base_depth: angle_context_base_depth,
+                                    generic_depth,
+                                    annotation_expected,
+                                    cast_scope_base_depth,
+                                });
+                                cast_scope_base_depth = None;
+                            } else if byte == b'{' && attribute_angle.is_none() {
+                                if generic_depth > 0 {
+                                    crate::repo_scan_policy::charge_parser_work(
+                                        1,
+                                        std::mem::size_of::<AngleSuspension>(),
+                                        "Rust angle-context stack",
+                                    )?;
+                                    suspended_angles.push(AngleSuspension {
+                                        depth: syntax_depth,
+                                        context: angle_context,
+                                        context_base_depth: angle_context_base_depth,
+                                        generic_depth,
+                                        annotation_expected,
+                                        cast_scope_base_depth,
+                                    });
+                                    angle_context = AngleContext::None;
+                                    angle_context_base_depth = syntax_depth;
+                                    generic_depth = 0;
+                                    annotation_expected = false;
+                                    cast_scope_base_depth = None;
+                                } else {
+                                    match angle_context {
+                                        AngleContext::Aggregate => {
+                                            aggregate_brace_depth.get_or_insert(syntax_depth);
+                                        }
+                                        AngleContext::Signature | AngleContext::Impl => {
+                                            angle_context = AngleContext::None;
+                                        }
+                                        AngleContext::Annotation => {
+                                            angle_context = AngleContext::None;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            prefix_run = 0;
+                        }
+                        b')' | b']' | b'}' => {
+                            if let Some(saved) = attribute_angle.filter(|saved| saved.depth == syntax_depth) {
+                                attribute_angle = None;
+                                angle_context = saved.context;
+                                angle_context_base_depth = saved.context_base_depth;
+                                generic_depth = saved.generic_depth;
+                                annotation_expected = saved.annotation_expected;
+                                cast_scope_base_depth = saved.cast_scope_base_depth;
+                            } else if let Some(saved) = suspended_angles
+                                .last()
+                                .copied()
+                                .filter(|saved| saved.depth == syntax_depth)
+                            {
+                                suspended_angles.pop();
+                                angle_context = saved.context;
+                                angle_context_base_depth = saved.context_base_depth;
+                                generic_depth = saved.generic_depth;
+                                annotation_expected = saved.annotation_expected;
+                                cast_scope_base_depth = saved.cast_scope_base_depth;
+                            }
+                            if byte == b'}' && aggregate_brace_depth == Some(syntax_depth) {
+                                aggregate_brace_depth = None;
+                                aggregate_discriminant_depth = None;
+                                angle_context = AngleContext::None;
+                            }
+                            if generic_depth == 0 && cast_scope_base_depth == Some(syntax_depth) {
+                                // A cast target cannot extend past the
+                                // expression delimiter that contains it. This
+                                // also covers parenthesized casts followed by
+                                // ordinary comparisons.
+                                angle_context = AngleContext::None;
+                                cast_scope_base_depth = None;
+                            }
+                            syntax_depth = syntax_depth.saturating_sub(1);
+                            prefix_run = 0;
+                        }
+                        _ if attribute_angle.is_some() => {
+                            prefix_run = 0;
+                        }
+                        b'<' if attribute_angle.is_none()
+                            && (generic_depth > 0
+                                || (angle_context != AngleContext::None && angle_context != AngleContext::Cast)
+                                || cast_angle_open
+                                || bytes[..index].ends_with(b"::")
+                                || rust_qself_open(bytes, index)) =>
+                        {
+                            generic_depth = generic_depth.saturating_add(1);
+                            prefix_run = 0;
+                        }
+                        b'>' if generic_depth > 0 => {
+                            generic_depth = generic_depth.saturating_sub(1);
+                            if generic_depth == 0 && angle_context == AngleContext::Cast {
+                                angle_context = AngleContext::None;
+                            }
+                            prefix_run = 0;
+                        }
+                        b'<' if angle_context == AngleContext::Cast => {
+                            angle_context = AngleContext::None;
+                            prefix_run = 0;
+                        }
+                        b':' if next == Some(b':') => {
+                            path_segments = path_segments.saturating_add(1);
+                            prefix_run = 0;
+                            index += 1;
+                        }
+                        b':' => {
+                            if angle_context == AngleContext::None
+                                && (annotation_expected || closure_parameter_depth.is_some())
+                            {
+                                angle_context = AngleContext::Annotation;
+                                angle_context_base_depth = syntax_depth;
+                            }
+                            annotation_expected = false;
+                            path_segments = 0;
+                            prefix_run = 0;
+                        }
+                        b'-' if next == Some(b'>') => {
+                            angle_context = AngleContext::Annotation;
+                            angle_context_base_depth = syntax_depth;
+                            prefix_run = 0;
+                            // Do not let the arrow's `>` consume one open
+                            // generic layer on the next loop iteration.
+                            index += 1;
+                        }
+                        b'=' if angle_context != AngleContext::TypeAlias && generic_depth == 0 => {
+                            if angle_context == AngleContext::Aggregate && aggregate_brace_depth == Some(syntax_depth) {
+                                // Enum discriminants are expressions. Resume
+                                // aggregate/type context at the next
+                                // top-level variant comma.
+                                aggregate_discriminant_depth = Some(syntax_depth);
+                                angle_context = AngleContext::None;
+                            } else {
+                                angle_context = AngleContext::None;
+                            }
+                            if cast_scope_base_depth == Some(syntax_depth) {
+                                cast_scope_base_depth = None;
+                            }
+                            annotation_expected = false;
+                            path_segments = 0;
+                            prefix_run = 0;
+                        }
+                        b',' => {
+                            if aggregate_discriminant_depth == Some(syntax_depth) {
+                                aggregate_discriminant_depth = None;
+                                angle_context = AngleContext::Aggregate;
+                            } else if generic_depth == 0 && cast_scope_base_depth == Some(syntax_depth) {
+                                // This is an expression/argument boundary.
+                                // Commas inside an actual generic target have
+                                // generic_depth > 0 and remain type context.
+                                angle_context = AngleContext::None;
+                                cast_scope_base_depth = None;
+                            } else if generic_depth == 0 && angle_context == AngleContext::Annotation {
+                                angle_context = AngleContext::None;
+                            }
+                            path_segments = 0;
+                            assignment_depth = 0;
+                            prefix_run = 0;
+                        }
+                        b';' => {
+                            if angle_context != AngleContext::None && syntax_depth > angle_context_base_depth {
+                                // The expression half of an array type
+                                // (`[T; EXPR]`) is not a type grammar. Ignore
+                                // comparison operators until its delimiter
+                                // closes while retaining any enclosing generic
+                                // depth.
+                                crate::repo_scan_policy::charge_parser_work(
+                                    1,
+                                    std::mem::size_of::<AngleSuspension>(),
+                                    "Rust angle-context stack",
+                                )?;
+                                suspended_angles.push(AngleSuspension {
+                                    depth: syntax_depth,
+                                    context: angle_context,
+                                    context_base_depth: angle_context_base_depth,
+                                    generic_depth,
+                                    annotation_expected,
+                                    cast_scope_base_depth,
+                                });
+                                angle_context = AngleContext::None;
+                                angle_context_base_depth = syntax_depth;
+                                generic_depth = 0;
+                                annotation_expected = false;
+                                cast_scope_base_depth = None;
+                            } else {
+                                angle_context = AngleContext::None;
+                                cast_scope_base_depth = None;
+                                annotation_expected = false;
+                                closure_parameter_depth = None;
+                                generic_depth = 0;
+                                path_segments = 0;
+                                assignment_depth = 0;
+                                prefix_run = 0;
+                            }
+                        }
+                        b'+' | b'/' | b'%' | b'^' | b'?' | b'.'
+                            if generic_depth == 0 && cast_scope_base_depth == Some(syntax_depth) =>
+                        {
+                            angle_context = AngleContext::None;
+                            cast_scope_base_depth = None;
+                            prefix_run = 0;
+                        }
+                        b'-' if next != Some(b'>')
+                            && generic_depth == 0
+                            && cast_scope_base_depth == Some(syntax_depth) =>
+                        {
+                            angle_context = AngleContext::None;
+                            cast_scope_base_depth = None;
+                            prefix_run = 0;
+                        }
+                        b'>' if generic_depth == 0 && cast_scope_base_depth == Some(syntax_depth) => {
+                            angle_context = AngleContext::None;
+                            cast_scope_base_depth = None;
+                            prefix_run = 0;
+                        }
+                        b'&' if next == Some(b'&')
+                            && generic_depth == 0
+                            && cast_scope_base_depth == Some(syntax_depth) =>
+                        {
+                            angle_context = AngleContext::None;
+                            cast_scope_base_depth = None;
+                            prefix_run = 0;
+                            index += 1;
+                        }
+                        b'|' if next == Some(b'|')
+                            && generic_depth == 0
+                            && cast_scope_base_depth == Some(syntax_depth) =>
+                        {
+                            angle_context = AngleContext::None;
+                            cast_scope_base_depth = None;
+                            prefix_run = 0;
+                            index += 1;
+                        }
+                        b'|' => {
+                            if closure_parameter_depth == Some(syntax_depth) {
+                                closure_parameter_depth = None;
+                                if angle_context == AngleContext::Annotation {
+                                    angle_context = AngleContext::None;
+                                    generic_depth = 0;
+                                }
+                            } else if rust_closure_bar_open(bytes, index) {
+                                closure_parameter_depth.get_or_insert(syntax_depth);
+                            }
+                            prefix_run = 0;
+                        }
+                        b'!' | b'&' | b'*' | b'-' => {
+                            prefix_run = prefix_run.saturating_add(1);
+                        }
+                        byte if byte.is_ascii_whitespace() => {}
+                        byte if byte.is_ascii_alphanumeric() || byte == b'_' => {
+                            prefix_run = 0;
+                        }
+                        b'<' | b'>' | b'\'' => {
+                            prefix_run = 0;
+                        }
+                        _ => {
+                            prefix_run = 0;
+                            path_segments = 0;
+                        }
+                    }
+                    if syntax_depth > RUST_SYNTAX_MAX_DEPTH
+                        || generic_depth > RUST_SYNTAX_MAX_DEPTH
+                        || prefix_run > RUST_SYNTAX_MAX_DEPTH
+                        || path_segments > RUST_SYNTAX_MAX_DEPTH
+                        || assignment_depth > RUST_SYNTAX_MAX_DEPTH
+                    {
+                        return Err(ScanError::Policy(format!(
+                            "Rust syntax nesting exceeds {RUST_SYNTAX_MAX_DEPTH}"
+                        )));
+                    }
+                }
+            }
+            LexState::LineComment => {
+                if byte == b'\n' {
+                    state = LexState::Code;
+                }
+            }
+            LexState::BlockComment => {
+                if byte == b'/' && next == Some(b'*') {
+                    block_depth = block_depth.saturating_add(1);
+                    if block_depth > RUST_SYNTAX_MAX_DEPTH {
+                        return Err(ScanError::Policy(format!(
+                            "Rust comment nesting exceeds {RUST_SYNTAX_MAX_DEPTH}"
+                        )));
+                    }
+                    index += 1;
+                } else if byte == b'*' && next == Some(b'/') {
+                    block_depth = block_depth.saturating_sub(1);
+                    index += 1;
+                    if block_depth == 0 {
+                        state = LexState::Code;
+                    }
+                }
+            }
+            LexState::Quoted(quote) => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == quote {
+                    state = LexState::Code;
+                }
+            }
+        }
+        index += 1;
+    }
+    validate_rust_tree_depth(src)?;
+    crate::repo_scan_policy::check_deadline()
+}
+
+fn validate_rust_tree_depth(src: &str) -> Result<(), ScanError> {
+    crate::repo_scan_policy::check_deadline()?;
+    crate::repo_scan_policy::charge_source_parse_work(src, "Rust tree-sitter preflight")?;
+
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .map_err(|error| ScanError::Policy(format!("Rust syntax preflight unavailable: {error}")))?;
+    let bytes = src.as_bytes();
+    let mut progress = |_state: &tree_sitter::ParseState| match crate::repo_scan_policy::check_deadline() {
+        Ok(()) => std::ops::ControlFlow::Continue(()),
+        Err(_) => std::ops::ControlFlow::Break(()),
+    };
+    let options = tree_sitter::ParseOptions::new().progress_callback(&mut progress);
+    let tree = parser.parse_with_options(
+        &mut |offset, _point| bytes.get(offset..).unwrap_or_default(),
+        None,
+        Some(options),
+    );
+    crate::repo_scan_policy::check_deadline()?;
+    let Some(tree) = tree else {
+        return Err(ScanError::Policy(
+            "Rust syntax preflight did not complete within the scan budget".to_string(),
+        ));
+    };
+    if tree.root_node().has_error() {
+        return Err(ScanError::Policy(
+            "Rust syntax preflight rejected an unparseable source tree".to_string(),
+        ));
+    }
+
+    // Tree-sitter owns its parse stack on the heap. Walk its concrete tree
+    // iteratively so no attacker-controlled source shape reaches `syn` (or
+    // recursive AST destruction) above the daemon's fixed depth ceiling.
+    let mut cursor = tree.root_node().walk();
+    let mut depth = 0usize;
+    let mut visited = 1usize;
+    'walk: loop {
+        if visited % 1024 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
+        if cursor.goto_first_child() {
+            depth = depth.saturating_add(1);
+            visited = visited.saturating_add(1);
+            if depth > RUST_SYNTAX_MAX_DEPTH {
+                return Err(ScanError::Policy(format!(
+                    "Rust syntax tree depth exceeds {RUST_SYNTAX_MAX_DEPTH}"
+                )));
+            }
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                visited = visited.saturating_add(1);
+                break;
+            }
+            if !cursor.goto_parent() {
+                break 'walk;
+            }
+            depth = depth.saturating_sub(1);
+        }
+    }
+    Ok(())
+}
+
+fn rust_qself_open(bytes: &[u8], index: usize) -> bool {
+    let mut cursor = index;
+    while cursor > 0 {
+        cursor -= 1;
+        let previous = bytes[cursor];
+        if previous.is_ascii_whitespace() {
+            continue;
+        }
+        if matches!(
+            previous,
+            b'(' | b'['
+                | b'{'
+                | b'='
+                | b','
+                | b';'
+                | b':'
+                | b'!'
+                | b'|'
+                | b'&'
+                | b'?'
+                | b'+'
+                | b'-'
+                | b'*'
+                | b'/'
+                | b'%'
+                | b'^'
+                | b'.'
+        ) {
+            return true;
+        }
+        if previous == b'>' {
+            return true;
+        }
+        if previous.is_ascii_alphanumeric() || previous == b'_' {
+            let end = cursor + 1;
+            while cursor > 0 && (bytes[cursor - 1].is_ascii_alphanumeric() || bytes[cursor - 1] == b'_') {
+                cursor -= 1;
+            }
+            return matches!(
+                &bytes[cursor..end],
+                b"return" | b"break" | b"yield" | b"if" | b"while" | b"match" | b"in" | b"as"
+            );
+        }
+        return false;
+    }
+    true
+}
+
+fn rust_attribute_open(bytes: &[u8], index: usize) -> bool {
+    let mut cursor = index;
+    while cursor > 0 {
+        cursor -= 1;
+        match bytes[cursor] {
+            byte if byte.is_ascii_whitespace() => {}
+            b'#' => return true,
+            b'!' => {
+                while cursor > 0 {
+                    cursor -= 1;
+                    if !bytes[cursor].is_ascii_whitespace() {
+                        return bytes[cursor] == b'#';
+                    }
+                }
+                return false;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn rust_angle_has_matching_close(bytes: &[u8], index: usize) -> Result<bool, ScanError> {
+    #[derive(Clone, Copy)]
+    enum State {
+        Code,
+        LineComment,
+        BlockComment(usize),
+        Quoted(u8),
+    }
+
+    let mut angle_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut state = State::Code;
+    let mut escaped = false;
+    let mut cursor = index;
+    while cursor < bytes.len() {
+        if cursor % 4096 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
+        let byte = bytes[cursor];
+        let next = bytes.get(cursor + 1).copied();
+        match state {
+            State::Code => {
+                if let Some(end) = rust_raw_string_end(bytes, cursor)? {
+                    cursor = end;
+                } else {
+                    match byte {
+                        b'/' if next == Some(b'/') => {
+                            state = State::LineComment;
+                            cursor += 1;
+                        }
+                        b'/' if next == Some(b'*') => {
+                            state = State::BlockComment(1);
+                            cursor += 1;
+                        }
+                        b'"' => {
+                            state = State::Quoted(byte);
+                            escaped = false;
+                        }
+                        b'\'' if rust_char_literal_end(bytes, cursor).is_some() => {
+                            cursor = rust_char_literal_end(bytes, cursor).unwrap_or(cursor);
+                        }
+                        b'{' => brace_depth = brace_depth.saturating_add(1),
+                        b'}' if brace_depth > 0 => brace_depth -= 1,
+                        b'(' => paren_depth = paren_depth.saturating_add(1),
+                        b')' if paren_depth > 0 => paren_depth -= 1,
+                        b'[' => bracket_depth = bracket_depth.saturating_add(1),
+                        b']' if bracket_depth > 0 => bracket_depth -= 1,
+                        b')' | b']' | b'}' if brace_depth == 0 && paren_depth == 0 && bracket_depth == 0 => {
+                            return Ok(false);
+                        }
+                        b'<' if brace_depth == 0 => angle_depth = angle_depth.saturating_add(1),
+                        b'>' if brace_depth == 0 && angle_depth > 0 => {
+                            angle_depth -= 1;
+                            if angle_depth == 0 {
+                                return Ok(true);
+                            }
+                        }
+                        b';' if angle_depth > 0 && brace_depth == 0 && paren_depth == 0 && bracket_depth == 0 => {
+                            return Ok(false);
+                        }
+                        b'&' | b'|' | b'=' | b'!'
+                            if angle_depth == 1
+                                && brace_depth == 0
+                                && paren_depth == 0
+                                && bracket_depth == 0
+                                && next == Some(byte) =>
+                        {
+                            return Ok(false);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            State::LineComment => {
+                if byte == b'\n' {
+                    state = State::Code;
+                }
+            }
+            State::BlockComment(depth) => {
+                if byte == b'/' && next == Some(b'*') {
+                    state = State::BlockComment(depth.saturating_add(1));
+                    cursor += 1;
+                } else if byte == b'*' && next == Some(b'/') {
+                    state = if depth == 1 {
+                        State::Code
+                    } else {
+                        State::BlockComment(depth - 1)
+                    };
+                    cursor += 1;
+                }
+            }
+            State::Quoted(quote) => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == quote {
+                    state = State::Code;
+                }
+            }
+        }
+        cursor += 1;
+    }
+    Ok(false)
+}
+
+fn rust_closure_bar_open(bytes: &[u8], index: usize) -> bool {
+    let mut cursor = index;
+    while cursor > 0 {
+        cursor -= 1;
+        let previous = bytes[cursor];
+        if previous.is_ascii_whitespace() {
+            continue;
+        }
+        if matches!(previous, b'(' | b'[' | b'{' | b'=' | b',' | b';') {
+            return true;
+        }
+        if previous == b'>' {
+            while cursor > 0 {
+                cursor -= 1;
+                if bytes[cursor].is_ascii_whitespace() {
+                    continue;
+                }
+                return bytes[cursor] == b'=';
+            }
+            return false;
+        }
+        if previous.is_ascii_alphanumeric() || previous == b'_' {
+            let end = cursor + 1;
+            while cursor > 0 && (bytes[cursor - 1].is_ascii_alphanumeric() || bytes[cursor - 1] == b'_') {
+                cursor -= 1;
+            }
+            return matches!(&bytes[cursor..end], b"move" | b"async" | b"return");
+        }
+        return false;
+    }
+    true
+}
+
+fn rust_type_prefix_run(bytes: &[u8], start: usize) -> usize {
+    fn skip_space(bytes: &[u8], cursor: &mut usize) {
+        while bytes.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
+            *cursor += 1;
+        }
+    }
+    fn consume_word(bytes: &[u8], cursor: &mut usize, word: &[u8]) -> bool {
+        if bytes.get(*cursor..).is_some_and(|tail| tail.starts_with(word))
+            && !bytes
+                .get(*cursor + word.len())
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            *cursor += word.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    let mut cursor = start;
+    let mut depth = 0usize;
+    loop {
+        skip_space(bytes, &mut cursor);
+        match bytes.get(cursor).copied() {
+            Some(b'&') => {
+                depth = depth.saturating_add(1);
+                cursor += 1;
+                skip_space(bytes, &mut cursor);
+                if bytes.get(cursor) == Some(&b'\'') {
+                    cursor += 1;
+                    while bytes
+                        .get(cursor)
+                        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                    {
+                        cursor += 1;
+                    }
+                    skip_space(bytes, &mut cursor);
+                }
+                let _ = consume_word(bytes, &mut cursor, b"mut");
+            }
+            Some(b'*') => {
+                cursor += 1;
+                skip_space(bytes, &mut cursor);
+                if !consume_word(bytes, &mut cursor, b"const") && !consume_word(bytes, &mut cursor, b"mut") {
+                    break;
+                }
+                depth = depth.saturating_add(1);
+            }
+            _ => break,
+        }
+    }
+    depth
+}
+
+fn rust_raw_string_end(bytes: &[u8], start: usize) -> Result<Option<usize>, ScanError> {
+    let r_index = if bytes.get(start) == Some(&b'r') {
+        start
+    } else if bytes.get(start) == Some(&b'b') && bytes.get(start + 1) == Some(&b'r') {
+        start + 1
+    } else {
+        return Ok(None);
+    };
+    let mut quote = r_index + 1;
+    while bytes.get(quote) == Some(&b'#') {
+        quote += 1;
+    }
+    if bytes.get(quote) != Some(&b'"') {
+        return Ok(None);
+    }
+    let hashes = quote.saturating_sub(r_index + 1);
+    let mut cursor = quote + 1;
+    while cursor < bytes.len() {
+        if cursor % 4096 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
+        if bytes[cursor] == b'"' && (0..hashes).all(|offset| bytes.get(cursor + 1 + offset) == Some(&b'#')) {
+            return Ok(Some(cursor + hashes));
+        }
+        cursor += 1;
+    }
+    Ok(Some(bytes.len().saturating_sub(1)))
+}
+
+fn rust_char_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let value_start = start.checked_add(1)?;
+    let first = *bytes.get(value_start)?;
+    let closing = if first == b'\\' {
+        match *bytes.get(value_start + 1)? {
+            b'x' => {
+                if bytes
+                    .get(value_start + 2..value_start + 4)?
+                    .iter()
+                    .all(u8::is_ascii_hexdigit)
+                {
+                    value_start + 4
+                } else {
+                    return None;
+                }
+            }
+            b'u' if bytes.get(value_start + 2) == Some(&b'{') => {
+                let mut cursor = value_start + 3;
+                let mut digits = 0usize;
+                while bytes.get(cursor).is_some_and(u8::is_ascii_hexdigit) && digits < 6 {
+                    cursor += 1;
+                    digits += 1;
+                }
+                if digits == 0 || bytes.get(cursor) != Some(&b'}') {
+                    return None;
+                }
+                cursor + 1
+            }
+            b'\\' | b'\'' | b'"' | b'n' | b'r' | b't' | b'0' => value_start + 2,
+            _ => return None,
+        }
+    } else {
+        let scalar = std::str::from_utf8(bytes.get(value_start..)?).ok()?.chars().next()?;
+        if scalar == '\n' || scalar == '\r' || scalar == '\'' {
+            return None;
+        }
+        value_start + scalar.len_utf8()
+    };
+    (bytes.get(closing) == Some(&b'\'')).then_some(closing)
+}
+
 pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
+    crate::repo_scan_policy::check_deadline()?;
     let started_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
     let started_inst = std::time::Instant::now();
-    let scan_id = format!("ws_{started_ms}");
+    let scan_id = format!("ws_{started_ms}_{}", uuid::Uuid::new_v4().simple());
 
     let mut scan = WorkspaceScan {
         scan_id,
@@ -323,20 +1233,36 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
 
     // ── 1. Find crates by walking for Cargo.toml files. ───────────────
     let mut cargo_files: Vec<PathBuf> = Vec::new();
+    let mut discovery_error = None;
     walk_dir(root, root, &mut |rel_path, abs_path| {
+        if discovery_error.is_some() {
+            return;
+        }
         if abs_path.file_name().and_then(|n| n.to_str()) == Some("Cargo.toml") && rel_path != Path::new("Cargo.toml")
         // skip workspace root manifest
         {
-            cargo_files.push(abs_path.to_path_buf());
+            match crate::repo_scan_policy::charge_generated_work(
+                1,
+                abs_path.as_os_str().len(),
+                "Cargo manifest discovery index",
+            ) {
+                Ok(()) => cargo_files.push(abs_path.to_path_buf()),
+                Err(error) => discovery_error = Some(error),
+            }
         }
     })?;
+    if let Some(error) = discovery_error {
+        return Err(error);
+    }
+    crate::repo_scan_policy::check_deadline()?;
 
     // For each crate, parse minimum metadata + collect rs files.
     let mut crate_dirs: HashMap<String, PathBuf> = HashMap::new(); // name → crate dir
     let mut crate_internal_deps: HashMap<String, Vec<String>> = HashMap::new();
     for cargo in &cargo_files {
+        crate::repo_scan_policy::check_deadline()?;
         let crate_dir = cargo.parent().unwrap_or(root).to_path_buf();
-        let toml = std::fs::read_to_string(cargo).unwrap_or_default();
+        let toml = read_scan_to_string(cargo)?;
         let name = parse_crate_name(&toml).unwrap_or_else(|| {
             crate_dir
                 .file_name()
@@ -344,7 +1270,12 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
                 .unwrap_or("?")
                 .to_string()
         });
-        let internal = parse_internal_path_deps(&toml);
+        let internal = parse_internal_path_deps(&toml)?;
+        crate::repo_scan_policy::charge_generated_work(
+            2,
+            name.len().saturating_mul(2).saturating_add(crate_dir.as_os_str().len()),
+            "crate manifest indexes",
+        )?;
         crate_dirs.insert(name.clone(), crate_dir);
         crate_internal_deps.insert(name, internal);
     }
@@ -352,25 +1283,46 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
     // Walk every .rs file under each crate's src/.
     let mut files_by_crate: HashMap<String, Vec<PathBuf>> = HashMap::new();
     for (name, dir) in &crate_dirs {
+        crate::repo_scan_policy::check_deadline()?;
         let src = dir.join("src");
-        if !src.exists() {
+        if !crate::repo_scan_policy::scan_path_is_directory(&src)? {
             continue;
         }
         let mut acc: Vec<PathBuf> = Vec::new();
+        let mut discovery_error = None;
         walk_dir(&src, &src, &mut |_rel, abs| {
+            if discovery_error.is_some() {
+                return;
+            }
             if abs.extension().and_then(|e| e.to_str()) == Some("rs") {
-                acc.push(abs.to_path_buf());
+                match crate::repo_scan_policy::charge_generated_work(
+                    1,
+                    abs.as_os_str().len(),
+                    "Rust source discovery index",
+                ) {
+                    Ok(()) => acc.push(abs.to_path_buf()),
+                    Err(error) => discovery_error = Some(error),
+                }
             }
         })?;
+        if let Some(error) = discovery_error {
+            return Err(error);
+        }
+        crate::repo_scan_policy::charge_generated_work(1, name.len(), "crate source index")?;
         files_by_crate.insert(name.clone(), acc);
     }
 
     // Pre-build a lookup for resolving `use crate_name::...` in the dep step.
+    crate::repo_scan_policy::charge_generated_work(
+        crate_dirs.len(),
+        crate_dirs.keys().map(String::len).sum(),
+        "known crate index",
+    )?;
     let known_crate_names: BTreeSet<String> = crate_dirs.keys().cloned().collect();
 
     // ── 2. Per-crate: parse files, extract symbols + deps + stubs ─────
-    let mut all_pub_symbols: HashMap<String, Vec<usize>> = HashMap::new(); // name → indices into scan.symbols
     for (cname, files) in &files_by_crate {
+        crate::repo_scan_policy::check_deadline()?;
         // crate_dirs was populated from the same files_by_crate keys above —
         // the missing-key branch is structurally unreachable but we handle it
         // gracefully rather than panic.
@@ -381,11 +1333,13 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
         let mut crate_file_count = 0usize;
 
         for abs in files {
+            crate::repo_scan_policy::check_deadline()?;
             let rel = abs.strip_prefix(root).map_or_else(|_| abs.clone(), |p| p.to_path_buf());
             let rel_str = rel.display().to_string();
             let module_path = infer_module_path(cname, &crate_root, abs);
 
-            let src = std::fs::read_to_string(abs).unwrap_or_default();
+            let src = read_scan_to_string(abs)?;
+            crate::repo_scan_policy::charge_source_parse_work(&src, "Rust regex scanner parser work")?;
             let loc = src.lines().count();
             crate_loc += loc;
             crate_file_count += 1;
@@ -400,10 +1354,22 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
             let is_self_source = rel_str.ends_with("corecruxd/src/workspace_scan.rs");
 
             for (line_no, line) in src.lines().enumerate() {
+                if line_no % 256 == 0 {
+                    crate::repo_scan_policy::check_deadline()?;
+                }
                 let line_num = line_no + 1;
                 // Symbols.
                 if let Some((kind, name, is_pub)) = parse_symbol_line(line) {
-                    let symbol_idx = scan.symbols.len();
+                    crate::repo_scan_policy::charge_generated_work(
+                        1,
+                        cname
+                            .len()
+                            .saturating_add(module_path.len())
+                            .saturating_add(rel_str.len())
+                            .saturating_add(kind.len())
+                            .saturating_add(name.len()),
+                        "scan output",
+                    )?;
                     scan.symbols.push(SymbolInfo {
                         crate_name: cname.clone(),
                         module_path: module_path.clone(),
@@ -414,13 +1380,19 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
                         is_pub,
                     });
                     file_symbol_count += 1;
-                    if is_pub {
-                        all_pub_symbols.entry(name).or_default().push(symbol_idx);
-                    }
                 }
                 // Stubs (skip the detector's own source — see comment above).
                 if !is_self_source {
                     if let Some((kind, snippet)) = parse_stub_line(line) {
+                        crate::repo_scan_policy::charge_generated_work(
+                            1,
+                            cname
+                                .len()
+                                .saturating_add(rel_str.len())
+                                .saturating_add(kind.len())
+                                .saturating_add(snippet.len()),
+                            "scan output",
+                        )?;
                         scan.stubs.push(StubHit {
                             crate_name: cname.clone(),
                             file_rel_path: rel_str.clone(),
@@ -433,6 +1405,15 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
                 }
                 // `use` statements → dep edges.
                 if let Some(target_module) = parse_use_target(line, cname, &known_crate_names) {
+                    crate::repo_scan_policy::charge_generated_work(
+                        1,
+                        cname
+                            .len()
+                            .saturating_add(rel_str.len())
+                            .saturating_add(target_module.len())
+                            .saturating_add(line.len()),
+                        "scan output",
+                    )?;
                     scan.deps.push(DepEdge {
                         from_crate: cname.clone(),
                         from_file: rel_str.clone(),
@@ -448,6 +1429,15 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
             let (doc_full, doc_summary) = parse_file_doc_header(&src);
             let is_test_file = looks_like_test_file(&rel_str, &src);
 
+            crate::repo_scan_policy::charge_generated_work(
+                1,
+                rel_str
+                    .len()
+                    .saturating_add(cname.len())
+                    .saturating_add(module_path.len())
+                    .saturating_add(doc_full.as_deref().map_or(0, str::len)),
+                "scan output",
+            )?;
             scan.files.push(FileInfo {
                 rel_path: rel_str,
                 crate_name: cname.clone(),
@@ -464,12 +1454,22 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
             });
         }
 
+        let rel_path = crate_root
+            .strip_prefix(root)
+            .map_or_else(|_| crate_root.display().to_string(), |p| p.display().to_string());
+        let internal_deps = crate_internal_deps.remove(cname).unwrap_or_default();
+        crate::repo_scan_policy::charge_generated_work(
+            1,
+            cname
+                .len()
+                .saturating_add(rel_path.len())
+                .saturating_add(internal_deps.iter().map(String::len).sum::<usize>()),
+            "scan output",
+        )?;
         scan.crates.push(CrateInfo {
             name: cname.clone(),
-            rel_path: crate_root
-                .strip_prefix(root)
-                .map_or_else(|_| crate_root.display().to_string(), |p| p.display().to_string()),
-            internal_deps: crate_internal_deps.remove(cname).unwrap_or_default(),
+            rel_path,
+            internal_deps,
             file_count: crate_file_count,
             total_loc: crate_loc,
         });
@@ -487,22 +1487,38 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
         // Quick lookup: file rel_path → index into scan.files.
         let mut file_idx_by_path: HashMap<String, usize> = HashMap::new();
         for (i, f) in scan.files.iter().enumerate() {
+            if i % 256 == 0 {
+                crate::repo_scan_policy::check_deadline()?;
+            }
+            crate::repo_scan_policy::charge_generated_work(1, f.rel_path.len(), "file path index")?;
             file_idx_by_path.insert(f.rel_path.clone(), i);
         }
         for (i, s) in scan.symbols.iter().enumerate() {
+            if i % 256 == 0 {
+                crate::repo_scan_policy::check_deadline()?;
+            }
             // Only index callable symbols. Structs/enums/types appear in call
             // expressions too (constructors), but the resulting edges add a lot
             // of noise; restrict to fn for the storyline view.
             if s.kind == "fn" {
+                crate::repo_scan_policy::charge_generated_work(1, s.name.len(), "symbol name index")?;
                 symbol_by_name.entry(s.name.clone()).or_default().push(i);
             }
         }
         // Denormalise `defines` into FileInfo for cheap downstream queries.
-        for s in &scan.symbols {
-            if let Some(idx) = file_idx_by_path.get(&s.file_rel_path) {
-                let f = &mut scan.files[*idx];
-                if !f.defines.contains(&s.name) {
-                    f.defines.push(s.name.clone());
+        let mut define_names_by_file: HashMap<usize, HashSet<String>> = HashMap::new();
+        for (idx, s) in scan.symbols.iter().enumerate() {
+            if idx % 256 == 0 {
+                crate::repo_scan_policy::check_deadline()?;
+            }
+            if let Some(file_idx) = file_idx_by_path.get(&s.file_rel_path).copied() {
+                if define_names_by_file.entry(file_idx).or_default().insert(s.name.clone()) {
+                    crate::repo_scan_policy::charge_generated_work(
+                        2,
+                        s.name.len().saturating_mul(2),
+                        "file definition index and output",
+                    )?;
+                    scan.files[file_idx].defines.push(s.name.clone());
                 }
             }
         }
@@ -518,8 +1534,16 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
         // file gets a sorted Vec<(line, name)> of fn definitions; resolving
         // the enclosing fn for a call site is then a binary search.
         let mut fn_cursor_by_file: HashMap<String, Vec<(usize, String)>> = HashMap::new();
-        for s in &scan.symbols {
+        for (idx, s) in scan.symbols.iter().enumerate() {
+            if idx % 256 == 0 {
+                crate::repo_scan_policy::check_deadline()?;
+            }
             if s.kind == "fn" {
+                crate::repo_scan_policy::charge_generated_work(
+                    1,
+                    s.file_rel_path.len().saturating_add(s.name.len()),
+                    "function cursor index",
+                )?;
                 fn_cursor_by_file
                     .entry(s.file_rel_path.clone())
                     .or_default()
@@ -527,23 +1551,26 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
             }
         }
         for v in fn_cursor_by_file.values_mut() {
+            crate::repo_scan_policy::check_deadline()?;
             v.sort_by_key(|(l, _)| *l);
         }
 
         for (cname, files) in &files_by_crate {
+            crate::repo_scan_policy::check_deadline()?;
             for abs in files {
+                crate::repo_scan_policy::check_deadline()?;
                 let rel = abs.strip_prefix(root).map_or_else(|_| abs.clone(), |p| p.to_path_buf());
                 let rel_str = rel.display().to_string();
                 let from_idx = match file_idx_by_path.get(&rel_str) {
                     Some(i) => *i,
                     None => continue,
                 };
-                let src = std::fs::read_to_string(abs).unwrap_or_default();
+                let src = read_scan_to_string(abs)?;
 
                 // ── route detection ── handled at the file level so that
                 // multi-line `.route(...)` declarations resolve correctly.
                 if src.contains(".route(") {
-                    for route in parse_routes_in_source(&src, &rel_str) {
+                    for route in parse_routes_in_source(&src, &rel_str)? {
                         // Resolve handler_fn via symbol_by_name (prefer same
                         // crate, then any single match). Failure modes split
                         // into two diagnostic reasons:
@@ -557,12 +1584,11 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
                                 diag_reason = Some("not_found");
                             }
                             Some(candidates) => {
-                                let same_crate: Vec<&usize> = candidates
-                                    .iter()
-                                    .filter(|i| scan.symbols[**i].crate_name == *cname)
-                                    .collect();
-                                let pick = if same_crate.len() == 1 {
-                                    Some(*same_crate[0])
+                                let same_crate = unique_matching_index(candidates, |index| {
+                                    scan.symbols[index].crate_name == *cname
+                                })?;
+                                let pick = if same_crate.is_some() {
+                                    same_crate
                                 } else if candidates.len() == 1 {
                                     Some(candidates[0])
                                 } else {
@@ -577,6 +1603,17 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
                             }
                         }
                         if let Some(reason) = diag_reason {
+                            crate::repo_scan_policy::charge_generated_work(
+                                1,
+                                route
+                                    .method
+                                    .len()
+                                    .saturating_add(route.path.len())
+                                    .saturating_add(route.handler_fn.len())
+                                    .saturating_add(route.source_file.len())
+                                    .saturating_add(reason.len()),
+                                "unresolved route output",
+                            )?;
                             scan.diagnostics.unresolved_routes.push(UnresolvedRoute {
                                 method: route.method.clone(),
                                 path: route.path.clone(),
@@ -586,6 +1623,17 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
                                 reason: reason.to_string(),
                             });
                         }
+                        crate::repo_scan_policy::charge_generated_work(
+                            1,
+                            route
+                                .method
+                                .len()
+                                .saturating_add(route.path.len())
+                                .saturating_add(route.handler_fn.len())
+                                .saturating_add(route.source_file.len())
+                                .saturating_add(resolved_file.as_deref().map_or(0, str::len)),
+                            "route output",
+                        )?;
                         scan.routes.push(RouteHit {
                             method: route.method,
                             path: route.path,
@@ -600,6 +1648,9 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
                 }
 
                 for (line_no, line) in src.lines().enumerate() {
+                    if line_no % 256 == 0 {
+                        crate::repo_scan_policy::check_deadline()?;
+                    }
                     let trimmed = line.trim_start();
                     if trimmed.starts_with("//") {
                         continue;
@@ -611,7 +1662,7 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
                     // identifier characters and `::` is enough to surface most
                     // cross-file calls. Macro invocations end with `!` which
                     // we explicitly reject.
-                    for call_name in scan_call_sites(line) {
+                    for call_name in scan_call_sites(line)? {
                         // Resolve.
                         let candidates = match symbol_by_name.get(&call_name) {
                             Some(c) => c,
@@ -620,22 +1671,18 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
                         // Prefer same-file matches first (handles intra-file
                         // private fn calls). If none, fall back to same-crate
                         // singleton, then global singleton.
-                        let same_file: Vec<&usize> = candidates
-                            .iter()
-                            .filter(|i| scan.symbols[**i].file_rel_path == rel_str)
-                            .collect();
-                        let target_idx = if !same_file.is_empty() {
+                        let same_file =
+                            first_matching_index(candidates, |index| scan.symbols[index].file_rel_path == rel_str)?;
+                        let target_idx = if same_file.is_some() {
                             // Resolve to first same-file match. Single hit is
                             // the common case; multiple-in-one-file is rare
                             // and usually a test mod reusing the fn name.
-                            Some(*same_file[0])
+                            same_file
                         } else {
-                            let same_crate: Vec<&usize> = candidates
-                                .iter()
-                                .filter(|i| scan.symbols[**i].crate_name == *cname)
-                                .collect();
-                            if same_crate.len() == 1 {
-                                Some(*same_crate[0])
+                            let same_crate =
+                                unique_matching_index(candidates, |index| scan.symbols[index].crate_name == *cname)?;
+                            if same_crate.is_some() {
+                                same_crate
                             } else if candidates.len() == 1 {
                                 Some(candidates[0])
                             } else {
@@ -673,7 +1720,21 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
                                 })
                                 .unwrap_or_default();
                             let key = (target.file_rel_path.clone(), target.name.clone(), from_symbol);
-                            *per_file_edges.entry(from_idx).or_default().entry(key).or_insert(0) += 1;
+                            let edges = per_file_edges.entry(from_idx).or_default();
+                            match edges.entry(key) {
+                                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                                    *entry.get_mut() = entry.get().saturating_add(1);
+                                }
+                                std::collections::btree_map::Entry::Vacant(entry) => {
+                                    let key = entry.key();
+                                    crate::repo_scan_policy::charge_generated_work(
+                                        1,
+                                        key.0.len().saturating_add(key.1.len()).saturating_add(key.2.len()),
+                                        "reference edge index",
+                                    )?;
+                                    entry.insert(1);
+                                }
+                            }
                         }
                     }
                 }
@@ -682,7 +1743,10 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
 
         // Emit accumulated edges into FileInfo.references.
         let mut total_edges = 0usize;
-        for (from_idx, edges) in per_file_edges {
+        for (edge_idx, (from_idx, edges)) in per_file_edges.into_iter().enumerate() {
+            if edge_idx % 256 == 0 {
+                crate::repo_scan_policy::check_deadline()?;
+            }
             let from_path = scan.files[from_idx].rel_path.clone();
             for ((to_file, to_symbol, from_symbol), call_count) in edges {
                 let same_file = to_file == from_path;
@@ -691,6 +1755,14 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
                 } else {
                     Some(from_symbol)
                 };
+                crate::repo_scan_policy::charge_generated_work(
+                    1,
+                    to_file
+                        .len()
+                        .saturating_add(to_symbol.len())
+                        .saturating_add(from_symbol.as_deref().map_or(0, str::len)),
+                    "reference edge output",
+                )?;
                 scan.files[from_idx].references.push(FileReference {
                     to_file,
                     to_symbol,
@@ -707,15 +1779,34 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
         // Build the inverse `referenced_by` index. Cross-file only — same-file
         // edges would just self-list every file, which adds noise.
         let mut inverse: HashMap<String, BTreeSet<String>> = HashMap::new();
-        for f in &scan.files {
+        for (file_idx, f) in scan.files.iter().enumerate() {
+            if file_idx % 256 == 0 {
+                crate::repo_scan_policy::check_deadline()?;
+            }
             for r in &f.references {
                 if !r.same_file {
-                    inverse.entry(r.to_file.clone()).or_default().insert(f.rel_path.clone());
+                    let sources = inverse.entry(r.to_file.clone()).or_default();
+                    if !sources.contains(&f.rel_path) {
+                        crate::repo_scan_policy::charge_generated_work(
+                            1,
+                            r.to_file.len().saturating_add(f.rel_path.len()),
+                            "inverse reference index",
+                        )?;
+                        sources.insert(f.rel_path.clone());
+                    }
                 }
             }
         }
-        for f in &mut scan.files {
+        for (file_idx, f) in scan.files.iter_mut().enumerate() {
+            if file_idx % 256 == 0 {
+                crate::repo_scan_policy::check_deadline()?;
+            }
             if let Some(set) = inverse.remove(&f.rel_path) {
+                crate::repo_scan_policy::charge_generated_work(
+                    set.len(),
+                    set.iter().map(String::len).sum(),
+                    "inverse reference output",
+                )?;
                 f.referenced_by = set.into_iter().collect();
             }
         }
@@ -733,21 +1824,27 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
     .copied()
     .collect();
 
-    // Build a single concatenated corpus per crate for fast substring scanning.
-    let mut crate_corpus: HashMap<String, String> = HashMap::new();
-    for (cname, files) in &files_by_crate {
-        let mut buf = String::new();
+    // Build one workspace corpus. Keeping a per-crate copy and then cloning it
+    // into this buffer doubled the largest scan allocation.
+    let mut workspace_corpus = String::new();
+    for files in files_by_crate.values() {
+        crate::repo_scan_policy::check_deadline()?;
         for abs in files {
-            if let Ok(src) = std::fs::read_to_string(abs) {
-                buf.push('\n');
-                buf.push_str(&src);
+            crate::repo_scan_policy::check_deadline()?;
+            let src = read_scan_to_string(abs)?;
+            crate::repo_scan_policy::charge_generated_work(0, src.len().saturating_add(1), "dead-code search corpus")?;
+            if !workspace_corpus.is_empty() {
+                workspace_corpus.push('\n');
             }
+            workspace_corpus.push_str(&src);
         }
-        crate_corpus.insert(cname.clone(), buf);
     }
-    let workspace_corpus: String = crate_corpus.values().cloned().collect::<Vec<_>>().join("\n");
+    crate::repo_scan_policy::check_deadline()?;
 
     for (idx, sym) in scan.symbols.iter().enumerate() {
+        if idx % 64 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
         if !sym.is_pub {
             continue;
         }
@@ -763,11 +1860,22 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
         // Skip the declaration site itself by counting occurrences and
         // requiring more than one (the declaration is one occurrence).
         let needle = sym.name.as_str();
-        let total_hits = count_substring(&workspace_corpus, needle);
+        let total_hits = count_substring(&workspace_corpus, needle)?;
         // Heuristic: a symbol referenced ≤1 time is likely dead. Confidence is
         // lower for short names and names that appear in commit messages
         // (we'd need a more careful AST pass to be sure).
         if total_hits <= 1 {
+            crate::repo_scan_policy::charge_generated_work(
+                1,
+                sym.crate_name
+                    .len()
+                    .saturating_add(sym.module_path.len())
+                    .saturating_add(sym.file_rel_path.len())
+                    .saturating_add(sym.kind.len())
+                    .saturating_add(sym.name.len())
+                    .saturating_add(96),
+                "dead-code output",
+            )?;
             scan.dead_code.push(DeadSymbol {
                 crate_name: sym.crate_name.clone(),
                 module_path: sym.module_path.clone(),
@@ -780,7 +1888,6 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
                     .to_string(),
             });
         }
-        let _ = idx; // keep clippy quiet
     }
 
     // ── 4. Stats roll-up. ──────────────────────────────────────────────
@@ -788,16 +1895,21 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
     let file_reference_count = scan.files.iter().map(|f| f.references.len()).sum();
     let doc_coverage_files = scan.files.iter().filter(|f| f.doc_summary.is_some()).count();
     let mut routes_by_crate: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    for r in &scan.routes {
-        if let Some(hf) = &r.handler_file {
-            // Match handler_file against each crate's rel_path prefix; first
-            // hit wins. Crates are sorted by name in scan.crates already.
-            for c in &scan.crates {
-                if hf.starts_with(&format!("{}/", c.rel_path)) {
-                    *routes_by_crate.entry(c.name.clone()).or_insert(0) += 1;
-                    break;
-                }
-            }
+    let crate_by_file: HashMap<&str, &str> = scan
+        .files
+        .iter()
+        .map(|file| (file.rel_path.as_str(), file.crate_name.as_str()))
+        .collect();
+    for (route_idx, r) in scan.routes.iter().enumerate() {
+        if route_idx % 256 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
+        if let Some(crate_name) = r
+            .handler_file
+            .as_deref()
+            .and_then(|handler_file| crate_by_file.get(handler_file))
+        {
+            *routes_by_crate.entry((*crate_name).to_string()).or_insert(0) += 1;
         }
     }
     scan.stats = ScanStats {
@@ -863,7 +1975,9 @@ pub async fn load_latest(
     let fact = latest
         .into_iter()
         .find(|f| f.entity == LATEST_SCAN_ENTITY && f.key == SCAN_KEY)?;
-    serde_json::from_str::<WorkspaceScan>(&fact.value).ok()
+    let mut scan = serde_json::from_str::<WorkspaceScan>(&fact.value).ok()?;
+    redact_self_workspace_paths(&mut scan);
+    Some(scan)
 }
 
 // ─────────────────────────── Storyline composer ───────────────────────
@@ -1308,30 +2422,314 @@ fn collect_chain_ids(node: &StorylineNode, id_by_path: &HashMap<String, usize>, 
 
 // ────────────────────────── Internal helpers ──────────────────────────
 
-/// Recursive-but-cheap directory walker. Skips `target/` and dot-dirs.
-#[allow(clippy::unnecessary_wraps)] // Result kept for symmetry + future fallibility (e.g. fs error propagation if we stop swallowing read_dir failures).
+/// Contained directory walker. Skips `target/`, `node_modules/`, and dot-dirs;
+/// never follows symlinks; rejects repeated canonical directories; and charges
+/// the active scan's shared depth/entry/byte/deadline budget.
 pub(crate) fn walk_dir<F: FnMut(&Path, &Path)>(root: &Path, base: &Path, visit: &mut F) -> Result<(), ScanError> {
-    let mut stack = vec![base.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
+    walk_dir_filtered(root, base, None, |_| false, visit)
+}
+
+pub(crate) fn walk_dir_filtered<F, S>(
+    root: &Path,
+    base: &Path,
+    max_depth: Option<usize>,
+    skip_dir: S,
+    visit: &mut F,
+) -> Result<(), ScanError>
+where
+    F: FnMut(&Path, &Path),
+    S: Fn(&str) -> bool,
+{
+    #[cfg(target_os = "linux")]
+    if let Some(directory) = crate::repo_scan_policy::open_active_scan_directory(base)? {
+        return walk_dir_filtered_anchored(root, base, directory, max_depth, &skip_dir, visit);
+    }
+    let canonical_root = crate::repo_scan_policy::active_root().unwrap_or(std::fs::canonicalize(root)?);
+    let canonical_base = std::fs::canonicalize(base)?;
+    if !canonical_base.starts_with(&canonical_root) {
+        return Err(ScanError::Policy("scan base escaped its canonical root".to_string()));
+    }
+    let base_depth = canonical_base
+        .strip_prefix(&canonical_root)
+        .map_or(0, |path| path.components().count());
+    let mut stack = vec![(base.to_path_buf(), base_depth)];
+    let mut visited = HashSet::new();
+    while let Some((dir, depth)) = stack.pop() {
+        crate::repo_scan_policy::check_depth(depth)?;
+        let metadata = std::fs::symlink_metadata(&dir)?;
+        let canonical_dir = crate::repo_scan_policy::authorize_directory(&dir, &metadata)?;
+        if !visited.insert(canonical_dir) {
+            return Err(ScanError::Policy(format!(
+                "repository scan encountered a repeated directory: {}",
+                dir.display()
+            )));
+        }
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            crate::repo_scan_policy::discover_entry(&entry.path())?;
+            entries.push(entry);
+        }
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
             let path = entry.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with('.') || name == "target" || name == "node_modules" {
+            if name.starts_with('.') || name == "target" || name == "node_modules" || skip_dir(name) {
                 continue;
             }
+            let metadata = std::fs::symlink_metadata(&path)?;
             let rel = path.strip_prefix(root).unwrap_or(&path);
-            if path.is_dir() {
-                stack.push(path);
+            if metadata.is_dir() {
+                let child_depth = depth.saturating_add(1);
+                crate::repo_scan_policy::check_depth(child_depth)?;
+                if max_depth.is_none_or(|limit| child_depth <= limit) {
+                    stack.push((path, child_depth));
+                }
             } else {
+                crate::repo_scan_policy::discover_file(&path, &metadata)?;
                 visit(rel, &path);
             }
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn walk_dir_filtered_anchored<F, S>(
+    root: &Path,
+    base: &Path,
+    directory: std::fs::File,
+    max_depth: Option<usize>,
+    skip_dir: &S,
+    visit: &mut F,
+) -> Result<(), ScanError>
+where
+    F: FnMut(&Path, &Path),
+    S: Fn(&str) -> bool,
+{
+    let active_root = crate::repo_scan_policy::active_root()
+        .ok_or_else(|| ScanError::Policy("descriptor-relative walk requires an active scan root".to_string()))?;
+    if !root.starts_with(&active_root) || !base.starts_with(&active_root) {
+        return Err(ScanError::Policy(
+            "descriptor-relative scan base escaped its execution root".to_string(),
+        ));
+    }
+    let base_depth = base
+        .strip_prefix(&active_root)
+        .map_or(0, |path| path.components().count());
+    let mut visited = HashSet::new();
+    walk_opened_directory(
+        root,
+        base,
+        directory,
+        base_depth,
+        max_depth,
+        skip_dir,
+        visit,
+        &mut visited,
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn walk_opened_directory<F, S>(
+    root: &Path,
+    dir_path: &Path,
+    directory: std::fs::File,
+    depth: usize,
+    max_depth: Option<usize>,
+    skip_dir: &S,
+    visit: &mut F,
+    visited: &mut HashSet<(u64, u64)>,
+) -> Result<(), ScanError>
+where
+    F: FnMut(&Path, &Path),
+    S: Fn(&str) -> bool,
+{
+    use std::os::unix::fs::MetadataExt as _;
+
+    crate::repo_scan_policy::check_depth(depth)?;
+    let metadata = directory
+        .metadata()
+        .map_err(|error| crate::repo_scan_policy::reject_read_io(dir_path, "opened directory metadata", &error))?;
+    if !metadata.is_dir() {
+        return Err(ScanError::Policy(format!(
+            "repository scan expected an opened directory: {}",
+            dir_path.display()
+        )));
+    }
+    if !visited.insert((metadata.dev(), metadata.ino())) {
+        return Err(ScanError::Policy(format!(
+            "repository scan encountered a repeated directory: {}",
+            dir_path.display()
+        )));
+    }
+    let entries = crate::repo_scan_policy::read_opened_scan_directory_names(&directory, dir_path)?;
+    for name in entries {
+        let name_text = name.to_str().unwrap_or("");
+        if name_text.starts_with('.') || name_text == "target" || name_text == "node_modules" || skip_dir(name_text) {
+            continue;
+        }
+        let path = dir_path.join(&name);
+        let entry = crate::repo_scan_policy::open_scan_entry(&directory, dir_path, &name)?;
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        if let Some(child_directory) = entry.directory {
+            let child_depth = depth.saturating_add(1);
+            crate::repo_scan_policy::check_depth(child_depth)?;
+            if max_depth.is_none_or(|limit| child_depth <= limit) {
+                walk_opened_directory(
+                    root,
+                    &path,
+                    child_directory,
+                    child_depth,
+                    max_depth,
+                    skip_dir,
+                    visit,
+                    visited,
+                )?;
+            }
+        } else {
+            // Enumeration admits the inode and corpus bytes, but does not
+            // authorize a content read. Format-specific scanners decide
+            // whether the file is relevant and apply their narrower ceiling
+            // before `read_scan_bytes` enforces the global per-file limit.
+            crate::repo_scan_policy::discover_file(&path, &entry.metadata)?;
+            visit(rel, &path);
+        }
+    }
+    Ok(())
+}
+
+/// Bounded, no-follow-aware scanner read. The opened file is identity-checked,
+/// and the read never consumes more than the remaining cumulative byte budget.
+pub(crate) fn read_scan_bytes(path: &Path) -> Result<Vec<u8>, ScanError> {
+    #[cfg(unix)]
+    {
+        if let Some(file) = crate::repo_scan_policy::open_active_scan_file(path)? {
+            let metadata = file
+                .metadata()
+                .map_err(|error| crate::repo_scan_policy::reject_read_io(path, "root-anchored metadata", &error))?;
+            verify_opened_file(path, &metadata, &metadata)?;
+            crate::repo_scan_policy::charge_opened_read(path, &metadata)?;
+            let max_bytes = crate::repo_scan_policy::max_file_bytes();
+            let remaining_bytes = crate::repo_scan_policy::remaining_read_bytes()?;
+            return read_scan_bytes_from_file(path, file, &metadata, max_bytes, remaining_bytes);
+        }
+    }
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| crate::repo_scan_policy::reject_read_io(path, "metadata", &error))?;
+    crate::repo_scan_policy::charge_read(path, &metadata)?;
+    let max_bytes = crate::repo_scan_policy::max_file_bytes();
+    let remaining_bytes = crate::repo_scan_policy::remaining_read_bytes()?;
+    read_scan_bytes_opened(path, &metadata, max_bytes, remaining_bytes)
+}
+
+#[cfg(unix)]
+fn read_scan_bytes_opened(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    max_bytes: u64,
+    remaining_bytes: u64,
+) -> Result<Vec<u8>, ScanError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| crate::repo_scan_policy::reject_read_io(path, "open", &error))?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|error| crate::repo_scan_policy::reject_read_io(path, "opened metadata", &error))?;
+    verify_opened_file(path, metadata, &opened_metadata)?;
+    read_scan_bytes_from_file(path, file, &opened_metadata, max_bytes, remaining_bytes)
+}
+
+#[cfg(unix)]
+fn read_scan_bytes_from_file(
+    path: &Path,
+    mut file: std::fs::File,
+    opened_metadata: &std::fs::Metadata,
+    max_bytes: u64,
+    remaining_bytes: u64,
+) -> Result<Vec<u8>, ScanError> {
+    if opened_metadata.len() > max_bytes {
+        return Err(crate::repo_scan_policy::reject_file_growth(path));
+    }
+    if opened_metadata.len() > remaining_bytes {
+        return Err(crate::repo_scan_policy::reject_read_budget(path));
+    }
+    let read_limit = max_bytes.min(remaining_bytes);
+    let mut bytes = Vec::with_capacity(usize::try_from(opened_metadata.len().min(read_limit)).unwrap_or(0));
+    (&mut file)
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|error| crate::repo_scan_policy::reject_read_io(path, "read", &error))?;
+    let final_metadata = file
+        .metadata()
+        .map_err(|error| crate::repo_scan_policy::reject_read_io(path, "final metadata", &error))?;
+    verify_opened_file(path, opened_metadata, &final_metadata)?;
+    if final_metadata.len() > max_bytes {
+        return Err(crate::repo_scan_policy::reject_file_growth(path));
+    }
+    if final_metadata.len() > remaining_bytes {
+        return Err(crate::repo_scan_policy::reject_read_budget(path));
+    }
+    crate::repo_scan_policy::charge_read_bytes(bytes.len())?;
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_scan_bytes_opened(
+    path: &Path,
+    _metadata: &std::fs::Metadata,
+    _max_bytes: u64,
+    _remaining_bytes: u64,
+) -> Result<Vec<u8>, ScanError> {
+    Err(crate::repo_scan_policy::reject_unsupported_secure_open(path))
+}
+
+#[cfg(unix)]
+fn verify_opened_file(path: &Path, expected: &std::fs::Metadata, opened: &std::fs::Metadata) -> Result<(), ScanError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if opened.is_file()
+        && expected.dev() == opened.dev()
+        && expected.ino() == opened.ino()
+        && expected.len() == opened.len()
+        && expected.mtime() == opened.mtime()
+        && expected.mtime_nsec() == opened.mtime_nsec()
+        && expected.ctime() == opened.ctime()
+        && expected.ctime_nsec() == opened.ctime_nsec()
+        && expected.nlink() == 1
+        && opened.nlink() == 1
+    {
+        Ok(())
+    } else {
+        Err(crate::repo_scan_policy::reject_file_change(path))
+    }
+}
+
+#[cfg(not(unix))]
+fn verify_opened_file(
+    path: &Path,
+    _expected: &std::fs::Metadata,
+    _opened: &std::fs::Metadata,
+) -> Result<(), ScanError> {
+    Err(crate::repo_scan_policy::reject_unsupported_secure_open(path))
+}
+
+pub(crate) fn read_scan_to_string(path: &Path) -> Result<String, ScanError> {
+    String::from_utf8(read_scan_bytes(path)?)
+        .map_err(|error| ScanError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error)))
+}
+
+pub(crate) fn read_optional_scan_to_string(path: &Path) -> Result<Option<String>, ScanError> {
+    if crate::repo_scan_policy::scan_file_metadata(path)?.is_some() {
+        read_scan_to_string(path).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 pub(crate) fn parse_crate_name(toml: &str) -> Option<String> {
@@ -1350,7 +2748,7 @@ pub(crate) fn parse_crate_name(toml: &str) -> Option<String> {
                 let after = rest.trim_start();
                 if let Some(value_part) = after.strip_prefix('=') {
                     let v = value_part.trim().trim_matches('"').trim_matches('\'');
-                    if !v.is_empty() {
+                    if !v.is_empty() && v.len() <= SCAN_METADATA_MAX_BYTES {
                         return Some(v.to_string());
                     }
                 }
@@ -1360,7 +2758,7 @@ pub(crate) fn parse_crate_name(toml: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn parse_internal_path_deps(toml: &str) -> Vec<String> {
+pub(crate) fn parse_internal_path_deps(toml: &str) -> Result<Vec<String>, ScanError> {
     // Find lines like `crux-mcp = { path = "../crux-mcp" }` or
     // `crux-mcp = { workspace = true }` — both indicate workspace deps.
     let mut out = Vec::new();
@@ -1376,11 +2774,12 @@ pub(crate) fn parse_internal_path_deps(toml: &str) -> Vec<String> {
                 continue;
             }
             if rest.contains("path =") || rest.contains("path=") || rest.contains("workspace = true") {
+                crate::repo_scan_policy::charge_generated_work(1, name.len(), "internal dependency index")?;
                 out.push(name.to_string());
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Infer a module path like `corecruxd::http::admin` from a file path.
@@ -1600,20 +2999,28 @@ fn parse_route_chunk(chunk: &str, source_file: &str, source_line: usize) -> Opti
 
 /// Walk a whole source file looking for `.route(...)` declarations, including
 /// multi-line ones. Returns every route found in source order.
-pub(crate) fn parse_routes_in_source(src: &str, source_file: &str) -> Vec<ParsedRoute> {
+pub(crate) fn parse_routes_in_source(src: &str, source_file: &str) -> Result<Vec<ParsedRoute>, ScanError> {
     let mut out = Vec::new();
     let bytes = src.as_bytes();
     let mut i = 0usize;
     // Pre-compute line numbers for each byte offset.
     // Cheap: walk bytes once, push line starts.
+    crate::repo_scan_policy::charge_generated_work(1, std::mem::size_of::<usize>(), "route line-start index")?;
     let mut line_starts: Vec<usize> = vec![0];
     for (idx, b) in bytes.iter().enumerate() {
+        if idx % 4096 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
         if *b == b'\n' {
+            crate::repo_scan_policy::charge_generated_work(1, std::mem::size_of::<usize>(), "route line-start index")?;
             line_starts.push(idx + 1);
         }
     }
     let needle = b".route(";
     while i + needle.len() <= bytes.len() {
+        if i % 4096 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
         if &bytes[i..i + needle.len()] == needle {
             // Skip if this looks like a comment line — find the start of the
             // current line and check.
@@ -1637,6 +3044,9 @@ pub(crate) fn parse_routes_in_source(src: &str, source_file: &str) -> Vec<Parsed
             let mut in_str = false;
             let mut prev = 0u8;
             while j < limit && depth > 0 {
+                if j % 1024 == 0 {
+                    crate::repo_scan_policy::check_deadline()?;
+                }
                 let c = bytes[j];
                 if in_str {
                     if c == b'"' && prev != b'\\' {
@@ -1659,6 +3069,16 @@ pub(crate) fn parse_routes_in_source(src: &str, source_file: &str) -> Vec<Parsed
             if depth == 0 {
                 let chunk = std::str::from_utf8(&bytes[chunk_start..j]).unwrap_or("");
                 if let Some(route) = parse_route_chunk(chunk, source_file, line_idx + 1) {
+                    crate::repo_scan_policy::charge_generated_work(
+                        1,
+                        route
+                            .method
+                            .len()
+                            .saturating_add(route.path.len())
+                            .saturating_add(route.handler_fn.len())
+                            .saturating_add(route.source_file.len()),
+                        "parsed route",
+                    )?;
                     out.push(route);
                 }
                 i = j + 1;
@@ -1667,7 +3087,7 @@ pub(crate) fn parse_routes_in_source(src: &str, source_file: &str) -> Vec<Parsed
         }
         i += 1;
     }
-    out
+    Ok(out)
 }
 
 /// Scan a single source line for function call sites. Returns the set of
@@ -1675,11 +3095,14 @@ pub(crate) fn parse_routes_in_source(src: &str, source_file: &str) -> Vec<Parsed
 /// occurrence, excluding macros which end with `!`). The caller resolves
 /// each name against the symbol index. Whitespace inside arg lists doesn't
 /// matter — we only care about the identifier immediately preceding `(`.
-fn scan_call_sites(line: &str) -> Vec<String> {
+fn scan_call_sites(line: &str) -> Result<Vec<String>, ScanError> {
     let bytes = line.as_bytes();
     let mut out: Vec<String> = Vec::new();
     let mut i = 0usize;
     while i < bytes.len() {
+        if i % 4096 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
         if bytes[i] != b'(' {
             i += 1;
             continue;
@@ -1761,12 +3184,42 @@ fn scan_call_sites(line: &str) -> Vec<String> {
                 "ref", "mut",
             ];
             if !last.is_empty() && !BLOCKED.contains(&last) {
+                crate::repo_scan_policy::charge_generated_work(1, last.len(), "call-site candidate")?;
                 out.push(last.to_string());
             }
         }
         i += 1;
     }
-    out
+    Ok(out)
+}
+
+fn first_matching_index(candidates: &[usize], predicate: impl Fn(usize) -> bool) -> Result<Option<usize>, ScanError> {
+    for (candidate_index, candidate) in candidates.iter().copied().enumerate() {
+        if candidate_index % 256 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
+        if predicate(candidate) {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn unique_matching_index(candidates: &[usize], predicate: impl Fn(usize) -> bool) -> Result<Option<usize>, ScanError> {
+    let mut found = None;
+    for (candidate_index, candidate) in candidates.iter().copied().enumerate() {
+        if candidate_index % 256 == 0 {
+            crate::repo_scan_policy::check_deadline()?;
+        }
+        if !predicate(candidate) {
+            continue;
+        }
+        if found.is_some() {
+            return Ok(None);
+        }
+        found = Some(candidate);
+    }
+    Ok(found)
 }
 
 pub(crate) fn parse_stub_line(line: &str) -> Option<(&'static str, String)> {
@@ -1821,13 +3274,14 @@ pub(crate) fn parse_use_target(line: &str, from_crate: &str, known_crates: &BTre
     None
 }
 
-fn count_substring(haystack: &str, needle: &str) -> usize {
+fn count_substring(haystack: &str, needle: &str) -> Result<usize, ScanError> {
     if needle.is_empty() {
-        return 0;
+        return Ok(0);
     }
     let mut count = 0usize;
     let mut start = 0usize;
     while let Some(pos) = haystack[start..].find(needle) {
+        crate::repo_scan_policy::check_deadline()?;
         // Require word boundary on both sides to avoid matching substrings
         // inside other identifiers (e.g. `foo_bar` matching `foo`).
         let abs = start + pos;
@@ -1847,12 +3301,358 @@ fn count_substring(haystack: &str, needle: &str) -> usize {
         }
         start = abs + needle.len();
     }
-    count
+    Ok(count)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_complexity_guard_bounds_generics_and_ignores_literals_and_comments() {
+        let nested = format!(
+            "type Deep = {}u8{};\n",
+            "Vec<".repeat(RUST_SYNTAX_MAX_DEPTH + 1),
+            ">".repeat(RUST_SYNTAX_MAX_DEPTH + 1)
+        );
+        let error = validate_rust_syntax_complexity(&nested).expect_err("deep generics must fail");
+        assert!(error.to_string().contains("Rust syntax nesting"));
+
+        let harmless = format!(
+            "const TEXT: &str = r#\"{}\"#;\n/* {} */\n",
+            "<{(".repeat(RUST_SYNTAX_MAX_DEPTH + 10),
+            ">})".repeat(RUST_SYNTAX_MAX_DEPTH + 10)
+        );
+        validate_rust_syntax_complexity(&harmless).expect("literal and comment delimiters are inert");
+
+        let comparisons = "let _ = left < right;\n".repeat(RUST_SYNTAX_MAX_DEPTH + 1);
+        validate_rust_syntax_complexity(&comparisons).expect("flat comparisons are not generic nesting");
+
+        let assignment_chain = format!(
+            "fn fixture() {{ {}tail; }}",
+            "value = ".repeat(RUST_SYNTAX_MAX_DEPTH + 1)
+        );
+        let error =
+            validate_rust_syntax_complexity(&assignment_chain).expect_err("deep assignment recursion must fail");
+        assert!(error.to_string().contains("Rust syntax nesting"));
+        let independent_assignments =
+            "fn fixture() {\n".to_string() + &"value = 1;\n".repeat(RUST_SYNTAX_MAX_DEPTH + 1) + "}";
+        validate_rust_syntax_complexity(&independent_assignments)
+            .expect("statement boundaries reset assignment recursion depth");
+
+        let recursive_shapes = [
+            format!(
+                "fn fixture() {{ let _ = {}; }}",
+                std::iter::repeat_n("value", RUST_SYNTAX_MAX_DEPTH + 2)
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            ),
+            format!(
+                "fn fixture() {{ let _ = value{}; }}",
+                ".method()".repeat(RUST_SYNTAX_MAX_DEPTH + 2)
+            ),
+            format!(
+                "fn fixture() {{ let _ = value{}; }}",
+                "()".repeat(RUST_SYNTAX_MAX_DEPTH + 2)
+            ),
+            format!(
+                "fn fixture() {{ let _ = value{}; }}",
+                "[0]".repeat(RUST_SYNTAX_MAX_DEPTH + 2)
+            ),
+            format!(
+                "fn fixture() {{ {}if condition {{}} }}",
+                "if condition {} else ".repeat(RUST_SYNTAX_MAX_DEPTH + 2)
+            ),
+            format!(
+                "fn fixture() {{ let _ = {}0; }}",
+                "|| ".repeat(RUST_SYNTAX_MAX_DEPTH + 2)
+            ),
+            format!("fn fixture() {{ {}0; }}", "return ".repeat(RUST_SYNTAX_MAX_DEPTH + 2)),
+            format!(
+                "fn fixture() -> Result<(), ()> {{ let _ = value{}; Ok(()) }}",
+                "?".repeat(RUST_SYNTAX_MAX_DEPTH + 2)
+            ),
+            format!("type DeepFn = {}u8;", "fn() -> ".repeat(RUST_SYNTAX_MAX_DEPTH + 2)),
+        ];
+        for source in recursive_shapes {
+            let error = validate_rust_syntax_complexity(&source)
+                .expect_err("deep recursive Rust syntax tree must fail before syn");
+            assert!(
+                error.to_string().contains("Rust syntax"),
+                "unexpected preflight error: {error}"
+            );
+        }
+
+        let labels = format!(
+            "{}let _ = 1;{}",
+            "'scope: {".repeat(RUST_SYNTAX_MAX_DEPTH + 1),
+            "}".repeat(RUST_SYNTAX_MAX_DEPTH + 1)
+        );
+        let error = validate_rust_syntax_complexity(&labels).expect_err("deep labeled blocks must fail");
+        assert!(error.to_string().contains("Rust syntax nesting"));
+
+        let lowercase_generics = format!(
+            "struct x<T>(T); type Deep = {}u8{};",
+            "x<".repeat(RUST_SYNTAX_MAX_DEPTH + 1),
+            ">".repeat(RUST_SYNTAX_MAX_DEPTH + 1)
+        );
+        assert!(validate_rust_syntax_complexity(&lowercase_generics).is_err());
+
+        let use_path = format!("use {}leaf;", "segment::".repeat(RUST_SYNTAX_MAX_DEPTH + 1));
+        assert!(validate_rust_syntax_complexity(&use_path).is_err());
+
+        let raw_pointers = format!("type Deep = {}u8;", "*const ".repeat(RUST_SYNTAX_MAX_DEPTH + 1));
+        assert!(validate_rust_syntax_complexity(&raw_pointers).is_err());
+        let references = format!("type Deep<'a> = {}u8;", "&'a ".repeat(RUST_SYNTAX_MAX_DEPTH + 1));
+        assert!(validate_rust_syntax_complexity(&references).is_err());
+
+        let grouped_comparisons = format!(
+            "let _ = ({}) && ({});",
+            std::iter::repeat_n("A<B", RUST_SYNTAX_MAX_DEPTH + 1)
+                .collect::<Vec<_>>()
+                .join(" && "),
+            std::iter::repeat_n("C>D", RUST_SYNTAX_MAX_DEPTH + 1)
+                .collect::<Vec<_>>()
+                .join(" && ")
+        );
+        let error = validate_rust_syntax_complexity(&grouped_comparisons)
+            .expect_err("recursive boolean-expression trees must be bounded");
+        assert!(error.to_string().contains("tree depth"));
+
+        let const_generic = format!(
+            "struct x<T, const B: bool>(T); type Deep = {}u8, {{true && true}}>{};",
+            "x<".repeat(RUST_SYNTAX_MAX_DEPTH + 1),
+            ", true>".repeat(RUST_SYNTAX_MAX_DEPTH)
+        );
+        assert!(validate_rust_syntax_complexity(&const_generic).is_err());
+
+        let tuple_comparisons = format!(
+            "let _ = ({}, {});",
+            std::iter::repeat_n("A<B", RUST_SYNTAX_MAX_DEPTH + 1)
+                .collect::<Vec<_>>()
+                .join(", "),
+            std::iter::repeat_n("C>D", RUST_SYNTAX_MAX_DEPTH + 1)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        validate_rust_syntax_complexity(&tuple_comparisons).expect("tuple comparison elements are not generic nesting");
+
+        let array_const_comparison = format!(
+            "type X = [u8; (1 < 2) as usize];\n{}",
+            "let _ = left < right;\n".repeat(RUST_SYNTAX_MAX_DEPTH + 1)
+        );
+        validate_rust_syntax_complexity(&array_const_comparison)
+            .expect("array const expressions and following comparisons are not generics");
+
+        let struct_field_comparisons = format!(
+            "struct S {{ field: bool }}\nfn fixture() {{ let _ = S {{ field: {} }}; }}",
+            std::iter::repeat_n("left < right", RUST_SYNTAX_MAX_DEPTH + 1)
+                .collect::<Vec<_>>()
+                .join(" && ")
+        );
+        let error = validate_rust_syntax_complexity(&struct_field_comparisons)
+            .expect_err("recursive struct-field expressions must be bounded");
+        assert!(error.to_string().contains("tree depth"));
+
+        let qself = format!(
+            "fn fixture() {{ let _ = <{} as Default>::default(); }}",
+            format!(
+                "{}u8{}",
+                "Vec<".repeat(RUST_SYNTAX_MAX_DEPTH + 1),
+                ">".repeat(RUST_SYNTAX_MAX_DEPTH + 1)
+            )
+        );
+        let error = validate_rust_syntax_complexity(&qself).expect_err("deep QSelf type must fail before syn");
+        assert!(error.to_string().contains("Rust syntax nesting"));
+
+        let nested_type = format!(
+            "{}u8{}",
+            "Vec<".repeat(RUST_SYNTAX_MAX_DEPTH + 1),
+            ">".repeat(RUST_SYNTAX_MAX_DEPTH + 1)
+        );
+        let const_block_then_type = format!("type D = Wrapper<{{ let _x = 0; 0 }}, {nested_type}>;");
+        assert!(
+            validate_rust_syntax_complexity(&const_block_then_type).is_err(),
+            "a const-block statement must not clear the enclosing generic context"
+        );
+
+        let union_field = format!("union U {{ field: std::mem::ManuallyDrop<{nested_type}> }}");
+        assert!(
+            validate_rust_syntax_complexity(&union_field).is_err(),
+            "union field types must receive the aggregate guard"
+        );
+
+        let enum_after_discriminant = format!("enum E {{ A = 0, B({nested_type}) }}");
+        assert!(
+            validate_rust_syntax_complexity(&enum_after_discriminant).is_err(),
+            "an enum discriminant must not disable later variant type guarding"
+        );
+
+        let keyword_qself = format!("fn fixture() {{ return <{nested_type} as Default>::default(); }}");
+        assert!(
+            validate_rust_syntax_complexity(&keyword_qself).is_err(),
+            "QSelf after a control-flow keyword must be guarded"
+        );
+        let arm_qself = format!("fn fixture() {{ match 0 {{ _ => <{nested_type} as Default>::default() }}; }}");
+        assert!(
+            validate_rust_syntax_complexity(&arm_qself).is_err(),
+            "QSelf after a fat arrow must be guarded"
+        );
+
+        let comparison_chain = std::iter::repeat_n("left < right", RUST_SYNTAX_MAX_DEPTH + 1)
+            .collect::<Vec<_>>()
+            .join(" && ");
+        let closure_comparisons = format!("fn fixture() {{ let f = |x: i32| {{ x > 0 && {comparison_chain} }}; }}");
+        let error = validate_rust_syntax_complexity(&closure_comparisons)
+            .expect_err("recursive closure-body expressions must be bounded");
+        assert!(error.to_string().contains("tree depth"));
+
+        let raw_identifier = format!("fn fixture() {{ let r#type = 0; let _ = {comparison_chain}; }}");
+        let error = validate_rust_syntax_complexity(&raw_identifier)
+            .expect_err("recursive raw-identifier expressions must be bounded");
+        assert!(error.to_string().contains("tree depth"));
+
+        let attributed_field = format!("struct S {{ #[cfg(feature = \"fixture\")] field: {nested_type} }}");
+        assert!(
+            validate_rust_syntax_complexity(&attributed_field).is_err(),
+            "attribute expressions must not erase aggregate type context"
+        );
+        let attributed_param = format!("fn fixture(#[cfg(feature = \"fixture\")] value: {nested_type}) {{}}");
+        assert!(
+            validate_rust_syntax_complexity(&attributed_param).is_err(),
+            "attribute expressions must not erase signature type context"
+        );
+
+        let binary_qself =
+            format!("fn fixture(flag: bool) {{ let _ = flag > <{nested_type} as Default>::default(); }}");
+        assert!(
+            validate_rust_syntax_complexity(&binary_qself).is_err(),
+            "QSelf after a binary greater-than boundary must be guarded"
+        );
+
+        let closure_or_pattern =
+            format!("enum E<T> {{ A, B(T) }} fn fixture() {{ let _ = |(E::A | E::B(_)): E<{nested_type}>| {{}}; }}");
+        assert!(
+            validate_rust_syntax_complexity(&closure_or_pattern).is_err(),
+            "an inner or-pattern bar must not close the surrounding closure parameters"
+        );
+
+        let cast_target = format!("fn fixture() {{ let _ = 0 as {nested_type}; }}");
+        assert!(
+            validate_rust_syntax_complexity(&cast_target).is_err(),
+            "deep cast target types must be guarded"
+        );
+        let lifetime_cast = format!("fn fixture() {{ let _ = 0 as Wrapper<'static, {nested_type}>; }}");
+        assert!(
+            validate_rust_syntax_complexity(&lifetime_cast).is_err(),
+            "lifetimes in cast target types must not hide later nested generics"
+        );
+        let raw_const = r##"r#""{"#"##;
+        let raw_const_cast = format!("fn fixture() {{ let _ = 0 as Wrapper<{{ {raw_const} }}, {nested_type}>; }}");
+        assert!(
+            validate_rust_syntax_complexity(&raw_const_cast).is_err(),
+            "raw strings in cast const arguments must not desynchronise lookahead"
+        );
+        let flat_cast_comparisons =
+            "fn fixture() {\n".to_string() + &"let _ = (0 as u8) < 3;\n".repeat(RUST_SYNTAX_MAX_DEPTH + 1) + "}";
+        validate_rust_syntax_complexity(&flat_cast_comparisons)
+            .expect("flat comparisons after simple cast targets are not nested generics");
+        let comma_cast_comparisons = format!(
+            "fn fixture() {{ consume(0 as u8, {}, z > q); }}",
+            std::iter::repeat_n("a < b", RUST_SYNTAX_MAX_DEPTH + 1)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        validate_rust_syntax_complexity(&comma_cast_comparisons)
+            .expect("an argument boundary ends a simple cast target");
+        let multi_argument_cast = format!("fn fixture() {{ let _ = 0 as Wrapper<u8, {nested_type}>; }}");
+        assert!(
+            validate_rust_syntax_complexity(&multi_argument_cast).is_err(),
+            "generic commas inside a cast target must preserve later nesting"
+        );
+        let function_pointer_alias = format!("type DeepFn = Wrapper<fn() -> u8, {nested_type}>;");
+        assert!(
+            validate_rust_syntax_complexity(&function_pointer_alias).is_err(),
+            "a function-pointer arrow must not close an enclosing generic"
+        );
+        let function_pointer_cast = format!("fn fixture() {{ let _ = fptr as Wrapper<fn() -> u8, {nested_type}>; }}");
+        assert!(
+            validate_rust_syntax_complexity(&function_pointer_cast).is_err(),
+            "a function-pointer arrow in a cast must preserve later generic arguments"
+        );
+        let function_pointer_comparisons = format!(
+            "fn fixture() {{ let _ = (fptr as fn() -> u8) < rhs && {}; }}",
+            std::iter::repeat_n("(a < b)", RUST_SYNTAX_MAX_DEPTH + 1)
+                .collect::<Vec<_>>()
+                .join(" && ")
+        );
+        let error = validate_rust_syntax_complexity(&function_pointer_comparisons)
+            .expect_err("recursive function-pointer comparison expressions must be bounded");
+        assert!(error.to_string().contains("tree depth"));
+
+        let const_turbofish = format!("type X = Wrapper<{{ std::mem::size_of::<{nested_type}>() }}>;");
+        assert!(
+            validate_rust_syntax_complexity(&const_turbofish).is_err(),
+            "deep turbofish types inside const generic blocks must be guarded"
+        );
+        let array_const_turbofish = format!("type X = [u8; std::mem::size_of::<{nested_type}>()];");
+        assert!(
+            validate_rust_syntax_complexity(&array_const_turbofish).is_err(),
+            "deep turbofish types inside array const expressions must be guarded"
+        );
+
+        let commented_cast = format!(
+            "fn fixture() {{ let _ = 0 as Vec</*{}*/{nested_type}>; }}",
+            "x".repeat(5000)
+        );
+        assert!(
+            validate_rust_syntax_complexity(&commented_cast).is_err(),
+            "long comments in cast target types must not create a lookahead blind spot"
+        );
+        let chained_cast_comparisons = format!(
+            "fn fixture() {{ let _ = (0 as u8 < 3) && {}; }}",
+            std::iter::repeat_n("(left < right)", RUST_SYNTAX_MAX_DEPTH + 1)
+                .collect::<Vec<_>>()
+                .join(" && ")
+        );
+        let error = validate_rust_syntax_complexity(&chained_cast_comparisons)
+            .expect_err("recursive cast-comparison expressions must be bounded");
+        assert!(error.to_string().contains("tree depth"));
+    }
+
+    #[test]
+    fn self_workspace_redaction_removes_legacy_absolute_roots() {
+        let private_root_dir = tempfile::tempdir().expect("private root");
+        let private_root = private_root_dir.path().canonicalize().expect("canonical private root");
+        let mut scan = WorkspaceScan {
+            root_path: private_root.display().to_string(),
+            crates: vec![
+                CrateInfo {
+                    name: "root".to_string(),
+                    rel_path: private_root.display().to_string(),
+                    internal_deps: Vec::new(),
+                    file_count: 0,
+                    total_loc: 0,
+                },
+                CrateInfo {
+                    name: "nested".to_string(),
+                    rel_path: private_root.join("crates/nested").display().to_string(),
+                    internal_deps: Vec::new(),
+                    file_count: 0,
+                    total_loc: 0,
+                },
+            ],
+            ..Default::default()
+        };
+
+        redact_self_workspace_paths(&mut scan);
+
+        assert_eq!(scan.root_path, ".");
+        assert_eq!(scan.crates[0].rel_path, ".");
+        assert_eq!(scan.crates[1].rel_path, "crates/nested");
+        let json = serde_json::to_string(&scan).expect("scan json");
+        assert!(!json.contains(private_root.to_str().expect("utf8 fixture")));
+    }
 
     #[test]
     fn parses_pub_fn_and_struct_lines() {
@@ -1914,7 +3714,7 @@ mod tests {
     fn count_substring_word_boundary() {
         let s = "foo foo_bar barfoo foo, foo!";
         // `foo` should match only at word boundaries: 3 hits ("foo ", "foo,", "foo!").
-        assert_eq!(count_substring(s, "foo"), 3);
+        assert_eq!(count_substring(s, "foo").expect("count"), 3);
     }
 
     #[test]
@@ -2082,7 +3882,7 @@ fn build() {
         );
 }
 "#;
-        let routes = parse_routes_in_source(src, "x.rs");
+        let routes = parse_routes_in_source(src, "x.rs").expect("routes");
         assert_eq!(routes.len(), 2);
         assert!(routes
             .iter()
@@ -2095,18 +3895,18 @@ fn build() {
     #[test]
     fn scans_call_sites_skipping_macros_and_keywords() {
         let line = "    let x = compute_total(a, b) + helper::format(s);";
-        let calls = scan_call_sites(line);
+        let calls = scan_call_sites(line).expect("calls");
         assert!(calls.contains(&"compute_total".to_string()));
         assert!(calls.contains(&"format".to_string()));
 
         // Macro should be skipped.
         let macro_line = "    println!(\"hi {}\", name);";
-        let calls2 = scan_call_sites(macro_line);
+        let calls2 = scan_call_sites(macro_line).expect("macro calls");
         assert!(!calls2.contains(&"println".to_string()));
 
         // Keyword `if (` shouldn't show up as a call.
         let kw_line = "    if (x > 0) { foo() }";
-        let calls3 = scan_call_sites(kw_line);
+        let calls3 = scan_call_sites(kw_line).expect("keyword calls");
         assert!(!calls3.contains(&"if".to_string()));
         assert!(calls3.contains(&"foo".to_string()));
     }
@@ -2117,30 +3917,38 @@ fn build() {
         // named `clone`. Pre-fix, this matched and resolved to any local
         // `clone` fn, producing bogus edges.
         let m1 = "    let x = obj.clone();";
-        assert!(!scan_call_sites(m1).contains(&"clone".to_string()));
+        assert!(!scan_call_sites(m1)
+            .expect("method calls")
+            .contains(&"clone".to_string()));
 
         let m2 = "    map.get(&key)";
-        assert!(!scan_call_sites(m2).contains(&"get".to_string()));
+        assert!(!scan_call_sites(m2).expect("method calls").contains(&"get".to_string()));
 
         let m3 = "    let h = headers.get_all(\"X\");";
-        assert!(!scan_call_sites(m3).contains(&"get_all".to_string()));
+        assert!(!scan_call_sites(m3)
+            .expect("method calls")
+            .contains(&"get_all".to_string()));
 
         // Chained methods — every `.method(` should drop, including the
         // intermediate `.iter()` and `.collect()`.
         let chain = "    items.iter().map(|x| x + 1).collect()";
-        let chain_calls = scan_call_sites(chain);
+        let chain_calls = scan_call_sites(chain).expect("chain calls");
         assert!(!chain_calls.contains(&"iter".to_string()));
         assert!(!chain_calls.contains(&"map".to_string()));
         assert!(!chain_calls.contains(&"collect".to_string()));
 
         // Legit free-fn call still emits.
         let free = "    clone(arg);";
-        assert!(scan_call_sites(free).contains(&"clone".to_string()));
+        assert!(scan_call_sites(free)
+            .expect("free calls")
+            .contains(&"clone".to_string()));
 
         // Free fn after a path separator (`mod::clone`) still emits — there's
         // no `.` immediately before the identifier.
         let path = "    mymod::clone(arg)";
-        assert!(scan_call_sites(path).contains(&"clone".to_string()));
+        assert!(scan_call_sites(path)
+            .expect("path calls")
+            .contains(&"clone".to_string()));
     }
 
     #[test]

@@ -15,6 +15,8 @@ mod fact_helpers {
     }
 }
 
+#[path = "../src/repo_scan_policy.rs"]
+mod repo_scan_policy;
 #[path = "../src/workspace_scan.rs"]
 mod workspace_scan;
 #[path = "../src/workspace_scan_ast.rs"]
@@ -30,12 +32,21 @@ fn main() {
         .nth(2)
         .expect("workspace root");
     let iterations = 10usize;
+    let policy = repo_scan_policy::RepoScanPolicy::for_exact_root(root).expect("scan policy");
 
     println!("root: {}", root.display());
     println!("iterations: {iterations}");
 
-    let (regex_cold, regex_scan) = timed_scan(|| workspace_scan::run_scan_regex_at(root).expect("regex scan"));
-    let (ast_cold, ast_scan) = timed_scan(|| workspace_scan_ast::run_scan_ast_at(root).expect("ast scan"));
+    let (regex_cold, regex_scan) = timed_scan(|| {
+        policy
+            .execute(root, workspace_scan::run_scan_regex_at)
+            .expect("regex scan")
+    });
+    let (ast_cold, ast_scan) = timed_scan(|| {
+        policy
+            .execute(root, workspace_scan_ast::run_scan_ast_at)
+            .expect("ast scan")
+    });
 
     let mut regex_times = Vec::with_capacity(iterations);
     let mut ast_times = Vec::with_capacity(iterations);
@@ -43,11 +54,19 @@ fn main() {
     let mut latest_ast = ast_scan;
 
     for _ in 0..iterations {
-        let (dur, scan) = timed_scan(|| workspace_scan::run_scan_regex_at(root).expect("regex scan"));
+        let (dur, scan) = timed_scan(|| {
+            policy
+                .execute(root, workspace_scan::run_scan_regex_at)
+                .expect("regex scan")
+        });
         regex_times.push(dur);
         latest_regex = scan;
 
-        let (dur, scan) = timed_scan(|| workspace_scan_ast::run_scan_ast_at(root).expect("ast scan"));
+        let (dur, scan) = timed_scan(|| {
+            policy
+                .execute(root, workspace_scan_ast::run_scan_ast_at)
+                .expect("ast scan")
+        });
         ast_times.push(dur);
         latest_ast = scan;
     }

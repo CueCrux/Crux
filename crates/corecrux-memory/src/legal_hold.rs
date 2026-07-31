@@ -55,6 +55,35 @@ impl LegalHold {
     pub fn covers_fact(&self, fact: &Fact) -> bool {
         self.covers(&fact.tenant_hash, &fact.entity)
     }
+
+    /// Match the persisted tenant key unless a legacy repo-control entity
+    /// carries its authoritative logical tenant in the entity name.
+    ///
+    /// Repository registry/scan facts historically lived in the internal
+    /// `default` FactStore tenant while their entity carried the authenticated
+    /// tenant. Public holds use that authenticated tenant, so exact storage-key
+    /// matching alone would allow replacement or erasure under a valid hold.
+    /// Conversely, treating both tenants as authorities would let a physical
+    /// `default` hold freeze every logical tenant.
+    pub(crate) fn covers_stored_or_logical_repo_control(&self, stored_tenant: &str, entity: &str) -> bool {
+        logical_repo_control_tenant(entity).map_or_else(
+            || self.covers(stored_tenant, entity),
+            |logical_tenant| self.covers(logical_tenant, entity),
+        )
+    }
+}
+
+fn logical_repo_control_tenant(entity: &str) -> Option<&str> {
+    [
+        "__repo_registry__::",
+        "__repo_scan__::",
+        "__repo_codegraph_ids__::",
+        "__repo_extdeps__::",
+    ]
+    .iter()
+    .find_map(|prefix| entity.strip_prefix(prefix))
+    .and_then(|suffix| suffix.split("::").next())
+    .filter(|tenant| !tenant.is_empty())
 }
 
 #[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
@@ -227,7 +256,7 @@ impl FactStore {
             release_receipt_id: None,
         };
         let value = serde_json::to_string(&hold)?;
-        self.try_store(StoreFact {
+        self.try_store_durable(StoreFact {
             tenant_hash: hold.tenant_id.clone(),
             entity: format!("{LEGAL_HOLD_ENTITY_PREFIX}{hold_id}"),
             key: "state".to_string(),
@@ -319,7 +348,7 @@ impl FactStore {
         let mut committed = prepared.clone();
         committed.hold.release_receipt_id = Some(durable_signed_receipt_id.to_string());
         let value = serde_json::to_string(&committed.hold)?;
-        self.try_store(StoreFact {
+        self.try_store_durable(StoreFact {
             tenant_hash: committed.hold.tenant_id.clone(),
             entity: format!("{LEGAL_HOLD_ENTITY_PREFIX}{}", committed.hold.hold_id),
             key: "state".to_string(),
@@ -351,7 +380,7 @@ impl FactStore {
             LegalHoldReceiptKind::Released => hold.release_receipt_id = Some(signed_record_id.to_string()),
             LegalHoldReceiptKind::Overridden => return Ok(hold),
         }
-        self.try_store(StoreFact {
+        self.try_store_durable(StoreFact {
             tenant_hash: hold.tenant_id.clone(),
             entity: format!("{LEGAL_HOLD_ENTITY_PREFIX}{}", hold.hold_id),
             key: "state".to_string(),
@@ -405,7 +434,7 @@ impl FactStore {
     pub fn covering_legal_holds(&self, tenant_id: &str, entity: &str) -> Vec<LegalHold> {
         self.active_legal_holds()
             .into_iter()
-            .filter(|hold| hold.covers(tenant_id, entity))
+            .filter(|hold| hold.covers_stored_or_logical_repo_control(tenant_id, entity))
             .collect()
     }
 
@@ -418,7 +447,7 @@ impl FactStore {
                 let hold_ids: Vec<String> = holds
                     .iter()
                     .filter(|hold| {
-                        hold.covers_fact(fact)
+                        hold.covers_stored_or_logical_repo_control(&fact.tenant_hash, &fact.entity)
                             || fact.entity.strip_prefix(LEGAL_HOLD_ENTITY_PREFIX) == Some(hold.hold_id.as_str())
                     })
                     .map(|hold| hold.hold_id.clone())
@@ -539,6 +568,53 @@ mod tests {
     }
 
     #[test]
+    fn active_scan_hold_is_durable_before_replacement_can_resume() {
+        let dir = tempdir().unwrap();
+        let entity = "__repo_scan__::tenant-a::repo-a::latest";
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            store
+                .try_replace_latest_daemon_control(StoreFact {
+                    tenant_hash: "default".to_string(),
+                    entity: entity.to_string(),
+                    key: "content".to_string(),
+                    value: "original".to_string(),
+                    source_receipt: None,
+                    confidence: 1.0,
+                    private: true,
+                    horizon_class: None,
+                    actor: None,
+                })
+                .unwrap();
+            store
+                .place_legal_hold(PlaceLegalHold {
+                    tenant_id: "tenant-a".to_string(),
+                    entity_prefixes: vec!["__repo_scan__::tenant-a::repo-a".to_string()],
+                    reason: "preserve selected scan".to_string(),
+                    actor: Some("p_operator".to_string()),
+                })
+                .unwrap();
+        }
+
+        let mut replayed = FactStore::with_persistence(dir.path()).unwrap();
+        let error = replayed
+            .try_replace_latest_daemon_control(StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: entity.to_string(),
+                key: "content".to_string(),
+                value: "replacement".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: true,
+                horizon_class: None,
+                actor: None,
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(replayed.get_by_entity(entity)[0].value, "original");
+    }
+
+    #[test]
     fn hold_scope_is_tenant_and_prefix_bounded() {
         let mut store = FactStore::new();
         store
@@ -556,6 +632,47 @@ mod tests {
         assert!(store
             .covering_legal_holds("tenant-b", "customer::42::profile")
             .is_empty());
+    }
+
+    #[test]
+    fn repo_control_holds_use_logical_tenant_instead_of_physical_default() {
+        let mut store = FactStore::new();
+        store
+            .place_legal_hold(PlaceLegalHold {
+                tenant_id: "default".to_string(),
+                entity_prefixes: Vec::new(),
+                reason: "physical tenant fixture".to_string(),
+                actor: None,
+            })
+            .unwrap();
+        store
+            .place_legal_hold(PlaceLegalHold {
+                tenant_id: "tenant-b".to_string(),
+                entity_prefixes: Vec::new(),
+                reason: "logical tenant fixture".to_string(),
+                actor: None,
+            })
+            .unwrap();
+
+        assert_eq!(store.covering_legal_holds("default", "ordinary::default").len(), 1);
+
+        for prefix in [
+            "__repo_registry__",
+            "__repo_scan__",
+            "__repo_codegraph_ids__",
+            "__repo_extdeps__",
+        ] {
+            let tenant_b_entity = format!("{prefix}::tenant-b::repo-a::latest");
+            let tenant_b_holds = store.covering_legal_holds("default", &tenant_b_entity);
+            assert_eq!(tenant_b_holds.len(), 1, "{tenant_b_entity}");
+            assert_eq!(tenant_b_holds[0].tenant_id, "tenant-b");
+
+            let tenant_c_entity = format!("{prefix}::tenant-c::repo-a::latest");
+            assert!(
+                store.covering_legal_holds("default", &tenant_c_entity).is_empty(),
+                "{tenant_c_entity}"
+            );
+        }
     }
 
     #[test]

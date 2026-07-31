@@ -16,7 +16,7 @@ use axum::Json;
 use serde_json::json;
 
 use super::observations::{append_one_durable, PostObservationBody, PostObservationResponse};
-use super::{problem_response, require_http_scopes, AppState};
+use super::{problem_response, require_http_scopes_for_tenant, AppState};
 use corecrux_memory::{LegalHoldMutation, LegalHoldReceiptKind, PlaceLegalHold};
 
 pub const LEGAL_HOLD_FEATURE_FLAG: &str = "CORECRUXD_FEATURE_LEGAL_HOLD";
@@ -43,8 +43,20 @@ fn feature_disabled_response() -> Response {
     )
 }
 
-fn caller(state: &AppState, headers: &HeaderMap) -> Result<String, Box<Response>> {
-    require_http_scopes(&state.auth, headers, &["admin:write"]).map_err(|problem| Box::new(problem.into_response()))?;
+fn require_persistent_fact_store(persistence_enabled: bool) -> Result<(), Box<Response>> {
+    if persistence_enabled {
+        Ok(())
+    } else {
+        Err(Box::new(problem_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "legal holds require durable fact persistence",
+        )))
+    }
+}
+
+fn caller_for_tenant(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<String, Box<Response>> {
+    require_http_scopes_for_tenant(&state.auth, headers, &["admin:write"], tenant_id)
+        .map_err(|problem| Box::new(problem.into_response()))?;
     let context =
         crate::auth::http_scope_context(&state.auth, headers).map_err(|problem| Box::new(problem.into_response()))?;
     Ok(context.passport_id.unwrap_or_else(|| state.passport_fpr.clone()))
@@ -162,12 +174,19 @@ pub(super) async fn post_legal_hold(
     if !feature_enabled() {
         return feature_disabled_response();
     }
-    let actor = match caller(&state, &headers) {
+    if let Err(response) = require_persistent_fact_store(state.fact_store.read().await.persistence_enabled()) {
+        return *response;
+    }
+    let tenant_id = body.tenant_id.trim().to_string();
+    if tenant_id.is_empty() {
+        return problem_response(StatusCode::BAD_REQUEST, "tenant_id and reason are required");
+    }
+    let actor = match caller_for_tenant(&state, &headers, &tenant_id) {
         Ok(actor) => actor,
         Err(response) => return *response,
     };
     let mutation = match state.fact_store.write().await.place_legal_hold(PlaceLegalHold {
-        tenant_id: body.tenant_id,
+        tenant_id,
         entity_prefixes: body.entity_prefixes,
         reason: body.reason,
         actor: Some(actor.clone()),
@@ -220,7 +239,14 @@ pub(super) async fn delete_legal_hold(
     if !feature_enabled() {
         return feature_disabled_response();
     }
-    let actor = match caller(&state, &headers) {
+    if let Err(response) = require_persistent_fact_store(state.fact_store.read().await.persistence_enabled()) {
+        return *response;
+    }
+    let tenant_id = match state.fact_store.read().await.legal_hold(&hold_id) {
+        Some(hold) => hold.tenant_id,
+        None => return problem_response(StatusCode::NOT_FOUND, format!("legal hold not found: {hold_id}")),
+    };
+    let actor = match caller_for_tenant(&state, &headers, &tenant_id) {
         Ok(actor) => actor,
         Err(response) => return *response,
     };
@@ -244,6 +270,96 @@ pub(super) async fn delete_legal_hold(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ephemeral_fact_store_cannot_claim_durable_legal_hold_support() {
+        let response =
+            require_persistent_fact_store(false).expect_err("ephemeral store must reject the legal-hold surface");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn tenant_bound_admin_cannot_place_or_release_cross_tenant_holds() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        const SECRET: &str = "0123456789abcdef0123456789abcdef";
+        let _feature = crate::test_support::EnvVarGuard::set(LEGAL_HOLD_FEATURE_FLAG, "1");
+        let mut state = crate::http::tests::test_app_state(4);
+        state.auth = crate::auth::Authz::test_hs256(SECRET.as_bytes(), "corecrux-test", "corecrux");
+        state.fact_store = std::sync::Arc::new(tokio::sync::RwLock::new(
+            corecrux_memory::FactStore::with_persistence(&state.data_dir).unwrap(),
+        ));
+        let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).unwrap();
+        state.passport_fpr = key.passport_fpr().to_string();
+        state.passport_public_key_hex = key.public_key_hex().to_string();
+
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &serde_json::json!({
+                "exp": chrono::Utc::now().timestamp() + 3600,
+                "iss": "corecrux-test",
+                "aud": "corecrux",
+                "scope": "admin:write",
+                "tenants": ["tenant-a"],
+                "passport_id": "p_tenant_a_admin",
+            }),
+            &EncodingKey::from_secret(SECRET.as_bytes()),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+
+        let cross_tenant_place = post_legal_hold(
+            State(state.clone()),
+            headers.clone(),
+            Json(PostLegalHoldBody {
+                tenant_id: "tenant-b".to_string(),
+                entity_prefixes: Vec::new(),
+                reason: "cross-tenant denial fixture".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(cross_tenant_place.status(), StatusCode::FORBIDDEN);
+        assert!(state.fact_store.read().await.active_legal_holds().is_empty());
+
+        let own_tenant_place = post_legal_hold(
+            State(state.clone()),
+            headers.clone(),
+            Json(PostLegalHoldBody {
+                tenant_id: "tenant-a".to_string(),
+                entity_prefixes: vec!["tenant-a::".to_string()],
+                reason: "authorized fixture".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(own_tenant_place.status(), StatusCode::CREATED);
+
+        let tenant_b_hold = state
+            .fact_store
+            .write()
+            .await
+            .place_legal_hold(PlaceLegalHold {
+                tenant_id: "tenant-b".to_string(),
+                entity_prefixes: Vec::new(),
+                reason: "tenant-b litigation".to_string(),
+                actor: Some("p_tenant_b_admin".to_string()),
+            })
+            .unwrap()
+            .hold;
+        let cross_tenant_release =
+            delete_legal_hold(State(state.clone()), headers, Path(tenant_b_hold.hold_id.clone())).await;
+        assert_eq!(cross_tenant_release.status(), StatusCode::FORBIDDEN);
+        assert!(state
+            .fact_store
+            .read()
+            .await
+            .legal_hold(&tenant_b_hold.hold_id)
+            .is_some_and(|hold| hold.active()));
+    }
 
     #[tokio::test]
     async fn place_and_release_emit_ed25519_observation_receipts() {

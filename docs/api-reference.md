@@ -137,22 +137,89 @@ reservation and emits no spend stamp.
 
 ### Repos & Code Map
 
-AST-derived code structure for registered repositories. Registration with a
-`root_path` runs a one-shot scan (Rust natively; TS/TSX/Vue/Python via
-tree-sitter) and persists it; the repo watch loop re-indexes on change. The
-codemap endpoint is the read side — the daemon serving its own code
-understanding back to agents.
+AST-derived code structure for registered repositories. HTTP and MCP
+registration with a local `root_path` always uses a queued
+`"scan_mode":"async"` scan. Inline local scans are rejected because the scan
+budget is longer than the router's HTTP request deadline. Rust is parsed with
+`syn`; supported polyglot languages use tree-sitter. The codemap endpoint is
+the read side.
+
+Local `root_path` registration is fail-closed and requires cross-tenant
+operator authority, even though the resulting registration belongs to a
+specific tenant. Configure one or more existing absolute directories in
+`CORECRUXD_REPO_SCAN_ALLOWED_ROOTS` (the platform path-list syntax); only
+canonical descendants are accepted. MCP binds `tenant_id` to its authenticated
+tenant; only a global MCP operator can name another tenant or a host path.
+`CORECRUXD_WORKSPACE_PATH` authorizes only the operator self-scan route and
+never expands tenant repo-scan authority. Without an explicit allowed-roots
+setting, tenant-triggered local scans are disabled, while `clone_url`
+registrations remain available. Roots and every traversed entry are
+revalidated without following symlinks at execution time, including queued
+jobs and watcher rescans. Async completions are bound to an opaque registration
+generation, so deleting and recreating the same repo ID cannot receive stale
+scan, status, or codegraph data. The async queue holds at most 32 active jobs
+and at most 8 for one tenant.
+
+For one named static token to register local roots through MCP and its daemon
+loopback, configure the same token as a dedicated global operator on both
+rails:
+
+```sh
+CRUX_AGENT_TOKENS=repo-operator:<generated-32-to-256-char-token>
+CORECRUXD_AGENT_PASSPORTS=1
+CRUX_AGENT_PASSPORTS=repo-operator:repo-operator-passport:*
+CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS=true
+CORECRUXD_AGENT_TOKEN_HTTP_SCOPES="admin:read admin:write"
+CORECRUXD_AGENT_TOKEN_HTTP_TENANT=*
+```
+
+HTTP acceptance of agent tokens requires a JWT auth mode. Treat this wildcard
+credential as host-level scan authority: dedicate and rotate it, keep
+`CORECRUXD_REPO_SCAN_ALLOWED_ROOTS` narrow, and mount those roots read-only.
+
+Secure repository reads currently require Linux `openat2` beneath a pinned
+root descriptor: symlinks, mount crossings, hard-linked files and non-regular
+files are rejected; identity, length, mtime and ctime are checked around each
+bounded read. Native macOS and Windows daemons reject before opening a
+candidate file. Mount allowed source roots read-only; Windows operators should
+run the daemon under WSL2.
+
+Starting `POST /v1/workspace/scan` and reading `/v1/workspace/scan` or
+`/v1/workspace/storyline` require cross-tenant operator authority; a
+tenant-bound JWT admin receives 403. Its `root_path` is persisted as `.` so the
+host checkout path is not disclosed.
+
+Each complete scan shares startup-frozen depth, entry, discovered-byte,
+cumulative-read-byte, per-file, and elapsed-work limits:
+`CORECRUXD_REPO_SCAN_MAX_DEPTH` (64),
+`CORECRUXD_REPO_SCAN_MAX_FILES` (100000),
+`CORECRUXD_REPO_SCAN_MAX_BYTES` (1 GiB),
+`CORECRUXD_REPO_SCAN_MAX_FILE_BYTES` (8 MiB),
+`CORECRUXD_REPO_SCAN_MAX_PARSER_ITEMS` (5000000),
+`CORECRUXD_REPO_SCAN_MAX_GENERATED_ITEMS` (2000000), and
+`CORECRUXD_REPO_SCAN_TIMEOUT_SECS` (300). Invalid values abort startup. The
+timeout is cooperative: tree-sitter is interruptible, while bounded `syn`,
+serde/TOML parsing and filesystem syscalls finish atomically before the next
+deadline check. One process-wide permit remains held through scan encoding and
+persistence. Published scan snapshots have an additional fixed 64 MiB
+serialized ceiling so later codemap reads remain process-memory bounded.
+
+`CORECRUXD_REPO_WATCH=1` enables fixed 30-second bounded polling. Secure
+content digests detect same-length or timestamp-preserving edits; any change
+causes a full replacement scan. Busy polls coalesce, failures retain the last
+snapshot for retry, and watcher counts are capped at 16 process-wide and 4 per
+tenant.
 
 | Method | Path | Description | Auth Scope |
 |--------|------|-------------|------------|
 | GET | `/v1/repos?tenant_id=…` | List registered repos for a tenant | `admin:read` |
-| POST | `/v1/repos` | Register a repo (`root_path` scans now; `clone_url` defers) | `admin:write` |
+| POST | `/v1/repos` | Register a repo (`root_path` also requires global tenant authority and queues `scan_mode=async`; `clone_url` defers) | `admin:write` |
 | GET | `/v1/repos/{repoId}?tenant_id=…` | One registration | `admin:read` |
 | DELETE | `/v1/repos/{repoId}?tenant_id=…` | Unregister (stops watch) | `admin:write` |
 | GET | `/v1/repos/{repoId}/codemap?tenant_id=…&format=summary\|full` | AST code map: `summary` = stats + per-crate rollup; `full` = files, symbols, deps, routes | `admin:read` |
-| POST | `/v1/workspace/scan` | Scan the daemon's own workspace (`CORECRUXD_WORKSPACE_PATH`) | `admin:write` |
-| GET | `/v1/workspace/scan` | Latest self-scan in full | `admin:read` |
-| GET | `/v1/workspace/storyline?format=tree\|json` | Per-route call trees from the self-scan | `admin:read` |
+| POST | `/v1/workspace/scan` | Scan the daemon's own workspace (`CORECRUXD_WORKSPACE_PATH`) | `admin:write` + global tenant authority |
+| GET | `/v1/workspace/scan` | Latest self-scan in full (absolute root redacted) | `admin:read` + global tenant authority |
+| GET | `/v1/workspace/storyline?format=tree\|json` | Per-route call trees from the self-scan | `admin:read` + global tenant authority |
 
 ### Routing & Shards
 

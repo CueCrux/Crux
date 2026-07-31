@@ -345,18 +345,31 @@ pub struct ResolverCache {
 
 impl ResolverCache {
     /// Return a resolver for `(tenant, repo)`, rebuilding only on scan change.
-    pub fn get(
+    pub async fn get(
         &mut self,
-        store: &corecrux_memory::fact_store::FactStore,
+        store: &std::sync::Arc<tokio::sync::RwLock<corecrux_memory::fact_store::FactStore>>,
+        admission: std::sync::Arc<tokio::sync::Semaphore>,
+        data_dir: &std::path::Path,
         tenant_id: &str,
         repo_id: &str,
     ) -> Option<std::sync::Arc<SymbolResolver>> {
-        let repo = crate::repo_registry::get_repo(store, tenant_id, repo_id)?;
-        if repo.last_scan_id.is_some() && repo.last_scan_id == self.scan_id {
+        let selected_scan_id = {
+            let store = store.read().await;
+            crate::repo_registry::get_repo(&store, tenant_id, repo_id)?.last_scan_id
+        };
+        if selected_scan_id.is_some() && selected_scan_id == self.scan_id {
             return self.resolver.clone();
         }
-        let scan_json = crate::repo_registry::load_scan_json(store, tenant_id, repo_id)?;
-        let scan: crate::workspace_scan::WorkspaceScan = serde_json::from_str(&scan_json).ok()?;
+        let loaded =
+            crate::repo_registry::load_registered_workspace_scan_async(store, admission, data_dir, tenant_id, repo_id)
+                .await
+                .ok()??;
+        let crate::repo_registry::LoadedRepoScan {
+            registration: repo,
+            scan,
+            admission: _scan_admission,
+        } = loaded;
+        let scan = scan?;
         let resolver = std::sync::Arc::new(SymbolResolver::from_scan(&scan));
         self.scan_id.clone_from(&repo.last_scan_id);
         self.resolver = Some(std::sync::Arc::clone(&resolver));

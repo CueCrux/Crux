@@ -160,6 +160,7 @@ mod tests {
             languages: Vec::new(),
             enabled,
             added_at_unix_ms: 0,
+            generation_id: format!("fixture-{tenant_id}-{repo_id}"),
             last_scan_id: None,
             scan_status: None,
             scan_error: None,

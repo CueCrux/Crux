@@ -153,6 +153,13 @@ const PATHS: &[MutationPath] = &[
         backing_test: "",
         followup_ref: "",
     },
+    MutationPath {
+        id: 14,
+        name: "try_replace_latest_daemon_control (bounded control snapshot)",
+        class: Class::Receipted,
+        backing_test: "",
+        followup_ref: "",
+    },
 ];
 
 /// Guard: no unaddressed bypass; every known gap is tracked.
@@ -199,7 +206,7 @@ fn receipted_erasure_gc_paths_name_a_backing_test() {
 fn table_covers_the_expected_path_count() {
     assert_eq!(
         PATHS.len(),
-        13,
+        14,
         "audit table row count changed — update docs/receipts-mutation-path-audit-2026-07.md and this guard together"
     );
 }
@@ -221,6 +228,7 @@ const NON_DURABLE_MUTATORS: &[&str] = &[
 const AUDITED_MUTATORS: &[&str] = &[
     "store",
     "try_store",
+    "try_replace_latest_daemon_control",
     "store_bulk",
     "try_store_bulk",
     "try_store_bulk_durable",

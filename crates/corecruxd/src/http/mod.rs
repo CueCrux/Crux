@@ -365,6 +365,9 @@ pub struct AppState {
     pub admin_actions: Arc<RwLock<std::collections::BTreeMap<String, AdminActionRecord>>>,
     pub repo_scan_jobs: Arc<RwLock<std::collections::BTreeMap<String, RepoScanJob>>>,
     pub repo_scan_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Startup-frozen canonical-root and resource-budget policy shared by
+    /// inline, queued, and watched repository scans.
+    pub repo_scan_policy: Arc<crate::repo_scan_policy::RepoScanPolicy>,
     pub corruption_detected: Arc<RwLock<bool>>,
     pub capacity: Arc<RwLock<CapacityState>>,
     pub admin_force_seal_enabled: bool,

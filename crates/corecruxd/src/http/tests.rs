@@ -1073,6 +1073,7 @@ pub(crate) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         admin_actions: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
         repo_scan_jobs: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
         repo_scan_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+        repo_scan_policy: Arc::new(crate::repo_scan_policy::RepoScanPolicy::allow_any_for_tests()),
         corruption_detected: Arc::new(RwLock::new(false)),
         admin_force_seal_enabled: false,
         local_ingest_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -1116,6 +1117,17 @@ pub(crate) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
 
 pub(super) fn test_app_state(action_max_pending: usize) -> AppState {
     test_app_state_with_auth(action_max_pending, AuthMode::Off)
+}
+
+fn enable_durable_fact_store(state: &mut AppState) {
+    let store = corecrux_memory::FactStore::with_persistence(&state.data_dir).expect("create durable test fact store");
+    state.fact_store = Arc::new(RwLock::new(store));
+}
+
+fn durable_test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> AppState {
+    let mut state = test_app_state_with_auth(action_max_pending, auth_mode);
+    enable_durable_fact_store(&mut state);
+    state
 }
 
 /// Fresh in-memory case store for `router(state, …)` test calls (M3).
@@ -9120,33 +9132,36 @@ async fn workbench_audit_triage_groups_replay_failures() {
 }
 
 #[tokio::test]
-async fn explicit_tenant_workbench_route_selects_from_multi_tenant_jwt_m16() {
+async fn workspace_backed_workbench_route_requires_global_tenant_authority_m17() {
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 
     const SECRET: &str = "0123456789abcdef0123456789abcdef";
     let mut state = pro_workbench_state(&["audit:triage"]);
     state.auth = crate::auth::Authz::test_hs256(SECRET.as_bytes(), "corecrux-test", "corecrux");
-    let token = encode(
-        &Header::new(Algorithm::HS256),
-        &serde_json::json!({
-            "exp": chrono::Utc::now().timestamp() + 3600,
-            "iss": "corecrux-test",
-            "aud": "corecrux",
-            "scope": "audit:triage",
-            "tenants": ["tenant-a", "tenant-b"],
-        }),
-        &EncodingKey::from_secret(SECRET.as_bytes()),
-    )
-    .expect("jwt");
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer"),
-    );
+    let headers_for_tenants = |tenants: serde_json::Value| {
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &serde_json::json!({
+                "exp": chrono::Utc::now().timestamp() + 3600,
+                "iss": "corecrux-test",
+                "aud": "corecrux",
+                "scope": "audit:triage",
+                "tenants": tenants,
+            }),
+            &EncodingKey::from_secret(SECRET.as_bytes()),
+        )
+        .expect("jwt");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer"),
+        );
+        headers
+    };
 
-    let response = super::workbench::get_audit_triage(
-        State(state),
-        headers,
+    let tenant_bound = super::workbench::get_audit_triage(
+        State(state.clone()),
+        headers_for_tenants(serde_json::json!(["tenant-a", "tenant-b"])),
         Query(super::workbench::TenantWorkbenchQuery {
             tenant_id: "tenant-a".to_string(),
             project_id: None,
@@ -9156,9 +9171,25 @@ async fn explicit_tenant_workbench_route_selects_from_multi_tenant_jwt_m16() {
     .await;
 
     assert_eq!(
-        response.status(),
+        tenant_bound.status(),
+        StatusCode::FORBIDDEN,
+        "workspace-derived route data requires authority wider than the selected fact tenant"
+    );
+
+    let global = super::workbench::get_audit_triage(
+        State(state),
+        headers_for_tenants(serde_json::json!(["*"])),
+        Query(super::workbench::TenantWorkbenchQuery {
+            tenant_id: "tenant-a".to_string(),
+            project_id: None,
+            limit: None,
+        }),
+    )
+    .await;
+    assert_eq!(
+        global.status(),
         StatusCode::OK,
-        "the explicit query tenant is the authorized selector; no header is required"
+        "a globally authorized operator may select the tenant-specific audit facts"
     );
 }
 
@@ -17806,6 +17837,52 @@ async fn workspace_routes_report_catalog_and_missing_scan_states() {
     assert_eq!(unconfigured.status(), StatusCode::PRECONDITION_FAILED);
 }
 
+#[tokio::test]
+async fn workspace_scan_and_results_require_global_operator_authority() {
+    let state = mint_test_verified_app_state(16);
+    let write_headers = mint_test_jwt_headers_for_tenant("admin:write", ("sub", "tenant-admin"), "tenant-a");
+    let read_headers = mint_test_jwt_headers_for_tenant("admin:read", ("sub", "tenant-admin"), "tenant-a");
+
+    let post = super::workspace::post_scan(State(state.clone()), write_headers)
+        .await
+        .into_response();
+    assert_eq!(post.status(), StatusCode::FORBIDDEN);
+
+    let get = super::workspace::get_scan(State(state.clone()), read_headers.clone())
+        .await
+        .into_response();
+    assert_eq!(get.status(), StatusCode::FORBIDDEN);
+
+    let storyline = super::workspace::get_storyline(
+        State(state),
+        read_headers,
+        Query(super::workspace::StorylineQuery {
+            root: None,
+            format: Some("json".to_string()),
+            include_tests: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(storyline.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn workspace_scan_rejects_busy_admission_without_waiting() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let _permit = state
+        .repo_scan_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("hold scan admission");
+
+    let response = super::workspace::post_scan(State(state), dev_scope_headers("admin:write"))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
 fn tiny_rust_repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     let src = dir.path().join("src");
@@ -17854,8 +17931,8 @@ async fn wait_for_repo_scan_job(
 }
 
 #[tokio::test]
-async fn repo_add_local_path_persists_registration_and_scan() {
-    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+async fn repo_add_local_path_defaults_to_async_and_persists_scan() {
+    let state = durable_test_app_state_with_auth(16, AuthMode::DevScopes);
     let repo = tiny_rust_repo();
     let root_path = repo.path().to_string_lossy().to_string();
 
@@ -17873,24 +17950,196 @@ async fn repo_add_local_path_persists_registration_and_scan() {
     )
     .await
     .into_response();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let body = json_body(resp).await;
     assert_eq!(body["repo"]["repo_id"], "fixture");
-    assert!(body["repo"]["last_scan_id"].as_str().is_some());
+    assert!(body["repo"]["last_scan_id"].is_null());
+    assert_eq!(body["repo"]["scan_status"], "pending");
+    let job_id = body["job_id"].as_str().expect("job id");
+    wait_for_repo_scan_job(state.clone(), "tenant-a", job_id, "succeeded").await;
 
     let store = state.fact_store.read().await;
     let registry_entity = crate::repo_registry::registry_entity("tenant-a", "fixture");
     let scan_entity = crate::repo_registry::scan_entity("tenant-a", "fixture");
     assert!(!store.get_by_entity(&registry_entity).is_empty());
-    assert!(!store.get_by_entity(&scan_entity).is_empty());
+    assert!(
+        store.get_by_entity(&scan_entity).is_empty(),
+        "runtime scan selection belongs to the durable registration; scan facts are migration-only"
+    );
     let persisted = crate::repo_registry::get_repo(&store, "tenant-a", "fixture").expect("repo persisted");
     assert_eq!(persisted.repo_id, "fixture");
+    assert_eq!(
+        persisted.root_path.as_deref(),
+        Some(
+            repo.path()
+                .canonicalize()
+                .expect("canonical repo")
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
     assert!(persisted.last_scan_id.is_some());
 }
 
 #[tokio::test]
+async fn repo_add_rejects_outside_allowed_roots_before_registration() {
+    let allowed = tempfile::tempdir().expect("allowed");
+    let outside = tempfile::tempdir().expect("outside");
+    let mut state = durable_test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.repo_scan_policy = Arc::new(crate::repo_scan_policy::RepoScanPolicy::for_test_roots(
+        vec![allowed.path().canonicalize().expect("canonical allowed")],
+        crate::repo_scan_policy::RepoScanLimits::default(),
+    ));
+
+    let resp = super::repos::post_repo(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::repos::CreateRepoBody {
+            repo_id: Some("outside".to_string()),
+            tenant_id: "tenant-a".to_string(),
+            root_path: Some(outside.path().display().to_string()),
+            clone_url: None,
+            languages: vec!["rust".to_string()],
+            scan_mode: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(crate::repo_registry::get_repo(&*state.fact_store.read().await, "tenant-a", "outside").is_none());
+}
+
+#[tokio::test]
+async fn repo_add_rejects_local_inline_mode_without_scanning() {
+    let state = durable_test_app_state_with_auth(16, AuthMode::DevScopes);
+    let repo = tiny_rust_repo();
+
+    let resp = super::repos::post_repo(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::repos::CreateRepoBody {
+            repo_id: Some("busy-inline".to_string()),
+            tenant_id: "tenant-a".to_string(),
+            root_path: Some(repo.path().display().to_string()),
+            clone_url: None,
+            languages: vec!["rust".to_string()],
+            scan_mode: Some("inline".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(crate::repo_registry::get_repo(&*state.fact_store.read().await, "tenant-a", "busy-inline").is_none());
+}
+
+#[tokio::test]
+async fn repo_local_path_requires_wildcard_tenant_authority_from_verified_passport() {
+    let mut state = mint_test_verified_app_state(16);
+    enable_durable_fact_store(&mut state);
+    let repo = tiny_rust_repo();
+    let request = |repo_id: &str| super::repos::CreateRepoBody {
+        repo_id: Some(repo_id.to_string()),
+        tenant_id: "tenant-a".to_string(),
+        root_path: Some(repo.path().display().to_string()),
+        clone_url: None,
+        languages: vec!["rust".to_string()],
+        scan_mode: Some("async".to_string()),
+    };
+
+    let tenant_bound = super::repos::post_repo(
+        State(state.clone()),
+        mint_test_jwt_headers_for_tenant("admin:write", ("passport_id", "repo-operator"), "tenant-a"),
+        Json(request("tenant-bound-path")),
+    )
+    .await
+    .into_response();
+    assert_eq!(tenant_bound.status(), StatusCode::FORBIDDEN);
+
+    let global = super::repos::post_repo(
+        State(state.clone()),
+        mint_test_jwt_headers_for_tenant("admin:write", ("passport_id", "repo-operator"), "*"),
+        Json(request("global-path")),
+    )
+    .await
+    .into_response();
+    assert_eq!(global.status(), StatusCode::ACCEPTED);
+    let body = json_body(global).await;
+    assert!(body["job_id"].as_str().is_some());
+    assert!(crate::repo_registry::get_repo(&*state.fact_store.read().await, "tenant-a", "global-path").is_some());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn queued_repo_scan_revalidates_root_after_registration() {
+    use std::os::unix::fs::symlink;
+
+    let container = tempfile::tempdir().expect("container");
+    let outside = tempfile::tempdir().expect("outside");
+    let root = container.path().join("repo");
+    let backup = container.path().join("repo-original");
+    std::fs::create_dir_all(root.join("src")).expect("source dir");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"queued-race\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(root.join("src/lib.rs"), "pub fn safe() {}\n").expect("source");
+    std::fs::write(outside.path().join("secret.rs"), "secret").expect("outside secret");
+
+    let mut state = durable_test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.repo_scan_policy = Arc::new(crate::repo_scan_policy::RepoScanPolicy::for_test_roots(
+        vec![root.canonicalize().expect("canonical root")],
+        crate::repo_scan_policy::RepoScanLimits::default(),
+    ));
+    let permit = state
+        .repo_scan_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("hold scan queue");
+
+    let resp = super::repos::post_repo(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::repos::CreateRepoBody {
+            repo_id: Some("queued-race".to_string()),
+            tenant_id: "tenant-a".to_string(),
+            root_path: Some(root.display().to_string()),
+            clone_url: None,
+            languages: vec!["rust".to_string()],
+            scan_mode: Some("async".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = json_body(resp).await;
+    let job_id = body["job_id"].as_str().expect("job id").to_string();
+
+    std::fs::rename(&root, &backup).expect("move registered root");
+    symlink(outside.path(), &root).expect("replace root with symlink");
+    drop(permit);
+
+    let job = wait_for_repo_scan_job(state.clone(), "tenant-a", &job_id, "failed").await;
+    let error = job["error"].as_str().expect("failed job error");
+    assert!(error.contains("root must not be a symlink"), "{error}");
+    let store = state.fact_store.read().await;
+    let persisted = crate::repo_registry::get_repo(&store, "tenant-a", "queued-race").expect("registered repo");
+    assert_eq!(persisted.scan_status.as_deref(), Some("failed"));
+    assert!(persisted.last_scan_id.is_none());
+    assert!(store
+        .get_by_entity(&crate::repo_registry::scan_entity("tenant-a", "queued-race"))
+        .is_empty());
+    drop(store);
+
+    std::fs::remove_file(&root).expect("remove symlink");
+    std::fs::rename(&backup, &root).expect("restore fixture");
+}
+
+#[tokio::test]
 async fn repo_add_local_path_async_persists_registration_scan_and_codemap() {
-    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let state = durable_test_app_state_with_auth(16, AuthMode::DevScopes);
     let repo = tiny_rust_workspace();
     let root_path = repo.path().to_string_lossy().to_string();
 
@@ -17953,7 +18202,7 @@ async fn repo_add_local_path_async_failure_keeps_registered_repo() {
         "forced repo scan failure for test".to_string(),
     );
     let _guard = super::repos::RepoScanTestHookGuard::install(hook);
-    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let state = durable_test_app_state_with_auth(16, AuthMode::DevScopes);
     let repo = tiny_rust_repo();
     let root_path = repo.path().to_string_lossy().to_string();
 
@@ -17989,8 +18238,77 @@ async fn repo_add_local_path_async_failure_keeps_registered_repo() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
+async fn stale_async_scan_cannot_mutate_recreated_registration() {
+    let mut hook = super::repos::RepoScanTestHook::default();
+    hook.delay_ms_by_repo.insert("generation-race".to_string(), 250);
+    let _guard = super::repos::RepoScanTestHookGuard::install(hook);
+    let state = durable_test_app_state_with_auth(16, AuthMode::DevScopes);
+    let repo = tiny_rust_repo();
+
+    let response = super::repos::post_repo(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::repos::CreateRepoBody {
+            repo_id: Some("generation-race".to_string()),
+            tenant_id: "tenant-a".to_string(),
+            root_path: Some(repo.path().display().to_string()),
+            clone_url: None,
+            languages: vec!["rust".to_string()],
+            scan_mode: Some("async".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let response_body = json_body(response).await;
+    let job_id = response_body["job_id"].as_str().expect("job id").to_string();
+    let _ = wait_for_repo_scan_job(state.clone(), "tenant-a", &job_id, "running").await;
+
+    let replacement_generation = "replacement-generation".to_string();
+    {
+        let mut store = state.fact_store.write().await;
+        let original =
+            crate::repo_registry::get_repo(&store, "tenant-a", "generation-race").expect("original registration");
+        crate::repo_registry::delete_repo(&mut store, "tenant-a", "generation-race").expect("delete original");
+        let replacement = crate::repo_registry::RepoRegistration {
+            generation_id: replacement_generation.clone(),
+            scan_status: None,
+            scan_error: None,
+            scan_queued_at_unix_ms: None,
+            scan_finished_at_unix_ms: None,
+            last_scan_id: None,
+            added_at_unix_ms: original.added_at_unix_ms.saturating_add(1),
+            ..original
+        };
+        crate::repo_registry::create_repo(&mut store, &replacement).expect("create replacement");
+    }
+
+    let job = wait_for_repo_scan_job(state.clone(), "tenant-a", &job_id, "failed").await;
+    assert!(job["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("stale result discarded")));
+
+    let store = state.fact_store.read().await;
+    let replacement =
+        crate::repo_registry::get_repo(&store, "tenant-a", "generation-race").expect("replacement registration");
+    assert_eq!(replacement.generation_id, replacement_generation);
+    assert!(replacement.scan_status.is_none());
+    assert!(replacement.scan_error.is_none());
+    assert!(replacement.last_scan_id.is_none());
+    assert!(
+        crate::repo_registry::load_scan_json(&state.data_dir, &store, &replacement)
+            .expect("load replacement scan")
+            .is_none()
+    );
+    assert!(store
+        .get_by_entity(&crate::repo_codegraph::ids_entity("tenant-a", "generation-race"))
+        .is_empty());
+}
+
+#[tokio::test]
 async fn repo_add_local_path_async_backpressure_rejects_when_queue_full() {
-    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let mut state = durable_test_app_state_with_auth(16, AuthMode::DevScopes);
     state.repo_scan_max_pending = 1;
     let permit = state
         .repo_scan_semaphore
@@ -18050,7 +18368,7 @@ async fn repo_add_local_path_async_jobs_are_serialized() {
     let mut hook = super::repos::RepoScanTestHook::default();
     hook.delay_ms_by_repo.insert("slow-scan".to_string(), 1_000);
     let _guard = super::repos::RepoScanTestHookGuard::install(hook);
-    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let state = durable_test_app_state_with_auth(16, AuthMode::DevScopes);
     let slow_repo = tiny_rust_repo();
     let fast_repo = tiny_rust_repo();
 
@@ -18244,7 +18562,37 @@ async fn register_local_repo(state: &AppState, tenant_id: &str, repo_id: &str, r
     )
     .await
     .into_response();
-    assert_eq!(created.status(), StatusCode::OK);
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let body = json_body(created).await;
+    let job_id = body["job_id"].as_str().expect("job id");
+    wait_for_repo_scan_job(state.clone(), tenant_id, job_id, "succeeded").await;
+}
+
+async fn emit_legacy_codegraph_test_fixture(state: &AppState, tenant_id: &str, repo_id: &str) {
+    let loaded = crate::repo_registry::load_registered_workspace_scan_async(
+        &state.fact_store,
+        state.repo_scan_semaphore.clone(),
+        &state.data_dir,
+        tenant_id,
+        repo_id,
+    )
+    .await
+    .expect("load registered scan")
+    .expect("registered scan");
+    let crate::repo_registry::LoadedRepoScan { scan, admission, .. } = loaded;
+    let scan = scan.expect("persisted scan");
+    drop(admission);
+    crate::repo_codegraph::maybe_emit_codegraph_edges(
+        &state.fact_store,
+        &state.projection_state,
+        &state.data_dir,
+        tenant_id,
+        repo_id,
+        &scan,
+    )
+    .await
+    .expect("emit explicit legacy test fixture")
+    .expect("legacy test flags enabled");
 }
 
 async fn seed_dependents_graph(
@@ -18299,7 +18647,7 @@ async fn seed_dependents_graph(
 
 #[tokio::test]
 async fn repo_codemap_serves_summary_and_full() {
-    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let state = durable_test_app_state_with_auth(16, AuthMode::DevScopes);
     let repo = tiny_rust_workspace();
     let root_path = repo.path().to_string_lossy().to_string();
 
@@ -18317,12 +18665,13 @@ async fn repo_codemap_serves_summary_and_full() {
     )
     .await
     .into_response();
-    assert_eq!(created.status(), StatusCode::OK);
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
     let created_body = json_body(created).await;
-    let scan_id = created_body["repo"]["last_scan_id"]
-        .as_str()
-        .expect("scan id")
-        .to_string();
+    let job_id = created_body["job_id"].as_str().expect("job id");
+    wait_for_repo_scan_job(state.clone(), "tenant-a", job_id, "succeeded").await;
+    let scan_id = crate::repo_registry::get_repo(&*state.fact_store.read().await, "tenant-a", "fixture")
+        .and_then(|registration| registration.last_scan_id)
+        .expect("scan id");
 
     // Default format is the summary: stats + per-crate rollup, no file list.
     let summary = super::repos::get_repo_codemap(
@@ -18380,7 +18729,7 @@ async fn repo_codemap_serves_summary_and_full() {
 #[tokio::test]
 #[serial_test::serial]
 async fn repo_codemap_summary_counts_external_deps_by_ecosystem() {
-    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let state = durable_test_app_state_with_auth(16, AuthMode::DevScopes);
     let repo = tiny_rust_workspace();
     let manifest = repo.path().join("mini/Cargo.toml");
     let mut manifest_body = std::fs::read_to_string(&manifest).expect("read manifest");
@@ -18403,7 +18752,10 @@ async fn repo_codemap_summary_counts_external_deps_by_ecosystem() {
     )
     .await
     .into_response();
-    assert_eq!(created.status(), StatusCode::OK);
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let created_body = json_body(created).await;
+    let job_id = created_body["job_id"].as_str().expect("job id");
+    wait_for_repo_scan_job(state.clone(), "tenant-a", job_id, "succeeded").await;
 
     let summary = super::repos::get_repo_codemap(
         State(state),
@@ -18425,7 +18777,7 @@ async fn repo_codemap_summary_counts_external_deps_by_ecosystem() {
 #[tokio::test]
 #[serial_test::serial]
 async fn repo_codemap_summary_omits_external_deps_when_flag_off() {
-    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let state = durable_test_app_state_with_auth(16, AuthMode::DevScopes);
     let repo = tiny_rust_workspace();
     let manifest = repo.path().join("mini/Cargo.toml");
     let mut manifest_body = std::fs::read_to_string(&manifest).expect("read manifest");
@@ -18448,7 +18800,10 @@ async fn repo_codemap_summary_omits_external_deps_when_flag_off() {
     )
     .await
     .into_response();
-    assert_eq!(created.status(), StatusCode::OK);
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let created_body = json_body(created).await;
+    let job_id = created_body["job_id"].as_str().expect("job id");
+    wait_for_repo_scan_job(state.clone(), "tenant-a", job_id, "succeeded").await;
 
     let summary = super::repos::get_repo_codemap(
         State(state),
@@ -18470,15 +18825,20 @@ async fn repo_codemap_summary_omits_external_deps_when_flag_off() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn repo_dependents_real_scans_return_version_rows() {
+async fn repo_dependents_migration_fixture_real_scans_return_version_rows() {
     let _deps = EnvVarGuard::set("CORECRUXD_EXTERNAL_DEPS", "1");
     let _edges = EnvVarGuard::set("CORECRUXD_CODEGRAPH_EDGES", "1");
     let _external_graph = EnvVarGuard::set("CORECRUXD_CODEGRAPH_EXTERNAL", "1");
-    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let state = durable_test_app_state_with_auth(16, AuthMode::DevScopes);
     let repo_a = tiny_cargo_dep_workspace("serde", "1", "1.0.200");
     let repo_b = tiny_cargo_dep_workspace("serde", "1", "1.0.201");
     register_local_repo(&state, "tenant-a", "repo-a", &repo_a).await;
     register_local_repo(&state, "tenant-a", "repo-b", &repo_b).await;
+    // Production startup rejects these legacy writer flags. Invoke the
+    // test-only emitter explicitly to keep the persisted migration/read format
+    // covered without re-enabling append-only writes in registration paths.
+    emit_legacy_codegraph_test_fixture(&state, "tenant-a", "repo-a").await;
+    emit_legacy_codegraph_test_fixture(&state, "tenant-a", "repo-b").await;
 
     let resp = super::repos::get_repo_dependents(
         State(state),
@@ -22729,6 +23089,7 @@ fn seed_repo(store: &mut corecrux_memory::FactStore, tenant_id: &str, repo_id: &
         languages: Vec::new(),
         enabled,
         added_at_unix_ms: 1,
+        generation_id: format!("fixture-{tenant_id}-{repo_id}"),
         last_scan_id: None,
         scan_status: None,
         scan_error: None,

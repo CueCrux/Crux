@@ -43,6 +43,8 @@ fs2 = { workspace = true }
 hex = { workspace = true }
 http-body-util = { workspace = true }
 jsonwebtoken = { workspace = true, default-features = false, features = ["use_pem", "aws_lc_rs"] }
+libc = "0.2.186"
+rustix = { version = "1.1.4", features = ["fs"] }
 prometheus = { workspace = true, default-features = false }
 chacha20poly1305 = { workspace = true }
 prost = { workspace = true }
@@ -106,8 +108,8 @@ tempfile = { workspace = true }
 # ECDSA P-256 (the daemon seal key is Ed25519), so the witness signs entries
 # with a dedicated P-256 key. Already a workspace dep via corecrux-receipts.
 p256 = { workspace = true, default-features = false, features = ["std", "ecdsa", "pem"] }
-notify = "8"
 tree-sitter = "0.26.10"
+tree-sitter-rust = "=0.24.2"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-python = "0.25.0"
 tree-sitter-go = "0.25.0"
@@ -121,6 +123,7 @@ tree-sitter-php = "=0.24.2"
 
 [dev-dependencies]
 corecrux-index = { path = "../corecrux-index" }
+corecrux-memory = { path = "../corecrux-memory", features = ["test-support"] }
 rcgen = { workspace = true }
 serial_test = { workspace = true }
 wat = "1"

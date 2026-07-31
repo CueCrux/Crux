@@ -221,9 +221,14 @@ impl AgentTokenHttpConfig {
             let (passport_id, tenants) = if let Some(passport_map) = &self.passport_map {
                 if let Some(group) = passport_map.get_group(&agent.name) {
                     require_tenant_allowed(&self.tenants, &group.tenant).ok()?;
-                    let mut tenant = BTreeSet::new();
-                    tenant.insert(group.tenant.clone());
-                    (group.passport.clone(), TenantAllow::Only(tenant))
+                    let tenants = if group.tenant == "*" {
+                        TenantAllow::Any
+                    } else {
+                        let mut tenant = BTreeSet::new();
+                        tenant.insert(group.tenant.clone());
+                        TenantAllow::Only(tenant)
+                    };
+                    (group.passport.clone(), tenants)
                 } else {
                     // Flag-on but unmapped agents remain automation principals
                     // and are confined to default, matching MCP authority.

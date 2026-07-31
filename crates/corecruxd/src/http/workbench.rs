@@ -300,6 +300,9 @@ pub(super) async fn get_agent_brief(
     {
         return response;
     }
+    if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
+        return problem.into_response();
+    }
     let sync_status = super::health::sync_runtime_status();
     let workspace = crate::workspace_scan::load_latest(&state.fact_store).await;
     let sessions = {
@@ -446,6 +449,9 @@ pub(super) async fn post_impact_preflight(
     {
         return response;
     }
+    if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
+        return problem.into_response();
+    }
     let scan = crate::workspace_scan::load_latest(&state.fact_store).await;
     let impacted_routes = scan
         .as_ref()
@@ -576,6 +582,9 @@ pub(super) async fn get_audit_triage(
         require_surface_for_tenant(&state, &headers, WorkbenchSurface::AuditTriage, false, &tenant_id)
     {
         return response;
+    }
+    if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
+        return problem.into_response();
     }
     let ctx = match http_scope_context(&state.auth, &headers) {
         Ok(ctx) => ctx,
@@ -713,6 +722,9 @@ pub(super) async fn post_route_probe(
     if let Some(response) = require_surface(&state, &headers, WorkbenchSurface::RouteProbe, true) {
         return response;
     }
+    if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
+        return problem.into_response();
+    }
     let scan = match crate::workspace_scan::load_latest(&state.fact_store).await {
         Some(scan) => scan,
         None => {
@@ -778,6 +790,9 @@ pub(super) async fn get_api_drift(
     if let Some(response) = require_surface_for_tenant(&state, &headers, WorkbenchSurface::ApiDrift, false, &tenant_id)
     {
         return response;
+    }
+    if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
+        return problem.into_response();
     }
     let scan = crate::workspace_scan::load_latest(&state.fact_store).await;
     let drift = api_drift_report(scan.as_ref());
