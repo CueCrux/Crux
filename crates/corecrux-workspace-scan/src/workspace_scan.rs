@@ -300,14 +300,14 @@ pub fn run_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
     run_scan_regex_at(root)
 }
 
-pub(crate) fn ast_scan_enabled_from_env() -> bool {
+pub fn ast_scan_enabled_from_env() -> bool {
     std::env::var("CORECRUXD_AST_SCAN").ok().is_some_and(|v| {
         let v = v.trim().to_ascii_lowercase();
         !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
     })
 }
 
-pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
+pub fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
     let started_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
@@ -397,7 +397,12 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
             // as detector tokens (and again as test inputs), which trip the
             // detector against itself. Skip stub-scanning when we encounter
             // this file so the report stays trustworthy.
-            let is_self_source = rel_str.ends_with("corecruxd/src/workspace_scan.rs");
+            //
+            // NOTE: this path is this file's own location, so it must be
+            // updated whenever the file moves — a stale value silently turns
+            // the guard off and the scanner starts reporting itself as stubbed.
+            // `full_scan_emits_routes_and_references` is what catches it.
+            let is_self_source = rel_str.ends_with("corecrux-workspace-scan/src/workspace_scan.rs");
 
             for (line_no, line) in src.lines().enumerate() {
                 let line_num = line_no + 1;
@@ -859,7 +864,7 @@ pub async fn load_latest(
         top_k: 8,
         token_budget: None,
     });
-    let latest = crate::fact_helpers::dedup_latest(result.facts);
+    let latest = corecrux_memory::fact_store::dedup_latest(result.facts);
     let fact = latest
         .into_iter()
         .find(|f| f.entity == LATEST_SCAN_ENTITY && f.key == SCAN_KEY)?;
@@ -1310,7 +1315,7 @@ fn collect_chain_ids(node: &StorylineNode, id_by_path: &HashMap<String, usize>, 
 
 /// Recursive-but-cheap directory walker. Skips `target/` and dot-dirs.
 #[allow(clippy::unnecessary_wraps)] // Result kept for symmetry + future fallibility (e.g. fs error propagation if we stop swallowing read_dir failures).
-pub(crate) fn walk_dir<F: FnMut(&Path, &Path)>(root: &Path, base: &Path, visit: &mut F) -> Result<(), ScanError> {
+pub fn walk_dir<F: FnMut(&Path, &Path)>(root: &Path, base: &Path, visit: &mut F) -> Result<(), ScanError> {
     let mut stack = vec![base.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
@@ -1334,7 +1339,7 @@ pub(crate) fn walk_dir<F: FnMut(&Path, &Path)>(root: &Path, base: &Path, visit: 
     Ok(())
 }
 
-pub(crate) fn parse_crate_name(toml: &str) -> Option<String> {
+pub fn parse_crate_name(toml: &str) -> Option<String> {
     // Find the `[package]` section then `name = "..."`.
     let mut in_package = false;
     for raw in toml.lines() {
@@ -1360,7 +1365,7 @@ pub(crate) fn parse_crate_name(toml: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn parse_internal_path_deps(toml: &str) -> Vec<String> {
+pub fn parse_internal_path_deps(toml: &str) -> Vec<String> {
     // Find lines like `crux-mcp = { path = "../crux-mcp" }` or
     // `crux-mcp = { workspace = true }` — both indicate workspace deps.
     let mut out = Vec::new();
@@ -1384,7 +1389,7 @@ pub(crate) fn parse_internal_path_deps(toml: &str) -> Vec<String> {
 }
 
 /// Infer a module path like `corecruxd::http::admin` from a file path.
-pub(crate) fn infer_module_path(crate_name: &str, crate_root: &Path, file: &Path) -> String {
+pub fn infer_module_path(crate_name: &str, crate_root: &Path, file: &Path) -> String {
     let src = crate_root.join("src");
     let rel = match file.strip_prefix(&src) {
         Ok(r) => r,
@@ -1459,7 +1464,7 @@ fn parse_symbol_line(line: &str) -> Option<(&'static str, String, bool)> {
 ///   `src/integrationTest` source set,
 /// - filename ends with `_tests.rs` or is exactly `tests.rs`,
 /// - first non-blank, non-comment line is `#![cfg(test)]` (rare, but legal).
-pub(crate) fn looks_like_test_file(rel_path: &str, src: &str) -> bool {
+pub fn looks_like_test_file(rel_path: &str, src: &str) -> bool {
     let normalized = rel_path.replace('\\', "/");
     let path_match = normalized.contains("/tests/")
         || normalized.ends_with("/tests.rs")
@@ -1492,7 +1497,7 @@ pub(crate) fn looks_like_test_file(rel_path: &str, src: &str) -> bool {
 /// `(full, summary)` where `summary` is the first sentence (≤80 chars).
 /// Skips a leading copyright `//` block and blank lines so the doc starts
 /// where the developer actually wrote `//!`.
-pub(crate) fn parse_file_doc_header(src: &str) -> (Option<String>, Option<String>) {
+pub fn parse_file_doc_header(src: &str) -> (Option<String>, Option<String>) {
     let mut full = String::new();
     let mut started = false;
     for line in src.lines() {
@@ -1548,12 +1553,12 @@ pub(crate) fn parse_file_doc_header(src: &str) -> (Option<String>, Option<String
 /// Parsed representation of a `.route("/path", METHOD(handler))` line. The
 /// caller resolves `handler_fn` to a definition file via the symbol index.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ParsedRoute {
-    pub(crate) method: String,
-    pub(crate) path: String,
-    pub(crate) handler_fn: String,
-    pub(crate) source_file: String,
-    pub(crate) source_line: usize,
+pub struct ParsedRoute {
+    pub method: String,
+    pub path: String,
+    pub handler_fn: String,
+    pub source_file: String,
+    pub source_line: usize,
 }
 
 /// Parse one route declaration (which may span multiple lines after `.route(`).
@@ -1600,7 +1605,7 @@ fn parse_route_chunk(chunk: &str, source_file: &str, source_line: usize) -> Opti
 
 /// Walk a whole source file looking for `.route(...)` declarations, including
 /// multi-line ones. Returns every route found in source order.
-pub(crate) fn parse_routes_in_source(src: &str, source_file: &str) -> Vec<ParsedRoute> {
+pub fn parse_routes_in_source(src: &str, source_file: &str) -> Vec<ParsedRoute> {
     let mut out = Vec::new();
     let bytes = src.as_bytes();
     let mut i = 0usize;
@@ -1769,7 +1774,7 @@ fn scan_call_sites(line: &str) -> Vec<String> {
     out
 }
 
-pub(crate) fn parse_stub_line(line: &str) -> Option<(&'static str, String)> {
+pub fn parse_stub_line(line: &str) -> Option<(&'static str, String)> {
     let trimmed = line.trim();
     if trimmed.starts_with("//") {
         return None;
@@ -1790,7 +1795,7 @@ pub(crate) fn parse_stub_line(line: &str) -> Option<(&'static str, String)> {
     None
 }
 
-pub(crate) fn parse_use_target(line: &str, from_crate: &str, known_crates: &BTreeSet<String>) -> Option<String> {
+pub fn parse_use_target(line: &str, from_crate: &str, known_crates: &BTreeSet<String>) -> Option<String> {
     let trimmed = line.trim();
     if trimmed.starts_with("//") {
         return None;
@@ -2315,7 +2320,7 @@ fn build() {
         let me = scan
             .files
             .iter()
-            .find(|f| f.rel_path.ends_with("corecruxd/src/workspace_scan.rs"));
+            .find(|f| f.rel_path.ends_with("corecrux-workspace-scan/src/workspace_scan.rs"));
         assert!(me.is_some(), "scan should include workspace_scan.rs");
         assert!(me.unwrap().doc_summary.is_some(), "workspace_scan.rs has a //! header");
     }
@@ -2339,7 +2344,10 @@ fn build() {
         let self_stubs: Vec<&StubHit> = scan
             .stubs
             .iter()
-            .filter(|s| s.file_rel_path.ends_with("corecruxd/src/workspace_scan.rs"))
+            .filter(|s| {
+                s.file_rel_path
+                    .ends_with("corecrux-workspace-scan/src/workspace_scan.rs")
+            })
             .collect();
         assert!(
             self_stubs.is_empty(),

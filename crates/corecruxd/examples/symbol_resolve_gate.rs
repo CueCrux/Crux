@@ -37,20 +37,16 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+// symbol_resolve.rs still lives in corecruxd/src, so it is still inlined here
+// (bin crate, no lib target to `use`). The workspace-scan modules it reaches for
+// via `crate::workspace_scan` now come from their own crate — a root-level `use`
+// is what makes that `crate::` path resolve inside this example binary.
+// The local no-op `fact_helpers::dedup_latest` stub is gone: it existed only to
+// satisfy the inlined workspace_scan, which now calls corecrux-memory directly.
 #[path = "../src/symbol_resolve.rs"]
 mod symbol_resolve;
-#[path = "../src/workspace_scan.rs"]
-mod workspace_scan;
-#[path = "../src/workspace_scan_ast.rs"]
-mod workspace_scan_ast;
-#[path = "../src/workspace_scan_manifests.rs"]
-mod workspace_scan_manifests;
 
-mod fact_helpers {
-    pub fn dedup_latest(facts: Vec<corecrux_memory::fact_store::Fact>) -> Vec<corecrux_memory::fact_store::Fact> {
-        facts
-    }
-}
+use corecrux_workspace_scan::{workspace_scan, workspace_scan_ast};
 
 use symbol_resolve::{Resolution, SymbolResolver};
 

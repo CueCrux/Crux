@@ -13,6 +13,7 @@ members = [
   "crates/corecrux-retrieval",
   "crates/corecrux-memory",
   "crates/corecrux-providers",
+  "crates/corecrux-workspace-scan",
   "crates/crux-sync",
   "crates/crux-contrib",
   "crates/crux-integrations",

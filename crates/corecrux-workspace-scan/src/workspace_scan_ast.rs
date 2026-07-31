@@ -20,7 +20,7 @@ use crate::workspace_scan::{
     ScanError, ScanStats, StubHit, SymbolInfo, UnresolvedRoute, WorkspaceScan,
 };
 
-pub(crate) fn run_scan_ast_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
+pub fn run_scan_ast_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
     let started_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
@@ -33,20 +33,20 @@ pub(crate) fn run_scan_ast_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct IncrementalUpdateStats {
+pub struct IncrementalUpdateStats {
     pub files_reparsed: usize,
     pub cache_hits: usize,
     pub files_dropped: usize,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct IncrementalScanResult {
+pub struct IncrementalScanResult {
     pub scan: WorkspaceScan,
     pub stats: IncrementalUpdateStats,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct AstScanCache {
+pub struct AstScanCache {
     pub root_path: PathBuf,
     crate_dirs: BTreeMap<String, PathBuf>,
     crate_internal_deps: BTreeMap<String, Vec<String>>,
@@ -55,7 +55,7 @@ pub(crate) struct AstScanCache {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CachedFile {
+pub struct CachedFile {
     pub rel_path: String,
     pub crate_name: String,
     pub module_path: String,
@@ -96,7 +96,7 @@ struct FileSignature {
 }
 
 impl AstScanCache {
-    pub(crate) fn from_root(root: &Path) -> Result<Self, ScanError> {
+    pub fn from_root(root: &Path) -> Result<Self, ScanError> {
         let workspace = discover_workspace(root)?;
         let known_crate_names: BTreeSet<String> = workspace.crate_dirs.keys().cloned().collect();
         let mut files = BTreeMap::new();
@@ -119,14 +119,14 @@ impl AstScanCache {
     }
 }
 
-pub(crate) fn assemble_scan(root: &Path, cache: &AstScanCache) -> WorkspaceScan {
+pub fn assemble_scan(root: &Path, cache: &AstScanCache) -> WorkspaceScan {
     let started_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
     assemble_scan_at(root, cache, started_ms)
 }
 
-pub(crate) fn update_cache_incremental(
+pub fn update_cache_incremental(
     root: &Path,
     cache: &mut AstScanCache,
     changed_paths: &[PathBuf],
@@ -769,8 +769,8 @@ fn parse_file_ast(
     let (doc_full, doc_summary) = parse_file_doc_header(&src);
     let is_test_file = crate::workspace_scan::looks_like_test_file(&rel_str, &src);
     let mut stubs = Vec::new();
-    let is_scanner_source = rel_str.ends_with("corecruxd/src/workspace_scan.rs")
-        || rel_str.ends_with("corecruxd/src/workspace_scan_ast.rs");
+    let is_scanner_source = rel_str.ends_with("corecrux-workspace-scan/src/workspace_scan.rs")
+        || rel_str.ends_with("corecrux-workspace-scan/src/workspace_scan_ast.rs");
     if !is_scanner_source {
         for (line_no, line) in src.lines().enumerate() {
             if let Some((kind, snippet)) = parse_stub_line(line) {
@@ -1131,7 +1131,7 @@ fn is_rs_path(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("rs")
 }
 
-pub(crate) fn should_ignore_path(path: &Path) -> bool {
+pub fn should_ignore_path(path: &Path) -> bool {
     path.components().any(|component| {
         let name = component.as_os_str().to_string_lossy();
         name.starts_with('.') || matches!(name.as_ref(), "target" | "node_modules" | ".git" | ".worktrees")

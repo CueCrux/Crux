@@ -936,6 +936,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "corecrux-workspace-scan"
+version = "0.5.54"
+dependencies = [
+ "blake3",
+ "corecrux-memory",
+ "proc-macro2",
+ "regex",
+ "roxmltree",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "serial_test",
+ "syn 3.0.3",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "toml",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-php",
+ "tree-sitter-python",
+ "tree-sitter-ruby",
+ "tree-sitter-swift",
+ "tree-sitter-typescript",
+]
+
+[[package]]
 name = "corecruxctl"
 version = "0.5.54"
 dependencies = [
@@ -1009,6 +1041,7 @@ dependencies = [
  "corecrux-segment",
  "corecrux-storage",
  "corecrux-types",
+ "corecrux-workspace-scan",
  "crc32fast",
  "crux-cost",
  "crux-enterprise-shim",
