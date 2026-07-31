@@ -1086,8 +1086,14 @@ impl RcxCapabilityToken {
         hex::encode(self.token_hash())
     }
 
+    /// Whether presentation-time proof of possession is required.
+    ///
+    /// Keyed on `rcx-ct/1.1` and on the delegation fields themselves — NOT on
+    /// `is_delegation_spec_version`. A `1.2` entitlement token carries no
+    /// delegation policy and must verify through the generic issuer path; a
+    /// `1.2` token that *does* carry one is caught by the field checks below.
     pub fn requires_contextual_verification(&self) -> bool {
-        is_delegation_spec_version(&self.spec_version)
+        self.spec_version == RCX_CT_DELEGATION_SPEC_VERSION
             || self.delegation_policy.is_some()
             || self.delegation_envelope.is_some()
     }
@@ -1228,6 +1234,10 @@ impl RcxCapabilityToken {
         let mut issues = Vec::new();
         match (&*self.spec_version, &self.delegation_policy) {
             (RCX_CT_SPEC_VERSION, None) if self.delegation_envelope.is_none() => {}
+            // `rcx-ct/1.2` is a TIER-VOCABULARY version, orthogonal to delegation:
+            // a plain entitlement token (the pairing flow's output) carries no
+            // delegation policy and must still be valid at 1.2.
+            (RCX_CT_GOVERNANCE_SPEC_VERSION, None) if self.delegation_envelope.is_none() => {}
             (RCX_CT_DELEGATION_SPEC_VERSION | RCX_CT_GOVERNANCE_SPEC_VERSION, Some(policy)) => {
                 let delegates_valid = !policy.allowed_delegate_fprs.is_empty()
                     && policy.allowed_delegate_fprs.len() <= RCX_MAX_DELEGATION_PRINCIPALS
@@ -1801,6 +1811,71 @@ mod tests {
     const SYNC_DELEGATION_VECTOR_CBOR_HEX: &str = "b06474696572646672656566697373756572a26a6973737565725f6f7267656c6f63616c6c70617373706f72745f6b69647822705f30313233343536373839616263646566303132333435363738396162636465666763726564697473a466726566696c6ca266616d6f756e74f666706572696f64646e6f6e656762616c616e6365f6696f766572647261667466666f726269646f6f76657264726166745f6c696d6974f6677375626a656374a26c70617373706f72745f6670727822705f3031323334353637383961626364656630313233343536373839616263646566726461656d6f6e5f696e7374616e63655f696478216461656d6f6e5f3031485630303030303030303030303030303030303030303030686261636b656e647381a46a6261636b656e645f696469637275782d73796e636c656e64706f696e745f75726cf66e74727573745f726f6f745f6b69647822705f3031323334353637383961626364656630313233343536373839616263646566767065726d69747465645f6361706162696c697469657382a46a6361706162696c69747972636f7265637275782e73796e632e70756c6c6b6372656469745f636f7374f673646174615f6567726573735f636c617373657381646e6f6e657572657175697265645f6174746573746174696f6e73816e70617373706f72745f626f756e64a46a6361706162696c69747972636f7265637275782e73796e632e707573686b6372656469745f636f7374f673646174615f6567726573735f636c617373657381646e6f6e657572657175697265645f6174746573746174696f6e73816e70617373706f72745f626f756e646866616c6c6261636ba4696f6e5f657870697279667265667573657171756575655f74746c5f7365636f6e6473f6746f6e5f637265646974735f65786861757374656466726566757365766f6e5f6261636b656e645f756e726561636861626c656672656675736568746f6b656e5f6964782672637863745f73796e6364656c5f303132333435363738396162636465665f64656661756c74696973737565645f61741a69eab5a0697369676e6174757265a363616c676765643235353139636b69647822705f3031323334353637383961626364656630313233343536373839616263646566637369675840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111116a657870697265735f61741a6a1ad4606a7265766f636174696f6ea26763726c5f75726cf66c707573685f6368616e6e656cf66c737065635f76657273696f6e6a7263782d63742f312e316c74656e616e745f73636f7065a26974656e616e745f69646764656661756c746c646973706c61795f6e616d65654c6f63616c6d726563656970745f636c6173736876657269666965646f726566726573685f68696e745f61741a6a1ac6507164656c65676174696f6e5f706f6c696379a46861756469656e636569637275782d73796e63696d61785f6465707468016c70726573656e746174696f6e7370726f6f665f6f665f706f7373657373696f6e75616c6c6f7765645f64656c65676174655f66707273827822705f30303030303030303030303030303030303030303030303030303030303030317822705f3030303030303030303030303030303030303030303030303030303030303032";
     const SYNC_DELEGATION_VECTOR_TOKEN_HASH: &str = "1ca9e0d2f4e74af7314a80d6f376b73a52e30df04a10d8cb435d11766a73b0c7";
     const SYNC_DELEGATION_VECTOR_ISSUER_SIG: &str = "6441eb1f1678566b7d0e81b52b331c77e3a500ae210cdbdeda67dbbe71ed1dc78ee1be37434735b19ac61362afb64c3f962fb3a3b5659cd96b4012f344ee3801";
+
+    // --- rcx-ct/1.2 governance-tier cross-language byte-parity vector ---------
+    // ExecPlan crux-pro-capabilities-rcx-entitled-2026-07-27 M1 exit criterion:
+    // "Rust and TS agree byte-for-byte on a 1.2 token with tier: governance".
+    // The TS mirror is `governanceTierVectorFixture` in
+    // packages/shared/packages/contracts/src/rcx-capability-token.ts; the shared
+    // hex constants below lock the two encoders together, exactly as the 1.1
+    // sync-delegation vector does.
+    const GOVERNANCE_VECTOR_CBOR_HEX: &str = "b064746965726a676f7665726e616e636566697373756572a26a6973737565725f6f7267656c6f63616c6c70617373706f72745f6b69647822705f30313233343536373839616263646566303132333435363738396162636465666763726564697473a466726566696c6ca266616d6f756e74f666706572696f64646e6f6e656762616c616e6365f6696f766572647261667466666f726269646f6f76657264726166745f6c696d6974f6677375626a656374a26c70617373706f72745f6670727822705f3031323334353637383961626364656630313233343536373839616263646566726461656d6f6e5f696e7374616e63655f696478216461656d6f6e5f3031485630303030303030303030303030303030303030303030686261636b656e647381a46a6261636b656e645f696472637573746f6d65723a636c75737465722d616c656e64706f696e745f75726c782668747470733a2f2f636c75737465722d612e637573746f6d65722e6578616d706c652f7263786e74727573745f726f6f745f6b69646f637573746f6d65722d726f6f742d61767065726d69747465645f6361706162696c697469657381a46a6361706162696c69747974636f7265637275782e71756572792e6c6f63616c6b6372656469745f636f7374f673646174615f6567726573735f636c617373657381646e6f6e657572657175697265645f6174746573746174696f6e73806866616c6c6261636ba4696f6e5f657870697279667265667573657171756575655f74746c5f7365636f6e6473f6746f6e5f637265646974735f65786861757374656466726566757365766f6e5f6261636b656e645f756e726561636861626c656672656675736568746f6b656e5f6964782972637863745f676f7665726e616e63655f303132333435363738396162636465665f64656661756c74696973737565645f61741a69eab5a0697369676e6174757265a363616c676765643235353139636b69647822705f3031323334353637383961626364656630313233343536373839616263646566637369675840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111116a657870697265735f61741a6a1ad4606a7265766f636174696f6ea26763726c5f75726cf66c707573685f6368616e6e656cf66c737065635f76657273696f6e6a7263782d63742f312e326c74656e616e745f73636f7065a26974656e616e745f69646764656661756c746c646973706c61795f6e616d65654c6f63616c6d726563656970745f636c6173736876657269666965646f726566726573685f68696e745f61741a6a1ac65070656e74657270726973655f73636f7065a766616972676170f56a6261636b656e645f696472637573746f6d65723a636c75737465722d616b636f6e74726163745f6964f66b637573746f6d65725f69646a637573746f6d65722d616c656e64706f696e745f75726c782668747470733a2f2f636c75737465722d612e637573746f6d65722e6578616d706c652f7263786e74727573745f726f6f745f6b69646f637573746f6d65722d726f6f742d61781963726f73735f7369676e65645f62795f7661756c7463727578f5";
+    const GOVERNANCE_VECTOR_TOKEN_HASH: &str = "5f9641d7020b4b191999ff32256ef21c624fb4e2e95b55238b7a94cc5f258c92";
+
+    fn governance_tier_vector_fixture() -> RcxCapabilityToken {
+        let mut token = free_local_verified_fixture();
+        token.spec_version = RCX_CT_GOVERNANCE_SPEC_VERSION.to_string();
+        token.token_id = "rcxct_governance_0123456789abcdef_default".to_string();
+        token.tier = RcxTier::Governance;
+        token.enterprise_scope = Some(EnterpriseScope {
+            customer_id: "customer-a".to_string(),
+            contract_id: None,
+            backend_id: "customer:cluster-a".to_string(),
+            endpoint_url: "https://cluster-a.customer.example/rcx".to_string(),
+            trust_root_kid: "customer-root-a".to_string(),
+            airgap: true,
+            cross_signed_by_vaultcrux: true,
+        });
+        // enterprise_scope names a backend that must exist in `backends`.
+        token.backends[0].backend_id = "customer:cluster-a".to_string();
+        token.backends[0].trust_root_kid = "customer-root-a".to_string();
+        token.backends[0].endpoint_url = Some("https://cluster-a.customer.example/rcx".to_string());
+        token
+    }
+
+    #[test]
+    fn governance_vector_has_stable_bytes_across_languages() {
+        let token = governance_tier_vector_fixture();
+        assert_eq!(token.tier, RcxTier::Governance);
+        assert_eq!(token.spec_version, "rcx-ct/1.2");
+        assert_eq!(hex::encode(token.to_canonical_cbor()), GOVERNANCE_VECTOR_CBOR_HEX);
+        assert_eq!(token.token_hash_hex(), GOVERNANCE_VECTOR_TOKEN_HASH);
+
+        // A plain entitlement token carries NO delegation policy. It must still
+        // be structurally valid at 1.2.
+        let issues: Vec<_> = token
+            .validate_basic(token.issued_at + 1)
+            .issues
+            .into_iter()
+            .map(|i| i.code)
+            .collect();
+        assert!(issues.is_empty(), "1.2 entitlement token must validate, got {issues:?}");
+
+        // And it must verify through the GENERIC issuer path — no proof-of-possession
+        // context. This is the shape the pairing flow (M3) mints, so if 1.2 demanded
+        // contextual verification the entire entitlement path would be unreachable.
+        assert!(
+            !token.requires_contextual_verification(),
+            "a 1.2 entitlement token carries no delegation and must not require PoP context"
+        );
+        let issuer = SigningKey::from_bytes(&[11u8; 32]);
+        let mut signed = governance_tier_vector_fixture();
+        signed.signature.sig = issuer.sign(&signed.token_hash()).to_bytes();
+        assert_eq!(
+            verify_token(&signed, &issuer.verifying_key().to_bytes(), signed.issued_at + 1),
+            VerifyOutcome::Verified
+        );
+    }
 
     fn sync_delegation_vector_fixture() -> RcxCapabilityToken {
         let mut token = free_local_verified_fixture();

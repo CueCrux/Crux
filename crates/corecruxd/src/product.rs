@@ -14,6 +14,10 @@ pub enum OperatingMode {
     ProLocalFirst,
     ProCloudOnly,
     ProHybrid,
+    /// Governance tier. Reachable from a verified `RcxTier::Governance`
+    /// capability token; `ProCloudOnly` and `ProHybrid` are not reachable from any
+    /// tier mapping and are retained for explicitly configured hosted deployments.
+    GovernanceHosted,
     MaxPrivate,
 }
 
@@ -30,6 +34,7 @@ impl OperatingMode {
             "pro_local_first" | "pro_local" | "local_first" => Some(Self::ProLocalFirst),
             "pro_cloud_only" | "cloud_only" => Some(Self::ProCloudOnly),
             "pro_hybrid" | "hybrid" | "pro" => Some(Self::ProHybrid),
+            "governance_hosted" | "governance" => Some(Self::GovernanceHosted),
             "max_private" | "max" | "private" | "onsite" | "on_site" => Some(Self::MaxPrivate),
             _ => None,
         }
@@ -41,6 +46,7 @@ impl OperatingMode {
             Self::ProLocalFirst => "pro_local_first",
             Self::ProCloudOnly => "pro_cloud_only",
             Self::ProHybrid => "pro_hybrid",
+            Self::GovernanceHosted => "governance_hosted",
             Self::MaxPrivate => "max_private",
         }
     }
@@ -49,6 +55,7 @@ impl OperatingMode {
         match self {
             Self::FreeLocal => "free",
             Self::ProLocalFirst | Self::ProCloudOnly | Self::ProHybrid => "pro",
+            Self::GovernanceHosted => "governance",
             Self::MaxPrivate => "max",
         }
     }
