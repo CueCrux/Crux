@@ -755,7 +755,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_view_rows_carry_actor_and_null_for_legacy() {
+    async fn memory_view_rows_carry_actor_and_preserve_tenant_isolation() {
         // agent-passport M3: attribution surfaced on the memory_view read.
         let _guard = FlagGuard::enabled().await;
         let map = crate::agent_passport::AgentPassportMap::builtin_default();
@@ -777,7 +777,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Legacy / flag-off write (same shared pool) → actor null.
+        // Legacy / flag-off write (same shared store, `default` tenant) → actor null.
         let legacy = base.with_agent(AgentIdentity {
             name: "legacy".to_string(),
             token_hash: [9u8; 32],
@@ -789,18 +789,21 @@ mod tests {
         .await
         .unwrap();
 
+        let res = handle_memory_view(&json!({"token_budget": 500, "top_k": 10}), &claude)
+            .await
+            .unwrap();
+        let arr = res["structuredContent"]["facts"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["value"], "NYC");
+        assert_eq!(arr[0]["actor"], json!("claude-work"));
+
         let res = handle_memory_view(&json!({"token_budget": 500, "top_k": 10}), &base)
             .await
             .unwrap();
         let arr = res["structuredContent"]["facts"].as_array().unwrap();
-        let actor_for = |value: &str| -> serde_json::Value {
-            arr.iter()
-                .find(|f| f["value"].as_str() == Some(value))
-                .unwrap_or_else(|| panic!("memory_view row for {value} missing"))["actor"]
-                .clone()
-        };
-        assert_eq!(actor_for("NYC"), json!("claude-work"));
-        assert_eq!(actor_for("engineer"), serde_json::Value::Null);
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["value"], "engineer");
+        assert_eq!(arr[0]["actor"], serde_json::Value::Null);
     }
 
     #[tokio::test]
