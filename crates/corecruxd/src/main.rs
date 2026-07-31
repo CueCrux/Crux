@@ -43,6 +43,7 @@ mod credit_meter;
 // Dataplane store stubs: proprietary edition provides the real implementation.
 #[allow(dead_code)]
 mod dataplane_store;
+mod entitlement;
 // gRPC service stubs: dataplane-enabled distributions implement full RPCs;
 // Crux Daemon keeps the server skeleton. Suppress dead_code for stub internals.
 #[allow(dead_code)]
