@@ -527,8 +527,28 @@ jobs:
           $msi1 = Get-ChildItem 'shells\desktop\app\target\release\bundle\msi\*.msi' | Select-Object -First 1
           Copy-Item $msi1.FullName "$ev\v1.msi" -Force
 
-          (Get-Content $conf -Raw) -replace ('"version": "' + [regex]::Escape($json.version) + '"'), ('"version": "' + $next + '"') |
-            Set-Content $conf -Encoding utf8
+          # NOT `Set-Content -Encoding utf8`. Windows PowerShell 5.1 writes
+          # UTF-8 WITH a BOM, and Tauri's Rust config parser then fails with
+          # "expected value at line 1 column 1" -- which reads like malformed
+          # JSON and is actually three invisible bytes. (PowerShell 7+ made
+          # -Encoding utf8 BOM-less; this job runs 5.1, same as the em-dash
+          # trap documented above.) UTF8Encoding($false) is BOM-less and says
+          # so at the call site.
+          $bumped = (Get-Content $conf -Raw) -replace
+            ('"version": "' + [regex]::Escape($json.version) + '"'), ('"version": "' + $next + '"')
+          [System.IO.File]::WriteAllText($conf, $bumped, (New-Object System.Text.UTF8Encoding $false))
+
+          # Prove the rewrite is still parseable before spending ~10 minutes
+          # discovering it is not. A failure here is the encoding, not the JSON.
+          try {
+            $check = Get-Content $conf -Raw | ConvertFrom-Json
+            Write-Host "config re-parsed OK, version now: $($check.version)"
+          } catch {
+            git checkout -- $conf
+            Write-Host "::error::the version rewrite produced unparseable JSON (encoding?): $_"
+            exit 1
+          }
+
           Push-Location 'shells\desktop\app'
           cargo tauri build
           $code = $LASTEXITCODE
