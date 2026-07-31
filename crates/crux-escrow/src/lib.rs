@@ -27,6 +27,8 @@
 // the customer's only route back to their data, and a panic message can carry operands.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod release;
+
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
 use data_encoding::{Encoding, Specification};
