@@ -1337,13 +1337,12 @@ mod tests {
 
     // ── agent-passport M3: attribution surfaced on read ────────────────
 
-    /// Two distinct actors (claude-work, codex-work) write facts via the
-    /// flag-ON path; a third writes with the flag OFF (legacy actor=None).
-    /// `query_facts` rows must carry the correct `actor` per fact, and the
-    /// legacy fact must show `actor: null`. Shared visibility is intact —
-    /// all three non-private facts are visible from a single shared read.
+    /// Two distinct actors (claude-work, codex-work) write facts into their
+    /// shared `work` tenant via the flag-ON path; a third writes with the flag
+    /// OFF into `default` (legacy actor=None). `query_facts` rows must carry
+    /// the correct actor without crossing the tenant boundary.
     #[tokio::test]
-    async fn query_facts_rows_carry_actor_per_writer_and_null_for_legacy() {
+    async fn query_facts_rows_carry_actor_and_preserve_tenant_isolation() {
         let map = crate::agent_passport::AgentPassportMap::builtin_default();
 
         // Shared base context (single fact store, Arc-shared by every
@@ -1396,8 +1395,9 @@ mod tests {
         .await
         .unwrap();
 
-        // Single shared read sees all three (shared visibility intact).
-        let res = handle_query_facts(&json!({"query": "needle", "token_budget": 500}), &base)
+        // A work-tenant read sees both attributed collaborators, but not the
+        // legacy fact in `default`.
+        let res = handle_query_facts(&json!({"query": "needle", "token_budget": 500}), &claude)
             .await
             .unwrap();
         let rows = res["structuredContent"]["rows"].as_array().unwrap();
@@ -1411,11 +1411,17 @@ mod tests {
 
         assert_eq!(actor_for("needle-claude"), json!("claude-work"));
         assert_eq!(actor_for("needle-codex"), json!("codex-work"));
-        // Legacy fact: actor serialized as JSON null.
-        assert_eq!(actor_for("needle-legacy"), Value::Null);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row["value"] != "needle-legacy"));
 
-        // Shared visibility re-confirmed: all three present from one read.
-        assert_eq!(rows.len(), 3);
+        // The legacy/default read sees only its own fact, with actor null.
+        let res = handle_query_facts(&json!({"query": "needle", "token_budget": 500}), &base)
+            .await
+            .unwrap();
+        let rows = res["structuredContent"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["value"], "needle-legacy");
+        assert_eq!(rows[0]["actor"], Value::Null);
     }
 
     #[tokio::test]
