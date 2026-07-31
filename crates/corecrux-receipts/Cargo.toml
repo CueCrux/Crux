@@ -23,7 +23,7 @@ sha2 = { workspace = true }
 tar = { workspace = true }
 thiserror = { workspace = true }
 zstd = { workspace = true }
-zip = { workspace = true, features = ["default"] }
+zip = { workspace = true }
 
 # C2PA X.509 trust-anchor signer (agent-ux-07 M6).
 # `p256` provides the local P-256 leaf key (ECDSA-with-SHA256).

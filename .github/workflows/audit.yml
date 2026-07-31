@@ -43,7 +43,7 @@ jobs:
       - name: Check advisory ignore metadata
         run: bash scripts/check-deny-advisory-ignores.sh
 
-      - name: Check cargo-deny policy
+      - name: Check advisories, yanked dependencies, and cargo-deny policy
         run: cargo deny check
 
   cargo-audit:

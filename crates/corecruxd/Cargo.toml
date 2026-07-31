@@ -77,7 +77,7 @@ uuid = { workspace = true, features = ["v4"] }
 url = { workspace = true }
 zeroize = "1.8"
 zstd = { workspace = true }
-zip = { workspace = true, features = ["default"] }
+zip = { workspace = true }
 
 corecrux-frame = { path = "../corecrux-frame" }
 corecrux-memory = { path = "../corecrux-memory" }
