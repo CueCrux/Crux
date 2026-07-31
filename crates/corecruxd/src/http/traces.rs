@@ -29,16 +29,41 @@ fn open_store(state: &AppState) -> Option<crate::trace_store::TraceStore> {
     .ok()
 }
 
-/// Resolve which tenant a span-reading surface should answer for (M3b).
+/// Authorise a span-reading surface and resolve which tenant it answers for (M3b).
 ///
 /// Returns `(tenant, bound)`. `bound = false` means no tenant was named and the
 /// daemon's capture tenant was used — the single-tenant-only path. Callers must
 /// surface that on the response; a surface that silently answers for the wrong
 /// tenant is exactly the defect M2 found.
-pub(super) fn runtime_tenant_for(_state: &AppState, _headers: &HeaderMap, requested: Option<&str>) -> (String, bool) {
+///
+/// **This performs the authorization itself; callers must not authorise
+/// separately.** When the request names a tenant the check is
+/// `require_http_scopes_for_tenant` against *that* tenant, which is the whole
+/// point of the milestone. Authorising with the tenant-blind
+/// `require_http_scopes` and then answering from a caller-supplied `tenant_id`
+/// lets any holder of a valid token read any tenant's spans — strictly worse
+/// than the pinned holding position #560 established, because the pin at least
+/// failed closed. Resolution and authorization live in one function so the two
+/// cannot drift apart again, which is exactly how they drifted the first time.
+// Same allow as `require_http_scopes_for_tenant` itself carries: the error is a
+// `ProblemResponse`, and boxing it here would differ from every other
+// authorization helper for no benefit.
+#[allow(clippy::result_large_err)]
+pub(super) fn runtime_tenant_for(
+    state: &AppState,
+    headers: &HeaderMap,
+    required: &[&str],
+    requested: Option<&str>,
+) -> Result<(String, bool), crate::problem::ProblemResponse> {
     match requested {
-        Some(t) if !t.trim().is_empty() => (t.to_string(), true),
-        _ => (crate::trace_store::TraceStore::capture_tenant(), false),
+        Some(t) if !t.trim().is_empty() => {
+            require_http_scopes_for_tenant(&state.auth, headers, required, t)?;
+            Ok((t.to_string(), true))
+        }
+        _ => {
+            require_http_scopes(&state.auth, headers, required)?;
+            Ok((crate::trace_store::TraceStore::capture_tenant(), false))
+        }
     }
 }
 

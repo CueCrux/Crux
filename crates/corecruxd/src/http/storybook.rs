@@ -60,22 +60,29 @@ pub(super) async fn post_generate(
     headers: HeaderMap,
     Query(tenant_q): Query<super::traces::OptionalTenantQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
-        return problem.into_response();
-    }
     let by_passport = extract_passport_id(&headers);
     let now_ms = now_unix_ms();
 
     // The same window /v1/code-intel/dead-code answers from, so the readout and
     // the code-intel route cannot disagree about the same symbols.
-    // M3b: the runtime tier is read for whichever tenant the request names. With
-    // no `tenant_id` this falls back to the daemon's capture tenant — correct on
-    // a single-tenant daemon and deliberately NOT hostable, because every
-    // customer on a shared daemon resolves to the same tenant. The fallback is
-    // reported on the response as `runtime_tenant_scope` rather than being left
-    // to be inferred.
-    let (runtime_tenant, runtime_bound) =
-        super::traces::runtime_tenant_for(&state, &headers, tenant_q.tenant_id.as_deref());
+    // M3b: the runtime tier is read for whichever tenant the request names, and
+    // `runtime_tenant_for` authorises against that tenant — it is the only
+    // authorization on this handler, deliberately, because a tenant-blind check
+    // followed by a caller-supplied `tenant_id` is a cross-tenant read. With no
+    // `tenant_id` it falls back to the daemon's capture tenant — correct on a
+    // single-tenant daemon and deliberately NOT hostable, because every customer
+    // on a shared daemon resolves to the same tenant. The fallback is reported
+    // on the response as `runtime_tenant_scope` rather than being left to be
+    // inferred.
+    let (runtime_tenant, runtime_bound) = match super::traces::runtime_tenant_for(
+        &state,
+        &headers,
+        &["admin:read", "facts:write"],
+        tenant_q.tenant_id.as_deref(),
+    ) {
+        Ok(resolved) => resolved,
+        Err(problem) => return problem.into_response(),
+    };
     let spans = super::traces::load_spans(&state, &runtime_tenant);
     let store = state.fact_store.read().await;
     let doc = match crate::storybook::generate(
