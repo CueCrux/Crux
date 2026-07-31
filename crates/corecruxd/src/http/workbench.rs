@@ -376,9 +376,7 @@ pub(super) async fn post_context_pack(
     let selected = {
         let store = state.fact_store.read().await;
         let mut facts = query_facts(&store, Some(&body.query), None, 200);
-        facts.retain(|fact| {
-            fact.entity.contains(&tenant_id) || fact.value.contains(&tenant_id) || fact.key.contains(&tenant_id)
-        });
+        facts.retain(|fact| fact_belongs_to_tenant(fact, &tenant_id));
         if !body.include_private {
             facts.retain(|fact| !fact.private);
         }
@@ -1026,12 +1024,53 @@ fn query_facts(store: &FactStore, query: Option<&str>, entity_prefix: Option<&st
     )
 }
 
+/// Exact tenant-ownership test for a fact on the workbench surface.
+///
+/// Ownership is expressed one of two ways, and both are matched **exactly**:
+///
+/// - `fact.tenant_hash` — the store's own isolation stamp, resolved from the
+///   caller's claims (see `http::facts::tenant_hash_for_read_context`).
+/// - the tenant as a whole `::`-delimited run of segments in `fact.entity` —
+///   the convention this module writes (`__workbench__::{tenant_id}::…`).
+///
+/// It is deliberately **never** tested against `value` or `key`. Those are
+/// caller-supplied text: a fact that merely *mentions* a tenant is not owned
+/// by it, and a substring test additionally served `tnA10`'s facts to `tnA1`.
+fn fact_belongs_to_tenant(fact: &Fact, tenant_id: &str) -> bool {
+    fact.tenant_hash == tenant_id || entity_belongs_to_tenant(&fact.entity, tenant_id)
+}
+
+/// True when `tenant_id` occurs in `entity` delimited by `::` on both sides
+/// (or by the ends of the string).
+///
+/// A plain `contains` is wrong twice over: `tnA1` matches inside `tnA10`, and
+/// it matches mid-segment. A plain `split("::")` is also wrong, because a
+/// tenant id may itself contain the separator (`business::acme`) — so the
+/// match is anchored at segment boundaries rather than split into segments.
+fn entity_belongs_to_tenant(entity: &str, tenant_id: &str) -> bool {
+    if tenant_id.is_empty() {
+        return false;
+    }
+    let mut from = 0usize;
+    while let Some(offset) = entity[from..].find(tenant_id) {
+        let start = from + offset;
+        let end = start + tenant_id.len();
+        let left_delimited = start == 0 || entity[..start].ends_with("::");
+        let right_delimited = end == entity.len() || entity[end..].starts_with("::");
+        if left_delimited && right_delimited {
+            return true;
+        }
+        // `tenant_id` is non-empty, so this always advances and always lands
+        // on a char boundary.
+        from = end;
+    }
+    false
+}
+
 fn tenant_facts_by_prefix(store: &FactStore, prefix: &str, tenant_id: &str, limit: usize) -> Vec<Value> {
     query_facts(store, None, Some(prefix), limit.saturating_mul(4).max(limit))
         .into_iter()
-        .filter(|fact| {
-            fact.entity.contains(tenant_id) || fact.value.contains(tenant_id) || fact.key.contains(tenant_id)
-        })
+        .filter(|fact| fact_belongs_to_tenant(fact, tenant_id))
         .take(limit)
         .map(fact_summary)
         .collect()
@@ -1040,7 +1079,7 @@ fn tenant_facts_by_prefix(store: &FactStore, prefix: &str, tenant_id: &str, limi
 fn tenant_facts(store: &FactStore, tenant_id: &str, limit: usize) -> Vec<Fact> {
     query_facts(store, Some(tenant_id), None, limit)
         .into_iter()
-        .filter(|fact| fact.entity.contains(tenant_id) || fact.value.contains(tenant_id))
+        .filter(|fact| fact_belongs_to_tenant(fact, tenant_id))
         .take(limit)
         .collect()
 }
@@ -1640,9 +1679,7 @@ pub(super) fn timeline_events(store: &FactStore, tenant_id: &str, limit: usize) 
 fn active_constraints(store: &FactStore, tenant_id: &str) -> Vec<Value> {
     query_facts(store, None, Some("__constraints__::"), 200)
         .into_iter()
-        .filter(|fact| {
-            fact.entity.contains(tenant_id) || fact.value.contains(tenant_id) || fact.key.contains(tenant_id)
-        })
+        .filter(|fact| fact_belongs_to_tenant(fact, tenant_id))
         .map(|fact| {
             let parsed = serde_json::from_str::<Value>(&fact.value).ok();
             if let Some(mut value) = parsed {
@@ -1883,9 +1920,68 @@ mod helper_tests {
         let wf = workbench_facts(&store, "t1", "brief", 10);
         assert_eq!(wf.len(), 1);
         assert_eq!(wf[0]["hello"], "world");
-        // tenant_facts filters by tenant occurrence.
+        // tenant_facts filters by exact tenant ownership.
         let tf = tenant_facts(&store, "t1", 10);
-        assert!(tf.iter().all(|f| f.entity.contains("t1") || f.value.contains("t1")));
+        assert!(tf.iter().all(|f| fact_belongs_to_tenant(f, "t1")));
+    }
+
+    /// D-3 (inverted pin): tenant scoping was a SUBSTRING test over
+    /// entity/value/key, so `tnA10`'s facts were served to a caller asking for
+    /// `tnA1`, and any fact whose *text* merely mentioned the tenant leaked
+    /// regardless of owner. Ownership is now an exact match on the owning
+    /// field — never on caller-supplied text.
+    #[tokio::test]
+    async fn tenant_scoping_is_exact_not_substring() {
+        let st = st_free();
+        {
+            let mut store = st.fact_store.write().await;
+            // Owned by a *different* tenant whose id merely has `tnA1` as a
+            // prefix.
+            seed(&mut store, "__workbench__::tnA10::note::r1", "note", "plan for tnA10");
+            // Owned by nobody in particular; the tenant is only mentioned in
+            // the value text.
+            seed(&mut store, "person:alice", "note", "escalate to tnA1 on failure");
+            // Genuinely owned by tnA1.
+            seed(&mut store, "__workbench__::tnA1::note::r1", "note", "the real one");
+        }
+        let store = st.fact_store.read().await;
+
+        let owned = tenant_facts(&store, "tnA1", 50);
+        assert_eq!(
+            owned.iter().map(|f| f.entity.as_str()).collect::<Vec<_>>(),
+            vec!["__workbench__::tnA1::note::r1"],
+            "neither the tnA10 fact nor a fact that merely mentions tnA1 is owned by tnA1"
+        );
+
+        // The wider tenant still sees its own fact — the fix narrows nothing
+        // that was legitimately in scope.
+        let wider = tenant_facts(&store, "tnA10", 50);
+        assert_eq!(
+            wider.iter().map(|f| f.entity.as_str()).collect::<Vec<_>>(),
+            vec!["__workbench__::tnA10::note::r1"]
+        );
+    }
+
+    #[test]
+    fn fact_ownership_matches_segments_and_the_store_stamp_only() {
+        assert!(entity_belongs_to_tenant("__workbench__::t1::brief::r1", "t1"));
+        assert!(entity_belongs_to_tenant("t1::note", "t1"));
+        assert!(!entity_belongs_to_tenant("__workbench__::t10::brief::r1", "t1"));
+        assert!(!entity_belongs_to_tenant("__workbench__::xt1::brief::r1", "t1"));
+        // A tenant id may itself contain the separator.
+        assert!(entity_belongs_to_tenant("business::acme::memory::x", "business::acme"));
+        assert!(entity_belongs_to_tenant(
+            "__constraints__::business::acme::no-prod-deploy",
+            "business::acme"
+        ));
+        assert!(!entity_belongs_to_tenant(
+            "__constraints__::business::acme2::x",
+            "business::acme"
+        ));
+        // A trailing occurrence is delimited by the end of the string.
+        assert!(entity_belongs_to_tenant("__work__::t1", "t1"));
+        // An empty tenant id must never match everything.
+        assert!(!entity_belongs_to_tenant("__workbench__::::x", ""));
     }
 
     #[tokio::test]
