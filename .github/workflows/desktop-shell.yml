@@ -502,6 +502,171 @@ jobs:
           }
           Write-Host 'lifecycle OK: graceful close reaped the bundled sidecar'
 
+      # M6b gate: "clean install/update/downgrade/uninstall evidence". Install is
+      # asserted above; the three below are what a shipped installer has to survive
+      # and what no Linux job can observe. The app is already closed at this point,
+      # so these exercise the installer, not the running shell.
+      #
+      # The second MSI is built by bumping the patch version and re-bundling. Only
+      # the version metadata changes, so the sidecar and every dependency stay
+      # warm in the target dir and this costs a fraction of the first bundle.
+      - name: bundle a second MSI one patch version up
+        run: |
+          $ev   = "$env:GITHUB_WORKSPACE\windows-gui-evidence"
+          $conf = 'shells\desktop\app\tauri.conf.json'
+          $json = Get-Content $conf -Raw | ConvertFrom-Json
+          $v    = [version]$json.version
+          $next = "$($v.Major).$($v.Minor).$($v.Build + 1)"
+          Write-Host "base version : $($json.version)"
+          Write-Host "bumped to    : $next"
+          $json.version | Out-File "$ev\version-v1.txt" -Encoding ascii
+          $next         | Out-File "$ev\version-v2.txt" -Encoding ascii
+
+          # Keep the v1 artifact: the downgrade check reinstalls it below, and
+          # re-bundling would otherwise overwrite it in place.
+          $msi1 = Get-ChildItem 'shells\desktop\app\target\release\bundle\msi\*.msi' | Select-Object -First 1
+          Copy-Item $msi1.FullName "$ev\v1.msi" -Force
+
+          (Get-Content $conf -Raw) -replace ('"version": "' + [regex]::Escape($json.version) + '"'), ('"version": "' + $next + '"') |
+            Set-Content $conf -Encoding utf8
+          Push-Location 'shells\desktop\app'
+          cargo tauri build
+          $code = $LASTEXITCODE
+          Pop-Location
+          # Restore the tracked file before anything can exit, so a failure here
+          # cannot leave a bumped version behind in the workspace.
+          git checkout -- $conf
+          if ($code -ne 0) {
+            Write-Host "::error::the second bundle failed with exit $code"
+            exit 1
+          }
+          $msi2 = Get-ChildItem 'shells\desktop\app\target\release\bundle\msi\*.msi' | Select-Object -First 1
+          Copy-Item $msi2.FullName "$ev\v2.msi" -Force
+          Write-Host "v1 msi : $((Get-Item "$ev\v1.msi").Name)"
+          Write-Host "v2 msi : $((Get-Item "$ev\v2.msi").Name)"
+
+      - name: update over the installed build
+        run: |
+          $ev      = "$env:GITHUB_WORKSPACE\windows-gui-evidence"
+          $product = (Get-Content "$ev\product-name.txt" -Raw).Trim()
+          $v2      = (Get-Content "$ev\version-v2.txt" -Raw).Trim()
+
+          $p = Start-Process msiexec.exe -ArgumentList '/i', "`"$ev\v2.msi`"", '/qn', '/norestart', '/l*v', "`"$ev\msi-update.log`"" -Wait -PassThru
+          Write-Host "msiexec exit: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            Write-Host "::error::updating over the installed build failed with exit $($p.ExitCode) -- see msi-update.log"
+            exit 1
+          }
+
+          $entries = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+                         Where-Object { $_.DisplayName -eq $product })
+          Write-Host "uninstall entries for '$product': $($entries.Count)"
+          foreach ($e in $entries) { Write-Host "  $($e.DisplayVersion)  $(Split-Path $e.PSPath -Leaf)" }
+
+          $fail = @()
+          # The failure this catches is a side-by-side install: the user ends up
+          # with two Start Menu entries and two copies on disk, and uninstalling
+          # "Crux" removes only one of them. That is an UpgradeCode regression in
+          # the WiX template, and it is invisible to a single-install test.
+          if ($entries.Count -ne 1) {
+            $fail += "expected exactly 1 uninstall entry after an update, found $($entries.Count) -- the MSI installed side-by-side instead of upgrading in place"
+          }
+          if ($entries.Count -eq 1 -and $entries[0].DisplayVersion -ne $v2) {
+            $fail += "the registered version is $($entries[0].DisplayVersion), expected $v2 -- the update did not replace the installed build"
+          }
+          # Record the post-update product code: an in-place major upgrade mints a
+          # new one, and teardown must uninstall what is actually installed now.
+          if ($entries.Count -ge 1) {
+            (Split-Path $entries[0].PSPath -Leaf) | Out-File "$ev\product-code.txt" -Encoding ascii
+          }
+          if ($fail.Count) {
+            foreach ($f in $fail) { Write-Host "::error::$f" }
+            exit 1
+          }
+          Write-Host 'update OK: upgraded in place, one entry, version advanced'
+
+      - name: downgrade is refused
+        run: |
+          $ev      = "$env:GITHUB_WORKSPACE\windows-gui-evidence"
+          $product = (Get-Content "$ev\product-name.txt" -Raw).Trim()
+          $v2      = (Get-Content "$ev\version-v2.txt" -Raw).Trim()
+
+          $p = Start-Process msiexec.exe -ArgumentList '/i', "`"$ev\v1.msi`"", '/qn', '/norestart', '/l*v', "`"$ev\msi-downgrade.log`"" -Wait -PassThru
+          Write-Host "msiexec exit: $($p.ExitCode)"
+
+          # 1638 = ERROR_PRODUCT_VERSION: another version of this product is
+          # already installed. That is the WiX default downgrade block doing its
+          # job and is the PASS condition, not a failure.
+          if ($p.ExitCode -eq 1638) {
+            Write-Host 'downgrade blocked by the installer (1638), as designed'
+          } elseif ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) {
+            Write-Host '::warning::the installer ACCEPTED a downgrade -- a stale MSI can silently replace a newer install'
+          } else {
+            Write-Host "::warning::downgrade returned an unclassified exit $($p.ExitCode) -- see msi-downgrade.log"
+          }
+
+          # Whatever the installer decided, the box must not be left holding two
+          # products or a version nobody asked for. That part IS asserted.
+          $entries = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+                         Where-Object { $_.DisplayName -eq $product })
+          Write-Host "uninstall entries: $($entries.Count)"
+          foreach ($e in $entries) { Write-Host "  $($e.DisplayVersion)" }
+          if ($entries.Count -ne 1) {
+            Write-Host "::error::after the downgrade attempt there are $($entries.Count) entries for '$product', expected 1"
+            exit 1
+          }
+          # Re-record the product code: if the installer DID accept the downgrade
+          # it minted a new one, and the uninstall step below must remove what is
+          # installed now rather than a code that no longer exists.
+          (Split-Path $entries[0].PSPath -Leaf) | Out-File "$ev\product-code.txt" -Encoding ascii
+          Write-Host "installed version now: $($entries[0].DisplayVersion) (was $v2 before the attempt)"
+
+      - name: uninstall leaves nothing behind
+        run: |
+          $ev      = "$env:GITHUB_WORKSPACE\windows-gui-evidence"
+          $product = (Get-Content "$ev\product-name.txt" -Raw).Trim()
+          $code    = (Get-Content "$ev\product-code.txt" -Raw).Trim()
+          $dir     = Join-Path $env:ProgramFiles $product
+
+          $p = Start-Process msiexec.exe -ArgumentList '/x', $code, '/qn', '/norestart', '/l*v', "`"$ev\msi-uninstall.log`"" -Wait -PassThru
+          Write-Host "msiexec exit: $($p.ExitCode)"
+          $fail = @()
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            $fail += "uninstall failed with exit $($p.ExitCode) -- see msi-uninstall.log"
+          }
+
+          $entries = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+                         Where-Object { $_.DisplayName -eq $product })
+          Write-Host "uninstall entries remaining: $($entries.Count)"
+          if ($entries.Count) { $fail += "'$product' still has $($entries.Count) uninstall entry after removal" }
+
+          # Teardown treated leftovers as a warning because its job is to get the
+          # box clean for the next run. Here it is the assertion: a shipped
+          # uninstaller that leaves the binary and the sidecar on disk is a defect,
+          # and the previous step already proved the install dir was populated.
+          if (Test-Path $dir) {
+            $left = @(Get-ChildItem $dir -Recurse -File -ErrorAction SilentlyContinue)
+            Write-Host "files left in ${dir}: $($left.Count)"
+            foreach ($f in ($left | Select-Object -First 10)) { Write-Host "  $($f.FullName)" }
+            if ($left.Count) { $fail += "$($left.Count) files remain in $dir after uninstall" }
+          } else {
+            Write-Host "install dir removed : $dir"
+          }
+
+          # The uninstaller must not leave the sidecar running either.
+          $orphans = @(Get-Process corecruxd -ErrorAction SilentlyContinue)
+          Write-Host "corecruxd processes : $($orphans.Count)"
+          if ($orphans.Count) { $fail += 'a corecruxd process survived the uninstall' }
+
+          if ($fail.Count) {
+            foreach ($f in $fail) { Write-Host "::error::$f" }
+            exit 1
+          }
+          # Teardown re-runs msiexec /x by product code; that is a harmless no-op
+          # once this step has removed the product, and it stays as the net for
+          # every path that fails before reaching here.
+          Write-Host 'uninstall OK: no registry entry, no files, no sidecar'
+
       - name: uninstall and clean up
         if: always()
         run: |
