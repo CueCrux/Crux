@@ -6,8 +6,8 @@
 //! Third-party **provider** integrations for the Crux daemon: credential storage,
 //! credential verification, and provider→fact sync.
 //!
-//! Scope boundary — this crate is *not* [`crux_integrations`]. The two are easy to
-//! confuse by name:
+//! Scope boundary — this crate is *not* `crux-integrations` (not linked: it is
+//! deliberately not a dependency). The two are easy to confuse by name:
 //!
 //! - `crux-integrations` owns integration **packs**: manifests, trust tiers, C2PA /
 //!   Ed25519 signing, the Studio index.

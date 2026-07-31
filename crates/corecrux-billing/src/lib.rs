@@ -9,7 +9,8 @@
 //! ([`credit_meter::CreditMeterStore`]) — an append-only journal of wallet seeds,
 //! reservations and spends.
 //!
-//! Scope boundary — this crate is *not* [`crux_cost`]. `crux-cost` analyses
+//! Scope boundary — this crate is *not* `crux-cost` (not linked: it is
+//! deliberately not a dependency). `crux-cost` analyses
 //! transcripts and produces cost *reports* (what a session appears to have cost);
 //! `corecrux-billing` owns the *ledger* (what a tenant has actually been granted
 //! and debited).
