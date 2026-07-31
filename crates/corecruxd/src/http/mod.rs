@@ -530,23 +530,33 @@ pub(crate) fn router_with_route_auth(
         )
         .route(
             "/v1/auth/device/start",
-            axum::routing::post(self::auth_device::post_device_start),
+            axum::routing::post(self::auth_device::post_device_start).layer(
+                axum::extract::DefaultBodyLimit::max(self::auth_device::DEVICE_AUTH_MAX_REQUEST_BYTES),
+            ),
         )
         .route(
             "/v1/auth/device/token",
-            axum::routing::post(self::auth_device::post_device_token),
+            axum::routing::post(self::auth_device::post_device_token).layer(
+                axum::extract::DefaultBodyLimit::max(self::auth_device::DEVICE_AUTH_MAX_REQUEST_BYTES),
+            ),
         )
         .route(
             "/v1/auth/device/approve",
-            axum::routing::post(self::auth_device::post_device_approve),
+            axum::routing::post(self::auth_device::post_device_approve).layer(
+                axum::extract::DefaultBodyLimit::max(self::auth_device::DEVICE_AUTH_MAX_REQUEST_BYTES),
+            ),
         )
         .route(
             "/v1/auth/device/refresh",
-            axum::routing::post(self::auth_device::post_device_refresh),
+            axum::routing::post(self::auth_device::post_device_refresh).layer(
+                axum::extract::DefaultBodyLimit::max(self::auth_device::DEVICE_AUTH_MAX_REQUEST_BYTES),
+            ),
         )
         .route(
             "/v1/auth/device/revoke",
-            axum::routing::post(self::auth_device::post_device_revoke),
+            axum::routing::post(self::auth_device::post_device_revoke).layer(
+                axum::extract::DefaultBodyLimit::max(self::auth_device::DEVICE_AUTH_MAX_REQUEST_BYTES),
+            ),
         )
         .route(
             "/v1/replay/exports/receipts/{receiptId}",

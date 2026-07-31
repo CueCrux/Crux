@@ -167,8 +167,9 @@ The four rails, in auto-selection preference order:
 | 4 — static token | `--token` / CI / air-gapped | operator-provided named token |
 
 An explicit `--token` or `--device` overrides auto-selection. Short-lived access
-tokens (≤5 min JWTs) auto-refresh; the device rail's refresh credential is named
-and revocable (`logout` revokes it). Off-host rails require encrypted transport
+tokens (≤5 min JWTs) auto-refresh; the device rail's refresh credential is named,
+revocable (`logout` revokes it), and expires after 90 days, at which point the
+client must run `corecruxctl login --device` again. Off-host rails require encrypted transport
 (WireGuard for tailnet, TLS for remote) — a plaintext non-loopback `auth=off`
 bind is refused.
 

@@ -167,6 +167,9 @@ pub struct DaemonCredential {
     /// Long-lived, named + revocable refresh credential (device rail; M3).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub refresh_token: Option<String>,
+    /// Absolute Unix-seconds expiry of the device refresh credential.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub refresh_expiry: Option<u64>,
     /// Unix-seconds expiry of `access_token`, if it is short-lived.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub expiry: Option<u64>,
@@ -654,6 +657,7 @@ fn verify_fact_roundtrip(agent: &ureq::Agent, http_base: &str, bearer: Option<&s
 struct IssuedToken {
     access_token: String,
     refresh_token: Option<String>,
+    refresh_expires_in: Option<u64>,
     expires_in: u64,
     scopes: Vec<String>,
     tenant_id: Option<String>,
@@ -679,6 +683,7 @@ fn parse_issued_token(text: &str) -> Result<IssuedToken, DynErr> {
     Ok(IssuedToken {
         access_token,
         refresh_token: v.get("refresh_token").and_then(|x| x.as_str()).map(str::to_string),
+        refresh_expires_in: v.get("refresh_expires_in").and_then(serde_json::Value::as_u64),
         expires_in: v.get("expires_in").and_then(|x| x.as_u64()).unwrap_or(300),
         scopes: v
             .get("scopes")
@@ -776,6 +781,7 @@ fn run_device_flow(agent: &ureq::Agent, http_base: &str) -> Result<IssuedToken, 
         match v.get("error").and_then(|e| e.as_str()).unwrap_or("") {
             "authorization_pending" => {}
             "slow_down" => interval = interval.saturating_add(5),
+            "temporarily_unavailable" => interval = interval.saturating_add(5).min(60),
             "access_denied" => return Err("device authorization was denied by the approver".into()),
             "expired_token" => return Err("device code expired before approval".into()),
             "" => return Err(format!("device/token error (HTTP {status}): {text}").into()),
@@ -799,6 +805,12 @@ fn refresh_credential(agent: &ureq::Agent, cred: &DaemonCredential) -> Result<Op
             let Some(refresh) = cred.refresh_token.as_deref() else {
                 return Ok(None);
             };
+            if cred.refresh_expiry.is_some_and(|expiry| now_unix() >= expiry) {
+                return Err(
+                    "device refresh credential expired; run `corecruxctl login --device` to authorize this client again"
+                        .into(),
+                );
+            }
             let url = format!("{}/v1/auth/device/refresh", cred.http_url);
             let (status, text) = post_json_capture(agent, &url, serde_json::json!({ "refresh_token": refresh }))?;
             if status != 200 {
@@ -813,6 +825,9 @@ fn refresh_credential(agent: &ureq::Agent, cred: &DaemonCredential) -> Result<Op
     updated.access_token = Some(issued.access_token);
     if issued.refresh_token.is_some() {
         updated.refresh_token = issued.refresh_token;
+    }
+    if let Some(refresh_expires_in) = issued.refresh_expires_in {
+        updated.refresh_expiry = Some(now_unix().saturating_add(refresh_expires_in));
     }
     updated.expiry = Some(now_unix() + issued.expires_in);
     if !issued.scopes.is_empty() {
@@ -990,27 +1005,32 @@ fn build_credential(
     mcp_url: &str,
     token: Option<String>,
 ) -> Result<(DaemonCredential, Option<String>), DynErr> {
-    let base =
-        |access_token: Option<String>, refresh_token: Option<String>, expiry: Option<u64>, scopes: Vec<String>| {
-            DaemonCredential {
-                rail: rail.as_str().to_string(),
-                access_token,
-                refresh_token,
-                expiry,
-                scopes,
-                mcp_url: mcp_url.to_string(),
-                http_url: http_base.to_string(),
-            }
-        };
+    let base = |access_token: Option<String>,
+                refresh_token: Option<String>,
+                refresh_expiry: Option<u64>,
+                expiry: Option<u64>,
+                scopes: Vec<String>| {
+        DaemonCredential {
+            rail: rail.as_str().to_string(),
+            access_token,
+            refresh_token,
+            refresh_expiry,
+            expiry,
+            scopes,
+            mcp_url: mcp_url.to_string(),
+            http_url: http_base.to_string(),
+        }
+    };
     match rail {
-        Rail::Loopback => Ok((base(None, None, None, vec![]), None)),
-        Rail::StaticToken => Ok((base(token.clone(), None, None, vec![]), token)),
+        Rail::Loopback => Ok((base(None, None, None, None, vec![]), None)),
+        Rail::StaticToken => Ok((base(token.clone(), None, None, None, vec![]), token)),
         Rail::Tailscale => {
             let issued = mint_tailscale(agent, http_base)?;
             print_issued("minted scoped token", &issued);
             let bearer = Some(issued.access_token.clone());
             let cred = base(
                 Some(issued.access_token),
+                None,
                 None,
                 Some(now_unix() + issued.expires_in),
                 issued.scopes,
@@ -1024,6 +1044,7 @@ fn build_credential(
             let cred = base(
                 Some(issued.access_token),
                 issued.refresh_token,
+                issued.refresh_expires_in.map(|ttl| now_unix().saturating_add(ttl)),
                 Some(now_unix() + issued.expires_in),
                 issued.scopes,
             );
@@ -1467,6 +1488,7 @@ mod tests {
                 rail: "loopback".to_string(),
                 access_token: None,
                 refresh_token: None,
+                refresh_expiry: None,
                 expiry: None,
                 scopes: vec![],
                 mcp_url: "http://127.0.0.1:14801/mcp".to_string(),
@@ -1478,6 +1500,40 @@ mod tests {
         assert_eq!(loaded.version, STORE_SCHEMA_VERSION);
         assert_eq!(loaded.daemons.len(), 1);
         assert_eq!(loaded.daemons["http://127.0.0.1:14800"].rail, "loopback");
+    }
+
+    #[test]
+    fn device_issuance_parses_refresh_expiry() {
+        let issued = parse_issued_token(
+            r#"{
+                "access_token":"access",
+                "refresh_token":"credential.secret",
+                "refresh_expires_in":7776000,
+                "expires_in":300,
+                "scopes":["query:read"],
+                "tenant_id":"tenant-a"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(issued.refresh_token.as_deref(), Some("credential.secret"));
+        assert_eq!(issued.refresh_expires_in, Some(7_776_000));
+    }
+
+    #[test]
+    fn legacy_credential_without_refresh_expiry_still_loads() {
+        let credential: DaemonCredential = serde_json::from_str(
+            r#"{
+                "rail":"device",
+                "access_token":"access",
+                "refresh_token":"credential.secret",
+                "expiry":123,
+                "scopes":[],
+                "mcp_url":"http://127.0.0.1:14801/mcp",
+                "http_url":"http://127.0.0.1:14800"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(credential.refresh_expiry, None);
     }
 
     #[test]
@@ -1495,6 +1551,7 @@ mod tests {
             rail: "loopback".to_string(),
             access_token: None,
             refresh_token: None,
+            refresh_expiry: None,
             expiry: None,
             scopes: vec![],
             mcp_url: "m".to_string(),

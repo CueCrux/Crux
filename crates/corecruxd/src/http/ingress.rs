@@ -58,6 +58,13 @@ const LARGE_BODY_ROUTES: &[&str] = &[
     "/v1/memory/import",
     "/v1/result-envelope/import",
 ];
+const DEVICE_AUTH_ROUTES: &[&str] = &[
+    "/v1/auth/device/start",
+    "/v1/auth/device/token",
+    "/v1/auth/device/approve",
+    "/v1/auth/device/refresh",
+    "/v1/auth/device/revoke",
+];
 
 /// Applies the ingress limits to a fully-built router.
 ///
@@ -616,7 +623,7 @@ fn payload_too_large_response(limit: usize) -> Response {
         "Payload Too Large",
     );
     pd.detail = Some(format!(
-        "request body exceeds the configured limit of {limit} bytes (CORECRUXD_MAX_REQUEST_BODY_BYTES)"
+        "request body exceeds the effective configured limit of {limit} bytes"
     ));
     ProblemResponse(pd).into_response()
 }
@@ -624,6 +631,8 @@ fn payload_too_large_response(limit: usize) -> Response {
 fn request_body_limit_for_path(path: &str, default_limit: usize) -> usize {
     if LARGE_BODY_ROUTES.contains(&path) {
         default_limit.max(LARGE_ROUTE_BODY_LIMIT_BYTES)
+    } else if DEVICE_AUTH_ROUTES.contains(&path) {
+        default_limit.min(super::auth_device::DEVICE_AUTH_MAX_REQUEST_BYTES)
     } else {
         default_limit
     }
@@ -653,7 +662,8 @@ mod tests {
         Router::new()
             .route("/echo", echo.clone())
             .route("/v1/admin/append", echo.clone())
-            .route("/v1/admin/actions", echo)
+            .route("/v1/admin/actions", echo.clone())
+            .route("/v1/auth/device/start", echo)
     }
 
     fn cfg(limit: usize) -> IngressConfig {
@@ -752,6 +762,59 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let json = problem_json(resp).await;
         assert!(json["detail"].as_str().unwrap().contains("1024"));
+    }
+
+    #[tokio::test]
+    async fn device_auth_known_length_uses_route_local_limit() {
+        let app = apply_ingress_limits(test_router(), &cfg(16 * 1024 * 1024), None);
+        let resp = app
+            .oneshot(
+                Request::post("/v1/auth/device/start")
+                    .header(
+                        "content-length",
+                        (super::super::auth_device::DEVICE_AUTH_MAX_REQUEST_BYTES + 1).to_string(),
+                    )
+                    .body(Body::from(vec![
+                        0u8;
+                        super::super::auth_device::DEVICE_AUTH_MAX_REQUEST_BYTES
+                            + 1
+                    ]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let json = problem_json(resp).await;
+        assert!(json["detail"]
+            .as_str()
+            .unwrap()
+            .contains(&super::super::auth_device::DEVICE_AUTH_MAX_REQUEST_BYTES.to_string()));
+    }
+
+    #[tokio::test]
+    async fn device_auth_chunked_body_uses_route_local_limit() {
+        let app = apply_ingress_limits(test_router(), &cfg(16 * 1024 * 1024), None);
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from(vec![
+                0u8;
+                super::super::auth_device::DEVICE_AUTH_MAX_REQUEST_BYTES
+            ])),
+            Ok(Bytes::from_static(b"x")),
+        ];
+        let resp = app
+            .oneshot(
+                Request::post("/v1/auth/device/start")
+                    .body(Body::from_stream(tokio_stream::iter(chunks)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let json = problem_json(resp).await;
+        assert!(json["detail"]
+            .as_str()
+            .unwrap()
+            .contains(&super::super::auth_device::DEVICE_AUTH_MAX_REQUEST_BYTES.to_string()));
     }
 
     #[tokio::test]
