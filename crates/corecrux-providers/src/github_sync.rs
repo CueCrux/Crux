@@ -779,14 +779,14 @@ mod tests {
     /// token is an obvious fake; nothing here reaches api.github.com because
     /// every test that uses it keeps the selected-repo set empty.
     fn write_fake_credentials(dir: &Path, key: &[u8; 32]) {
-        let creds = crate::integrations_github::GithubCredentials {
-            encrypted_pat: crate::encrypted_secrets::seal(b"github_pat_FAKE_not_a_real_token", key),
+        let creds = crate::github::GithubCredentials {
+            encrypted_pat: corecrux_secrets::seal(b"github_pat_FAKE_not_a_real_token", key),
             username: "octocat".to_string(),
             scopes: vec!["repo".to_string()],
             connected_at_unix_ms: 1_700_000_000_000,
             last_verified_at_unix_ms: None,
         };
-        crate::integrations_github::write_credentials(dir, &creds).expect("write credentials");
+        crate::github::write_credentials(dir, &creds).expect("write credentials");
     }
 
     fn store_record(store: &mut FactStore, entity: &str, private: bool) {
@@ -832,13 +832,13 @@ mod tests {
         write_fake_credentials(&dir, &[3u8; 32]);
         // A repo IS selected — so if decrypt did not hard-fail first, this
         // test would try to reach the network.
-        crate::integrations_github::select_repo(&dir, "cuecrux", "Crux", false, 1).expect("select");
+        crate::github::select_repo(&dir, "cuecrux", "Crux", false, 1).expect("select");
         let mut store = FactStore::new();
         let err = run_sync_with_key(&dir, &mut store, &[9u8; 32], 1).expect_err("must fail");
         assert!(
             matches!(
                 err,
-                GithubIntegrationError::Encryption(crate::encrypted_secrets::EncryptedSecretError::DecryptionFailed)
+                GithubIntegrationError::Encryption(corecrux_secrets::EncryptedSecretError::DecryptionFailed)
             ),
             "got {err:?}"
         );
@@ -889,16 +889,14 @@ mod tests {
     #[test]
     fn persist_repo_synced_sets_cursor_and_clears_previous_error() {
         let dir = temp_dir("persist-ok");
-        let repo = crate::integrations_github::select_repo(&dir, "a", "b", false, 1).expect("select");
+        let repo = crate::github::select_repo(&dir, "a", "b", false, 1).expect("select");
         persist_repo_error(&dir, &repo, "earlier failure".to_string());
         assert_eq!(
-            crate::integrations_github::list_selected_repos(&dir)[0]
-                .last_sync_error
-                .as_deref(),
+            crate::github::list_selected_repos(&dir)[0].last_sync_error.as_deref(),
             Some("earlier failure")
         );
         persist_repo_synced(&dir, &repo, 9_999);
-        let after = crate::integrations_github::list_selected_repos(&dir);
+        let after = crate::github::list_selected_repos(&dir);
         assert_eq!(after[0].last_synced_at_unix_ms, Some(9_999));
         assert!(after[0].last_sync_error.is_none(), "success must clear the error");
         let _ = std::fs::remove_dir_all(&dir);
@@ -909,10 +907,10 @@ mod tests {
     #[test]
     fn persist_repo_error_records_error_without_advancing_cursor() {
         let dir = temp_dir("persist-err");
-        let repo = crate::integrations_github::select_repo(&dir, "a", "b", false, 1).expect("select");
+        let repo = crate::github::select_repo(&dir, "a", "b", false, 1).expect("select");
         persist_repo_synced(&dir, &repo, 500);
         persist_repo_error(&dir, &repo, "github returned 403".to_string());
-        let after = crate::integrations_github::list_selected_repos(&dir);
+        let after = crate::github::list_selected_repos(&dir);
         assert_eq!(after[0].last_sync_error.as_deref(), Some("github returned 403"));
         assert_eq!(after[0].last_synced_at_unix_ms, Some(500), "cursor unchanged");
         let _ = std::fs::remove_dir_all(&dir);
@@ -935,7 +933,7 @@ mod tests {
         };
         persist_repo_synced(&dir, &repo, 5);
         persist_repo_error(&dir, &repo, "boom".to_string());
-        assert!(crate::integrations_github::list_selected_repos(&dir).is_empty());
+        assert!(crate::github::list_selected_repos(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -945,12 +943,12 @@ mod tests {
     #[test]
     fn write_selected_for_sync_is_readable_by_the_owning_module() {
         let dir = temp_dir("write-compat");
-        crate::integrations_github::select_repo(&dir, "a", "b", true, 7).expect("select");
-        crate::integrations_github::set_planning_repo(&dir, "a", "b", true).expect("planning");
-        let mut repos = crate::integrations_github::list_selected_repos(&dir);
+        crate::github::select_repo(&dir, "a", "b", true, 7).expect("select");
+        crate::github::set_planning_repo(&dir, "a", "b", true).expect("planning");
+        let mut repos = crate::github::list_selected_repos(&dir);
         repos[0].last_synced_at_unix_ms = Some(4_242);
         write_selected_for_sync(&dir, &repos).expect("write");
-        let reloaded = crate::integrations_github::list_selected_repos(&dir);
+        let reloaded = crate::github::list_selected_repos(&dir);
         assert_eq!(reloaded.len(), 1);
         assert!(reloaded[0].private);
         assert!(reloaded[0].planning, "planning flag survives the sync-side write");

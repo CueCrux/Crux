@@ -613,7 +613,7 @@ mod tests {
         write_credentials(&dir, &first).expect("write 1");
         let key = [9u8; 32];
         let second = GithubCredentials {
-            encrypted_pat: crate::encrypted_secrets::seal(b"github_pat_second_fake", &key),
+            encrypted_pat: corecrux_secrets::seal(b"github_pat_second_fake", &key),
             username: "hubot".to_string(),
             scopes: Vec::new(),
             connected_at_unix_ms: 42,
