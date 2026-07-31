@@ -1,6 +1,8 @@
 [workspace]
 members = [
   "crates/corecrux-types",
+  "crates/corecrux-secrets",
+  "crates/corecrux-billing",
   "crates/corecrux-frame",
   "crates/corecrux-proto",
   "crates/corecrux-receipts",
@@ -10,6 +12,7 @@ members = [
   "crates/corecrux-index",
   "crates/corecrux-retrieval",
   "crates/corecrux-memory",
+  "crates/corecrux-providers",
   "crates/crux-sync",
   "crates/crux-contrib",
   "crates/crux-integrations",

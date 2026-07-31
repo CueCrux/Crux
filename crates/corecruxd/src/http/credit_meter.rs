@@ -282,4 +282,53 @@ mod tests {
         let guard = state.credit_meter.as_ref().unwrap().lock().unwrap();
         assert_eq!(guard.available_balance("tenant-a"), 3);
     }
+
+    /// A poisoned meter mutex must fail every metered request **closed** with
+    /// 500 — never fall through to compute, and never debit. Recovering the
+    /// lock here would mean serving from state whose last writer panicked
+    /// mid-update, which on a money path can permit an untracked debit or
+    /// compute without one.
+    ///
+    /// Guards `post_credit_spend`'s `meter.lock()` arm. There was no coverage
+    /// for it before the credit-meter store moved to `corecrux-billing`; the
+    /// fail-closed decision stays here in the handler, so it is pinned here.
+    #[tokio::test]
+    async fn poisoned_meter_fails_closed_without_spending() {
+        let mut state = crate::http::tests::test_app_state_with_auth(10, crate::auth::AuthMode::DevScopes);
+        let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).expect("passport key");
+        state.passport_fpr = key.passport_fpr().to_string();
+        state.passport_public_key_hex = key.public_key_hex().to_string();
+        let meter_path = state.data_dir.join("credit-meter.jsonl");
+        let mut meter = crate::credit_meter::CreditMeterStore::open(&meter_path).expect("meter");
+        meter.seed_comped_wallet("tenant-a", 10, "seed-1").expect("seed wallet");
+        let meter = std::sync::Arc::new(std::sync::Mutex::new(meter));
+        state.credit_meter = Some(std::sync::Arc::clone(&meter));
+
+        // Poison the mutex: a thread that panics while holding the guard.
+        let poisoner = std::sync::Arc::clone(&meter);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().expect("lock for poisoning");
+            panic!("deliberate panic to poison the credit meter");
+        })
+        .join();
+        assert!(meter.is_poisoned(), "test setup must actually poison the mutex");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-scopes", "admin:write".parse().unwrap());
+        let resp = post_credit_spend(
+            State(state.clone()),
+            headers,
+            Json(SpendCreditsBody { quote: quote(4) }),
+        )
+        .await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a poisoned meter must fail closed, not serve the request"
+        );
+        // And nothing was debited: the wallet is untouched behind the poison.
+        let guard = meter.lock().unwrap_or_else(|poison| poison.into_inner());
+        assert_eq!(guard.available_balance("tenant-a"), 10, "fail-closed must not debit");
+    }
 }

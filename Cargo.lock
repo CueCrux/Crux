@@ -722,6 +722,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "corecrux-billing"
+version = "0.5.54"
+dependencies = [
+ "blake3",
+ "crux-session",
+ "hex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "corecrux-frame"
 version = "0.5.54"
 dependencies = [
@@ -798,6 +811,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "corecrux-providers"
+version = "0.5.54"
+dependencies = [
+ "chrono",
+ "corecrux-memory",
+ "corecrux-secrets",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "ureq 3.3.0",
+]
+
+[[package]]
 name = "corecrux-receipts"
 version = "0.5.54"
 dependencies = [
@@ -850,6 +876,17 @@ dependencies = [
  "thiserror 2.0.19",
  "tracing",
  "xxhash-rust",
+]
+
+[[package]]
+name = "corecrux-secrets"
+version = "0.5.54"
+dependencies = [
+ "chacha20poly1305",
+ "hex",
+ "rand 0.10.2",
+ "serde",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -959,13 +996,16 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "ciborium",
+ "corecrux-billing",
  "corecrux-frame",
  "corecrux-index",
  "corecrux-memory",
  "corecrux-projections",
  "corecrux-proto",
+ "corecrux-providers",
  "corecrux-receipts",
  "corecrux-retrieval",
+ "corecrux-secrets",
  "corecrux-segment",
  "corecrux-storage",
  "corecrux-types",
