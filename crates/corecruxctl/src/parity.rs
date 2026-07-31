@@ -248,6 +248,13 @@ pub fn parity_living_v1(
     corecrux_base: &str,
 ) -> Result<ParityLivingReportV1, Box<dyn std::error::Error + Send + Sync>> {
     let artifacts = fetch_engine_sample(engine_base, engine_api_key, tenant_id, seed, sample_n)?;
+    // D-18: an empty engine sample compared nothing and reported parity —
+    // indistinguishable from every artifact matching. `generate_parity_pack`
+    // already hard-errors on the identical input (see `sampled_artifacts`
+    // below); this is the same call with the same meaning.
+    if artifacts.is_empty() {
+        return Err("engine sample is empty: no artifacts were compared, so parity is unverified".into());
+    }
 
     let mut mismatches: Vec<ParityMismatchV1> = Vec::new();
     let mut summary = ParitySummaryV1::default();

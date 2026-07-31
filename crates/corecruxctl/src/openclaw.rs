@@ -941,10 +941,22 @@ fn fetch_openclaw_facts(
                 all.push(f.clone());
             }
         }
-        let has_more = body
-            .get("has_more")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        // D-20: this walk is documented as failing closed, but `has_more` was
+        // `.unwrap_or(false)` — a daemon that omitted the field truncated the
+        // walk after page 1 and the scan then reported "no anomalies" over a
+        // partial view. An absent pagination signal is not "no more pages".
+        let has_more = match body.get("has_more") {
+            Some(value) => value.as_bool().ok_or_else(|| {
+                format!("fact export response `has_more` is not a boolean at page {}; refusing to report a possibly truncated scan", page + 1)
+            })?,
+            None => {
+                return Err(format!(
+                    "fact export response omits `has_more` at page {}; refusing to report a possibly truncated scan",
+                    page + 1
+                )
+                .into())
+            }
+        };
         cursor = body.get("next_cursor").and_then(|v| v.as_str()).map(str::to_string);
         if !has_more || cursor.is_none() {
             return Ok(all);
@@ -1137,6 +1149,45 @@ pub fn scan_run(opts: &ScanOptions) -> Result<(), DynErr> {
 mod tests {
     use super::*;
     use std::fs::{self, File, FileTimes};
+
+    /// D-20: the export walk is documented as failing closed, but `has_more`
+    /// was `.unwrap_or(false)`. A daemon that omitted the field truncated the
+    /// walk after page 1, and the scan then reported "no anomalies" over a
+    /// partial view. An absent pagination signal is not "no more pages".
+    #[test]
+    fn fact_export_refuses_a_response_that_omits_has_more() {
+        let page = serde_json::json!({ "facts": [], "next_cursor": "c1" }).to_string();
+        let (port, handle) = crate::test_support::serve_responses(vec![(200, page)]);
+
+        let err = fetch_openclaw_facts(&format!("http://127.0.0.1:{port}"), None, &agent())
+            .expect_err("an omitted has_more must not read as 'no more pages'");
+        assert!(err.to_string().contains("omits `has_more`"), "{err}");
+        let _ = handle.join();
+    }
+
+    /// The same for a `has_more` of the wrong type.
+    #[test]
+    fn fact_export_refuses_a_non_boolean_has_more() {
+        let page = serde_json::json!({ "facts": [], "has_more": "yes", "next_cursor": "c1" }).to_string();
+        let (port, handle) = crate::test_support::serve_responses(vec![(200, page)]);
+
+        let err = fetch_openclaw_facts(&format!("http://127.0.0.1:{port}"), None, &agent())
+            .expect_err("a non-boolean has_more is not a pagination signal");
+        assert!(err.to_string().contains("not a boolean"), "{err}");
+        let _ = handle.join();
+    }
+
+    /// Control: an explicit `has_more: false` still ends the walk cleanly.
+    #[test]
+    fn fact_export_ends_cleanly_on_an_explicit_has_more_false() {
+        let page = serde_json::json!({ "facts": [], "has_more": false }).to_string();
+        let (port, handle) = crate::test_support::serve_responses(vec![(200, page)]);
+
+        let facts = fetch_openclaw_facts(&format!("http://127.0.0.1:{port}"), None, &agent())
+            .expect("an explicit end of pagination is fine");
+        assert!(facts.is_empty());
+        let _ = handle.join();
+    }
 
     const POISON_REL: &str = "memory/2026-06-02.md";
 

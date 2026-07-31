@@ -141,6 +141,17 @@ pub fn run_ingest(
 ) -> Result<(), DynErr> {
     let path = crate::cost::resolve_transcript(file, session)?;
     let events = transcript::parse_file_capturing(&path)?;
+    // D-21: `parse_reader` silently skips every malformed line, so a corrupt
+    // transcript yielded zero events, printed "0 nodes", returned `Ok(())` and
+    // never opened a connection — identical to a genuinely empty session. A
+    // file with bytes in it that produces no events did not parse.
+    if events.is_empty() && std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0) > 0 {
+        return Err(format!(
+            "{} is non-empty but contains no parseable transcript records; refusing to report an empty ingest",
+            path.display()
+        )
+        .into());
+    }
     let session_id = session_id_of(&events, &path);
     let nodes = build_nodes(&events, &session_id);
 
@@ -424,6 +435,49 @@ mod tests {
     fn body_json(raw: &str) -> serde_json::Value {
         let (_, body) = raw.split_once("\r\n\r\n").expect("request body");
         serde_json::from_str(body).expect("json body")
+    }
+
+    /// D-21: `parse_reader` silently skips every malformed line, so a corrupt
+    /// transcript yielded zero events; `run_ingest` printed "0 nodes",
+    /// returned `Ok(())` and never opened a connection — identical to a
+    /// genuinely empty session.
+    #[test]
+    fn a_corrupt_transcript_is_an_error_not_an_empty_ingest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("corrupt.jsonl");
+        std::fs::write(&path, b"this is not jsonl\nnor is this\n").expect("write");
+
+        let err = run_ingest(
+            Some(path.display().to_string()),
+            None,
+            Some(tmp.path().join("blobs").display().to_string()),
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect_err("a corrupt transcript must not report an empty ingest");
+        assert!(err.to_string().contains("no parseable transcript records"), "{err}");
+    }
+
+    /// Control: a genuinely empty file is an empty session, not a parse
+    /// failure, and still succeeds.
+    #[test]
+    fn an_empty_transcript_file_is_still_an_empty_ingest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("empty.jsonl");
+        std::fs::write(&path, b"").expect("write");
+
+        run_ingest(
+            Some(path.display().to_string()),
+            None,
+            Some(tmp.path().join("blobs").display().to_string()),
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("an empty transcript is an empty session");
     }
 
     #[test]

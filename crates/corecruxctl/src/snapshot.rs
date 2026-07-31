@@ -68,6 +68,15 @@ pub struct SnapshotVerifyReport {
     #[serde(rename = "failedShards")]
     pub failed_shards: u64,
     pub shards: Vec<SnapshotShardVerifyItem>,
+    /// Checks that were requested but could not be evaluated.
+    ///
+    /// With no shards on disk the loop below never ran, yet `failed_shards`
+    /// was 0 and `ok` was `true` — a fresh or wiped data directory verified
+    /// identically to one whose every snapshot matched. `ok` keeps its
+    /// meaning; a caller that needs a snapshot to have actually been hashed
+    /// gates on `ok && checks_skipped.is_empty()`.
+    #[serde(rename = "checksSkipped", default)]
+    pub checks_skipped: Vec<String>,
 }
 
 fn list_shards(shard_root: &Path) -> Result<Vec<u32>, Box<dyn std::error::Error + Send + Sync>> {
@@ -228,11 +237,19 @@ pub fn verify_snapshots(
         });
     }
 
+    // D-15: an empty `shards/` walked zero shards and reported a clean pass.
+    let checks_skipped = if out_shards.is_empty() {
+        vec!["snapshot_verify:no_shards".to_string()]
+    } else {
+        Vec::new()
+    };
+
     Ok(SnapshotVerifyReport {
         ok: failed_shards == 0,
         data_dir: opts.data_dir.display().to_string(),
         failed_shards,
         shards: out_shards,
+        checks_skipped,
     })
 }
 
@@ -366,6 +383,29 @@ mod tests {
         assert_eq!(parsed.shards[0].projections[0].bytes, 1024);
     }
 
+    /// D-15: an empty `shards/` walked zero shards, so `failed_shards` was 0
+    /// and `ok` was `true` — a fresh or wiped data directory verified
+    /// identically to one whose every snapshot matched.
+    #[test]
+    fn verify_snapshots_records_a_skip_when_there_are_no_shards() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("shards")).unwrap();
+
+        let report = verify_snapshots(&SnapshotOptions {
+            data_dir: tmp.path().to_path_buf(),
+            shard: None,
+        })
+        .unwrap();
+
+        assert!(report.ok, "an empty data dir is not itself an error");
+        assert_eq!(
+            report.checks_skipped,
+            vec!["snapshot_verify:no_shards".to_string()],
+            "but nothing was hashed, and the report says so"
+        );
+        assert!(report.shards.is_empty());
+    }
+
     #[test]
     fn snapshot_verify_report_roundtrip() {
         let report = SnapshotVerifyReport {
@@ -384,6 +424,7 @@ mod tests {
                     actual_blake3: None,
                 }],
             }],
+            checks_skipped: Vec::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
         let parsed: SnapshotVerifyReport = serde_json::from_str(&json).unwrap();
