@@ -37,7 +37,7 @@ url = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 xxhash-rust = { workspace = true, features = ["xxh64"] }
-zip = { workspace = true, default-features = false, features = ["deflate-flate2"] }
+zip = { workspace = true, default-features = false, features = ["deflate-flate2-zlib-rs"] }
 rand = { workspace = true }
 sha2 = { workspace = true }
 
