@@ -495,6 +495,17 @@ fn build_split_checks(
                 split_norm, parent_boundary, child_boundary
             ),
         });
+    } else {
+        // D-28: with no split point supplied — and none recoverable from the
+        // coordinator record — the boundary check was simply OMITTED, so
+        // `ok = checks.iter().all(...)` passed on a verification that never
+        // examined the split at all. Emit the check as unevaluated instead.
+        checks.push(VerifyCheck {
+            name: "split_point_boundary_present".to_string(),
+            ok: false,
+            detail: "no split point supplied and none recorded on the split job; the boundary was NOT verified"
+                .to_string(),
+        });
     }
 
     if let (Some(p), Some(c)) = (parent, child) {

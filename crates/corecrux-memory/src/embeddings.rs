@@ -1097,6 +1097,26 @@ impl EmbeddingClient {
 }
 
 /// Compute cosine similarity between two vectors.
+/// Cosine similarity, or `None` when the two vectors are **not comparable**.
+///
+/// D-25: `cosine_similarity` collapses a dimension mismatch to `0.0`, which is
+/// exactly the score of two genuinely orthogonal vectors — so a caller that
+/// has mixed two embedding profiles reads "not similar" and never "not
+/// comparable". Callers that must tell the two apart use this.
+///
+/// `None` means the vectors have different lengths, or either is empty.
+pub fn try_cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    Some(cosine_similarity(a, b))
+}
+
+/// Cosine similarity, with **incomparable treated as `0.0`**.
+///
+/// Prefer [`try_cosine_similarity`] wherever "not comparable" must be
+/// distinguishable from "not similar" — see D-25 in ExecPlan
+/// `crux-pinned-defect-remediation-2026-07-31`.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -1305,6 +1325,26 @@ mod tests {
     fn cosine_empty_vectors() {
         let sim = cosine_similarity(&[], &[]);
         assert_eq!(sim, 0.0);
+    }
+
+    /// D-25: `cosine_similarity` collapses a dimension mismatch to `0.0`,
+    /// which is exactly the score of two genuinely orthogonal vectors, so a
+    /// caller that has mixed two embedding profiles reads "not similar" and
+    /// never "not comparable".
+    #[test]
+    fn try_cosine_similarity_distinguishes_incomparable_from_orthogonal() {
+        // Genuinely orthogonal: comparable, and the answer is 0.
+        let orthogonal = try_cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).expect("same dimension is comparable");
+        assert!(orthogonal.abs() < 1e-6);
+
+        // Different profiles: NOT comparable at all.
+        assert_eq!(try_cosine_similarity(&[1.0, 0.0], &[1.0, 0.0, 0.0]), None);
+        assert_eq!(try_cosine_similarity(&[], &[]), None);
+
+        // The lossy wrapper still returns 0.0 for both, which is the whole
+        // reason the fallible form exists.
+        assert_eq!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]), 0.0);
+        assert_eq!(cosine_similarity(&[1.0, 0.0], &[1.0, 0.0, 0.0]), 0.0);
     }
 
     #[test]

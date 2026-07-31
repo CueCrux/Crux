@@ -28,7 +28,9 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::{http_scope_context, problem_response, require_http_any_scope_for_tenant, AppState};
+use super::{
+    http_scope_context, problem_response, require_http_any_scope, require_http_any_scope_for_tenant, AppState,
+};
 use crate::agentgraph_kinds::PUNCHCARD_KIND;
 
 pub(super) const FEATURE_FLAG_ENV: &str = "CORECRUXD_FEATURE_INCIDENTS";
@@ -114,6 +116,13 @@ pub(super) struct IncidentEvent {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(super) struct IncidentCostTotals {
     pub reports_joined: usize,
+    /// Cost reports excluded because their window bounds could not be parsed.
+    ///
+    /// D-28: an unparsable timestamp used to take the same branch as an absent
+    /// one, so a broken report overlapped every window and was folded into the
+    /// totals unannounced. Non-zero here means the totals are incomplete.
+    #[serde(default)]
+    pub reports_skipped_unparsable_window: usize,
     pub assistant_turns: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -344,12 +353,14 @@ fn coordination_events(
             {
                 return None;
             }
+            // D-28: an announce whose session has no tenant binding used to
+            // fall through to whichever caller asked for the `default` tenant
+            // — an unknown owner served as if it were owned. An unbound
+            // announce belongs to no tenant and is served to none.
             let binding_tenant = bindings
                 .get(&intent.session_id_hex)
                 .map(|binding| binding.tenant_id.as_str());
-            if binding_tenant.is_some_and(|bound| bound != tenant_id)
-                || (binding_tenant.is_none() && tenant_id != "default")
-            {
+            if binding_tenant.is_none_or(|bound| bound != tenant_id) {
                 return None;
             }
             Some(IncidentEvent {
@@ -504,18 +515,26 @@ async fn incident_cost_totals(tenant_id: &str, session_ids: &[String], window: &
         if !session_ids.is_empty() && !session_ids.contains(&stored.session_id) {
             continue;
         }
-        let starts_before_end = stored
-            .report
-            .started_at
-            .as_deref()
-            .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-            .is_none_or(|dt| dt.with_timezone(&Utc) < window.to);
-        let ends_after_start = stored
-            .report
-            .ended_at
-            .as_deref()
-            .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-            .is_none_or(|dt| dt.with_timezone(&Utc) >= window.from);
+        // D-28: an UNPARSABLE timestamp took the same `is_none_or` branch as
+        // an ABSENT one, so a malformed report overlapped every window and was
+        // silently folded into the totals. Absent is legitimate (the report
+        // simply has no bound); unparsable is a broken report and is counted
+        // out loud instead.
+        let parse_bound = |raw: Option<&str>| match raw {
+            None => Ok(None),
+            Some(raw) => DateTime::parse_from_rfc3339(raw)
+                .map(|dt| Some(dt.with_timezone(&Utc)))
+                .map_err(|_| ()),
+        };
+        let (Ok(started), Ok(ended)) = (
+            parse_bound(stored.report.started_at.as_deref()),
+            parse_bound(stored.report.ended_at.as_deref()),
+        ) else {
+            totals.reports_skipped_unparsable_window += 1;
+            continue;
+        };
+        let starts_before_end = started.is_none_or(|dt| dt < window.to);
+        let ends_after_start = ended.is_none_or(|dt| dt >= window.from);
         if !starts_before_end || !ends_after_start {
             continue;
         }
@@ -859,13 +878,17 @@ pub(super) async fn post_incident(
     if !feature_enabled() {
         return disabled_response();
     }
-    if let Err(error) = validate_create(&body) {
-        return problem_response(StatusCode::BAD_REQUEST, error);
-    }
+    // D-28: validation used to run BEFORE authentication, so an
+    // unauthenticated caller could probe the body schema by the shape of the
+    // 400 it got back. Authenticate first; a caller with no credential learns
+    // nothing about what the endpoint accepts.
     if let Err(problem) =
         require_http_any_scope_for_tenant(&state.auth, &headers, &["facts:write", "admin:write"], &body.tenant_id)
     {
         return problem.into_response();
+    }
+    if let Err(error) = validate_create(&body) {
+        return problem_response(StatusCode::BAD_REQUEST, error);
     }
     let ctx = match http_scope_context(&state.auth, &headers) {
         Ok(ctx) => ctx,
@@ -943,6 +966,14 @@ pub(super) async fn get_incident(
     if !valid_case_id(&id) {
         return problem_response(StatusCode::BAD_REQUEST, "invalid incident id");
     }
+    // D-27: the lookup used to run BEFORE any scope check, so an
+    // unauthenticated caller got 404 for an absent case and 401 for a present
+    // one — an existence oracle over every case id. Require the read scope
+    // first, tenant-agnostically; the tenant-bound check still follows once
+    // the owning tenant is known.
+    if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["query:read", "exports:read", "admin:read"]) {
+        return problem.into_response();
+    }
     let found = {
         let store = state.fact_store.read().await;
         latest_case_fact(&store, &id)
@@ -969,6 +1000,14 @@ pub(super) async fn export_incident(
     }
     if !valid_case_id(&id) {
         return problem_response(StatusCode::BAD_REQUEST, "invalid incident id");
+    }
+    // D-27: the lookup used to run BEFORE any scope check, so an
+    // unauthenticated caller got 404 for an absent case and 401 for a present
+    // one — an existence oracle over every case id. Require the read scope
+    // first, tenant-agnostically; the tenant-bound check still follows once
+    // the owning tenant is known.
+    if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["query:read", "exports:read", "admin:read"]) {
+        return problem.into_response();
     }
     let found = {
         let store = state.fact_store.read().await;
@@ -1707,11 +1746,12 @@ mod tests {
         assert_eq!(events[0].assurance_class, AssuranceClass::VerifiableRecord);
     }
 
-    /// PINS CURRENT BEHAVIOUR: an announce from a session with no binding at
-    /// all falls through to the `default` tenant — it is visible in a `default`
-    /// case and invisible in every named tenant's case.
+    /// D-28 (inverted pin): an announce from a session with NO binding used
+    /// to fall through to the `default` tenant — an unknown owner served as if
+    /// it were owned. An unbound announce belongs to no tenant and is served
+    /// to none.
     #[test]
-    fn unbound_coordination_announces_fall_through_to_the_default_tenant() {
+    fn unbound_coordination_announces_belong_to_no_tenant() {
         let at = 1_700_000_000_000u64;
         let window = IncidentWindow {
             from: DateTime::from_timestamp_millis(at as i64 - 1_000).expect("from"),
@@ -1720,14 +1760,13 @@ mod tests {
         let facts = coord_facts_for(&[coord_intent("unbound", "p1", at)]);
         let bindings = HashMap::new();
 
-        assert_eq!(
-            coordination_events(&facts, &bindings, "default", &window, &[], &[]).len(),
-            1,
-            "unbound announce is attributed to the default tenant"
+        assert!(
+            coordination_events(&facts, &bindings, "default", &window, &[], &[]).is_empty(),
+            "an unbound announce is not the default tenant's"
         );
         assert!(
             coordination_events(&facts, &bindings, "tenant-a", &window, &[], &[]).is_empty(),
-            "and must not leak into a named tenant"
+            "nor any named tenant's"
         );
     }
 
@@ -2132,9 +2171,14 @@ mod tests {
             );
         }
         let totals = incident_cost_totals(&tenant, &[], &window).await;
+        // D-28 (inverted pin): an ABSENT bound is legitimate — the report
+        // simply has none — and still joins. An UNPARSABLE one is a broken
+        // report; it used to take the same branch and overlap every window
+        // silently. It is now counted out loud instead.
+        assert_eq!(totals.reports_joined, 1, "only the report with no bounds joins");
         assert_eq!(
-            totals.reports_joined, 2,
-            "reports with no usable window currently join unconditionally"
+            totals.reports_skipped_unparsable_window, 1,
+            "and the malformed one is reported, not folded in"
         );
     }
 
@@ -2276,16 +2320,29 @@ mod tests {
         }
     }
 
-    /// PINS CURRENT BEHAVIOUR: body validation runs BEFORE the auth check, so
-    /// an unauthenticated caller sending a malformed body gets 400 rather than
-    /// 401. It confirms the endpoint exists but leaks nothing else.
+    /// D-28 (inverted pin): body validation used to run BEFORE the auth
+    /// check, so an unauthenticated caller could probe the body schema by the
+    /// shape of the 400 it got back.
     #[tokio::test]
     #[serial_test::serial]
-    async fn post_incident_validates_the_body_before_authenticating() {
+    async fn post_incident_authenticates_before_validating_the_body() {
         let _flag = FeatureFlag::on();
         let state = test_app_state_with_auth(16, AuthMode::DevScopes);
-        let response = post_incident(State(state), HeaderMap::new(), Json(create_body("", "t"))).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = post_incident(State(state.clone()), HeaderMap::new(), Json(create_body("", "t"))).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "a caller with no credential learns nothing about what the endpoint accepts"
+        );
+
+        // Control: an authenticated caller still gets the validation error.
+        let validated = post_incident(
+            State(state),
+            dev_scope_headers("facts:write"),
+            Json(create_body("", "t")),
+        )
+        .await;
+        assert_eq!(validated.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -2316,11 +2373,13 @@ mod tests {
     }
 
     /// PINS CURRENT BEHAVIOUR: `get_incident` resolves the case BEFORE the
-    /// scope check, so an unauthenticated caller can distinguish an unknown id
-    /// (404) from an existing one (401) — a case-id enumeration oracle.
+    /// D-27 (inverted pin): the lookup used to run BEFORE any scope check, so
+    /// an unauthenticated caller could distinguish an unknown id (404) from an
+    /// existing one (401) — a case-id enumeration oracle. The read scope is
+    /// now required first, tenant-agnostically.
     #[tokio::test]
     #[serial_test::serial]
-    async fn get_incident_reveals_existence_before_authenticating() {
+    async fn get_incident_does_not_reveal_existence_before_authenticating() {
         let _flag = FeatureFlag::on();
         let state = test_app_state_with_auth(16, AuthMode::DevScopes);
         let id = {
@@ -2336,13 +2395,12 @@ mod tests {
             AxumPath("inc_absent".to_string()),
         )
         .await;
-        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
-
         let existing = get_incident(State(state.clone()), HeaderMap::new(), AxumPath(id.clone())).await;
+        assert_eq!(unknown.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
             existing.status(),
-            StatusCode::UNAUTHORIZED,
-            "existence is distinguishable without a credential"
+            unknown.status(),
+            "an absent id and an existing one are indistinguishable without a credential"
         );
 
         let authorised = get_incident(

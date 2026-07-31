@@ -11,8 +11,8 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    problem_response, require_http_scopes, require_http_scopes_for_tenant, AppState, HeaderMap, IntoResponse, Json,
-    Path, Query, State, StatusCode,
+    problem_response, require_http_any_scope, require_http_scopes, require_http_scopes_for_tenant, AppState, HeaderMap,
+    IntoResponse, Json, Path, Query, State, StatusCode,
 };
 
 type BoostOverlay = BTreeMap<String, String>;
@@ -2895,6 +2895,13 @@ pub(super) async fn get_console_facts(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     let top_k = query.top_k.unwrap_or(50).clamp(1, 200);
+    if query.as_of_unix_ms.is_some_and(|as_of| as_of < 0) {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "as_of_unix_ms must not be negative; a cutoff that cannot be applied is refused, not ignored",
+        )
+        .into_response();
+    }
 
     let store = state.fact_store.read().await;
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
@@ -2910,7 +2917,14 @@ pub(super) async fn get_console_facts(
 
     // #6 — server-side as-of filter. We compare against `stored_at` (DateTime<Utc>)
     // converted to ms; facts created strictly after the cutoff are dropped.
-    if let Some(as_of) = query.as_of_unix_ms.filter(|t| *t > 0) {
+    //
+    // D-26: this was `.filter(|t| *t > 0)`, so `as_of_unix_ms=0` silently
+    // disabled the cutoff and returned ALL current facts while the response
+    // still echoed the parameter back — a client computing 0 was told it had
+    // time-travelled and had not. Zero is a valid epoch cutoff (nothing had
+    // been stored yet); a negative one is a broken client and is refused
+    // above, so the cutoff either applies or the request fails.
+    if let Some(as_of) = query.as_of_unix_ms {
         visible_facts.retain(|fact| fact.stored_at.timestamp_millis() <= as_of);
     }
 
@@ -3129,6 +3143,15 @@ pub(super) async fn get_console_chunk_preview(
     Path(chunk_digest): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    // D-27: the lookup used to run BEFORE any scope check, so an
+    // unauthorized caller got 404 for an absent digest and 401 for a present
+    // one — an existence oracle over every chunk digest. Require the scope
+    // tenant-agnostically first; the tenant-bound check still follows once the
+    // owning tenant is known.
+    if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["tenant:content:preview", "admin:read"]) {
+        return problem.into_response();
+    }
+
     let Some(chunk) = (match crate::console_index::find_chunk(&state.data_dir, &chunk_digest) {
         Ok(chunk) => chunk,
         Err(err) => return problem_response(StatusCode::BAD_REQUEST, err.to_string()),

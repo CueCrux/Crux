@@ -294,7 +294,7 @@ pub fn parse_workspace(root: &Path) -> Result<Workspace, DynErr> {
     let mut paths = Vec::new();
     let mut sqlite = Vec::new();
     let mut budget = WalkBudget::default();
-    collect(root, &mut paths, &mut sqlite, 0, &mut budget)?;
+    collect(root, root, &mut paths, &mut sqlite, 0, &mut budget)?;
     paths.sort();
     sqlite.sort();
 
@@ -349,6 +349,7 @@ fn rel_path(root: &Path, path: &Path) -> String {
 }
 
 fn collect(
+    root: &Path,
     dir: &Path,
     out: &mut Vec<PathBuf>,
     sqlite: &mut Vec<String>,
@@ -372,7 +373,7 @@ fn collect(
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if !name.starts_with('.') && name != "node_modules" {
-                collect(&path, out, sqlite, depth + 1, budget)?;
+                collect(root, &path, out, sqlite, depth + 1, budget)?;
             }
         } else if file_type.is_file() {
             if is_markdown(&path) {
@@ -386,7 +387,12 @@ fn collect(
                 }
                 out.push(path);
             } else if is_sqlite(&path) {
-                sqlite.push(rel_path(dir, &path));
+                // D-28: this was `rel_path(dir, ...)` — relative to the
+                // directory being walked, not the workspace root — so a nested
+                // index reported a path that resolves nowhere from the root the
+                // operator passed, and two indexes in different subtrees could
+                // collide on the same recorded name.
+                sqlite.push(rel_path(root, &path));
             }
         }
     }

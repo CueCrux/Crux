@@ -1343,6 +1343,30 @@ fn gc_cold_segments_dir_v1(
     let mut unparseable_segment_files = 0u64;
     let mut deleted: BTreeSet<[u8; 32]> = BTreeSet::new();
 
+    // D-28: `collect_files_recursive_v1` swallows an unreadable directory, so
+    // a MISSING segments dir walked nothing and reported an all-zero clean
+    // sweep — identical to a directory that was walked and held no orphans.
+    // The report already carries a `skipped` shape; use it.
+    if !segments_dir.is_dir() {
+        return Ok((
+            ColdSegmentGcProjectionReportV1 {
+                projection: projection.to_string(),
+                schema_version,
+                skipped: true,
+                skip_reason: Some(format!("segments dir not present: {}", segments_dir.display())),
+                reachable_segments: reachable.map_or(0, |r| r.len() as u64),
+                segments_on_disk: 0,
+                orphan_segments: 0,
+                deleted_segments: 0,
+                deleted_bytes: 0,
+                skipped_young_segments: 0,
+                kept_orphans_due_to_limit: 0,
+                unparseable_segment_files: 0,
+            },
+            deleted,
+        ));
+    }
+
     let Some(reachable) = reachable else {
         // We cannot safely determine reachability. Still report what exists on disk.
         let files = collect_files_recursive_v1(segments_dir)?;
