@@ -4,6 +4,12 @@ Pull-only compose stack for running the published Crux daemon image. No
 source checkout, no local build. For the build-from-source stack, use the
 `docker-compose.yml` at the repository root instead.
 
+> [!WARNING]
+> This is a loopback-only, single-user development stack. Its `dev_scopes`
+> mode trusts caller-supplied scopes, so do not expose it through a reverse
+> proxy, tunnel, or public interface. For shared use, deploy the standalone
+> [`../remote/`](../remote/) stack behind TLS.
+
 ## 1. Verify the image (once per version)
 
 Every published image is signed (cosign keyless) and carries a CycloneDX
@@ -13,7 +19,7 @@ SBOM attestation. Verify by digest before first use — copy-paste commands in
 ## 2. Start
 
 ```bash
-docker compose up -d
+docker compose -f docker-compose.yml up -d
 curl -sf http://127.0.0.1:14800/readyz
 ```
 
@@ -24,7 +30,7 @@ Pin a version (recommended — `:latest` tracks the newest *release tag*, not
 `main`):
 
 ```bash
-CRUX_VERSION=0.5.0 docker compose up -d
+CRUX_VERSION=0.5.0 docker compose -f docker-compose.yml up -d
 ```
 
 ## Conventions
@@ -37,6 +43,7 @@ CRUX_VERSION=0.5.0 docker compose up -d
 | Ports | HTTP API + console `14800`, MCP `14801` — published on loopback only |
 | Health | `GET /readyz` (wired as the container healthcheck) |
 | Logs | JSON on stdout (`CORECRUX_LOG_FORMAT=json`) |
+| Runtime | read-only root, all capabilities dropped, privilege escalation disabled, restricted `/tmp` tmpfs |
 
 ### Bind mounts
 
@@ -57,9 +64,9 @@ git-drift probe only applies to repo-checkout deploys). Outbound features
 ## Smoke test (clean machine)
 
 ```bash
-docker compose up -d
+docker compose -f docker-compose.yml up -d
 # wait for healthy
-docker compose ps --format '{{.Name}} {{.Health}}'
+docker compose -f docker-compose.yml ps --format '{{.Name}} {{.Health}}'
 curl -sf http://127.0.0.1:14800/readyz && echo OK
 # MCP handshake (initialize over streamable HTTP)
 curl -sf -X POST http://127.0.0.1:14801/mcp \
@@ -71,6 +78,6 @@ curl -sf -X POST http://127.0.0.1:14801/mcp \
 ## Stop / remove
 
 ```bash
-docker compose down        # keeps the data volume
-docker compose down -v     # deletes daemon state too
+docker compose -f docker-compose.yml down        # keeps the data volume
+docker compose -f docker-compose.yml down -v     # deletes daemon state too
 ```

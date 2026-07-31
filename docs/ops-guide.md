@@ -113,11 +113,13 @@ bypass.
 ### Example: Caddy rate limiting
 
 Use the `rate_limit` directive from the
-[caddy-ratelimit](https://github.com/mholt/caddy-ratelimit) plugin:
+[caddy-ratelimit](https://github.com/mholt/caddy-ratelimit) plugin. This
+same-host example terminates TLS on the normal external port and proxies to the
+loopback-only daemon; the listener and upstream must never use the same socket:
 
 ```caddyfile
-:14800 {
-    reverse_proxy localhost:14800
+crux.example.com {
+    reverse_proxy 127.0.0.1:14800
 
     rate_limit {
         zone append {
@@ -149,6 +151,10 @@ Use the `rate_limit` directive from the
 
 ### Example: nginx rate limiting
 
+The certificate directives are deployment-specific and intentionally shown as
+placeholders; do not expose this server until valid TLS configuration is in
+place.
+
 ```nginx
 http {
     # Define rate-limit zones (per client IP)
@@ -159,7 +165,10 @@ http {
     limit_req_zone $binary_remote_addr zone=metrics:10m rate=10r/s;
 
     server {
-        listen 14800;
+        listen 443 ssl;
+        server_name crux.example.com;
+        ssl_certificate /path/from/secret-manager/fullchain.pem;
+        ssl_certificate_key /path/from/secret-manager/privkey.pem;
 
         location = /v1/admin/append {
             limit_req zone=append burst=20 nodelay;

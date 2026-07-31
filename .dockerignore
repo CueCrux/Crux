@@ -1,0 +1,58 @@
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
+#
+# Security boundary: Docker must receive only inputs copied by the Dockerfile.
+# The repository can also contain local daemon state, credentials, build output,
+# and sibling-tool caches that must never reach a builder or remote BuildKit.
+**
+!Dockerfile
+!.dockerignore
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!LICENSE
+!NOTICE
+!crates/
+!crates/**
+!proto/
+!proto/**
+!integrations/
+!integrations/**
+
+# Belt-and-braces exclusions inside the admitted source directories. Keep these
+# after the broad negations above: Docker rules are evaluated last-match-wins.
+# Only the exact tracked JSONL fixtures listed at the end are re-admitted.
+**/.git
+**/.git/**
+**/.env*
+**/.mcp.json
+**/*.jsonl
+**/*.key
+**/passport.key
+**/credentials.json
+**/data
+**/data/**
+**/crux-data
+**/crux-data/**
+**/passports
+**/passports/**
+**/selected_repos.json
+**/sync_cursor.json
+**/console/settings.json
+**/LOCK
+**/.install-uuid
+**/target
+**/target/**
+**/node_modules
+**/node_modules/**
+**/__pycache__
+**/__pycache__/**
+**/*.pyc
+
+# Reviewable, tracked test vectors are the only JSONL admitted to the context.
+!crates/corecrux-receipts/vectors/audit-bundle-v1/invalid-events-hash/events.jsonl
+!crates/corecrux-receipts/vectors/audit-bundle-v1/valid-minimal/events.jsonl
+!crates/corecrux-receipts/vectors/audit-bundle-v1/valid-minimal-v2/events.jsonl
+!crates/corecrux-receipts/vectors/audit-bundle-v1/valid-minimal-v3/events.jsonl
+!crates/corecruxctl/tests/fixtures_code_health/cargo_check.jsonl
+!integrations/claude-code/compaction-survival/fixtures/transcript.jsonl

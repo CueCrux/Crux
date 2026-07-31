@@ -7,9 +7,10 @@
 # rust-toolchain.toml (channel 1.88.0) and needs rustup to honour that pin;
 # cgr.dev/chainguard/rust free tier is :latest-only (floating toolchain), which
 # would silently drift the compiler under a pinned, reproducible release build.
-FROM rust:1.88-bookworm AS builder
-
-RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
+# The patch release and Debian suite are exact. The publication workflow records
+# the resolved base image in max-mode provenance, so tag-to-digest resolution is
+# auditable without copying an unverified registry digest into this file.
+FROM rust:1.88.0-bookworm AS builder
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
@@ -37,7 +38,12 @@ RUN cargo build --locked --release --bin corecruxd --bin corecruxctl
 
 # --- Runtime stage ---
 # Chainguard wolfi-base (CLAUDE.md §9): rebuilt daily, zero-known-CVE target,
-# minimal package set. Free tier requires the :latest tag (accepted).
+# minimal package set. This intentionally follows the patched `latest` channel;
+# the resolved base is auditable from publication provenance, but this
+# Dockerfile alone is not byte-reproducible. Release CI builds once, scans that
+# exact candidate digest before assigning supported tags, then inventories,
+# signs, and publishes by digest.
+# hadolint ignore=DL3007
 FROM cgr.dev/chainguard/wolfi-base:latest
 
 # Runtime packages:
@@ -49,6 +55,9 @@ FROM cgr.dev/chainguard/wolfi-base:latest
 #   `git rev-list` against the /repo bind mount on repo-checkout deploys to
 #   compute ahead/behind. Without git the fetch silently fails and the banner
 #   reports a confidently-wrong drift count from the stale cached tracking ref.
+# Wolfi package versions intentionally follow the patched base channel above;
+# freezing them would prevent security updates when that channel advances.
+# hadolint ignore=DL3018
 RUN apk add --no-cache ca-certificates curl git
 
 COPY --from=builder /build/target/release/corecruxd /usr/local/bin/corecruxd
@@ -71,8 +80,8 @@ ENV CORECRUX_LOG_FORMAT=json
 
 EXPOSE 14800
 
-HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
-  CMD curl -f http://localhost:14800/readyz || exit 1
+HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3 \
+  CMD curl --fail --silent --show-error --max-time 4 http://127.0.0.1:14800/readyz || exit 1
 
 VOLUME ["/data"]
 

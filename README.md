@@ -70,10 +70,15 @@ session and confirm the console is up at http://localhost:14800.
 **Prefer to do it yourself?** Bring the daemon up on any of three rails:
 
 ```bash
-# Docker (recommended)
+# Docker (local development)
 git clone https://github.com/CueCrux/Crux.git && cd Crux
-docker compose up -d
+docker compose -f docker-compose.yml up -d
 ```
+
+The root Compose stack is intentionally loopback-only and uses development
+authentication; never expose it through a proxy or tunnel. For a shared host,
+use the digest-pinned, JWT-authenticated
+[`examples/remote/`](examples/remote/) stack behind TLS.
 
 <details>
 <summary>From a release binary, or from source</summary>
@@ -86,7 +91,7 @@ chmod +x crux
 CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR=./data ./crux
 ```
 
-**From source** (Rust 1.88+, `protobuf-compiler`):
+**From source** (Rust 1.88+):
 
 ```bash
 git clone https://github.com/CueCrux/Crux.git && cd Crux
@@ -383,7 +388,7 @@ API surface: [`docs/developer-portal.md`](docs/developer-portal.md).
 | Path | Requirements |
 |---|---|
 | Docker | Docker or Docker Desktop. |
-| Build from source | Rust 1.88+, `protobuf-compiler`, and a C toolchain. |
+| Build from source | Rust 1.88+ and a C toolchain. Protocol Buffers use a vendored `protoc`. |
 | Shell examples | `curl`; `jq` recommended. |
 | Embeddings | Optional local or remote embedding endpoint. |
 

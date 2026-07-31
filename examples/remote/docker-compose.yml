@@ -1,0 +1,60 @@
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
+#
+# SECURITY POSTURE: SHARED DEPLOYMENT BEHIND A SAME-HOST TLS REVERSE PROXY.
+# Host ports remain loopback-only. See README.md before starting this stack.
+
+services:
+  crux:
+    image: "ghcr.io/cuecrux/crux-daemon@${CRUX_IMAGE_DIGEST:?Set CRUX_IMAGE_DIGEST to sha256 followed by the verified 64-hex digest}"
+    restart: unless-stopped
+    init: true
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 4g
+    stop_grace_period: 30s
+    labels:
+      io.cuecrux.security.posture: shared-behind-tls
+    ports:
+      # A reverse proxy running on this host terminates TLS on 443 and connects
+      # to these loopback-only upstreams. Do not change these to 0.0.0.0.
+      - "127.0.0.1:14800:14800" # HTTP API + embedded console
+      - "127.0.0.1:14801:14801" # MCP (streamable HTTP)
+    volumes:
+      - crux-data:/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "--max-time", "4", "http://127.0.0.1:14800/readyz"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    environment:
+      CORECRUXD_DATA_DIR: /data
+      CORECRUXD_AUTH_MODE: jwt_hs256
+      CORECRUXD_ROUTE_AUTH: enforce
+      CORECRUXD_TENANT_WRITE_STAMP: "on"
+      CORECRUXD_JWT_HS256_SECRET: "${CORECRUXD_JWT_HS256_SECRET:?Set a secret of at least 32 bytes}"
+      CORECRUXD_JWT_ISS: "${CORECRUXD_JWT_ISS:?Set the exact JWT issuer}"
+      CORECRUXD_JWT_AUD: "${CORECRUXD_JWT_AUD:?Set the exact JWT audience}"
+      # MCP has a separate bearer registry. Never reuse a passport seed, JWT
+      # signing secret, or HTTP access token here.
+      CRUX_AGENT_TOKEN: "${CRUX_AGENT_TOKEN:?Set a distinct 32-to-256-character MCP bearer token}"
+      CORECRUXD_HTTP_HOST: 0.0.0.0
+      # gRPC is not published by this example.
+      CORECRUXD_GRPC_HOST: 127.0.0.1
+      CORECRUXD_MCP_HOST: 0.0.0.0
+      CORECRUXD_MCP_PORT: "14801"
+      CORECRUXD_BUILD_CCXI: "1"
+      CORECRUX_LOG_FORMAT: json
+      # Published containers have no repository checkout to audit.
+      CORECRUXD_UPDATE_CHECK_ENABLED: "0"
+
+volumes:
+  crux-data:

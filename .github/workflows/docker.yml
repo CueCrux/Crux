@@ -14,7 +14,29 @@ on:
     paths:
       - "Dockerfile"
       - ".dockerignore"
+      # Dockerfile-specific ignore files override the root .dockerignore.
+      - "*.dockerignore"
+      - "**/*.dockerignore"
+      # Every path admitted by .dockerignore can change the built image.
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "LICENSE"
+      - "NOTICE"
+      - "crates/**"
+      - "proto/**"
+      - "integrations/**"
+      - "docker-compose.yml"
+      - "docker-compose.dev.yml"
+      # Reject any alternative auto-discovery or override files at repo root.
+      - "compose*.yml"
+      - "compose*.yaml"
+      - "docker-compose*.yml"
+      - "docker-compose*.yaml"
+      - "examples/quickstart/**"
+      - "examples/remote/**"
       - ".github/workflows/docker.yml"
+      - "scripts/check-container-hardening.py"
       - "scripts/check-docker-tag-policy.py"
   # Floating aliases move only after the complete Release workflow succeeds.
   # The promotion job never checks out or executes code from the release ref.
@@ -59,9 +81,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Verify immutable release tag policy
         run: python3 scripts/check-docker-tag-policy.py
+
+      - name: Validate container and Compose security postures
+        run: python3 scripts/check-container-hardening.py
 
       - name: Build image for scan (no push)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -114,9 +141,14 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Verify immutable release tag policy
         run: python3 scripts/check-docker-tag-policy.py
+
+      - name: Validate container and Compose security postures
+        run: python3 scripts/check-container-hardening.py
 
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -148,18 +180,24 @@ jobs:
             type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
 
       # --- Supply-chain scan gate (ExecPlan crux-supply-chain-attestation-2026-06-11, M2) ---
-      # Build locally first (no push), scan with Trivy, and only push if the
-      # image carries no CRITICAL vulnerabilities. The runner's Docker layer
-      # cache makes the subsequent push build a no-op rebuild.
+      # Build exactly once under a unique candidate tag, then scan that remote
+      # digest. Only the scanned digest is promoted to edge/semver tags; a
+      # cache hit or second build is never treated as proof of equivalence.
       # New third-party actions below are pinned to commit SHAs (floating
       # tags are themselves a T.5 supply-chain vector).
-      - name: Build image for scan (no push)
+      - name: Build and push uniquely named scan candidate
+        id: push
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
-          push: false
-          load: true
-          tags: local/crux-daemon:scan
+          push: true
+          # A failed scan can leave this explicitly unaccepted candidate tag,
+          # but no supported edge/semver alias moves until the gate below.
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Capture the resolved floating Wolfi base, build args, and complete
+          # dependency graph so every published digest remains traceable.
+          provenance: mode=max
           build-args: |
             GIT_SHA=${{ github.sha }}
             RELEASE_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
@@ -168,7 +206,7 @@ jobs:
         # aquasecurity/trivy-action v0.36.0
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
         with:
-          image-ref: local/crux-daemon:scan
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
           format: sarif
           output: trivy-results.sarif
           severity: CRITICAL,HIGH
@@ -187,15 +225,15 @@ jobs:
         # aquasecurity/trivy-action v0.36.0
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
         with:
-          image-ref: local/crux-daemon:scan
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
           format: table
           severity: CRITICAL
           exit-code: "1"
-          # Gate only on vulnerabilities that have an available fix. Distro base
-          # images (Debian bookworm-slim → git → perl) ship unfixable CRITICALs
-          # (e.g. CVE-2026-8376, CVE-2026-42496 fix_deferred/affected with no
-          # fixed version), which would pin the gate permanently red without any
-          # action available to us. The SARIF report above stays comprehensive
+          # Gate only on vulnerabilities that have an available fix. Base
+          # images can carry vulnerabilities whose distro status is
+          # fix_deferred/affected with no fixed package version, which would pin
+          # the gate permanently red without an available remediation. The
+          # SARIF report above stays comprehensive
           # (all CRITICAL+HIGH, fixed or not) so the Security tab still tracks
           # them; the merge gate fails only on actionable fixes we are skipping.
           ignore-unfixed: true
@@ -230,7 +268,7 @@ jobs:
             --arg reason "$WAIVER_REASON" \
             --arg run_id "${{ github.run_id }}" \
             --arg sha "${{ github.sha }}" \
-            --arg image "local/crux-daemon:scan" \
+            --arg image "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}" \
             '{
               schema: "cuecrux.trivy_waiver.v1",
               owner: $owner,
@@ -254,20 +292,6 @@ jobs:
           path: trivy-waiver.json
           if-no-files-found: error
           retention-days: 90
-
-      - name: Build and push
-        id: push
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # Stamp the build sha into corecruxd --version / the boot banner
-          # (the build context has no .git, so build.rs can't derive it).
-          build-args: |
-            GIT_SHA=${{ github.sha }}
-            RELEASE_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
 
       # --- Image SBOM + keyless sign/attest (ExecPlan crux-supply-chain-attestation-2026-06-11, M3) ---
       # syft generates the SBOM from the image as pushed (digest-addressed),
@@ -297,6 +321,45 @@ jobs:
             --type cyclonedx \
             --predicate crux-daemon-image.cdx.json \
             "$IMAGE_DIGEST_REF"
+
+      # Supported aliases move only after the exact candidate digest has passed
+      # the vulnerability gate, SBOM generation, signing, and attestation.
+      - name: Promote scanned digest to build tags
+        env:
+          EXPECTED_DIGEST: ${{ steps.push.outputs.digest }}
+          FINAL_TAGS: ${{ steps.meta.outputs.tags }}
+          SOURCE_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$EXPECTED_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Build returned an invalid candidate digest: $EXPECTED_DIGEST"
+            exit 1
+          fi
+
+          promoted=0
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            case "$tag" in
+              "${REGISTRY}/${IMAGE_NAME}:"*) ;;
+              *)
+                echo "::error::Refusing unexpected metadata tag: $tag"
+                exit 1
+                ;;
+            esac
+            docker buildx imagetools create --tag "$tag" "$SOURCE_IMAGE"
+            tagged_digest="$(docker buildx imagetools inspect "$tag" \
+              --format '{{json .Manifest.Digest}}' | jq -er '.')"
+            if [ "$tagged_digest" != "$EXPECTED_DIGEST" ]; then
+              echo "::error::Promoted tag $tag resolved to $tagged_digest, expected $EXPECTED_DIGEST"
+              exit 1
+            fi
+            promoted=$((promoted + 1))
+          done <<<"$FINAL_TAGS"
+
+          if [ "$promoted" -eq 0 ]; then
+            echo "::error::Metadata produced no accepted build tag"
+            exit 1
+          fi
 
   # `vX.Y` and `latest` are release acceptance aliases, not build aliases.
   # workflow_run carries a privileged token, so this job treats its payload as

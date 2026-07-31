@@ -18,7 +18,7 @@ Your MCP client connects to `http://localhost:14801/mcp`.
 1. Crux Daemon must be running:
 
    ```bash
-   docker compose up -d
+   docker compose -f docker-compose.yml up -d
    # or: source config.example.env && ./corecruxd
    ```
 

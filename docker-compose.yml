@@ -1,10 +1,28 @@
 # Copyright (c) 2026 CueCrux Ltd.
 # Licensed under the Apache License, Version 2.0.
+#
+# SECURITY POSTURE: LOCAL DEVELOPMENT ONLY.
+# `dev_scopes` trusts caller-supplied scope text. Although host ports are bound
+# to loopback, this stack must not be exposed through a proxy, tunnel, or public
+# interface. For a shared deployment behind TLS, use examples/remote/.
 
 services:
   crux:
     image: cuecrux/crux-daemon:latest
     build: .
+    pull_policy: build
+    labels:
+      io.cuecrux.security.posture: local-development-only
+    init: true
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
     # `unless-stopped` lets the in-console "Restart daemon" button work — the
     # process exits cleanly via POST /v1/admin/restart and Docker brings it
     # back up. Manual `docker compose stop` still wins (won't auto-restart).
@@ -15,21 +33,24 @@ services:
     volumes:
       - crux-data:/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:14800/readyz"]
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "--max-time", "4", "http://127.0.0.1:14800/readyz"]
       interval: 10s
       timeout: 5s
+      start_period: 10s
       retries: 3
     deploy:
       resources:
         limits:
           memory: 4G
+          pids: 512
     environment:
       - CORECRUXD_DATA_DIR=/data
       - CORECRUXD_AUTH_MODE=dev_scopes
       - CORECRUXD_ROUTE_AUTH=enforce
       - CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND=1
       - CORECRUXD_HTTP_HOST=0.0.0.0
-      - CORECRUXD_GRPC_HOST=0.0.0.0
+      # gRPC is not published by this stack; keep it unreachable to sidecars.
+      - CORECRUXD_GRPC_HOST=127.0.0.1
       - CORECRUXD_MCP_HOST=0.0.0.0
       - CORECRUXD_MCP_PORT=14801
       - CORECRUXD_BUILD_CCXI=1
@@ -42,17 +63,31 @@ services:
       - CORECRUXD_OBS_RETENTION_DAYS=${CORECRUXD_OBS_RETENTION_DAYS:-}
 
   # ── Optional: local Ollama for embeddings ──────────────────────
-  # Start with:  docker compose --profile embeddings up -d
+  # Start with:  docker compose -f docker-compose.yml --profile embeddings up -d
   ollama:
+    # Deliberate local-only convenience float. The hardened shared example
+    # omits this optional sidecar; pin a reviewed digest for shared use.
     image: ollama/ollama:latest
     profiles: ["embeddings"]
+    labels:
+      io.cuecrux.security.posture: local-development-only
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
     ports:
       - "127.0.0.1:11434:11434"
     volumes:
       - ollama-models:/root/.ollama
+    environment:
+      # Pass the model as data. The entrypoint expands it inside double quotes,
+      # so Compose-controlled values cannot become shell syntax.
+      OLLAMA_MODEL: ${CORECRUXD_EMBEDDING_MODEL:-nomic-embed-text}
     # Pull the embedding model on first start.
     # Remove or change this if you use a different model.
-    entrypoint: ["/bin/sh", "-c", "ollama serve & sleep 3 && ollama pull ${CORECRUXD_EMBEDDING_MODEL:-nomic-embed-text} && wait"]
+    entrypoint: ["/bin/sh", "-ec", "ollama serve & pid=$$!; sleep 3; ollama pull \"$$OLLAMA_MODEL\"; wait \"$$pid\""]
 
 volumes:
   crux-data:

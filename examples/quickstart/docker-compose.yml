@@ -2,8 +2,11 @@
 # Licensed under the Apache License, Version 2.0.
 #
 # Crux daemon — pull-only quickstart (no source checkout, no local build).
+# SECURITY POSTURE: LOCAL DEVELOPMENT ONLY. `dev_scopes` trusts caller-supplied
+# scope text. Do not expose this stack through a proxy, tunnel, or public
+# interface; use ../remote/ for a shared deployment behind TLS.
 #
-#   docker compose up -d
+#   docker compose -f docker-compose.yml up -d
 #   curl -sf http://127.0.0.1:14800/readyz
 #
 # Before first use, verify the image signature + SBOM attestation:
@@ -11,11 +14,23 @@
 #
 # Tag policy: `:latest` tracks the newest RELEASE TAG, not main. Pin a version
 # for anything you care about:
-#   CRUX_VERSION=0.5.0 docker compose up -d
+#   CRUX_VERSION=0.5.0 docker compose -f docker-compose.yml up -d
 services:
   crux:
     image: ghcr.io/cuecrux/crux-daemon:${CRUX_VERSION:-latest}
+    labels:
+      io.cuecrux.security.posture: local-development-only
     restart: unless-stopped
+    init: true
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
     # Runs as uid 65532 (non-root). The named volume below inherits correct
     # ownership from the image automatically. If you switch to a bind mount,
     # chown the host dir first: sudo chown -R 65532:65532 ./crux-data
@@ -28,14 +43,16 @@ services:
     volumes:
       - crux-data:/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:14800/readyz"]
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "--max-time", "4", "http://127.0.0.1:14800/readyz"]
       interval: 10s
       timeout: 5s
+      start_period: 10s
       retries: 3
     deploy:
       resources:
         limits:
           memory: 4G
+          pids: 512
     environment:
       - CORECRUXD_DATA_DIR=/data
       # dev_scopes is the local-development posture. For anything shared,
@@ -44,7 +61,8 @@ services:
       - CORECRUXD_ROUTE_AUTH=enforce
       - CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND=1
       - CORECRUXD_HTTP_HOST=0.0.0.0
-      - CORECRUXD_GRPC_HOST=0.0.0.0
+      # gRPC is not published by this stack; keep it unreachable to sidecars.
+      - CORECRUXD_GRPC_HOST=127.0.0.1
       - CORECRUXD_MCP_HOST=0.0.0.0
       - CORECRUXD_MCP_PORT=14801
       - CORECRUXD_BUILD_CCXI=1

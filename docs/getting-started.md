@@ -95,8 +95,10 @@ first-class, continuously-dogfooded path. WSL2 specifics are in
 
 ### Build from source
 
-Rust 1.88+, `protobuf-compiler`, then `cargo build --locked --release`. See
-the [README Quickstart](../README.md#quickstart).
+Install Rust 1.88+ and a C toolchain, then run
+`cargo build --locked --release`. The workspace uses a vendored `protoc`; no
+system Protocol Buffers compiler is required. See the
+[README Quickstart](../README.md#quickstart).
 
 #### Cargo feature flags
 
