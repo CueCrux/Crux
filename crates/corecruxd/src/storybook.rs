@@ -885,10 +885,18 @@ fn truncate_iso(iso: &str) -> String {
 fn truncate_for_quote(s: &str, max: usize) -> String {
     let cleaned: String = s.lines().take(3).collect::<Vec<_>>().join(" ");
     if cleaned.len() <= max {
-        cleaned
-    } else {
-        format!("{}…", &cleaned[..max])
+        return cleaned;
     }
+    // `max` is a byte budget, but slicing at it directly panics when a
+    // multi-byte character straddles the limit. Callers pass operator-supplied
+    // plane-vision text and source snippets, so an em-dash in a comment used
+    // to take down the whole readout. Retreat to the nearest char boundary at
+    // or below the budget.
+    let mut end = max;
+    while end > 0 && !cleaned.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &cleaned[..end])
 }
 
 #[cfg(test)]
@@ -1700,17 +1708,33 @@ mod tests {
         assert_eq!(out, format!("{}…", "a".repeat(10)));
     }
 
-    /// Pins current behaviour, deliberately: `truncate_for_quote` slices by byte
-    /// index, so a multi-byte character straddling the limit panics rather than
-    /// truncating. `generate` calls it on operator-supplied plane vision text
+    /// D-4 (inverted pin): `truncate_for_quote` sliced by byte index, so a
+    /// multi-byte character straddling the limit panicked rather than
+    /// truncating. `generate` calls it on operator-supplied plane-vision text
     /// (limit 280) and on scan snippets (limit 80), so non-ASCII prose of the
-    /// wrong length takes the whole readout down. Not fixed here — this test
-    /// exists so the fix has a failing test to flip.
+    /// wrong length took the whole readout down.
     #[test]
-    #[should_panic(expected = "char boundary")]
-    fn truncate_for_quote_panics_on_a_multibyte_char_boundary() {
-        // Nine 'é' (2 bytes each) = 18 bytes; byte 9 lands mid-character.
-        let _ = truncate_for_quote(&"é".repeat(9), 9);
+    fn truncate_for_quote_retreats_to_a_char_boundary_instead_of_panicking() {
+        // Nine 'é' (2 bytes each) = 18 bytes; byte 9 lands mid-character, so
+        // the cut retreats to byte 8 — four whole characters.
+        assert_eq!(truncate_for_quote(&"é".repeat(9), 9), format!("{}…", "é".repeat(4)));
+
+        // A budget that lands exactly on a boundary is unchanged.
+        assert_eq!(truncate_for_quote(&"é".repeat(9), 8), format!("{}…", "é".repeat(4)));
+
+        // Wider characters, and a budget smaller than the first character:
+        // the result is the ellipsis alone, never a panic and never invalid
+        // UTF-8.
+        assert_eq!(truncate_for_quote("日本語テキスト", 2), "…");
+        assert_eq!(truncate_for_quote("日本語テキスト", 3), "日…");
+
+        // The real caller budgets, over text that straddles them.
+        for max in [80usize, 280] {
+            let text = "—".repeat(max);
+            let out = truncate_for_quote(&text, max);
+            assert!(out.ends_with('…'));
+            assert!(out.len() <= max + '…'.len_utf8());
+        }
     }
 
     #[test]
