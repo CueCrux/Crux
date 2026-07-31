@@ -56,6 +56,13 @@ pub enum AuthMode {
 
 impl AuthMode {
     pub fn parse(s: &str) -> Option<Self> {
+        // A value that is *present but blank* is not "off" — it is a
+        // misconfiguration. Returning `Off` here would boot the daemon with
+        // authentication disabled while the config looks set. Only a
+        // genuinely empty string (an unset variable) means "unset".
+        if !s.is_empty() && s.trim().is_empty() {
+            return None;
+        }
         match s.trim() {
             "" | "off" | "OFF" => Some(Self::Off),
             "dev" | "DEV" | "dev_scopes" | "DEV_SCOPES" | "devscopes" | "DEVSCOPES" | "dev-scopes" | "DEV-SCOPES" => {
@@ -520,9 +527,14 @@ fn verify_jwt_hs256(cfg: &JwtHs256Config, token: &str) -> Result<AuthContext, St
     validation.leeway = 30;
     if let Some(iss) = cfg.issuer.as_deref() {
         validation.set_issuer(&[iss]);
+        // jsonwebtoken only compares a pinned claim WHEN PRESENT; an absent
+        // claim otherwise falls through to `Ok`. Require it so that "not
+        // checked" cannot read the same as "checked and matched".
+        validation.required_spec_claims.insert("iss".to_string());
     }
     if let Some(aud) = cfg.audience.as_deref() {
         validation.set_audience(&[aud]);
+        validation.required_spec_claims.insert("aud".to_string());
     }
 
     let data = decode::<serde_json::Value>(token, &DecodingKey::from_secret(cfg.secret.as_slice()), &validation)
@@ -711,9 +723,13 @@ fn verify_jwt_jwks(cfg: &JwtJwksConfig, token: &str) -> Result<AuthContext, Stri
     validation.leeway = 30;
     if let Some(iss) = cfg.issuer.as_deref() {
         validation.set_issuer(&[iss]);
+        // See `verify_jwt_hs256`: pinning without requiring the claim lets a
+        // token that simply omits it bypass the pin.
+        validation.required_spec_claims.insert("iss".to_string());
     }
     if let Some(aud) = cfg.audience.as_deref() {
         validation.set_audience(&[aud]);
+        validation.required_spec_claims.insert("aud".to_string());
     }
 
     let key = resolve_jwks_key(cfg, kid)?;
@@ -1643,6 +1659,135 @@ mod tests {
         assert_eq!(err.0.status, 403);
     }
 
+    /// D-1 (inverted pin): a token that OMITS a pinned `iss`/`aud` must be
+    /// rejected, not waved through. `jsonwebtoken` only compares a pinned
+    /// claim when it is present, so pinning without `required_spec_claims`
+    /// let a credential minted by the same key for a different audience
+    /// authenticate simply by leaving the claim out.
+    #[test]
+    #[serial_test::serial]
+    fn jwt_hs256_token_omitting_pinned_iss_or_aud_is_rejected() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
+        std::env::remove_var(ALLOW_WEAK_HS256_SECRET_ENV);
+        std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
+        std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
+
+        let auth = Authz::from_env(AuthMode::JwtHs256).expect("auth from env");
+        let exp = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600) as usize;
+
+        let headers_for = |claims: serde_json::Value| {
+            let token = encode(
+                &Header::new(Algorithm::HS256),
+                &claims,
+                &EncodingKey::from_secret(TEST_HS256_SECRET.as_bytes()),
+            )
+            .expect("jwt");
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {token}").parse().unwrap(),
+            );
+            headers
+        };
+
+        // Both claims omitted.
+        let both = headers_for(serde_json::json!({
+            "exp": exp, "scope": "admin:write", "tenant_id": "t1",
+        }));
+        assert_eq!(
+            require_http_scopes(&auth, &both, &["admin:write"])
+                .unwrap_err()
+                .0
+                .status,
+            401,
+            "a token omitting both pinned claims must not authenticate"
+        );
+
+        // `iss` omitted, `aud` correct.
+        let no_iss = headers_for(serde_json::json!({
+            "exp": exp, "aud": "corecrux", "scope": "admin:write", "tenant_id": "t1",
+        }));
+        assert_eq!(
+            require_http_scopes(&auth, &no_iss, &["admin:write"])
+                .unwrap_err()
+                .0
+                .status,
+            401,
+            "an absent iss must not read the same as a matching iss"
+        );
+
+        // `aud` omitted, `iss` correct.
+        let no_aud = headers_for(serde_json::json!({
+            "exp": exp, "iss": "corecrux-test", "scope": "admin:write", "tenant_id": "t1",
+        }));
+        assert_eq!(
+            require_http_scopes(&auth, &no_aud, &["admin:write"])
+                .unwrap_err()
+                .0
+                .status,
+            401,
+            "an absent aud must not read the same as a matching aud"
+        );
+
+        // Control: both present and correct still authenticates.
+        let good = headers_for(serde_json::json!({
+            "exp": exp, "iss": "corecrux-test", "aud": "corecrux",
+            "scope": "admin:write", "tenant_id": "t1",
+        }));
+        require_http_scopes(&auth, &good, &["admin:write"]).expect("fully-claimed token still works");
+
+        std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
+        std::env::remove_var("CORECRUXD_JWT_ISS");
+        std::env::remove_var("CORECRUXD_JWT_AUD");
+    }
+
+    /// D-1 (inverted pin), unpinned-config control: when the daemon pins
+    /// neither `iss` nor `aud`, a token omitting them is still fine. The fix
+    /// must tighten only what the operator actually configured.
+    #[test]
+    #[serial_test::serial]
+    fn jwt_hs256_unpinned_iss_and_aud_do_not_become_required() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
+        std::env::remove_var(ALLOW_WEAK_HS256_SECRET_ENV);
+        std::env::remove_var("CORECRUXD_JWT_ISS");
+        std::env::remove_var("CORECRUXD_JWT_AUD");
+
+        let auth = Authz::from_env(AuthMode::JwtHs256).expect("auth from env");
+        let exp = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600) as usize;
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &serde_json::json!({ "exp": exp, "scope": "admin:write", "tenant_id": "t1" }),
+            &EncodingKey::from_secret(TEST_HS256_SECRET.as_bytes()),
+        )
+        .expect("jwt");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        require_http_scopes(&auth, &headers, &["admin:write"]).expect("unpinned config is unchanged");
+
+        std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
+    }
+
     #[test]
     fn jwt_jwks_requires_config_env() {
         let lock = env_lock();
@@ -1816,6 +1961,32 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         }));
         assert_eq!(legacy_alias.passport_id.as_deref(), Some("legacy-passport"));
         assert!(!legacy_alias.canonical_passport_claim_verified());
+
+        // D-1 (inverted pin) on the JWKS path: omitting a pinned claim must
+        // not bypass the pin. Same defect, same fix as `verify_jwt_hs256`.
+        let omitted = encode(
+            &header,
+            &serde_json::json!({ "exp": exp, "scope": "admin:write", "tenant_id": "t1" }),
+            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY_PEM.as_bytes()).expect("rsa key"),
+        )
+        .expect("jwt");
+        let mut omitted_headers = HeaderMap::new();
+        omitted_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {omitted}").parse().unwrap(),
+        );
+        assert_eq!(
+            require_http_scopes(&auth, &omitted_headers, &["admin:write"])
+                .unwrap_err()
+                .0
+                .status,
+            401,
+            "a JWKS token omitting the pinned iss/aud must not authenticate"
+        );
+
+        std::env::remove_var("CORECRUXD_JWT_JWKS_JSON");
+        std::env::remove_var("CORECRUXD_JWT_ISS");
+        std::env::remove_var("CORECRUXD_JWT_AUD");
     }
 
     fn env_lock() -> &'static std::sync::Mutex<()> {
@@ -1871,6 +2042,28 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
                 "expected Off for alias '{alias}'"
             );
         }
+    }
+
+    /// D-2 (inverted pin): a *present but blank* auth mode is a
+    /// misconfiguration, not "off". `parse` trimmed first, so
+    /// `CORECRUXD_AUTH_MODE="   "` resolved to `Off` — the daemon booted with
+    /// authentication disabled while the config looked set — and
+    /// `auth_mode_invalid` stayed `None`, so `main`'s fail-closed guard never
+    /// fired. Only a genuinely empty string means "unset".
+    #[test]
+    fn auth_mode_parse_blank_string_is_rejected_not_off() {
+        for blank in &["   ", "\t", "\n", " \t\n "] {
+            assert_eq!(
+                AuthMode::parse(blank),
+                None,
+                "a present-but-blank mode must be reported as invalid, not Off"
+            );
+        }
+        // The unset case is still Off.
+        assert_eq!(AuthMode::parse(""), Some(AuthMode::Off));
+        // Padded but meaningful values are still trimmed and accepted.
+        assert_eq!(AuthMode::parse("  off  "), Some(AuthMode::Off));
+        assert_eq!(AuthMode::parse("\tdev\n"), Some(AuthMode::DevScopes));
     }
 
     #[test]
@@ -2785,18 +2978,10 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
 
     // ── DEFECT PIN: a whitespace-only auth mode silently means "off" ───────
 
-    #[test]
-    fn auth_mode_parse_blank_string_is_off_not_rejected() {
-        // `AuthMode::parse` trims first, so a whitespace-only configured value
-        // resolves to `Off` — i.e. NO authentication — instead of being
-        // reported as an unknown mode. `config.rs` only filters the *empty*
-        // string, so `CORECRUXD_AUTH_MODE="   "` reaches here, parses clean,
-        // and `auth_mode_invalid` stays `None`, so `main` does not abort.
-        //
-        // This test pins CURRENT behaviour. It is not an endorsement.
-        assert_eq!(AuthMode::parse("   "), Some(AuthMode::Off));
-        assert_eq!(AuthMode::parse("\t\n"), Some(AuthMode::Off));
-    }
+    // The characterization test that pinned blank-is-Off lived here. It said of
+    // itself "This test pins CURRENT behaviour. It is not an endorsement" — the
+    // behaviour it pinned is D-2, fixed above. `auth_mode_parse_blank_string_is_rejected_not_off`
+    // is its replacement and covers the same inputs with the corrected expectation.
 
     // ── AuthMode::Off — the documented total bypass ────────────────────────
 
@@ -3149,81 +3334,12 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         );
     }
 
-    // ── DEFECT PIN: an ABSENT iss/aud claim skips issuer/audience pinning ──
-
-    #[test]
-    fn hs256_token_omitting_iss_and_aud_is_accepted_even_though_both_are_pinned() {
-        // `verify_jwt_hs256` calls `Validation::set_issuer` / `set_audience`
-        // but never adds "iss"/"aud" to `required_spec_claims`. jsonwebtoken 11
-        // only compares those claims WHEN PRESENT (see
-        // `validation.rs::validate` — the `(NotPresent, Some(expected))` arm
-        // falls through to `Ok`), so a token that simply omits them sails past
-        // the configured pinning. A credential minted by the same key for a
-        // different audience is therefore accepted here.
-        //
-        // This test pins CURRENT behaviour. It is not an endorsement.
-        let auth = hs256_authz();
-        let token = sign_hs256(
-            &serde_json::json!({
-                "exp": now_secs() + 3600,
-                "scope": "admin:write",
-                "tenant_id": "t1",
-            }),
-            TEST_HS256_SECRET,
-        );
-        require_http_scopes(&auth, &bearer(&token), &["admin:write"])
-            .expect("current behaviour: an absent iss/aud claim is not checked");
-
-        // Only ONE of the two omitted is enough to demonstrate it per claim.
-        let no_iss = sign_hs256(
-            &serde_json::json!({
-                "exp": now_secs() + 3600, "aud": "corecrux", "scope": "admin:write",
-            }),
-            TEST_HS256_SECRET,
-        );
-        require_http_scopes(&auth, &bearer(&no_iss), &["admin:write"]).expect("absent iss is not checked");
-
-        let no_aud = sign_hs256(
-            &serde_json::json!({
-                "exp": now_secs() + 3600, "iss": "corecrux-test", "scope": "admin:write",
-            }),
-            TEST_HS256_SECRET,
-        );
-        require_http_scopes(&auth, &bearer(&no_aud), &["admin:write"]).expect("absent aud is not checked");
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn jwt_jwks_token_omitting_iss_and_aud_is_also_accepted() {
-        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-
-        // Same defect on the JWKS path (`verify_jwt_jwks`). Pinned, not fixed.
-        let lock = env_lock();
-        let _g = lock.lock().unwrap();
-
-        std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
-        std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
-        std::env::remove_var("CORECRUXD_JWT_ALGS");
-        std::env::set_var("CORECRUXD_JWT_JWKS_JSON", TEST_JWKS_JSON);
-        std::env::remove_var("CORECRUXD_JWT_JWKS_URL");
-        std::env::remove_var("CORECRUXD_JWT_OIDC_DISCOVERY_URL");
-        let auth = Authz::from_env(AuthMode::JwtJwks).expect("auth from env");
-
-        let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some("test-kid".to_string());
-        let token = encode(
-            &header,
-            &serde_json::json!({
-                "exp": now_secs() + 3600, "scope": "admin:write", "tenant_id": "t1",
-            }),
-            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY_PEM.as_bytes()).expect("rsa key"),
-        )
-        .expect("jwt");
-        require_http_scopes(&auth, &bearer(&token), &["admin:write"])
-            .expect("current behaviour: an absent iss/aud claim is not checked");
-
-        std::env::remove_var("CORECRUXD_JWT_JWKS_JSON");
-    }
+    // The DEFECT PIN block for D-1 lived here: two tests asserting that an
+    // absent iss/aud claim sails past the configured pinning. Both said of
+    // themselves "This test pins CURRENT behaviour. It is not an endorsement".
+    // That behaviour is the defect fixed above; the replacements are
+    // jwt_hs256_token_omitting_pinned_iss_or_aud_is_rejected and its control
+    // jwt_hs256_unpinned_iss_and_aud_do_not_become_required.
 
     #[test]
     fn hs256_valid_token_with_wrong_scope_is_403_not_401() {
