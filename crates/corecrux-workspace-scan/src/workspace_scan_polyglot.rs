@@ -5533,7 +5533,10 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
         std::fs::write(root.join("good.ts"), "export function ok() { return 1; }\n").expect("good ts");
-        std::fs::write(root.join("broken.ts"), "export function ( { ) }}} <<<\n").expect("broken ts");
+        // NB: brace-balanced on purpose — `scripts/unwrap-ratchet.sh` tracks
+        // `#[cfg(test)]` scope by counting braces textually, so an unbalanced
+        // literal here silently exposes the rest of this module to the ratchet.
+        std::fs::write(root.join("broken.ts"), "export function ( <<< ,,, ===\n").expect("broken ts");
         std::fs::write(root.join("broken.py"), "def (:::\n  return\n").expect("broken py");
         // Genuinely empty: no symbols, but also no failure.
         std::fs::write(root.join("empty.ts"), "").expect("empty ts");
