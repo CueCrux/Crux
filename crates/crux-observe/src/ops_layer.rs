@@ -343,7 +343,7 @@ mod tests {
             ids.push_back(fact.fact_id);
             while ids.len() > max_facts {
                 if let Some(old_id) = ids.pop_front() {
-                    s.delete(&old_id);
+                    s.delete("default", &old_id);
                 }
             }
         }
