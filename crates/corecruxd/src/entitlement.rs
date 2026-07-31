@@ -264,6 +264,37 @@ pub fn load_token_record(store: &FactStore) -> Option<String> {
 
 // ---- verify + resolve ------------------------------------------------------
 
+/// Verify a candidate token without touching the store.
+///
+/// Pairing uses this to check a freshly-minted token **before** persisting it.
+/// Persisting first would be a downgrade vector: writes are versioned and reads
+/// take the highest version, so a rejected token written over a good one would
+/// silently drop a working Pro daemon to Free on the next resolve.
+pub fn verify_candidate(
+    token: &RcxCapabilityToken,
+    trust_root_pubkey: &[u8],
+    now_unix_seconds: u64,
+    daemon_tenant_id: &str,
+) -> Option<EntitlementFailure> {
+    if token.tenant_scope.tenant_id != daemon_tenant_id {
+        return Some(EntitlementFailure::WrongTenantScope);
+    }
+    match rcx_capability_token::verify_token(token, trust_root_pubkey, now_unix_seconds) {
+        VerifyOutcome::Verified => None,
+        VerifyOutcome::BadSignature | VerifyOutcome::BadTrustRoot => Some(EntitlementFailure::BadSignature),
+        VerifyOutcome::StructuralFailure(issues) => {
+            if !issues.iter().any(|issue| issue == "token_expired") {
+                return Some(EntitlementFailure::Structural(issues));
+            }
+            let when_fresh = token.issued_at.saturating_add(1);
+            if rcx_capability_token::verify_token(token, trust_root_pubkey, when_fresh) != VerifyOutcome::Verified {
+                return Some(EntitlementFailure::BadSignature);
+            }
+            Some(EntitlementFailure::Expired)
+        }
+    }
+}
+
 /// Resolve the daemon's operating mode from persisted entitlement state.
 ///
 /// **Dark in M2** — no caller enforces on this yet.
