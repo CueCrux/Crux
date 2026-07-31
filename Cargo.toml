@@ -25,6 +25,7 @@ members = [
   "crates/crux-lens-features",
   "crates/crux-mcp",
   "crates/crux-session",
+  "crates/crux-escrow",
   "crates/rcx-capability-token",
   "crates/crux-router",
   "crates/crux-enterprise-shim",
@@ -70,6 +71,7 @@ crc32fast = "1.4.2"
 # `zeroize` is a default feature of ed25519-dalek; pinned explicitly so the
 # SigningKey seed zeroize-on-drop guarantee (compaction-sync review F4) survives a
 # future `default-features = false` on any consumer. Additive; no lock/version change.
+data-encoding = "2.9.0"
 ed25519-dalek = { version = "2.2.0", features = ["zeroize"] }
 fs2 = "0.4.3"
 hex = "0.4.3"
@@ -108,6 +110,10 @@ url = "2.5.7"
 urlencoding = "2.1"
 utoipa = "5"
 uuid = "1.23.2"
+# GF(256) Shamir for the 2-of-3 key escrow (`Gf256::split_bytes`). Default features
+# off keeps the prime-field/elliptic-curve half of the crate out of the tree.
+vsss-rs = { version = "6.0.1", default-features = false, features = ["std", "zeroize"] }
+zeroize = { version = "1", features = ["derive"] }
 x509-cert = { version = "0.3.0", default-features = false }
 xxhash-rust = "0.8.12"
 zip = { version = "8.6.0", default-features = false }
