@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 CueCrux Ltd.
 # Licensed under the Apache License, Version 2.0.
-"""Fail closed on untrusted GitHub workflow runner selection.
+"""Fail closed on unsafe GitHub workflow runners and mutable action references.
 
 This intentionally parses only the security-relevant GitHub Actions YAML
 surface. Unsupported indirection is rejected in untrusted workflows rather
-than evaluated as a GitHub expression. The checker has no third-party runtime
-dependencies so the trusted default-branch copy can inspect a PR tree as inert
-data from ``pull_request_target``.
+than evaluated as a GitHub expression, and every external action is required
+to use an immutable commit or image digest. The checker has no third-party
+runtime dependencies so the trusted default-branch copy can inspect a PR tree
+as inert data from ``pull_request_target``.
 """
 
 from __future__ import annotations
@@ -37,6 +38,19 @@ TRUSTED_DYNAMIC_RUNNER_EXCEPTIONS = {
 POLICY_WORKFLOW = ".github/workflows/runner-policy.yml"
 POLICY_WORKFLOW_EVENTS = frozenset({"pull_request_target", "merge_group", "push"})
 POLICY_STATUS_NAME = "Workflow runner policy"
+ACTION_SHA = re.compile(r"^[0-9a-f]{40}$")
+DOCKER_DIGEST = re.compile(r"^docker://[^@\s]+@sha256:[0-9a-f]{64}$")
+MUTABLE_ACTION_EXCEPTIONS = {
+    (
+        ".github/workflows/release.yml",
+        "provenance",
+        "slsa-framework/slsa-github-generator/.github/workflows/"
+        "generator_generic_slsa3.yml@v2.1.0",
+    ): (
+        "slsa-github-generator requires an exact vX.Y.Z reusable-workflow ref "
+        "so its verifier can authenticate the builder identity; commit refs are unsupported"
+    ),
+}
 TRUSTED_DYNAMIC_JOB_NAME_EXCEPTIONS = {
     (".github/workflows/fuzz.yml", "fuzz"): "Fuzz (${{ matrix.target }})",
     (".github/workflows/mutants.yml", "mutants"): "shard ${{ matrix.shard }}",
@@ -551,6 +565,164 @@ class WorkflowDocument:
             raise ValueError("runner selection is empty")
         return line, values
 
+    def job_action_uses(self, job: Job) -> list[tuple[Line, str]]:
+        """Return literal job- and step-level ``uses`` references.
+
+        This parser is deliberately strict for privileged jobs: aliases, merge
+        keys, block scalars, expressions, duplicate properties, and scalar
+        continuations fail closed instead of being interpreted.
+        """
+        references: list[tuple[Line, str]] = []
+
+        reusable = job.properties.get("uses")
+        if reusable is not None:
+            line, value = reusable
+            continuation = self.scalar_continuation(line, job.end)
+            if continuation is not None:
+                self.error(
+                    continuation.number,
+                    "privileged reusable-workflow uses must be one line",
+                    job.name,
+                )
+            else:
+                parsed = self._literal_action_reference(line, value, job)
+                if parsed is not None:
+                    references.append((line, parsed))
+
+        steps = job.properties.get("steps")
+        if steps is None:
+            return references
+        steps_line, steps_value = steps
+        if steps_value:
+            self.error(
+                steps_line.number,
+                "privileged job steps must be a literal block sequence",
+                job.name,
+            )
+            return references
+
+        steps_end = job.end
+        for index in range(steps_line.number, job.end):
+            candidate = self.lines[index]
+            if candidate.content and candidate.indent <= steps_line.indent:
+                steps_end = index
+                break
+        body = [
+            candidate
+            for candidate in self.lines[steps_line.number : steps_end]
+            if candidate.content
+        ]
+        if not body:
+            self.error(
+                steps_line.number,
+                "privileged job steps block is empty",
+                job.name,
+            )
+            return references
+        step_indent = body[0].indent
+        if step_indent <= steps_line.indent:
+            self.error(
+                body[0].number,
+                "privileged job steps must be indented below the steps key",
+                job.name,
+            )
+            return references
+        starts: list[int] = []
+        for index in range(steps_line.number, steps_end):
+            candidate = self.lines[index]
+            if not candidate.content:
+                continue
+            if candidate.indent < step_indent:
+                self.error(
+                    candidate.number,
+                    "privileged job steps use inconsistent indentation",
+                    job.name,
+                )
+                continue
+            if candidate.indent != step_indent:
+                continue
+            if not candidate.content.startswith("- "):
+                self.error(
+                    candidate.number,
+                    "privileged job steps must use literal sequence mappings",
+                    job.name,
+                )
+                continue
+            starts.append(index)
+        if not starts:
+            self.error(
+                steps_line.number,
+                "privileged job steps contain no literal sequence mappings",
+                job.name,
+            )
+            return references
+
+        for position, start in enumerate(starts):
+            end = starts[position + 1] if position + 1 < len(starts) else steps_end
+            first = self.lines[start]
+            first_entry = _mapping_entry(first.content[2:].strip())
+            if first_entry is None or first_entry[0] == "<<":
+                self.error(
+                    first.number,
+                    "privileged job step contains an alias, merge, or unresolved mapping",
+                    job.name,
+                )
+                continue
+
+            properties: dict[str, tuple[Line, str]] = {
+                first_entry[0]: (first, first_entry[1])
+            }
+            for candidate in self.lines[start + 1 : end]:
+                if not candidate.content or candidate.indent != step_indent + 2:
+                    continue
+                entry = _mapping_entry(candidate.content)
+                if entry is None or entry[0] == "<<":
+                    self.error(
+                        candidate.number,
+                        "privileged job step contains an alias, merge, or unresolved property",
+                        job.name,
+                    )
+                    continue
+                key, value = entry
+                if key in properties:
+                    self.error(
+                        candidate.number,
+                        f"privileged job step duplicates {key!r}",
+                        job.name,
+                    )
+                    continue
+                properties[key] = (candidate, value)
+
+            action = properties.get("uses")
+            if action is None:
+                continue
+            line, value = action
+            parsed = self._literal_action_reference(line, value, job)
+            if parsed is not None:
+                references.append((line, parsed))
+        return references
+
+    def _literal_action_reference(
+        self, line: Line, value: str, job: Job
+    ) -> str | None:
+        try:
+            parsed = _literal_values(value)
+        except ValueError as exc:
+            self.error(
+                line.number,
+                f"privileged action uses is unresolved: {exc}",
+                job.name,
+            )
+            return None
+        if len(parsed) != 1:
+            self.error(
+                line.number,
+                "privileged action uses must contain exactly one literal reference",
+                job.name,
+            )
+            return None
+        return parsed[0]
+
     def validate_hosted_include_matrix(self, job: Job, variable: str) -> None:
         strategy = job.properties.get("strategy")
         if strategy is None or strategy[1]:
@@ -793,7 +965,7 @@ class WorkflowDocument:
             }
             parsed_steps.append((first, flattened, with_values))
 
-        checkout = re.compile(r"^actions/checkout@(?:v7|[0-9a-f]{40})$")
+        checkout = re.compile(r"^actions/checkout@[0-9a-f]{40}$")
         expected = [
             (
                 {"uses"},
@@ -1122,7 +1294,10 @@ class RunnerPolicy:
                 f"{POLICY_WORKFLOW}:1: trusted runner policy workflow is required"
             )
         for path in candidates:
-            self._audit_path(path, force_untrusted=False)
+            self._audit_path(
+                path,
+                force_untrusted=False,
+            )
         return sorted(set(self.errors))
 
     def _document(self, path: Path) -> WorkflowDocument:
@@ -1194,7 +1369,101 @@ class RunnerPolicy:
                 job.name,
             )
 
-    def _audit_path(self, path: Path, *, force_untrusted: bool) -> None:
+    def _audit_privileged_action_pins(
+        self,
+        document: WorkflowDocument,
+        jobs: list[Job],
+    ) -> None:
+        # Privilege classification itself is a mutable, expression-rich YAML
+        # surface. Enforce immutable external references repository-wide so a
+        # new secret spelling, token default, artifact edge, or YAML feature
+        # cannot move an action outside the protected set.
+        for job in jobs:
+            for line, reference in document.job_action_uses(job):
+                exception = MUTABLE_ACTION_EXCEPTIONS.get(
+                    (document.relative, job.name, reference)
+                )
+                if exception is not None:
+                    continue
+                if reference.startswith("./"):
+                    local = PurePosixPath(reference[2:])
+                    if local.is_absolute() or ".." in local.parts:
+                        document.error(
+                            line.number,
+                            f"privileged local action path is unsafe: {reference!r}",
+                            job.name,
+                        )
+                        continue
+                    workflow_target = _local_workflow_target(reference)
+                    if reference.startswith("./.github/workflows/"):
+                        if workflow_target is None:
+                            document.error(
+                                line.number,
+                                f"privileged local reusable workflow path is unsafe: "
+                                f"{reference!r}",
+                                job.name,
+                            )
+                            continue
+                        callee = self.root / workflow_target
+                        if (
+                            not callee.exists()
+                            or callee.is_symlink()
+                            or not callee.is_file()
+                        ):
+                            document.error(
+                                line.number,
+                                f"privileged local reusable workflow "
+                                f"{workflow_target.as_posix()!r} is missing or unsafe",
+                                job.name,
+                            )
+                            continue
+                        callee_document = self._document(callee)
+                        if "workflow_call" not in callee_document.events():
+                            document.error(
+                                line.number,
+                                f"privileged local reusable workflow "
+                                f"{workflow_target.as_posix()!r} lacks workflow_call",
+                                job.name,
+                            )
+                            continue
+                        self._audit_path(
+                            callee,
+                            force_untrusted=False,
+                        )
+                        continue
+                    document.error(
+                        line.number,
+                        "privileged local actions are unsupported because nested "
+                        f"external uses cannot be proven pinned: {reference!r}",
+                        job.name,
+                    )
+                    continue
+                if DOCKER_DIGEST.fullmatch(reference) is not None:
+                    continue
+                action, separator, revision = reference.rpartition("@")
+                action_parts = action.split("/")
+                literal_action = (
+                    separator == "@"
+                    and len(action_parts) >= 2
+                    and all(
+                        re.fullmatch(r"[A-Za-z0-9_.-]+", part) is not None
+                        for part in action_parts
+                    )
+                )
+                if not literal_action or ACTION_SHA.fullmatch(revision) is None:
+                    document.error(
+                        line.number,
+                        "privileged external actions must use a reviewed full "
+                        f"commit SHA (or Docker sha256 digest), got {reference!r}",
+                        job.name,
+                    )
+
+    def _audit_path(
+        self,
+        path: Path,
+        *,
+        force_untrusted: bool,
+    ) -> None:
         key = (path, force_untrusted)
         if key in self._visited:
             return
@@ -1320,6 +1589,11 @@ class RunnerPolicy:
                     "to contents: read",
                 )
 
+        self._audit_privileged_action_pins(
+            document,
+            jobs,
+        )
+
         for job in jobs:
             runner = job.properties.get("runs-on")
             reusable = job.properties.get("uses")
@@ -1433,7 +1707,10 @@ class RunnerPolicy:
                         job.name,
                     )
                     continue
-                self._audit_path(callee, force_untrusted=True)
+                self._audit_path(
+                    callee,
+                    force_untrusted=True,
+                )
                 continue
 
             if runner is None:

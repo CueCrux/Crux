@@ -23,8 +23,10 @@ jobs:
       CARGO_HOME: ${{ runner.temp }}/cargo-home
       CARGO_DENY_VERSION: 0.19.4
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
       - name: Ensure cargo-deny
         run: |
           set -euo pipefail
@@ -51,8 +53,10 @@ jobs:
       CARGO_HOME: ${{ runner.temp }}/cargo-home
       CARGO_AUDIT_VERSION: 0.22.1
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
       - name: Ensure cargo-audit
         run: |
           set -euo pipefail
@@ -76,8 +80,10 @@ jobs:
       CARGO_HOME: ${{ runner.temp }}/cargo-home
       CARGO_DENY_VERSION: 0.19.4
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
       - name: Ensure cargo-deny
         run: |
           set -euo pipefail

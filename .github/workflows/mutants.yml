@@ -66,9 +66,11 @@ jobs:
       CARGO_HOME: ${{ runner.temp }}/cargo-mutants-${{ matrix.shard }}-${{ github.run_id }}
       CARGO_BUILD_JOBS: "4"
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
         with:
           # Pinned: cargo-mutants documents that its mutants.out format may
           # change between versions; scripts/mutants-report.py parses it.
@@ -95,7 +97,7 @@ jobs:
           fi
       - name: Upload shard report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mutants-shard-${{ matrix.shard }}
           path: mutants.out/
@@ -112,9 +114,9 @@ jobs:
     runs-on: [self-hosted, hel1]
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Download shard reports
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: mutants-shard-*
           path: shard-reports

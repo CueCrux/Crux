@@ -39,14 +39,14 @@ class WorkflowRunnerPolicyTest(unittest.TestCase):
                 timeout-minutes: 10
                 steps:
                   - name: Trusted policy
-                    uses: actions/checkout@v7
+                    uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
                     with:
                       ref: refs/heads/main
                       path: policy
                       persist-credentials: false
                   - name: PR candidate
                     if: github.event_name == 'pull_request_target'
-                    uses: actions/checkout@v7
+                    uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
                     with:
                       repository: ${{ github.event.pull_request.head.repo.full_name }}
                       ref: ${{ github.event.pull_request.head.sha }}
@@ -55,7 +55,7 @@ class WorkflowRunnerPolicyTest(unittest.TestCase):
                       submodules: false
                   - name: Merge candidate
                     if: github.event_name != 'pull_request_target'
-                    uses: actions/checkout@v7
+                    uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
                     with:
                       ref: ${{ github.sha }}
                       path: candidate
@@ -1115,6 +1115,375 @@ class WorkflowRunnerPolicyTest(unittest.TestCase):
         errors = self.errors()
         self.assertTrue(any("trigger indirection" in error for error in errors))
         self.assertTrue(any("must not be a symlink" in error for error in errors))
+
+    def test_privileged_action_requires_full_commit_sha(self) -> None:
+        path = self.workflow(
+            "publish.yml",
+            """
+            on: push
+            permissions:
+              contents: read
+            jobs:
+              publish:
+                runs-on: ubuntu-latest
+                permissions:
+                  contents: write
+                steps:
+                  - uses: owner/publisher@v3
+            """,
+        )
+        self.assert_rejected("privileged external actions must use a reviewed full commit SHA")
+
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "owner/publisher@v3",
+                "owner/publisher@0123456789abcdef0123456789abcdef01234567",
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(self.errors(), [])
+
+    def test_action_pin_policy_covers_read_only_and_publish_jobs(self) -> None:
+        self.workflow(
+            "publish.yml",
+            """
+            on: push
+            permissions:
+              contents: read
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                steps:
+                  - uses: owner/builder@main
+              unrelated:
+                runs-on: ubuntu-latest
+                steps:
+                  - uses: owner/read-only-check@main
+              publish:
+                needs: build
+                runs-on: ubuntu-latest
+                permissions:
+                  id-token: write
+                steps:
+                  - run: publish
+            """,
+        )
+        errors = self.errors()
+        self.assertTrue(any("job=build" in error for error in errors))
+        self.assertTrue(any("job=unrelated" in error for error in errors))
+
+    def test_secret_bearing_job_is_privileged_without_write_permissions(self) -> None:
+        self.workflow(
+            "sign.yml",
+            """
+            on: push
+            permissions:
+              contents: read
+            jobs:
+              sign:
+                runs-on: ubuntu-latest
+                env:
+                  SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+                steps:
+                  - uses: owner/signer@v1
+            """,
+        )
+        self.assert_rejected("privileged external actions must use a reviewed full commit SHA")
+
+    def test_only_exact_slsa_mutable_ref_exception_is_accepted(self) -> None:
+        path = self.workflow(
+            "release.yml",
+            """
+            on: push
+            permissions: {}
+            jobs:
+              provenance:
+                permissions:
+                  id-token: write
+                uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+            """,
+        )
+        self.assertEqual(self.errors(), [])
+
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("@v2.1.0", "@v2.1.1"),
+            encoding="utf-8",
+        )
+        self.assert_rejected("privileged external actions must use a reviewed full commit SHA")
+
+        self.workflow(
+            "sdk-python.yml",
+            """
+            on: push
+            permissions:
+              contents: read
+            jobs:
+              publish:
+                runs-on: ubuntu-latest
+                permissions:
+                  id-token: write
+                steps:
+                  - uses: pypa/gh-action-pypi-publish@v1.14.1
+            """,
+        )
+        self.assert_rejected("pypa/gh-action-pypi-publish@v1.14.1")
+
+    def test_privileged_docker_action_requires_digest_and_local_action_is_rejected(self) -> None:
+        path = self.workflow(
+            "publish.yml",
+            """
+            on: push
+            permissions:
+              packages: write
+            jobs:
+              publish:
+                runs-on: ubuntu-latest
+                steps:
+                  - uses: docker://ghcr.io/owner/publisher:v1
+            """,
+        )
+        self.assert_rejected("docker://ghcr.io/owner/publisher:v1")
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "docker://ghcr.io/owner/publisher:v1",
+                "docker://ghcr.io/owner/publisher@sha256:"
+                + "a" * 64,
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(self.errors(), [])
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "      - uses: docker://",
+                "      - uses: ./actions/local-publisher\n"
+                "      - uses: docker://",
+            ),
+            encoding="utf-8",
+        )
+        self.assert_rejected("privileged local actions are unsupported")
+
+    def test_privileged_steps_and_needs_indirection_fail_closed(self) -> None:
+        self.workflow(
+            "publish.yml",
+            """
+            on: push
+            permissions:
+              contents: read
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                steps:
+                  - &shared
+                    uses: owner/builder@0123456789abcdef0123456789abcdef01234567
+              publish:
+                needs: *dependency
+                runs-on: ubuntu-latest
+                permissions:
+                  contents: write
+                steps: *shared
+            """,
+        )
+        errors = self.errors()
+        self.assertTrue(
+            any("alias, merge, or unresolved mapping" in error for error in errors)
+        )
+        self.assertTrue(
+            any("privileged job steps must be a literal block sequence" in error for error in errors)
+        )
+
+    def test_runner_policy_checkout_must_itself_be_sha_pinned(self) -> None:
+        path = self.root / ".github/workflows/runner-policy.yml"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+                "actions/checkout@v7",
+            ),
+            encoding="utf-8",
+        )
+        self.assert_rejected("runner policy trusted step 1 must use actions/checkout")
+
+    def test_omitted_permissions_treats_repository_default_as_privileged(self) -> None:
+        self.workflow(
+            "push.yml",
+            """
+            on: push
+            jobs:
+              publish:
+                runs-on: ubuntu-latest
+                steps:
+                  - uses: owner/publisher@main
+            """,
+        )
+        self.assert_rejected("privileged external actions must use a reviewed full commit SHA")
+
+    def test_secret_context_bracket_and_workflow_env_forms_are_privileged(self) -> None:
+        self.workflow(
+            "sign.yml",
+            """
+            on: push
+            permissions:
+              contents: read
+            env:
+              ALL_SECRETS: ${{ toJSON(secrets) }}
+            jobs:
+              sign:
+                runs-on: ubuntu-latest
+                env:
+                  SIGNING_KEY: ${{ secrets['SIGNING_KEY'] }}
+                  TOKEN: ${{ github['token'] }}
+                steps:
+                  - uses: owner/signer@main
+            """,
+        )
+        self.assert_rejected("privileged external actions must use a reviewed full commit SHA")
+
+    def test_secret_context_yaml_escapes_and_dynamic_token_index_are_privileged(self) -> None:
+        self.workflow(
+            "sign.yml",
+            r"""
+            on: push
+            permissions:
+              contents: read
+            jobs:
+              sign:
+                runs-on: ubuntu-latest
+                env:
+                  SIGNING_KEY: "${{ secr\u0065ts.SIGNING_KEY }}"
+                  TOKEN: ${{ github[format('to{0}', 'ken')] }}
+                steps:
+                  - uses: owner/signer@main
+            """,
+        )
+        self.assert_rejected("privileged external actions must use a reviewed full commit SHA")
+
+    def test_yaml_anchor_or_alias_consumer_is_treated_as_privileged(self) -> None:
+        self.workflow(
+            "sign.yml",
+            """
+            on: push
+            permissions:
+              contents: read
+            jobs:
+              define:
+                runs-on: ubuntu-latest
+                env: &publish-env
+                  TOKEN: ${{ secrets.PUBLISH_TOKEN }}
+                steps:
+                  - run: prepare
+              consume:
+                runs-on: ubuntu-latest
+                env: *publish-env
+                steps:
+                  - uses: owner/publisher@main
+            """,
+        )
+        errors = self.errors()
+        self.assertTrue(
+            any(
+                "job=consume" in error and "owner/publisher@main" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_yaml_escaped_line_folding_cannot_hide_secret_context(self) -> None:
+        self.workflow(
+            "sign.yml",
+            r"""
+            on: push
+            permissions:
+              contents: read
+            jobs:
+              sign:
+                runs-on: ubuntu-latest
+                env:
+                  SIGNING_KEY: "${{ secr\
+                    ets.SIGNING_KEY }}"
+                steps:
+                  - uses: owner/signer@main
+            """,
+        )
+        self.assert_rejected("privileged external actions must use a reviewed full commit SHA")
+
+    def test_github_wildcard_context_cannot_hide_implicit_token(self) -> None:
+        self.workflow(
+            "publish.yml",
+            """
+            on: push
+            permissions:
+              contents: read
+            jobs:
+              publish:
+                runs-on: ubuntu-latest
+                env:
+                  GITHUB_CONTEXT_VALUES: ${{ toJSON(github.*) }}
+                steps:
+                  - uses: owner/publisher@main
+            """,
+        )
+        self.assert_rejected("privileged external actions must use a reviewed full commit SHA")
+
+    def test_privileged_action_scan_accepts_noncanonical_yaml_indentation_but_not_tag(self) -> None:
+        self.workflow(
+            "publish.yml",
+            """
+            on: push
+            permissions:
+              contents: write
+            jobs:
+              publish:
+                runs-on: ubuntu-latest
+                steps:
+                    - uses: owner/publisher@main
+                timeout-minutes: 10
+            """,
+        )
+        self.assert_rejected("owner/publisher@main")
+
+        path = self.root / ".github/workflows/publish.yml"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "owner/publisher@main",
+                "owner/publisher@0123456789abcdef0123456789abcdef01234567",
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(self.errors(), [])
+
+    def test_privileged_local_reusable_workflow_is_scanned_transitively(self) -> None:
+        self.workflow(
+            "caller.yml",
+            """
+            on: push
+            permissions:
+              contents: write
+            jobs:
+              publish:
+                uses: ./.github/workflows/callee.yml
+            """,
+        )
+        self.workflow(
+            "callee.yml",
+            """
+            on: workflow_call
+            permissions:
+              contents: read
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                steps:
+                  - uses: owner/builder@main
+            """,
+        )
+        errors = self.errors()
+        self.assertTrue(
+            any(
+                ".github/workflows/callee.yml" in error
+                and "owner/builder@main" in error
+                for error in errors
+            ),
+            errors,
+        )
 
     def test_rejects_symlinked_github_directory(self) -> None:
         external = self.root / "external"
