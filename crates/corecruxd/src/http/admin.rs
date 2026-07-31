@@ -3094,3 +3094,1364 @@ mod admin_read_tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    use crate::auth::AuthMode;
+    use crate::http::tests::{dev_scope_headers, test_app_state, test_app_state_with_auth};
+
+    fn dev_state() -> AppState {
+        test_app_state_with_auth(16, AuthMode::DevScopes)
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 22).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    }
+
+    // ── param readers ─────────────────────────────────────────────────────
+
+    #[test]
+    fn read_param_str_trims_and_rejects_blanks() {
+        let params = serde_json::json!({ "a": "  value  ", "blank": "   ", "n": 5, "null": null });
+        assert_eq!(read_param_str(Some(&params), "a"), Some("value"));
+        assert_eq!(read_param_str(Some(&params), "blank"), None);
+        assert_eq!(read_param_str(Some(&params), "n"), None);
+        assert_eq!(read_param_str(Some(&params), "null"), None);
+        assert_eq!(read_param_str(Some(&params), "absent"), None);
+        assert_eq!(read_param_str(None, "a"), None);
+    }
+
+    #[test]
+    fn read_param_bool_accepts_bools_and_the_documented_strings() {
+        let params = serde_json::json!({
+            "t": true, "f": false,
+            "s1": "1", "strue": "TRUE", "syes": " yes ", "sy": "Y",
+            "s0": "0", "sfalse": "False", "sno": "no", "sn": "n",
+            "junk": "maybe", "num": 1, "arr": [],
+        });
+        let p = Some(&params);
+        assert_eq!(read_param_bool(p, "t"), Some(true));
+        assert_eq!(read_param_bool(p, "f"), Some(false));
+        for key in ["s1", "strue", "syes", "sy"] {
+            assert_eq!(read_param_bool(p, key), Some(true), "{key}");
+        }
+        for key in ["s0", "sfalse", "sno", "sn"] {
+            assert_eq!(read_param_bool(p, key), Some(false), "{key}");
+        }
+        // Unparsable values must be None, never a silent `false`.
+        assert_eq!(read_param_bool(p, "junk"), None);
+        assert_eq!(read_param_bool(p, "num"), None);
+        assert_eq!(read_param_bool(p, "arr"), None);
+        assert_eq!(read_param_bool(p, "absent"), None);
+        assert_eq!(read_param_bool(None, "t"), None);
+    }
+
+    #[test]
+    fn read_param_u64_and_u32_reject_out_of_range_and_junk() {
+        let params = serde_json::json!({
+            "n": 42, "s": "43", "neg": -1, "float": 1.5, "junk": "abc", "big": "4294967296",
+        });
+        let p = Some(&params);
+        assert_eq!(read_param_u64(p, "n"), Some(42));
+        assert_eq!(read_param_u64(p, "s"), Some(43));
+        assert_eq!(read_param_u64(p, "neg"), None);
+        assert_eq!(read_param_u64(p, "float"), None);
+        assert_eq!(read_param_u64(p, "junk"), None);
+        assert_eq!(read_param_u64(p, "absent"), None);
+        assert_eq!(read_param_u64(None, "n"), None);
+
+        assert_eq!(read_param_u32(p, "n"), Some(42));
+        // Above u32::MAX must narrow to None, not truncate.
+        assert_eq!(read_param_u32(p, "big"), None);
+    }
+
+    #[test]
+    fn read_param_f64_accepts_numbers_and_numeric_strings() {
+        let params = serde_json::json!({ "f": 0.25, "s": "0.5", "junk": "x", "b": true });
+        let p = Some(&params);
+        assert_eq!(read_param_f64(p, "f"), Some(0.25));
+        assert_eq!(read_param_f64(p, "s"), Some(0.5));
+        assert_eq!(read_param_f64(p, "junk"), None);
+        assert_eq!(read_param_f64(p, "b"), None);
+        assert_eq!(read_param_f64(None, "f"), None);
+    }
+
+    // ── action id / type validation ───────────────────────────────────────
+
+    #[test]
+    fn is_known_admin_action_matches_the_documented_set_only() {
+        for ty in [
+            "verify-store",
+            "scrub-now",
+            "snapshot-verify",
+            "projection-rebuild",
+            "parity-pack",
+            "runtime-knob-update",
+            "force-seal",
+            "compact-facts",
+        ] {
+            assert!(is_known_admin_action(ty), "{ty} should be known");
+        }
+        for ty in ["", "verify_store", "VERIFY-STORE", "restart", " force-seal "] {
+            assert!(!is_known_admin_action(ty), "{ty} must not be known");
+        }
+    }
+
+    #[test]
+    fn is_safe_admin_action_id_rejects_path_and_control_characters() {
+        assert!(is_safe_admin_action_id("act_123.a-b"));
+        assert!(is_safe_admin_action_id(&"a".repeat(128)));
+        assert!(!is_safe_admin_action_id(""));
+        assert!(!is_safe_admin_action_id(&"a".repeat(129)));
+        for bad in ["../etc/passwd", "a/b", "a b", "a\nb", "a\0b", "café", "a:b", "a%2e"] {
+            assert!(!is_safe_admin_action_id(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    // ── knowledge-authority parsers ───────────────────────────────────────
+
+    #[test]
+    fn knowledge_authority_mode_parser_covers_every_alias() {
+        for (raw, want) in [
+            ("knowledge_shadow", KnowledgeAuthorityModeV1::Shadow),
+            (" shadow ", KnowledgeAuthorityModeV1::Shadow),
+            ("knowledge_dual_write", KnowledgeAuthorityModeV1::DualWrite),
+            ("dual_write", KnowledgeAuthorityModeV1::DualWrite),
+            ("knowledge_shadow_read", KnowledgeAuthorityModeV1::ShadowRead),
+            ("shadow_read", KnowledgeAuthorityModeV1::ShadowRead),
+            ("knowledge_authoritative", KnowledgeAuthorityModeV1::Authoritative),
+            ("authoritative", KnowledgeAuthorityModeV1::Authoritative),
+        ] {
+            assert_eq!(parse_knowledge_authority_mode(raw), Some(want), "{raw}");
+        }
+        for raw in ["", "AUTHORITATIVE", "dual-write", "nonsense"] {
+            assert_eq!(parse_knowledge_authority_mode(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn knowledge_rollout_stage_parser_covers_every_alias() {
+        for (raw, want) in [
+            ("internal_shadow", KnowledgeRolloutStageV1::InternalShadow),
+            (" shadow ", KnowledgeRolloutStageV1::InternalShadow),
+            ("tenant_validation", KnowledgeRolloutStageV1::TenantValidation),
+            ("internal_authority", KnowledgeRolloutStageV1::InternalAuthority),
+            (
+                "limited_production_authority",
+                KnowledgeRolloutStageV1::LimitedProductionAuthority,
+            ),
+            (
+                "full_production_authority",
+                KnowledgeRolloutStageV1::FullProductionAuthority,
+            ),
+        ] {
+            assert_eq!(parse_knowledge_rollout_stage(raw), Some(want), "{raw}");
+        }
+        assert_eq!(parse_knowledge_rollout_stage("production"), None);
+    }
+
+    #[test]
+    fn knowledge_parity_status_parser_covers_every_variant() {
+        for (raw, want) in [
+            ("unknown", KnowledgeParityStatusV1::Unknown),
+            (" pass ", KnowledgeParityStatusV1::Pass),
+            ("warn", KnowledgeParityStatusV1::Warn),
+            ("fail", KnowledgeParityStatusV1::Fail),
+        ] {
+            assert_eq!(parse_knowledge_parity_status(raw), Some(want), "{raw}");
+        }
+        assert_eq!(parse_knowledge_parity_status("PASS"), None);
+        assert_eq!(parse_knowledge_parity_status(""), None);
+    }
+
+    #[test]
+    fn parse_tenant_throttle_rules_rejects_bad_shapes_and_blank_tenants() {
+        let ok = parse_tenant_throttle_rules(&serde_json::json!([
+            { "tenantId": "t1", "eventsPerSec": 10 }
+        ]))
+        .expect("valid rules");
+        assert_eq!(ok.len(), 1);
+
+        assert!(parse_tenant_throttle_rules(&serde_json::json!([])).unwrap().is_empty());
+
+        let err = parse_tenant_throttle_rules(&serde_json::json!({ "tenantId": "t1" })).unwrap_err();
+        assert!(err.contains("must be an array"), "got {err}");
+
+        let err = parse_tenant_throttle_rules(&serde_json::json!([{ "tenantId": "  " }])).unwrap_err();
+        assert!(err.contains("non-empty tenantId"), "got {err}");
+    }
+
+    #[test]
+    fn admin_action_error_passes_the_detail_through() {
+        assert_eq!(admin_action_error("boom"), "boom");
+        assert_eq!(admin_action_error(String::from("boom")), "boom");
+    }
+
+    // ── evidence ids + correlation ────────────────────────────────────────
+
+    #[test]
+    fn trace_id_from_traceparent_only_accepts_a_32_hex_trace_id() {
+        assert_eq!(trace_id_from_traceparent(None), None);
+        assert_eq!(trace_id_from_traceparent(Some("")), None);
+        assert_eq!(trace_id_from_traceparent(Some("00")), None);
+        assert_eq!(trace_id_from_traceparent(Some("00-short-b7ad6b7169203331-01")), None);
+        assert_eq!(
+            trace_id_from_traceparent(Some("00-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-b7ad6b7169203331-01")),
+            None
+        );
+        assert_eq!(
+            trace_id_from_traceparent(Some("00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01")),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string())
+        );
+    }
+
+    #[test]
+    fn evidence_request_context_extracts_the_trace_id_when_present() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01"),
+        );
+        headers.insert("x-request-id", HeaderValue::from_static("req-1"));
+        let ctx = evidence_request_context_from_headers(&headers);
+        assert_eq!(ctx.trace_id.as_deref(), Some("4bf92f3577b34da6a3ce929d0e0e4736"));
+        assert!(ctx.traceparent.is_some());
+
+        let bare = evidence_request_context_from_headers(&HeaderMap::new());
+        assert_eq!(bare.trace_id, None);
+        assert_eq!(bare.traceparent, None);
+    }
+
+    #[test]
+    fn event_id_builders_are_deterministic_and_hash_prefixed() {
+        assert!(submitted_event_id("act-1").ends_with(":act-1"));
+        assert!(finished_event_id("act-1", "succeeded").ends_with(":act-1:succeeded"));
+
+        let full = "0123456789abcdef0123456789abcdef";
+        assert!(mutation_event_id("act-1", full).ends_with(":act-1:0123456789abcdef"));
+        // A hash shorter than the 16-char prefix must be used whole, not panic.
+        assert!(mutation_event_id("act-1", "abc").ends_with(":act-1:abc"));
+
+        assert_eq!(checkpoint_id("act-1", full), "checkpoint:act-1:0123456789abcdef");
+        assert_eq!(checkpoint_id("act-1", "abc"), "checkpoint:act-1:abc");
+        assert!(checkpoint_event_id("checkpoint:act-1:abc").ends_with("checkpoint:act-1:abc"));
+    }
+
+    #[test]
+    fn now_unix_ms_is_a_plausible_wall_clock() {
+        // Well past 2020 and inside u64 — the saturating conversion holds.
+        assert!(now_unix_ms() > 1_600_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn evidence_node_context_carries_the_local_node_identity() {
+        let state = test_app_state(16);
+        let node = evidence_node_context(&state);
+        assert_eq!(node.node_id, state.node_id);
+        assert_eq!(node.http_listen_addr, None);
+        assert_eq!(node.grpc_listen_addr, None);
+    }
+
+    // ── control evidence appenders (dataplane-disabled path) ──────────────
+
+    #[tokio::test]
+    async fn append_control_evidence_event_is_a_no_op_without_a_dataplane() {
+        let state = test_app_state(16);
+        let appended = append_control_evidence_event(
+            &state,
+            EVT_CONTROL_ADMIN_ACTION_SUBMITTED_V1,
+            submitted_event_id("act-1"),
+            &serde_json::json!({ "ok": true }),
+        )
+        .await
+        .expect("no dataplane is not an error");
+        assert!(!appended, "nothing can be appended without a dataplane");
+    }
+
+    #[tokio::test]
+    async fn append_control_checkpoint_materialized_event_succeeds_without_a_dataplane() {
+        let state = test_app_state(16);
+        let control = state.control.read().await.clone();
+        append_control_checkpoint_materialized_event(&state, "act-1", &control)
+            .await
+            .expect("checkpoint append");
+        // Warning helper is a pure log call; exercise it for completeness.
+        append_control_event_warning("act-1", EVT_CONTROL_CHECKPOINT_MATERIALIZED_V1, "synthetic");
+    }
+
+    #[tokio::test]
+    async fn evidence_event_builders_populate_the_schema_fields() {
+        let state = test_app_state(16);
+        let auth = EvidenceAuthContextV1 {
+            mode: "dev_scopes".to_string(),
+            subject: Some("s".to_string()),
+            tenant_binding: Some("*".to_string()),
+            scopes: vec!["admin:write".to_string()],
+        };
+        let request = evidence_request_context_from_headers(&HeaderMap::new());
+
+        let submitted = build_admin_action_submitted_event(
+            &state,
+            "act-1",
+            "verify-store",
+            7,
+            Some("actor".to_string()),
+            Some("reason".to_string()),
+            Some(serde_json::json!({ "scope": "all" })),
+            auth.clone(),
+            request.clone(),
+        );
+        assert_eq!(submitted.schema, EVT_CONTROL_ADMIN_ACTION_SUBMITTED_V1);
+        assert_eq!(submitted.action_id, "act-1");
+        assert_eq!(submitted.submitted_at_unix_ms, 7);
+
+        let before = state.control.read().await.clone();
+        let mut after = before.clone();
+        after.valves.pause_ingest.set(true, "actor", "reason", 1);
+        let mutation = build_control_mutation_event(
+            &state,
+            "act-1",
+            "set_valves",
+            "actor",
+            "reason",
+            auth,
+            request,
+            &before,
+            &after,
+            serde_json::json!({ "ok": true }),
+        );
+        assert_eq!(mutation.schema, EVT_CONTROL_STATE_MUTATION_V1);
+        assert_eq!(mutation.mutation_type, "set_valves");
+        assert!(mutation.result.is_some());
+
+        let finished = build_admin_action_finished_event(
+            &state,
+            "act-1",
+            "verify-store",
+            "failed",
+            Some(1),
+            2,
+            None,
+            None,
+            Some("boom".to_string()),
+        );
+        assert_eq!(finished.schema, EVT_CONTROL_ADMIN_ACTION_FINISHED_V1);
+        assert_eq!(finished.status, "failed");
+        assert_eq!(finished.error.as_deref(), Some("boom"));
+
+        let checkpoint = build_control_checkpoint_materialized_event(&state, "checkpoint:act-1:abc", &after);
+        assert_eq!(checkpoint.schema, EVT_CONTROL_CHECKPOINT_MATERIALIZED_V1);
+        assert_eq!(checkpoint.checkpoint_format, "control.json.pretty.v1");
+        assert!(checkpoint.checkpoint_size_bytes > 0);
+        assert_eq!(checkpoint.checkpoint_blake3.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn sync_control_metrics_mirrors_every_valve_into_prometheus() {
+        let state = test_app_state(16);
+        let mut control = state.control.read().await.clone();
+        control.valves.pause_ingest.set(true, "a", "r", 1);
+        control.valves.read_only.set(true, "a", "r", 1);
+        sync_control_metrics(&state.metrics, &control);
+        let rendered = state.metrics.render().unwrap();
+        assert!(rendered.contains("corecrux_valve_pause_ingest 1"));
+        assert!(rendered.contains("corecrux_valve_read_only 1"));
+        assert!(rendered.contains("corecrux_valve_pause_compaction 0"));
+        assert!(rendered.contains("corecrux_throttle_ratio 1"));
+        assert!(rendered.contains("corecrux_knowledge_authority_mode"));
+    }
+
+    // ── execute_admin_action: the error arms ──────────────────────────────
+
+    #[tokio::test]
+    async fn execute_admin_action_rejects_an_unknown_action_type() {
+        let state = test_app_state(16);
+        let err = execute_admin_action(&state, "act-1", "not-an-action", None, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown actionType 'not-an-action'"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn execute_admin_action_parity_pack_is_explicitly_unsupported() {
+        let state = test_app_state(16);
+        let err = execute_admin_action(&state, "act-1", "parity-pack", None, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("not implemented in corecruxd"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn dataplane_backed_actions_fail_closed_without_a_dataplane() {
+        let state = test_app_state(16);
+        for action in ["verify-store", "scrub-now", "snapshot-verify", "projection-rebuild"] {
+            let err = execute_admin_action(&state, "act-1", action, None, None, None, None)
+                .await
+                .unwrap_err();
+            assert!(err.contains("dataplane disabled"), "{action}: got {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn force_seal_is_refused_until_explicitly_enabled() {
+        let state = test_app_state(16);
+        let err = execute_admin_action(&state, "act-1", "force-seal", None, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("force-seal is disabled"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn force_seal_requires_a_reason_once_enabled() {
+        let mut state = test_app_state(16);
+        state.admin_force_seal_enabled = true;
+        let err = execute_admin_action(&state, "act-1", "force-seal", None, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("reason is required for force-seal"), "got {err}");
+
+        // With a reason it gets as far as the (absent) dataplane, and stops.
+        let params = serde_json::json!({ "reason": "operator drill" });
+        let err = execute_admin_action(&state, "act-1", "force-seal", Some(&params), None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("dataplane disabled"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn runtime_knob_update_with_no_params_changes_nothing() {
+        let state = test_app_state(16);
+        let out = execute_admin_action(&state, "act-1", "runtime-knob-update", None, None, None, None)
+            .await
+            .expect("no-op knob update");
+        assert_eq!(out.result["changed"], false);
+        assert_eq!(out.mutation_event_id, None);
+    }
+
+    #[tokio::test]
+    async fn runtime_knob_update_persists_throttle_and_knowledge_authority() {
+        let state = test_app_state(16);
+        let params = serde_json::json!({
+            "actor": "op",
+            "reason": "tuning",
+            "throttleEnabled": true,
+            "throttleEventsPerSec": 100,
+            "throttleBytesPerSec": 2048,
+            "throttleMaxInFlight": 4,
+            "throttleRetryAfterMs": 250,
+            "knowledgeAuthorityMode": "dual_write",
+            "knowledgeAuthorityRolloutStage": "tenant_validation",
+            "knowledgeLastParityStatus": "warn",
+            "knowledgeLastParityMismatchCount": 3,
+            "knowledgeRollbackTriggered": true,
+            "tenantThrottleRules": [{ "tenantId": "t1" }],
+        });
+        let out = execute_admin_action(&state, "act-1", "runtime-knob-update", Some(&params), None, None, None)
+            .await
+            .expect("knob update");
+        assert_eq!(out.result["changed"], true);
+        assert_eq!(out.result["throttle"]["enabled"], true);
+        assert_eq!(out.result["throttle"]["eventsPerSec"], 100);
+        assert!(out.mutation_event_id.is_some());
+
+        let control = state.control.read().await;
+        assert!(control.valves.throttle.enabled);
+        assert_eq!(control.knowledge_authority.mode, KnowledgeAuthorityModeV1::DualWrite);
+        assert!(control.knowledge_authority.rollback_triggered);
+        assert_eq!(control.tenant_throttles.len(), 1);
+        drop(control);
+
+        // CONTROL.json is on disk and reloadable.
+        assert!(state.control_path.exists());
+    }
+
+    #[tokio::test]
+    async fn runtime_knob_update_rejects_invalid_enum_params() {
+        let state = test_app_state(16);
+        for (key, value, needle) in [
+            ("knowledgeAuthorityMode", "bogus", "invalid knowledgeAuthorityMode"),
+            (
+                "knowledgeAuthorityRolloutStage",
+                "bogus",
+                "invalid knowledgeAuthorityRolloutStage",
+            ),
+            (
+                "knowledgeLastParityStatus",
+                "bogus",
+                "invalid knowledgeLastParityStatus",
+            ),
+        ] {
+            let params = serde_json::json!({ key: value });
+            let err = execute_admin_action(&state, "act-1", "runtime-knob-update", Some(&params), None, None, None)
+                .await
+                .unwrap_err();
+            assert!(err.contains(needle), "{key}: got {err}");
+        }
+
+        let params = serde_json::json!({ "tenantThrottleRules": [{ "tenantId": "" }] });
+        let err = execute_admin_action(&state, "act-1", "runtime-knob-update", Some(&params), None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("non-empty tenantId"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn runtime_knob_update_can_clear_the_parity_outcome() {
+        let state = test_app_state(16);
+        let set = serde_json::json!({ "knowledgeLastParityStatus": "fail" });
+        execute_admin_action(&state, "act-1", "runtime-knob-update", Some(&set), None, None, None)
+            .await
+            .unwrap();
+        assert!(state
+            .control
+            .read()
+            .await
+            .knowledge_authority
+            .last_parity_outcome
+            .is_some());
+
+        let clear = serde_json::json!({ "knowledgeClearParityOutcome": true });
+        let out = execute_admin_action(&state, "act-2", "runtime-knob-update", Some(&clear), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(out.result["changed"], true);
+        assert!(state
+            .control
+            .read()
+            .await
+            .knowledge_authority
+            .last_parity_outcome
+            .is_none());
+    }
+
+    // ── read handlers: authentication + authorisation ─────────────────────
+
+    #[tokio::test]
+    async fn admin_read_handlers_are_401_without_a_credential() {
+        let s = dev_state();
+        let cases: Vec<axum::response::Response> = vec![
+            get_shard_map(State(s.clone()), HeaderMap::new()).await.into_response(),
+            get_control(State(s.clone()), HeaderMap::new()).await.into_response(),
+            get_replication_status(State(s.clone()), HeaderMap::new())
+                .await
+                .into_response(),
+            get_segment_fingerprints(State(s.clone()), HeaderMap::new())
+                .await
+                .into_response(),
+            get_sharing_posture(State(s.clone()), HeaderMap::new())
+                .await
+                .into_response(),
+            get_admin_action(State(s.clone()), HeaderMap::new(), Path("act-1".to_string()))
+                .await
+                .into_response(),
+        ];
+        for resp in cases {
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_read_handlers_are_403_with_the_wrong_scope() {
+        let s = dev_state();
+        let h = || dev_scope_headers("facts:write");
+        assert_eq!(
+            get_shard_map(State(s.clone()), h()).await.into_response().status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get_control(State(s.clone()), h()).await.into_response().status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get_replication_status(State(s.clone()), h())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get_segment_fingerprints(State(s.clone()), h())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get_sharing_posture(State(s.clone()), h())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get_admin_action(State(s.clone()), h(), Path("act-1".to_string()))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn get_shard_map_returns_the_routing_snapshot() {
+        let s = dev_state();
+        let resp = get_shard_map(State(s.clone()), dev_scope_headers("admin:read"))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let expected = s.routing.read().await.shard_map.clone();
+        assert_eq!(body["currentVersion"], expected.version);
+        assert_eq!(body["blake3"], expected.blake3);
+    }
+
+    #[tokio::test]
+    async fn get_control_returns_the_live_control_document() {
+        let s = dev_state();
+        s.control.write().await.valves.read_only.set(true, "op", "drill", 1);
+        let resp = get_control(State(s.clone()), dev_scope_headers("admin:read"))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["valves"]["readOnly"]["enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn get_segment_fingerprints_reports_partial_v6_parity() {
+        let s = dev_state();
+        let resp = get_segment_fingerprints(State(s), dev_scope_headers("admin:read"))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["status"], "partial");
+        assert_eq!(body["cpu_only"], true);
+        assert_eq!(body["fingerprint_guard"]["mode"], "not_enforced");
+        assert_eq!(body["calibration"]["available"], false);
+    }
+
+    #[tokio::test]
+    async fn get_replication_status_reports_the_local_role_per_shard() {
+        let s = dev_state();
+        let resp = get_replication_status(State(s.clone()), dev_scope_headers("admin:read"))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["nodeId"], s.node_id);
+        assert!(body["shards"].is_array());
+        for shard in body["shards"].as_array().unwrap() {
+            assert!(
+                ["leader", "follower", "unassigned"].contains(&shard["role"].as_str().unwrap()),
+                "unexpected role {}",
+                shard["role"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_ops_log_auth_is_checked_before_the_dataplane_precondition() {
+        let s = dev_state();
+        let query = || {
+            Query(OpsLogQuery {
+                node_id: None,
+                since: None,
+                until: None,
+                from_seq: None,
+                max_events: None,
+            })
+        };
+        assert_eq!(
+            get_ops_log(State(s.clone()), query(), HeaderMap::new())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_ops_log(State(s.clone()), query(), dev_scope_headers("facts:write"))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        // Authorised, but there is no dataplane to read from.
+        assert_eq!(
+            get_ops_log(State(s), query(), dev_scope_headers("admin:read"))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+    }
+
+    // ── write handlers: authorisation + validation ────────────────────────
+
+    #[tokio::test]
+    async fn post_shard_map_needs_admin_write_and_is_cli_only() {
+        let s = dev_state();
+        assert_eq!(
+            post_shard_map(State(s.clone()), HeaderMap::new(), axum::body::Bytes::new())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_shard_map(
+                State(s.clone()),
+                dev_scope_headers("admin:read"),
+                axum::body::Bytes::new()
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN,
+            "admin:read must not authorise a write route"
+        );
+        assert_eq!(
+            post_shard_map(State(s), dev_scope_headers("admin:write"), axum::body::Bytes::new())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::NOT_IMPLEMENTED
+        );
+    }
+
+    fn valves_req(actor: &str, reason: &str) -> SetValvesReq {
+        SetValvesReq {
+            actor: actor.to_string(),
+            reason: reason.to_string(),
+            pause_ingest: None,
+            pause_compaction: None,
+            throttle: None,
+            read_only: None,
+            emergency_brake: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn post_valves_requires_admin_write() {
+        let s = dev_state();
+        assert_eq!(
+            post_valves(State(s.clone()), HeaderMap::new(), Json(valves_req("op", "drill")))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_valves(
+                State(s),
+                dev_scope_headers("admin:read"),
+                Json(valves_req("op", "drill"))
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn post_valves_rejects_a_blank_actor_or_reason() {
+        let s = dev_state();
+        for (actor, reason) in [("", "drill"), ("op", ""), ("   ", "  ")] {
+            let resp = post_valves(
+                State(s.clone()),
+                dev_scope_headers("admin:write"),
+                Json(valves_req(actor, reason)),
+            )
+            .await
+            .into_response();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "actor={actor:?} reason={reason:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn post_valves_with_no_flags_persists_nothing_but_still_succeeds() {
+        let s = dev_state();
+        let resp = post_valves(
+            State(s.clone()),
+            dev_scope_headers("admin:write"),
+            Json(valves_req("op", "drill")),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!s.control.read().await.valves.pause_ingest.enabled);
+    }
+
+    #[tokio::test]
+    async fn post_valves_sets_each_individual_valve() {
+        let s = dev_state();
+        let mut req = valves_req("op", "drill");
+        req.pause_ingest = Some(true);
+        req.pause_compaction = Some(true);
+        req.read_only = Some(true);
+        req.throttle = Some(SetThrottle {
+            enabled: true,
+            retry_after_ms: Some(500),
+            events_per_sec: Some(10),
+            bytes_per_sec: Some(1024),
+            max_in_flight: Some(2),
+        });
+        let resp = post_valves(State(s.clone()), dev_scope_headers("admin:write"), Json(req))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let control = s.control.read().await;
+        assert!(control.valves.pause_ingest.enabled);
+        assert!(control.valves.pause_compaction.enabled);
+        assert!(control.valves.read_only.enabled);
+        assert!(control.valves.throttle.enabled);
+        assert_eq!(control.valves.throttle.events_per_sec, Some(10));
+        assert_eq!(control.valves.throttle.retry_after_ms, Some(500));
+        drop(control);
+        assert!(s.control_path.exists(), "CONTROL.json must be persisted");
+    }
+
+    #[tokio::test]
+    async fn emergency_brake_forces_the_non_mutating_posture_and_counts_once() {
+        let s = dev_state();
+        let mut req = valves_req("op", "incident");
+        req.emergency_brake = Some(true);
+        let resp = post_valves(State(s.clone()), dev_scope_headers("admin:write"), Json(req))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let control = s.control.read().await;
+        assert!(control.valves.emergency_brake.enabled);
+        // The brake implies read-only + both pauses, regardless of what was asked.
+        assert!(control.valves.read_only.enabled);
+        assert!(control.valves.pause_ingest.enabled);
+        assert!(control.valves.pause_compaction.enabled);
+        drop(control);
+
+        assert!(s
+            .metrics
+            .render()
+            .unwrap()
+            .contains(r#"corecrux_emergency_brake_total{source="admin_http"} 1"#));
+    }
+
+    #[tokio::test]
+    async fn post_stream_meta_validates_before_reaching_the_dataplane() {
+        let s = dev_state();
+        let req = |actor: &str, reason: &str| StreamMetaReq {
+            tenant_id: "t1".to_string(),
+            stream_type: "receipts".to_string(),
+            stream_id: "s1".to_string(),
+            min_live_seq: Some(1),
+            tombstone_seq: Some(0),
+            actor: actor.to_string(),
+            reason: reason.to_string(),
+        };
+
+        assert_eq!(
+            post_stream_meta(State(s.clone()), HeaderMap::new(), Json(req("op", "r")))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_stream_meta(State(s.clone()), dev_scope_headers("admin:read"), Json(req("op", "r")))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_stream_meta(State(s.clone()), dev_scope_headers("admin:write"), Json(req(" ", "r")))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        // Authorised + well-formed, but the CE has no dataplane.
+        assert_eq!(
+            post_stream_meta(State(s.clone()), dev_scope_headers("admin:write"), Json(req("op", "r")))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::NOT_IMPLEMENTED
+        );
+    }
+
+    #[tokio::test]
+    async fn post_stream_meta_is_refused_while_writes_are_valved_off() {
+        let s = dev_state();
+        s.control.write().await.valves.read_only.set(true, "op", "drill", 1);
+        let resp = post_stream_meta(
+            State(s.clone()),
+            dev_scope_headers("admin:write"),
+            Json(StreamMetaReq {
+                tenant_id: "t1".to_string(),
+                stream_type: "receipts".to_string(),
+                stream_id: "s1".to_string(),
+                min_live_seq: None,
+                tombstone_seq: None,
+                actor: "op".to_string(),
+                reason: "r".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ── replication receiver ──────────────────────────────────────────────
+
+    fn segment_req(shard: &str, payload: &str, hash: Option<&str>) -> ReplicationSegmentReq {
+        ReplicationSegmentReq {
+            shard_id: shard.to_string(),
+            epoch: 1,
+            leader_node_id: Some("node-b".to_string()),
+            segment_base64: payload.to_string(),
+            segment_hash: hash.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn post_replication_segment_requires_the_replication_write_scope() {
+        let s = dev_state();
+        assert_eq!(
+            post_replication_segment(
+                State(s.clone()),
+                HeaderMap::new(),
+                Json(segment_req("sh-1", "AAAA", None))
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        // admin:write is NOT replication:write.
+        assert_eq!(
+            post_replication_segment(
+                State(s.clone()),
+                dev_scope_headers("admin:write"),
+                Json(segment_req("sh-1", "AAAA", None))
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(s
+            .metrics
+            .render()
+            .unwrap()
+            .contains(r#"corecrux_replication_receive_total{result="rejected"} 2"#));
+    }
+
+    #[tokio::test]
+    async fn post_replication_segment_rejects_malformed_payloads() {
+        let s = dev_state();
+        let scopes = || dev_scope_headers("replication:write");
+
+        for (req, want) in [
+            (segment_req("   ", "AAAA", None), StatusCode::BAD_REQUEST),
+            (segment_req("sh-1", "   ", None), StatusCode::BAD_REQUEST),
+            (segment_req("sh-1", "!!!not-base64!!!", None), StatusCode::BAD_REQUEST),
+            (segment_req("sh-1", "AAAA", Some("too-short")), StatusCode::BAD_REQUEST),
+            (
+                segment_req("sh-1", "AAAA", Some(&"z".repeat(64))),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let resp = post_replication_segment(State(s.clone()), scopes(), Json(req))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), want);
+        }
+    }
+
+    #[tokio::test]
+    async fn post_replication_segment_detects_a_segment_hash_mismatch() {
+        let s = dev_state();
+        let resp = post_replication_segment(
+            State(s.clone()),
+            dev_scope_headers("replication:write"),
+            Json(segment_req("sh-1", "AAAA", Some(&"a".repeat(64)))),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+        let body = body_json(resp).await;
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("REPLICATION_SEGMENT_HASH_MISMATCH"), "got {detail}");
+    }
+
+    #[tokio::test]
+    async fn post_replication_segment_accepts_a_matching_hash_then_stops_at_the_dataplane() {
+        let s = dev_state();
+        let payload = base64::engine::general_purpose::STANDARD.encode(b"segment-bytes");
+        let hash = hex32(blake3::hash(b"segment-bytes").as_bytes());
+        let resp = post_replication_segment(
+            State(s.clone()),
+            dev_scope_headers("replication:write"),
+            Json(segment_req("sh-1", &payload, Some(&hash.to_ascii_uppercase()))),
+        )
+        .await
+        .into_response();
+        // Hash matched (uppercase is normalised); the CE has no receiver.
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(s
+            .metrics
+            .render()
+            .unwrap()
+            .contains(r#"corecrux_replication_receive_total{result="error"} 1"#));
+    }
+
+    // ── sharing posture + backfill ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_sharing_posture_buckets_facts_by_entity_prefix() {
+        let s = dev_state();
+        {
+            let mut store = s.fact_store.write().await;
+            for (entity, private) in [("github::repo", false), ("personal::note", true), ("bare", false)] {
+                store.store(corecrux_memory::fact_store::StoreFact {
+                    tenant_hash: "default".to_string(),
+                    entity: entity.to_string(),
+                    key: "k".to_string(),
+                    value: "v".to_string(),
+                    source_receipt: None,
+                    confidence: 1.0,
+                    private,
+                    horizon_class: None,
+                    actor: None,
+                });
+            }
+        }
+        let resp = get_sharing_posture(State(s), dev_scope_headers("admin:read"))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["facts"]["total_count"], 3);
+        // `github::` is a born-private prefix, so the store forces it private on
+        // write regardless of the caller's flag — 2 private, 1 pushable.
+        assert_eq!(body["facts"]["private_count"], 2);
+        assert_eq!(body["facts"]["pushable_count"], 1);
+        assert_eq!(
+            body["facts"]["would_be_private_after_backfill"], 0,
+            "born-private enforcement leaves nothing for the backfill to fix"
+        );
+        assert!(body["sync"]["note"].is_string());
+        let prefixes: Vec<&str> = body["by_prefix"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["prefix"].as_str().unwrap())
+            .collect();
+        assert!(prefixes.contains(&"github"));
+        assert!(prefixes.contains(&"personal"));
+        assert!(
+            prefixes.contains(&"(no prefix)"),
+            "unprefixed entities get their own bucket"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_sharing_backfill_needs_both_scopes() {
+        let s = dev_state();
+        assert_eq!(
+            post_sharing_backfill(State(s.clone()), HeaderMap::new(), Json(BackfillBody::default()))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        // Only one of the two required scopes.
+        assert_eq!(
+            post_sharing_backfill(State(s), dev_scope_headers("admin:read"), Json(BackfillBody::default()))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn post_sharing_backfill_previews_before_it_writes() {
+        let s = dev_state();
+        let resp = post_sharing_backfill(
+            State(s.clone()),
+            dev_scope_headers("admin:read,facts:write"),
+            Json(BackfillBody::default()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["mode"], "preview");
+        assert!(body["would_re_store"].is_number());
+
+        let resp = post_sharing_backfill(
+            State(s),
+            dev_scope_headers("admin:read,facts:write"),
+            Json(BackfillBody { confirm: true }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["mode"], "confirmed");
+        assert!(body["re_stored_count"].is_number());
+    }
+
+    // ── admin-action submission ───────────────────────────────────────────
+
+    fn action_req(action_id: Option<&str>, action_type: &str) -> PostAdminActionRequest {
+        PostAdminActionRequest {
+            action_id: action_id.map(str::to_string),
+            action_type: action_type.to_string(),
+            actor: Some("   ".to_string()),
+            reason: Some("   ".to_string()),
+            params: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn post_admin_action_requires_admin_write() {
+        let s = dev_state();
+        assert_eq!(
+            post_admin_action(
+                State(s.clone()),
+                HeaderMap::new(),
+                Json(action_req(None, "verify-store"))
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_admin_action(
+                State(s),
+                dev_scope_headers("admin:read"),
+                Json(action_req(None, "verify-store"))
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn post_admin_action_rejects_blank_and_unknown_action_types() {
+        let s = dev_state();
+        assert_eq!(
+            post_admin_action(
+                State(s.clone()),
+                dev_scope_headers("admin:write"),
+                Json(action_req(None, "   "))
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let resp = post_admin_action(
+            State(s),
+            dev_scope_headers("admin:write"),
+            Json(action_req(None, "rm-rf")),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let detail = body_json(resp).await["detail"].as_str().unwrap_or_default().to_string();
+        assert!(detail.contains("unknown actionType 'rm-rf'"), "got {detail}");
+    }
+
+    #[tokio::test]
+    async fn post_admin_action_rejects_an_unsafe_action_id() {
+        let s = dev_state();
+        for bad in ["../escape", "a b", &"a".repeat(129)] {
+            let resp = post_admin_action(
+                State(s.clone()),
+                dev_scope_headers("admin:write"),
+                Json(action_req(Some(bad), "parity-pack")),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn post_admin_action_blank_action_id_falls_back_to_a_generated_one() {
+        let s = dev_state();
+        let resp = post_admin_action(
+            State(s.clone()),
+            dev_scope_headers("admin:write"),
+            Json(action_req(Some("   "), "parity-pack")),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = body_json(resp).await;
+        let id = body["action"]["actionId"].as_str().unwrap();
+        assert!(id.starts_with("act_"), "got {id}");
+        // Blank actor/reason are dropped rather than stored as whitespace.
+        assert!(body["action"].get("actor").is_none());
+        assert!(body["action"].get("reason").is_none());
+    }
+
+    #[tokio::test]
+    async fn post_admin_action_is_idempotent_on_a_repeated_action_id() {
+        let s = dev_state();
+        let first = post_admin_action(
+            State(s.clone()),
+            dev_scope_headers("admin:write"),
+            Json(action_req(Some("act-dup"), "parity-pack")),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+        let second = post_admin_action(
+            State(s.clone()),
+            dev_scope_headers("admin:write"),
+            Json(action_req(Some("act-dup"), "parity-pack")),
+        )
+        .await
+        .into_response();
+        assert_eq!(second.status(), StatusCode::ACCEPTED);
+        assert_eq!(body_json(second).await["action"]["actionId"], "act-dup");
+        assert_eq!(s.admin_actions.read().await.len(), 1, "no duplicate record");
+    }
+
+    #[tokio::test]
+    async fn post_admin_action_sheds_load_when_the_queue_is_full() {
+        // action_max_pending = 0 → nothing may be queued.
+        let s = test_app_state_with_auth(0, AuthMode::DevScopes);
+        let resp = post_admin_action(
+            State(s),
+            dev_scope_headers("admin:write"),
+            Json(action_req(Some("act-1"), "parity-pack")),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let detail = body_json(resp).await["detail"].as_str().unwrap_or_default().to_string();
+        assert!(detail.contains("queue is full"), "got {detail}");
+    }
+
+    #[tokio::test]
+    async fn submitted_action_runs_and_records_its_failure() {
+        let s = dev_state();
+        let resp = post_admin_action(
+            State(s.clone()),
+            dev_scope_headers("admin:write"),
+            Json(action_req(Some("act-run"), "parity-pack")),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let action = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+            loop {
+                let action = s.admin_actions.read().await.get("act-run").cloned().unwrap();
+                if matches!(action.status, AdminActionStatus::Succeeded | AdminActionStatus::Failed) {
+                    break action;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(action.status, AdminActionStatus::Failed);
+        assert!(action.error.unwrap().contains("not implemented in corecruxd"));
+        assert!(action.started_at_unix_ms.is_some());
+        assert!(action.finished_at_unix_ms.is_some());
+
+        // …and it is then readable through the GET route.
+        let resp = get_admin_action(State(s), dev_scope_headers("admin:read"), Path("act-run".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn run_admin_action_is_a_no_op_for_unknown_or_already_running_ids() {
+        let s = dev_state();
+        // Unknown id: must return without panicking or inserting anything.
+        run_admin_action(s.clone(), "never-submitted".to_string()).await;
+        assert!(s.admin_actions.read().await.is_empty());
+
+        // Already-terminal record: the guard leaves it untouched.
+        s.admin_actions.write().await.insert(
+            "act-done".to_string(),
+            AdminActionRecord {
+                action_id: "act-done".to_string(),
+                action_type: "parity-pack".to_string(),
+                status: AdminActionStatus::Succeeded,
+                submitted_at_unix_ms: 1,
+                started_at_unix_ms: Some(1),
+                finished_at_unix_ms: Some(2),
+                actor: None,
+                reason: None,
+                params: None,
+                result: None,
+                error: None,
+                auth_context: None,
+                request_context: None,
+                authenticated_passport: None,
+            },
+        );
+        run_admin_action(s.clone(), "act-done".to_string()).await;
+        let rec = s.admin_actions.read().await.get("act-done").cloned().unwrap();
+        assert_eq!(rec.status, AdminActionStatus::Succeeded);
+        assert_eq!(rec.finished_at_unix_ms, Some(2));
+    }
+
+    #[tokio::test]
+    async fn admin_action_record_round_trips_through_json_without_the_bound_passport() {
+        let record = AdminActionRecord {
+            action_id: "act-1".to_string(),
+            action_type: "verify-store".to_string(),
+            status: AdminActionStatus::Running,
+            submitted_at_unix_ms: 1,
+            started_at_unix_ms: Some(2),
+            finished_at_unix_ms: None,
+            actor: Some("op".to_string()),
+            reason: Some("r".to_string()),
+            params: None,
+            result: None,
+            error: None,
+            auth_context: None,
+            request_context: None,
+            authenticated_passport: Some("p_secret_binding".to_string()),
+        };
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(json["status"], "running");
+        assert_eq!(json["submittedAtUnixMs"], 1);
+        assert_eq!(json["startedAtUnixMs"], 2);
+        assert!(json.get("finishedAtUnixMs").is_none());
+        // The auth-layer-bound passport is `serde(skip)` — never wire-visible.
+        assert!(
+            !json.to_string().contains("p_secret_binding"),
+            "authenticated passport must not be serialised"
+        );
+
+        let back: AdminActionRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back.status, AdminActionStatus::Running);
+        assert_eq!(back.authenticated_passport, None);
+    }
+}
