@@ -93,12 +93,33 @@ pub struct ScanDiagnostics {
     /// non-regular-file check. Empty/off remains absent from serialized scans.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub v3_skipped_files: Vec<V3SkippedFile>,
+    /// Source files that were read but could **not be parsed**.
+    ///
+    /// Distinct from `v3_skipped_files`, which records only files rejected
+    /// *before* parsing. Without this, an unparsable file produced an entry
+    /// with no symbols — byte-identical to a file that genuinely declares
+    /// none — so `blast_radius` and dead-code answers for its contents read
+    /// as "nothing here". A parse that could not run is not a parse that ran
+    /// and found nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parse_failures: Vec<ParseFailure>,
 }
 
 impl ScanDiagnostics {
     pub fn is_empty(&self) -> bool {
-        self.unresolved_routes.is_empty() && self.v3_skipped_files.is_empty()
+        self.unresolved_routes.is_empty() && self.v3_skipped_files.is_empty() && self.parse_failures.is_empty()
     }
+}
+
+/// A file the scanner read but could not parse. See
+/// [`ScanDiagnostics::parse_failures`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParseFailure {
+    pub rel_path: String,
+    /// The parser that was applied: `rust`, `manifest:<ecosystem>`, or the
+    /// polyglot language id.
+    pub language: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

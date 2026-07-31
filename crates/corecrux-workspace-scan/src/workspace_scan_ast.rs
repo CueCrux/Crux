@@ -67,6 +67,11 @@ pub struct CachedFile {
     pub doc_full: Option<String>,
     pub is_test_file: bool,
     pub stubs: Vec<StubHit>,
+    /// `Some(reason)` when `syn::parse_file` REFUSED this file. Cached with
+    /// the rest of the entry so an incremental rescan does not lose the
+    /// signal. Without it, an unparsable file's empty `symbols` was
+    /// indistinguishable from a file that genuinely declares none (D-22).
+    pub parse_error: Option<String>,
     pub symbols: Vec<SymbolInfo>,
     fns: Vec<CachedFnDef>,
     deps: Vec<DepEdge>,
@@ -216,6 +221,24 @@ fn assemble_scan_at(root: &Path, cache: &AstScanCache, started_ms: u64) -> Works
             total_loc: crate_loc,
         });
     }
+
+    // D-22: an unparsable file still contributes LOC and a `FileInfo`, so
+    // without this the scan reports it as a file with no symbols. Surface the
+    // refusal alongside the pre-parse skips.
+    for file in cache.files.values() {
+        if let Some(reason) = &file.parse_error {
+            scan.diagnostics
+                .parse_failures
+                .push(crate::workspace_scan::ParseFailure {
+                    rel_path: file.rel_path.clone(),
+                    language: "rust".to_string(),
+                    reason: reason.clone(),
+                });
+        }
+    }
+    scan.diagnostics
+        .parse_failures
+        .sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 
     for file in cache.files.values() {
         for def in &file.fns {
@@ -786,14 +809,15 @@ fn parse_file_ast(
     }
 
     let mut parts = ParsedFileParts::default();
-    if let Ok(parsed) = syn::parse_file(&src) {
+    let parse_result = syn::parse_file(&src);
+    if let Ok(parsed) = parse_result.as_ref() {
         let mut ident_refs = HashMap::new();
-        collect_identifier_refs(&parsed, &mut ident_refs);
+        collect_identifier_refs(parsed, &mut ident_refs);
         // Second pass with test scopes elided. A file that *is* a test file
         // contributes nothing here: every reference in it is a test reference.
         let mut ident_refs_nontest = HashMap::new();
         if !is_test_file {
-            collect_identifier_refs_nontest(&parsed, &mut ident_refs_nontest);
+            collect_identifier_refs_nontest(parsed, &mut ident_refs_nontest);
         }
         let mut line_lookup = LineLookup::new(&src);
         index_items(
@@ -820,6 +844,7 @@ fn parse_file_ast(
             doc_full,
             is_test_file,
             stubs,
+            parse_error: None,
             symbols: parts.symbols,
             fns: parts.fns,
             deps: parts.deps,
@@ -828,6 +853,11 @@ fn parse_file_ast(
             ident_refs_nontest,
         })
     } else {
+        // D-22: the file was read but `syn` refused it. Record WHY, so the
+        // empty symbol set below cannot read as "this file declares nothing".
+        let parse_error = parse_result
+            .err()
+            .map_or_else(|| "rust parse failed".to_string(), |err| err.to_string());
         Ok(CachedFile {
             rel_path: rel_str.clone(),
             crate_name: crate_name.to_string(),
@@ -840,6 +870,7 @@ fn parse_file_ast(
             doc_full,
             is_test_file,
             stubs,
+            parse_error: Some(parse_error),
             symbols: Vec::new(),
             fns: Vec::new(),
             deps: Vec::new(),
@@ -1372,6 +1403,48 @@ fn roll_up_stats(scan: &mut WorkspaceScan) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D-22: an unparsable Rust file produced a `CachedFile` with empty
+    /// symbols while still counting LOC, so `blast_radius` and dead-code
+    /// answers over its contents read as "nothing here". Nothing recorded the
+    /// parse failure.
+    #[test]
+    fn an_unparsable_rust_file_is_recorded_as_a_parse_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("crates/alpha/src")).expect("mkdir");
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/alpha\"]\n").expect("ws");
+        std::fs::write(
+            root.join("crates/alpha/Cargo.toml"),
+            "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("crate toml");
+        std::fs::write(root.join("crates/alpha/src/lib.rs"), "pub fn ok() {}\n").expect("good");
+        // Syntactically invalid: `syn` refuses it.
+        std::fs::write(root.join("crates/alpha/src/broken.rs"), "pub fn ( { ] not rust\n").expect("bad");
+        // Genuinely empty: no symbols, but also no failure.
+        std::fs::write(root.join("crates/alpha/src/empty.rs"), "").expect("empty");
+
+        let scan = run_scan_ast_at(root).expect("scan");
+        let failures = &scan.diagnostics.parse_failures;
+        assert_eq!(
+            failures.iter().map(|f| f.rel_path.as_str()).collect::<Vec<_>>(),
+            vec!["crates/alpha/src/broken.rs"],
+            "only the unparsable file is recorded, not the empty one"
+        );
+        assert_eq!(failures[0].language, "rust");
+        assert!(!failures[0].reason.is_empty(), "the parser's reason is carried");
+        assert!(!scan.diagnostics.is_empty());
+
+        // Both files are still in the scan with no symbols — which is exactly
+        // why the diagnostic is needed to tell them apart.
+        let broken = scan
+            .files
+            .iter()
+            .find(|f| f.rel_path == "crates/alpha/src/broken.rs")
+            .expect("broken file is still scanned");
+        assert_eq!(broken.symbol_count, 0);
+    }
     use crate::test_support::EnvVarGuard;
 
     fn write_fixture(root: &Path) {
