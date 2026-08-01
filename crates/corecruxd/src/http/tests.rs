@@ -21410,10 +21410,9 @@ async fn m3b_storybook_allows_the_tenant_the_caller_does_hold() {
 // before the limit rather than at it.
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn m8_enrich_query(tenant: &str, seat: &str) -> super::traces::EnrichQuery {
+fn m8_enrich_query(tenant: &str, _seat: &str) -> super::traces::EnrichQuery {
     super::traces::EnrichQuery {
         tenant_id: tenant.to_string(),
-        seat_id: Some(seat.to_string()),
         repo_id: None,
         symbol: Some("some_symbol".to_string()),
         token_budget: Some(4000),
@@ -21480,39 +21479,43 @@ async fn m8_the_budget_is_readable_before_the_ceiling_bites() {
 async fn m8_one_seat_exhausting_itself_leaves_another_working() {
     // The reason the ceiling is per seat rather than per account: a runaway
     // agent must not take the team down with it.
+    //
+    // Seats are distinguished by CREDENTIAL, not by a field the caller picks —
+    // so this test uses two distinct passports, which is what two colleagues
+    // actually have.
     std::env::set_var(crate::enrich_budget::SEAT_CEILING_ENV, "2");
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
 
     for _ in 0..4 {
         let _ = super::traces::post_enrich_verdict(
             State(state.clone()),
-            dev_scope_headers("admin:write"),
-            Query(m8_enrich_query("tenant-a", "noisy")),
+            dev_scope_passport_headers("admin:write", "passport-noisy"),
+            Query(m8_enrich_query("tenant-a", "unused")),
         )
         .await
         .into_response();
     }
     let noisy = super::traces::get_enrich_budget(
         State(state.clone()),
-        dev_scope_headers("admin:read"),
-        Query(m8_enrich_query("tenant-a", "noisy")),
+        dev_scope_passport_headers("admin:read", "passport-noisy"),
+        Query(m8_enrich_query("tenant-a", "unused")),
     )
     .await
     .into_response();
     let noisy_body = json_body(noisy).await;
-    assert_eq!(noisy_body["budget"]["at_ceiling"], true);
+    assert_eq!(noisy_body["budget"]["at_ceiling"], true, "the looping seat is capped");
 
     let quiet = super::traces::get_enrich_budget(
         State(state.clone()),
-        dev_scope_headers("admin:read"),
-        Query(m8_enrich_query("tenant-a", "quiet")),
+        dev_scope_passport_headers("admin:read", "passport-quiet"),
+        Query(m8_enrich_query("tenant-a", "unused")),
     )
     .await
     .into_response();
     let quiet_body = json_body(quiet).await;
     assert_eq!(
         quiet_body["budget"]["at_ceiling"], false,
-        "a quiet seat must keep its own headroom"
+        "a colleague's seat must keep its own headroom"
     );
     assert_eq!(quiet_body["budget"]["remaining"], 2);
     std::env::remove_var(crate::enrich_budget::SEAT_CEILING_ENV);
@@ -21535,4 +21538,38 @@ async fn m8_enrichment_is_refused_across_tenants() {
         StatusCode::FORBIDDEN,
         "enrichment must honour tenant scoping like every other code-intel surface"
     );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m8_renaming_the_seat_cannot_mint_a_fresh_allowance() {
+    // Regression. seat_id was once a query parameter, so an agent that exhausted
+    // its allowance named a different seat and carried on — the ceiling was
+    // bypassable by exactly the caller it exists to stop. Seat identity is now
+    // taken from the verified credential.
+    std::env::set_var(crate::enrich_budget::SEAT_CEILING_ENV, "2");
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let mut admitted = 0;
+    for i in 0..20 {
+        let resp = super::traces::post_enrich_verdict(
+            State(state.clone()),
+            dev_scope_headers("admin:write"),
+            Query(m8_enrich_query("tenant-a", &format!("seat-{i}"))),
+        )
+        .await
+        .into_response();
+        // Past the ceiling means anything other than 429 — these return 404 for
+        // "no scan registered", which is still a call the ceiling did not stop.
+        if resp.status() != StatusCode::TOO_MANY_REQUESTS {
+            admitted += 1;
+        }
+    }
+    assert!(
+        admitted <= 3,
+        "renaming the seat must not mint a fresh allowance: {admitted} of 20 calls got \
+         past a ceiling of 2. Seat identity comes from the verified credential, so a \
+         caller cannot choose which bucket it spends from."
+    );
+    std::env::remove_var(crate::enrich_budget::SEAT_CEILING_ENV);
 }

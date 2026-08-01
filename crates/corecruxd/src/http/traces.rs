@@ -428,17 +428,35 @@ pub(super) async fn get_code_path(
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct EnrichQuery {
     pub tenant_id: String,
-    /// Which seat the call is charged against. The ceiling is per seat, so an
-    /// account that does not distinguish them shares one bucket — which is the
-    /// safe default, not a silent merge of everybody's headroom.
-    #[serde(default)]
-    pub seat_id: Option<String>,
+    // NOTE: there is deliberately no `seat_id` here. Seat identity is taken
+    // from the verified credential, never from the request — see
+    // `seat_identity`. A caller-supplied seat makes the ceiling a suggestion.
     #[serde(default)]
     pub repo_id: Option<String>,
     #[serde(default)]
     pub symbol: Option<String>,
     #[serde(default)]
     pub token_budget: Option<usize>,
+}
+
+/// The seat a rate-ceilinged call is charged against.
+///
+/// **Taken from the verified credential, never from the request.** This was a
+/// real defect: with `seat_id` as a query parameter, an agent that exhausted its
+/// allowance simply named a different seat and got a fresh one — which is
+/// exactly the caller the ceiling exists to stop, and one already making
+/// programmatic calls. A limit keyed on something the limited party chooses is
+/// not a limit.
+///
+/// Falls back to the tenant itself when the credential carries no passport, so
+/// an unidentified caller shares one bucket per tenant rather than minting a
+/// fresh allowance per request. Sharing is the safe failure here; a per-request
+/// bucket is unbounded.
+fn seat_identity(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> String {
+    crate::auth::passport_bound_context(&state.auth, headers)
+        .ok()
+        .and_then(|ctx| ctx.passport_id)
+        .unwrap_or_else(|| format!("tenant:{tenant_id}"))
 }
 
 /// Credits charged for one enriched verdict.
@@ -462,11 +480,11 @@ pub(super) async fn get_enrich_budget(
     if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
         return problem.into_response();
     }
-    let seat = q.seat_id.as_deref().unwrap_or("default");
+    let seat = seat_identity(&state, &headers, &q.tenant_id);
     let Ok(mut budgets) = state.enrich_budgets.lock() else {
         return problem_response(StatusCode::INTERNAL_SERVER_ERROR, "enrich budget lock poisoned");
     };
-    let view = budgets.peek(&q.tenant_id, seat);
+    let view = budgets.peek(&q.tenant_id, &seat);
     drop(budgets);
     (
         StatusCode::OK,
@@ -497,14 +515,14 @@ pub(super) async fn post_enrich_verdict(
     let Some(symbol) = q.symbol.as_deref() else {
         return problem_response(StatusCode::BAD_REQUEST, "symbol is required");
     };
-    let seat = q.seat_id.as_deref().unwrap_or("default");
+    let seat = seat_identity(&state, &headers, &q.tenant_id);
 
     // 1. Rate ceiling. Refuse here and nothing else has happened yet.
     let budget = {
         let Ok(mut budgets) = state.enrich_budgets.lock() else {
             return problem_response(StatusCode::INTERNAL_SERVER_ERROR, "enrich budget lock poisoned");
         };
-        match budgets.try_consume(&q.tenant_id, seat) {
+        match budgets.try_consume(&q.tenant_id, &seat) {
             Ok(b) => b,
             Err(exhausted) => {
                 // 429, not 402: this is a rate limit, not a billing failure, and
