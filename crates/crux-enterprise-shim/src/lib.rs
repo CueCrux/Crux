@@ -121,12 +121,12 @@ impl EnterpriseShim {
     }
 
     fn validate_policy(&self, token: &RcxCapabilityToken, call: &EnterpriseShimCall) -> EnterpriseShimDecision {
-        if token.tier != RcxTier::Enterprise {
+        if token.tier != RcxTier::Governance {
             return Self::refuse(
                 token,
                 call,
                 "capability_not_permitted",
-                vec![issue("not_enterprise_tier")],
+                vec![issue("not_governance_tier")],
             );
         }
 
@@ -315,7 +315,7 @@ mod tests {
         token.issuer.passport_kid = "rcx-test-kid".to_string();
         token.issuer.issuer_org = "vaultcrux".to_string();
         token.signature.kid = "rcx-test-kid".to_string();
-        token.tier = RcxTier::Enterprise;
+        token.tier = RcxTier::Governance;
         token.enterprise_scope = Some(EnterpriseScope {
             customer_id: "customer-a".to_string(),
             contract_id: Some("contract-a".to_string()),
