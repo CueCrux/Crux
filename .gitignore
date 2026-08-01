@@ -65,3 +65,8 @@ crates/crux-console-ui/dist/
 
 # Coverage instrumentation artifacts (cargo-llvm-cov / -Cinstrument-coverage)
 *.profraw
+
+# Local `git worktree add .worktrees/<name>` checkouts. Untracked, but they made
+# `git status --porcelain` non-empty, which tripped the clean-tree guard in
+# scripts/cut-release.sh and blocked the supported release path outright.
+.worktrees/
