@@ -306,12 +306,26 @@ jobs:
       - name: install the MSI (per-machine, silent)
         run: |
           $ev  = "$env:GITHUB_WORKSPACE\windows-gui-evidence"
-          $msi = Get-ChildItem 'shells\desktop\app\target\release\bundle\msi\*.msi' -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $msi) {
+          $built = Get-ChildItem 'shells\desktop\app\target\release\bundle\msi\*.msi' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $built) {
             Write-Host '::error::cargo tauri build produced no .msi under target/release/bundle/msi'
             exit 1
           }
-          Write-Host "installing $($msi.Name) ($([math]::Round($msi.Length/1MB,1)) MB)"
+
+          # Install from a STABLE path, not from the build output.
+          #
+          # Windows Installer caches the package source path of an installed
+          # product and resolves it again on a major upgrade. The update step
+          # below re-runs `cargo tauri build`, which replaces the contents of
+          # target/release/bundle/msi -- so a product installed from there has a
+          # cached source that no longer exists, and the upgrade dies at
+          # RegisterProduct with 1603, logging "SECREPAIR: Error determining
+          # package source type" and error 1302 (source needed). Copying to the
+          # evidence dir FIRST and installing from there keeps the source path
+          # valid for the whole job. Found the hard way; the msi-update.log
+          # artifact is what named it.
+          $msi = Copy-Item $built.FullName "$ev\v1.msi" -Force -PassThru
+          Write-Host "installing $($built.Name) as $($msi.FullName) ($([math]::Round($msi.Length/1MB,1)) MB)"
           $log = "$ev\msi-install.log"
           $p = Start-Process msiexec.exe -ArgumentList '/i', "`"$($msi.FullName)`"", '/qn', '/norestart', '/l*v', "`"$log`"" -Wait -PassThru
           Write-Host "msiexec exit: $($p.ExitCode)"
@@ -522,10 +536,13 @@ jobs:
           $json.version | Out-File "$ev\version-v1.txt" -Encoding ascii
           $next         | Out-File "$ev\version-v2.txt" -Encoding ascii
 
-          # Keep the v1 artifact: the downgrade check reinstalls it below, and
-          # re-bundling would otherwise overwrite it in place.
-          $msi1 = Get-ChildItem 'shells\desktop\app\target\release\bundle\msi\*.msi' | Select-Object -First 1
-          Copy-Item $msi1.FullName "$ev\v1.msi" -Force
+          # v1.msi is already in the evidence dir -- the install step put it
+          # there and installed FROM there precisely so this rebuild cannot
+          # invalidate the installed product's cached source path.
+          if (-not (Test-Path "$ev\v1.msi")) {
+            Write-Host '::error::v1.msi missing from the evidence dir; the install step should have placed it there'
+            exit 1
+          }
 
           # NOT `Set-Content -Encoding utf8`. Windows PowerShell 5.1 writes
           # UTF-8 WITH a BOM, and Tauri's Rust config parser then fails with
