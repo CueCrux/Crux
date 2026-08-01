@@ -39,23 +39,23 @@ use crate::workspace_scan::{
 
 const POLYGLOT_V2_ENV: &str = "CORECRUXD_POLYGLOT_V2";
 const POLYGLOT_V3_ENV: &str = "CORECRUXD_POLYGLOT_V3";
-pub(crate) const POLYGLOT_AST_MAX_DEPTH: usize = 512;
-pub(crate) const POLYGLOT_JS_MAX_BYTES: usize = 1024 * 1024;
-pub(crate) const POLYGLOT_JS_MAX_LINE_BYTES: usize = 10_000;
-pub(crate) const POLYGLOT_JAVA_MAX_BYTES: usize = 1024 * 1024;
-pub(crate) const POLYGLOT_JAVA_MAX_LINE_BYTES: usize = 10_000;
-pub(crate) const POLYGLOT_C_MAX_BYTES: usize = 1024 * 1024;
-pub(crate) const POLYGLOT_C_MAX_LINE_BYTES: usize = 10_000;
-pub(crate) const POLYGLOT_CPP_MAX_BYTES: usize = 1024 * 1024;
-pub(crate) const POLYGLOT_CPP_MAX_LINE_BYTES: usize = 10_000;
-pub(crate) const POLYGLOT_CSHARP_MAX_BYTES: usize = 1024 * 1024;
-pub(crate) const POLYGLOT_CSHARP_MAX_LINE_BYTES: usize = 10_000;
-pub(crate) const POLYGLOT_RUBY_MAX_BYTES: usize = 1024 * 1024;
-pub(crate) const POLYGLOT_RUBY_MAX_LINE_BYTES: usize = 10_000;
-pub(crate) const POLYGLOT_SWIFT_MAX_BYTES: usize = 1024 * 1024;
-pub(crate) const POLYGLOT_SWIFT_MAX_LINE_BYTES: usize = 10_000;
-pub(crate) const POLYGLOT_PHP_MAX_BYTES: usize = 1024 * 1024;
-pub(crate) const POLYGLOT_PHP_MAX_LINE_BYTES: usize = 10_000;
+pub const POLYGLOT_AST_MAX_DEPTH: usize = 512;
+pub const POLYGLOT_JS_MAX_BYTES: usize = 1024 * 1024;
+pub const POLYGLOT_JS_MAX_LINE_BYTES: usize = 10_000;
+pub const POLYGLOT_JAVA_MAX_BYTES: usize = 1024 * 1024;
+pub const POLYGLOT_JAVA_MAX_LINE_BYTES: usize = 10_000;
+pub const POLYGLOT_C_MAX_BYTES: usize = 1024 * 1024;
+pub const POLYGLOT_C_MAX_LINE_BYTES: usize = 10_000;
+pub const POLYGLOT_CPP_MAX_BYTES: usize = 1024 * 1024;
+pub const POLYGLOT_CPP_MAX_LINE_BYTES: usize = 10_000;
+pub const POLYGLOT_CSHARP_MAX_BYTES: usize = 1024 * 1024;
+pub const POLYGLOT_CSHARP_MAX_LINE_BYTES: usize = 10_000;
+pub const POLYGLOT_RUBY_MAX_BYTES: usize = 1024 * 1024;
+pub const POLYGLOT_RUBY_MAX_LINE_BYTES: usize = 10_000;
+pub const POLYGLOT_SWIFT_MAX_BYTES: usize = 1024 * 1024;
+pub const POLYGLOT_SWIFT_MAX_LINE_BYTES: usize = 10_000;
+pub const POLYGLOT_PHP_MAX_BYTES: usize = 1024 * 1024;
+pub const POLYGLOT_PHP_MAX_LINE_BYTES: usize = 10_000;
 
 #[derive(Debug, Clone, Copy)]
 struct PolyglotScanOptions {
@@ -72,11 +72,11 @@ impl PolyglotScanOptions {
     }
 }
 
-pub(crate) fn polyglot_v2_enabled_from_env() -> bool {
+pub fn polyglot_v2_enabled_from_env() -> bool {
     crate::workspace_scan_manifests::env_flag_enabled(POLYGLOT_V2_ENV)
 }
 
-pub(crate) fn polyglot_v3_enabled() -> bool {
+pub fn polyglot_v3_enabled() -> bool {
     crate::workspace_scan_manifests::env_flag_enabled(POLYGLOT_V3_ENV)
 }
 
@@ -182,7 +182,7 @@ impl AstWalkGuard {
     }
 }
 
-pub(crate) fn run_repo_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
+pub fn run_repo_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
     let options = PolyglotScanOptions::from_env();
     let mut scan = if should_use_rust_workspace_scan_with_options(root, options) {
         crate::workspace_scan::run_scan_at(root)?
@@ -203,11 +203,11 @@ pub(crate) fn run_repo_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> 
     Ok(scan)
 }
 
-pub(crate) fn has_rust_workspace(root: &Path) -> bool {
+pub fn has_rust_workspace(root: &Path) -> bool {
     root.join("Cargo.toml").exists() && has_supported_file(root, &[Some("rs")])
 }
 
-pub(crate) fn should_use_rust_workspace_scan(root: &Path) -> bool {
+pub fn should_use_rust_workspace_scan(root: &Path) -> bool {
     should_use_rust_workspace_scan_with_options(root, PolyglotScanOptions::from_env())
 }
 
@@ -243,7 +243,7 @@ fn merge_polyglot_scan(scan: &mut WorkspaceScan, poly: WorkspaceScan, options: P
 }
 
 #[cfg(test)]
-pub(crate) fn run_polyglot_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
+pub fn run_polyglot_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
     run_polyglot_scan_inner(root, true, PolyglotScanOptions::from_env())
 }
 

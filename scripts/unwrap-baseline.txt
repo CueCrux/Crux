@@ -51,6 +51,7 @@ corecrux-secrets 2
 corecrux-segment 32
 corecrux-storage 47
 corecrux-types 1
+corecrux-workspace-scan 0
 corecruxctl 9
 corecruxd 45
 crux-claude-hooks 1

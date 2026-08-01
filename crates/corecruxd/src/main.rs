@@ -134,10 +134,15 @@ mod witness_proofs;
 mod witness_submit;
 mod work;
 mod work_execplans;
-mod workspace_scan;
-mod workspace_scan_ast;
-mod workspace_scan_manifests;
-mod workspace_scan_polyglot;
+// Extracted to the `corecrux-workspace-scan` crate; aliased so the 16 consumer
+// modules here (http/repos, http/workspace, code_intel, repo_codegraph,
+// symbol_resolve, dossier, …) keep their existing `crate::workspace_scan*::`
+// paths. Module names kept their prefix inside the new crate so the ~15k lines
+// of intra-group paths needed no rewriting.
+use corecrux_workspace_scan::workspace_scan;
+use corecrux_workspace_scan::workspace_scan_ast;
+use corecrux_workspace_scan::workspace_scan_manifests;
+use corecrux_workspace_scan::workspace_scan_polyglot;
 
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;

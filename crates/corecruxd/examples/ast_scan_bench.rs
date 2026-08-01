@@ -9,18 +9,12 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-mod fact_helpers {
-    pub fn dedup_latest(facts: Vec<corecrux_memory::fact_store::Fact>) -> Vec<corecrux_memory::fact_store::Fact> {
-        facts
-    }
-}
-
-#[path = "../src/workspace_scan.rs"]
-mod workspace_scan;
-#[path = "../src/workspace_scan_ast.rs"]
-mod workspace_scan_ast;
-#[path = "../src/workspace_scan_manifests.rs"]
-mod workspace_scan_manifests;
+// These used to be pulled in as `#[path = "../src/..."] mod ...`, because
+// corecruxd is a bin crate with no lib target for an example to `use`. They now
+// live in `corecrux-workspace-scan`, so this is a plain dependency — and the
+// local no-op `fact_helpers::dedup_latest` stub that existed only to satisfy the
+// inlined module's `crate::` path is gone with it.
+use corecrux_workspace_scan::{workspace_scan, workspace_scan_ast};
 
 use workspace_scan::WorkspaceScan;
 
