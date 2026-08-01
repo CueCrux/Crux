@@ -21304,6 +21304,104 @@ async fn m3b_unbound_request_declares_the_daemon_fallback() {
     );
 }
 
+// M3b, the other two surfaces. `dossier` and `storybook` shipped accepting a
+// caller-supplied `tenant_id` while still authorising with the tenant-blind
+// `require_http_scopes`, so any holder of a valid token could read any tenant's
+// spans by naming it. The gate says all three surfaces, and only `/v1/traces*`
+// had tests — which is precisely why it went unnoticed. Each of these fails
+// against the pre-fix handler.
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_dossier_refuses_a_tenant_the_caller_does_not_hold() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::dossier::post_auto(
+        State(state.clone()),
+        Path("proj".to_string()),
+        m2_bearer_for("tenant-b", "admin:read facts:write"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "dossier leaked across tenants: it read tenant-a's spans for a tenant-b caller"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_dossier_allows_the_tenant_the_caller_does_hold() {
+    // Positive control: the refusal must not be a surface that refuses
+    // everything the moment a tenant is named. A missing project answers 404,
+    // which is past authorization and is all this control needs to prove.
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::dossier::post_auto(
+        State(state.clone()),
+        Path("proj".to_string()),
+        m2_bearer_for("tenant-b", "admin:read facts:write"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_ne!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a caller naming its own tenant must get past authorization"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_storybook_refuses_a_tenant_the_caller_does_not_hold() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::storybook::post_generate(
+        State(state.clone()),
+        Path("proj".to_string()),
+        m2_bearer_for("tenant-b", "admin:read facts:write"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "storybook leaked across tenants: it read tenant-a's spans for a tenant-b caller"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_storybook_allows_the_tenant_the_caller_does_hold() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::storybook::post_generate(
+        State(state.clone()),
+        Path("proj".to_string()),
+        m2_bearer_for("tenant-b", "admin:read facts:write"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_ne!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a caller naming its own tenant must get past authorization"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // M8 — enrichment behind a per-seat rate ceiling.
 // crux-code-intel-pro-hosted-surface-2026-07-28.
