@@ -82,6 +82,20 @@ pub const FREE_CAPABILITY_CLAIMS: &[&str] = &[
     "store:durable",
 ];
 
+/// A claim listed here is **sold**, and `require_surface_enabled` will let a
+/// paying tenant reach the surface behind it. So a claim earns its place by
+/// delivering something, not by having an implemented route.
+///
+/// `ledger:history` is deliberately absent. `/v1/workbench/command-ledger` is
+/// implemented in both directions and still served — but no CLI, MCP tool or
+/// hook has ever written a record to it, so the capability could only ever
+/// render an empty page. Do not re-add it without landing a producer first;
+/// the surface returns `402 pro_service_not_enabled` until then, and
+/// `workbench_command_ledger_is_not_a_sold_claim_without_a_producer` pins
+/// that. Removing it from [`DAEMON_IMPLEMENTED_PRO_CLAIMS`] alone would have
+/// been worse than leaving it: `pro_claim_placements` would then report it as
+/// `contracted_external`, asserting an outside implementer that does not
+/// exist. See ExecPlan `crux-command-ledger-claim-truth-2026-07-30`.
 pub const PRO_CAPABILITY_CLAIMS: &[&str] = &[
     "memorycrux:tenant",
     "gpu1:answer",
@@ -96,7 +110,6 @@ pub const PRO_CAPABILITY_CLAIMS: &[&str] = &[
     "agent_brief:pro",
     "context_pack:budgeted",
     "impact:preflight",
-    "ledger:history",
     "audit:triage",
     "audit:central_retention",
     "reasoning:timeline",
@@ -130,7 +143,6 @@ pub const DAEMON_IMPLEMENTED_PRO_CLAIMS: &[&str] = &[
     "agent_brief:pro",
     "context_pack:budgeted",
     "impact:preflight",
-    "ledger:history",
     "audit:triage",
     "reasoning:timeline",
     "handoff:v2",
@@ -920,13 +932,6 @@ fn hosted_rest_endpoints() -> Vec<RestEndpointContract> {
             hosted_path: "/v1/workbench/impact-preflight",
             local_path: Some("/v1/workbench/impact-preflight"),
             scopes: vec!["impact:preflight"],
-        },
-        RestEndpointContract {
-            name: "command_test_ledger",
-            method: "GET/POST",
-            hosted_path: "/v1/workbench/command-ledger",
-            local_path: Some("/v1/workbench/command-ledger"),
-            scopes: vec!["ledger:history"],
         },
         RestEndpointContract {
             name: "audit_triage_mode",

@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.54] - 2026-07-30
+
 ### Changed
 
 - **Relicensed to Apache-2.0 — Crux Daemon is now open source.** The CueCrux
@@ -52,6 +54,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The token-burn cost lens gains a model/effort axis.** `crux-cost` already
+  opened every transcript line by line and discarded what it found: `gitBranch`
+  was parsed but used only as an internal ranking tie-breaker, and `model`,
+  `effort` and `cwd` were not parsed at all. All four are now parsed onto the
+  event, promoted onto `CostReport`, and rolled up into a per-model burn
+  breakdown with per-effort burn *within* each model, rendered by both
+  `corecruxctl session cost` and the console `cx-cost` page.
+  - **It reconciles.** Per-model context, plus the `<synthetic>` pseudo-model,
+    plus records carrying usage but no model id, sum exactly to
+    `headline.measured_context_total`.
+  - **Coverage travels with every effort number.** `effort` is absent from 61%
+    of the measured corpus and its absence correlates with model — 100% / 100% /
+    22.5% / 9.4% across 46,239 assistant records — so a cross-model effort
+    comparison is confounded at source and no sample size fixes it.
+    `effort_coverage_pct` lives on the type, so no surface can render an effort
+    figure without the denominator that qualifies it.
+  - `<synthetic>` is reported separately, never ranked as a model and never
+    dropped. Model-id normalisation folds only stable presentation variants
+    (`[1m]` context suffix, `us.anthropic.`/`bedrock/`/`vertex/` route prefixes,
+    `-v1:0`); floating aliases such as `opus` and `sonnet` are deliberately left
+    unresolved, since resolving them would silently merge two models the day the
+    alias moves.
+  - The five new `CostReport` fields are additive, serde-default and omitted
+    when absent, so an older daemon ignores a newer report and a legacy report
+    is unchanged on the wire. A daemon must be upgraded before the console can
+    render the axis.
+  - Adds the cost lane's first integration coverage: a post-then-get test
+    through both `/v1/cost/report` handlers.
+
 - **`CITATION.cff`.** Machine-readable citation metadata (GitHub "Cite this
   repository" button). Under Apache-2.0 citation is appreciated but not a
   licence condition.
@@ -78,6 +109,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   WSL2 parity with a developer box).
 
 ### Fixed
+
+- **The SessionEnd cost hook now records whether it worked.** The generated
+  `cost)` launcher branch failed silently on three paths — `corecruxctl` absent,
+  no configured endpoint, post rejected — each swallowed by `|| true`. Quiet is
+  the correct posture for a SessionEnd hook, which must never block session end;
+  undiagnosable is not. There was no way to distinguish "no sessions ran" from
+  "every session silently failed to post", and the branch had no test coverage
+  of any kind, which is why it survived.
+  - Every attempt writes a one-line outcome record (result, reason, endpoint,
+    endpoint source, launcher version) to `~/.claude/hooks/crux-cost.state.json`;
+    failures additionally append to `crux-cost.errors.log`. `exit 0` remains
+    unconditional on every path.
+  - `CRUX_HTTP_URL` can never actually be empty — `${CRUX_HTTP_URL:-…}`
+    substitutes for empty as well as unset — so the real misconfiguration is the
+    *unconfigured loopback default*, which fails with a connection refused the
+    operator cannot place. The launcher now records whether the endpoint came
+    from config or from the built-in default, and names the remedy.
+  - `corecruxctl hooks status` reports the last outcome and flags a stale
+    launcher by version marker. The boot self-check warns when the installed
+    launcher predates the running build, or when capture last failed or was
+    never attempted — nothing warns when no outcome has been recorded yet, since
+    a fresh install has simply not ended a session.
+  - Six shell-level tests run the *embedded* launcher template under `bash`, so
+    they cannot drift from what `hooks install` writes.
+
+  **This takes effect only after `corecruxctl hooks install` is re-run.** An
+  un-re-run wizard keeps the old silent script, and that is the most likely way
+  this fix appears not to work.
+
+- **Three tests that asserted things the machine does not guarantee.** Each
+  failed CI on an unrelated PR and passed on a re-run of the identical commit;
+  two of them gate required checks, so they cost merges rather than just noise.
+  - `envelope_build_latency_under_2ms_for_10_facts` (`crux-mcp`) asserted a
+    wall-clock bound — the only one in the workspace. On a shared runner that
+    measures how busy the machine is, not how fast the code is. The figure is
+    still measured and printed; the assertion is gone, and the test is renamed
+    `envelope_build_covers_all_ten_facts` after the check that carries content
+    (`memories_used.len() == 10`). Raising the constant was rejected: it trades a
+    frequent flake for a rarer one and keeps a load-dependent test.
+  - `allowed_origins_reads_the_env_var` (`corecruxd`) round-tripped through
+    `set_var`/`getenv` and read back the built-in defaults instead of the value
+    it had just set — *while holding the module's `env_lock()`*. The mutex was
+    never the problem: `setenv` can reallocate the environment block, and a
+    concurrent `getenv` anywhere in this 2000-plus-test binary may then read a
+    stale pointer, which no Rust-level lock can fence (hence `set_var` being
+    `unsafe` from the 2024 edition). It now parses via `resolve_allowed_origins`
+    directly, matching its five neighbours, and removes the last `set_var` in
+    the file.
+  - `pick_free_port_is_bindable` (`crux-shell-lifecycle`) asserted that a port
+    picked by binding `:0` and dropping the listener is immediately re-bindable.
+    Nothing promises that — sibling tests binding `:0` in parallel can take it
+    in the gap. It now retries a bounded number of times, so only a genuinely
+    broken helper fails.
 
 - **The desktop shell no longer opens stray console windows on Windows.** Two
   spawn sites, both console-subsystem binaries launched from a GUI-subsystem app
@@ -532,7 +616,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-deny` supply chain and licence audit in CI
 - `cargo-audit` CVE scanning in CI
 
-[unreleased]: https://github.com/CueCrux/Crux/compare/v0.4.6...HEAD
+[unreleased]: https://github.com/CueCrux/Crux/compare/v0.5.54...HEAD
+[0.5.54]: https://github.com/CueCrux/Crux/compare/v0.5.53...v0.5.54
 [0.4.6]: https://github.com/CueCrux/Crux/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/CueCrux/Crux/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/CueCrux/Crux/compare/v0.4.3...v0.4.4

@@ -14,6 +14,8 @@
 //! embedded into the binary via `include_str!`. The `load_bundled_profiles()`
 //! function returns the list at runtime; no filesystem read is required.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 use crate::Target;
@@ -57,8 +59,21 @@ pub struct ProfileFragment {
 
 impl ProfileFragment {
     /// Parse a raw fragment string (with `+++`-delimited TOML frontmatter).
+    ///
+    /// CRLF input parses identically to LF. `bundled_raw` resolves these
+    /// fragments with `include_str!`, which bakes in whatever bytes are on disk
+    /// at compile time, so a checkout under git's `core.autocrlf=true` (the
+    /// Windows default) hands every fence below a `\r` it would not otherwise
+    /// match. Normalising once here — rather than relying on `.gitattributes` —
+    /// keeps parsing and the composed output byte-identical across platforms,
+    /// and covers existing clones that an attributes file could not reach.
     pub fn parse(name_hint: &str, raw: &str) -> Result<Self, ProfileError> {
-        let trimmed = raw.trim_start();
+        let normalised: Cow<'_, str> = if raw.contains('\r') {
+            Cow::Owned(raw.replace("\r\n", "\n"))
+        } else {
+            Cow::Borrowed(raw)
+        };
+        let trimmed = normalised.trim_start();
         let rest = trimmed.strip_prefix("+++\n").ok_or_else(|| ProfileError::Frontmatter {
             name: name_hint.to_string(),
             reason: "missing opening '+++' frontmatter fence".into(),
@@ -148,6 +163,45 @@ risk_class = "medium"
 
 This is the body.
 "#;
+
+    /// A CRLF checkout must parse exactly as an LF one, and produce the same
+    /// body bytes. `include_str!` embeds the on-disk form, so under git's
+    /// `core.autocrlf=true` this is what every bundled profile actually looks
+    /// like to the parser — the whole crate failed to load a single profile on
+    /// Windows until the parser normalised it, while Linux-only CI stayed green.
+    #[test]
+    fn crlf_checkout_parses_identically_to_lf() {
+        let lf = ProfileFragment::parse("sample.md", SAMPLE).unwrap();
+        let crlf_src = SAMPLE.replace('\n', "\r\n");
+        let crlf = ProfileFragment::parse("sample.md", &crlf_src).unwrap();
+
+        assert_eq!(crlf.frontmatter.name, lf.frontmatter.name);
+        assert_eq!(crlf.frontmatter.version, lf.frontmatter.version);
+        assert_eq!(crlf.frontmatter.targets, lf.frontmatter.targets);
+        assert_eq!(crlf.frontmatter.order, lf.frontmatter.order);
+        // Byte-identical bodies: a composed CLAUDE.md must not depend on how
+        // the repository happened to be checked out.
+        assert_eq!(crlf.body, lf.body);
+        assert!(
+            !crlf.body.contains('\r'),
+            "normalisation must not leave stray CR in the body"
+        );
+    }
+
+    /// The bundled set must load on the host actually running the tests, not
+    /// just on the CI platform. This is the assertion Linux-only CI could not make.
+    #[test]
+    fn bundled_profiles_load_on_this_platform() {
+        let loaded = load_bundled_profiles().expect("every bundled profile must parse on this platform");
+        assert_eq!(loaded.len(), bundled_raw().len());
+        for f in &loaded {
+            assert!(
+                !f.body.contains('\r'),
+                "profile {} kept a CR in its body",
+                f.frontmatter.name
+            );
+        }
+    }
 
     #[test]
     fn parse_round_trip() {

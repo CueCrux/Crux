@@ -10,7 +10,7 @@
 //! - `credentials.json` — `GithubCredentials { encrypted_pat, username, scopes,
 //!   connected_at_unix_ms, last_verified_at_unix_ms? }`. The PAT itself never
 //!   appears in plaintext; the envelope is sealed with the daemon-root
-//!   passport-derived key (see `crate::encrypted_secrets`).
+//!   passport-derived key (see `corecrux_secrets`).
 //!
 //! Future (G2): `selected_repos.json` for the operator-selected repo set.
 
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::encrypted_secrets::{EncryptedEnvelope, EncryptedSecretError};
+use corecrux_secrets::{EncryptedEnvelope, EncryptedSecretError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GithubIntegrationError {
@@ -120,7 +120,7 @@ pub fn delete_credentials(data_dir: &Path) -> Result<(), GithubIntegrationError>
 
 #[allow(dead_code)] // Used by G3 sync worker — reads PAT for outbound api.github.com calls.
 pub fn decrypt_pat(creds: &GithubCredentials, key: &[u8; 32]) -> Result<String, GithubIntegrationError> {
-    let bytes = crate::encrypted_secrets::open(&creds.encrypted_pat, key)?;
+    let bytes = corecrux_secrets::open(&creds.encrypted_pat, key)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -413,6 +413,7 @@ fn set_owner_only_perms(_path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -431,7 +432,7 @@ mod tests {
 
     fn sample_creds() -> (GithubCredentials, [u8; 32]) {
         let key = [7u8; 32];
-        let env = crate::encrypted_secrets::seal(b"github_pat_test_token_12345", &key);
+        let env = corecrux_secrets::seal(b"github_pat_test_token_12345", &key);
         (
             GithubCredentials {
                 encrypted_pat: env,
@@ -545,5 +546,341 @@ mod tests {
     fn fetch_accessible_rejects_empty_pat() {
         let err = fetch_accessible_repos("", 1).expect_err("empty rejected");
         assert!(matches!(err, GithubIntegrationError::VerifyFailed(_)));
+    }
+
+    // ── Credential file error branches ────────────────────────────────────
+
+    /// A truncated / hand-edited `credentials.json` must surface as a JSON
+    /// error, not as "connected with an empty username". Catches a regression
+    /// where a partial write would be treated as a live credential.
+    #[test]
+    fn read_credentials_on_corrupt_json_returns_json_error() {
+        let dir = temp_dir("corrupt-creds");
+        let path = credentials_path(&dir);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, b"{ not json").expect("write");
+        let err = read_credentials(&dir).expect_err("must fail");
+        assert!(matches!(err, GithubIntegrationError::Json(_)), "got {err:?}");
+        // …and the status view must degrade to disconnected rather than
+        // reporting a half-populated connection.
+        let status = read_status(&dir);
+        assert!(!status.connected);
+        assert!(status.scopes.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_credentials_missing_file_is_not_connected_error() {
+        let dir = temp_dir("missing-creds");
+        let err = read_credentials(&dir).expect_err("must fail");
+        assert!(matches!(err, GithubIntegrationError::NotConnected));
+        assert_eq!(err.to_string(), "not connected: no credentials on disk");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `delete_credentials` is called on the disconnect path even when nothing
+    /// was ever connected; it must be a no-op rather than an io error.
+    #[test]
+    fn delete_credentials_is_idempotent_when_absent() {
+        let dir = temp_dir("del-absent");
+        delete_credentials(&dir).expect("first delete");
+        delete_credentials(&dir).expect("second delete");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The PAT envelope is the only thing standing between an on-disk read and
+    /// a live GitHub token — the file must not be world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn write_credentials_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("perms");
+        let (creds, _) = sample_creds();
+        write_credentials(&dir, &creds).expect("write");
+        let mode = fs::metadata(credentials_path(&dir)).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "credentials.json must be 0600, got {mode:o}");
+        // The temp file used for the atomic rename must not be left behind.
+        assert!(!credentials_path(&dir).with_extension("json.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Re-connecting overwrites the previous envelope instead of appending or
+    /// failing on the existing file.
+    #[test]
+    fn write_credentials_overwrites_previous_envelope() {
+        let dir = temp_dir("overwrite");
+        let (first, _) = sample_creds();
+        write_credentials(&dir, &first).expect("write 1");
+        let key = [9u8; 32];
+        let second = GithubCredentials {
+            encrypted_pat: corecrux_secrets::seal(b"github_pat_second_fake", &key),
+            username: "hubot".to_string(),
+            scopes: Vec::new(),
+            connected_at_unix_ms: 42,
+            last_verified_at_unix_ms: Some(43),
+        };
+        write_credentials(&dir, &second).expect("write 2");
+        let loaded = read_credentials(&dir).expect("read");
+        assert_eq!(loaded, second);
+        let status = read_status(&dir);
+        assert_eq!(status.username.as_deref(), Some("hubot"));
+        assert_eq!(status.last_verified_at_unix_ms, Some(43));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `scopes` is `#[serde(default)]` — a credentials file written by an older
+    /// build without the field must still load.
+    #[test]
+    fn credentials_without_scopes_field_defaults_to_empty() {
+        let dir = temp_dir("no-scopes");
+        let (creds, _) = sample_creds();
+        let path = credentials_path(&dir);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let json = serde_json::json!({
+            "encrypted_pat": creds.encrypted_pat,
+            "username": "octocat",
+            "connected_at_unix_ms": 1_700_000_000_000u64,
+        });
+        fs::write(&path, serde_json::to_vec(&json).expect("json")).expect("write");
+        let loaded = read_credentials(&dir).expect("read");
+        assert!(loaded.scopes.is_empty());
+        assert!(loaded.last_verified_at_unix_ms.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decrypt_pat_rejects_unknown_scheme() {
+        let (mut creds, key) = sample_creds();
+        creds.encrypted_pat.scheme = "xchacha-v99".to_string();
+        let err = decrypt_pat(&creds, &key).expect_err("must fail");
+        assert!(matches!(
+            err,
+            GithubIntegrationError::Encryption(EncryptedSecretError::UnknownScheme(_))
+        ));
+    }
+
+    #[test]
+    fn decrypt_pat_rejects_tampered_ciphertext() {
+        let (mut creds, key) = sample_creds();
+        creds.encrypted_pat.ciphertext_hex = "zz".to_string() + &creds.encrypted_pat.ciphertext_hex;
+        let err = decrypt_pat(&creds, &key).expect_err("must fail");
+        assert!(matches!(
+            err,
+            GithubIntegrationError::Encryption(EncryptedSecretError::InvalidHex)
+        ));
+    }
+
+    #[test]
+    fn verify_pat_rejects_whitespace_only_pat() {
+        // Whitespace-only must be rejected *before* any outbound call — a
+        // blank token trimmed to nothing is not a credential.
+        let err = verify_pat("   \t\n ").expect_err("blank rejected");
+        assert!(matches!(err, GithubIntegrationError::VerifyFailed(_)));
+    }
+
+    #[test]
+    fn fetch_accessible_rejects_whitespace_only_pat() {
+        let err = fetch_accessible_repos("  ", 3).expect_err("blank rejected");
+        assert!(matches!(err, GithubIntegrationError::VerifyFailed(_)));
+    }
+
+    // ── Selected-repo set ─────────────────────────────────────────────────
+
+    /// A repo that became private after first selection must be upgraded to
+    /// private; the reverse (private -> public) must never happen, or a private
+    /// repo's commits would start being stored as non-private facts.
+    #[test]
+    fn select_upgrades_private_but_never_downgrades() {
+        let dir = temp_dir("privacy-ratchet");
+        let first = select_repo(&dir, "a", "b", false, 1).expect("public select");
+        assert!(!first.private);
+
+        let upgraded = select_repo(&dir, "a", "b", true, 2).expect("private select");
+        assert!(upgraded.private, "private flag must ratchet up");
+        assert_eq!(upgraded.selected_at_unix_ms, 1, "original selection time preserved");
+        assert_eq!(list_selected_repos(&dir).len(), 1, "still one entry");
+
+        let downgrade_attempt = select_repo(&dir, "a", "b", false, 3).expect("public re-select");
+        assert!(downgrade_attempt.private, "private must not be downgraded");
+        assert!(list_selected_repos(&dir)[0].private);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The private ratchet must only touch the named repo — a sibling entry in
+    /// the same file must keep its own flag.
+    #[test]
+    fn select_upgrade_does_not_touch_siblings() {
+        let dir = temp_dir("ratchet-sibling");
+        select_repo(&dir, "a", "x", false, 1).expect("a/x");
+        select_repo(&dir, "a", "y", false, 1).expect("a/y");
+        select_repo(&dir, "a", "x", true, 2).expect("upgrade a/x");
+        let repos = list_selected_repos(&dir);
+        let x = repos.iter().find(|r| r.repo == "x").expect("a/x present");
+        let y = repos.iter().find(|r| r.repo == "y").expect("a/y present");
+        assert!(x.private);
+        assert!(!y.private);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn select_distinguishes_same_repo_name_across_owners() {
+        let dir = temp_dir("owners");
+        select_repo(&dir, "owner-a", "Crux", false, 1).expect("a");
+        select_repo(&dir, "owner-b", "Crux", false, 1).expect("b");
+        let names: Vec<String> = list_selected_repos(&dir).iter().map(SelectedRepo::full_name).collect();
+        assert_eq!(names, vec!["owner-a/Crux".to_string(), "owner-b/Crux".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_planning_repo_toggles_flag_and_persists() {
+        let dir = temp_dir("planning");
+        select_repo(&dir, "a", "b", false, 1).expect("select");
+        let on = set_planning_repo(&dir, "a", "b", true).expect("set on");
+        assert!(on.planning);
+        assert!(list_selected_repos(&dir)[0].planning, "persisted to disk");
+        let off = set_planning_repo(&dir, "a", "b", false).expect("set off");
+        assert!(!off.planning);
+        assert!(!list_selected_repos(&dir)[0].planning);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Flagging an unselected repo as the planning target must be an explicit
+    /// error rather than silently creating a selection.
+    #[test]
+    fn set_planning_repo_on_unselected_repo_errors_without_creating_it() {
+        let dir = temp_dir("planning-missing");
+        let err = set_planning_repo(&dir, "ghost", "repo", true).expect_err("must fail");
+        assert!(matches!(err, GithubIntegrationError::VerifyFailed(_)));
+        assert!(err.to_string().contains("select it first"));
+        assert!(list_selected_repos(&dir).is_empty(), "no phantom selection created");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Unselecting a repo that was never selected must succeed (idempotent
+    /// disconnect path) and must not create the file with junk in it.
+    #[test]
+    fn unselect_unknown_repo_is_idempotent() {
+        let dir = temp_dir("unsel-unknown");
+        unselect_repo(&dir, "nope", "nada").expect("unselect");
+        assert!(list_selected_repos(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_selected_repos_on_missing_file_is_empty() {
+        let dir = temp_dir("list-missing");
+        assert!(list_selected_repos(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PINS CURRENT BEHAVIOUR (absent-signal-reads-as-pass): a corrupt
+    /// `selected_repos.json` is swallowed and reported as "no repos selected",
+    /// and the next `select_repo` overwrites the unreadable file. Callers get
+    /// no signal that a selection set was lost.
+    #[test]
+    fn corrupt_selected_repos_file_reads_as_empty_and_is_overwritten() {
+        let dir = temp_dir("corrupt-selected");
+        let path = selected_repos_path(&dir);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, b"[[[not json").expect("write");
+        assert!(
+            list_selected_repos(&dir).is_empty(),
+            "corrupt file currently reads as an empty selection set"
+        );
+        select_repo(&dir, "a", "b", false, 1).expect("select over corrupt file");
+        assert_eq!(list_selected_repos(&dir).len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A well-formed file with an unknown top-level shape also degrades to
+    /// empty rather than erroring.
+    #[test]
+    fn selected_repos_file_without_repos_key_reads_as_empty() {
+        let dir = temp_dir("no-repos-key");
+        let path = selected_repos_path(&dir);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, br#"{"other": 1}"#).expect("write");
+        assert!(list_selected_repos(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_repos_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("selected-perms");
+        select_repo(&dir, "a", "b", true, 1).expect("select");
+        let mode = fs::metadata(selected_repos_path(&dir))
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Sync bookkeeping fields must survive a write/read cycle — the sync
+    /// worker's `since=` cursor lives here.
+    #[test]
+    fn selected_repo_sync_cursor_round_trips() {
+        let dir = temp_dir("cursor");
+        select_repo(&dir, "a", "b", false, 1).expect("select");
+        let mut repos = list_selected_repos(&dir);
+        repos[0].last_synced_at_unix_ms = Some(1_700_000_000_000);
+        repos[0].last_sync_error = Some("boom".to_string());
+        write_selected_repos(&dir, &repos).expect("write");
+        let reloaded = list_selected_repos(&dir);
+        assert_eq!(reloaded[0].last_synced_at_unix_ms, Some(1_700_000_000_000));
+        assert_eq!(reloaded[0].last_sync_error.as_deref(), Some("boom"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Status / serde surface ────────────────────────────────────────────
+
+    /// The disconnected status must not emit `null` fields the console would
+    /// have to special-case.
+    #[test]
+    fn disconnected_status_omits_optional_fields() {
+        let dir = temp_dir("status-json");
+        let json = serde_json::to_value(read_status(&dir)).expect("serialise");
+        assert_eq!(json["connected"], serde_json::Value::Bool(false));
+        assert!(json.get("username").is_none());
+        assert!(json.get("connected_at_unix_ms").is_none());
+        assert!(json.get("last_verified_at_unix_ms").is_none());
+        assert_eq!(json["scopes"], serde_json::json!([]));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A serialised status must never leak the sealed PAT envelope.
+    #[test]
+    fn connected_status_does_not_expose_the_pat_envelope() {
+        let dir = temp_dir("status-no-pat");
+        let (creds, _) = sample_creds();
+        let cipher = creds.encrypted_pat.ciphertext_hex.clone();
+        write_credentials(&dir, &creds).expect("write");
+        let json = serde_json::to_string(&read_status(&dir)).expect("serialise");
+        assert!(!json.contains(&cipher), "status must not carry the sealed PAT");
+        assert!(!json.contains("encrypted_pat"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncate_appends_ellipsis_only_when_over_limit() {
+        assert_eq!(truncate("abc", 3), "abc");
+        assert_eq!(truncate("abc", 10), "abc");
+        assert_eq!(truncate("abcdef", 3), "abc...");
+        assert_eq!(truncate("", 4), "");
+    }
+
+    #[test]
+    fn error_display_strings_are_stable() {
+        assert_eq!(
+            GithubIntegrationError::VerifyFailed("nope".to_string()).to_string(),
+            "PAT verification failed: nope"
+        );
+        assert_eq!(
+            GithubIntegrationError::Network("timeout".to_string()).to_string(),
+            "network: timeout"
+        );
     }
 }

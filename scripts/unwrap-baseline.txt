@@ -31,18 +31,28 @@
 #   baseline; lowering a count updates this file in the same PR.
 # Self-test: scripts/unwrap-ratchet.sh --self-test (covers the mid-file
 #   #[cfg(test)] regression from defect 2 above).
+#
+# 2026-07-31: corecruxd 47 -> 45, corecrux-secrets 0 -> 2. Not new debt — the
+# corecruxd crate-split moved encrypted_secrets.rs into corecrux-secrets, and
+# its two infallible expect() sites (fixed-length XNonce conversion; an encrypt
+# that only fails on programmer error) moved with it. Whole-tree total is
+# unchanged at 369. corecrux-billing and corecrux-providers were added by the
+# same split and carry no non-test sites.
+corecrux-billing 0
 corecrux-frame 0
 corecrux-index 3
 corecrux-memory 0
 corecrux-projections 49
 corecrux-proto 0
+corecrux-providers 0
 corecrux-receipts 0
 corecrux-retrieval 2
+corecrux-secrets 2
 corecrux-segment 32
 corecrux-storage 47
 corecrux-types 1
 corecruxctl 9
-corecruxd 47
+corecruxd 45
 crux-claude-hooks 1
 crux-config-wizard 8
 crux-contrib 0

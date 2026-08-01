@@ -1,0 +1,22 @@
+[package]
+name = "corecrux-billing"
+publish.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Payload hashes pin a reservation to the exact quote it was made against.
+blake3 = { workspace = true }
+hex = { workspace = true }
+# Spend receipts are signed with the daemon-root passport key.
+crux-session = { path = "../crux-session" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -1040,6 +1040,7 @@ pub(crate) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         quota_hosted_surfaces: Arc::new(Vec::new()),
         quota_ledger: Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
         credit_meter: None,
+        enrich_budgets: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
         openai_shim_enabled: false,
         memory_import_enabled: true,
         identity_links_enabled: true,
@@ -8393,8 +8394,8 @@ async fn workbench_brief_requires_enabled_pro_service() {
 }
 
 #[tokio::test]
-async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
-    let state = pro_workbench_state(&["context_pack:budgeted", "ledger:history"]);
+async fn workbench_context_pack_stores_private_receipts() {
+    let state = pro_workbench_state(&["context_pack:budgeted"]);
     let shared = state.clone();
     {
         let mut store = shared.fact_store.write().await;
@@ -8433,43 +8434,6 @@ async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
         .unwrap()
         .starts_with("workbench:context_pack:"));
 
-    let ledger_resp = super::workbench::post_command_ledger(
-        State(state.clone()),
-        HeaderMap::new(),
-        Json(super::workbench::CommandLedgerBody {
-            tenant_id: "business::acme".to_string(),
-            command: "cargo".to_string(),
-            args: vec!["test".to_string(), "-p".to_string(), "corecruxd".to_string()],
-            cwd: Some("/home/myles/CueCrux/Crux".to_string()),
-            exit_status: Some(0),
-            duration_ms: Some(42),
-            started_at_unix_ms: Some(100),
-            completed_at_unix_ms: Some(142),
-            stdout_hash: Some("blake3:stdout".to_string()),
-            stderr_hash: None,
-            linked_receipts: vec![pack["receipt"]["receipt_id"].as_str().unwrap().to_string()],
-            project_id: Some("alpha".to_string()),
-            work_id: Some("work-1".to_string()),
-        }),
-    )
-    .await;
-    assert_eq!(ledger_resp.status(), StatusCode::OK);
-
-    let list_resp = super::workbench::get_command_ledger(
-        State(state),
-        HeaderMap::new(),
-        Query(super::workbench::TenantWorkbenchQuery {
-            tenant_id: "business::acme".to_string(),
-            project_id: None,
-            limit: Some(10),
-        }),
-    )
-    .await;
-    assert_eq!(list_resp.status(), StatusCode::OK);
-    let list = json_body(list_resp).await;
-    assert_eq!(list["count"], 1);
-    assert_eq!(list["entries"][0]["record"]["command"], "cargo");
-
     let store = shared.fact_store.read().await;
     let facts = store.query(&corecrux_memory::fact_store::FactQuery {
         min_effective_confidence: None,
@@ -8480,8 +8444,76 @@ async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
         top_k: 10,
         token_budget: None,
     });
-    assert_eq!(facts.facts.len(), 2);
+    assert_eq!(facts.facts.len(), 1);
     assert!(facts.facts.iter().all(|fact| fact.private));
+}
+
+/// `ledger:history` is not a sold claim, because nothing in the product ever
+/// writes a command-ledger record. `/v1/workbench/command-ledger` is still
+/// implemented and still routed — it simply cannot be enabled, so it answers
+/// `402 pro_service_not_enabled` in every mode.
+///
+/// This is the regression pin for re-adding the claim without a producer.
+/// If you are here because this test failed, land the producer first.
+/// ExecPlan: `crux-command-ledger-claim-truth-2026-07-30`.
+#[tokio::test]
+async fn workbench_command_ledger_is_not_a_sold_claim_without_a_producer() {
+    // Even asking for it explicitly cannot enable it: `ProductPosture::new`
+    // filters `enabled_pro_services` through `PRO_CAPABILITY_CLAIMS`.
+    let state = pro_workbench_state(&["ledger:history"]);
+    let posture = crate::product::ProductPosture::new(state.operating_mode, &state.enabled_pro_services);
+    assert!(
+        posture.enabled_pro_services.is_empty(),
+        "ledger:history must not survive the PRO_CAPABILITY_CLAIMS filter"
+    );
+
+    // It appears in no catalogue, so it can never be reported as
+    // `contracted_external` by `pro_claim_placements`.
+    assert!(!crate::product::PRO_CAPABILITY_CLAIMS.contains(&"ledger:history"));
+    assert!(!crate::product::DAEMON_IMPLEMENTED_PRO_CLAIMS.contains(&"ledger:history"));
+    assert!(!crate::product::HOSTED_CONTROL_PLANE_PRO_CLAIMS.contains(&"ledger:history"));
+    assert!(!posture
+        .capability_catalog
+        .pro_claim_placements
+        .iter()
+        .any(|placement| placement.claim == "ledger:history"));
+
+    let write_resp = super::workbench::post_command_ledger(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::workbench::CommandLedgerBody {
+            tenant_id: "business::acme".to_string(),
+            command: "cargo".to_string(),
+            args: vec!["test".to_string()],
+            cwd: None,
+            exit_status: Some(0),
+            duration_ms: Some(42),
+            started_at_unix_ms: Some(100),
+            completed_at_unix_ms: Some(142),
+            stdout_hash: None,
+            stderr_hash: None,
+            linked_receipts: Vec::new(),
+            project_id: None,
+            work_id: None,
+        }),
+    )
+    .await;
+    assert_eq!(write_resp.status(), StatusCode::PAYMENT_REQUIRED);
+    let write_body = json_body(write_resp).await;
+    assert_eq!(write_body["status"], "pro_service_not_enabled");
+    assert_eq!(write_body["capability"], "ledger:history");
+
+    let read_resp = super::workbench::get_command_ledger(
+        State(state),
+        HeaderMap::new(),
+        Query(super::workbench::TenantWorkbenchQuery {
+            tenant_id: "business::acme".to_string(),
+            project_id: None,
+            limit: Some(10),
+        }),
+    )
+    .await;
+    assert_eq!(read_resp.status(), StatusCode::PAYMENT_REQUIRED);
 }
 
 #[tokio::test]
@@ -21269,5 +21301,140 @@ async fn m3b_unbound_request_declares_the_daemon_fallback() {
     assert_eq!(
         body["tenant_scope"], "daemon-capture-tenant",
         "an unbound read must declare that it answered for the capture tenant"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M8 — enrichment behind a per-seat rate ceiling.
+// crux-code-intel-pro-hosted-surface-2026-07-28.
+//
+// Gate: the ceiling holds under a deliberate loop, and the counter is visible
+// before the limit rather than at it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn m8_enrich_query(tenant: &str, seat: &str) -> super::traces::EnrichQuery {
+    super::traces::EnrichQuery {
+        tenant_id: tenant.to_string(),
+        seat_id: Some(seat.to_string()),
+        repo_id: None,
+        symbol: Some("some_symbol".to_string()),
+        token_budget: Some(4000),
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m8_a_deliberate_loop_is_refused_with_429_not_402() {
+    // A rate ceiling is not a billing failure. 429 tells the caller to wait;
+    // 402 would tell them to buy credit they do not need, and they would.
+    std::env::set_var(crate::enrich_budget::SEAT_CEILING_ENV, "3");
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let mut statuses = Vec::new();
+    for _ in 0..12 {
+        let resp = super::traces::post_enrich_verdict(
+            State(state.clone()),
+            dev_scope_headers("admin:write"),
+            Query(m8_enrich_query("tenant-a", "seat-a")),
+        )
+        .await
+        .into_response();
+        statuses.push(resp.status());
+    }
+
+    let refused = statuses.iter().filter(|s| **s == StatusCode::TOO_MANY_REQUESTS).count();
+    assert!(
+        refused >= 8,
+        "a 12-call loop against a ceiling of 3 must be refused most of the time, got {statuses:?}"
+    );
+    assert!(
+        !statuses.iter().any(|s| *s == StatusCode::PAYMENT_REQUIRED),
+        "a rate ceiling must never present as a billing failure"
+    );
+    std::env::remove_var(crate::enrich_budget::SEAT_CEILING_ENV);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m8_the_budget_is_readable_before_the_ceiling_bites() {
+    std::env::set_var(crate::enrich_budget::SEAT_CEILING_ENV, "10");
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    // Reading the counter must never consume it, however often it is polled.
+    for _ in 0..5 {
+        let resp = super::traces::get_enrich_budget(
+            State(state.clone()),
+            dev_scope_headers("admin:read"),
+            Query(m8_enrich_query("tenant-a", "seat-a")),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["budget"]["used_in_window"], 0, "peeking must not spend budget");
+        assert_eq!(body["cost_cr_per_verdict"], 5);
+    }
+    std::env::remove_var(crate::enrich_budget::SEAT_CEILING_ENV);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m8_one_seat_exhausting_itself_leaves_another_working() {
+    // The reason the ceiling is per seat rather than per account: a runaway
+    // agent must not take the team down with it.
+    std::env::set_var(crate::enrich_budget::SEAT_CEILING_ENV, "2");
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    for _ in 0..4 {
+        let _ = super::traces::post_enrich_verdict(
+            State(state.clone()),
+            dev_scope_headers("admin:write"),
+            Query(m8_enrich_query("tenant-a", "noisy")),
+        )
+        .await
+        .into_response();
+    }
+    let noisy = super::traces::get_enrich_budget(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Query(m8_enrich_query("tenant-a", "noisy")),
+    )
+    .await
+    .into_response();
+    let noisy_body = json_body(noisy).await;
+    assert_eq!(noisy_body["budget"]["at_ceiling"], true);
+
+    let quiet = super::traces::get_enrich_budget(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Query(m8_enrich_query("tenant-a", "quiet")),
+    )
+    .await
+    .into_response();
+    let quiet_body = json_body(quiet).await;
+    assert_eq!(
+        quiet_body["budget"]["at_ceiling"], false,
+        "a quiet seat must keep its own headroom"
+    );
+    assert_eq!(quiet_body["budget"]["remaining"], 2);
+    std::env::remove_var(crate::enrich_budget::SEAT_CEILING_ENV);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m8_enrichment_is_refused_across_tenants() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::traces::post_enrich_verdict(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:write"),
+        Query(m8_enrich_query("tenant-a", "seat-a")),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "enrichment must honour tenant scoping like every other code-intel surface"
     );
 }

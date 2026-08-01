@@ -108,7 +108,7 @@ To understand what makes this tamper-evident, read these symbols in order:
 
 ## Build / test
 
-- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.53
+- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.54
   (`[workspace.package]` in `Cargo.toml` is authoritative, and
   `scripts/check-agent-docs.sh` fails the build when this line disagrees with it).
 - `cargo build --workspace --locked`
@@ -450,7 +450,7 @@ schema: crux-agent-manifest/v1
 summary: Local-first, tamper-evident retrieval + memory engine with signed, replayable receipts.
 msrv: "1.88.0"
 edition: "2021"
-workspace_version: "0.5.53"
+workspace_version: "0.5.54"
 
 verify_commands:
   - cargo test --workspace
@@ -3070,8 +3070,8 @@ also disables submission — the gate requires all three.
 How the Crux Daemon is tested, how coverage is measured and gated, and an honest
 account of why the gated number sits where it does.
 
-> **Snapshot (2026-07-30, `main`):** **6,317** test functions; **88.49%** gated
-> region coverage (ungated, whole tree: **87.20%**).
+> **Snapshot (2026-07-30, `main`):** **6,671** test functions; **90.11%** gated
+> region coverage (ungated, whole tree: **88.81%**).
 > CI is the source of truth — the live numbers are printed in
 > the [Coverage job](../.github/workflows/ci.yml) of every run and attested by
 > [`coverage-attestation.yml`](../.github/workflows/coverage-attestation.yml).
@@ -3079,7 +3079,7 @@ account of why the gated number sits where it does.
 ## Running the tests
 
 ```bash
-cargo test --workspace            # the full suite (4,489 tests)
+cargo test --workspace            # the full suite (6,671 test functions)
 cargo test -p corecruxd           # one crate (corecruxd is a binary crate — no lib target)
 cargo fmt --check                 # formatting gate
 cargo clippy --workspace -- -D warnings   # lint gate (lib + bins; not #[cfg(test)] code)
@@ -3105,13 +3105,13 @@ The [`Coverage` job in `ci.yml`](../.github/workflows/ci.yml) enforces:
 
 | Scope | Floor | Actual (snapshot) | Notes |
 |---|---|---|---|
-| **Workspace total** | **86%** | 86.97% | the headline gate |
+| **Workspace total** | **89%** | 90.11% | the headline gate; ratchet target **90** |
 | `corecrux-memory` | 93% | 93.5% | ratchet target **95** (see below) |
-| `crux-sync` | 98% | 99.0% | |
+| `crux-sync` | 98% | 98.4% | |
 | `crux-contrib` | 99% | 100% | |
-| `corecrux-receipts` | 88% | 88.6% | trust core (CROWN receipts) |
-| `corecrux-segment` | 85% | 86.2% | trust core (sealed `.ccxseg`) |
-| `corecrux-storage` | 79% | 80.2% | trust core (append-only store) |
+| `corecrux-receipts` | 88% | 91.2% | trust core (CROWN receipts); ratchet available |
+| `corecrux-segment` | 85% | 93.8% | trust core (sealed `.ccxseg`); ratchet available |
+| `corecrux-storage` | 79% | 89.9% | trust core (append-only store); ratchet available |
 
 Floors are set **at current-rounded-down** ("ratchet from reality"): they prevent
 regression today and are raised as coverage improves. The job also prints the
@@ -3152,20 +3152,21 @@ admin HTTP surfaces — is gated.
 
 | Crate | Tests | | Crate | Tests |
 |---|---:|---|---|---:|
-| `corecruxd` | 1537 | | `corecrux-receipts` | 170 |
-| `corecruxctl` | 933 | | `corecrux-storage` | 143 |
-| `crux-mcp` | 622 | | `crux-claude-hooks` | 108 |
-| `corecrux-projections` | 269 | | `crux-session` | 76 |
-| `corecrux-memory` | 176 | | `corecrux-segment` | 54 |
+| `corecruxd` | 2671 | | `corecrux-receipts` | 275 |
+| `corecruxctl` | 1174 | | `corecrux-storage` | 223 |
+| `crux-mcp` | 798 | | `crux-claude-hooks` | 222 |
+| `corecrux-memory` | 288 | | `crux-session` | 89 |
+| `corecrux-projections` | 276 | | `corecrux-segment` | 62 |
 
-## Why the gated number is ~87%, not higher
+## Why the gated number is ~90%, not higher
 
-This is the honest part. 86.97% is what an *accurate* gate over the
+This is the honest part. 90.11% is what an *accurate* gate over the
 *meaningfully-testable* tree reports — it is not a target someone padded up to.
 
-1. **The trust-core crates pull the average down on purpose.**
-   `corecrux-storage` (80%), `corecrux-segment` (86%), and `corecrux-receipts`
-   (89%) are large and full of deep I/O and error branches. The
+1. **The trust-core crates used to pull the average down, and no longer do.**
+   `corecrux-storage` (89.9%), `corecrux-segment` (93.8%) and
+   `corecrux-receipts` (91.2%) are large and full of deep I/O and error
+   branches; they sat at 80/86/89% as recently as 2026-06-18. The
    **security-critical** paths in them *are* covered — tamper-rejection in
    [`corecrux-segment/tests/corruption_matrix.rs`](../crates/corecrux-segment/tests/corruption_matrix.rs)
    (magic / version / CRC / record-hash / TOC corruption all rejected) and
@@ -3182,6 +3183,20 @@ This is the honest part. 86.97% is what an *accurate* gate over the
    excluded) throughout, which is why they showed up as debt rather than
    staying hidden. Remaining `corecruxd` debt is tracked per-file in the
    Coverage job log.
+
+   A second sweep on 2026-07-30 took the nine largest remaining concentrations
+   across `corecruxd` and `corecruxctl` — `http/replay.rs` (1032 missed regions
+   → 66), `corecruxctl/audit_pack.rs` (1164 → 228), `corecruxctl/login.rs`
+   (1035 → 159), `repo_watch.rs` (456 → 125), `storybook.rs` (411 → 35),
+   `context_graph.rs` (296 → 19) and `http/incidents.rs` (379 → 211).
+
+   **What is left is mostly not testable without a production change.** The
+   clearest example is `integrations_github_sync.rs` (532 → 421) and
+   `integrations_github.rs` (253 → 215): every fetch builds a `ureq::Agent`
+   inline against a hard-coded `https://api.github.com/...` URL, with no
+   base-URL or transport injection seam, so the pagination and status-code
+   branches cannot be reached without hitting the real network. Adding a seam
+   is the prerequisite for covering them — not more test effort.
 
    A related trap worth knowing: **no CI job runs `cargo test -- --ignored`**, so
    an `#[ignore]`d test contributes nothing to the gate. Two exist today —
@@ -3221,8 +3236,17 @@ This is the honest part. 86.97% is what an *accurate* gate over the
 
 - **To raise a floor:** add tests for the crate, confirm the new per-crate number
   in the Coverage job log, then bump the `pair` floor in
-  [`ci.yml`](../.github/workflows/ci.yml) (keep it ≤ actual). Raising
-  `corecrux-memory` to its 95 target is the first such opportunity.
+  [`ci.yml`](../.github/workflows/ci.yml) (keep it ≤ actual). Three per-crate
+  floors are currently well below reality and are the standing opportunities:
+  `corecrux-storage` (79 → 89), `corecrux-segment` (85 → 93) and
+  `corecrux-receipts` (88 → 91). They were left alone on 2026-07-30 because
+  part of that headroom comes from `corecruxctl` tests exercising those crates
+  *transitively*, so the numbers should be confirmed stable across a couple of
+  main runs before being locked in. `corecrux-memory` remains at 93.5% against
+  its 95 target.
+- **Leave headroom when ratcheting the workspace floor.** It is set one point
+  below the measured total, not at it: a floor equal to reality turns main red
+  on the first feature PR that adds uncovered code.
 - **Keep the regex in lock-step:** the `COVERAGE_IGNORE_REGEX` is duplicated in
   `ci.yml` and `coverage-attestation.yml` — change both together.
 - **Adding an exclusion is a reviewed decision:** justify it inline (the only
@@ -3576,7 +3600,7 @@ Report it privately per the [security policy](SECURITY.md).
 <sub><b>receipts as a literal chain</b> — click any block in the console, inspect the proof</sub>
 </div>
 
-**Testing & coverage:** 6,000+ tests and **~87%** CI-gated region coverage, with per-crate floors
+**Testing & coverage:** 6,000+ tests and **~90%** CI-gated region coverage, with per-crate floors
 on the trust core (`corecrux-receipts` / `-segment` / `-storage`) and the ungated total reported
 alongside so exclusions can't hide low-coverage code. How it's measured and exactly what's
 excluded: [docs/testing-and-coverage.md](docs/testing-and-coverage.md).
@@ -3970,6 +3994,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.54] - 2026-07-30
+
 ### Changed
 
 - **Relicensed to Apache-2.0 — Crux Daemon is now open source.** The CueCrux
@@ -4011,6 +4037,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The token-burn cost lens gains a model/effort axis.** `crux-cost` already
+  opened every transcript line by line and discarded what it found: `gitBranch`
+  was parsed but used only as an internal ranking tie-breaker, and `model`,
+  `effort` and `cwd` were not parsed at all. All four are now parsed onto the
+  event, promoted onto `CostReport`, and rolled up into a per-model burn
+  breakdown with per-effort burn *within* each model, rendered by both
+  `corecruxctl session cost` and the console `cx-cost` page.
+  - **It reconciles.** Per-model context, plus the `<synthetic>` pseudo-model,
+    plus records carrying usage but no model id, sum exactly to
+    `headline.measured_context_total`.
+  - **Coverage travels with every effort number.** `effort` is absent from 61%
+    of the measured corpus and its absence correlates with model — 100% / 100% /
+    22.5% / 9.4% across 46,239 assistant records — so a cross-model effort
+    comparison is confounded at source and no sample size fixes it.
+    `effort_coverage_pct` lives on the type, so no surface can render an effort
+    figure without the denominator that qualifies it.
+  - `<synthetic>` is reported separately, never ranked as a model and never
+    dropped. Model-id normalisation folds only stable presentation variants
+    (`[1m]` context suffix, `us.anthropic.`/`bedrock/`/`vertex/` route prefixes,
+    `-v1:0`); floating aliases such as `opus` and `sonnet` are deliberately left
+    unresolved, since resolving them would silently merge two models the day the
+    alias moves.
+  - The five new `CostReport` fields are additive, serde-default and omitted
+    when absent, so an older daemon ignores a newer report and a legacy report
+    is unchanged on the wire. A daemon must be upgraded before the console can
+    render the axis.
+  - Adds the cost lane's first integration coverage: a post-then-get test
+    through both `/v1/cost/report` handlers.
+
 - **`CITATION.cff`.** Machine-readable citation metadata (GitHub "Cite this
   repository" button). Under Apache-2.0 citation is appreciated but not a
   licence condition.
@@ -4037,6 +4092,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   WSL2 parity with a developer box).
 
 ### Fixed
+
+- **The SessionEnd cost hook now records whether it worked.** The generated
+  `cost)` launcher branch failed silently on three paths — `corecruxctl` absent,
+  no configured endpoint, post rejected — each swallowed by `|| true`. Quiet is
+  the correct posture for a SessionEnd hook, which must never block session end;
+  undiagnosable is not. There was no way to distinguish "no sessions ran" from
+  "every session silently failed to post", and the branch had no test coverage
+  of any kind, which is why it survived.
+  - Every attempt writes a one-line outcome record (result, reason, endpoint,
+    endpoint source, launcher version) to `~/.claude/hooks/crux-cost.state.json`;
+    failures additionally append to `crux-cost.errors.log`. `exit 0` remains
+    unconditional on every path.
+  - `CRUX_HTTP_URL` can never actually be empty — `${CRUX_HTTP_URL:-…}`
+    substitutes for empty as well as unset — so the real misconfiguration is the
+    *unconfigured loopback default*, which fails with a connection refused the
+    operator cannot place. The launcher now records whether the endpoint came
+    from config or from the built-in default, and names the remedy.
+  - `corecruxctl hooks status` reports the last outcome and flags a stale
+    launcher by version marker. The boot self-check warns when the installed
+    launcher predates the running build, or when capture last failed or was
+    never attempted — nothing warns when no outcome has been recorded yet, since
+    a fresh install has simply not ended a session.
+  - Six shell-level tests run the *embedded* launcher template under `bash`, so
+    they cannot drift from what `hooks install` writes.
+
+  **This takes effect only after `corecruxctl hooks install` is re-run.** An
+  un-re-run wizard keeps the old silent script, and that is the most likely way
+  this fix appears not to work.
+
+- **Three tests that asserted things the machine does not guarantee.** Each
+  failed CI on an unrelated PR and passed on a re-run of the identical commit;
+  two of them gate required checks, so they cost merges rather than just noise.
+  - `envelope_build_latency_under_2ms_for_10_facts` (`crux-mcp`) asserted a
+    wall-clock bound — the only one in the workspace. On a shared runner that
+    measures how busy the machine is, not how fast the code is. The figure is
+    still measured and printed; the assertion is gone, and the test is renamed
+    `envelope_build_covers_all_ten_facts` after the check that carries content
+    (`memories_used.len() == 10`). Raising the constant was rejected: it trades a
+    frequent flake for a rarer one and keeps a load-dependent test.
+  - `allowed_origins_reads_the_env_var` (`corecruxd`) round-tripped through
+    `set_var`/`getenv` and read back the built-in defaults instead of the value
+    it had just set — *while holding the module's `env_lock()`*. The mutex was
+    never the problem: `setenv` can reallocate the environment block, and a
+    concurrent `getenv` anywhere in this 2000-plus-test binary may then read a
+    stale pointer, which no Rust-level lock can fence (hence `set_var` being
+    `unsafe` from the 2024 edition). It now parses via `resolve_allowed_origins`
+    directly, matching its five neighbours, and removes the last `set_var` in
+    the file.
+  - `pick_free_port_is_bindable` (`crux-shell-lifecycle`) asserted that a port
+    picked by binding `:0` and dropping the listener is immediately re-bindable.
+    Nothing promises that — sibling tests binding `:0` in parallel can take it
+    in the gap. It now retries a bounded number of times, so only a genuinely
+    broken helper fails.
 
 - **The desktop shell no longer opens stray console windows on Windows.** Two
   spawn sites, both console-subsystem binaries launched from a GUI-subsystem app
@@ -4491,7 +4599,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-deny` supply chain and licence audit in CI
 - `cargo-audit` CVE scanning in CI
 
-[unreleased]: https://github.com/CueCrux/Crux/compare/v0.4.6...HEAD
+[unreleased]: https://github.com/CueCrux/Crux/compare/v0.5.54...HEAD
+[0.5.54]: https://github.com/CueCrux/Crux/compare/v0.5.53...v0.5.54
 [0.4.6]: https://github.com/CueCrux/Crux/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/CueCrux/Crux/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/CueCrux/Crux/compare/v0.4.3...v0.4.4

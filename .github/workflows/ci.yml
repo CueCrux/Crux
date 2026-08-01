@@ -426,8 +426,12 @@ jobs:
 
           FAILED=0
 
-          if (( $(echo "$TOTAL < 86" | bc -l) )); then
-            echo "::error::Workspace coverage ${TOTAL}% is below 86% floor"
+          # Ratcheted 86 -> 89 on 2026-07-30 (measured 90.11%). Deliberately 89
+          # and not 90: at a 90 floor the headline gate would sit 0.11pp above
+          # reality, so a single feature PR adding ~400 uncovered regions would
+          # turn main red. 90 is the ratchet target once there is headroom.
+          if (( $(echo "$TOTAL < 89" | bc -l) )); then
+            echo "::error::Workspace coverage ${TOTAL}% is below 89% floor"
             FAILED=1
           fi
 
