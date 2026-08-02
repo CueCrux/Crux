@@ -1464,6 +1464,32 @@ pub enum VerifyOutcome {
     BadTrustRoot,
 }
 
+/// Establish that a token was really issued by the trust root — and **nothing
+/// more**.
+///
+/// **This is NOT an authorization check.** It answers exactly one question: did
+/// this issuer sign these bytes, and is the base envelope structurally valid and
+/// unexpired. It deliberately does *not* apply the contextual gate, so a
+/// delegation-capable `rcx-ct/1.1` token passes here even though it must still
+/// be presented through [`verify_token_attenuated`] before it authorizes
+/// anything.
+///
+/// It exists because a daemon has to *load* a hosted token at startup — to
+/// discover which backends it was granted and where they live — long before any
+/// session presents it. [`verify_token`] cannot serve that purpose: it fails
+/// every delegation-bearing token closed by design
+/// (ExecPlan `crux-hosted-relay-gateway-2026-07-30`, contract v1 §8).
+///
+/// If you are deciding whether a caller may *do* something, you want
+/// [`verify_token_attenuated`], not this.
+pub fn verify_issuer_provenance(
+    token: &RcxCapabilityToken,
+    trust_root_pubkey: &[u8],
+    now_unix_seconds: u64,
+) -> VerifyOutcome {
+    verify_issuer_signed_token(token, trust_root_pubkey, now_unix_seconds)
+}
+
 pub fn verify_token(token: &RcxCapabilityToken, trust_root_pubkey: &[u8], now_unix_seconds: u64) -> VerifyOutcome {
     match verify_issuer_signed_token(token, trust_root_pubkey, now_unix_seconds) {
         VerifyOutcome::Verified if token.requires_contextual_verification() => {

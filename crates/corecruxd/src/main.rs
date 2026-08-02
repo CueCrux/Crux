@@ -54,6 +54,7 @@ mod pairing;
 // Crux Daemon keeps the server skeleton. Suppress dead_code for stub internals.
 #[allow(dead_code)]
 mod grpc;
+mod hosted_token;
 mod http;
 mod local_ingest;
 // Candidate proposers are staged behind the identity-candidates rollout path; tests
@@ -901,6 +902,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // restart no longer silently unpairs every device (ExecPlan
     // crux-hosted-relay-gateway-2026-07-30, M1).
     crate::http::auth_device::hydrate_refresh_credentials(&state).await;
+
+    // Load-at-startup: the externally-minted hosted token, if the operator
+    // configured one (M4a). Held to one side and NOT given to `rcx_router` — a
+    // delegation-bearing token makes `requires_contextual_verification()` true,
+    // and the router then refuses every capability on it. M4b's relay client is
+    // the consumer.
+    // The verified grant is intentionally not retained yet: M4b's relay client
+    // is the first consumer and will own the storage. Loading here still earns
+    // its keep — an operator sees at boot whether the grant is usable, rather
+    // than discovering it at the first connect attempt.
+    let _ = crate::hosted_token::load_from_env(now_unix_ms() / 1000);
     {
         let mut store = state.fact_store.write().await;
         match crate::repo_registry::fail_incomplete_scans(
