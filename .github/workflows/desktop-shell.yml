@@ -577,10 +577,38 @@ jobs:
             Write-Host "::error::the second bundle failed with exit $code"
             exit 1
           }
-          $msi2 = Get-ChildItem 'shells\desktop\app\target\release\bundle\msi\*.msi' | Select-Object -First 1
+          # Select by the bumped version, NOT `Select-Object -First 1`.
+          # The bundle dir is never cleaned, so after this second build it holds
+          # BOTH MSIs. Get-ChildItem returns them name-ascending, so -First 1
+          # picks 0.5.34 over 0.5.35 -- v2.msi becomes a copy of v1. The MSI then
+          # carries an identical ProductVersion and therefore an identical
+          # ProductCode, so msiexec runs a maintenance repair instead of a major
+          # upgrade: exit 0, one uninstall entry, DisplayVersion unchanged. That
+          # is exactly the "update did not replace the installed build" failure,
+          # and the assertion catching it was right -- the MSI was the bug.
+          $msi2 = Get-ChildItem "shells\desktop\app\target\release\bundle\msi\*$next*.msi" |
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $msi2) {
+            $have = (Get-ChildItem 'shells\desktop\app\target\release\bundle\msi\*.msi' -ErrorAction SilentlyContinue).Name -join ', '
+            Write-Host "::error::the second bundle produced no MSI for version $next -- bundle dir holds: $have"
+            exit 1
+          }
           Copy-Item $msi2.FullName "$ev\v2.msi" -Force
-          Write-Host "v1 msi : $((Get-Item "$ev\v1.msi").Name)"
-          Write-Host "v2 msi : $((Get-Item "$ev\v2.msi").Name)"
+          Write-Host "v1 msi : $($msi2.Name) -> v2.msi"
+
+          # Belt and braces: prove the two MSIs are genuinely different files
+          # before spending ~20 minutes discovering it in the update step. The
+          # original failure copied v1 over v2 silently, and every downstream
+          # symptom (exit 0, one entry, version unchanged) was consistent with a
+          # working installer -- so the only honest place to catch it is here.
+          $h1 = (Get-FileHash "$ev\v1.msi" -Algorithm SHA256).Hash
+          $h2 = (Get-FileHash "$ev\v2.msi" -Algorithm SHA256).Hash
+          if ($h1 -eq $h2) {
+            Write-Host "::error::v1.msi and v2.msi are byte-identical ($h1) -- the version bump did not reach the bundle, so the update step would run a maintenance repair instead of an upgrade"
+            exit 1
+          }
+          Write-Host "v1 sha256 : $h1"
+          Write-Host "v2 sha256 : $h2"
 
       - name: update over the installed build
         run: |
