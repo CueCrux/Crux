@@ -54,15 +54,15 @@ pub(super) fn runtime_tenant_for(
     headers: &HeaderMap,
     required: &[&str],
     requested: Option<&str>,
-) -> Result<(String, bool), crate::problem::ProblemResponse> {
+) -> Result<(crate::auth::TenantScope, bool), crate::problem::ProblemResponse> {
     match requested {
         Some(t) if !t.trim().is_empty() => {
-            require_http_scopes_for_tenant(&state.auth, headers, required, t)?;
-            Ok((t.to_string(), true))
+            let scope = require_http_scopes_for_tenant(&state.auth, headers, required, t)?;
+            Ok((scope, true))
         }
         _ => {
             require_http_scopes(&state.auth, headers, required)?;
-            Ok((crate::trace_store::TraceStore::capture_tenant(), false))
+            Ok((crate::auth::TenantScope::daemon_capture(), false))
         }
     }
 }
@@ -96,19 +96,12 @@ pub(super) async fn get_trace(
     headers: HeaderMap,
     Query(tq): Query<OptionalTenantQuery>,
 ) -> impl IntoResponse {
-    let (tenant, bound) = match tq.tenant_id.as_deref() {
-        Some(t) => {
-            if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], t) {
-                return problem.into_response();
-            }
-            (t.to_string(), true)
-        }
-        None => {
-            if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-                return problem.into_response();
-            }
-            (crate::trace_store::TraceStore::capture_tenant(), false)
-        }
+    // Through `runtime_tenant_for` rather than inline: this handler carried its
+    // own copy of the resolve-then-authorise pair, which is how the two drifted
+    // apart on `dossier` and `storybook` in the first place (M3b, 2026-07-31a).
+    let (tenant, bound) = match runtime_tenant_for(&state, &headers, &["admin:read"], tq.tenant_id.as_deref()) {
+        Ok(resolved) => resolved,
+        Err(problem) => return problem.into_response(),
     };
 
     let Ok(trace_id) = trace_id.parse::<u64>() else {
@@ -123,7 +116,7 @@ pub(super) async fn get_trace(
             ),
         );
     };
-    match store.load_trace(trace_id, &tenant) {
+    match store.load_trace(trace_id, tenant.as_str()) {
         Ok(spans) if spans.is_empty() => problem_response(StatusCode::NOT_FOUND, "no such trace"),
         Ok(spans) => {
             let resolved = spans.iter().filter(|s| s.symbol_id.is_some()).count();
@@ -135,7 +128,7 @@ pub(super) async fn get_trace(
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
-                "tenant_id": tenant,
+                "tenant_id": tenant.as_str(),
                 "tenant_scope": if bound { "request" } else { "daemon-capture-tenant" },
                     "trace_id": trace_id,
                     "span_count": spans.len(),
@@ -158,19 +151,10 @@ pub(super) async fn list_traces(
     Query(query): Query<TraceSpansQuery>,
     Query(tq): Query<OptionalTenantQuery>,
 ) -> impl IntoResponse {
-    let (list_tenant, list_bound) = match tq.tenant_id.as_deref() {
-        Some(t) => {
-            if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], t) {
-                return problem.into_response();
-            }
-            (t.to_string(), true)
-        }
-        None => {
-            if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-                return problem.into_response();
-            }
-            (crate::trace_store::TraceStore::capture_tenant(), false)
-        }
+    let (list_tenant, list_bound) = match runtime_tenant_for(&state, &headers, &["admin:read"], tq.tenant_id.as_deref())
+    {
+        Ok(resolved) => resolved,
+        Err(problem) => return problem.into_response(),
     };
     let Some(store) = open_store(&state) else {
         return (
@@ -182,19 +166,19 @@ pub(super) async fn list_traces(
                 // Scope is a property of the request, not of whether persistence
                 // happens to be on — a caller must be able to tell which tenant
                 // it asked for regardless of the answer being empty.
-                "tenant_id": list_tenant,
+                "tenant_id": list_tenant.as_str(),
                 "tenant_scope": if list_bound { "request" } else { "daemon-capture-tenant" },
             })),
         )
             .into_response();
     };
-    match store.list_traces(query.limit.unwrap_or(100), &list_tenant) {
+    match store.list_traces(query.limit.unwrap_or(100), list_tenant.as_str()) {
         Ok(traces) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "persist_enabled": true,
                 "traces": traces.iter().map(|(id, n)| serde_json::json!({"trace_id": id, "span_count": n})).collect::<Vec<_>>(),
-                "tenant_id": list_tenant,
+                "tenant_id": list_tenant.as_str(),
                 // `daemon-capture-tenant` means no tenant was named, so this
                 // answered for whatever tenant the process captures as. Correct
                 // locally, NOT hostable — see OptionalTenantQuery.
@@ -356,7 +340,8 @@ pub(super) struct CodeIntelQuery {
 /// The in-memory ring is process-wide and holds this daemon's own execution, so
 /// its spans belong to the capture tenant and are withheld from every other —
 /// the same rule the store applies to legacy unlabelled records.
-pub(super) fn load_spans(state: &AppState, tenant_id: &str) -> Vec<crate::trace_store::StoredSpan> {
+pub(super) fn load_spans(state: &AppState, scope: &crate::auth::TenantScope) -> Vec<crate::trace_store::StoredSpan> {
+    let tenant_id = scope.as_str();
     if let Some(store) = open_store(state) {
         if let Ok(spans) = store.load_for_tenant(tenant_id) {
             if !spans.is_empty() {
@@ -364,7 +349,7 @@ pub(super) fn load_spans(state: &AppState, tenant_id: &str) -> Vec<crate::trace_
             }
         }
     }
-    if tenant_id != crate::trace_store::TraceStore::capture_tenant() {
+    if !scope.is_daemon_capture() {
         return Vec::new();
     }
     crate::trace_span_ring().map_or_else(Vec::new, |ring| {
@@ -382,9 +367,19 @@ pub(super) fn load_spans(state: &AppState, tenant_id: &str) -> Vec<crate::trace_
     })
 }
 
-async fn load_scan(state: &AppState, tenant_id: &str, repo_id: &str) -> Option<crate::workspace_scan::WorkspaceScan> {
+/// The static scan for one repo, readable only through a tenant the caller was
+/// authorised for.
+///
+/// Taking `&TenantScope` rather than `&str` is the point: this used to be handed
+/// a tenant string a second time, next to an authorization call that had already
+/// thrown its own copy away, and only a test asserted the two matched.
+async fn load_scan(
+    state: &AppState,
+    scope: &crate::auth::TenantScope,
+    repo_id: &str,
+) -> Option<crate::workspace_scan::WorkspaceScan> {
     let store = state.fact_store.read().await;
-    let json = crate::repo_registry::load_scan_json(&store, tenant_id, repo_id)?;
+    let json = crate::repo_registry::load_scan_json(&store, scope.as_str(), repo_id)?;
     drop(store);
     serde_json::from_str(&json).ok()
 }
@@ -396,13 +391,14 @@ pub(super) async fn get_code_path(
     headers: HeaderMap,
     Query(q): Query<CodeIntelQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
-        return problem.into_response();
-    }
+    let scope = match require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
+        Ok(scope) => scope,
+        Err(problem) => return problem.into_response(),
+    };
     let Some(entry) = q.entry_point.as_deref() else {
         return problem_response(StatusCode::BAD_REQUEST, "entry_point is required");
     };
-    let spans = load_spans(&state, &q.tenant_id);
+    let spans = load_spans(&state, &scope);
     let path = crate::code_intel::code_path(&spans, entry, q.token_budget);
 
     if q.all_repos {
@@ -477,14 +473,15 @@ pub(super) async fn get_enrich_budget(
     headers: HeaderMap,
     Query(q): Query<EnrichQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
-        return problem.into_response();
-    }
-    let seat = seat_identity(&state, &headers, &q.tenant_id);
+    let scope = match require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
+        Ok(scope) => scope,
+        Err(problem) => return problem.into_response(),
+    };
+    let seat = seat_identity(&state, &headers, scope.as_str());
     let Ok(mut budgets) = state.enrich_budgets.lock() else {
         return problem_response(StatusCode::INTERNAL_SERVER_ERROR, "enrich budget lock poisoned");
     };
-    let view = budgets.peek(&q.tenant_id, &seat);
+    let view = budgets.peek(scope.as_str(), &seat);
     drop(budgets);
     (
         StatusCode::OK,
@@ -509,9 +506,10 @@ pub(super) async fn post_enrich_verdict(
     headers: HeaderMap,
     Query(q): Query<EnrichQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:write"], &q.tenant_id) {
-        return problem.into_response();
-    }
+    let scope = match require_http_scopes_for_tenant(&state.auth, &headers, &["admin:write"], &q.tenant_id) {
+        Ok(scope) => scope,
+        Err(problem) => return problem.into_response(),
+    };
     let Some(symbol) = q.symbol.as_deref() else {
         return problem_response(StatusCode::BAD_REQUEST, "symbol is required");
     };
@@ -543,9 +541,9 @@ pub(super) async fn post_enrich_verdict(
     // 2. Evidence. Enrichment reasons over the deterministic ladder rather than
     //    replacing it — the free answer stays the substrate, and a model that is
     //    unavailable degrades the response, never the verdict underneath.
-    let spans = load_spans(&state, &q.tenant_id);
+    let spans = load_spans(&state, &scope);
     let repo_id = q.repo_id.as_deref().unwrap_or("crux");
-    let Some(scan) = load_scan(&state, &q.tenant_id, repo_id).await else {
+    let Some(scan) = load_scan(&state, &scope, repo_id).await else {
         return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
     };
     let ladder = crate::code_intel::dead_code_ladder(&scan, &spans, Some(symbol), q.token_budget.unwrap_or(4000));
@@ -579,9 +577,10 @@ pub(super) async fn get_span_volume(
     headers: HeaderMap,
     Query(q): Query<super::repos::RepoTenantQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
-        return problem.into_response();
-    }
+    let scope = match require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
+        Ok(scope) => scope,
+        Err(problem) => return problem.into_response(),
+    };
     let Some(store) = open_store(&state) else {
         return problem_response(
             StatusCode::CONFLICT,
@@ -591,7 +590,7 @@ pub(super) async fn get_span_volume(
             ),
         );
     };
-    match store.volume_for_tenant(&q.tenant_id) {
+    match store.volume_for_tenant(scope.as_str()) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(err) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     }
@@ -608,9 +607,10 @@ pub(super) async fn get_releases(
     headers: HeaderMap,
     Query(q): Query<super::repos::RepoTenantQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
-        return problem.into_response();
-    }
+    let scope = match require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
+        Ok(scope) => scope,
+        Err(problem) => return problem.into_response(),
+    };
     let Some(store) = open_store(&state) else {
         return problem_response(
             StatusCode::CONFLICT,
@@ -620,7 +620,7 @@ pub(super) async fn get_releases(
             ),
         );
     };
-    match store.releases_for_tenant(&q.tenant_id) {
+    match store.releases_for_tenant(scope.as_str()) {
         Ok(rs) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -640,19 +640,20 @@ pub(super) async fn get_blast_radius(
     headers: HeaderMap,
     Query(q): Query<CodeIntelQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
-        return problem.into_response();
-    }
+    let scope = match require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
+        Ok(scope) => scope,
+        Err(problem) => return problem.into_response(),
+    };
     let Some(symbol) = q.symbol.as_deref() else {
         return problem_response(StatusCode::BAD_REQUEST, "symbol is required");
     };
-    let spans = load_spans(&state, &q.tenant_id);
+    let spans = load_spans(&state, &scope);
 
     if q.all_repos {
         // P1: one graph across every enabled repo this tenant registered. Paths
         // are repo-qualified by the aggregator so the answer says which repo each
         // caller is in rather than leaving that to a second lookup.
-        let (scan, repos) = crate::repo_aggregate::aggregate_tenant(&state, &q.tenant_id).await;
+        let (scan, repos) = crate::repo_aggregate::aggregate_tenant(&state, &scope).await;
         let radius = crate::code_intel::blast_radius(&scan, &spans, symbol, q.token_budget);
         return (
             StatusCode::OK,
@@ -671,7 +672,7 @@ pub(super) async fn get_blast_radius(
     }
 
     let repo_id = q.repo_id.as_deref().unwrap_or("crux");
-    let Some(scan) = load_scan(&state, &q.tenant_id, repo_id).await else {
+    let Some(scan) = load_scan(&state, &scope, repo_id).await else {
         return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
     };
     let radius = crate::code_intel::blast_radius(&scan, &spans, symbol, q.token_budget);
@@ -685,20 +686,21 @@ pub(super) async fn get_liveness(
     headers: HeaderMap,
     Query(q): Query<CodeIntelQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
-        return problem.into_response();
-    }
+    let scope = match require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
+        Ok(scope) => scope,
+        Err(problem) => return problem.into_response(),
+    };
     let Some(symbol) = q.symbol.as_deref() else {
         return problem_response(StatusCode::BAD_REQUEST, "symbol is required");
     };
-    let spans = load_spans(&state, &q.tenant_id);
+    let spans = load_spans(&state, &scope);
 
     if q.all_repos {
         // P1. Liveness reads the static scan as well as the span window, so a
         // single-repo scan answers "is this used" against one repo's references
         // only — which is the wrong answer, not a partial one, when the caller
         // lives elsewhere in the estate.
-        let (scan, repos) = crate::repo_aggregate::aggregate_tenant(&state, &q.tenant_id).await;
+        let (scan, repos) = crate::repo_aggregate::aggregate_tenant(&state, &scope).await;
         let l = crate::code_intel::liveness(&scan, &spans, symbol);
         return (
             StatusCode::OK,
@@ -713,7 +715,7 @@ pub(super) async fn get_liveness(
     }
 
     let repo_id = q.repo_id.as_deref().unwrap_or("crux");
-    let Some(scan) = load_scan(&state, &q.tenant_id, repo_id).await else {
+    let Some(scan) = load_scan(&state, &scope, repo_id).await else {
         return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
     };
     let l = crate::code_intel::liveness(&scan, &spans, symbol);
@@ -727,9 +729,10 @@ pub(super) async fn get_trace_diff(
     headers: HeaderMap,
     Query(q): Query<CodeIntelQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
-        return problem.into_response();
-    }
+    let scope = match require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
+        Ok(scope) => scope,
+        Err(problem) => return problem.into_response(),
+    };
     // M6: release-over-release. "What executes now that did not before a
     // release" is the question that makes this operational — two trace ids from
     // the same afternoon cannot answer it.
@@ -773,7 +776,7 @@ pub(super) async fn get_trace_diff(
             "provide trace_a and trace_b, or release_a and release_b",
         );
     };
-    let spans = load_spans(&state, &q.tenant_id);
+    let spans = load_spans(&state, &scope);
     let d = crate::code_intel::trace_diff(&spans, a, b, q.token_budget);
 
     if q.all_repos {
@@ -807,10 +810,11 @@ pub(super) async fn get_dead_code_ladder(
     headers: HeaderMap,
     Query(q): Query<CodeIntelQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
-        return problem.into_response();
-    }
-    let spans = load_spans(&state, &q.tenant_id);
+    let scope = match require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
+        Ok(scope) => scope,
+        Err(problem) => return problem.into_response(),
+    };
+    let spans = load_spans(&state, &scope);
 
     if q.all_repos {
         // P1, and the highest-stakes aggregate on this surface. A symbol defined
@@ -818,7 +822,7 @@ pub(super) async fn get_dead_code_ladder(
         // *within A*, so a single-repo ladder reports it as dead. Someone acting
         // on that deletes live code. Aggregating first is what makes the verdict
         // safe to act on.
-        let (scan, repos) = crate::repo_aggregate::aggregate_tenant(&state, &q.tenant_id).await;
+        let (scan, repos) = crate::repo_aggregate::aggregate_tenant(&state, &scope).await;
         let ladder = crate::code_intel::dead_code_ladder(&scan, &spans, q.symbol.as_deref(), q.token_budget);
         return (
             StatusCode::OK,
@@ -833,7 +837,7 @@ pub(super) async fn get_dead_code_ladder(
     }
 
     let repo_id = q.repo_id.as_deref().unwrap_or("crux");
-    let Some(scan) = load_scan(&state, &q.tenant_id, repo_id).await else {
+    let Some(scan) = load_scan(&state, &scope, repo_id).await else {
         return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
     };
     let ladder = crate::code_intel::dead_code_ladder(&scan, &spans, q.symbol.as_deref(), q.token_budget);
@@ -853,13 +857,14 @@ pub(super) async fn get_repo_spatial(
     headers: HeaderMap,
     Query(q): Query<super::repos::RepoTenantQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
-        return problem.into_response();
-    }
-    let Some(scan) = load_scan(&state, &q.tenant_id, &repo_id).await else {
+    let scope = match require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &q.tenant_id) {
+        Ok(scope) => scope,
+        Err(problem) => return problem.into_response(),
+    };
+    let Some(scan) = load_scan(&state, &scope, &repo_id).await else {
         return problem_response(StatusCode::NOT_FOUND, "no scan for this repo; register it first");
     };
-    let spans = load_spans(&state, &q.tenant_id);
+    let spans = load_spans(&state, &scope);
     let map = crate::code_intel::spatial_map(&scan, &spans);
     (StatusCode::OK, Json(map)).into_response()
 }

@@ -127,7 +127,11 @@ pub fn aggregate(inputs: Vec<RepoScan>) -> WorkspaceScan {
 /// Repos with no stored scan are skipped rather than failing the whole request —
 /// a newly registered repo that has not been scanned yet must not break the
 /// answer for the ones that have.
-pub async fn aggregate_tenant(state: &crate::http::AppState, tenant_id: &str) -> (WorkspaceScan, Vec<String>) {
+pub async fn aggregate_tenant(
+    state: &crate::http::AppState,
+    scope: &crate::auth::TenantScope,
+) -> (WorkspaceScan, Vec<String>) {
+    let tenant_id = scope.as_str();
     let store = state.fact_store.read().await;
     let repos = crate::repo_registry::list_repos(&store, tenant_id);
     let mut inputs = Vec::new();
