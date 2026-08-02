@@ -555,9 +555,54 @@ fn probe_posture(agent: &ureq::Agent, http_base: &str, bearer: Option<&str>) -> 
     }
 }
 
+/// Why a login self-check did not report success.
+///
+/// D-28: both self-checks used to collapse into a bare `DynErr`, and the
+/// caller printed every one as `"skipped"` — so a daemon that answered
+/// `PUT /v1/facts` with a 500, or returned no fact at all, read exactly like
+/// a daemon that was not running. A check that RAN AND FAILED must not report
+/// the same word as a check that could not run.
+#[derive(Debug)]
+enum VerifyOutcome {
+    /// The check could not run — nothing was reachable to check. Legitimately
+    /// skipped: `corecruxctl login` is expected to work offline.
+    Unreachable(String),
+    /// The check ran against a live daemon and the daemon failed it.
+    Failed(String),
+}
+
+impl std::fmt::Display for VerifyOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreachable(msg) | Self::Failed(msg) => f.write_str(msg),
+        }
+    }
+}
+
+/// Classify a `ureq` transport error.
+///
+/// NOTE: `http_agent` sets `http_status_as_error(false)` so the device-grant
+/// poll can read its status code out of a 400 body. That means
+/// `ureq::Error::StatusCode` is **never produced by this agent** — a non-2xx
+/// arrives as `Ok(resp)`. Every caller here must therefore check
+/// `resp.status()` itself (see `status_outcome`); reaching this function at all
+/// means the request never got an HTTP response. The `StatusCode` arm is kept
+/// only so this stays correct if the agent config changes.
+fn transport_outcome(err: &ureq::Error, what: &str) -> VerifyOutcome {
+    match err {
+        ureq::Error::StatusCode(code) => VerifyOutcome::Failed(format!("{what} returned HTTP {code}")),
+        other => VerifyOutcome::Unreachable(format!("{what}: {other}")),
+    }
+}
+
+/// The daemon answered — a non-2xx is a live refusal, never a skip.
+fn status_outcome(status: u16, what: &str) -> Option<VerifyOutcome> {
+    (!(200..300).contains(&status)).then(|| VerifyOutcome::Failed(format!("{what} returned HTTP {status}")))
+}
+
 /// Best-effort verification that the resolved daemon answers MCP `tools/list`.
 /// Returns the advertised tool count. Non-fatal on the caller's side.
-fn verify_mcp_tools_list(agent: &ureq::Agent, mcp_url: &str, bearer: Option<&str>) -> Result<usize, DynErr> {
+fn verify_mcp_tools_list(agent: &ureq::Agent, mcp_url: &str, bearer: Option<&str>) -> Result<usize, VerifyOutcome> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -572,28 +617,37 @@ fn verify_mcp_tools_list(agent: &ureq::Agent, mcp_url: &str, bearer: Option<&str
         req = req.header("authorization", format!("Bearer {t}"));
     }
     let text = match req.send_json(body) {
-        Ok(resp) => resp.into_body().read_to_string()?,
-        Err(ureq::Error::StatusCode(code)) => return Err(format!("MCP tools/list returned HTTP {code}").into()),
-        Err(other) => return Err(Box::new(other)),
+        Ok(mut resp) => {
+            if let Some(failure) = status_outcome(resp.status().as_u16(), "MCP tools/list") {
+                return Err(failure);
+            }
+            resp.body_mut()
+                .read_to_string()
+                .map_err(|err| VerifyOutcome::Failed(format!("MCP tools/list body unreadable: {err}")))?
+        }
+        Err(err) => return Err(transport_outcome(&err, "MCP tools/list")),
     };
     // The MCP endpoint may answer as JSON or as an SSE `data:` frame.
     let json_text = text
         .lines()
         .find_map(|l| l.trim().strip_prefix("data:").map(str::trim))
         .unwrap_or(text.as_str());
-    let parsed: serde_json::Value = serde_json::from_str(json_text)?;
+    // Past this point the daemon answered: every remaining failure is a real
+    // failure, never a skip.
+    let parsed: serde_json::Value = serde_json::from_str(json_text)
+        .map_err(|err| VerifyOutcome::Failed(format!("MCP tools/list response is not JSON: {err}")))?;
     let count = parsed
         .get("result")
         .and_then(|r| r.get("tools"))
         .and_then(|t| t.as_array())
         .map(|a| a.len())
-        .ok_or("MCP tools/list response missing result.tools")?;
+        .ok_or_else(|| VerifyOutcome::Failed("MCP tools/list response missing result.tools".to_string()))?;
     Ok(count)
 }
 
 /// Best-effort end-to-end memory check: `store_fact` (PUT /v1/facts) then read
 /// it back (GET /v1/facts?query=). Returns Ok on a successful round-trip.
-fn verify_fact_roundtrip(agent: &ureq::Agent, http_base: &str, bearer: Option<&str>) -> Result<(), DynErr> {
+fn verify_fact_roundtrip(agent: &ureq::Agent, http_base: &str, bearer: Option<&str>) -> Result<(), VerifyOutcome> {
     let entity = "__crux_login_selfcheck";
     let key = "last_login_probe";
     let value = "ok";
@@ -611,9 +665,15 @@ fn verify_fact_roundtrip(agent: &ureq::Agent, http_base: &str, bearer: Option<&s
         put = put.header("x-corecrux-scopes", "facts:write");
     }
     match put.send_json(put_body) {
-        Ok(_) => {}
-        Err(ureq::Error::StatusCode(code)) => return Err(format!("store_fact returned HTTP {code}").into()),
-        Err(other) => return Err(Box::new(other)),
+        Ok(resp) => {
+            // The write leg's whole point is to prove the daemon accepts a
+            // fact. Without this check a 500 arrived as `Ok` and the round-trip
+            // carried on to the read leg as though the write had landed.
+            if let Some(failure) = status_outcome(resp.status().as_u16(), "store_fact") {
+                return Err(failure);
+            }
+        }
+        Err(err) => return Err(transport_outcome(&err, "store_fact")),
     }
 
     let get_url = format!("{http_base}/v1/facts");
@@ -628,12 +688,25 @@ fn verify_fact_roundtrip(agent: &ureq::Agent, http_base: &str, bearer: Option<&s
     } else {
         get = get.header("x-corecrux-scopes", "query:read");
     }
+    // The write already succeeded, so the daemon is demonstrably up: from here
+    // every failure is a real failure, never a skip.
     let text = match get.call() {
-        Ok(resp) => resp.into_body().read_to_string()?,
-        Err(ureq::Error::StatusCode(code)) => return Err(format!("query_facts returned HTTP {code}").into()),
-        Err(other) => return Err(Box::new(other)),
+        Ok(mut resp) => {
+            if let Some(failure) = status_outcome(resp.status().as_u16(), "query_facts") {
+                return Err(failure);
+            }
+            resp.body_mut()
+                .read_to_string()
+                .map_err(|err| VerifyOutcome::Failed(format!("query_facts body unreadable: {err}")))?
+        }
+        Err(other) => {
+            return Err(VerifyOutcome::Failed(format!(
+                "query_facts failed after a successful write: {other}"
+            )))
+        }
     };
-    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    let parsed: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|err| VerifyOutcome::Failed(format!("query_facts response is not JSON: {err}")))?;
     let found = parsed
         .get("facts")
         .and_then(|f| f.as_array())
@@ -641,7 +714,9 @@ fn verify_fact_roundtrip(agent: &ureq::Agent, http_base: &str, bearer: Option<&s
     if found {
         Ok(())
     } else {
-        Err("query_facts did not return the just-written fact".into())
+        Err(VerifyOutcome::Failed(
+            "query_facts did not return the just-written fact".to_string(),
+        ))
     }
 }
 
@@ -941,19 +1016,32 @@ pub fn run(args: LoginArgs) -> Result<(), DynErr> {
     register_mcp(&cfg_dir, &http_base, &mcp_url, mcp_agent_token.as_deref())?;
     println!("registered MCP endpoint {mcp_url} → {}", env_file.display());
 
+    let mut verification_failed = false;
     if args.no_verify {
         println!("verification skipped (--no-verify)");
     } else {
         // MCP authenticates with the agent token (ambient `CRUX_AGENT_TOKEN`),
         // not the HTTP bearer — verify with that.
         let mcp_bearer = mcp_agent_token.or_else(|| ambient_token.clone());
+        // D-28: every outcome used to print as "skipped", so a daemon that
+        // answered with a 500 — or returned no fact at all — read exactly like
+        // a daemon that was not running. Failures now say FAILED and go to
+        // stderr; only a genuinely unreachable daemon is "skipped".
         match verify_mcp_tools_list(&agent, &mcp_url, mcp_bearer.as_deref()) {
             Ok(n) => println!("verify: MCP tools/list ok ({n} tools)"),
-            Err(e) => println!("verify: MCP tools/list skipped ({e})"),
+            Err(VerifyOutcome::Unreachable(e)) => println!("verify: MCP tools/list skipped ({e})"),
+            Err(VerifyOutcome::Failed(e)) => {
+                verification_failed = true;
+                eprintln!("verify: MCP tools/list FAILED ({e})");
+            }
         }
         match verify_fact_roundtrip(&agent, &http_base, effective_bearer.as_deref()) {
             Ok(()) => println!("verify: store_fact → query_facts round-trip ok"),
-            Err(e) => println!("verify: fact round-trip skipped ({e})"),
+            Err(VerifyOutcome::Unreachable(e)) => println!("verify: fact round-trip skipped ({e})"),
+            Err(VerifyOutcome::Failed(e)) => {
+                verification_failed = true;
+                eprintln!("verify: store_fact → query_facts round-trip FAILED ({e})");
+            }
         }
     }
 
@@ -978,6 +1066,16 @@ pub fn run(args: LoginArgs) -> Result<(), DynErr> {
 
     println!();
     println!("logged in to {http_base} via the {} rail.", rail.as_str());
+    // D-28: login itself succeeded — the credential is stored and usable — so
+    // this is not an error. But a self-check that RAN AND FAILED is a live
+    // daemon problem the operator must not have to notice in the scrollback.
+    if verification_failed {
+        eprintln!();
+        eprintln!(
+            "WARNING: login succeeded but one or more self-checks FAILED against the live daemon (see the FAILED lines above). \
+             This is not the same as a skipped check: the daemon answered and did not behave."
+        );
+    }
     Ok(())
 }
 
@@ -1824,6 +1922,68 @@ mod tests {
         assert!(captured[0]
             .to_ascii_lowercase()
             .contains("authorization: bearer test-bearer"));
+    }
+
+    /// D-28: both self-checks collapsed every outcome into a bare error and
+    /// the caller printed all of them as `"skipped"`, so a daemon that
+    /// answered `PUT /v1/facts` with a 500 — or returned no fact at all — read
+    /// exactly like a daemon that was not running. A check that RAN AND FAILED
+    /// must be distinguishable from one that could not run.
+    #[test]
+    fn a_live_daemon_failure_is_not_reported_as_a_skip() {
+        let agent = http_agent();
+
+        // Daemon answers and refuses the write: ran, failed.
+        let (port, handle) = serve_responses(vec![(500, "boom".to_string())]);
+        let outcome = verify_fact_roundtrip(&agent, &format!("http://127.0.0.1:{port}"), None).unwrap_err();
+        assert!(
+            matches!(outcome, VerifyOutcome::Failed(_)),
+            "a 500 on the write leg is a failure, not a skip: {outcome:?}"
+        );
+        assert!(outcome.to_string().contains("HTTP 500"), "{outcome}");
+        handle.join().unwrap();
+
+        // Write succeeds, read-back returns no matching fact: ran, failed.
+        let (port, handle) = serve_responses(vec![
+            (200, r#"{"ok":true}"#.to_string()),
+            (200, r#"{"facts":[]}"#.to_string()),
+        ]);
+        let outcome = verify_fact_roundtrip(&agent, &format!("http://127.0.0.1:{port}"), None).unwrap_err();
+        assert!(
+            matches!(outcome, VerifyOutcome::Failed(_)),
+            "a silent read-back miss is a failure, not a skip: {outcome:?}"
+        );
+        handle.join().unwrap();
+
+        // Nothing listening at all: could not run. `corecruxctl login` is
+        // expected to work offline, so this one really is a skip.
+        let outcome = verify_fact_roundtrip(&agent, "http://127.0.0.1:9", None).unwrap_err();
+        assert!(
+            matches!(outcome, VerifyOutcome::Unreachable(_)),
+            "an unreachable daemon is a skip, not a failure: {outcome:?}"
+        );
+    }
+
+    /// Same split on the MCP check.
+    #[test]
+    fn mcp_tools_list_separates_a_refusal_from_an_unreachable_daemon() {
+        let agent = http_agent();
+
+        let (port, handle) = serve_responses(vec![(500, "boom".to_string())]);
+        let outcome = verify_mcp_tools_list(&agent, &format!("http://127.0.0.1:{port}/mcp"), None).unwrap_err();
+        assert!(matches!(outcome, VerifyOutcome::Failed(_)), "{outcome:?}");
+        handle.join().unwrap();
+
+        let (port, handle) = serve_responses(vec![(200, r#"{"error":{"code":-32601}}"#.to_string())]);
+        let outcome = verify_mcp_tools_list(&agent, &format!("http://127.0.0.1:{port}/mcp"), None).unwrap_err();
+        assert!(
+            matches!(outcome, VerifyOutcome::Failed(_)),
+            "a daemon that answered without result.tools ran and failed: {outcome:?}"
+        );
+        handle.join().unwrap();
+
+        let outcome = verify_mcp_tools_list(&agent, "http://127.0.0.1:9/mcp", None).unwrap_err();
+        assert!(matches!(outcome, VerifyOutcome::Unreachable(_)), "{outcome:?}");
     }
 
     #[test]

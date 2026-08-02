@@ -1894,19 +1894,18 @@ mod tests {
 
     /// DEFECT PIN (absent signal reads as pass): a `shards/` directory with no
     /// shard subdirectories — a wrong `--data-dir`, or a node whose data was
-    /// never mounted — yields `Ok` with zero records, zero segments scanned,
-    /// and `partial: false`. Downstream that becomes a report with
-    /// `checked: 0, matched: 0, missingInPostgres: 0`, indistinguishable from
-    /// genuine parity. This test pins the CURRENT behaviour; it is not an
-    /// endorsement of it.
+    /// never mounted — used to yield `Ok` with zero records, which downstream
+    /// became `checked: 0, matched: 0, missingInPostgres: 0`, indistinguishable
+    /// from genuine parity. The neighbouring absent-`shards/` and
+    /// absent-MANIFEST cases already failed loudly; this one now does too.
+    /// D-19, fixed in M5 of `crux-pinned-defect-remediation-2026-07-31`.
     #[test]
-    fn collect_corecrux_records_empty_shards_root_is_silently_clean() {
+    fn collect_corecrux_records_empty_shards_root_is_an_error() {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("shards")).unwrap();
-        let result = super::collect_corecrux_records(&options_for(tmp.path())).unwrap();
-        assert_eq!(result.segments_scanned, 0);
-        assert!(result.records.is_empty());
-        assert!(!result.partial);
+        let err =
+            super::collect_corecrux_records(&options_for(tmp.path())).expect_err("an empty shard set is not parity");
+        assert!(err.to_string().contains("no shards"), "{err}");
     }
 
     /// A shard directory without a MANIFEST is a hard error, not an empty scan.

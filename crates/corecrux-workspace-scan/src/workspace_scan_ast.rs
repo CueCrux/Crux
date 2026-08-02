@@ -1968,6 +1968,12 @@ fn private_helper() {}
         );
     }
 
+    /// The scanner's own sources mention stub markers as *data*. The exemption
+    /// in `is_scanner_source` keys on the path, so this fixture must use the
+    /// crate the scanner actually lives in: PR #593 moved it out of `corecruxd`
+    /// into `corecrux-workspace-scan` and renamed the exemption, but this
+    /// fixture (added by the second coverage sweep) still built a `corecruxd`
+    /// tree — so the test asserted an exemption that could no longer match.
     #[test]
     fn scanner_sources_are_exempt_from_stub_detection() {
         let tmp = tempfile::tempdir().expect("tempdir");

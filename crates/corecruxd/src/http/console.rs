@@ -5067,9 +5067,12 @@ mod tests {
 
         // A cutoff before every write hides everything.
         assert_eq!(fetch(state.clone(), Some(1)).await["visible_count"], 0);
-        // CURRENT behaviour: `as_of_unix_ms = 0` is treated as "no cutoff", not
-        // as "the epoch" — an absent-ish signal reads as pass.
-        assert_eq!(fetch(state, Some(0)).await["visible_count"], 1);
+        // D-26 (inverted pin): `as_of_unix_ms = 0` used to be treated as "no
+        // cutoff" rather than "the epoch", so a client computing 0 silently got
+        // ALL current facts while the response echoed the parameter back. Zero
+        // is a valid epoch cutoff: nothing had been stored yet. Fixed in M7 of
+        // `crux-pinned-defect-remediation-2026-07-31`.
+        assert_eq!(fetch(state, Some(0)).await["visible_count"], 0);
     }
 
     #[tokio::test]
@@ -5299,15 +5302,22 @@ mod tests {
             .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        // NOTE (current behaviour): the preview route resolves the chunk BEFORE
-        // the tenant scope check, so an unauthenticated caller can tell an
-        // unknown digest (404) from a known one. Pinned, not fixed.
+        // D-27 (inverted pin): the preview route used to resolve the chunk
+        // BEFORE the scope check, so an unauthenticated caller could tell an
+        // unknown digest (404) from a known one — an existence oracle over
+        // every chunk digest. The scope is now required tenant-agnostically
+        // first. Fixed in M7 of
+        // `crux-pinned-defect-remediation-2026-07-31`.
         let mut unauthenticated = st_dev();
         unauthenticated.data_dir = state.data_dir.clone();
         let resp = get_console_chunk_preview(State(unauthenticated), Path("deadbeef".to_string()), HeaderMap::new())
             .await
             .into_response();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "presence must not be distinguishable without a credential"
+        );
     }
 
     #[tokio::test]

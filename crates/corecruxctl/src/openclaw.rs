@@ -1561,12 +1561,13 @@ mod tests {
         assert_eq!(ws.memories[0].entity, "openclaw:doc");
     }
 
-    /// **Pinned current behaviour, not an endorsement.** `collect` records a
-    /// SQLite index relative to the directory it was found in, not to the
-    /// workspace root, so `sub/index.db` and a root-level `index.db` both report
-    /// as `index.db` — the nesting is lost from the operator-facing note.
+    /// D-28 (inverted pin): `collect` recorded a SQLite index relative to the
+    /// directory it was found in rather than the workspace root, so
+    /// `sub/index.db` and a root-level `index.db` both reported as `index.db`
+    /// — the nesting was lost and two indexes could collide on one name. Fixed
+    /// in M7 of `crux-pinned-defect-remediation-2026-07-31`.
     #[test]
-    fn sqlite_indexes_are_noted_relative_to_their_own_directory() {
+    fn sqlite_indexes_are_noted_relative_to_the_workspace_root() {
         let dir = tiny_workspace("SOUL.md", "# soul");
         fs::create_dir_all(dir.path().join("sub")).unwrap();
         fs::write(dir.path().join("sub/index.db"), "not really sqlite").unwrap();
@@ -1574,7 +1575,8 @@ mod tests {
         let ws = parse_workspace(dir.path()).unwrap();
         assert_eq!(
             ws.sqlite_files,
-            vec!["index.db".to_string(), "other.sqlite3".to_string()]
+            vec!["other.sqlite3".to_string(), "sub/index.db".to_string()],
+            "the nested index keeps its path relative to the workspace root"
         );
         assert_eq!(ws.memories.len(), 1, "sqlite files are noted, never parsed");
     }
@@ -1850,19 +1852,19 @@ mod tests {
         assert!(reqs[1].contains("cursor=cur-2"), "{}", reqs[1]);
     }
 
-    /// **Pinned current behaviour, not an endorsement.** The module claims the
-    /// export "fails closed: a pagination overrun errors rather than returning a
-    /// partial view", but that only covers the page *cap*. A response that omits
-    /// `has_more` (or returns it with no `next_cursor`) stops the walk and the
-    /// truncated page set is reported as the complete store — an absent signal
-    /// read as "no more data".
+    /// D-20 (inverted pin): the module documents the export as failing closed,
+    /// but that only covered the page *cap*. A response omitting `has_more`
+    /// stopped the walk and the truncated page set was reported as the complete
+    /// store — an absent signal read as "no more data". Fixed in M5 of
+    /// `crux-pinned-defect-remediation-2026-07-31`.
     #[test]
-    fn fetch_openclaw_facts_stops_silently_when_has_more_is_absent() {
+    fn fetch_openclaw_facts_refuses_a_response_that_omits_has_more() {
         let body = serde_json::json!({"facts": [{"entity": "openclaw:doc", "key": "a"}]}).to_string();
         let (port, handle) = crate::test_support::serve_responses(vec![(200, body)]);
-        let facts = fetch_openclaw_facts(&format!("http://127.0.0.1:{port}"), None, &agent()).unwrap();
+        let err = fetch_openclaw_facts(&format!("http://127.0.0.1:{port}"), None, &agent())
+            .expect_err("an omitted has_more must not read as 'no more pages'");
         handle.join().ok();
-        assert_eq!(facts.len(), 1, "one page accepted as the whole store, with no error");
+        assert!(err.to_string().contains("omits `has_more`"), "{err}");
     }
 
     #[test]

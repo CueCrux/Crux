@@ -3136,19 +3136,20 @@ mod tests {
         assert_eq!(collect_files_recursive_v1(tmp.path()).unwrap().len(), 2);
     }
 
-    /// Documented current behaviour: a segments directory that does not exist
-    /// yields an all-zero, `skipped:false` report — i.e. "nothing on disk,
-    /// nothing orphaned", indistinguishable from a directory that was scanned
-    /// and found clean. `collect_files_recursive_v1` swallows the read_dir
-    /// error by design. Pins the behaviour; does not endorse it.
+    /// D-28 (pin inverted): a segments directory that does not exist used to
+    /// yield an all-zero, `skipped:false` report — "nothing on disk, nothing
+    /// orphaned" — indistinguishable from a directory that was scanned and
+    /// found clean, because `collect_files_recursive_v1` swallows the read_dir
+    /// error. It now reports `skipped:true`, so "could not look" is a distinct
+    /// answer from "looked and found nothing".
     #[test]
-    fn gc_cold_segments_dir_missing_directory_reports_clean_not_error() {
+    fn gc_cold_segments_dir_missing_directory_reports_skipped_not_clean() {
         let tmp = TempDir::new().unwrap();
         let missing = tmp.path().join("does-not-exist");
         let reachable = BTreeMap::new();
         let (report, deleted) =
             gc_cold_segments_dir_v1("relations", 3, &missing, Some(&reachable), &gc_opts(false, 0, 0)).unwrap();
-        assert!(!report.skipped);
+        assert!(report.skipped, "a directory that could not be read is not a clean scan");
         assert_eq!(report.segments_on_disk, 0);
         assert_eq!(report.orphan_segments, 0);
         assert_eq!(report.unparseable_segment_files, 0);
@@ -3514,11 +3515,18 @@ mod tests {
         assert!(!files.living_snapshot_path.exists());
 
         let store = ProjectionStoreV1::load_or_init(&shard_dir, 1, 1).unwrap();
-        assert_eq!(store.meta.commit_id, 12, "meta is NOT reset (current behaviour)");
-        assert!(store.state.living.is_empty(), "but no rows were loaded");
-        let cursor = store.cursor_from_meta().expect("cursor survives");
-        assert_eq!(cursor.segment_seq, 7);
-        assert_eq!(cursor.offset, 4_096);
+        // D-6 (pin inverted): the meta recorded a snapshot hash and an advanced
+        // cursor while the snapshot FILE was gone. The old guard skipped
+        // verification entirely and returned the store cursor-intact with empty
+        // state, so the next `tick` resumed past frames it had never applied —
+        // silent data loss. A missing snapshot now resets to genesis, matching
+        // how a corrupt one has always been handled.
+        assert_eq!(store.meta.commit_id, 0, "a missing snapshot resets meta to genesis");
+        assert!(store.state.living.is_empty(), "and no rows were loaded");
+        assert!(
+            store.cursor_from_meta().is_none(),
+            "the cursor must not survive a snapshot that is gone"
+        );
     }
 
     // ── cursor plumbing ─────────────────────────────────────────────

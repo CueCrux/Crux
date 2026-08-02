@@ -1221,28 +1221,29 @@ mod tests {
         assert!(!reqs[0].to_lowercase().contains("authorization:"), "{}", reqs[0]);
     }
 
-    /// **Pinned current behaviour, not an endorsement.** `execute` copies the
-    /// daemon's own `documents`/`ingested` counters into the report without
-    /// comparing them to what it sent. A daemon that accepts the request but
-    /// seals nothing (`ingested: 0`) yields `Ok` with `files_ingested: 2` and
-    /// `documents_sealed: 0` — a partial/no-op ingest reads as success.
+    /// D-9 (inverted pin): `execute` copied the daemon's own
+    /// `documents`/`ingested` counters into the report without comparing them
+    /// to what it sent, so a daemon that accepted the request but sealed
+    /// nothing (`ingested: 0`) yielded `Ok` with `files_ingested: 2` and
+    /// `documents_sealed: 0` — a no-op ingest read as success. Fixed in M4 of
+    /// `crux-pinned-defect-remediation-2026-07-31`.
     #[test]
     #[serial_test::serial]
-    fn execute_trusts_the_daemon_reported_counts_over_what_it_sent() {
+    fn execute_reconciles_sent_against_acknowledged_counts() {
         let _env = EnvGuard::apply(&[("CRUX_AGENT_TOKEN", None)]);
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("a.md"), "# Alpha\n\nbody").unwrap();
         std::fs::write(temp.path().join("b.md"), "# Beta\n\nbody").unwrap();
         let (port, handle) = crate::test_support::serve_responses(vec![(202, ingest_reply(0, 0))]);
 
-        let report = execute(&options(temp.path(), &format!("http://127.0.0.1:{port}"))).unwrap();
+        let err = execute(&options(temp.path(), &format!("http://127.0.0.1:{port}")))
+            .expect_err("a zero acknowledgement must not read as success");
         handle.join().ok();
-        assert_eq!(report.files_ingested, 2, "two documents were sent");
-        assert_eq!(
-            report.documents_sealed, 0,
-            "…and none were sealed, with no error raised"
+        let msg = err.to_string();
+        assert!(
+            msg.contains("acknowledged 0 documents") && msg.contains("2 documents"),
+            "the error names both sides of the reconciliation: {msg}"
         );
-        assert_eq!(report.seals[0].chunks, 0);
     }
 
     #[test]

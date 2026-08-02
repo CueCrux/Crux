@@ -612,7 +612,7 @@ fn write_selected_for_sync(data_dir: &Path, repos: &[SelectedRepo]) -> Result<()
     let path = data_dir.join("integrations").join("github").join("selected_repos.json");
     // Same guard as the sibling writer: never clobber a selection we could not
     // read (D-8).
-    crate::integrations_github::ensure_selection_writable(&path)?;
+    crate::github::ensure_selection_writable(&path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
