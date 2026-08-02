@@ -1898,12 +1898,12 @@ fn private_helper() {}
     #[test]
     fn scanner_sources_are_exempt_from_stub_detection() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let crate_dir = tmp.path().join("corecruxd");
+        let crate_dir = tmp.path().join("corecrux-workspace-scan");
         std::fs::create_dir_all(crate_dir.join("src")).expect("dirs");
         std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").expect("workspace toml");
         std::fs::write(
             crate_dir.join("Cargo.toml"),
-            "[package]\nname = \"corecruxd\"\nversion = \"0.1.0\"\n",
+            "[package]\nname = \"corecrux-workspace-scan\"\nversion = \"0.1.0\"\n",
         )
         .expect("crate toml");
         // The scanner's own sources mention `todo!(` as data, not as a stub.
@@ -1920,10 +1920,9 @@ fn private_helper() {}
 
         let scan = run_scan_ast_at(tmp.path()).expect("ast scan");
         assert!(
-            !scan
-                .stubs
-                .iter()
-                .any(|s| s.file_rel_path.ends_with("corecruxd/src/workspace_scan.rs")),
+            !scan.stubs.iter().any(|s| s
+                .file_rel_path
+                .ends_with("corecrux-workspace-scan/src/workspace_scan.rs")),
             "the scanner's own source must not report its stub markers"
         );
         assert!(scan.stubs.iter().any(|s| s.file_rel_path.ends_with("other.rs")));
