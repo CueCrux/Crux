@@ -27,9 +27,10 @@
 use super::context_budget::{
     parse_section_filter, payload_budget, section_matches, section_order_key, serialised_tokens, PRIORITY_SECTIONS,
 };
-use super::{
-    problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode,
-};
+// As in `dossier.rs`: no `require_http_scopes` import, because every handler on
+// this surface touches a tenant's derived artifact and goes through
+// `runtime_tenant_for`.
+use super::{problem_response, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode};
 
 const STORYBOOK_PREFIX: &str = "__storybook__";
 const STORYBOOK_KEY: &str = "content";
@@ -105,8 +106,12 @@ pub(super) async fn post_generate(
     };
     {
         let mut store = state.fact_store.write().await;
+        // Stamped with the tenant this storybook was generated for. It used to be
+        // a hardcoded "default" while the reads filtered on nothing, so a document
+        // built from one tenant's runtime was served to any caller that named the
+        // project — M3b bound generation here and left persistence unbound.
         let mut sf = corecrux_memory::fact_store::StoreFact {
-            tenant_hash: "default".to_string(),
+            tenant_hash: runtime_tenant.as_str().to_string(),
             entity: entity_for(&project_id, now_ms),
             key: STORYBOOK_KEY.to_string(),
             value,
@@ -148,6 +153,7 @@ pub(super) async fn post_generate(
 
 async fn list_storybook_versions_internal(
     fact_store: &std::sync::Arc<tokio::sync::RwLock<corecrux_memory::FactStore>>,
+    scope: &crate::auth::TenantScope,
     project_id: &str,
 ) -> Vec<u64> {
     let store = fact_store.read().await;
@@ -164,6 +170,7 @@ async fn list_storybook_versions_internal(
     let latest = crate::fact_helpers::dedup_latest(result.facts);
     let mut tss: Vec<u64> = latest
         .into_iter()
+        .filter(|f| scope.may_read_fact_tenant(&f.tenant_hash))
         .filter(|f| f.entity.starts_with(&prefix) && f.key == STORYBOOK_KEY && !f.value.is_empty())
         .filter_map(|f| f.entity[prefix.len()..].parse::<u64>().ok())
         .collect();
@@ -173,6 +180,7 @@ async fn list_storybook_versions_internal(
 
 async fn load_storybook(
     fact_store: &std::sync::Arc<tokio::sync::RwLock<corecrux_memory::FactStore>>,
+    scope: &crate::auth::TenantScope,
     project_id: &str,
     ts: u64,
 ) -> Option<crate::storybook::StorybookDocument> {
@@ -190,7 +198,7 @@ async fn load_storybook(
     let latest = crate::fact_helpers::dedup_latest(result.facts);
     let fact = latest
         .into_iter()
-        .find(|f| f.entity == entity && f.key == STORYBOOK_KEY)?;
+        .find(|f| f.entity == entity && f.key == STORYBOOK_KEY && scope.may_read_fact_tenant(&f.tenant_hash))?;
     serde_json::from_str::<crate::storybook::StorybookDocument>(&fact.value).ok()
 }
 
@@ -327,11 +335,16 @@ pub(super) async fn get_latest(
     Path(project_id): Path<String>,
     Query(q): Query<SelectQuery>,
     headers: HeaderMap,
+    Query(tq): Query<super::traces::OptionalTenantQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-        return problem.into_response();
-    }
-    let versions = list_storybook_versions_internal(&state.fact_store, &project_id).await;
+    // Bound the same way generation is (M3b): resolution and authorization in one
+    // operation, so a caller reads the tenant it was authorised for and no other.
+    let (scope, _bound) =
+        match super::traces::runtime_tenant_for(&state, &headers, &["admin:read"], tq.tenant_id.as_deref()) {
+            Ok(resolved) => resolved,
+            Err(problem) => return problem.into_response(),
+        };
+    let versions = list_storybook_versions_internal(&state.fact_store, &scope, &project_id).await;
     let latest_ts = match versions.first() {
         Some(t) => *t,
         None => {
@@ -341,7 +354,7 @@ pub(super) async fn get_latest(
             )
         }
     };
-    match load_storybook(&state.fact_store, &project_id, latest_ts).await {
+    match load_storybook(&state.fact_store, &scope, &project_id, latest_ts).await {
         Some(d) => (StatusCode::OK, Json(select_sections(d, &q, versions))).into_response(),
         None => problem_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to load latest readout"),
     }
@@ -352,11 +365,16 @@ pub(super) async fn list_versions(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
     headers: HeaderMap,
+    Query(tq): Query<super::traces::OptionalTenantQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-        return problem.into_response();
-    }
-    let versions = list_storybook_versions_internal(&state.fact_store, &project_id).await;
+    // Bound the same way generation is (M3b): resolution and authorization in one
+    // operation, so a caller reads the tenant it was authorised for and no other.
+    let (scope, _bound) =
+        match super::traces::runtime_tenant_for(&state, &headers, &["admin:read"], tq.tenant_id.as_deref()) {
+            Ok(resolved) => resolved,
+            Err(problem) => return problem.into_response(),
+        };
+    let versions = list_storybook_versions_internal(&state.fact_store, &scope, &project_id).await;
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -374,13 +392,18 @@ pub(super) async fn get_version(
     Path((project_id, ts)): Path<(String, u64)>,
     Query(q): Query<SelectQuery>,
     headers: HeaderMap,
+    Query(tq): Query<super::traces::OptionalTenantQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-        return problem.into_response();
-    }
-    match load_storybook(&state.fact_store, &project_id, ts).await {
+    // Bound the same way generation is (M3b): resolution and authorization in one
+    // operation, so a caller reads the tenant it was authorised for and no other.
+    let (scope, _bound) =
+        match super::traces::runtime_tenant_for(&state, &headers, &["admin:read"], tq.tenant_id.as_deref()) {
+            Ok(resolved) => resolved,
+            Err(problem) => return problem.into_response(),
+        };
+    match load_storybook(&state.fact_store, &scope, &project_id, ts).await {
         Some(d) => {
-            let versions = list_storybook_versions_internal(&state.fact_store, &project_id).await;
+            let versions = list_storybook_versions_internal(&state.fact_store, &scope, &project_id).await;
             (StatusCode::OK, Json(select_sections(d, &q, versions))).into_response()
         }
         None => problem_response(StatusCode::NOT_FOUND, "no readout with that timestamp"),
@@ -399,15 +422,20 @@ pub(super) async fn get_diff(
     Path(project_id): Path<String>,
     Query(q): Query<DiffQuery>,
     headers: HeaderMap,
+    Query(tq): Query<super::traces::OptionalTenantQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-        return problem.into_response();
-    }
-    let a = match load_storybook(&state.fact_store, &project_id, q.a).await {
+    // Bound the same way generation is (M3b): resolution and authorization in one
+    // operation, so a caller reads the tenant it was authorised for and no other.
+    let (scope, _bound) =
+        match super::traces::runtime_tenant_for(&state, &headers, &["admin:read"], tq.tenant_id.as_deref()) {
+            Ok(resolved) => resolved,
+            Err(problem) => return problem.into_response(),
+        };
+    let a = match load_storybook(&state.fact_store, &scope, &project_id, q.a).await {
         Some(d) => d,
         None => return problem_response(StatusCode::NOT_FOUND, format!("readout 'a' (ts={}) not found", q.a)),
     };
-    let b = match load_storybook(&state.fact_store, &project_id, q.b).await {
+    let b = match load_storybook(&state.fact_store, &scope, &project_id, q.b).await {
         Some(d) => d,
         None => return problem_response(StatusCode::NOT_FOUND, format!("readout 'b' (ts={}) not found", q.b)),
     };
@@ -612,6 +640,7 @@ mod tests {
                 Path("proj".into()),
                 Query(SelectQuery::default()),
                 HeaderMap::new(),
+                Query(super::super::traces::OptionalTenantQuery::default()),
             )
             .await
             .into_response(),
@@ -634,6 +663,7 @@ mod tests {
                 Path("proj".into()),
                 Query(SelectQuery::default()),
                 HeaderMap::new(),
+                Query(super::super::traces::OptionalTenantQuery::default()),
             )
             .await
             .into_response(),
@@ -656,6 +686,7 @@ mod tests {
                     token_budget: None,
                 }),
                 HeaderMap::new(),
+                Query(super::super::traces::OptionalTenantQuery::default()),
             )
             .await
             .into_response(),
@@ -672,6 +703,7 @@ mod tests {
                 Path(("proj".into(), 9999)),
                 Query(SelectQuery::default()),
                 HeaderMap::new(),
+                Query(super::super::traces::OptionalTenantQuery::default()),
             )
             .await
             .into_response(),
@@ -687,9 +719,14 @@ mod tests {
         persist(&st, &doc("proj", 3000)).await;
         persist(&st, &doc("proj", 2000)).await;
         let (status, body) = parts(
-            list_versions(State(st), Path("proj".into()), HeaderMap::new())
-                .await
-                .into_response(),
+            list_versions(
+                State(st),
+                Path("proj".into()),
+                HeaderMap::new(),
+                Query(crate::http::traces::OptionalTenantQuery::default()),
+            )
+            .await
+            .into_response(),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -714,6 +751,7 @@ mod tests {
                 Path("proj".into()),
                 Query(DiffQuery { a: 1000, b: 2000 }),
                 HeaderMap::new(),
+                Query(super::super::traces::OptionalTenantQuery::default()),
             )
             .await
             .into_response(),
@@ -729,6 +767,7 @@ mod tests {
                 Path("proj".into()),
                 Query(DiffQuery { a: 1000, b: 4242 }),
                 HeaderMap::new(),
+                Query(super::super::traces::OptionalTenantQuery::default()),
             )
             .await
             .into_response(),

@@ -1403,6 +1403,13 @@ pub fn require_http_any_scope_for_tenant(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantScope(String);
 
+/// The stamp on facts written before their plane was tenant-partitioned.
+///
+/// Mirrors `corecrux_memory::fact_store::default_tenant_hash`. Named here rather
+/// than spelled `"default"` at each read site so the legacy rule is one thing to
+/// find and one thing to change.
+pub const LEGACY_FACT_TENANT: &str = "default";
+
 impl TenantScope {
     /// The daemon's own capture tenant, for the tenant-blind fallback path.
     ///
@@ -1430,9 +1437,18 @@ impl TenantScope {
         self.0 == crate::trace_store::TraceStore::capture_tenant()
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test(tenant_id: &str) -> Self {
-        Self(tenant_id.to_string())
+    /// Whether a stored fact stamped `fact_tenant` may be read in this scope.
+    ///
+    /// A fact written before its plane was partitioned carries the fact store's
+    /// default stamp (`corecrux_memory::fact_store::default_tenant_hash`, i.e.
+    /// `"default"`), which is not any requester's tenant. Those rows go to the
+    /// daemon's capture tenant and to nobody else: they were written by this
+    /// process under this configuration, so attributing them there is accurate,
+    /// while attributing them to whoever happens to ask would recreate the leak
+    /// the partitioning closed. Same rule, same reasoning, as the legacy-span
+    /// case in `trace_store.rs`.
+    pub fn may_read_fact_tenant(&self, fact_tenant: &str) -> bool {
+        fact_tenant == self.0 || (fact_tenant == LEGACY_FACT_TENANT && self.is_daemon_capture())
     }
 }
 

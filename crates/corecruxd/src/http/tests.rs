@@ -16557,6 +16557,7 @@ async fn dossier_list_when_empty_returns_empty_array() {
         Path("alpha".to_string()),
         Query(Default::default()),
         dev_scope_headers("admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -16572,6 +16573,7 @@ async fn dossier_list_requires_admin_read() {
         Path("alpha".to_string()),
         Query(Default::default()),
         HeaderMap::new(),
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -16598,6 +16600,7 @@ async fn storybook_post_generate_then_get_latest() {
         Path("alpha".to_string()),
         Query(Default::default()),
         dev_scope_headers("admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -16607,10 +16610,14 @@ async fn storybook_post_generate_then_get_latest() {
         latest_resp.status()
     );
 
-    let versions_resp =
-        super::storybook::list_versions(State(state), Path("alpha".to_string()), dev_scope_headers("admin:read"))
-            .await
-            .into_response();
+    let versions_resp = super::storybook::list_versions(
+        State(state),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
+    )
+    .await
+    .into_response();
     let body = json_body(versions_resp).await;
     assert!(body["versions"].is_array());
 }
@@ -16623,6 +16630,7 @@ async fn storybook_get_latest_when_none_returns_404() {
         Path("nonexistent".to_string()),
         Query(Default::default()),
         dev_scope_headers("admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -16651,6 +16659,7 @@ async fn dossier_get_unknown_returns_404() {
         Path(("alpha".to_string(), "nonexistent".to_string())),
         Query(Default::default()),
         dev_scope_headers("admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -21399,6 +21408,395 @@ async fn m3b_storybook_allows_the_tenant_the_caller_does_hold() {
         resp.status(),
         StatusCode::FORBIDDEN,
         "a caller naming its own tenant must get past authorization"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The dossier and storybook *persistence* plane.
+// crux-tenant-scope-by-type-2026-08-02, M2.
+//
+// M3b bound generation on both surfaces and left publication and read unbound:
+// the persist stamped a hardcoded `tenant_hash: "default"` whatever tenant the
+// artifact was derived from, the entity key carried no tenant, and every read
+// queried with `tenant_hash: None` — which is *no filter*, not *default tenant*
+// (`fact_store.rs`, `q.tenant_hash.as_ref().is_none_or(..)`). A dossier built
+// from tenant A's runtime was therefore readable by anyone holding `admin:read`
+// who named A's project. Same defect shape as 2026-07-31a, one layer down, and
+// invisible to the M3b tests because those were scoped to what M3b changed.
+//
+// Each of these fails against the pre-fix reader.
+
+/// Store an artifact fact directly, choosing its tenant stamp — the state the
+/// daemon is in after some other tenant published.
+async fn seed_artifact_fact(state: &AppState, tenant_hash: &str, entity: &str, value: serde_json::Value) {
+    let mut store = state.fact_store.write().await;
+    store.store(corecrux_memory::fact_store::StoreFact {
+        tenant_hash: tenant_hash.to_string(),
+        entity: entity.to_string(),
+        key: "content".to_string(),
+        value: value.to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+        horizon_class: None,
+        actor: None,
+    });
+}
+
+fn seeded_dossier_value(dossier_id: &str, project_id: &str) -> serde_json::Value {
+    serde_json::json!({ "dossier_id": dossier_id, "project_id": project_id })
+}
+
+fn seeded_storybook_value(project_id: &str, ts: u64) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": project_id,
+        "generated_at_unix_ms": ts,
+        "generated_by_passport": "p_a",
+        "markdown": "# secret",
+        "sections": { "00_front": "# secret" },
+        "stats": {
+            "plane_count": 0,
+            "planes_with_vision": 0,
+            "planes_with_mapped_modules": 0,
+            "orphan_planes": [],
+            "workspace_loc": 0,
+            "stub_count": 0,
+            "dead_code_count": 0,
+            "bytes": 0
+        }
+    })
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_dossier_read_refuses_another_tenants_artifact() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    seed_artifact_fact(
+        &state,
+        "tenant-a",
+        "__dossier__::alpha::d1",
+        seeded_dossier_value("d1", "alpha"),
+    )
+    .await;
+
+    // Tenant B, naming its own tenant — a well-formed hosted request, not an
+    // attack on the authorization boundary. The refusal has to come from the
+    // data filter, which is where it was missing.
+    let resp = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "d1".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "dossier leaked across tenants: tenant-b read an artifact stamped tenant-a"
+    );
+
+    // And unbound — the shape the pre-fix handler actually served, since no
+    // caller had to name a tenant to get someone else's dossier.
+    let unbound = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "d1".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        unbound.status(),
+        StatusCode::NOT_FOUND,
+        "dossier leaked to an unbound caller: the daemon-capture scope is not tenant-a"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_dossier_read_allows_the_owning_tenant() {
+    // Positive control: the filter must not be a surface that refuses
+    // everything. Tenant A reads what tenant A published.
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    seed_artifact_fact(
+        &state,
+        "tenant-a",
+        "__dossier__::alpha::d1",
+        seeded_dossier_value("d1", "alpha"),
+    )
+    .await;
+
+    let resp = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "d1".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-a", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the owning tenant must still be able to read its own dossier"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_dossier_list_hides_another_tenants_artifact() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    seed_artifact_fact(
+        &state,
+        "tenant-a",
+        "__dossier__::alpha::d1",
+        seeded_dossier_value("d1", "alpha"),
+    )
+    .await;
+
+    let resp = super::dossier::list_dossiers(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["count"], 0,
+        "dossier list leaked across tenants: tenant-b enumerated tenant-a's artifacts"
+    );
+
+    // Control on the same fixture: tenant A sees exactly the one it owns, so a
+    // zero above is a filter working rather than a seed that never landed.
+    let owner = super::dossier::list_dossiers(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        Query(Default::default()),
+        m2_bearer_for("tenant-a", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    let owner_body = json_body(owner).await;
+    assert_eq!(owner_body["count"], 1, "the owning tenant must see its own dossier");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_storybook_read_refuses_another_tenants_artifact() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    seed_artifact_fact(
+        &state,
+        "tenant-a",
+        "__storybook__::alpha::1000",
+        seeded_storybook_value("alpha", 1000),
+    )
+    .await;
+
+    let resp = super::storybook::get_version(
+        State(state.clone()),
+        Path(("alpha".to_string(), 1000u64)),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "storybook leaked across tenants: tenant-b read a readout stamped tenant-a"
+    );
+
+    let owner = super::storybook::get_version(
+        State(state.clone()),
+        Path(("alpha".to_string(), 1000u64)),
+        Query(Default::default()),
+        m2_bearer_for("tenant-a", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        owner.status(),
+        StatusCode::OK,
+        "the owning tenant must still be able to read its own readout"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_storybook_versions_hides_another_tenants_artifact() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    seed_artifact_fact(
+        &state,
+        "tenant-a",
+        "__storybook__::alpha::1000",
+        seeded_storybook_value("alpha", 1000),
+    )
+    .await;
+
+    let resp = super::storybook::list_versions(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["count"], 0,
+        "storybook versions leaked across tenants: tenant-b enumerated tenant-a's readouts"
+    );
+
+    let owner = super::storybook::list_versions(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        m2_bearer_for("tenant-a", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    let owner_body = json_body(owner).await;
+    assert_eq!(owner_body["count"], 1, "the owning tenant must see its own readout");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_published_dossier_is_stamped_with_the_publishing_tenant() {
+    // The five tests above seed the store directly, so they pin the *read*
+    // filter and would all stay green if `persist_dossier` went back to stamping
+    // `"default"`. This one goes through the publish handler and then reads with
+    // the daemon-capture scope, which is what a `"default"` stamp would satisfy.
+    // Without it the suite would prove half the fix — the exact shape of defect
+    // this plan exists to stop shipping.
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+
+    let published = super::dossier::post_publish(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        m2_bearer_for("tenant-a", "admin:read facts:write"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+        Json(serde_json::from_value(seeded_dossier_value("d9", "alpha")).expect("dossier body")),
+    )
+    .await
+    .into_response();
+    assert_eq!(published.status(), StatusCode::CREATED, "publish should succeed");
+
+    let unbound = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "d9".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        unbound.status(),
+        StatusCode::NOT_FOUND,
+        "a dossier published by tenant-a was stamped so the capture tenant could read it"
+    );
+
+    let owner = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "d9".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-a", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        owner.status(),
+        StatusCode::OK,
+        "the publisher must be able to read it back"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_legacy_default_rows_reach_the_capture_tenant_only() {
+    // Everything written before this change carries the fact store's default
+    // stamp. Those rows must keep working on a single-tenant daemon — that is
+    // Constraint 1 — without becoming readable by a named tenant that never
+    // owned them. Same rule `trace_store` applies to legacy unlabelled spans.
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    seed_artifact_fact(
+        &state,
+        crate::auth::LEGACY_FACT_TENANT,
+        "__dossier__::alpha::legacy",
+        seeded_dossier_value("legacy", "alpha"),
+    )
+    .await;
+
+    // Unbound request → the daemon's capture tenant → the legacy row is visible,
+    // exactly as it was before this change.
+    let capture = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "legacy".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        capture.status(),
+        StatusCode::OK,
+        "a legacy row must still reach the daemon's own capture tenant"
+    );
+
+    // The same row named by a tenant that never owned it: refused.
+    let named = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "legacy".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        named.status(),
+        StatusCode::NOT_FOUND,
+        "a legacy row must not become readable by a named tenant that never owned it"
     );
 }
 
