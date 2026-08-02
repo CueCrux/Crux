@@ -3148,7 +3148,11 @@ pub(super) async fn get_console_chunk_preview(
     // one — an existence oracle over every chunk digest. Require the scope
     // tenant-agnostically first; the tenant-bound check still follows once the
     // owning tenant is known.
-    if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["tenant:content:preview", "admin:read"]) {
+    // Gate 1 is the SCOPE rail, checked before the lookup: a caller without
+    // `tenant:content:preview` at all is refused 403 without the digest ever
+    // being resolved, so it learns nothing about existence. `admin:read` does
+    // not buy this rail.
+    if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["tenant:content:preview"]) {
         return problem.into_response();
     }
 
@@ -3159,10 +3163,13 @@ pub(super) async fn get_console_chunk_preview(
         return problem_response(StatusCode::NOT_FOUND, "chunk metadata not found");
     };
 
-    if let Err(problem) =
-        require_http_scopes_for_tenant(&state.auth, &headers, &["tenant:content:preview"], &chunk.tenant_id)
-    {
-        return problem.into_response();
+    // Gate 2 is the TENANT rail, checked after the lookup because it needs the
+    // owner. D-27, second half: a caller holding the preview scope for one
+    // tenant could still tell another tenant's existing digest (403) from an
+    // absent one (404). Past gate 1 the caller does hold the rail, so the only
+    // thing left to hide is the chunk itself — report it absent.
+    if require_http_scopes_for_tenant(&state.auth, &headers, &["tenant:content:preview"], &chunk.tenant_id).is_err() {
+        return problem_response(StatusCode::NOT_FOUND, "chunk metadata not found");
     }
 
     (

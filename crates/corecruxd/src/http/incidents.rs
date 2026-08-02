@@ -981,10 +981,13 @@ pub(super) async fn get_incident(
     let Some((fact, case)) = found else {
         return problem_response(StatusCode::NOT_FOUND, format!("incident {id} not found"));
     };
-    if let Err(problem) =
-        require_http_any_scope_for_tenant(&state.auth, &headers, &["query:read", "admin:read"], &case.tenant_id)
+    // D-27, second half: a caller authorised for SOME tenant could still tell
+    // another tenant's existing case (403) from an absent one (404). A case the
+    // caller may not read is, to that caller, indistinguishable from one that
+    // does not exist — so report it as absent rather than forbidden.
+    if require_http_any_scope_for_tenant(&state.auth, &headers, &["query:read", "admin:read"], &case.tenant_id).is_err()
     {
-        return problem.into_response();
+        return problem_response(StatusCode::NOT_FOUND, format!("incident {id} not found"));
     }
     Json(json!({ "case": case, "case_record_id": fact.fact_id })).into_response()
 }
@@ -1016,13 +1019,18 @@ pub(super) async fn export_incident(
     let Some((fact, case)) = found else {
         return problem_response(StatusCode::NOT_FOUND, format!("incident {id} not found"));
     };
-    if let Err(problem) = require_http_any_scope_for_tenant(
+    // D-27, second half: same as `get_incident` — a case this caller may not
+    // read is reported absent, not forbidden, so 403-vs-404 stops being an
+    // existence oracle for a caller authorised on a different tenant.
+    if require_http_any_scope_for_tenant(
         &state.auth,
         &headers,
         &["query:read", "exports:read", "admin:read"],
         &case.tenant_id,
-    ) {
-        return problem.into_response();
+    )
+    .is_err()
+    {
+        return problem_response(StatusCode::NOT_FOUND, format!("incident {id} not found"));
     }
     let (bytes, key_class, bundle_id) = match build_incident_bundle(&state, &fact, &case).await {
         Ok(result) => result,
@@ -2377,6 +2385,76 @@ mod tests {
     /// an unauthenticated caller could distinguish an unknown id (404) from an
     /// existing one (401) — a case-id enumeration oracle. The read scope is
     /// now required first, tenant-agnostically.
+    /// D-27, second half: a caller who IS authenticated, but scoped to a
+    /// different tenant, could still tell an existing case (403) from an absent
+    /// one (404). To that caller the two are the same thing, so both report
+    /// 404. Needs `jwt_hs256` — `dev_scopes` grants `TenantAllow::Any`, so a
+    /// tenant restriction is not expressible there.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_incident_hides_another_tenants_case_behind_404() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        const TEST_HS256_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+        let _flag = FeatureFlag::on();
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
+        std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
+        std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
+
+        let state = super::tests::test_app_state_with_auth(16, crate::auth::AuthMode::JwtHs256);
+        let id = {
+            let mut store = state.fact_store.write().await;
+            let case = bare_case("inc_other", "tenant-b", "t", Utc::now());
+            store_case(&mut store, &case);
+            case.id
+        };
+
+        let bearer_for = |tenant: &str| {
+            let claims = serde_json::json!({
+                "exp": (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 3600),
+                "iss": "corecrux-test",
+                "aud": "corecrux",
+                "scope": "query:read",
+                "tenant_id": tenant,
+            });
+            let token = encode(
+                &Header::new(Algorithm::HS256),
+                &claims,
+                &EncodingKey::from_secret(TEST_HS256_SECRET.as_bytes()),
+            )
+            .expect("jwt");
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {token}").parse().expect("header"),
+            );
+            headers
+        };
+
+        // Authenticated, but scoped to tenant-a only.
+        let outsider = bearer_for("tenant-a");
+        let existing = get_incident(State(state.clone()), outsider.clone(), AxumPath(id.clone())).await;
+        let absent = get_incident(State(state.clone()), outsider, AxumPath("inc_absent".to_string())).await;
+        assert_eq!(existing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            existing.status(),
+            absent.status(),
+            "another tenant's case is indistinguishable from one that does not exist"
+        );
+
+        // Control: the owning tenant still reads it.
+        let owner = get_incident(State(state), bearer_for("tenant-b"), AxumPath(id)).await;
+        assert_eq!(owner.status(), StatusCode::OK);
+
+        std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
+        std::env::remove_var("CORECRUXD_JWT_ISS");
+        std::env::remove_var("CORECRUXD_JWT_AUD");
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn get_incident_does_not_reveal_existence_before_authenticating() {
