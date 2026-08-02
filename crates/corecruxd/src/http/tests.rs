@@ -21403,6 +21403,42 @@ async fn m3b_storybook_allows_the_tenant_the_caller_does_hold() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Constraint 3, re-scoped — the aggregate surface declares its tier and says
+// plainly that it does not enforce it.
+//
+// The value being protected is the HONESTY of the annotation, not a gate. A
+// response that carries `aggregate: true` without `tier_enforcement` invites a
+// client to infer that reaching it meant something.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn tier_advisory_declares_the_tier_and_that_it_is_not_enforced() {
+    let annotated = super::traces::with_tier_advisory(serde_json::json!({"aggregate": true}));
+    assert_eq!(annotated["required_tier"], super::traces::AGGREGATE_REQUIRED_TIER);
+    assert_eq!(
+        annotated["tier_enforcement"], "advisory",
+        "the stamp must say advisory; a client that sees a tier and no enforcement note will assume a gate"
+    );
+    assert_eq!(annotated["aggregate"], true, "annotation must not disturb the payload");
+}
+
+#[test]
+fn every_aggregate_response_carries_the_advisory_stamp() {
+    // A source-level invariant rather than five near-identical response tests.
+    // The failure this guards is a SIXTH aggregate route added later without the
+    // stamp — which no test of the existing five would ever notice.
+    let src = include_str!("traces.rs");
+    let aggregate_bodies = src.matches("\"aggregate\": true").count();
+    let stamped = src.matches("with_tier_advisory(serde_json::json!(").count();
+    assert_eq!(
+        aggregate_bodies, stamped,
+        "every response body carrying `aggregate: true` must be wrapped in with_tier_advisory(); \
+         found {aggregate_bodies} aggregate bodies but {stamped} stamped. A new cross-repo route \
+         was probably added without the advisory annotation."
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // M8 — enrichment behind a per-seat rate ceiling.
 // crux-code-intel-pro-hosted-surface-2026-07-28.
 //

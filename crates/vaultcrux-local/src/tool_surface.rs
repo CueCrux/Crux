@@ -388,15 +388,26 @@ pub const TOOL_SURFACE: &[ToolSurfaceEntry] = &[
     // entries honest is that **the MCP tools do not expose `all_repos`**, so no
     // MCP caller can reach the hosted capability through them.
     //
-    // The HTTP routes are a different matter and are NOT gated by tier today.
-    // Per Constraint 3 of that plan ("tier alone decides") the aggregate path
-    // needs a per-tenant RcxTier check, which belongs to
-    // crux-pro-capabilities-rcx-entitled-2026-07-27. The process-wide
-    // `OperatingMode::includes_pro()` must NOT be used for it: on a multi-tenant
-    // daemon every tenant resolves to the same answer, which is the same
-    // process-configuration defect M3b exists to remove. **If `all_repos` is ever
-    // added to an MCP tool, that tool must become HostedGated in the same commit**
-    // — a missing entry silently grants it to Free.
+    // The HTTP routes are not gated by tier, and as of 2026-08-01 that is a
+    // decision rather than a gap. Constraint 3 of that plan was re-scoped: an
+    // in-daemon tier gate is security theatre in an Apache-2.0 daemon, because
+    // any operator can rebuild without it. `studio_library` reached the same
+    // conclusion first and stamps `tier_enforcement: "advisory"`; the aggregate
+    // routes now do the same via `traces::with_tier_advisory`. Enforcement lives
+    // at admission to a hosted daemon, not in a handler.
+    //
+    // The earlier note here said the aggregate path "needs a per-tenant RcxTier
+    // check". That check does not exist and cannot be built from what is on
+    // main: the entitlement plane is daemon-scoped (one `__entitlement__::rcx`
+    // record resolved against `daemon_tenant_id`), so `resolve_entitlement` is
+    // just as process-wide as the `OperatingMode::includes_pro()` the note
+    // correctly warned against — the substitution looks like a fix and is not.
+    //
+    // What still holds: **if `all_repos` is ever added to an MCP tool, revisit
+    // this table in the same commit.** Not because the marker enforces anything
+    // — nothing consumes `HostedGated` — but because the marker is how the
+    // surface documents which capability a caller is reaching for, and a silent
+    // omission is how that documentation stops being true.
     ToolSurfaceEntry {
         name: "code_blast_radius",
         tier: ToolTier::Local,
