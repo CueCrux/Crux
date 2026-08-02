@@ -473,4 +473,60 @@ mod tests {
         assert_eq!(claims["nbf"].as_u64().unwrap(), mcp_now - 30);
         assert_eq!(claims["exp"].as_u64().unwrap() - claims["iat"].as_u64().unwrap(), 300);
     }
+
+    /// The loopback credential is **wildcard-tenant by construction**, and that
+    /// disqualifies MCP as a hosted multi-tenant transport.
+    ///
+    /// `mint_loopback_jwt` sets `tenant_id: "*"`, which the daemon's
+    /// `tenant_allow_from_str` turns into `TenantAllow::Any`. Every
+    /// `require_http_scopes_for_tenant` check therefore passes for whatever
+    /// `tenant_id` the *caller* named in the tool arguments.
+    ///
+    /// On a local daemon that is correct and deliberate: the loopback socket is
+    /// the trust boundary, the agent is the user's own, and there is one tenant.
+    /// It is **not** safe if MCP ever becomes the transport for hosted Pro,
+    /// where the tenant named in a tool argument would be honoured for any
+    /// caller. The HTTP surface's adversarial isolation evidence does not carry
+    /// over to MCP, because the credential is different.
+    ///
+    /// This test pins the wildcard so the property cannot change silently in
+    /// either direction: narrowing it would break local MCP, and leaving it
+    /// wildcard while hosting over MCP would be a cross-tenant read.
+    #[test]
+    fn loopback_credential_is_wildcard_tenant_and_that_gates_hosted_mcp() {
+        let Some(jwt) = mint_loopback_jwt() else {
+            // No signing material in this environment; the claim under test is
+            // about the minted token's shape, so there is nothing to assert.
+            return;
+        };
+        let payload = jwt.split('.').nth(1).expect("jwt has a payload segment");
+        let decoded = base64_url_decode_for_test(payload);
+        let claims: serde_json::Value = serde_json::from_slice(&decoded).expect("payload is json");
+        assert_eq!(
+            claims["tenant_id"], "*",
+            "the loopback token is wildcard-tenant. If this has changed, hosted MCP may now be \
+             viable — update the isolation packet rather than just this assertion."
+        );
+    }
+
+    /// Minimal base64url decoder so the test does not add a dependency for one
+    /// assertion.
+    fn base64_url_decode_for_test(input: &str) -> Vec<u8> {
+        const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = Vec::new();
+        let mut buf = 0u32;
+        let mut bits = 0u32;
+        for byte in input.bytes() {
+            let Some(idx) = TABLE.iter().position(|c| *c == byte) else {
+                continue;
+            };
+            buf = (buf << 6) | idx as u32;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((buf >> bits) as u8);
+            }
+        }
+        out
+    }
 }
