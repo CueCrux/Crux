@@ -1451,7 +1451,7 @@ dependencies = [
 
 [[package]]
 name = "crux-escrow"
-version = "0.5.54"
+version = "0.5.55"
 dependencies = [
  "blake3",
  "chacha20poly1305",
