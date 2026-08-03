@@ -393,7 +393,7 @@ pub(super) struct CodeIntelQuery {
 pub(super) fn load_spans(state: &AppState, scope: &crate::auth::TenantScope) -> Vec<crate::trace_store::StoredSpan> {
     let tenant_id = scope.as_str();
     if let Some(store) = open_store(state) {
-        if let Ok(spans) = store.load_for_tenant(tenant_id) {
+        if let Ok(spans) = store.load_for_tenant(scope) {
             if !spans.is_empty() {
                 return spans;
             }
@@ -429,7 +429,7 @@ async fn load_scan(
     repo_id: &str,
 ) -> Option<crate::workspace_scan::WorkspaceScan> {
     let store = state.fact_store.read().await;
-    let json = crate::repo_registry::load_scan_json(&store, scope.as_str(), repo_id)?;
+    let json = crate::repo_registry::load_scan_json(&store, scope, repo_id)?;
     drop(store);
     serde_json::from_str(&json).ok()
 }

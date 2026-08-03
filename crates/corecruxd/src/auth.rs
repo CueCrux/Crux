@@ -1453,6 +1453,21 @@ impl TenantScope {
         self.0 == crate::trace_store::TraceStore::capture_tenant()
     }
 
+    /// A scope for work with no request behind it: repo watching, retention
+    /// sweeps, scheduled jobs.
+    ///
+    /// This one CAN name an arbitrary tenant, so it is the weak point in the
+    /// argument the rest of this type makes — which is why it is a named
+    /// constructor that records why it was minted, rather than a `From<&str>`.
+    /// A source-invariant test (`background_scopes_are_not_minted_in_handlers`)
+    /// asserts it is never called from `src/http/`: a handler has a request, so
+    /// it has a real authorization to derive its scope from, and reaching for
+    /// this instead would launder an unauthorised read into a typed one.
+    pub fn background(tenant_id: &str, reason: &'static str) -> Self {
+        let _ = reason;
+        Self(tenant_id.to_string())
+    }
+
     /// Whether a stored fact stamped `fact_tenant` may be read in this scope.
     ///
     /// A fact written before its plane was partitioned carries the fact store's
@@ -1531,14 +1546,16 @@ pub fn require_grpc_scopes(auth: &Authz, meta: &MetadataMap, required: &[&str]) 
 }
 
 #[allow(clippy::result_large_err)]
+/// gRPC counterpart of [`require_http_scopes_for_tenant`], returning the same
+/// [`TenantScope`] so the two transports cannot drift into different habits.
 pub fn require_grpc_scopes_for_tenant(
     auth: &Authz,
     meta: &MetadataMap,
     required: &[&str],
     tenant_id: &str,
-) -> Result<(), Status> {
+) -> Result<TenantScope, Status> {
     if auth.mode == AuthMode::Off {
-        return Ok(());
+        return Ok(TenantScope(tenant_id.to_string()));
     }
 
     let ctx = grpc_ctx(auth, meta)?;
@@ -1554,7 +1571,7 @@ pub fn require_grpc_scopes_for_tenant(
     }
 
     match require_tenant_allowed(&ctx.tenants, tenant_id) {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(TenantScope(tenant_id.to_string())),
         Err(problem) => Err(Status::permission_denied(problem.0.title)),
     }
 }

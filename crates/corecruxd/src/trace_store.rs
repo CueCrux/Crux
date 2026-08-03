@@ -169,7 +169,7 @@ impl TraceStore {
         // O(store) and a flush is per-interval, so this is a bounded cost paid
         // rarely rather than a per-span tax on the hot path.
         let ceiling = tenant_ceiling();
-        let already = self.load_for_tenant(tenant_id).map(|v| v.len()).unwrap_or(0);
+        let already = self.load_for_tenant_str(tenant_id).map(|v| v.len()).unwrap_or(0);
         let mut headroom = ceiling.saturating_sub(already);
 
         let now = now_unix_ms();
@@ -273,7 +273,20 @@ impl TraceStore {
     ///   by this process under that configuration, so attributing it there is
     ///   accurate; attributing it to whoever happens to ask would recreate the
     ///   exact defect partitioning exists to close.
-    pub fn load_for_tenant(&self, tenant_id: &str) -> std::io::Result<Vec<StoredSpan>> {
+    ///
+    /// Takes a [`TenantScope`](crate::auth::TenantScope): a caller must have
+    /// obtained the right to read this tenant, not merely be able to name it.
+    pub fn load_for_tenant(&self, scope: &crate::auth::TenantScope) -> std::io::Result<Vec<StoredSpan>> {
+        self.load_for_tenant_str(scope.as_str())
+    }
+
+    /// The unscoped primitive, private to this module.
+    ///
+    /// Retention and volume accounting sweep every tenant by construction, so
+    /// making them mint a scope per tenant would produce exactly the decorative
+    /// `TenantScope` values that would hollow out the type. They call this
+    /// instead; nothing outside this file can.
+    fn load_for_tenant_str(&self, tenant_id: &str) -> std::io::Result<Vec<StoredSpan>> {
         let capture = Self::capture_tenant();
         Ok(self
             .load_all()?
@@ -290,7 +303,7 @@ impl TraceStore {
 
     /// Report one tenant's retained volume against the ceiling.
     pub fn volume_for_tenant(&self, tenant_id: &str) -> std::io::Result<SpanVolume> {
-        let retained = self.load_for_tenant(tenant_id)?.len();
+        let retained = self.load_for_tenant_str(tenant_id)?.len();
         let ceiling = tenant_ceiling();
         let pct = retained.saturating_mul(100) / ceiling.max(1);
         Ok(SpanVolume {
@@ -306,7 +319,7 @@ impl TraceStore {
     /// Spans for one tenant captured under `release`.
     pub fn load_for_release(&self, tenant_id: &str, release: &str) -> std::io::Result<Vec<StoredSpan>> {
         Ok(self
-            .load_for_tenant(tenant_id)?
+            .load_for_tenant_str(tenant_id)?
             .into_iter()
             .filter(|s| s.release == release)
             .collect())
@@ -315,7 +328,7 @@ impl TraceStore {
     /// Distinct releases held for a tenant, oldest first, with span counts.
     pub fn releases_for_tenant(&self, tenant_id: &str) -> std::io::Result<Vec<(String, usize)>> {
         let mut first_seen: BTreeMap<String, (u64, usize)> = BTreeMap::new();
-        for s in self.load_for_tenant(tenant_id)? {
+        for s in self.load_for_tenant_str(tenant_id)? {
             let e = first_seen.entry(s.release.clone()).or_insert((s.stored_at_unix_ms, 0));
             e.0 = e.0.min(s.stored_at_unix_ms);
             e.1 += 1;
@@ -367,7 +380,7 @@ impl TraceStore {
     /// at the handler keeps the guarantee with the data.
     pub fn load_trace(&self, trace_id: u64, tenant_id: &str) -> std::io::Result<Vec<StoredSpan>> {
         let mut spans: Vec<StoredSpan> = self
-            .load_for_tenant(tenant_id)?
+            .load_for_tenant_str(tenant_id)?
             .into_iter()
             .filter(|s| s.span.trace_id == trace_id)
             .collect();
@@ -382,7 +395,7 @@ impl TraceStore {
     /// even without returning a single span body.
     pub fn list_traces(&self, limit: usize, tenant_id: &str) -> std::io::Result<Vec<(u64, usize)>> {
         let mut counts: BTreeMap<u64, usize> = BTreeMap::new();
-        for s in self.load_for_tenant(tenant_id)? {
+        for s in self.load_for_tenant_str(tenant_id)? {
             *counts.entry(s.span.trace_id).or_insert(0) += 1;
         }
         let mut v: Vec<(u64, usize)> = counts.into_iter().collect();
@@ -540,7 +553,11 @@ impl ResolverCache {
         if repo.last_scan_id.is_some() && repo.last_scan_id == self.scan_id {
             return self.resolver.clone();
         }
-        let scan_json = crate::repo_registry::load_scan_json(store, tenant_id, repo_id)?;
+        // Background: the flusher warms this cache with no request behind it, so
+        // the scope is minted explicitly rather than derived from an
+        // authorization that does not exist here.
+        let scope = crate::auth::TenantScope::background(tenant_id, "trace flush: symbol-resolver cache warm");
+        let scan_json = crate::repo_registry::load_scan_json(store, &scope, repo_id)?;
         let scan: crate::workspace_scan::WorkspaceScan = serde_json::from_str(&scan_json).ok()?;
         let resolver = std::sync::Arc::new(SymbolResolver::from_scan(&scan));
         self.scan_id.clone_from(&repo.last_scan_id);
@@ -728,7 +745,9 @@ mod tests {
         store
             .append_resolved(vec![span("a", Some("f.rs"), Some(1), 1, 1)], None, "tenant-a")
             .unwrap();
-        let got = store.load_for_tenant("tenant-a").unwrap();
+        let got = store
+            .load_for_tenant(&crate::auth::TenantScope::background("tenant-a", "test"))
+            .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].tenant_id, "tenant-a");
     }
@@ -744,16 +763,23 @@ mod tests {
             .append_resolved(vec![span("b", Some("b.rs"), Some(1), 2, 2)], None, "tenant-b")
             .unwrap();
 
-        let a = store.load_for_tenant("tenant-a").unwrap();
+        let a = store
+            .load_for_tenant(&crate::auth::TenantScope::background("tenant-a", "test"))
+            .unwrap();
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].span.name, "a", "tenant-a must not see tenant-b's span");
 
-        let b = store.load_for_tenant("tenant-b").unwrap();
+        let b = store
+            .load_for_tenant(&crate::auth::TenantScope::background("tenant-b", "test"))
+            .unwrap();
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].span.name, "b");
 
         // A tenant with nothing in the store gets nothing, not everything.
-        assert!(store.load_for_tenant("tenant-c").unwrap().is_empty());
+        assert!(store
+            .load_for_tenant(&crate::auth::TenantScope::background("tenant-c", "test"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -775,12 +801,18 @@ mod tests {
         let store = TraceStore::open(path, 1000).unwrap();
 
         assert_eq!(
-            store.load_for_tenant("the-capture-tenant").unwrap().len(),
+            store
+                .load_for_tenant(&crate::auth::TenantScope::background("the-capture-tenant", "test"))
+                .unwrap()
+                .len(),
             1,
             "the daemon that captured it must still see its own history"
         );
         assert!(
-            store.load_for_tenant("someone-else").unwrap().is_empty(),
+            store
+                .load_for_tenant(&crate::auth::TenantScope::background("someone-else", "test"))
+                .unwrap()
+                .is_empty(),
             "an unlabelled legacy span must never answer for another tenant"
         );
         std::env::remove_var("CORECRUXD_TRACE_TENANT_ID");
@@ -872,7 +904,13 @@ mod tests {
         let batch: Vec<_> = (0..3).map(|i| span("a", Some("a.rs"), Some(1), 1, i)).collect();
         let r1 = store.append_resolved(batch, None, "t1").unwrap();
         assert_eq!(r1.refused_over_ceiling, 0);
-        assert_eq!(store.load_for_tenant("t1").unwrap().len(), 3);
+        assert_eq!(
+            store
+                .load_for_tenant(&crate::auth::TenantScope::background("t1", "test"))
+                .unwrap()
+                .len(),
+            3
+        );
 
         // Two more against a ceiling of three: both refused, nothing deleted.
         let more: Vec<_> = (10..12).map(|i| span("b", Some("b.rs"), Some(1), 2, i)).collect();
@@ -881,7 +919,9 @@ mod tests {
             r2.refused_over_ceiling, 2,
             "over-ceiling spans must be refused at ingest"
         );
-        let kept = store.load_for_tenant("t1").unwrap();
+        let kept = store
+            .load_for_tenant(&crate::auth::TenantScope::background("t1", "test"))
+            .unwrap();
         assert_eq!(kept.len(), 3, "retained history must be untouched");
         assert!(
             kept.iter().all(|s| s.span.name == "a"),
@@ -906,8 +946,20 @@ mod tests {
         let quiet = vec![span("q", Some("q.rs"), Some(1), 2, 99)];
         let rq = store.append_resolved(quiet, None, "quiet").unwrap();
         assert_eq!(rq.refused_over_ceiling, 0, "quiet tenant keeps its own headroom");
-        assert_eq!(store.load_for_tenant("quiet").unwrap().len(), 1);
-        assert_eq!(store.load_for_tenant("noisy").unwrap().len(), 2);
+        assert_eq!(
+            store
+                .load_for_tenant(&crate::auth::TenantScope::background("quiet", "test"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .load_for_tenant(&crate::auth::TenantScope::background("noisy", "test"))
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -942,7 +994,13 @@ mod tests {
         let batch: Vec<_> = (0..6).map(|i| span("a", Some("a.rs"), Some(1), 1, i)).collect();
         let r = store.append_resolved(batch, None, "t1").unwrap();
         assert_eq!(r.refused_over_ceiling, 2);
-        assert_eq!(store.load_for_tenant("t1").unwrap().len(), 4);
+        assert_eq!(
+            store
+                .load_for_tenant(&crate::auth::TenantScope::background("t1", "test"))
+                .unwrap()
+                .len(),
+            4
+        );
     }
 
     // ── M6: retention and release-over-release history ──────────────────────
@@ -956,7 +1014,9 @@ mod tests {
         store
             .append_resolved(vec![span("a", Some("a.rs"), Some(1), 1, 1)], None, "t1")
             .unwrap();
-        let got = store.load_for_tenant("t1").unwrap();
+        let got = store
+            .load_for_tenant(&crate::auth::TenantScope::background("t1", "test"))
+            .unwrap();
         assert_eq!(got[0].release, "v1.4.0");
         std::env::remove_var(TRACE_RELEASE_ENV);
     }
@@ -1048,7 +1108,9 @@ mod tests {
 
         let pruned = store.prune_expired(now).unwrap();
         assert_eq!(pruned, 1, "only the out-of-window span may be pruned");
-        let left = store.load_for_tenant("t1").unwrap();
+        let left = store
+            .load_for_tenant(&crate::auth::TenantScope::background("t1", "test"))
+            .unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].span.name, "recent", "in-window history must survive");
         std::env::remove_var(TRACE_RETENTION_DAYS_ENV);
@@ -1066,7 +1128,13 @@ mod tests {
             .append_resolved(vec![span("a", Some("a.rs"), Some(1), 1, 1)], None, "t1")
             .unwrap();
         assert_eq!(store.prune_expired(now_unix_ms()).unwrap(), 0);
-        assert_eq!(store.load_for_tenant("t1").unwrap().len(), 1);
+        assert_eq!(
+            store
+                .load_for_tenant(&crate::auth::TenantScope::background("t1", "test"))
+                .unwrap()
+                .len(),
+            1
+        );
         std::env::remove_var(TRACE_RETENTION_DAYS_ENV);
     }
 }
