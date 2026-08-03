@@ -47,6 +47,9 @@ pub fn run(args: StartArgs) -> Result<(), DynErr> {
         token: args.token.clone(),
         device: false,
         no_verify: false,
+        // `start` is the operator-facing happy path, not CI: a failed
+        // self-check is printed loudly but must not fail the command.
+        strict_verify: false,
         no_hooks: false,
         no_register: false,
     });

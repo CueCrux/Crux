@@ -911,6 +911,16 @@ pub struct LoginArgs {
     pub device: bool,
     /// Skip the post-login `tools/list` + fact round-trip verification.
     pub no_verify: bool,
+    /// Exit non-zero when a self-check RAN and FAILED.
+    ///
+    /// Off by default: login itself succeeded — the credential is stored and
+    /// usable — so failing the command would break `corecruxctl login && …`
+    /// over a transient daemon fault. On for CI and provisioning, which need
+    /// every requested check to have actually passed. Same shape as the
+    /// evidence plane's `--strict` (see ExecPlan
+    /// `crux-pinned-defect-remediation-2026-07-31`, M5): an *unreachable*
+    /// daemon is still tolerated, because that check could not run.
+    pub strict_verify: bool,
     /// Skip installing the Claude Code hooks (banner + observe capture).
     pub no_hooks: bool,
     /// Skip registering this machine with the daemon.
@@ -1075,6 +1085,9 @@ pub fn run(args: LoginArgs) -> Result<(), DynErr> {
             "WARNING: login succeeded but one or more self-checks FAILED against the live daemon (see the FAILED lines above). \
              This is not the same as a skipped check: the daemon answered and did not behave."
         );
+        if args.strict_verify {
+            return Err("post-login self-check failed against the live daemon (--strict-verify)".into());
+        }
     }
     Ok(())
 }
@@ -1964,6 +1977,32 @@ mod tests {
         );
     }
 
+    /// OD-4: `--strict-verify` turns a self-check that RAN AND FAILED into a
+    /// non-zero exit, while still tolerating one that COULD NOT RUN. That
+    /// asymmetry is the whole point — `corecruxctl login` is expected to work
+    /// offline, so an unreachable daemon must not fail the command even under
+    /// strict. Same shape as the evidence plane's `--strict`.
+    #[test]
+    fn strict_verify_separates_a_live_failure_from_an_unreachable_daemon() {
+        let agent = http_agent();
+
+        // Ran and failed: the daemon answered 500 on the write leg.
+        let (port, handle) = serve_responses(vec![(500, "boom".to_string())]);
+        let outcome = verify_fact_roundtrip(&agent, &format!("http://127.0.0.1:{port}"), None).unwrap_err();
+        assert!(
+            matches!(outcome, VerifyOutcome::Failed(_)),
+            "--strict-verify must be able to see this as a failure: {outcome:?}"
+        );
+        handle.join().unwrap();
+
+        // Could not run: nothing listening. Even under strict this is tolerated.
+        let outcome = verify_fact_roundtrip(&agent, "http://127.0.0.1:9", None).unwrap_err();
+        assert!(
+            matches!(outcome, VerifyOutcome::Unreachable(_)),
+            "an offline login must stay green even with --strict-verify: {outcome:?}"
+        );
+    }
+
     /// Same split on the MCP check.
     #[test]
     fn mcp_tools_list_separates_a_refusal_from_an_unreachable_daemon() {
@@ -2525,6 +2564,7 @@ mod tests {
         run(LoginArgs {
             url: Some(base.clone()),
             no_verify: true,
+            strict_verify: false,
             no_hooks: true,
             no_register: true,
             ..Default::default()
@@ -2566,6 +2606,7 @@ mod tests {
             url: Some(base.clone()),
             token: Some("  test-static-token  ".to_string()),
             no_verify: true,
+            strict_verify: false,
             no_hooks: true,
             no_register: true,
             ..Default::default()
@@ -2613,6 +2654,7 @@ mod tests {
         run(LoginArgs {
             url: Some(base.clone()),
             no_verify: true,
+            strict_verify: false,
             no_hooks: true,
             no_register: true,
             ..Default::default()
@@ -2648,6 +2690,7 @@ mod tests {
         let err = run(LoginArgs {
             url: Some(base),
             no_verify: true,
+            strict_verify: false,
             no_hooks: true,
             no_register: true,
             ..Default::default()
