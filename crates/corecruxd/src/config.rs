@@ -1941,6 +1941,34 @@ mod tests {
         assert_eq!(cfg.auth_mode_invalid.as_deref(), Some("prod-typo"));
     }
 
+    /// D-2 (inverted pin): `env_string` only filters the *empty* string, so a
+    /// whitespace-only `CORECRUXD_AUTH_MODE` reached `AuthMode::parse`, trimmed
+    /// to `""` and resolved to `Off`. `auth_mode_invalid` stayed `None`, so
+    /// `main`'s fail-closed guard did not abort and the daemon served with
+    /// authentication disabled. A blank value must now be flagged invalid.
+    #[test]
+    #[serial_test::serial]
+    fn blank_auth_mode_is_startup_error_not_off() {
+        let _g = env_lock().lock().unwrap();
+        for blank in ["   ", "\t", "\n"] {
+            clear_corecruxd_env();
+            std::env::set_var("CORECRUXD_AUTH_MODE", blank);
+            let cfg = super::load_config();
+            assert!(cfg.auth_mode_explicitly_set, "a blank value is still present");
+            assert_eq!(
+                cfg.auth_mode_invalid.as_deref(),
+                Some(blank),
+                "a blank auth mode must abort startup, not resolve to Off"
+            );
+            assert_ne!(
+                cfg.auth_mode,
+                crate::auth::AuthMode::Off,
+                "the placeholder mode must never be Off for an invalid value"
+            );
+        }
+        clear_corecruxd_env();
+    }
+
     #[test]
     #[serial_test::serial]
     fn valid_auth_modes_parse_exactly() {
