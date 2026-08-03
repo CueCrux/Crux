@@ -2558,33 +2558,52 @@ mod helper_tests {
         );
     }
 
-    /// Pins CURRENT behaviour: tenant scoping in the context pack is a SUBSTRING
-    /// test over entity/value/key, so a fact belonging to `tnA10` is served to a
-    /// caller asking for `tnA1`. Reported, not fixed.
+    /// The prefix collision at the *route* level. `tenant_scoping_is_exact_not_substring`
+    /// covers `tenant_facts`; this pins the same guarantee through `post_context_pack`,
+    /// which reached the store by its own call site.
+    ///
+    /// Was a defect pin asserting the leak ("Reported, not fixed"); inverted here
+    /// because the report is now the fix.
     #[tokio::test]
-    async fn context_pack_tenant_scoping_is_substring_not_exact() {
+    async fn context_pack_tenant_scoping_is_exact_not_substring() {
         let st = st_pro(&["context_pack:budgeted"]);
         {
             let mut store = st.fact_store.write().await;
             seed_private(&mut store, "tnA10::note", "note", "deployment plan for tnA10", false);
         }
-        let resp = post_context_pack(
-            State(st),
-            HeaderMap::new(),
-            Json(ContextPackBody {
-                tenant_id: "tnA1".to_string(),
-                query: "deployment".to_string(),
-                token_budget: 4000,
-                include_private: false,
-                source_labels: Vec::new(),
-            }),
-        )
-        .await;
-        let body = body_of(resp).await;
+        let pack_for = |state: AppState, tenant: &str| {
+            let tenant = tenant.to_string();
+            async move {
+                let resp = post_context_pack(
+                    State(state),
+                    HeaderMap::new(),
+                    Json(ContextPackBody {
+                        tenant_id: tenant,
+                        query: "deployment".to_string(),
+                        token_budget: 4000,
+                        include_private: false,
+                        source_labels: Vec::new(),
+                    }),
+                )
+                .await;
+                body_of(resp).await
+            }
+        };
+
+        let leaked = pack_for(st.clone(), "tnA1").await;
         assert_eq!(
-            body["pack"]["items"].as_array().unwrap().len(),
+            leaked["pack"]["items"].as_array().unwrap().len(),
+            0,
+            "tnA1 is a prefix of tnA10, not its owner — the fact must not reach this pack"
+        );
+
+        // Positive control: the owning tenant still gets it, so the scoping did
+        // not simply narrow to nothing.
+        let owned = pack_for(st, "tnA10").await;
+        assert_eq!(
+            owned["pack"]["items"].as_array().unwrap().len(),
             1,
-            "current behaviour: the tnA10 fact leaks into the tnA1 pack"
+            "the owning tenant must still receive its own fact"
         );
     }
 
