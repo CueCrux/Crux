@@ -174,7 +174,10 @@ pub const DAEMON_IMPLEMENTED_PRO_CLAIMS: &[&str] = &[
 /// asserting an outside implementer that does not exist. They leave both lists
 /// together or not at all.
 ///
-/// Audit: `PlanCrux/.agent/artifacts/m4-vow-audit-2026-08-03.md`.
+/// The classification behind the four, for the record: of the twenty claims
+/// declared daemon-implemented, five egress (the GPU-1 bridge, the only Pro
+/// handler that reaches the network), eleven are local compute that answers on
+/// a network-severed daemon, and these four have no gate and no handler at all.
 #[cfg(test)]
 const DAEMON_CLAIM_GATE_SITES: &[(&str, Option<&str>)] = &[
     ("gpu1:answer", Some("http/gpu1.rs:801 service_enabled")),
