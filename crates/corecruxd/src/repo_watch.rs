@@ -266,6 +266,21 @@ async fn run_scan_and_store(
     mode: &mut WatchMode,
     paths: &[PathBuf],
 ) -> Result<(), String> {
+    // A vanished repo root must not overwrite the last good scan with an empty
+    // one. When every file disappears, `files_dropped` is non-zero, so the
+    // early-returns below do NOT fire and the empty scan is stored — the
+    // operator loses the whole index with no signal. A scan that could not run
+    // is not a scan that ran and found nothing: leave the stored scan alone
+    // and say so.
+    if !root.is_dir() {
+        tracing::warn!(
+            repo_id=%registration.repo_id,
+            tenant_id=%registration.tenant_id,
+            root=?root,
+            "repo-watch-root-missing-scan-skipped"
+        );
+        return Ok(());
+    }
     let (scan, files_reparsed, cache_hits, files_dropped) = match mode {
         WatchMode::Rust { cache } => {
             let result = crate::workspace_scan_ast::update_cache_incremental(root, cache, paths)
@@ -912,12 +927,14 @@ mod tests {
         assert!(scan.crates.iter().any(|c| c.name == "alpha"));
     }
 
-    /// Current behaviour, pinned deliberately: if the watched tree disappears
-    /// under the Rust lane, `files_dropped` is non-zero so the early return does
-    /// not fire and an *empty* scan is written over the last good one. Nothing
-    /// distinguishes "the repo was deleted" from "the repo has no code".
+    /// D-7 (inverted pin): if the watched tree disappears under the Rust lane,
+    /// `files_dropped` is non-zero so the "nothing changed" early return does
+    /// not fire, and an *empty* scan used to be written over the last good
+    /// one — nothing distinguished "the repo was deleted" from "the repo has
+    /// no code". A scan that could not run must now leave the stored scan
+    /// untouched.
     #[tokio::test]
-    async fn a_vanished_rust_root_overwrites_the_scan_with_an_empty_one() {
+    async fn a_vanished_rust_root_leaves_the_last_good_scan_intact() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().join("repo");
         cargo_workspace(&root);
@@ -927,14 +944,40 @@ mod tests {
             cache: crate::workspace_scan_ast::AstScanCache::from_root(&root).expect("ast cache"),
         };
 
+        // Land a good scan first: an edit is what moves the AST cache.
+        std::fs::write(
+            root.join("crates/alpha/src/lib.rs"),
+            "pub fn alpha() {}\npub fn beta() {}\n",
+        )
+        .expect("edit lib.rs");
+        run_scan_and_store(
+            &reg,
+            &root,
+            &fact_store,
+            &projection_state,
+            tmp.path(),
+            &mut mode,
+            &[root.join("crates/alpha/src/lib.rs")],
+        )
+        .await
+        .expect("first scan");
+        let good = stored_scan(&fact_store, "t", "r").await.expect("scan stored");
+        assert!(good.crates.iter().any(|c| c.name == "alpha"));
+
         std::fs::remove_dir_all(&root).expect("delete the repo out from under the watcher");
         run_scan_and_store(&reg, &root, &fact_store, &projection_state, tmp.path(), &mut mode, &[])
             .await
             .expect("a vanished root is not reported as an error");
 
-        let scan = stored_scan(&fact_store, "t", "r").await.expect("scan stored");
-        assert!(scan.crates.is_empty(), "the stored scan lost every crate");
-        assert_eq!(scan.stats.total_loc, 0);
+        let after = stored_scan(&fact_store, "t", "r").await.expect("scan still stored");
+        assert_eq!(
+            after.scan_id, good.scan_id,
+            "the last good scan survives a vanished root"
+        );
+        assert!(
+            after.crates.iter().any(|c| c.name == "alpha"),
+            "it was not replaced by an empty scan"
+        );
     }
 
     // ────────────────────────── Watch loops ──────────────────────────

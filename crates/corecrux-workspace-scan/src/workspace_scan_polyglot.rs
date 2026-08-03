@@ -122,6 +122,13 @@ struct ExtractedFile {
     django_includes: Vec<DjangoIncludeCandidate>,
     unresolved_routes: Vec<UnresolvedRoute>,
     ast_depth_limit_hits: usize,
+    /// `Some(reason)` when the tree-sitter parse refused this file outright or
+    /// produced a tree containing ERROR nodes.
+    ///
+    /// D-24: tree-sitter is error-tolerant, so a broken `.ts`/`.py`/`.java`
+    /// file yields a tree full of ERROR nodes and therefore no symbols —
+    /// byte-identical to an empty file. Nothing recorded the failure.
+    parse_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -281,6 +288,24 @@ fn run_polyglot_scan_inner(
     let mut file_idx_by_path = HashMap::new();
     let mut symbol_by_name: HashMap<String, Vec<SymbolInfo>> = HashMap::new();
 
+    // D-24: a file the parser could not read produces no symbols, exactly like
+    // an empty one. Record the refusal so `blast_radius`/dead-code answers over
+    // its contents cannot read as "nothing here".
+    for file in &extracted {
+        if let Some(reason) = &file.parse_error {
+            scan.diagnostics
+                .parse_failures
+                .push(crate::workspace_scan::ParseFailure {
+                    rel_path: file.rel_path.clone(),
+                    language: language_id_for_path(&file.rel_path).to_string(),
+                    reason: reason.clone(),
+                });
+        }
+    }
+    scan.diagnostics
+        .parse_failures
+        .sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+
     for file in &extracted {
         file_idx_by_path.insert(file.rel_path.clone(), scan.files.len());
         scan.files.push(FileInfo {
@@ -408,6 +433,40 @@ fn should_skip_generated_polyglot_file(rel: &Path, options: PolyglotScanOptions)
     })
 }
 
+/// Best-effort language id from a path, for `ParseFailure::language`.
+fn language_id_for_path(rel_path: &str) -> &'static str {
+    match rel_path.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("ts") => "typescript",
+        Some("tsx") => "tsx",
+        Some("js") | Some("jsx") | Some("mjs") | Some("cjs") => "javascript",
+        Some("py") => "python",
+        Some("go") => "go",
+        Some("java") => "java",
+        Some("c") | Some("h") => "c",
+        Some("cc") | Some("cpp") | Some("cxx") | Some("hpp") => "cpp",
+        Some("cs") => "csharp",
+        Some("rb") => "ruby",
+        Some("swift") => "swift",
+        Some("php") => "php",
+        Some("vue") => "vue",
+        Some("rs") => "rust",
+        _ => "unknown",
+    }
+}
+
+/// Parse `src`, recording on `file` when the parser refused it outright or
+/// produced a tree containing ERROR nodes. See `ExtractedFile::parse_error`.
+fn parse_or_note(parser: &mut Parser, src: &str, file: &mut ExtractedFile) -> Option<tree_sitter::Tree> {
+    let Some(tree) = parser.parse(src, None) else {
+        file.parse_error = Some("parser returned no tree".to_string());
+        return None;
+    };
+    if tree.root_node().has_error() && file.parse_error.is_none() {
+        file.parse_error = Some("source contains syntax errors; extracted symbols are incomplete".to_string());
+    }
+    Some(tree)
+}
+
 #[cfg(test)]
 fn extract_file(
     root: &Path,
@@ -475,6 +534,7 @@ fn extract_file_recording_skips(
         django_includes: Vec::new(),
         unresolved_routes: Vec::new(),
         ast_depth_limit_hits: 0,
+        parse_error: None,
     };
     let mut guard = AstWalkGuard::default();
 
@@ -919,7 +979,7 @@ fn extract_ts_block(
     parser
         .set_language(&language.into())
         .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
-    let Some(tree) = parser.parse(src, None) else {
+    let Some(tree) = parse_or_note(&mut parser, src, file) else {
         return Ok(());
     };
     let bytes = src.as_bytes();
@@ -1156,7 +1216,7 @@ fn extract_python_file(
     parser
         .set_language(&tree_sitter_python::LANGUAGE.into())
         .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
-    let Some(tree) = parser.parse(src, None) else {
+    let Some(tree) = parse_or_note(&mut parser, src, file) else {
         return Ok(());
     };
     let bytes = src.as_bytes();
@@ -1261,7 +1321,7 @@ fn extract_go_file(
     parser
         .set_language(&tree_sitter_go::LANGUAGE.into())
         .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
-    let Some(tree) = parser.parse(src, None) else {
+    let Some(tree) = parse_or_note(&mut parser, src, file) else {
         return Ok(());
     };
     let bytes = src.as_bytes();
@@ -1394,7 +1454,7 @@ fn extract_java_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkGua
     parser
         .set_language(&tree_sitter_java::LANGUAGE.into())
         .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
-    let Some(tree) = parser.parse(src, None) else {
+    let Some(tree) = parse_or_note(&mut parser, src, file) else {
         return Ok(());
     };
     let bytes = src.as_bytes();
@@ -1530,7 +1590,7 @@ fn extract_c_family_file(
     parser
         .set_language(&language.into())
         .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
-    let Some(tree) = parser.parse(src, None) else {
+    let Some(tree) = parse_or_note(&mut parser, src, file) else {
         return Ok(());
     };
     walk_c_family_node(
@@ -2114,7 +2174,7 @@ fn extract_csharp_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkG
     parser
         .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
         .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
-    let Some(tree) = parser.parse(src, None) else {
+    let Some(tree) = parse_or_note(&mut parser, src, file) else {
         return Ok(());
     };
     let root = tree.root_node();
@@ -2280,7 +2340,7 @@ fn extract_ruby_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkGua
     parser
         .set_language(&tree_sitter_ruby::LANGUAGE.into())
         .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
-    let Some(tree) = parser.parse(src, None) else {
+    let Some(tree) = parse_or_note(&mut parser, src, file) else {
         return Ok(());
     };
     walk_ruby_node(tree.root_node(), src.as_bytes(), file, guard, RubyWalkState::default());
@@ -2436,7 +2496,7 @@ fn extract_swift_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkGu
     parser
         .set_language(&tree_sitter_swift::LANGUAGE.into())
         .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
-    let Some(tree) = parser.parse(src, None) else {
+    let Some(tree) = parse_or_note(&mut parser, src, file) else {
         return Ok(());
     };
     walk_swift_node(tree.root_node(), src.as_bytes(), file, guard, SwiftWalkState::default());
@@ -2562,7 +2622,7 @@ fn extract_php_file(src: &str, file: &mut ExtractedFile, guard: &mut AstWalkGuar
     parser
         .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
         .map_err(|err| ScanError::Io(std::io::Error::other(err.to_string())))?;
-    let Some(tree) = parser.parse(src, None) else {
+    let Some(tree) = parse_or_note(&mut parser, src, file) else {
         return Ok(());
     };
     let root = tree.root_node();
@@ -5462,6 +5522,53 @@ fn line_of(src: &str, needle: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D-24: tree-sitter is error-tolerant, so a broken `.ts`/`.py`/`.java`
+    /// file produced a `FileInfo` with no symbols — byte-identical to an empty
+    /// one. Nothing recorded the parse failure.
+    #[test]
+    #[serial_test::serial]
+    fn a_broken_polyglot_file_is_recorded_as_a_parse_failure() {
+        let _env = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("good.ts"), "export function ok() { return 1; }\n").expect("good ts");
+        // NB: brace-balanced on purpose — `scripts/unwrap-ratchet.sh` tracks
+        // `#[cfg(test)]` scope by counting braces textually, so an unbalanced
+        // literal here silently exposes the rest of this module to the ratchet.
+        std::fs::write(root.join("broken.ts"), "export function ( <<< ,,, ===\n").expect("broken ts");
+        std::fs::write(root.join("broken.py"), "def (:::\n  return\n").expect("broken py");
+        // Genuinely empty: no symbols, but also no failure.
+        std::fs::write(root.join("empty.ts"), "").expect("empty ts");
+
+        let scan = run_repo_scan_at(root).expect("scan");
+        let failed: Vec<&str> = scan
+            .diagnostics
+            .parse_failures
+            .iter()
+            .map(|f| f.rel_path.as_str())
+            .collect();
+        assert_eq!(
+            failed,
+            vec!["broken.py", "broken.ts"],
+            "only the unparsable files are recorded, not the empty or good ones"
+        );
+        assert!(scan
+            .diagnostics
+            .parse_failures
+            .iter()
+            .any(|f| f.language == "typescript"));
+        assert!(scan.diagnostics.parse_failures.iter().any(|f| f.language == "python"));
+
+        // The broken file is still scanned with no symbols — which is exactly
+        // why the diagnostic is what tells it apart from `empty.ts`.
+        let broken = scan
+            .files
+            .iter()
+            .find(|f| f.rel_path == "broken.ts")
+            .expect("broken file is still scanned");
+        assert_eq!(broken.symbol_count, 0);
+    }
     use crate::test_support::EnvVarGuard;
     use std::collections::BTreeSet;
 

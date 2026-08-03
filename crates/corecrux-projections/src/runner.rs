@@ -165,6 +165,38 @@ impl ProjectionStoreV1 {
         let mut dependents_block_locs: BTreeMap<[u8; 32], ColdBlockLocV1> = BTreeMap::new();
         let mut ok = true;
 
+        // A snapshot that meta DECLARES but that is absent on disk must reset
+        // to genesis exactly as a corrupt one does. The `.filter(|_|
+        // …exists())` guards below skip the whole verification block when the
+        // file is gone, which left `ok = true`: the store was returned with
+        // the cursor intact and the state empty, so the next `tick` resumed
+        // past frames it had never applied. A deleted snapshot is silent data
+        // loss; it must not read the same as a clean load.
+        for (declared, path) in [
+            (
+                meta.artifact_living_state.snapshot_blake3.is_some(),
+                &files.living_snapshot_path,
+            ),
+            (
+                meta.artifact_relations.snapshot_blake3.is_some(),
+                &files.relations_snapshot_path,
+            ),
+            (
+                meta.artifact_dependents.snapshot_blake3.is_some(),
+                &files.dependents_snapshot_path,
+            ),
+            (
+                meta.pressure_events.snapshot_blake3.is_some(),
+                &files.pressure_snapshot_path,
+            ),
+        ] {
+            // This crate carries no logger by design; the genesis reset below
+            // is itself the signal, and `tick` re-derives the state.
+            if declared && !path.exists() {
+                ok = false;
+            }
+        }
+
         // Treat meta as source of truth; ignore snapshots whose blake3 doesn't match.
         if let Some(h) = meta
             .artifact_living_state
@@ -1311,6 +1343,30 @@ fn gc_cold_segments_dir_v1(
     let mut unparseable_segment_files = 0u64;
     let mut deleted: BTreeSet<[u8; 32]> = BTreeSet::new();
 
+    // D-28: `collect_files_recursive_v1` swallows an unreadable directory, so
+    // a MISSING segments dir walked nothing and reported an all-zero clean
+    // sweep — identical to a directory that was walked and held no orphans.
+    // The report already carries a `skipped` shape; use it.
+    if !segments_dir.is_dir() {
+        return Ok((
+            ColdSegmentGcProjectionReportV1 {
+                projection: projection.to_string(),
+                schema_version,
+                skipped: true,
+                skip_reason: Some(format!("segments dir not present: {}", segments_dir.display())),
+                reachable_segments: reachable.map_or(0, |r| r.len() as u64),
+                segments_on_disk: 0,
+                orphan_segments: 0,
+                deleted_segments: 0,
+                deleted_bytes: 0,
+                skipped_young_segments: 0,
+                kept_orphans_due_to_limit: 0,
+                unparseable_segment_files: 0,
+            },
+            deleted,
+        ));
+    }
+
     let Some(reachable) = reachable else {
         // We cannot safely determine reachability. Still report what exists on disk.
         let files = collect_files_recursive_v1(segments_dir)?;
@@ -2018,6 +2074,103 @@ mod tests {
         // Second load should succeed (idempotent)
         let store2 = ProjectionStoreV1::load_or_init(&shard_dir, 1, 1).unwrap();
         assert_eq!(store2.shard_id, 1);
+    }
+
+    /// D-6 (inverted pin): when meta records a `snapshotBlake3` and an
+    /// advanced cursor but the snapshot FILE is gone, the
+    /// `.filter(|_| …exists())` guard skipped the whole verification block and
+    /// left `ok = true`. The store came back with the cursor intact and the
+    /// state empty, so the next `tick` resumed past frames it had never
+    /// applied. A *corrupt* snapshot already reset to genesis correctly; a
+    /// *deleted* one must too.
+    #[test]
+    fn load_or_init_missing_snapshot_file_resets_to_genesis() {
+        let tmp = TempDir::new().unwrap();
+        let shard_dir = tmp.path().join("shard-0001");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let files = ProjectionFilesV1::for_shard_dir(&shard_dir);
+        std::fs::create_dir_all(&files.projections_dir).unwrap();
+
+        let mut meta = crate::meta::ProjectionsMetaV1::empty_now();
+        meta.commit_id = 12;
+        meta.artifact_living_state.snapshot_blake3 = Some("d".repeat(64));
+        meta.artifact_living_state.row_count = 500;
+        meta.artifact_living_state.cursor = Some(ProjectionCursorV1 {
+            shard_id: 1,
+            epoch: 1,
+            segment_seq: 7,
+            offset: 4_096,
+        });
+        store_projections_meta_v1(&files.meta_path, &meta).unwrap();
+        assert!(!files.living_snapshot_path.exists());
+
+        let store = ProjectionStoreV1::load_or_init(&shard_dir, 1, 1).unwrap();
+        assert!(store.state.living.is_empty(), "no rows were loaded");
+        assert_eq!(store.meta.commit_id, 0, "meta is reset alongside the empty state");
+        assert!(
+            store.cursor_from_meta().is_none(),
+            "the cursor must not survive a snapshot that could not be verified"
+        );
+    }
+
+    /// Same defect, sibling artifacts: a declared-but-absent relations,
+    /// dependents or pressure snapshot resets too.
+    #[test]
+    fn load_or_init_missing_sibling_snapshots_also_reset_to_genesis() {
+        for artifact in ["relations", "dependents", "pressure"] {
+            let tmp = TempDir::new().unwrap();
+            let shard_dir = tmp.path().join("shard-0001");
+            std::fs::create_dir_all(&shard_dir).unwrap();
+            let files = ProjectionFilesV1::for_shard_dir(&shard_dir);
+            std::fs::create_dir_all(&files.projections_dir).unwrap();
+
+            let mut meta = crate::meta::ProjectionsMetaV1::empty_now();
+            meta.commit_id = 9;
+            meta.artifact_living_state.cursor = Some(ProjectionCursorV1 {
+                shard_id: 1,
+                epoch: 1,
+                segment_seq: 3,
+                offset: 64,
+            });
+            match artifact {
+                "relations" => meta.artifact_relations.snapshot_blake3 = Some("a".repeat(64)),
+                "dependents" => meta.artifact_dependents.snapshot_blake3 = Some("b".repeat(64)),
+                _ => meta.pressure_events.snapshot_blake3 = Some("c".repeat(64)),
+            }
+            store_projections_meta_v1(&files.meta_path, &meta).unwrap();
+
+            let store = ProjectionStoreV1::load_or_init(&shard_dir, 1, 1).unwrap();
+            assert_eq!(store.meta.commit_id, 0, "{artifact}: meta is reset");
+            assert!(
+                store.cursor_from_meta().is_none(),
+                "{artifact}: the cursor must not survive"
+            );
+        }
+    }
+
+    /// Control: a meta that declares no snapshot at all is a clean cold start,
+    /// not a reset. The fix must fire only on *declared but absent*.
+    #[test]
+    fn load_or_init_without_a_declared_snapshot_keeps_its_cursor() {
+        let tmp = TempDir::new().unwrap();
+        let shard_dir = tmp.path().join("shard-0001");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let files = ProjectionFilesV1::for_shard_dir(&shard_dir);
+        std::fs::create_dir_all(&files.projections_dir).unwrap();
+
+        let mut meta = crate::meta::ProjectionsMetaV1::empty_now();
+        meta.commit_id = 4;
+        meta.artifact_living_state.cursor = Some(ProjectionCursorV1 {
+            shard_id: 1,
+            epoch: 1,
+            segment_seq: 2,
+            offset: 128,
+        });
+        store_projections_meta_v1(&files.meta_path, &meta).unwrap();
+
+        let store = ProjectionStoreV1::load_or_init(&shard_dir, 1, 1).unwrap();
+        assert_eq!(store.meta.commit_id, 4);
+        assert_eq!(store.cursor_from_meta().expect("cursor survives").segment_seq, 2);
     }
 
     // ── write_atomic: empty data ────────────────────────────────────
@@ -2983,19 +3136,20 @@ mod tests {
         assert_eq!(collect_files_recursive_v1(tmp.path()).unwrap().len(), 2);
     }
 
-    /// Documented current behaviour: a segments directory that does not exist
-    /// yields an all-zero, `skipped:false` report — i.e. "nothing on disk,
-    /// nothing orphaned", indistinguishable from a directory that was scanned
-    /// and found clean. `collect_files_recursive_v1` swallows the read_dir
-    /// error by design. Pins the behaviour; does not endorse it.
+    /// D-28 (pin inverted): a segments directory that does not exist used to
+    /// yield an all-zero, `skipped:false` report — "nothing on disk, nothing
+    /// orphaned" — indistinguishable from a directory that was scanned and
+    /// found clean, because `collect_files_recursive_v1` swallows the read_dir
+    /// error. It now reports `skipped:true`, so "could not look" is a distinct
+    /// answer from "looked and found nothing".
     #[test]
-    fn gc_cold_segments_dir_missing_directory_reports_clean_not_error() {
+    fn gc_cold_segments_dir_missing_directory_reports_skipped_not_clean() {
         let tmp = TempDir::new().unwrap();
         let missing = tmp.path().join("does-not-exist");
         let reachable = BTreeMap::new();
         let (report, deleted) =
             gc_cold_segments_dir_v1("relations", 3, &missing, Some(&reachable), &gc_opts(false, 0, 0)).unwrap();
-        assert!(!report.skipped);
+        assert!(report.skipped, "a directory that could not be read is not a clean scan");
         assert_eq!(report.segments_on_disk, 0);
         assert_eq!(report.orphan_segments, 0);
         assert_eq!(report.unparseable_segment_files, 0);
@@ -3361,11 +3515,18 @@ mod tests {
         assert!(!files.living_snapshot_path.exists());
 
         let store = ProjectionStoreV1::load_or_init(&shard_dir, 1, 1).unwrap();
-        assert_eq!(store.meta.commit_id, 12, "meta is NOT reset (current behaviour)");
-        assert!(store.state.living.is_empty(), "but no rows were loaded");
-        let cursor = store.cursor_from_meta().expect("cursor survives");
-        assert_eq!(cursor.segment_seq, 7);
-        assert_eq!(cursor.offset, 4_096);
+        // D-6 (pin inverted): the meta recorded a snapshot hash and an advanced
+        // cursor while the snapshot FILE was gone. The old guard skipped
+        // verification entirely and returned the store cursor-intact with empty
+        // state, so the next `tick` resumed past frames it had never applied —
+        // silent data loss. A missing snapshot now resets to genesis, matching
+        // how a corrupt one has always been handled.
+        assert_eq!(store.meta.commit_id, 0, "a missing snapshot resets meta to genesis");
+        assert!(store.state.living.is_empty(), "and no rows were loaded");
+        assert!(
+            store.cursor_from_meta().is_none(),
+            "the cursor must not survive a snapshot that is gone"
+        );
     }
 
     // ── cursor plumbing ─────────────────────────────────────────────

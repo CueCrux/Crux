@@ -2066,6 +2066,42 @@ async fn console_redacts_private_facts_and_session_state() {
     let facts_text = serde_json::to_string(&facts_body).expect("facts json");
     assert!(!facts_text.contains("secret-token-123"));
 
+    // D-26: `as_of_unix_ms` was filtered with `.filter(|t| *t > 0)`, so a
+    // client computing 0 silently got ALL current facts while the response
+    // echoed the parameter back — it was told it had time-travelled and had
+    // not. Zero is a valid epoch cutoff: nothing had been stored yet.
+    let epoch_resp = console::get_console_facts(
+        State(state.clone()),
+        Query(console::ConsoleFactsQuery {
+            q: None,
+            top_k: None,
+            as_of_unix_ms: Some(0),
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(epoch_resp.status(), StatusCode::OK);
+    let epoch_body = json_body(epoch_resp).await;
+    assert_eq!(
+        epoch_body["visible_count"], 0,
+        "an epoch cutoff returns nothing, it does not disable the filter"
+    );
+
+    // A cutoff that cannot be applied is refused, not ignored.
+    let negative_resp = console::get_console_facts(
+        State(state.clone()),
+        Query(console::ConsoleFactsQuery {
+            q: None,
+            top_k: None,
+            as_of_unix_ms: Some(-1),
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(negative_resp.status(), StatusCode::BAD_REQUEST);
+
     let sessions_resp = console::get_console_sessions(
         State(state),
         dev_scope_headers("admin:read"),

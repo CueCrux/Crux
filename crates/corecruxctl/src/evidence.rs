@@ -88,6 +88,16 @@ pub struct ControlVerifyReportV1 {
     pub error_code: Option<String>,
     #[serde(rename = "errorMessage", skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Checks that were requested but could not be evaluated.
+    ///
+    /// With no control evidence there is nothing to replay, yet
+    /// `state_matches_evidence` and `checkpoint_bytes_match_expected` both
+    /// reported `true` and `ok` was simply `!hosted_only` — verifying nothing
+    /// scored the same as verifying a matching stream. `ok` keeps its meaning
+    /// (an unhosted deployment is not an error); a caller that needs the
+    /// replay to have actually run gates on `checks_skipped.is_empty()`.
+    #[serde(rename = "checksSkipped", default)]
+    pub checks_skipped: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +154,18 @@ pub struct EvidenceVerifyReportV1 {
     #[serde(rename = "artifactChecks")]
     pub artifact_checks: Vec<EvidenceVerifyArtifactCheckV1>,
     pub checks: Vec<EvidenceVerifyCheckV1>,
+    /// Checks that were REQUESTED but could not be evaluated.
+    ///
+    /// `ok` keeps its meaning, so an operator deliberately verifying a partial
+    /// pack is not broken. A caller that needs every requested check to have
+    /// actually *run* gates on `ok && checks_skipped.is_empty()`. Same shape as
+    /// `X509VerifyReport::checks_skipped` (see `incident:2026-07-28`).
+    ///
+    /// Deliberately narrow: an artifact class that is wholly absent means the
+    /// caller never asked for it and is NOT listed. A field that is non-empty
+    /// on every ordinary run is useless as a gate.
+    #[serde(rename = "checksSkipped", default)]
+    pub checks_skipped: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -239,6 +261,7 @@ pub fn verify_evidence_pack(opts: &PackVerifyOptions) -> Result<EvidenceVerifyRe
 
     let mut artifact_checks = Vec::new();
     let mut checks = Vec::new();
+    let mut checks_skipped: Vec<String> = Vec::new();
     let mut failed_artifacts = 0u64;
 
     let index_path = opts.pack_dir.join("audit_pack_index_v2.json");
@@ -291,12 +314,29 @@ pub fn verify_evidence_pack(opts: &PackVerifyOptions) -> Result<EvidenceVerifyRe
         artifact_checks.push(result);
     }
 
-    checks.extend(verify_control_artifacts(&opts.pack_dir, &manifest, opts.strict)?);
-    checks.extend(verify_receipt_artifacts(&opts.pack_dir, &manifest)?);
-    checks.extend(verify_replay_artifacts(&opts.pack_dir, &manifest, opts.device_index)?);
-    checks.extend(verify_projection_artifacts(&opts.pack_dir, &manifest)?);
+    for (checks_part, skipped_part) in [
+        verify_control_artifacts(&opts.pack_dir, &manifest, opts.strict)?,
+        verify_receipt_artifacts(&opts.pack_dir, &manifest)?,
+        verify_replay_artifacts(&opts.pack_dir, &manifest, opts.device_index)?,
+        verify_projection_artifacts(&opts.pack_dir, &manifest)?,
+    ] {
+        checks.extend(checks_part);
+        checks_skipped.extend(skipped_part);
+    }
 
-    let ok = failed_artifacts == 0 && checks.iter().all(|check| check.ok);
+    // D-10: a manifest declaring no artifacts verified nothing. It used to
+    // report `ok: true` even under `--strict` — identical to a pack whose every
+    // artifact was checked and matched.
+    if manifest.artifacts.is_empty() {
+        checks_skipped.push("artifacts:manifest_declares_none".to_string());
+    }
+
+    let verified_nothing = manifest.artifacts.is_empty();
+    let ok = failed_artifacts == 0
+        && checks.iter().all(|check| check.ok)
+        // Under `--strict` the caller has asked for every requested check to
+        // have run, so an unevaluable check is a failure rather than a note.
+        && !(opts.strict && (verified_nothing || !checks_skipped.is_empty()));
     Ok(EvidenceVerifyReportV1 {
         schema: "corecrux.evidence.verify.v1".to_string(),
         ok,
@@ -307,21 +347,46 @@ pub fn verify_evidence_pack(opts: &PackVerifyOptions) -> Result<EvidenceVerifyRe
         missing_capabilities: manifest.missing_capabilities.clone(),
         artifact_checks,
         checks,
+        checks_skipped,
     })
 }
+
+/// Checks produced, plus the names of checks that were requested but could not
+/// be evaluated. See `EvidenceVerifyReportV1::checks_skipped`.
+type CheckOutcome = (Vec<EvidenceVerifyCheckV1>, Vec<String>);
 
 fn verify_control_artifacts(
     pack_dir: &Path,
     manifest: &EvidenceManifestV1,
     strict: bool,
-) -> Result<Vec<EvidenceVerifyCheckV1>, DynError> {
+) -> Result<CheckOutcome, DynError> {
     let checkpoint = artifact_path_by_kind(manifest, "control_checkpoint_json");
     let evidence = artifact_path_by_kind(manifest, "control_evidence_jsonl");
     let report_path = artifact_path_by_kind(manifest, "control_verify_report");
 
     let mut checks = Vec::new();
     let (Some(checkpoint_path), Some(evidence_path), Some(report_path)) = (checkpoint, evidence, report_path) else {
-        return Ok(checks);
+        // D-12: an absent OR PARTIAL control trio emitted no checks at all, so
+        // a pack carrying two of the three verified identically to one carrying
+        // all three. A wholly absent trio means the caller never asked; a
+        // partial one is a check that could not run.
+        let present = [
+            ("control_checkpoint_json", checkpoint.is_some()),
+            ("control_evidence_jsonl", evidence.is_some()),
+            ("control_verify_report", report_path.is_some()),
+        ];
+        let skipped = if present.iter().any(|(_, is_present)| *is_present) {
+            let missing = present
+                .iter()
+                .filter(|(_, is_present)| !*is_present)
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>()
+                .join(",");
+            vec![format!("control_verify_report:missing_artifacts[{missing}]")]
+        } else {
+            Vec::new()
+        };
+        return Ok((checks, skipped));
     };
 
     let checkpoint_bytes = std::fs::read(pack_dir.join(checkpoint_path))?;
@@ -349,28 +414,29 @@ fn verify_control_artifacts(
             rebuilt.report.expected_checkpoint_blake3 == bundled_report.expected_checkpoint_blake3
         )),
     });
-    Ok(checks)
+    Ok((checks, Vec::new()))
 }
 
-fn verify_receipt_artifacts(
-    pack_dir: &Path,
-    manifest: &EvidenceManifestV1,
-) -> Result<Vec<EvidenceVerifyCheckV1>, DynError> {
+fn verify_receipt_artifacts(pack_dir: &Path, manifest: &EvidenceManifestV1) -> Result<CheckOutcome, DynError> {
     let bundle = artifact_path_by_kind(manifest, "receipt_export_bundle");
     let keyring = artifact_path_by_kind(manifest, "receipt_keyring_json");
     let verification = artifact_path_by_kind(manifest, "receipt_verification_report");
     let mut checks = Vec::new();
 
     let Some(bundle_path) = bundle else {
-        return Ok(checks);
+        // No receipt bundle at all: nothing was requested.
+        return Ok((checks, Vec::new()));
     };
     let Some(keyring_path) = keyring else {
+        // D-11: a bundle WITHOUT a keyring emitted `ok: true` with only a
+        // free-text `skipped_signature_verification` detail, so the aggregate
+        // `ok` was identical to a pack whose signature actually verified.
         checks.push(EvidenceVerifyCheckV1 {
             name: "receipt_signature_verification".to_string(),
             ok: true,
             detail: Some("skipped_signature_verification".to_string()),
         });
-        return Ok(checks);
+        return Ok((checks, vec!["receipt_signature_verification:no_keyring".to_string()]));
     };
 
     let bundle_bytes = std::fs::read(pack_dir.join(bundle_path))?;
@@ -415,19 +481,27 @@ fn verify_receipt_artifacts(
             export_manifest.receipt_id, rerun.error_code, rerun.signature_valid
         )),
     });
-    Ok(checks)
+    Ok((checks, Vec::new()))
 }
 
 fn verify_replay_artifacts(
     pack_dir: &Path,
     manifest: &EvidenceManifestV1,
     device_index: i32,
-) -> Result<Vec<EvidenceVerifyCheckV1>, DynError> {
+) -> Result<CheckOutcome, DynError> {
     let replay_input = artifact_path_by_kind(manifest, "replay_input_segment");
     let replay_report = artifact_path_by_kind(manifest, "replay_determinism_report");
     let mut checks = Vec::new();
     let (Some(input_path), Some(report_path)) = (replay_input, replay_report) else {
-        return Ok(checks);
+        // D-13: ONE HALF of the replay pair emitted no determinism check, so a
+        // pack with an input segment and no report verified identically to one
+        // with neither. Neither half present means nothing was requested.
+        let skipped = match (replay_input.is_some(), replay_report.is_some()) {
+            (true, false) => vec!["replay_determinism:missing_replay_determinism_report".to_string()],
+            (false, true) => vec!["replay_determinism:missing_replay_input_segment".to_string()],
+            _ => Vec::new(),
+        };
+        return Ok((checks, skipped));
     };
 
     let report: serde_json::Value = serde_json::from_slice(&std::fs::read(pack_dir.join(report_path))?)?;
@@ -451,19 +525,26 @@ fn verify_replay_artifacts(
             replay.digest_blake3, run_a_digest, run_b_digest
         )),
     });
-    Ok(checks)
+    Ok((checks, Vec::new()))
 }
 
-fn verify_projection_artifacts(
-    pack_dir: &Path,
-    manifest: &EvidenceManifestV1,
-) -> Result<Vec<EvidenceVerifyCheckV1>, DynError> {
+fn verify_projection_artifacts(pack_dir: &Path, manifest: &EvidenceManifestV1) -> Result<CheckOutcome, DynError> {
     let mut checks = Vec::new();
+    let mut skipped = Vec::new();
     for artifact in manifest.artifacts.values() {
         if artifact.kind != "projection_meta_json" {
             continue;
         }
         let meta_path = pack_dir.join(&artifact.path);
+        // D-14: `load_projections_meta_v1` returns an EMPTY meta for a missing
+        // file, so a declared-but-absent meta produced an all-`None` expectation
+        // set — every snapshot then compared against "missing", and a meta with
+        // no sibling snapshots emitted no check at all. Declared and absent is a
+        // check that could not run.
+        if !meta_path.exists() {
+            skipped.push(format!("projection_meta:missing[{}]", artifact.path));
+            continue;
+        }
         let meta = load_projections_meta_v1(&meta_path)?;
         let meta_dir = meta_path
             .parent()
@@ -487,7 +568,7 @@ fn verify_projection_artifacts(
             });
         }
     }
-    Ok(checks)
+    Ok((checks, skipped))
 }
 
 fn projection_name_from_snapshot_artifact(artifact: &corecrux_types::EvidenceArtifactDescriptorV1) -> Option<String> {
@@ -673,6 +754,9 @@ fn verify_control_inputs_v1(
                 } else {
                     None
                 },
+                // D-17: there were no events, so the replay never ran. Both
+                // `*_match*` booleans above are `true` having compared nothing.
+                checks_skipped: vec!["control_evidence_replay:no_events".to_string()],
             },
             checkpoint_bytes,
             evidence_lines: lines,
@@ -704,6 +788,8 @@ fn verify_control_inputs_v1(
                 checkpoint_bytes_match_expected: false,
                 error_code: Some("MULTIPLE_HOSTED_SHARDS".to_string()),
                 error_message: Some("control evidence stream should not appear on multiple local shards".to_string()),
+                // Refused, not unchecked: `ok: false` is the whole verdict.
+                checks_skipped: Vec::new(),
             },
             checkpoint_bytes,
             evidence_lines: lines,
@@ -801,6 +887,8 @@ fn verify_control_inputs_v1(
             checkpoint_bytes_match_expected,
             error_code,
             error_message,
+            // The replay ran over real events; nothing was left unevaluated.
+            checks_skipped: Vec::new(),
         },
         checkpoint_bytes,
         evidence_lines: lines,
@@ -1376,6 +1464,7 @@ mod tests {
             checkpoint_bytes_match_expected: true,
             error_code: None,
             error_message: None,
+            checks_skipped: Vec::new(),
         };
         let json = serde_json::to_string(&report).expect("serialize");
         assert!(json.contains("\"ok\":true"));
@@ -1399,6 +1488,7 @@ mod tests {
                 ok: true,
                 detail: None,
             }],
+            checks_skipped: Vec::new(),
         };
         let json = serde_json::to_value(&report).expect("serialize");
         assert_eq!(json["checkedArtifacts"], 5);
@@ -1729,6 +1819,7 @@ mod tests {
                 checkpoint_bytes_match_expected: true,
                 error_code: None,
                 error_message: None,
+                checks_skipped: Vec::new(),
             },
             checkpoint_bytes: Vec::new(),
             evidence_lines: Vec::new(),
@@ -2528,6 +2619,237 @@ mod tests {
         assert!(report.ok);
     }
 
+    // ── M5: verification that verified nothing ────────────────────
+
+    fn manifest_with(artifacts: BTreeMap<String, corecrux_types::EvidenceArtifactDescriptorV1>) -> EvidenceManifestV1 {
+        EvidenceManifestV1 {
+            schema: corecrux_types::EVIDENCE_MANIFEST_SCHEMA_V1.to_string(),
+            generated_at: "2026-07-31T00:00:00Z".to_string(),
+            producer: corecrux_types::EvidenceProducerV1 {
+                name: "corecruxctl".to_string(),
+                version: "test".to_string(),
+                commit: "test".to_string(),
+            },
+            corecrux_build: build_info(),
+            compat: None,
+            subject_scope: corecrux_types::EvidenceSubjectScopeV1::default(),
+            status: EvidenceStatusV1::Pass,
+            artifacts,
+            relationships: Vec::new(),
+            missing_capabilities: Vec::new(),
+        }
+    }
+
+    fn descriptor(kind: &str, path: &str) -> corecrux_types::EvidenceArtifactDescriptorV1 {
+        corecrux_types::EvidenceArtifactDescriptorV1 {
+            kind: kind.to_string(),
+            media_type: "application/json".to_string(),
+            path: path.to_string(),
+            // `pack_dir_with` materialises each artifact as a zero-byte file,
+            // so the per-artifact hash check passes and these tests isolate the
+            // *check-level* behaviour under test.
+            blake3: blake3::hash(b"").to_hex().to_string(),
+            size_bytes: 0,
+            status: EvidenceStatusV1::Pass,
+            required: false,
+            observational: false,
+            produced_by: corecrux_types::EvidenceProducerV1 {
+                name: "corecruxctl".to_string(),
+                version: "test".to_string(),
+                commit: "test".to_string(),
+            },
+            source_refs: Vec::new(),
+        }
+    }
+
+    /// Write `manifest` into a fresh pack dir, plus a zero-byte file for each
+    /// artifact so the per-artifact hash check is not what fails.
+    fn pack_dir_with(manifest: &EvidenceManifestV1) -> tempfile::TempDir {
+        let dir = tempdir().expect("tempdir");
+        for artifact in manifest.artifacts.values() {
+            let path = dir.path().join(&artifact.path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("mkdir");
+            }
+            std::fs::write(&path, b"").expect("artifact file");
+        }
+        std::fs::write(
+            dir.path().join("evidence_manifest.json"),
+            serde_json::to_vec_pretty(manifest).expect("manifest bytes"),
+        )
+        .expect("write manifest");
+        dir
+    }
+
+    fn verify(dir: &tempfile::TempDir, strict: bool) -> EvidenceVerifyReportV1 {
+        verify_evidence_pack(&PackVerifyOptions {
+            pack_dir: dir.path().to_path_buf(),
+            strict,
+            device_index: 0,
+        })
+        .expect("verify pack")
+    }
+
+    /// D-10: a manifest declaring zero artifacts verified nothing yet reported
+    /// `ok: true`, even under `--strict`.
+    #[test]
+    fn a_manifest_with_no_artifacts_records_a_skip_and_fails_strict() {
+        let dir = pack_dir_with(&manifest_with(BTreeMap::new()));
+
+        let lenient = verify(&dir, false);
+        assert!(lenient.ok, "an operator verifying an empty pack is not broken");
+        assert!(
+            lenient
+                .checks_skipped
+                .contains(&"artifacts:manifest_declares_none".to_string()),
+            "but the report says nothing was verified: {:?}",
+            lenient.checks_skipped
+        );
+
+        let strict = verify(&dir, true);
+        assert!(!strict.ok, "under --strict, verifying nothing is not a pass");
+    }
+
+    /// D-12: a PARTIAL control trio emitted no checks, so two of the three
+    /// artifacts verified identically to all three.
+    #[test]
+    fn a_partial_control_trio_records_a_skip() {
+        let dir = pack_dir_with(&manifest_with(BTreeMap::from([
+            (
+                "checkpoint".to_string(),
+                descriptor("control_checkpoint_json", "control_checkpoint.json"),
+            ),
+            (
+                "evidence".to_string(),
+                descriptor("control_evidence_jsonl", "control_evidence.jsonl"),
+            ),
+            // `control_verify_report` deliberately absent.
+        ])));
+
+        let report = verify(&dir, false);
+        assert!(
+            report
+                .checks_skipped
+                .iter()
+                .any(|skip| skip.starts_with("control_verify_report:missing_artifacts")),
+            "{:?}",
+            report.checks_skipped
+        );
+        assert!(!verify(&dir, true).ok, "--strict refuses an unevaluable check");
+    }
+
+    /// Control for D-12: a wholly absent control trio means the caller never
+    /// asked, so it is NOT listed. A field that is non-empty on every ordinary
+    /// run is useless as a gate.
+    #[test]
+    fn a_wholly_absent_control_trio_is_not_a_skip() {
+        let dir = pack_dir_with(&manifest_with(BTreeMap::from([(
+            "generic".to_string(),
+            descriptor("generic", "artifact.json"),
+        )])));
+
+        let report = verify(&dir, false);
+        assert!(
+            report.checks_skipped.is_empty(),
+            "nothing was requested, so nothing was skipped: {:?}",
+            report.checks_skipped
+        );
+        assert!(verify(&dir, true).ok, "and --strict still passes");
+    }
+
+    /// D-13: one half of the replay pair emitted no determinism check.
+    #[test]
+    fn half_a_replay_pair_records_a_skip() {
+        let dir = pack_dir_with(&manifest_with(BTreeMap::from([(
+            "replay_input".to_string(),
+            descriptor("replay_input_segment", "replay_input.seg"),
+        )])));
+
+        let report = verify(&dir, false);
+        assert_eq!(
+            report.checks_skipped,
+            vec!["replay_determinism:missing_replay_determinism_report".to_string()]
+        );
+    }
+
+    /// D-14: a declared-but-missing `projection_meta_json` was loaded as an
+    /// EMPTY meta, so every snapshot compared against an all-`None` expectation
+    /// set — and a meta with no sibling snapshots emitted no check at all.
+    #[test]
+    fn a_declared_but_missing_projection_meta_records_a_skip() {
+        let manifest = manifest_with(BTreeMap::from([(
+            "projection_meta".to_string(),
+            descriptor("projection_meta_json", "projections/projections.meta.json"),
+        )]));
+        // Build the pack WITHOUT materialising the artifact file.
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("evidence_manifest.json"),
+            serde_json::to_vec_pretty(&manifest).expect("manifest bytes"),
+        )
+        .expect("write manifest");
+
+        let report = verify(&dir, false);
+        assert!(
+            report
+                .checks_skipped
+                .iter()
+                .any(|skip| skip.starts_with("projection_meta:missing")),
+            "{:?}",
+            report.checks_skipped
+        );
+    }
+
+    /// D-11: a receipt bundle WITHOUT a keyring emitted `ok: true` with only a
+    /// free-text `skipped_signature_verification` detail, so the aggregate `ok`
+    /// was identical to a pack whose signature actually verified.
+    #[test]
+    fn a_receipt_bundle_without_a_keyring_records_a_skip() {
+        let dir = pack_dir_with(&manifest_with(BTreeMap::from([(
+            "bundle".to_string(),
+            descriptor("receipt_export_bundle", "receipts.zip"),
+        )])));
+
+        let report = verify(&dir, false);
+        assert!(report.ok, "an operator verifying without a keyring is not broken");
+        assert_eq!(
+            report.checks_skipped,
+            vec!["receipt_signature_verification:no_keyring".to_string()],
+            "but the signature was never checked, and the report says so"
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "receipt_signature_verification" && check.ok),
+            "the pass-shaped check is still emitted for compatibility"
+        );
+        assert!(!verify(&dir, true).ok, "--strict refuses an unverified signature");
+    }
+
+    /// D-17: with no control evidence there is nothing to replay, yet
+    /// `state_matches_evidence` and `checkpoint_bytes_match_expected` both
+    /// reported `true` and `ok` was simply `!hosted_only`.
+    #[test]
+    fn control_verify_with_no_evidence_records_a_skip() {
+        let dir = tempdir().expect("tempdir");
+        let bundle = verify_control_inputs_v1(
+            dir.path(),
+            &dir.path().join("CONTROL.json"),
+            checkpoint_control_bytes_v1(&LocalControlV1::default()),
+            Vec::new(),
+            false,
+        )
+        .expect("verify control inputs");
+
+        assert!(bundle.report.ok, "an unhosted deployment is not an error");
+        assert_eq!(
+            bundle.report.checks_skipped,
+            vec!["control_evidence_replay:no_events".to_string()],
+            "but nothing was replayed, and the report says so"
+        );
+    }
+
     // ── reconcile_control mutation-only anchor ────────────────────
 
     #[test]
@@ -2587,7 +2909,7 @@ mod tests {
         }
     }
 
-    fn descriptor(
+    fn descriptor_bytes(
         kind: &str,
         path: &str,
         bytes: &[u8],
@@ -2607,7 +2929,9 @@ mod tests {
         }
     }
 
-    fn manifest_with(artifacts: BTreeMap<String, corecrux_types::EvidenceArtifactDescriptorV1>) -> EvidenceManifestV1 {
+    fn manifest_with_producer(
+        artifacts: BTreeMap<String, corecrux_types::EvidenceArtifactDescriptorV1>,
+    ) -> EvidenceManifestV1 {
         EvidenceManifestV1 {
             schema: corecrux_types::EVIDENCE_MANIFEST_SCHEMA_V1.to_string(),
             generated_at: "2026-03-06T00:00:00Z".to_string(),
@@ -2655,20 +2979,26 @@ mod tests {
         assert!(verify_pack(dir.path(), false).is_err());
     }
 
-    /// DEFECT PIN (absent signal reads as pass): a manifest declaring ZERO
-    /// artifacts verifies nothing yet reports `ok: true` with
-    /// `checkedArtifacts: 0`. Nothing in `verify_evidence_pack` requires a
-    /// minimum evidence set, so an empty pack is indistinguishable from a
-    /// fully-verified one. Reported, not fixed.
+    /// D-10 (pin inverted): a manifest declaring ZERO artifacts used to verify
+    /// nothing and still report `ok: true`, even under `--strict`, so an empty
+    /// pack was indistinguishable from a fully-verified one. It now records
+    /// `artifacts:manifest_declares_none` and fails `--strict`.
     #[test]
-    fn verify_pack_with_zero_artifacts_reports_ok() {
+    fn verify_pack_with_zero_artifacts_records_a_skip_and_fails_strict() {
         let dir = tempdir().expect("tempdir");
-        write_manifest(dir.path(), &manifest_with(BTreeMap::new()));
+        write_manifest(dir.path(), &manifest_with_producer(BTreeMap::new()));
+
         let report = verify_pack(dir.path(), true).expect("verify");
-        assert!(report.ok, "empty pack currently passes even under --strict");
+        assert!(!report.ok, "under --strict, verifying nothing is not a pass");
         assert_eq!(report.checked_artifacts, 0);
         assert_eq!(report.failed_artifacts, 0);
-        assert!(report.checks.is_empty());
+        assert!(
+            report
+                .checks_skipped
+                .contains(&"artifacts:manifest_declares_none".to_string()),
+            "the report must say nothing was verified: {:?}",
+            report.checks_skipped
+        );
     }
 
     /// A missing but *required* artifact must fail even without `--strict`.
@@ -2676,8 +3006,8 @@ mod tests {
     fn verify_pack_missing_required_artifact_fails_non_strict() {
         let dir = tempdir().expect("tempdir");
         let mut artifacts = BTreeMap::new();
-        artifacts.insert("req".to_string(), descriptor("generic", "gone.json", b"x", true));
-        write_manifest(dir.path(), &manifest_with(artifacts));
+        artifacts.insert("req".to_string(), descriptor_bytes("generic", "gone.json", b"x", true));
+        write_manifest(dir.path(), &manifest_with_producer(artifacts));
 
         let report = verify_pack(dir.path(), false).expect("verify");
         assert!(!report.ok);
@@ -2691,8 +3021,8 @@ mod tests {
     fn verify_pack_missing_optional_artifact_fails_under_strict() {
         let dir = tempdir().expect("tempdir");
         let mut artifacts = BTreeMap::new();
-        artifacts.insert("opt".to_string(), descriptor("generic", "gone.json", b"x", false));
-        write_manifest(dir.path(), &manifest_with(artifacts));
+        artifacts.insert("opt".to_string(), descriptor_bytes("generic", "gone.json", b"x", false));
+        write_manifest(dir.path(), &manifest_with_producer(artifacts));
 
         let report = verify_pack(dir.path(), true).expect("verify");
         assert!(!report.ok);
@@ -2706,11 +3036,11 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let bytes = br#"{"ok":true}"#;
         std::fs::write(dir.path().join("a.json"), bytes).expect("write");
-        let mut d = descriptor("generic", "a.json", bytes, true);
+        let mut d = descriptor_bytes("generic", "a.json", bytes, true);
         d.size_bytes = bytes.len() as u64 + 1;
         let mut artifacts = BTreeMap::new();
         artifacts.insert("a".to_string(), d);
-        write_manifest(dir.path(), &manifest_with(artifacts));
+        write_manifest(dir.path(), &manifest_with_producer(artifacts));
 
         let report = verify_pack(dir.path(), false).expect("verify");
         assert!(!report.ok);
@@ -2744,7 +3074,7 @@ mod tests {
     #[test]
     fn verify_pack_audit_index_matching_manifest_passes() {
         let dir = tempdir().expect("tempdir");
-        let manifest = manifest_with(BTreeMap::new());
+        let manifest = manifest_with_producer(BTreeMap::new());
         write_manifest(dir.path(), &manifest);
         let manifest_bytes = std::fs::read(dir.path().join("evidence_manifest.json")).expect("read");
         write_audit_index(
@@ -2768,7 +3098,7 @@ mod tests {
     #[test]
     fn verify_pack_audit_index_stale_manifest_hash_fails() {
         let dir = tempdir().expect("tempdir");
-        write_manifest(dir.path(), &manifest_with(BTreeMap::new()));
+        write_manifest(dir.path(), &manifest_with_producer(BTreeMap::new()));
         write_audit_index(dir.path(), "0".repeat(64), 1);
 
         let report = verify_pack(dir.path(), false).expect("verify");
@@ -2787,7 +3117,7 @@ mod tests {
     #[test]
     fn verify_pack_unparsable_audit_index_errors() {
         let dir = tempdir().expect("tempdir");
-        write_manifest(dir.path(), &manifest_with(BTreeMap::new()));
+        write_manifest(dir.path(), &manifest_with_producer(BTreeMap::new()));
         std::fs::write(dir.path().join("audit_pack_index_v2.json"), b"nope").expect("write");
         assert!(verify_pack(dir.path(), false).is_err());
     }
@@ -2801,10 +3131,14 @@ mod tests {
     /// fixed.
     #[test]
     fn verify_control_artifacts_absent_emits_no_checks() {
-        let manifest = manifest_with(BTreeMap::new());
+        let manifest = manifest_with_producer(BTreeMap::new());
         let dir = tempdir().expect("tempdir");
-        let checks = verify_control_artifacts(dir.path(), &manifest, true).expect("checks");
+        let (checks, checks_skipped) = verify_control_artifacts(dir.path(), &manifest, true).expect("checks");
         assert!(checks.is_empty());
+        // A WHOLLY absent trio means the caller never asked, so it is
+        // deliberately not a skip either — `a_wholly_absent_control_trio_is_not_a_skip`
+        // pins that distinction. A *partial* trio is the one that records a skip.
+        assert!(checks_skipped.is_empty());
     }
 
     /// A partial control trio (checkpoint present, report missing) is also
@@ -2815,11 +3149,15 @@ mod tests {
         let mut artifacts = BTreeMap::new();
         artifacts.insert(
             "cp".to_string(),
-            descriptor("control_checkpoint_json", "CONTROL.json", b"{}", true),
+            descriptor_bytes("control_checkpoint_json", "CONTROL.json", b"{}", true),
         );
-        let manifest = manifest_with(artifacts);
-        let checks = verify_control_artifacts(dir.path(), &manifest, true).expect("checks");
+        let manifest = manifest_with_producer(artifacts);
+        let (checks, checks_skipped) = verify_control_artifacts(dir.path(), &manifest, true).expect("checks");
         assert!(checks.is_empty());
+        assert!(
+            !checks_skipped.is_empty(),
+            "a partial control trio must be recorded as skipped"
+        );
     }
 
     /// Full trio: the rebuilt report must agree with the bundled one.
@@ -2853,6 +3191,7 @@ mod tests {
             shard_ids: Vec::new(),
             state_matches_evidence: true,
             checkpoint_bytes_match_expected: true,
+            checks_skipped: Vec::new(),
             error_code: None,
             error_message: None,
         };
@@ -2868,23 +3207,24 @@ mod tests {
         let mut artifacts = BTreeMap::new();
         artifacts.insert(
             "cp".to_string(),
-            descriptor("control_checkpoint_json", "checkpoint.json", b"", true),
+            descriptor_bytes("control_checkpoint_json", "checkpoint.json", b"", true),
         );
         artifacts.insert(
             "ev".to_string(),
-            descriptor("control_evidence_jsonl", "evidence.jsonl", b"", true),
+            descriptor_bytes("control_evidence_jsonl", "evidence.jsonl", b"", true),
         );
         artifacts.insert(
             "rp".to_string(),
-            descriptor("control_verify_report", "control_verify.json", b"", true),
+            descriptor_bytes("control_verify_report", "control_verify.json", b"", true),
         );
-        manifest_with(artifacts)
+        manifest_with_producer(artifacts)
     }
 
     #[test]
     fn verify_control_artifacts_rebuild_agrees_with_bundled_report() {
         let dir = control_trio_pack(true, false);
-        let checks = verify_control_artifacts(dir.path(), &control_trio_manifest(), false).expect("checks");
+        let (checks, _checks_skipped) =
+            verify_control_artifacts(dir.path(), &control_trio_manifest(), false).expect("checks");
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].name, "control_verify_report");
         assert!(checks[0].ok, "detail={:?}", checks[0].detail);
@@ -2895,7 +3235,8 @@ mod tests {
     #[test]
     fn verify_control_artifacts_flags_bundled_ok_disagreement() {
         let dir = control_trio_pack(false, false);
-        let checks = verify_control_artifacts(dir.path(), &control_trio_manifest(), false).expect("checks");
+        let (checks, _checks_skipped) =
+            verify_control_artifacts(dir.path(), &control_trio_manifest(), false).expect("checks");
         assert!(!checks[0].ok);
         let detail = checks[0].detail.clone().unwrap_or_default();
         assert!(detail.contains("rebuilt_ok=true"), "detail={detail}");
@@ -2907,7 +3248,8 @@ mod tests {
     #[test]
     fn verify_control_artifacts_flags_expected_checkpoint_hash_drift() {
         let dir = control_trio_pack(true, true);
-        let checks = verify_control_artifacts(dir.path(), &control_trio_manifest(), false).expect("checks");
+        let (checks, _checks_skipped) =
+            verify_control_artifacts(dir.path(), &control_trio_manifest(), false).expect("checks");
         assert!(!checks[0].ok);
         let detail = checks[0].detail.clone().unwrap_or_default();
         assert!(
@@ -2921,7 +3263,8 @@ mod tests {
     #[test]
     fn verify_receipt_artifacts_without_bundle_emits_no_checks() {
         let dir = tempdir().expect("tempdir");
-        let checks = verify_receipt_artifacts(dir.path(), &manifest_with(BTreeMap::new())).expect("checks");
+        let (checks, _checks_skipped) =
+            verify_receipt_artifacts(dir.path(), &manifest_with_producer(BTreeMap::new())).expect("checks");
         assert!(checks.is_empty());
     }
 
@@ -2937,13 +3280,18 @@ mod tests {
         let mut artifacts = BTreeMap::new();
         artifacts.insert(
             "bundle".to_string(),
-            descriptor("receipt_export_bundle", "bundle.zip", b"", true),
+            descriptor_bytes("receipt_export_bundle", "bundle.zip", b"", true),
         );
-        let checks = verify_receipt_artifacts(dir.path(), &manifest_with(artifacts)).expect("checks");
+        let (checks, checks_skipped) =
+            verify_receipt_artifacts(dir.path(), &manifest_with_producer(artifacts)).expect("checks");
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].name, "receipt_signature_verification");
         assert!(checks[0].ok, "skipped verification currently reports ok");
         assert_eq!(checks[0].detail.as_deref(), Some("skipped_signature_verification"));
+        assert!(
+            !checks_skipped.is_empty(),
+            "no keyring means the signature check could not run and must be recorded"
+        );
     }
 
     /// With a keyring declared the bundle is actually opened; a missing or
@@ -2954,13 +3302,13 @@ mod tests {
         let mut artifacts = BTreeMap::new();
         artifacts.insert(
             "bundle".to_string(),
-            descriptor("receipt_export_bundle", "bundle.zip", b"", true),
+            descriptor_bytes("receipt_export_bundle", "bundle.zip", b"", true),
         );
         artifacts.insert(
             "kr".to_string(),
-            descriptor("receipt_keyring_json", "keyring.json", b"", true),
+            descriptor_bytes("receipt_keyring_json", "keyring.json", b"", true),
         );
-        assert!(verify_receipt_artifacts(dir.path(), &manifest_with(artifacts)).is_err());
+        assert!(verify_receipt_artifacts(dir.path(), &manifest_with_producer(artifacts)).is_err());
     }
 
     #[test]
@@ -2971,13 +3319,13 @@ mod tests {
         let mut artifacts = BTreeMap::new();
         artifacts.insert(
             "bundle".to_string(),
-            descriptor("receipt_export_bundle", "bundle.zip", b"", true),
+            descriptor_bytes("receipt_export_bundle", "bundle.zip", b"", true),
         );
         artifacts.insert(
             "kr".to_string(),
-            descriptor("receipt_keyring_json", "keyring.json", b"", true),
+            descriptor_bytes("receipt_keyring_json", "keyring.json", b"", true),
         );
-        assert!(verify_receipt_artifacts(dir.path(), &manifest_with(artifacts)).is_err());
+        assert!(verify_receipt_artifacts(dir.path(), &manifest_with_producer(artifacts)).is_err());
     }
 
     // ── read_zip_entry ──────────────────────────────────────────────
@@ -3026,18 +3374,24 @@ mod tests {
         let mut artifacts = BTreeMap::new();
         artifacts.insert(
             "seg".to_string(),
-            descriptor("replay_input_segment", "input.ccxseg", b"", true),
+            descriptor_bytes("replay_input_segment", "input.ccxseg", b"", true),
         );
-        let checks = verify_replay_artifacts(dir.path(), &manifest_with(artifacts), 0).expect("checks");
+        let (checks, _checks_skipped) =
+            verify_replay_artifacts(dir.path(), &manifest_with_producer(artifacts), 0).expect("checks");
         assert!(checks.is_empty());
 
         let mut artifacts = BTreeMap::new();
         artifacts.insert(
             "rep".to_string(),
-            descriptor("replay_determinism_report", "replay.json", b"", true),
+            descriptor_bytes("replay_determinism_report", "replay.json", b"", true),
         );
-        let checks = verify_replay_artifacts(dir.path(), &manifest_with(artifacts), 0).expect("checks");
+        let (checks, checks_skipped) =
+            verify_replay_artifacts(dir.path(), &manifest_with_producer(artifacts), 0).expect("checks");
         assert!(checks.is_empty());
+        assert!(
+            !checks_skipped.is_empty(),
+            "half a replay pair must be recorded as skipped"
+        );
     }
 
     /// With both halves declared, an unreadable determinism report is an
@@ -3049,13 +3403,13 @@ mod tests {
         let mut artifacts = BTreeMap::new();
         artifacts.insert(
             "seg".to_string(),
-            descriptor("replay_input_segment", "input.ccxseg", b"", true),
+            descriptor_bytes("replay_input_segment", "input.ccxseg", b"", true),
         );
         artifacts.insert(
             "rep".to_string(),
-            descriptor("replay_determinism_report", "replay.json", b"", true),
+            descriptor_bytes("replay_determinism_report", "replay.json", b"", true),
         );
-        assert!(verify_replay_artifacts(dir.path(), &manifest_with(artifacts), 0).is_err());
+        assert!(verify_replay_artifacts(dir.path(), &manifest_with_producer(artifacts), 0).is_err());
     }
 
     // ── verify_projection_artifacts ─────────────────────────────────
@@ -3077,7 +3431,7 @@ mod tests {
         )
         .expect("write meta");
 
-        let mut snapshot_desc = descriptor("projection_snapshot_ccxs", "proj/living.ccxs", &snapshot_bytes, true);
+        let mut snapshot_desc = descriptor_bytes("projection_snapshot_ccxs", "proj/living.ccxs", &snapshot_bytes, true);
         snapshot_desc.source_refs = vec![EvidenceSourceRefV1::ProjectionSnapshot {
             shard_id: 1,
             projection: "artifact_living_state".to_string(),
@@ -3088,16 +3442,17 @@ mod tests {
         let mut artifacts = BTreeMap::new();
         artifacts.insert(
             "meta".to_string(),
-            descriptor("projection_meta_json", "proj/projections.meta.json", b"", true),
+            descriptor_bytes("projection_meta_json", "proj/projections.meta.json", b"", true),
         );
         artifacts.insert("snap".to_string(), snapshot_desc);
-        manifest_with(artifacts)
+        manifest_with_producer(artifacts)
     }
 
     #[test]
     fn verify_projection_artifacts_without_meta_emits_no_checks() {
         let dir = tempdir().expect("tempdir");
-        let checks = verify_projection_artifacts(dir.path(), &manifest_with(BTreeMap::new())).expect("checks");
+        let (checks, _checks_skipped) =
+            verify_projection_artifacts(dir.path(), &manifest_with_producer(BTreeMap::new())).expect("checks");
         assert!(checks.is_empty());
     }
 
@@ -3106,7 +3461,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let expected = CcxsSnapshot::snapshot_blake3_hex(b"pretend-ccxs-snapshot-bytes");
         let manifest = projection_pack(dir.path(), Some(expected));
-        let checks = verify_projection_artifacts(dir.path(), &manifest).expect("checks");
+        let (checks, _checks_skipped) = verify_projection_artifacts(dir.path(), &manifest).expect("checks");
         assert_eq!(checks.len(), 1);
         assert!(checks[0].ok, "detail={:?}", checks[0].detail);
         assert!(checks[0].name.starts_with("snapshot_hash:artifact_living_state:"));
@@ -3118,7 +3473,7 @@ mod tests {
     fn verify_projection_artifacts_snapshot_hash_drift_fails() {
         let dir = tempdir().expect("tempdir");
         let manifest = projection_pack(dir.path(), Some("a".repeat(64)));
-        let checks = verify_projection_artifacts(dir.path(), &manifest).expect("checks");
+        let (checks, _checks_skipped) = verify_projection_artifacts(dir.path(), &manifest).expect("checks");
         assert_eq!(checks.len(), 1);
         assert!(!checks[0].ok);
     }
@@ -3130,7 +3485,7 @@ mod tests {
     fn verify_projection_artifacts_missing_expected_hash_fails() {
         let dir = tempdir().expect("tempdir");
         let manifest = projection_pack(dir.path(), None);
-        let checks = verify_projection_artifacts(dir.path(), &manifest).expect("checks");
+        let (checks, _checks_skipped) = verify_projection_artifacts(dir.path(), &manifest).expect("checks");
         assert_eq!(checks.len(), 1);
         assert!(!checks[0].ok);
         assert!(
@@ -3170,10 +3525,15 @@ mod tests {
         let mut artifacts = BTreeMap::new();
         artifacts.insert(
             "meta".to_string(),
-            descriptor("projection_meta_json", "missing.meta.json", b"", false),
+            descriptor_bytes("projection_meta_json", "missing.meta.json", b"", false),
         );
-        let checks = verify_projection_artifacts(dir.path(), &manifest_with(artifacts)).expect("no error");
+        let (checks, checks_skipped) =
+            verify_projection_artifacts(dir.path(), &manifest_with_producer(artifacts)).expect("no error");
         assert!(checks.is_empty(), "missing meta produced no verification at all");
+        assert!(
+            !checks_skipped.is_empty(),
+            "a declared-but-missing projection meta must be recorded as skipped"
+        );
     }
 
     /// A meta file that exists but is not parsable JSON must error.
@@ -3184,9 +3544,9 @@ mod tests {
         let mut artifacts = BTreeMap::new();
         artifacts.insert(
             "meta".to_string(),
-            descriptor("projection_meta_json", "bad.meta.json", b"", true),
+            descriptor_bytes("projection_meta_json", "bad.meta.json", b"", true),
         );
-        assert!(verify_projection_artifacts(dir.path(), &manifest_with(artifacts)).is_err());
+        assert!(verify_projection_artifacts(dir.path(), &manifest_with_producer(artifacts)).is_err());
     }
 
     // ── control evidence collection ─────────────────────────────────
@@ -3499,7 +3859,7 @@ mod tests {
     #[test]
     fn evidence_verify_report_carries_missing_capabilities_through_verify() {
         let dir = tempdir().expect("tempdir");
-        let mut manifest = manifest_with(BTreeMap::new());
+        let mut manifest = manifest_with_producer(BTreeMap::new());
         manifest.missing_capabilities = vec!["decision_plane_events".to_string()];
         write_manifest(dir.path(), &manifest);
         let report = verify_pack(dir.path(), false).expect("verify");

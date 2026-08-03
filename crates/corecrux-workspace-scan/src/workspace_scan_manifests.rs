@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+use crate::workspace_scan::ParseFailure;
+
 const EXTERNAL_DEPS_ENV: &str = "CORECRUXD_EXTERNAL_DEPS";
 const MAX_DEPTH: usize = 12;
 const MAX_MANIFESTS: usize = 2000;
@@ -41,14 +43,33 @@ pub fn external_deps_enabled_from_env() -> bool {
 
 pub fn attach_external_deps_if_enabled(root: &Path, scan: &mut crate::workspace_scan::WorkspaceScan) {
     if external_deps_enabled_from_env() {
-        scan.external_deps = scan_external_deps(root);
+        let (deps, failures) = scan_external_deps_with_diagnostics(root);
+        scan.external_deps = deps;
         scan.stats.external_dep_count = scan.external_deps.len();
+        scan.diagnostics.parse_failures.extend(failures);
+        scan.diagnostics
+            .parse_failures
+            .sort_by(|a, b| (&a.rel_path, &a.language).cmp(&(&b.rel_path, &b.language)));
     }
 }
 
+#[cfg(test)]
 pub fn scan_external_deps(root: &Path) -> Vec<ExternalDep> {
+    scan_external_deps_with_diagnostics(root).0
+}
+
+/// Like `scan_external_deps`, but also returns the manifests whose lockfile
+/// was **present and unparsable**. (Not an intra-doc link: `scan_external_deps`
+/// is `#[cfg(test)]`, so it does not exist in a `cargo doc` build.)
+///
+/// D-23: an unparsable lockfile was byte-identical to a missing one — both
+/// simply yielded unlocked versions — and `v3_skipped_files` records only
+/// pre-parse rejections, so nothing distinguished "this repo pins nothing"
+/// from "we could not read what it pins".
+pub fn scan_external_deps_with_diagnostics(root: &Path) -> (Vec<ExternalDep>, Vec<ParseFailure>) {
     let manifests = discover_manifests(root);
     let mut deps = Vec::new();
+    let mut failures: Vec<ParseFailure> = Vec::new();
     for (idx, manifest) in manifests.iter().enumerate() {
         if idx >= MAX_MANIFESTS {
             tracing::warn!(
@@ -63,25 +84,58 @@ pub fn scan_external_deps(root: &Path) -> Vec<ExternalDep> {
             continue;
         };
         match name {
-            "Cargo.toml" => parse_cargo_manifest(root, manifest, &mut deps),
-            "package.json" => parse_package_json(root, manifest, &mut deps),
-            "pyproject.toml" => parse_pyproject_toml(root, manifest, &mut deps),
-            "go.mod" => parse_go_mod(root, manifest, &mut deps),
+            "Cargo.toml" => parse_cargo_manifest(root, manifest, &mut deps, &mut failures),
+            "package.json" => parse_package_json(root, manifest, &mut deps, &mut failures),
+            "pyproject.toml" => parse_pyproject_toml(root, manifest, &mut deps, &mut failures),
+            "go.mod" => parse_go_mod(root, manifest, &mut deps, &mut failures),
+            // Maven and Gradle have no lockfile to parse, so no failure channel.
             "pom.xml" => parse_maven_pom(root, manifest, &mut deps),
             "build.gradle" | "build.gradle.kts" => parse_gradle_manifest(root, manifest, &mut deps),
-            "Gemfile" => parse_gemfile(root, manifest, &mut deps),
-            "Package.swift" => parse_swift_package(root, manifest, &mut deps),
-            "composer.json" => parse_composer_manifest(root, manifest, &mut deps),
+            "Gemfile" => parse_gemfile(root, manifest, &mut deps, &mut failures),
+            "Package.swift" => parse_swift_package(root, manifest, &mut deps, &mut failures),
+            "composer.json" => parse_composer_manifest(root, manifest, &mut deps, &mut failures),
             _ if manifest.extension().and_then(|ext| ext.to_str()) == Some("csproj") => {
-                parse_csproj(root, manifest, &mut deps);
+                parse_csproj(root, manifest, &mut deps, &mut failures);
             }
             _ if is_requirements_file(name) || is_requirements_path(manifest) => {
-                parse_requirements_txt(root, manifest, &mut deps);
+                parse_requirements_txt(root, manifest, &mut deps, &mut failures);
             }
             _ => {}
         }
     }
-    dedup_and_sort(deps)
+    failures.sort_by(|a, b| (&a.rel_path, &a.language).cmp(&(&b.rel_path, &b.language)));
+    failures.dedup();
+    (dedup_and_sort(deps), failures)
+}
+
+/// Resolve a lockfile, parse it, and record the failure when it exists but
+/// cannot be parsed. `None` from an absent lockfile is silent — that is a
+/// legitimate unlocked repo; `None` from a present one is not.
+fn lock_versions_or_note<T>(
+    failures: &mut Vec<ParseFailure>,
+    root: &Path,
+    lock: Option<PathBuf>,
+    ecosystem: &str,
+    parse: impl FnOnce(&Path) -> Option<T>,
+) -> Option<T> {
+    let lock = lock?;
+    let parsed = parse(&lock);
+    if parsed.is_none() {
+        note_unparsable_lockfile(failures, root, &lock, ecosystem);
+    }
+    parsed
+}
+
+/// Record a lockfile that exists on disk but could not be parsed.
+fn note_unparsable_lockfile(failures: &mut Vec<ParseFailure>, root: &Path, lock: &Path, ecosystem: &str) {
+    let Some(rel) = rel_path(root, lock) else {
+        return;
+    };
+    failures.push(ParseFailure {
+        rel_path: rel,
+        language: format!("manifest:{ecosystem}"),
+        reason: "lockfile is present but could not be parsed; declared versions are unlocked".to_string(),
+    });
 }
 
 fn discover_manifests(root: &Path) -> Vec<PathBuf> {
@@ -297,7 +351,7 @@ fn table_at<'a>(value: &'a toml::Value, path: &[&str]) -> Option<&'a toml::Table
     current.as_table()
 }
 
-fn parse_cargo_manifest(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
+fn parse_cargo_manifest(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>, failures: &mut Vec<ParseFailure>) {
     let Some(contents) = read_utf8_file(manifest, "Cargo.toml") else {
         return;
     };
@@ -309,7 +363,13 @@ fn parse_cargo_manifest(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep
     };
     let manifest_dir = manifest.parent().unwrap_or(root);
     let workspace_deps = nearest_workspace_cargo_deps(root, manifest_dir);
-    let lock_versions = find_nearest_file(manifest_dir, root, "Cargo.lock").and_then(|lock| parse_cargo_lock(&lock));
+    let lock_versions = lock_versions_or_note(
+        failures,
+        root,
+        find_nearest_file(manifest_dir, root, "Cargo.lock"),
+        "cargo",
+        parse_cargo_lock,
+    );
 
     add_cargo_section(
         table_at(&value, &["dependencies"]),
@@ -513,7 +573,7 @@ fn workspace_dep_spec(name: &str, workspace_deps: Option<&toml::Table>) -> Optio
     })
 }
 
-fn parse_package_json(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
+fn parse_package_json(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>, failures: &mut Vec<ParseFailure>) {
     let Some(contents) = read_utf8_file(manifest, "package.json") else {
         return;
     };
@@ -528,7 +588,7 @@ fn parse_package_json(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>)
         return;
     };
     let manifest_dir = manifest.parent().unwrap_or(root);
-    let lock_versions = npm_lock_versions(root, manifest_dir);
+    let lock_versions = npm_lock_versions(root, manifest_dir, failures);
     add_package_json_section(
         value.get("dependencies").and_then(serde_json::Value::as_object),
         "normal",
@@ -587,11 +647,21 @@ fn add_package_json_section(
     }
 }
 
-fn npm_lock_versions(root: &Path, manifest_dir: &Path) -> Option<BTreeMap<String, String>> {
+fn npm_lock_versions(
+    root: &Path,
+    manifest_dir: &Path,
+    failures: &mut Vec<ParseFailure>,
+) -> Option<BTreeMap<String, String>> {
     if let Some(lock) = find_nearest_file(manifest_dir, root, "package-lock.json") {
-        return package_lock_versions(&lock);
+        return lock_versions_or_note(failures, root, Some(lock), "npm", package_lock_versions);
     }
-    find_nearest_file(manifest_dir, root, "pnpm-lock.yaml").and_then(|lock| pnpm_lock_versions(&lock, manifest_dir))
+    lock_versions_or_note(
+        failures,
+        root,
+        find_nearest_file(manifest_dir, root, "pnpm-lock.yaml"),
+        "npm",
+        |lock| pnpm_lock_versions(lock, manifest_dir),
+    )
 }
 
 fn package_lock_versions(lock: &Path) -> Option<BTreeMap<String, String>> {
@@ -693,14 +763,14 @@ fn strip_pnpm_peer_suffix(version: &str) -> &str {
     }
 }
 
-fn parse_requirements_txt(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
+fn parse_requirements_txt(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>, failures: &mut Vec<ParseFailure>) {
     let Some(contents) = read_utf8_file(manifest, "requirements.txt") else {
         return;
     };
     let Some(source_manifest) = rel_path(root, manifest) else {
         return;
     };
-    let lock_versions = pypi_lock_versions(root, manifest.parent().unwrap_or(root));
+    let lock_versions = pypi_lock_versions(root, manifest.parent().unwrap_or(root), failures);
     for line in contents.lines() {
         let Some((name, version_req)) = parse_requirement_line(line, manifest) else {
             continue;
@@ -718,7 +788,7 @@ fn parse_requirements_txt(root: &Path, manifest: &Path, deps: &mut Vec<ExternalD
     }
 }
 
-fn parse_pyproject_toml(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
+fn parse_pyproject_toml(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>, failures: &mut Vec<ParseFailure>) {
     let Some(contents) = read_utf8_file(manifest, "pyproject.toml") else {
         return;
     };
@@ -728,7 +798,7 @@ fn parse_pyproject_toml(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep
     let Some(source_manifest) = rel_path(root, manifest) else {
         return;
     };
-    let lock_versions = pypi_lock_versions(root, manifest.parent().unwrap_or(root));
+    let lock_versions = pypi_lock_versions(root, manifest.parent().unwrap_or(root), failures);
     if let Some(project_deps) = table_at(&value, &["project"])
         .and_then(|project| project.get("dependencies"))
         .and_then(toml::Value::as_array)
@@ -799,10 +869,16 @@ fn parse_pyproject_toml(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep
     }
 }
 
-fn pypi_lock_versions(root: &Path, manifest_dir: &Path) -> Option<BTreeMap<String, String>> {
+fn pypi_lock_versions(
+    root: &Path,
+    manifest_dir: &Path,
+    failures: &mut Vec<ParseFailure>,
+) -> Option<BTreeMap<String, String>> {
     for file_name in ["poetry.lock", "uv.lock"] {
         if let Some(lock) = find_nearest_file(manifest_dir, root, file_name) {
-            return parse_pypi_toml_lock(&lock, file_name);
+            return lock_versions_or_note(failures, root, Some(lock), "pypi", |lock| {
+                parse_pypi_toml_lock(lock, file_name)
+            });
         }
     }
     None
@@ -944,15 +1020,20 @@ fn version_req_from_python_suffix(suffix: &str) -> Option<String> {
     None
 }
 
-fn parse_go_mod(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
+fn parse_go_mod(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>, failures: &mut Vec<ParseFailure>) {
     let Some(contents) = read_utf8_file(manifest, "go.mod") else {
         return;
     };
     let Some(source_manifest) = rel_path(root, manifest) else {
         return;
     };
-    let lock_versions =
-        find_nearest_file(manifest.parent().unwrap_or(root), root, "go.sum").and_then(|lock| parse_go_sum(&lock));
+    let lock_versions = lock_versions_or_note(
+        failures,
+        root,
+        find_nearest_file(manifest.parent().unwrap_or(root), root, "go.sum"),
+        "go",
+        parse_go_sum,
+    );
     let mut in_require_block = false;
     for raw in contents.lines() {
         let line = raw.trim();
@@ -1232,15 +1313,20 @@ fn gradle_version_is_dynamic(version: &str) -> bool {
 static GEM_SPEC_RE: LazyLock<Option<regex::Regex>> =
     LazyLock::new(|| regex::Regex::new(r"^    ([A-Za-z0-9_.-]+) \(([^ )]+)").ok());
 
-fn parse_gemfile(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
+fn parse_gemfile(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>, failures: &mut Vec<ParseFailure>) {
     let Some(contents) = read_utf8_file(manifest, "Gemfile") else {
         return;
     };
     let Some(source_manifest) = rel_path(root, manifest) else {
         return;
     };
-    let lock_versions = find_nearest_file(manifest.parent().unwrap_or(root), root, "Gemfile.lock")
-        .and_then(|lock| parse_gemfile_lock(&lock));
+    let lock_versions = lock_versions_or_note(
+        failures,
+        root,
+        find_nearest_file(manifest.parent().unwrap_or(root), root, "Gemfile.lock"),
+        "rubygems",
+        parse_gemfile_lock,
+    );
     let mut block_stack = Vec::new();
     for raw_line in contents.lines() {
         let line = raw_line.split_once('#').map_or(raw_line, |(before, _)| before).trim();
@@ -1399,7 +1485,7 @@ fn gem_version_is_platform_specific(version: &str) -> bool {
     })
 }
 
-fn parse_csproj(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
+fn parse_csproj(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>, failures: &mut Vec<ParseFailure>) {
     let Some(contents) = read_utf8_file(manifest, "csproj") else {
         return;
     };
@@ -1416,8 +1502,13 @@ fn parse_csproj(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
     let manifest_dir = manifest.parent().unwrap_or(root);
     let central_versions = find_nearest_file(manifest_dir, root, "Directory.Packages.props")
         .and_then(|props| parse_nuget_central_versions(&props));
-    let lock_versions =
-        find_nearest_file(manifest_dir, root, "packages.lock.json").and_then(|lock| parse_nuget_lock(&lock));
+    let lock_versions = lock_versions_or_note(
+        failures,
+        root,
+        find_nearest_file(manifest_dir, root, "packages.lock.json"),
+        "nuget",
+        parse_nuget_lock,
+    );
     for reference in document.descendants().filter(|node| xml_is(*node, "PackageReference")) {
         let Some(name) = reference.attribute("Include") else {
             continue;
@@ -1505,7 +1596,7 @@ static SWIFTPM_URL_RE: LazyLock<Option<regex::Regex>> =
 static SWIFTPM_REQUIREMENT_RE: LazyLock<Option<regex::Regex>> =
     LazyLock::new(|| regex::Regex::new(r#"\b(from|exact|branch|revision)\s*:\s*\"([^\"]+)\""#).ok());
 
-fn parse_swift_package(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
+fn parse_swift_package(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>, failures: &mut Vec<ParseFailure>) {
     let Some(contents) = read_utf8_file(manifest, "Package.swift") else {
         return;
     };
@@ -1520,8 +1611,13 @@ fn parse_swift_package(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>
         tracing::warn!("failed to initialize SwiftPM URL pattern");
         return;
     };
-    let lock_versions = find_nearest_file(manifest.parent().unwrap_or(root), root, "Package.resolved")
-        .and_then(|lock| parse_swift_package_resolved(&lock));
+    let lock_versions = lock_versions_or_note(
+        failures,
+        root,
+        find_nearest_file(manifest.parent().unwrap_or(root), root, "Package.resolved"),
+        "swiftpm",
+        parse_swift_package_resolved,
+    );
     for capture in package_pattern.captures_iter(&contents) {
         let Some(arguments) = capture.get(1).map(|matched| matched.as_str()) else {
             continue;
@@ -1606,7 +1702,12 @@ fn parse_swift_package_resolved(lock: &Path) -> Option<BTreeMap<String, String>>
     Some(versions)
 }
 
-fn parse_composer_manifest(root: &Path, manifest: &Path, deps: &mut Vec<ExternalDep>) {
+fn parse_composer_manifest(
+    root: &Path,
+    manifest: &Path,
+    deps: &mut Vec<ExternalDep>,
+    failures: &mut Vec<ParseFailure>,
+) {
     let Some(contents) = read_utf8_file(manifest, "composer.json") else {
         return;
     };
@@ -1620,8 +1721,13 @@ fn parse_composer_manifest(root: &Path, manifest: &Path, deps: &mut Vec<External
     let Some(source_manifest) = rel_path(root, manifest) else {
         return;
     };
-    let lock_versions = find_nearest_file(manifest.parent().unwrap_or(root), root, "composer.lock")
-        .and_then(|lock| parse_composer_lock(&lock));
+    let lock_versions = lock_versions_or_note(
+        failures,
+        root,
+        find_nearest_file(manifest.parent().unwrap_or(root), root, "composer.lock"),
+        "composer",
+        parse_composer_lock,
+    );
     for (section, kind) in [("require", "normal"), ("require-dev", "dev")] {
         let Some(requirements) = value.get(section).and_then(serde_json::Value::as_object) else {
             continue;
@@ -1696,6 +1802,50 @@ fn parse_composer_lock(lock: &Path) -> Option<BTreeMap<String, String>> {
 mod tests {
     use super::*;
     use crate::test_support::EnvVarGuard;
+
+    /// D-23: an unparsable lockfile was byte-identical to a missing one —
+    /// both simply left versions unlocked — and `v3_skipped_files` records
+    /// only pre-parse rejections, so nothing distinguished "this repo pins
+    /// nothing" from "we could not read what it pins".
+    #[test]
+    fn an_unparsable_lockfile_is_recorded_as_a_parse_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(tmp.path().join("Cargo.lock"), "this is not [[[ toml").expect("lock");
+
+        let (deps, failures) = scan_external_deps_with_diagnostics(tmp.path());
+        assert_eq!(deps.len(), 1);
+        assert!(deps[0].version_locked.is_none(), "the version is indeed unlocked");
+        assert_eq!(
+            failures
+                .iter()
+                .map(|f| (f.rel_path.as_str(), f.language.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("Cargo.lock", "manifest:cargo")],
+            "but the report says the lockfile could not be read"
+        );
+    }
+
+    /// Control: an ABSENT lockfile is a legitimately unlocked repo, not a
+    /// parse failure. Without this the diagnostic would fire on every
+    /// unlocked project and be useless as a signal.
+    #[test]
+    fn an_absent_lockfile_is_not_a_parse_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+        )
+        .expect("manifest");
+
+        let (deps, failures) = scan_external_deps_with_diagnostics(tmp.path());
+        assert_eq!(deps.len(), 1);
+        assert!(failures.is_empty(), "{failures:?}");
+    }
 
     fn dep<'a>(deps: &'a [ExternalDep], ecosystem: &str, source_manifest: &str, name: &str) -> &'a ExternalDep {
         deps.iter()

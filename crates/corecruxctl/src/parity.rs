@@ -248,6 +248,13 @@ pub fn parity_living_v1(
     corecrux_base: &str,
 ) -> Result<ParityLivingReportV1, Box<dyn std::error::Error + Send + Sync>> {
     let artifacts = fetch_engine_sample(engine_base, engine_api_key, tenant_id, seed, sample_n)?;
+    // D-18: an empty engine sample compared nothing and reported parity —
+    // indistinguishable from every artifact matching. `generate_parity_pack`
+    // already hard-errors on the identical input (see `sampled_artifacts`
+    // below); this is the same call with the same meaning.
+    if artifacts.is_empty() {
+        return Err("engine sample is empty: no artifacts were compared, so parity is unverified".into());
+    }
 
     let mut mismatches: Vec<ParityMismatchV1> = Vec::new();
     let mut summary = ParitySummaryV1::default();
@@ -2802,23 +2809,20 @@ mod tests {
     }
 
     /// DEFECT PIN (absent signal reads as pass): when the engine returns an
-    /// empty sample, `parity_living_v1` returns a clean report —
-    /// `artifacts_checked: 0`, no mismatches, `Ok` — which a caller reads as
-    /// "the two systems agree". `generate_parity_pack` treats the same input
-    /// as a hard error ("engine sample candidate set is empty",
-    /// `parity.rs:739`); the living driver has no such guard. This test pins
-    /// the CURRENT behaviour of the asymmetry, it does not endorse it.
+    /// empty sample, `parity_living_v1` used to return a clean report —
+    /// `artifacts_checked: 0`, no mismatches, `Ok` — which a caller read as
+    /// "the two systems agree". `generate_parity_pack` already treated the
+    /// same input as a hard error ("engine sample candidate set is empty");
+    /// the living driver now agrees. D-18, fixed in M5 of
+    /// `crux-pinned-defect-remediation-2026-07-31`.
     #[test]
-    fn parity_living_v1_empty_sample_reports_clean_with_nothing_checked() {
+    fn parity_living_v1_empty_sample_is_an_error_not_clean_parity() {
         let (eng_port, eng) = serve_responses(vec![ok(json!({ "tenant_id": "t1", "artifacts": [] }))]);
         let (ccx_port, ccx) = serve_responses(vec![]);
 
-        let report = parity_living_v1("t1", "seed", 5, &base_url(eng_port), "k", &base_url(ccx_port)).unwrap();
-        assert_eq!(report.summary.artifacts_checked, 0);
-        assert_eq!(report.summary.fail, 0);
-        assert!(report.mismatches.is_empty());
-        assert!(report.artifacts.is_empty());
-        assert_eq!(report.sample_n, 5);
+        let err = parity_living_v1("t1", "seed", 5, &base_url(eng_port), "k", &base_url(ccx_port))
+            .expect_err("comparing nothing is not parity");
+        assert!(err.to_string().contains("engine sample is empty"), "{err}");
         let _ = (eng.join(), ccx.join());
     }
 

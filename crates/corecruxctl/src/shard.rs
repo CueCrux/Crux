@@ -495,6 +495,17 @@ fn build_split_checks(
                 split_norm, parent_boundary, child_boundary
             ),
         });
+    } else {
+        // D-28: with no split point supplied — and none recoverable from the
+        // coordinator record — the boundary check was simply OMITTED, so
+        // `ok = checks.iter().all(...)` passed on a verification that never
+        // examined the split at all. Emit the check as unevaluated instead.
+        checks.push(VerifyCheck {
+            name: "split_point_boundary_present".to_string(),
+            ok: false,
+            detail: "no split point supplied and none recorded on the split job; the boundary was NOT verified"
+                .to_string(),
+        });
     }
 
     if let (Some(p), Some(c)) = (parent, child) {
@@ -1835,12 +1846,13 @@ mod tests {
         assert!(!report.ok);
     }
 
-    /// DEFECT-ADJACENT PIN: when neither `--at` nor a matching coordinator
-    /// record supplies a split point, `split_point_boundary_present` is never
-    /// emitted, so a split can be reported `ok` without its boundary ever
-    /// being checked.
+    /// D-28 (inverted pin): when neither `--at` nor a matching coordinator
+    /// record supplied a split point, `split_point_boundary_present` was never
+    /// emitted at all, so `ok = checks.iter().all(...)` passed on a
+    /// verification that never examined the split. Fixed in M7 of
+    /// `crux-pinned-defect-remediation-2026-07-31`.
     #[test]
-    fn verify_split_without_split_point_skips_boundary_check() {
+    fn verify_split_without_split_point_reports_the_boundary_as_unverified() {
         let map = sample_map();
         let (port, h) = serve_responses(vec![(200, shard_map_body(&map)), (200, "[]".to_string())]);
         let base = format!("http://127.0.0.1:{port}");
@@ -1848,8 +1860,14 @@ mod tests {
         let report = verify_split(&base, &base, "shard-0001", "shard-0002", None, None).expect("verify split");
         h.join().ok();
         assert!(report.selected_record.is_none());
-        assert!(report.checks.iter().all(|c| c.name != "split_point_boundary_present"));
-        assert!(report.ok);
+        let boundary = report
+            .checks
+            .iter()
+            .find(|c| c.name == "split_point_boundary_present")
+            .expect("the check is emitted, not omitted");
+        assert!(!boundary.ok, "an unexamined boundary is not a pass");
+        assert!(boundary.detail.contains("NOT verified"), "{}", boundary.detail);
+        assert!(!report.ok, "and the report as a whole is not ok");
     }
 
     #[test]

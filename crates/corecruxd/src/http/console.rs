@@ -11,8 +11,8 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    problem_response, require_http_scopes, require_http_scopes_for_tenant, AppState, HeaderMap, IntoResponse, Json,
-    Path, Query, State, StatusCode,
+    problem_response, require_http_any_scope, require_http_scopes, require_http_scopes_for_tenant, AppState, HeaderMap,
+    IntoResponse, Json, Path, Query, State, StatusCode,
 };
 
 type BoostOverlay = BTreeMap<String, String>;
@@ -2895,6 +2895,13 @@ pub(super) async fn get_console_facts(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     let top_k = query.top_k.unwrap_or(50).clamp(1, 200);
+    if query.as_of_unix_ms.is_some_and(|as_of| as_of < 0) {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "as_of_unix_ms must not be negative; a cutoff that cannot be applied is refused, not ignored",
+        )
+        .into_response();
+    }
 
     let store = state.fact_store.read().await;
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
@@ -2910,7 +2917,14 @@ pub(super) async fn get_console_facts(
 
     // #6 — server-side as-of filter. We compare against `stored_at` (DateTime<Utc>)
     // converted to ms; facts created strictly after the cutoff are dropped.
-    if let Some(as_of) = query.as_of_unix_ms.filter(|t| *t > 0) {
+    //
+    // D-26: this was `.filter(|t| *t > 0)`, so `as_of_unix_ms=0` silently
+    // disabled the cutoff and returned ALL current facts while the response
+    // still echoed the parameter back — a client computing 0 was told it had
+    // time-travelled and had not. Zero is a valid epoch cutoff (nothing had
+    // been stored yet); a negative one is a broken client and is refused
+    // above, so the cutoff either applies or the request fails.
+    if let Some(as_of) = query.as_of_unix_ms {
         visible_facts.retain(|fact| fact.stored_at.timestamp_millis() <= as_of);
     }
 
@@ -3129,6 +3143,19 @@ pub(super) async fn get_console_chunk_preview(
     Path(chunk_digest): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    // D-27: the lookup used to run BEFORE any scope check, so an
+    // unauthorized caller got 404 for an absent digest and 401 for a present
+    // one — an existence oracle over every chunk digest. Require the scope
+    // tenant-agnostically first; the tenant-bound check still follows once the
+    // owning tenant is known.
+    // Gate 1 is the SCOPE rail, checked before the lookup: a caller without
+    // `tenant:content:preview` at all is refused 403 without the digest ever
+    // being resolved, so it learns nothing about existence. `admin:read` does
+    // not buy this rail.
+    if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["tenant:content:preview"]) {
+        return problem.into_response();
+    }
+
     let Some(chunk) = (match crate::console_index::find_chunk(&state.data_dir, &chunk_digest) {
         Ok(chunk) => chunk,
         Err(err) => return problem_response(StatusCode::BAD_REQUEST, err.to_string()),
@@ -3136,10 +3163,13 @@ pub(super) async fn get_console_chunk_preview(
         return problem_response(StatusCode::NOT_FOUND, "chunk metadata not found");
     };
 
-    if let Err(problem) =
-        require_http_scopes_for_tenant(&state.auth, &headers, &["tenant:content:preview"], &chunk.tenant_id)
-    {
-        return problem.into_response();
+    // Gate 2 is the TENANT rail, checked after the lookup because it needs the
+    // owner. D-27, second half: a caller holding the preview scope for one
+    // tenant could still tell another tenant's existing digest (403) from an
+    // absent one (404). Past gate 1 the caller does hold the rail, so the only
+    // thing left to hide is the chunk itself — report it absent.
+    if require_http_scopes_for_tenant(&state.auth, &headers, &["tenant:content:preview"], &chunk.tenant_id).is_err() {
+        return problem_response(StatusCode::NOT_FOUND, "chunk metadata not found");
     }
 
     (
@@ -5044,9 +5074,12 @@ mod tests {
 
         // A cutoff before every write hides everything.
         assert_eq!(fetch(state.clone(), Some(1)).await["visible_count"], 0);
-        // CURRENT behaviour: `as_of_unix_ms = 0` is treated as "no cutoff", not
-        // as "the epoch" — an absent-ish signal reads as pass.
-        assert_eq!(fetch(state, Some(0)).await["visible_count"], 1);
+        // D-26 (inverted pin): `as_of_unix_ms = 0` used to be treated as "no
+        // cutoff" rather than "the epoch", so a client computing 0 silently got
+        // ALL current facts while the response echoed the parameter back. Zero
+        // is a valid epoch cutoff: nothing had been stored yet. Fixed in M7 of
+        // `crux-pinned-defect-remediation-2026-07-31`.
+        assert_eq!(fetch(state, Some(0)).await["visible_count"], 0);
     }
 
     #[tokio::test]
@@ -5276,15 +5309,22 @@ mod tests {
             .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        // NOTE (current behaviour): the preview route resolves the chunk BEFORE
-        // the tenant scope check, so an unauthenticated caller can tell an
-        // unknown digest (404) from a known one. Pinned, not fixed.
+        // D-27 (inverted pin): the preview route used to resolve the chunk
+        // BEFORE the scope check, so an unauthenticated caller could tell an
+        // unknown digest (404) from a known one — an existence oracle over
+        // every chunk digest. The scope is now required tenant-agnostically
+        // first. Fixed in M7 of
+        // `crux-pinned-defect-remediation-2026-07-31`.
         let mut unauthenticated = st_dev();
         unauthenticated.data_dir = state.data_dir.clone();
         let resp = get_console_chunk_preview(State(unauthenticated), Path("deadbeef".to_string()), HeaderMap::new())
             .await
             .into_response();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "presence must not be distinguishable without a credential"
+        );
     }
 
     #[tokio::test]

@@ -37,6 +37,10 @@ pub enum GithubIntegrationError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(
+        "selected repositories file is present but unreadable ({0}); refusing to overwrite it — repair or remove it"
+    )]
+    SelectionUnreadable(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -211,17 +215,38 @@ struct SelectedReposFile {
 }
 
 pub fn list_selected_repos(data_dir: &Path) -> Vec<SelectedRepo> {
-    let path = selected_repos_path(data_dir);
+    match read_selected_repos(&selected_repos_path(data_dir)) {
+        Ok(repos) => repos,
+        Err(err) => {
+            // Read paths still degrade to "nothing selected" so the console
+            // renders, but never silently: the operator's selection is intact
+            // on disk and every write path refuses to clobber it.
+            tracing::warn!(%err, "github-selected-repos-unreadable");
+            Vec::new()
+        }
+    }
+}
+
+/// Read the selection, distinguishing **absent** (a legitimate empty set) from
+/// **present but unreadable** (an operator file we must not silently discard).
+fn read_selected_repos(path: &Path) -> Result<Vec<SelectedRepo>, GithubIntegrationError> {
     if !path.exists() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    match fs::read(&path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<SelectedReposFile>(&b).ok())
-    {
-        Some(file) => file.repos,
-        None => Vec::new(),
-    }
+    let bytes = fs::read(path).map_err(|err| GithubIntegrationError::SelectionUnreadable(err.to_string()))?;
+    let file = serde_json::from_slice::<SelectedReposFile>(&bytes)
+        .map_err(|err| GithubIntegrationError::SelectionUnreadable(err.to_string()))?;
+    Ok(file.repos)
+}
+
+/// Guard every whole-file rewrite of `selected_repos.json`.
+///
+/// A corrupt file read as an *empty* selection, so the next `select_repo`
+/// rewrote the file with just that one repo and the operator's set was gone
+/// with no signal. An unreadable file is not an empty one: refuse the write
+/// and surface why.
+pub(crate) fn ensure_selection_writable(path: &Path) -> Result<(), GithubIntegrationError> {
+    read_selected_repos(path).map(|_| ())
 }
 
 pub fn select_repo(
@@ -293,6 +318,7 @@ pub fn unselect_repo(data_dir: &Path, owner: &str, repo: &str) -> Result<(), Git
 
 fn write_selected_repos(data_dir: &Path, repos: &[SelectedRepo]) -> Result<(), GithubIntegrationError> {
     let path = selected_repos_path(data_dir);
+    ensure_selection_writable(&path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -774,21 +800,44 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// PINS CURRENT BEHAVIOUR (absent-signal-reads-as-pass): a corrupt
-    /// `selected_repos.json` is swallowed and reported as "no repos selected",
-    /// and the next `select_repo` overwrites the unreadable file. Callers get
-    /// no signal that a selection set was lost.
+    /// D-8 (inverted pin): a corrupt `selected_repos.json` was swallowed and
+    /// reported as "no repos selected", and the next `select_repo` overwrote
+    /// the unreadable file — the operator's whole selection was gone with no
+    /// signal. Reads still degrade to empty so the console renders, but every
+    /// write path now refuses to clobber a file it could not read.
     #[test]
-    fn corrupt_selected_repos_file_reads_as_empty_and_is_overwritten() {
+    fn corrupt_selected_repos_file_is_never_overwritten() {
         let dir = temp_dir("corrupt-selected");
         let path = selected_repos_path(&dir);
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         fs::write(&path, b"[[[not json").expect("write");
+
+        let err = select_repo(&dir, "a", "b", false, 1).expect_err("must refuse to overwrite");
         assert!(
-            list_selected_repos(&dir).is_empty(),
-            "corrupt file currently reads as an empty selection set"
+            matches!(err, GithubIntegrationError::SelectionUnreadable(_)),
+            "the operator is told why, not handed a silent success: {err}"
         );
-        select_repo(&dir, "a", "b", false, 1).expect("select over corrupt file");
+        assert!(
+            unselect_repo(&dir, "a", "b").is_err(),
+            "every whole-file rewrite is guarded, not just select"
+        );
+        assert!(set_planning_repo(&dir, "a", "b", true).is_err());
+
+        assert_eq!(
+            fs::read(&path).expect("file still there"),
+            b"[[[not json",
+            "the unreadable file is left exactly as it was, for repair"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Control: an *absent* file is a legitimate empty selection and must stay
+    /// writable. Only present-but-unreadable is refused.
+    #[test]
+    fn an_absent_selection_file_still_accepts_a_first_select() {
+        let dir = temp_dir("absent-selected");
+        assert!(list_selected_repos(&dir).is_empty());
+        select_repo(&dir, "a", "b", false, 1).expect("first select on a fresh install");
         assert_eq!(list_selected_repos(&dir).len(), 1);
         let _ = fs::remove_dir_all(&dir);
     }

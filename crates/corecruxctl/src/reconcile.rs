@@ -198,7 +198,21 @@ fn collect_corecrux_records(opts: &ReconcilePostgresOptions) -> Result<CoreCruxC
         .map(|days| now_unix_ns().saturating_sub((days as u64) * DAY_NS));
     let mut segments = Vec::new();
 
-    for shard_id in list_shards(&shards_root)? {
+    // D-19: a `shards/` directory with no shard subdirectories walked nothing
+    // and returned a clean empty scan, which downstream read as genuine parity.
+    // The neighbouring cases already fail loudly — an absent `shards/` errors
+    // out of `list_shards`, and an absent MANIFEST errors out of
+    // `load_manifest_segment_catalog` — so this one should too.
+    let shard_ids = list_shards(&shards_root)?;
+    if shard_ids.is_empty() {
+        return Err(format!(
+            "no shards under {}: nothing was scanned, so an empty reconcile result is not parity",
+            shards_root.display()
+        )
+        .into());
+    }
+
+    for shard_id in shard_ids {
         if opts.shard.is_some_and(|expected| expected != shard_id) {
             continue;
         }
@@ -467,9 +481,35 @@ fn now_unix_ns() -> u64 {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{has_partial_scope, reconcile_maps, ReconcilePostgresOptions, ReconcileRecord};
+    use super::{
+        collect_corecrux_records, has_partial_scope, reconcile_maps, ReconcilePostgresOptions, ReconcileRecord,
+    };
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    /// D-19: a `shards/` directory with no shard subdirectories walked nothing
+    /// and returned a clean empty scan, which downstream read as genuine
+    /// parity. The neighbouring absent-`shards/` and absent-MANIFEST cases
+    /// already failed loudly.
+    #[test]
+    fn collect_corecrux_records_rejects_a_shards_dir_with_no_shards() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("shards")).unwrap();
+        let mut opts = base_options();
+        opts.data_dir = tmp.path().to_path_buf();
+
+        let err = collect_corecrux_records(&opts).expect_err("an empty shard set is not parity");
+        assert!(err.to_string().contains("no shards"), "{err}");
+    }
+
+    /// Sibling case, unchanged: an absent `shards/` directory still fails.
+    #[test]
+    fn collect_corecrux_records_still_rejects_an_absent_shards_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut opts = base_options();
+        opts.data_dir = tmp.path().to_path_buf();
+        assert!(collect_corecrux_records(&opts).is_err());
+    }
 
     fn base_options() -> ReconcilePostgresOptions {
         ReconcilePostgresOptions {
@@ -1854,19 +1894,18 @@ mod tests {
 
     /// DEFECT PIN (absent signal reads as pass): a `shards/` directory with no
     /// shard subdirectories — a wrong `--data-dir`, or a node whose data was
-    /// never mounted — yields `Ok` with zero records, zero segments scanned,
-    /// and `partial: false`. Downstream that becomes a report with
-    /// `checked: 0, matched: 0, missingInPostgres: 0`, indistinguishable from
-    /// genuine parity. This test pins the CURRENT behaviour; it is not an
-    /// endorsement of it.
+    /// never mounted — used to yield `Ok` with zero records, which downstream
+    /// became `checked: 0, matched: 0, missingInPostgres: 0`, indistinguishable
+    /// from genuine parity. The neighbouring absent-`shards/` and
+    /// absent-MANIFEST cases already failed loudly; this one now does too.
+    /// D-19, fixed in M5 of `crux-pinned-defect-remediation-2026-07-31`.
     #[test]
-    fn collect_corecrux_records_empty_shards_root_is_silently_clean() {
+    fn collect_corecrux_records_empty_shards_root_is_an_error() {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("shards")).unwrap();
-        let result = super::collect_corecrux_records(&options_for(tmp.path())).unwrap();
-        assert_eq!(result.segments_scanned, 0);
-        assert!(result.records.is_empty());
-        assert!(!result.partial);
+        let err =
+            super::collect_corecrux_records(&options_for(tmp.path())).expect_err("an empty shard set is not parity");
+        assert!(err.to_string().contains("no shards"), "{err}");
     }
 
     /// A shard directory without a MANIFEST is a hard error, not an empty scan.

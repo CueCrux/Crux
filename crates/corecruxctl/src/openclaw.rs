@@ -294,7 +294,7 @@ pub fn parse_workspace(root: &Path) -> Result<Workspace, DynErr> {
     let mut paths = Vec::new();
     let mut sqlite = Vec::new();
     let mut budget = WalkBudget::default();
-    collect(root, &mut paths, &mut sqlite, 0, &mut budget)?;
+    collect(root, root, &mut paths, &mut sqlite, 0, &mut budget)?;
     paths.sort();
     sqlite.sort();
 
@@ -349,6 +349,7 @@ fn rel_path(root: &Path, path: &Path) -> String {
 }
 
 fn collect(
+    root: &Path,
     dir: &Path,
     out: &mut Vec<PathBuf>,
     sqlite: &mut Vec<String>,
@@ -372,7 +373,7 @@ fn collect(
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if !name.starts_with('.') && name != "node_modules" {
-                collect(&path, out, sqlite, depth + 1, budget)?;
+                collect(root, &path, out, sqlite, depth + 1, budget)?;
             }
         } else if file_type.is_file() {
             if is_markdown(&path) {
@@ -386,7 +387,12 @@ fn collect(
                 }
                 out.push(path);
             } else if is_sqlite(&path) {
-                sqlite.push(rel_path(dir, &path));
+                // D-28: this was `rel_path(dir, ...)` — relative to the
+                // directory being walked, not the workspace root — so a nested
+                // index reported a path that resolves nowhere from the root the
+                // operator passed, and two indexes in different subtrees could
+                // collide on the same recorded name.
+                sqlite.push(rel_path(root, &path));
             }
         }
     }
@@ -941,10 +947,22 @@ fn fetch_openclaw_facts(
                 all.push(f.clone());
             }
         }
-        let has_more = body
-            .get("has_more")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        // D-20: this walk is documented as failing closed, but `has_more` was
+        // `.unwrap_or(false)` — a daemon that omitted the field truncated the
+        // walk after page 1 and the scan then reported "no anomalies" over a
+        // partial view. An absent pagination signal is not "no more pages".
+        let has_more = match body.get("has_more") {
+            Some(value) => value.as_bool().ok_or_else(|| {
+                format!("fact export response `has_more` is not a boolean at page {}; refusing to report a possibly truncated scan", page + 1)
+            })?,
+            None => {
+                return Err(format!(
+                    "fact export response omits `has_more` at page {}; refusing to report a possibly truncated scan",
+                    page + 1
+                )
+                .into())
+            }
+        };
         cursor = body.get("next_cursor").and_then(|v| v.as_str()).map(str::to_string);
         if !has_more || cursor.is_none() {
             return Ok(all);
@@ -1137,6 +1155,45 @@ pub fn scan_run(opts: &ScanOptions) -> Result<(), DynErr> {
 mod tests {
     use super::*;
     use std::fs::{self, File, FileTimes};
+
+    /// D-20: the export walk is documented as failing closed, but `has_more`
+    /// was `.unwrap_or(false)`. A daemon that omitted the field truncated the
+    /// walk after page 1, and the scan then reported "no anomalies" over a
+    /// partial view. An absent pagination signal is not "no more pages".
+    #[test]
+    fn fact_export_refuses_a_response_that_omits_has_more() {
+        let page = serde_json::json!({ "facts": [], "next_cursor": "c1" }).to_string();
+        let (port, handle) = crate::test_support::serve_responses(vec![(200, page)]);
+
+        let err = fetch_openclaw_facts(&format!("http://127.0.0.1:{port}"), None, &agent())
+            .expect_err("an omitted has_more must not read as 'no more pages'");
+        assert!(err.to_string().contains("omits `has_more`"), "{err}");
+        let _ = handle.join();
+    }
+
+    /// The same for a `has_more` of the wrong type.
+    #[test]
+    fn fact_export_refuses_a_non_boolean_has_more() {
+        let page = serde_json::json!({ "facts": [], "has_more": "yes", "next_cursor": "c1" }).to_string();
+        let (port, handle) = crate::test_support::serve_responses(vec![(200, page)]);
+
+        let err = fetch_openclaw_facts(&format!("http://127.0.0.1:{port}"), None, &agent())
+            .expect_err("a non-boolean has_more is not a pagination signal");
+        assert!(err.to_string().contains("not a boolean"), "{err}");
+        let _ = handle.join();
+    }
+
+    /// Control: an explicit `has_more: false` still ends the walk cleanly.
+    #[test]
+    fn fact_export_ends_cleanly_on_an_explicit_has_more_false() {
+        let page = serde_json::json!({ "facts": [], "has_more": false }).to_string();
+        let (port, handle) = crate::test_support::serve_responses(vec![(200, page)]);
+
+        let facts = fetch_openclaw_facts(&format!("http://127.0.0.1:{port}"), None, &agent())
+            .expect("an explicit end of pagination is fine");
+        assert!(facts.is_empty());
+        let _ = handle.join();
+    }
 
     const POISON_REL: &str = "memory/2026-06-02.md";
 
@@ -1504,12 +1561,13 @@ mod tests {
         assert_eq!(ws.memories[0].entity, "openclaw:doc");
     }
 
-    /// **Pinned current behaviour, not an endorsement.** `collect` records a
-    /// SQLite index relative to the directory it was found in, not to the
-    /// workspace root, so `sub/index.db` and a root-level `index.db` both report
-    /// as `index.db` — the nesting is lost from the operator-facing note.
+    /// D-28 (inverted pin): `collect` recorded a SQLite index relative to the
+    /// directory it was found in rather than the workspace root, so
+    /// `sub/index.db` and a root-level `index.db` both reported as `index.db`
+    /// — the nesting was lost and two indexes could collide on one name. Fixed
+    /// in M7 of `crux-pinned-defect-remediation-2026-07-31`.
     #[test]
-    fn sqlite_indexes_are_noted_relative_to_their_own_directory() {
+    fn sqlite_indexes_are_noted_relative_to_the_workspace_root() {
         let dir = tiny_workspace("SOUL.md", "# soul");
         fs::create_dir_all(dir.path().join("sub")).unwrap();
         fs::write(dir.path().join("sub/index.db"), "not really sqlite").unwrap();
@@ -1517,7 +1575,8 @@ mod tests {
         let ws = parse_workspace(dir.path()).unwrap();
         assert_eq!(
             ws.sqlite_files,
-            vec!["index.db".to_string(), "other.sqlite3".to_string()]
+            vec!["other.sqlite3".to_string(), "sub/index.db".to_string()],
+            "the nested index keeps its path relative to the workspace root"
         );
         assert_eq!(ws.memories.len(), 1, "sqlite files are noted, never parsed");
     }
@@ -1793,19 +1852,19 @@ mod tests {
         assert!(reqs[1].contains("cursor=cur-2"), "{}", reqs[1]);
     }
 
-    /// **Pinned current behaviour, not an endorsement.** The module claims the
-    /// export "fails closed: a pagination overrun errors rather than returning a
-    /// partial view", but that only covers the page *cap*. A response that omits
-    /// `has_more` (or returns it with no `next_cursor`) stops the walk and the
-    /// truncated page set is reported as the complete store — an absent signal
-    /// read as "no more data".
+    /// D-20 (inverted pin): the module documents the export as failing closed,
+    /// but that only covered the page *cap*. A response omitting `has_more`
+    /// stopped the walk and the truncated page set was reported as the complete
+    /// store — an absent signal read as "no more data". Fixed in M5 of
+    /// `crux-pinned-defect-remediation-2026-07-31`.
     #[test]
-    fn fetch_openclaw_facts_stops_silently_when_has_more_is_absent() {
+    fn fetch_openclaw_facts_refuses_a_response_that_omits_has_more() {
         let body = serde_json::json!({"facts": [{"entity": "openclaw:doc", "key": "a"}]}).to_string();
         let (port, handle) = crate::test_support::serve_responses(vec![(200, body)]);
-        let facts = fetch_openclaw_facts(&format!("http://127.0.0.1:{port}"), None, &agent()).unwrap();
+        let err = fetch_openclaw_facts(&format!("http://127.0.0.1:{port}"), None, &agent())
+            .expect_err("an omitted has_more must not read as 'no more pages'");
         handle.join().ok();
-        assert_eq!(facts.len(), 1, "one page accepted as the whole store, with no error");
+        assert!(err.to_string().contains("omits `has_more`"), "{err}");
     }
 
     #[test]

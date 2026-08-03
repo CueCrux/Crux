@@ -1674,11 +1674,29 @@ fn load_v1_events_log_comparator(
     let mut fallback_seq: u64 = 0;
 
     loop {
+        // D-16: `read_exact` reports a file that ends 1-3 bytes into a record
+        // length prefix with the same `UnexpectedEof` as a file that ends
+        // cleanly on a record boundary, so a log truncated mid-prefix parsed as
+        // COMPLETE. (Truncation mid-*payload* already errored below.) Read
+        // incrementally so the two are distinguishable.
         let mut len_buf = [0u8; 4];
-        match input.read_exact(&mut len_buf) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(err) => return Err(err.into()),
+        let mut filled = 0usize;
+        while filled < len_buf.len() {
+            match input.read(&mut len_buf[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        if filled == 0 {
+            break; // clean end of log, on a record boundary
+        }
+        if filled < len_buf.len() {
+            return Err(format!(
+                "v1 events.log is truncated: it ends {filled} byte(s) into a 4-byte record length prefix"
+            )
+            .into());
         }
 
         let len = u32::from_be_bytes(len_buf) as usize;
@@ -2441,6 +2459,7 @@ mod tests {
             checkpoint_bytes_match_expected: true,
             error_code: None,
             error_message: None,
+            checks_skipped: Vec::new(),
         };
         assert_eq!(control_verify_status(&report), AuditStatusV1::Pass);
     }
@@ -2470,6 +2489,7 @@ mod tests {
             checkpoint_bytes_match_expected: false,
             error_code: None,
             error_message: None,
+            checks_skipped: Vec::new(),
         };
         assert_eq!(control_verify_status(&report), AuditStatusV1::Fail);
     }
@@ -2499,6 +2519,7 @@ mod tests {
             checkpoint_bytes_match_expected: true,
             error_code: None,
             error_message: None,
+            checks_skipped: Vec::new(),
         };
         assert_eq!(control_verify_status(&report), AuditStatusV1::Warn);
     }
@@ -4524,19 +4545,30 @@ mod tests {
         assert_eq!(rows[1].seq, 2);
     }
 
-    /// KNOWN BEHAVIOUR, pinned deliberately: a trailing fragment shorter than
-    /// the 4-byte length prefix is treated as clean EOF and silently dropped,
-    /// so a log truncated mid-prefix parses as complete. Reported, not changed.
+    /// D-16 (inverted pin): a trailing fragment shorter than the 4-byte length
+    /// prefix used to be treated as clean EOF and silently dropped, so a log
+    /// truncated mid-prefix parsed as COMPLETE. Truncation mid-*payload*
+    /// already errored — the two must not disagree.
     #[test]
-    fn load_v1_events_log_comparator_trailing_partial_prefix_is_silently_ignored() {
+    fn load_v1_events_log_comparator_rejects_a_trailing_partial_prefix() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("events.log");
-        let mut blob = v1_record(&v1_envelope(Some(1), "e1", "t1", "knowledge", "s1"));
-        blob.extend_from_slice(&[0u8, 0u8]); // half a length prefix
-        std::fs::write(&path, &blob).expect("write log");
 
+        for partial in 1..4usize {
+            let mut blob = v1_record(&v1_envelope(Some(1), "e1", "t1", "knowledge", "s1"));
+            blob.extend_from_slice(&vec![0u8; partial]);
+            std::fs::write(&path, &blob).expect("write log");
+
+            let err = load_v1_events_log_comparator(&path, "t1", "knowledge", "s1")
+                .expect_err("a truncated length prefix is not a clean end of log");
+            assert!(err.to_string().contains("truncated"), "{partial}-byte fragment: {err}");
+        }
+
+        // Control: a log ending exactly on a record boundary still parses.
+        let blob = v1_record(&v1_envelope(Some(1), "e1", "t1", "knowledge", "s1"));
+        std::fs::write(&path, &blob).expect("write log");
         let rows = load_v1_events_log_comparator(&path, "t1", "knowledge", "s1").expect("parse");
-        assert_eq!(rows.len(), 1, "trailing fragment is currently ignored, not rejected");
+        assert_eq!(rows.len(), 1);
     }
 
     // ══════════════════════════════════════════════════════════════════

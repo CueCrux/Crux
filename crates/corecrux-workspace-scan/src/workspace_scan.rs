@@ -93,12 +93,33 @@ pub struct ScanDiagnostics {
     /// non-regular-file check. Empty/off remains absent from serialized scans.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub v3_skipped_files: Vec<V3SkippedFile>,
+    /// Source files that were read but could **not be parsed**.
+    ///
+    /// Distinct from `v3_skipped_files`, which records only files rejected
+    /// *before* parsing. Without this, an unparsable file produced an entry
+    /// with no symbols — byte-identical to a file that genuinely declares
+    /// none — so `blast_radius` and dead-code answers for its contents read
+    /// as "nothing here". A parse that could not run is not a parse that ran
+    /// and found nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parse_failures: Vec<ParseFailure>,
 }
 
 impl ScanDiagnostics {
     pub fn is_empty(&self) -> bool {
-        self.unresolved_routes.is_empty() && self.v3_skipped_files.is_empty()
+        self.unresolved_routes.is_empty() && self.v3_skipped_files.is_empty() && self.parse_failures.is_empty()
     }
+}
+
+/// A file the scanner read but could not parse. See
+/// [`ScanDiagnostics::parse_failures`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParseFailure {
+    pub rel_path: String,
+    /// The parser that was applied: `rust`, `manifest:<ecosystem>`, or the
+    /// polyglot language id.
+    pub language: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1328,8 +1349,30 @@ pub fn walk_dir<F: FnMut(&Path, &Path)>(root: &Path, base: &Path, visit: &mut F)
             if name.starts_with('.') || name == "target" || name == "node_modules" {
                 continue;
             }
+            // `DirEntry::file_type` does NOT follow the link, where
+            // `Path::is_dir` does. Descending through a symlink lets
+            // `a/b/loop -> <root>` recurse without bound on the live
+            // repo-watch path.
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(err) => {
+                    tracing::warn!(path = %path.display(), ?err, "failed to read file type during scan walk");
+                    continue;
+                }
+            };
             let rel = path.strip_prefix(root).unwrap_or(&path);
-            if path.is_dir() {
+            if file_type.is_symlink() {
+                // Never descend through a link. A link that resolves to a
+                // non-directory is still handed to `visit`, so the callers'
+                // own guards can record *why* it was skipped — dropping it
+                // here would make an unreadable file indistinguishable from
+                // an absent one.
+                if !path.is_dir() {
+                    visit(rel, &path);
+                }
+                continue;
+            }
+            if file_type.is_dir() {
                 stack.push(path);
             } else {
                 visit(rel, &path);
@@ -1858,6 +1901,60 @@ fn count_substring(haystack: &str, needle: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D-5: `walk_dir` pushed any `path.is_dir()`, which *follows* symlinks,
+    /// so `a/b/loop -> <root>` recursed without bound. It is the walker behind
+    /// both the AST and the polyglot scanners on the live repo-watch path;
+    /// `discover_manifests` already guarded the same shape.
+    ///
+    /// The walk is run on a worker thread with a hard join deadline: before
+    /// the fix this test does not fail, it *hangs*, and an unbounded repro
+    /// would wedge CI.
+    #[cfg(unix)]
+    #[test]
+    fn walk_dir_does_not_follow_symlinks_into_a_loop() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        let nested = root.join("a/b");
+        std::fs::create_dir_all(&nested).expect("nested dirs");
+        std::fs::write(root.join("top.rs"), "fn main() {}").expect("top file");
+        std::fs::write(nested.join("deep.rs"), "fn deep() {}").expect("deep file");
+        // Points back at the root: following it recurses for ever.
+        std::os::unix::fs::symlink(&root, nested.join("loop")).expect("dir symlink");
+        // A symlink to a *file* is still visited — callers record why they
+        // skip it, and dropping it here would hide it entirely.
+        std::os::unix::fs::symlink(root.join("top.rs"), root.join("alias.rs")).expect("file symlink");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let walker = std::thread::spawn(move || {
+            let mut seen: Vec<String> = Vec::new();
+            let mut visits = 0usize;
+            let outcome = walk_dir(&root, &root, &mut |rel, _abs| {
+                visits += 1;
+                // Belt and braces: cap the work even if the walk is unbounded,
+                // so a regression fails the deadline rather than filling disk
+                // or spinning for ever.
+                if visits <= 10_000 {
+                    seen.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            });
+            let _ = tx.send((outcome.is_ok(), visits, seen));
+        });
+
+        let (ok, visits, mut seen) = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("walk_dir must terminate on a symlink loop");
+        walker.join().expect("walker thread");
+
+        assert!(ok, "the walk completes cleanly");
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec!["a/b/deep.rs".to_string(), "alias.rs".to_string(), "top.rs".to_string()],
+            "the directory loop is not descended; the file alias is still surfaced"
+        );
+        assert_eq!(visits, 3, "no path is visited twice via the loop");
+    }
 
     #[test]
     fn parses_pub_fn_and_struct_lines() {

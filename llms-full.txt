@@ -381,11 +381,68 @@ field fails the check.
   `tampered_component_fails_verification`, `tampered_signed_field_fails_signature`.
   The export → offline-verify → tamper-rejection cycle is a release-blocking CI gate.
 
+## I7 — an absent signal is never a pass
+
+```
+value(check could not run)  ≠  value(check ran and passed)
+```
+
+A check that **could not be evaluated** must never return the value of a check that ran
+and succeeded. This is the single most-repeated defect in this codebase: a two-round
+coverage sweep in July 2026 found 28 pre-existing defects, and **19 of them were this one
+bug** (ExecPlan `crux-pinned-defect-remediation-2026-07-31`). It reappears because the
+lossy form is always the shorter one to write — `.unwrap_or(true)`, `is_none_or(...)`,
+`.ok()`, an early `return Ok(())`, or simply not emitting the check at all.
+
+Three sanctioned shapes, in order of preference:
+
+1. **Add an explicit skipped state** — `checks_skipped: Vec<String>` on the report,
+   listing checks that were *requested but not evaluable*. `ok` keeps its meaning, so an
+   operator who deliberately verifies without an input is not broken; a caller that needs
+   every requested check to have actually run gates on `ok && checks_skipped.is_empty()`.
+   This is the house idiom. Use it wherever an operator could reasonably have omitted the
+   input.
+2. **Fail closed** — return an error. Correct only when the absent signal has *no*
+   legitimate cause (a truncated log, an empty sample where the neighbouring call already
+   hard-errors, a pagination field the protocol requires).
+3. **Reconcile sent against acknowledged** — where a count exists on both sides, compare
+   them rather than copying one across.
+
+Two rules keep the mechanism honest:
+
+- **Absent ≠ skipped.** An input class that is *wholly absent* means the caller never
+  asked for that check; it must NOT be listed. A `checks_skipped` that is non-empty on
+  every ordinary run is useless as a gate. Every fix in the ExecPlan above ships with a
+  control test asserting the absent-input case is not flagged.
+- **Only what the operator configured.** Tightening a check must not start requiring an
+  input the operator never opted into — see `verify_jwt_hs256`, where `iss`/`aud` become
+  required *only* when they are pinned.
+
+- **established:** `checks_skipped` on `EvidenceVerifyReportV1`, `ControlVerifyReportV1`
+  and `SnapshotVerifyReport` (`corecruxctl/src/evidence.rs`, `snapshot.rs`);
+  `X509VerifyReport::checks_skipped` (`corecruxctl/src/c2pa_x509.rs`, the originating
+  precedent — commit `5dd75fc`, `incident:2026-07-28`);
+  `ScanDiagnostics::parse_failures` (`corecruxd/src/workspace_scan.rs`) for the scanner
+  form; `AuthMode::parse` and `required_spec_claims` (`corecruxd/src/auth.rs`) for the
+  fail-closed form.
+- **checked:** the pin-inversion tests named in the ExecPlan's milestones, each paired
+  with an absent-input control.
+
+**Review checklist item.** On any verification, scan, or auth path, treat these as
+requiring a written justification in review: `unwrap_or(true)`, `is_none_or(...)`,
+`.ok()` discarding an error, `.filter(|_| …exists())`, an early `return Ok(())` on
+missing input, and a check that is simply not pushed when its input is absent. A clippy
+lint was considered and **rejected** as too blunt: every one of these is correct in the
+majority of its uses (`is_none_or` on an optional filter bound, `.ok()` on a
+best-effort log write), so a lint would train reviewers to `#[allow]` it rather than
+read it. The signal is the *path*, not the combinator.
+
 ---
 
 *The I1–I4 formulas are quoted from current source (the audit's guessed forms for I1 and I3
 matched the implementation verbatim; I2/I4 field names confirmed exact). I5–I6 statements are
-derived from the named builders/verifiers and their proving tests, not quoted formulas.*
+derived from the named builders/verifiers and their proving tests, not quoted formulas. I7 is
+a codified defect class, not a code-derived formula.*
 
 # ============================================================
 # BEGIN docs/agent/GLOSSARY.md
