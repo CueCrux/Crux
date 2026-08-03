@@ -68,8 +68,16 @@ classify_status() {
 # First `Status:` line (bare or `> **Status:**`) in the first ~30 lines.
 leading_status() {
   local f="$1" line
-  line="$(head -30 "$f" 2>/dev/null | grep -iEm1 '^[[:space:]]*(>[[:space:]]*\*\*status:\*\*|>?[[:space:]]*\*{0,2}status:)' || true)"
-  sed -E 's/^[[:space:]]*(>[[:space:]]*)*([-*][[:space:]]+)?(\*+)?[[:space:]]*[Ss][Tt][Aa][Tt][Uu][Ss]:[[:space:]]*(\*+)?[[:space:]]*//; s/[[:space:]]+$//' <<<"$line"
+  # CASE-SENSITIVE `Status:`, matching the daemon's parser
+  # (work_execplans.rs `parse_plan`). The `-i` this used to carry made the sweep
+  # disagree with the board: a lowercase `status: draft` in YAML frontmatter
+  # matched first and shadowed the real declaration below it, so three plans
+  # (corecrux-kv-compression, corecrux-kv-offload, llm-gate-completion) were
+  # reported as "Status reads: draft" and counted as needing a flip while
+  # actually declaring `Status: Parked` / `Status: Archived` correctly. A sweep
+  # that reports drift the board does not see is worse than no sweep.
+  line="$(head -30 "$f" 2>/dev/null | grep -Em1 '^[[:space:]]*(>[[:space:]]*(\*\*)?Status:|Status:)' || true)"
+  sed -E 's/^[[:space:]]*(>[[:space:]]*)*([-*][[:space:]]+)?(\*+)?[[:space:]]*Status:[[:space:]]*(\*+)?[[:space:]]*//; s/[[:space:]]+$//' <<<"$line"
 }
 
 # fetch_work → echoes the /v1/work?source=all JSON to stdout, or returns 2 if the

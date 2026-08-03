@@ -346,10 +346,31 @@ pub fn parse_plan(md: &str) -> ParsedPlan {
         }
 
         if out.status_line.is_none() {
-            if let Some(rest) = trimmed.strip_prefix("Status:") {
-                out.status_line = Some(rest.trim().to_string());
-            } else if let Some(rest) = trimmed.strip_prefix("> **Status:**") {
-                out.status_line = Some(rest.trim().to_string());
+            // Three spellings, all in live use. The bare and bolded-blockquote
+            // forms were recognised from the start; `> Status:` (blockquote, no
+            // bold) was not, and **117 of 1,115 plans use it** — 10.5% whose
+            // human declaration the board silently ignored, falling through to
+            // fact-inference instead. `agent-config-wizard-2026-05-19` reads
+            // `> Status: COMPLETE — M0–M7 deployed` and did not count as
+            // declared-complete. Measured 2026-08-03.
+            //
+            // Case-sensitive on purpose: a lowercase `status: draft` in YAML
+            // frontmatter is metadata, not a declaration, and matching it would
+            // shadow the real `Status:` line further down (three plans do
+            // exactly this — see scripts/reconcile-execplan-status.sh, which had
+            // that bug and now matches these same rules).
+            let rest = trimmed
+                .strip_prefix("> **Status:**")
+                .or_else(|| trimmed.strip_prefix(">**Status:**"))
+                .or_else(|| trimmed.strip_prefix("Status:"))
+                .or_else(|| {
+                    trimmed
+                        .strip_prefix('>')
+                        .map(str::trim_start)
+                        .and_then(|r| r.strip_prefix("Status:"))
+                });
+            if let Some(rest) = rest {
+                out.status_line = Some(rest.trim_start_matches('*').trim().to_string());
             }
         }
 
@@ -1825,6 +1846,40 @@ pub fn apply_default_orchestrator(items: &mut [WorkItem], default_id: &str) {
 
 #[cfg(test)]
 mod tests {
+
+    /// `> Status:` — blockquote, no bold — is a live spelling: 117 of 1,115
+    /// plans used it on 2026-08-03 and every one of those declarations was
+    /// invisible to the board, which fell through to fact-inference instead.
+    #[test]
+    fn status_is_read_from_all_three_spellings() {
+        for md in [
+            "# P\n\nStatus: Complete\n",
+            "# P\n\n> **Status:** Complete\n",
+            "# P\n\n> Status: Complete\n",
+        ] {
+            let parsed = parse_plan(md);
+            assert_eq!(
+                parsed.status_line.as_deref(),
+                Some("Complete"),
+                "failed to read status from: {md:?}"
+            );
+        }
+    }
+
+    /// A lowercase `status:` in YAML frontmatter is metadata, not a declaration.
+    /// Matching it would shadow the real `Status:` line below — three plans
+    /// (`corecrux-kv-*`, `llm-gate-*`) carry `status: draft` in frontmatter while
+    /// declaring `Status: Parked` / `Status: Archived` further down.
+    #[test]
+    fn frontmatter_status_does_not_shadow_the_real_declaration() {
+        let md = "---\nstatus: draft\n---\n\n# P\n\nStatus: Parked — superseded by the follow-up\n";
+        let parsed = parse_plan(md);
+        assert!(
+            parsed.status_line.as_deref().unwrap_or("").starts_with("Parked"),
+            "frontmatter shadowed the declaration: {:?}",
+            parsed.status_line
+        );
+    }
     use super::*;
     use chrono::TimeZone;
     use corecrux_memory::fact_store::StoreFact;
