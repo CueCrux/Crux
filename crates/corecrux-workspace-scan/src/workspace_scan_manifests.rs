@@ -58,8 +58,9 @@ pub fn scan_external_deps(root: &Path) -> Vec<ExternalDep> {
     scan_external_deps_with_diagnostics(root).0
 }
 
-/// Like [`scan_external_deps`], but also returns the manifests whose lockfile
-/// was **present and unparsable**.
+/// Like `scan_external_deps`, but also returns the manifests whose lockfile
+/// was **present and unparsable**. (Not an intra-doc link: `scan_external_deps`
+/// is `#[cfg(test)]`, so it does not exist in a `cargo doc` build.)
 ///
 /// D-23: an unparsable lockfile was byte-identical to a missing one — both
 /// simply yielded unlocked versions — and `v3_skipped_files` records only
