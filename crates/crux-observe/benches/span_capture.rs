@@ -128,6 +128,7 @@ fn bench_ring(c: &mut Criterion) {
         duration_ns: 4_200,
         depth: 1,
         had_error: false,
+        outcome: Default::default(),
     };
 
     group.bench_function("push_uncontended", |b| {

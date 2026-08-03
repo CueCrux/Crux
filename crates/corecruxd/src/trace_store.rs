@@ -567,6 +567,7 @@ mod tests {
             duration_ns: 100,
             depth: 0,
             had_error: false,
+            outcome: Default::default(),
         }
     }
 
