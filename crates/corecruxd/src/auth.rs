@@ -1400,15 +1400,98 @@ pub fn require_http_any_scope_for_tenant(
     Ok(())
 }
 
+/// Proof that this request was authorised for exactly this tenant.
+///
+/// The field is private to this module and there is no public constructor that
+/// takes a tenant, so a `TenantScope` can only come from an authorization check
+/// that named the tenant it carries. Reads on the tenant-partitioned planes take
+/// `&TenantScope` rather than `&str`, which makes "authorise tenant A, then read
+/// tenant B" — the mutation the M2 isolation suite had to catch from outside the
+/// type system — not expressible in a handler.
+///
+/// **What this proves and what it does not.** It proves a check named this
+/// tenant. It does not prove the tenant exists, is entitled, or is the caller's
+/// only tenant. It is an authorization-provenance marker, and the guarantee it
+/// carries stops at the HTTP handler plane: `TraceStore::load_for_tenant` and
+/// `repo_registry::load_scan_json` still take `&str`, because they have callers
+/// with no request behind them (repo watching, retention). Handlers cannot read
+/// a tenant they did not authorise; that is the claim, and it is the whole claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantScope(String);
+
+/// The stamp on facts written before their plane was tenant-partitioned.
+///
+/// Mirrors `corecrux_memory::fact_store::default_tenant_hash`. Named here rather
+/// than spelled `"default"` at each read site so the legacy rule is one thing to
+/// find and one thing to change.
+pub const LEGACY_FACT_TENANT: &str = "default";
+
+impl TenantScope {
+    /// The daemon's own capture tenant, for the tenant-blind fallback path.
+    ///
+    /// Deliberately takes no argument: it cannot name someone else's tenant, and
+    /// `grep` finds every place that reaches for it. This is process
+    /// configuration rather than request provenance, so a surface resolving its
+    /// tenant this way still cannot be hosted — see M3b of
+    /// `crux-code-intel-pro-hosted-surface-2026-07-28`.
+    pub fn daemon_capture() -> Self {
+        Self(crate::trace_store::TraceStore::capture_tenant())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether this scope is the daemon's own capture tenant.
+    ///
+    /// Facts written before a plane was tenant-partitioned are attributed here
+    /// and nowhere else: they were captured by this process under this
+    /// configuration, so attributing them to whoever happens to ask would
+    /// recreate the leak the partitioning closed. Mirrors the legacy-span rule
+    /// in `trace_store.rs`.
+    pub fn is_daemon_capture(&self) -> bool {
+        self.0 == crate::trace_store::TraceStore::capture_tenant()
+    }
+
+    /// Whether a stored fact stamped `fact_tenant` may be read in this scope.
+    ///
+    /// A fact written before its plane was partitioned carries the fact store's
+    /// default stamp (`corecrux_memory::fact_store::default_tenant_hash`, i.e.
+    /// `"default"`), which is not any requester's tenant. Those rows go to the
+    /// daemon's capture tenant and to nobody else: they were written by this
+    /// process under this configuration, so attributing them there is accurate,
+    /// while attributing them to whoever happens to ask would recreate the leak
+    /// the partitioning closed. Same rule, same reasoning, as the legacy-span
+    /// case in `trace_store.rs`.
+    pub fn may_read_fact_tenant(&self, fact_tenant: &str) -> bool {
+        fact_tenant == self.0 || (fact_tenant == LEGACY_FACT_TENANT && self.is_daemon_capture())
+    }
+}
+
+impl std::fmt::Display for TenantScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Authorise `required` scopes *and* access to `tenant_id`, returning the scope
+/// the caller may then read with.
+///
+/// The tenant is returned rather than discarded on purpose. Every caller used to
+/// authorise against `tenant_id` and then pass a separately-supplied `&str` to
+/// the read, leaving nothing but a test to assert the two were the same string.
 #[allow(clippy::result_large_err)]
 pub fn require_http_scopes_for_tenant(
     auth: &Authz,
     headers: &HeaderMap,
     required: &[&str],
     tenant_id: &str,
-) -> Result<(), ProblemResponse> {
+) -> Result<TenantScope, ProblemResponse> {
     if auth.mode == AuthMode::Off {
-        return Ok(());
+        // Off authorises everything, and did so before this returned a scope.
+        // Minting for the requested tenant preserves that exactly: the caller
+        // reads what it named, as it always has.
+        return Ok(TenantScope(tenant_id.to_string()));
     }
 
     let ctx = http_ctx(auth, headers)?;
@@ -1423,7 +1506,7 @@ pub fn require_http_scopes_for_tenant(
     }
 
     require_tenant_allowed(&ctx.tenants, tenant_id)?;
-    Ok(())
+    Ok(TenantScope(tenant_id.to_string()))
 }
 
 #[allow(clippy::result_large_err, dead_code)]
