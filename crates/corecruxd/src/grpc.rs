@@ -1201,22 +1201,14 @@ mod tests {
     use crate::control::{ControlV1, TenantThrottleV1};
     use crate::dataplane_store::{AppendError, AppendStatus};
     use crate::pool::DataPlanePool;
-    use crate::shard_map::{LoadedShardMap, RoutingTable};
     use corecrux_proto::dataplane_v1::{
         core_crux_data_plane_v1_server::CoreCruxDataPlaneV1, core_crux_export_v1_server::CoreCruxExportV1,
         AppendBatchRequest, ExportReceiptBundleRequest, ReadFramesRequest, ReadManyBatchedRequest,
         ReadManyFramesBatchedRequest, ReadStreamBatchedRequest, ReadStreamRequest, ReadStreamResponse,
     };
-    use corecrux_types::{
-        compute_shard_map_v1_blake3_hex, format_u64_hex, HashRange, NodeAddr, ShardDescriptor, ShardMapV1, ShardState,
-        SHARDMAP_HASH_FN_V1, SHARDMAP_KEY_ENCODING_V1, SHARDMAP_V1,
-    };
     use std::collections::HashMap;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
-    use std::time::Duration;
     use tokio::sync::RwLock;
     use tonic::{Code, Request};
 
@@ -1255,69 +1247,6 @@ mod tests {
         }
     }
 
-    fn test_node(node_id: &str, http_addr: &str, grpc_addr: &str) -> NodeAddr {
-        NodeAddr {
-            node_id: node_id.to_string(),
-            grpc_addr: grpc_addr.to_string(),
-            http_addr: http_addr.to_string(),
-        }
-    }
-
-    fn test_routing_with_followers(followers: Vec<NodeAddr>) -> RoutingTable {
-        let mut map = ShardMapV1 {
-            v: SHARDMAP_V1,
-            cluster_id: "test".to_string(),
-            version: 1,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            hash_fn: SHARDMAP_HASH_FN_V1.to_string(),
-            key_encoding: SHARDMAP_KEY_ENCODING_V1.to_string(),
-            shards: vec![ShardDescriptor {
-                shard_id: "shard-0001".to_string(),
-                epoch: 3,
-                state: ShardState::Active,
-                ranges: vec![HashRange {
-                    start_inclusive: format_u64_hex(0),
-                    end_exclusive: format_u64_hex(0),
-                }],
-                leader: test_node("leader-a", "http://leader-a.http", "http://leader-a.grpc"),
-                followers: Some(followers),
-                data_dir: None,
-                gpu_id: Some(0),
-            }],
-            blake3: String::new(),
-            prev_blake3: None,
-        };
-        map.blake3 = compute_shard_map_v1_blake3_hex(&map).expect("compute shardmap hash");
-        RoutingTable::new(LoadedShardMap {
-            current_version: 1,
-            shard_map: map,
-        })
-        .expect("routing table")
-    }
-
-    fn test_replicated_commit_service(node_id: &str) -> DataPlaneService {
-        let build = corecrux_types::BuildInfo {
-            version: "test".to_string(),
-            commit: "test".to_string(),
-        };
-        let metrics = crate::metrics::Metrics::new(&build, "corecruxd-test");
-        let auth = Authz::from_env(AuthMode::Off).expect("auth off");
-        let cfg = DataPlaneServiceConfig {
-            node_id: node_id.to_string(),
-            commit_level: CommitLevel::ReplicatedCommit,
-            replicated_commit_timeout_ms: 2_000,
-            replicated_commit_require_all_followers: true,
-            replay_batch_max_events: 128,
-            replay_batch_max_bytes: 1024 * 1024,
-            replay_many_max_reads: 128,
-            replay_use_batched_rpc_default: false,
-            store_lock_strategy: StoreLockStrategy::RwLock,
-            append_lane_enabled: false,
-            append_lane_scope: AppendLaneScope::Shard,
-        };
-        DataPlaneService::new(None, Arc::new(RwLock::new(ControlV1::default())), metrics, auth, cfg)
-    }
-
     fn test_service_with_auth(node_id: &str, auth_mode: AuthMode) -> DataPlaneService {
         test_service_with_control(node_id, auth_mode, ControlV1::default())
     }
@@ -1331,6 +1260,17 @@ mod tests {
         auth_mode: AuthMode,
         pool: Option<DataPlanePool>,
         control: ControlV1,
+    ) -> DataPlaneService {
+        test_service_with_lane_config(node_id, auth_mode, pool, control, false, AppendLaneScope::Shard)
+    }
+
+    fn test_service_with_lane_config(
+        node_id: &str,
+        auth_mode: AuthMode,
+        pool: Option<DataPlanePool>,
+        control: ControlV1,
+        append_lane_enabled: bool,
+        append_lane_scope: AppendLaneScope,
     ) -> DataPlaneService {
         let build = corecrux_types::BuildInfo {
             version: "test".to_string(),
@@ -1348,8 +1288,8 @@ mod tests {
             replay_many_max_reads: 128,
             replay_use_batched_rpc_default: false,
             store_lock_strategy: StoreLockStrategy::RwLock,
-            append_lane_enabled: false,
-            append_lane_scope: AppendLaneScope::Shard,
+            append_lane_enabled,
+            append_lane_scope,
         };
         DataPlaneService::new(pool, Arc::new(RwLock::new(control)), metrics, auth, cfg)
     }
@@ -1360,62 +1300,6 @@ mod tests {
             .metadata_mut()
             .insert("x-corecrux-scopes", scopes.parse().expect("valid test scope value"));
         request
-    }
-
-    fn spawn_replication_receiver_once(
-        response_status: u16,
-        response_body: serde_json::Value,
-    ) -> (String, std::thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind receiver");
-        listener.set_nonblocking(false).expect("receiver blocking mode");
-        let addr = listener.local_addr().expect("receiver addr");
-        let body = response_body.to_string();
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept replication request");
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-
-            let mut buf = Vec::<u8>::with_capacity(4096);
-            let mut chunk = [0u8; 1024];
-            let mut header_end: Option<usize> = None;
-            while header_end.is_none() {
-                let n = stream.read(&mut chunk).expect("read request bytes");
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|pos| pos + 4);
-            }
-
-            let mut content_len = 0usize;
-            if let Some(end) = header_end {
-                if let Ok(headers) = std::str::from_utf8(&buf[..end]) {
-                    for line in headers.lines() {
-                        let lower = line.to_ascii_lowercase();
-                        if let Some(raw) = lower.strip_prefix("content-length:") {
-                            content_len = raw.trim().parse::<usize>().unwrap_or(0);
-                        }
-                    }
-                }
-                let already = buf.len().saturating_sub(end);
-                if already < content_len {
-                    let mut rem = vec![0u8; content_len - already];
-                    stream.read_exact(&mut rem).expect("read remaining request body");
-                }
-            }
-
-            let status_text = if response_status == 200 { "OK" } else { "ERROR" };
-            let response = format!(
-                "HTTP/1.1 {response_status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write replication response");
-            let _ = stream.flush();
-        });
-
-        (format!("http://{addr}"), handle)
     }
 
     fn mk_event(seq: u64, payload_len: usize) -> corecrux_storage::StoredEvent {
@@ -3821,5 +3705,504 @@ mod tests {
                 .expect("grpc-status header present"),
             "13",
         );
+    }
+
+    /// Every panic payload shape must still produce INTERNAL. A `String`
+    /// payload (the common `panic!("{fmt}")` case) took a different downcast
+    /// branch from `&str`, and a non-string payload took a third — all three
+    /// must return the same trailers-only status rather than dropping the
+    /// connection.
+    #[test]
+    fn handle_grpc_panic_maps_every_payload_shape_to_internal() {
+        let payloads: Vec<Box<dyn std::any::Any + Send + 'static>> = vec![
+            Box::new("static str panic"),
+            Box::new("owned string panic".to_string()),
+            Box::new(42_u32),
+        ];
+        for payload in payloads {
+            let response = super::handle_grpc_panic(payload);
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            assert_eq!(response.headers().get("grpc-status").expect("grpc-status header"), "13");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .expect("content-type header"),
+                "application/grpc"
+            );
+            assert_eq!(
+                response.headers().get("grpc-message").expect("grpc-message header"),
+                "internal error (panic recovered)"
+            );
+        }
+    }
+
+    // ── apply_tenant_throttle rejection paths ────────────────────────
+
+    /// `maxInFlight: 0` is an explicit operator stop, not "no limit". It must
+    /// reject before any token is consumed, with the retry hint the client
+    /// needs to back off.
+    #[test]
+    fn apply_tenant_throttle_rejects_zero_max_in_flight() {
+        let mut control = ControlV1::default();
+        control.valves.throttle.set_retry_after_ms(Some(250));
+        control.tenant_throttles.push(TenantThrottleV1 {
+            tenant_id: "stopped".to_string(),
+            events_per_sec: None,
+            bytes_per_sec: None,
+            max_in_flight: Some(0),
+        });
+        let svc = test_service_with_control("node-a", AuthMode::Off, control.clone());
+
+        let status = svc
+            .apply_tenant_throttle(&control, "stopped", &[])
+            .err()
+            .expect("maxInFlight=0 must reject");
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        let body: serde_json::Value = serde_json::from_str(status.message()).expect("problem json");
+        assert_eq!(body["code"], "TENANT_THROTTLE_INFLIGHT");
+        assert_eq!(body["retryAfterMs"], 250);
+        assert_eq!(
+            body["tenantIdHash"],
+            super::DataPlaneService::tenant_id_hash_label("stopped")
+        );
+        // The rejected caller must not be counted as in flight.
+        let state = svc.tenant_throttle_state.lock().expect("throttle state");
+        assert_eq!(state["stopped"].in_flight, 0);
+    }
+
+    /// Concurrency cap: the Nth+1 concurrent append is refused while N guards
+    /// are live, and admitted again once one is dropped.
+    #[test]
+    fn apply_tenant_throttle_rejects_when_in_flight_is_at_the_cap() {
+        let mut control = ControlV1::default();
+        control.tenant_throttles.push(TenantThrottleV1 {
+            tenant_id: "busy".to_string(),
+            events_per_sec: None,
+            bytes_per_sec: None,
+            max_in_flight: Some(1),
+        });
+        let svc = test_service_with_control("node-a", AuthMode::Off, control.clone());
+
+        let first = svc
+            .apply_tenant_throttle(&control, "busy", &[])
+            .expect("first call admitted");
+        let status = svc
+            .apply_tenant_throttle(&control, "busy", &[])
+            .err()
+            .expect("second concurrent call must reject");
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        let body: serde_json::Value = serde_json::from_str(status.message()).expect("problem json");
+        assert_eq!(body["code"], "TENANT_THROTTLE_INFLIGHT");
+        assert!(
+            body["message"].as_str().unwrap_or_default().contains("max_in_flight=1"),
+            "message must name the cap: {body}"
+        );
+
+        drop(first);
+        svc.apply_tenant_throttle(&control, "busy", &[])
+            .expect("slot freed by the dropped guard");
+    }
+
+    /// A throttled tenant's rate rejection carries the distinct
+    /// `TENANT_THROTTLE_RATE` code so operators can tell a rate refusal from a
+    /// concurrency refusal.
+    #[test]
+    fn apply_tenant_throttle_rate_rejection_uses_its_own_code() {
+        let mut control = ControlV1::default();
+        control.tenant_throttles.push(TenantThrottleV1 {
+            tenant_id: "byte-limited".to_string(),
+            events_per_sec: None,
+            bytes_per_sec: Some(0),
+            max_in_flight: None,
+        });
+        let svc = test_service_with_control("node-a", AuthMode::Off, control.clone());
+        let events = vec![corecrux_proto::dataplane_v1::AppendEvent {
+            event_id: "e1".to_string(),
+            occurred_at: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "test".to_string(),
+            content_type: "application/json".to_string(),
+            payload: b"payload".to_vec(),
+        }];
+
+        let status = svc
+            .apply_tenant_throttle(&control, "byte-limited", &events)
+            .err()
+            .expect("bytesPerSec=0 must reject");
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        let body: serde_json::Value = serde_json::from_str(status.message()).expect("problem json");
+        assert_eq!(body["code"], "TENANT_THROTTLE_RATE");
+        assert_eq!(body["retryAfterMs"], 50, "default retry hint when none configured");
+    }
+
+    /// A guard whose tenant has already been evicted from the throttle map must
+    /// drop cleanly rather than resurrecting an entry with a wrapped counter.
+    #[test]
+    fn tenant_in_flight_guard_missing_entry_is_a_noop() {
+        let state = Arc::new(StdMutex::new(HashMap::new()));
+        {
+            let _guard = super::TenantInFlightGuard {
+                state: state.clone(),
+                tenant_id: Some("already-evicted".to_string()),
+            };
+        }
+        assert!(state.lock().expect("throttle state").is_empty());
+    }
+
+    // ── append lanes ─────────────────────────────────────────────────
+
+    /// With global-scope lanes enabled the single lane is pre-built at
+    /// construction, so the hot path never takes the dynamic-lane map lock.
+    #[tokio::test]
+    async fn append_lane_for_key_uses_the_prebuilt_global_lane() {
+        let svc = test_service_with_lane_config(
+            "node-a",
+            AuthMode::Off,
+            None,
+            ControlV1::default(),
+            true,
+            AppendLaneScope::Global,
+        );
+        assert!(svc.append_static_lanes.contains_key("global"));
+        let lane = svc.append_lane_for_key("global").await;
+        assert!(
+            Arc::ptr_eq(&lane, svc.append_static_lanes.get("global").expect("static lane")),
+            "global lane must come from the prebuilt map"
+        );
+        assert!(
+            svc.append_dynamic_lanes.lock().await.is_empty(),
+            "static hit must not populate the dynamic map"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_lane_for_key_falls_back_to_a_dynamic_lane() {
+        let svc = test_service_with_lane_config(
+            "node-a",
+            AuthMode::Off,
+            None,
+            ControlV1::default(),
+            true,
+            AppendLaneScope::Shard,
+        );
+        assert!(svc.append_static_lanes.is_empty(), "shard lanes are created lazily");
+        let first = svc.append_lane_for_key("shard:shard-0001").await;
+        let second = svc.append_lane_for_key("shard:shard-0001").await;
+        assert!(Arc::ptr_eq(&first, &second), "same key must reuse one lane");
+        assert_eq!(svc.append_dynamic_lanes.lock().await.len(), 1);
+    }
+
+    /// The lane key is what serialises concurrent appends. Global scope must
+    /// collapse every shard onto one key; shard scope must not.
+    #[test]
+    fn append_lane_key_reflects_the_configured_scope() {
+        let route = |shard_id: &str| crate::shard_map::RouteDecision {
+            stream_hash: 7,
+            shard_id: shard_id.to_string(),
+            epoch: 1,
+            shard_map_version: 1,
+            leader_grpc_addr: "http://leader.grpc".to_string(),
+            leader_node_id: "leader-a".to_string(),
+            gpu_id: None,
+        };
+
+        let global = test_service_with_lane_config(
+            "node-a",
+            AuthMode::Off,
+            None,
+            ControlV1::default(),
+            true,
+            AppendLaneScope::Global,
+        );
+        assert_eq!(global.append_lane_key(&route("shard-0001"), 7), "global");
+        assert_eq!(global.append_lane_key(&route("shard-0002"), 7), "global");
+
+        let sharded = test_service_with_lane_config(
+            "node-a",
+            AuthMode::Off,
+            None,
+            ControlV1::default(),
+            true,
+            AppendLaneScope::Shard,
+        );
+        assert_eq!(sharded.append_lane_key(&route("shard-0001"), 7), "shard:shard-0001");
+        assert_ne!(
+            sharded.append_lane_key(&route("shard-0001"), 7),
+            sharded.append_lane_key(&route("shard-0002"), 7)
+        );
+    }
+
+    /// Lanes disabled must pre-build nothing, even in global scope — otherwise
+    /// a disabled feature still serialises appends.
+    #[test]
+    fn build_static_append_lanes_respects_enabled_and_scope() {
+        let cfg = |append_lane_enabled: bool, append_lane_scope: AppendLaneScope| DataPlaneServiceConfig {
+            node_id: "node-a".to_string(),
+            commit_level: CommitLevel::LocalCommit,
+            replicated_commit_timeout_ms: 2_000,
+            replicated_commit_require_all_followers: true,
+            replay_batch_max_events: 128,
+            replay_batch_max_bytes: 1024 * 1024,
+            replay_many_max_reads: 128,
+            replay_use_batched_rpc_default: false,
+            store_lock_strategy: StoreLockStrategy::RwLock,
+            append_lane_enabled,
+            append_lane_scope,
+        };
+        assert!(super::build_static_append_lanes(None, &cfg(false, AppendLaneScope::Global)).is_empty());
+        assert!(super::build_static_append_lanes(None, &cfg(false, AppendLaneScope::Shard)).is_empty());
+        assert!(super::build_static_append_lanes(None, &cfg(true, AppendLaneScope::Shard)).is_empty());
+        let global = super::build_static_append_lanes(None, &cfg(true, AppendLaneScope::Global));
+        assert_eq!(global.len(), 1);
+        assert!(global.contains_key("global"));
+    }
+
+    // ── follower watermark metadata parsing ──────────────────────────
+
+    /// A metadata value that is not valid ASCII must be an explicit
+    /// `INVALID_ARGUMENT`, never silently treated as "header absent" — a
+    /// replication read would then skip the follower watermark check entirely.
+    #[test]
+    fn parse_min_follower_watermark_rejects_non_ascii_metadata() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-corecrux-min-watermark-segment-seq",
+            axum::http::HeaderValue::from_bytes(&[0xC3, 0xA9]).expect("non-ascii header value"),
+        );
+        let meta = tonic::metadata::MetadataMap::from_headers(headers);
+        let status = super::parse_min_follower_watermark_from_meta(&meta)
+            .err()
+            .expect("non-ascii must be rejected");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status
+            .message()
+            .contains("invalid x-corecrux-min-watermark-segment-seq"));
+    }
+
+    #[test]
+    fn parse_min_follower_watermark_trims_surrounding_whitespace() {
+        let mut meta = tonic::metadata::MetadataMap::new();
+        meta.insert(
+            "x-corecrux-min-watermark-segment-seq",
+            "  42  ".parse().expect("metadata value"),
+        );
+        assert_eq!(
+            super::parse_min_follower_watermark_from_meta(&meta).expect("parse"),
+            Some(42)
+        );
+    }
+
+    // ── unsigned write-confirmation queue ────────────────────────────
+
+    /// Without a signing key the drain must be a no-op: silently emptying the
+    /// backlog would discard the audit debt it exists to record.
+    #[test]
+    #[serial_test::serial]
+    fn drain_unsigned_queue_is_a_noop_without_a_signing_key() {
+        let _env = WRITE_CONFIRMATION_ENV_LOCK.lock();
+        std::env::remove_var(WRITE_CONFIRMATION_SIGNING_KEY_ENV);
+        let svc = test_service_with_auth("node-a", AuthMode::Off);
+        for commit_seq in 0..3u64 {
+            assert!(
+                svc.queue_unsigned_write_confirmation(corecrux_storage::WriteConfirmationMaterialV1 {
+                    commit_seq,
+                    segment_id: 1,
+                    receipt_hash: [0x22; 32],
+                })
+            );
+        }
+        svc.drain_unsigned_write_confirmation_queue();
+        assert_eq!(
+            svc.unsigned_write_confirmation_queue
+                .lock()
+                .expect("unsigned queue")
+                .len(),
+            3,
+            "backlog must survive a drain attempt with no key"
+        );
+    }
+
+    /// Crossing the warn threshold must still accept the confirmation — the
+    /// depth warning is observability, not a second rejection point.
+    #[test]
+    fn queue_unsigned_write_confirmation_accepts_past_the_warn_threshold() {
+        let svc = test_service_with_auth("node-a", AuthMode::Off);
+        for commit_seq in 0..=super::WRITE_CONFIRMATION_UNSIGNED_QUEUE_WARN_DEPTH as u64 {
+            assert!(
+                svc.queue_unsigned_write_confirmation(corecrux_storage::WriteConfirmationMaterialV1 {
+                    commit_seq,
+                    segment_id: 2,
+                    receipt_hash: [0x33; 32],
+                }),
+                "confirmation {commit_seq} must be retained"
+            );
+        }
+        assert_eq!(
+            svc.unsigned_write_confirmation_queue
+                .lock()
+                .expect("unsigned queue")
+                .len(),
+            super::WRITE_CONFIRMATION_UNSIGNED_QUEUE_WARN_DEPTH + 1
+        );
+    }
+
+    // ── write-confirmation material ──────────────────────────────────
+
+    /// An accepted outcome that carries no frame location must not be dropped
+    /// from the commitment; only the segment id stays at its default.
+    #[test]
+    fn fallback_write_confirmation_material_covers_outcomes_without_location() {
+        let with_location = super::AppendOutcome {
+            status: AppendStatus::Appended,
+            seq: 5,
+            header_hash: [0x01; 32],
+            payload_hash: [0x02; 32],
+            error_code: None,
+            error_message: None,
+            location: Some(corecrux_storage::FrameLocation {
+                shard_id: 1,
+                epoch: 1,
+                segment_seq: 9,
+                offset: 0,
+            }),
+        };
+        let without_location = super::AppendOutcome {
+            status: AppendStatus::Appended,
+            seq: 6,
+            header_hash: [0x03; 32],
+            payload_hash: [0x04; 32],
+            error_code: None,
+            error_message: None,
+            location: None,
+        };
+
+        let only_unlocated = fallback_write_confirmation_material(std::slice::from_ref(&without_location));
+        assert_eq!(only_unlocated.commit_seq, 6);
+        assert_eq!(only_unlocated.segment_id, 0, "no location ⇒ default segment id");
+
+        let mixed = fallback_write_confirmation_material(&[with_location, without_location]);
+        assert_eq!(mixed.commit_seq, 6, "highest accepted seq wins");
+        assert_eq!(mixed.segment_id, 9, "highest located segment wins");
+        assert_ne!(
+            mixed.receipt_hash, only_unlocated.receipt_hash,
+            "the located outcome must be inside the commitment"
+        );
+    }
+
+    // ── signing-key loading ──────────────────────────────────────────
+
+    /// All four base64 alphabets the loader advertises must actually work; a
+    /// key that fails to decode silently disables signing, which downgrades
+    /// every write confirmation to `unsigned: true`.
+    #[test]
+    #[serial_test::serial]
+    fn load_write_confirmation_signing_key_accepts_every_advertised_base64_alphabet() {
+        let _env = WRITE_CONFIRMATION_ENV_LOCK.lock();
+        let secret = [0x5A_u8; 32];
+        let expected = ed25519_dalek::SigningKey::from_bytes(&secret);
+        let encodings = [
+            base64::engine::general_purpose::STANDARD.encode(secret),
+            base64::engine::general_purpose::STANDARD_NO_PAD.encode(secret),
+            base64::engine::general_purpose::URL_SAFE.encode(secret),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret),
+        ];
+        for encoded in encodings {
+            std::env::set_var(WRITE_CONFIRMATION_SIGNING_KEY_ENV, &encoded);
+            let key = load_write_confirmation_signing_key().expect("key must decode");
+            assert_eq!(key.to_bytes(), expected.to_bytes(), "failed for {encoded}");
+        }
+        std::env::remove_var(WRITE_CONFIRMATION_SIGNING_KEY_ENV);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_write_confirmation_signing_key_rejects_undecodable_material() {
+        let _env = WRITE_CONFIRMATION_ENV_LOCK.lock();
+        std::env::set_var(WRITE_CONFIRMATION_SIGNING_KEY_ENV, "not base64 at all !!!");
+        assert!(load_write_confirmation_signing_key().is_none());
+        std::env::remove_var(WRITE_CONFIRMATION_SIGNING_KEY_ENV);
+    }
+
+    // ── AppendError → Status mapping ─────────────────────────────────
+
+    /// A backend I/O fault is retryable from the client's point of view, so it
+    /// must map to `UNAVAILABLE` rather than `INTERNAL`.
+    #[test]
+    fn map_append_error_io_backend_maps_to_unavailable() {
+        let status = map_append_error(AppendError::IoBackend("disk offline".to_string()));
+        assert_eq!(status.code(), Code::Unavailable);
+        assert!(status.message().contains("disk offline"));
+    }
+
+    // ── batch limit resolution ───────────────────────────────────────
+
+    /// A caller may only ever narrow the configured ceilings, and the byte
+    /// floor keeps a tiny request from producing single-event messages.
+    #[test]
+    fn resolve_batch_limits_clamps_caller_supplied_values() {
+        let svc = test_service_with_auth("node-a", AuthMode::Off);
+        let request = |max_events_per_message: u32, max_bytes_per_message: u32| ReadStreamBatchedRequest {
+            base: None,
+            max_events_per_message,
+            max_bytes_per_message,
+        };
+
+        // Below the configured ceiling → honoured verbatim.
+        assert_eq!(super::resolve_batch_limits(&request(16, 4096), &svc.cfg), (16, 4096));
+        // Above the configured ceiling → clamped down to config.
+        assert_eq!(
+            super::resolve_batch_limits(&request(u32::MAX, u32::MAX), &svc.cfg),
+            (svc.cfg.replay_batch_max_events, svc.cfg.replay_batch_max_bytes)
+        );
+        // Byte floor: 1 byte would otherwise make every message one event.
+        assert_eq!(super::resolve_batch_limits(&request(1, 1), &svc.cfg), (1, 1024));
+    }
+
+    // ── replication bearer normalisation ─────────────────────────────
+
+    /// An operator who already wrote `Bearer …` into the env must not get a
+    /// double-prefixed `Bearer Bearer …` header (which the follower rejects).
+    #[test]
+    #[serial_test::serial]
+    fn replication_auth_bearer_preserves_an_existing_bearer_prefix() {
+        for configured in ["Bearer already-prefixed", "bEaReR mixed-case"] {
+            std::env::set_var("CORECRUXD_REPLICATION_AUTH_BEARER", configured);
+            assert_eq!(replication_auth_bearer_value(), configured);
+        }
+        std::env::set_var("CORECRUXD_REPLICATION_AUTH_BEARER", "   ");
+        assert_eq!(
+            replication_auth_bearer_value(),
+            "Bearer replication:write",
+            "whitespace-only override falls back to the default"
+        );
+        std::env::remove_var("CORECRUXD_REPLICATION_AUTH_BEARER");
+    }
+
+    // ── segment seal receipts ────────────────────────────────────────
+
+    /// Without a signing key the seal receipt must be marked `unsigned` and
+    /// carry an empty signature — never an absent flag that reads as signed.
+    #[test]
+    #[serial_test::serial]
+    fn build_segment_seal_receipt_is_marked_unsigned_without_a_key() {
+        let _env = WRITE_CONFIRMATION_ENV_LOCK.lock();
+        std::env::remove_var(WRITE_CONFIRMATION_SIGNING_KEY_ENV);
+        let receipt = build_segment_seal_receipt(corecrux_storage::SegmentSealMaterialV1 {
+            shard_id: 1,
+            epoch: 2,
+            segment_seq: 3,
+            segment_id: corecrux_segment::SegmentId([0x07; 16]),
+            segment_hash: [0x08; 32],
+            previous_segment_seq: None,
+            previous_segment_hash: None,
+            sealed_at_unix_ns: 1_700_000_000_000_000_000,
+            frame_count: 4,
+        });
+        assert!(receipt.unsigned);
+        assert!(receipt.vault_signature.is_empty());
+        assert!(!receipt.previous_segment_present, "no previous segment was supplied");
+        assert_eq!(receipt.previous_segment_seq, 0);
+        assert_eq!(receipt.previous_segment_hash, vec![0u8; 32]);
+        assert_eq!(receipt.frame_count, 4);
     }
 }
