@@ -79,6 +79,6 @@ jobs:
           name: python-sdk-${{ github.sha }}
           path: sdks/python/dist
       - name: Publish to PyPI (OIDC)
-        uses: pypa/gh-action-pypi-publish@v1.14.1 # Docker action version tag; SHA pins are not published manifests
+        uses: pypa/gh-action-pypi-publish@v1.14.2 # Docker action version tag; SHA pins are not published manifests
         with:
           packages-dir: sdks/python/dist

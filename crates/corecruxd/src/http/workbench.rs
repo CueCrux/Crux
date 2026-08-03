@@ -1761,7 +1761,7 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod helper_tests {
     use super::*;
 
@@ -2000,5 +2000,970 @@ mod helper_tests {
         let q: TenantWorkbenchQuery = serde_json::from_value(json!({ "tenant_id": "t1" })).unwrap();
         let resp = get_agent_brief(State(st), HeaderMap::new(), Query(q)).await;
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    // ── Shared fixtures for the handler-level tests below ────────────────
+
+    /// Pro posture with an explicit capability allowlist, auth OFF (scope checks
+    /// bypassed) so a test can isolate the entitlement gate from the auth gate.
+    fn st_pro(services: &[&str]) -> AppState {
+        let mut state = super::super::tests::test_app_state(16);
+        state.operating_mode = crate::product::OperatingMode::ProHybrid;
+        state.enabled_pro_services = services.iter().map(|service| (*service).to_string()).collect();
+        state
+    }
+
+    /// Pro posture with `DevScopes` auth, so 401 (no credential) and 403 (wrong
+    /// scope) can be told apart.
+    fn st_pro_dev(services: &[&str]) -> AppState {
+        let mut state = super::super::tests::test_app_state_with_auth(16, crate::auth::AuthMode::DevScopes);
+        state.operating_mode = crate::product::OperatingMode::ProHybrid;
+        state.enabled_pro_services = services.iter().map(|service| (*service).to_string()).collect();
+        state
+    }
+
+    fn scoped(scopes: &str) -> HeaderMap {
+        super::super::tests::dev_scope_headers(scopes)
+    }
+
+    async fn body_of(resp: axum::response::Response) -> Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 22)
+            .await
+            .expect("read body");
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    }
+
+    fn tenant_query(tenant_id: &str) -> Query<TenantWorkbenchQuery> {
+        Query(TenantWorkbenchQuery {
+            tenant_id: tenant_id.to_string(),
+            project_id: None,
+            limit: None,
+        })
+    }
+
+    fn seed_private(store: &mut FactStore, entity: &str, key: &str, value: &str, private: bool) {
+        store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: entity.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+
+    fn route_hit(method: &str, path: &str, handler_file: Option<&str>) -> crate::workspace_scan::RouteHit {
+        crate::workspace_scan::RouteHit {
+            method: method.to_string(),
+            path: path.to_string(),
+            handler_fn: format!("handler_for_{}", path.replace(['/', '{', '}', '-'], "_")),
+            framework: None,
+            handler_file: handler_file.map(str::to_string),
+            handler_line: handler_file.map(|_| 42),
+            source_file: "crates/corecruxd/src/http/mod.rs".to_string(),
+            source_line: 7,
+        }
+    }
+
+    fn scan_with_routes(routes: Vec<crate::workspace_scan::RouteHit>) -> crate::workspace_scan::WorkspaceScan {
+        let mut scan = crate::workspace_scan::WorkspaceScan {
+            scan_id: "scan-1".to_string(),
+            root_path: "/repo".to_string(),
+            ..Default::default()
+        };
+        scan.stats.route_count = routes.len();
+        scan.routes = routes;
+        scan
+    }
+
+    async fn store_scan(state: &AppState, scan: &crate::workspace_scan::WorkspaceScan) {
+        let mut store = state.fact_store.write().await;
+        seed_private(
+            &mut store,
+            crate::workspace_scan::LATEST_SCAN_ENTITY,
+            crate::workspace_scan::SCAN_KEY,
+            &serde_json::to_string(scan).unwrap(),
+            false,
+        );
+    }
+
+    // ── Pure helpers ─────────────────────────────────────────────────────
+
+    #[test]
+    fn route_matches_accepts_method_path_pair_and_bare_path() {
+        assert!(route_matches("GET /v1/facts", "GET", "/v1/facts"));
+        assert!(route_matches("  /v1/facts  ", "GET", "/v1/facts"));
+        assert!(!route_matches("POST /v1/facts", "GET", "/v1/facts"));
+        assert!(!route_matches("/v1/other", "GET", "/v1/facts"));
+    }
+
+    #[test]
+    fn route_key_is_stable_and_tolerates_missing_fields() {
+        assert_eq!(route_key(&json!({ "method": "GET", "path": "/a" })), "GET /a");
+        // A malformed row degrades to a blank key rather than panicking.
+        assert_eq!(route_key(&json!({})), " ");
+    }
+
+    #[test]
+    fn scope_hints_cover_surface_read_write_and_fallbacks() {
+        // A known workbench surface contributes its capability plus the
+        // read/write admin scope for the method.
+        let read = scope_hints_for_route("GET", "/v1/workbench/audit-triage");
+        assert!(read.contains(&"audit:triage") && read.contains(&"admin:read"));
+        let write = scope_hints_for_route("POST", "/v1/workbench/context-pack");
+        assert!(write.contains(&"context_pack:budgeted") && write.contains(&"admin:write"));
+
+        // Non-surface paths fall through to the heuristic table.
+        assert_eq!(scope_hints_for_route("POST", "/v1/sessions"), vec!["sessions:write"]);
+        assert_eq!(scope_hints_for_route("GET", "/v1/receipts/abc"), vec!["receipts:read"]);
+        assert!(scope_hints_for_route("GET", "/v1/admin/status").contains(&"admin:read"));
+        // Nothing matched → the least-privilege default, never an empty list
+        // (an empty hint list would read as "no scope needed").
+        assert_eq!(scope_hints_for_route("GET", "/healthz"), vec!["query:read"]);
+    }
+
+    #[test]
+    fn surface_for_path_resolves_known_paths_only() {
+        assert_eq!(
+            surface_for_path("/v1/workbench/handoff-v2"),
+            Some(WorkbenchSurface::HandoffV2)
+        );
+        assert_eq!(surface_for_path("/v1/workbench/nope"), None);
+    }
+
+    #[test]
+    fn normalize_path_collapses_every_param_segment() {
+        assert_eq!(normalize_path("/v1/a/{id}/b/{sub}"), "/v1/a/{}/b/{}");
+        assert_eq!(normalize_path("/v1/plain"), "/v1/plain");
+        // An unterminated brace swallows the rest rather than panicking.
+        assert_eq!(normalize_path("/v1/a/{id"), "/v1/a/{}");
+    }
+
+    #[test]
+    fn route_exists_matches_through_param_normalisation() {
+        let scan = scan_with_routes(vec![route_hit("GET", "/v1/work/{id}", Some("http/work.rs"))]);
+        assert!(route_exists(&scan, "GET", "/v1/work/{work_id}"));
+        assert!(route_exists(&scan, "GET/POST", "/v1/work/{id}"), "method list matches");
+        assert!(!route_exists(&scan, "GET", "/v1/work"));
+    }
+
+    #[test]
+    fn terms_drops_short_tokens_and_dedups() {
+        assert_eq!(terms("Deploy to Prod, deploy AT db"), vec!["deploy", "prod"]);
+        assert!(terms("a b c").is_empty());
+        assert_eq!(terms("snake_case_word"), vec!["snake_case_word"]);
+    }
+
+    #[test]
+    fn match_constraints_ranks_by_overlap_and_defaults_severity_to_medium() {
+        let constraints = vec![
+            json!({ "constraint_id": "c1", "assertion": "never delete production data", "severity": "critical" }),
+            json!({ "fact_id": "f2", "value_preview": "prefer smaller commits" }),
+            json!({ "assertion": "" }),
+        ];
+        let matches = match_constraints("delete production data now", &constraints);
+        assert_eq!(matches.len(), 1, "only the overlapping constraint matches");
+        assert_eq!(matches[0]["constraint_id"], "c1");
+        assert_eq!(matches[0]["severity"], "critical");
+
+        // A constraint with no explicit severity is reported as `medium`, not
+        // silently dropped.
+        let matches = match_constraints("prefer smaller commits", &constraints);
+        assert_eq!(matches[0]["constraint_id"], "f2");
+        assert_eq!(matches[0]["severity"], "medium");
+    }
+
+    #[test]
+    fn replay_failure_severity_escalates_on_missing_evidence() {
+        assert_eq!(replay_failure_severity(&[]), "ok");
+        assert_eq!(
+            replay_failure_severity(&[json!({ "categories": ["fact_changed"] })]),
+            "medium"
+        );
+        assert_eq!(
+            replay_failure_severity(&[json!({ "categories": ["fact_changed", "fact_missing"] })]),
+            "high"
+        );
+        assert_eq!(
+            replay_failure_severity(&[json!({ "categories": ["projection_module_unavailable"] })]),
+            "high"
+        );
+        // A row without a categories array must not be read as "high".
+        assert_eq!(replay_failure_severity(&[json!({})]), "medium");
+    }
+
+    #[test]
+    fn living_status_drift_category_names_only_the_drifted_states() {
+        use corecrux_projections::LivingStatusV1 as S;
+        assert_eq!(living_status_drift_category(S::Stale), Some("living_state_stale"));
+        assert_eq!(
+            living_status_drift_category(S::Contested),
+            Some("living_state_contested")
+        );
+        assert_eq!(
+            living_status_drift_category(S::Superseded),
+            Some("living_state_superseded")
+        );
+        assert_eq!(
+            living_status_drift_category(S::Deprecated),
+            Some("living_state_deprecated")
+        );
+        assert_eq!(living_status_drift_category(S::Active), None);
+        assert_eq!(living_status_drift_category(S::Dormant), None);
+    }
+
+    #[test]
+    fn truncate_counts_characters_not_bytes() {
+        // Multi-byte input must not be cut mid-character (a byte slice here
+        // would panic).
+        let out = truncate(&"é".repeat(300), 240);
+        assert_eq!(out.chars().count(), 243, "240 chars + the three-dot marker");
+    }
+
+    #[test]
+    fn normalize_handoff_agent_trims_lowercases_and_drops_blank() {
+        assert_eq!(
+            normalize_handoff_agent(Some("  Claude-Code ")),
+            Some("claude-code".into())
+        );
+        assert_eq!(normalize_handoff_agent(Some("   ")), None);
+        assert_eq!(normalize_handoff_agent(None), None);
+    }
+
+    #[test]
+    fn handoff_agent_lookup_key_folds_vendor_aliases() {
+        for alias in ["claude", "claude-code", "anthropic"] {
+            assert_eq!(handoff_agent_lookup_key(alias), "anthropic");
+        }
+        for alias in ["codex", "codex-cli", "openai"] {
+            assert_eq!(handoff_agent_lookup_key(alias), "openai");
+        }
+        assert_eq!(handoff_agent_lookup_key("mistral"), "mistral");
+    }
+
+    #[test]
+    fn api_drift_report_without_scan_asks_for_a_scan() {
+        let report = api_drift_report(None);
+        assert_eq!(report["status"], "no_workspace_scan");
+        assert_eq!(report["route_count"], 0);
+        assert_eq!(report["queues"][0]["category"], "workspace_scan_missing");
+    }
+
+    #[test]
+    fn api_drift_report_flags_workbench_routes_absent_from_the_scan() {
+        // A scan that knows about exactly one workbench route must still report
+        // the other nine as contract drift.
+        let scan = scan_with_routes(vec![route_hit(
+            "GET",
+            "/v1/workbench/api-drift",
+            Some("http/workbench.rs"),
+        )]);
+        let report = api_drift_report(Some(&scan));
+        assert_eq!(report["status"], "drift_detected");
+        let missing = &report["queues"][1];
+        assert_eq!(missing["category"], "workbench_contract_missing_from_scan");
+        assert_eq!(missing["count"], WorkbenchSurface::all().len() - 1);
+    }
+
+    #[test]
+    fn impacted_routes_matches_by_request_changed_path_and_dedups() {
+        let scan = scan_with_routes(vec![
+            route_hit("GET", "/v1/alpha", Some("crates/corecruxd/src/http/alpha.rs")),
+            route_hit("POST", "/v1/beta", None),
+        ]);
+        // Requested explicitly AND touched by a changed path → one row, not two.
+        let routes = impacted_routes(
+            &scan,
+            &["http/alpha.rs".to_string()],
+            &["GET /v1/alpha".to_string()],
+            false,
+        );
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0]["path"], "/v1/alpha");
+        assert!(routes[0]["storyline"].is_null(), "storyline is opt-in");
+
+        // A route whose handler never resolved is still reachable via the
+        // declaration file.
+        let routes = impacted_routes(&scan, &["http/mod.rs".to_string()], &[], false);
+        assert_eq!(routes.len(), 2);
+
+        assert!(impacted_routes(&scan, &[], &[], false).is_empty());
+    }
+
+    #[tokio::test]
+    async fn recent_receipt_refs_orders_newest_first_and_truncates() {
+        let st = st_free();
+        {
+            let mut store = st.fact_store.write().await;
+            for n in 0..4 {
+                seed_private(&mut store, &format!("__gpu1_receipt__::t1::{n}"), "r", "{}", false);
+            }
+        }
+        let store = st.fact_store.read().await;
+        let refs = recent_receipt_refs(&store, "t1", 2);
+        assert_eq!(refs.len(), 2, "limit is honoured across all three prefixes");
+        let first = refs[0]["stored_at"].as_str().unwrap_or_default();
+        let second = refs[1]["stored_at"].as_str().unwrap_or_default();
+        assert!(first >= second, "newest first");
+    }
+
+    #[test]
+    fn workbench_posture_lists_every_surface_with_a_status() {
+        let st = st_free();
+        let posture = workbench_posture(&st);
+        assert_eq!(posture["schema"], WORKBENCH_CONTRACT_SCHEMA);
+        let surfaces = posture["surfaces"].as_array().unwrap();
+        assert_eq!(surfaces.len(), WorkbenchSurface::all().len());
+        assert!(
+            surfaces.iter().all(|s| s["status"] == "pro_required"),
+            "free posture gates every surface"
+        );
+    }
+
+    // ── Auth and entitlement gates ───────────────────────────────────────
+
+    /// 401 (no credential) and 403 (credential without the scope) are different
+    /// bugs; a regression that collapsed them into one status would be invisible
+    /// to a status-code-only assertion.
+    #[tokio::test]
+    async fn contract_distinguishes_missing_credential_from_missing_scope() {
+        let st = super::super::tests::test_app_state_with_auth(16, crate::auth::AuthMode::DevScopes);
+        assert_eq!(
+            get_workbench_contract(State(st.clone()), HeaderMap::new())
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_workbench_contract(State(st.clone()), scoped("facts:write"))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get_workbench_contract(State(st), scoped("query:read")).await.status(),
+            StatusCode::OK
+        );
+    }
+
+    /// The entitlement gate must run for an authenticated caller too: a valid
+    /// admin scope does not buy a Pro capability.
+    #[tokio::test]
+    async fn admin_scope_does_not_bypass_the_pro_entitlement_gate() {
+        let st = super::super::tests::test_app_state_with_auth(16, crate::auth::AuthMode::DevScopes);
+        let resp = get_agent_brief(State(st), scoped("admin:read"), tenant_query("t1")).await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn pro_gate_402_body_names_the_capability_and_path() {
+        let st = st_free();
+        let resp = post_context_pack(
+            State(st),
+            HeaderMap::new(),
+            Json(ContextPackBody {
+                tenant_id: "t1".to_string(),
+                query: "anything".to_string(),
+                token_budget: 4000,
+                include_private: false,
+                source_labels: Vec::new(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let body = body_of(resp).await;
+        assert_eq!(body["status"], "pro_service_not_enabled");
+        assert_eq!(body["capability"], "context_pack:budgeted");
+        assert_eq!(body["path"], "/v1/workbench/context-pack");
+        assert_eq!(body["fallback"]["reason_code"], "pro_service_not_enabled");
+    }
+
+    #[tokio::test]
+    async fn route_probe_requires_a_credential_before_the_entitlement_gate() {
+        let st = st_pro_dev(&["route_probe:lab"]);
+        let resp = post_route_probe(
+            State(st),
+            HeaderMap::new(),
+            Json(RouteProbeBody {
+                route: "GET /v1/alpha".to_string(),
+                include_storyline: false,
+                include_tests: false,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn every_tenant_scoped_surface_rejects_a_blank_tenant_id() {
+        let st = st_pro(&[
+            "context_pack:budgeted",
+            "impact:preflight",
+            "ledger:history",
+            "audit:triage",
+            "reasoning:timeline",
+            "handoff:v2",
+            "api_drift:check",
+            "policy:simulate",
+        ]);
+        let blank = "   ";
+        assert_eq!(
+            get_command_ledger(State(st.clone()), HeaderMap::new(), tenant_query(blank))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            get_audit_triage(State(st.clone()), HeaderMap::new(), tenant_query(blank))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            get_reasoning_timeline(State(st.clone()), HeaderMap::new(), tenant_query(blank))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            get_api_drift(State(st.clone()), HeaderMap::new(), tenant_query(blank))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post_impact_preflight(
+                State(st.clone()),
+                HeaderMap::new(),
+                Json(ImpactPreflightBody {
+                    tenant_id: blank.to_string(),
+                    changed_paths: Vec::new(),
+                    routes: Vec::new(),
+                    selected_tests: Vec::new(),
+                    include_storyline: false,
+                }),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        // A policy simulation with NO tenant_id at all must fail the same way an
+        // empty one does — an absent tenant is not a pass.
+        assert_eq!(
+            post_policy_simulation(
+                State(st),
+                HeaderMap::new(),
+                Json(PolicySimulationBody {
+                    action: ActionEnrichmentInput {
+                        tenant_id: None,
+                        tool_name: "bash".to_string(),
+                        tool_parameters: json!({}),
+                        action_description: None,
+                        include_first_party_enrichers: false,
+                    },
+                }),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    // ── Context pack ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn context_pack_rejects_empty_query_and_clamps_the_budget() {
+        let st = st_pro(&["context_pack:budgeted"]);
+        let resp = post_context_pack(
+            State(st.clone()),
+            HeaderMap::new(),
+            Json(ContextPackBody {
+                tenant_id: "tnA".to_string(),
+                query: "   ".to_string(),
+                token_budget: 4000,
+                include_private: false,
+                source_labels: Vec::new(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = post_context_pack(
+            State(st),
+            HeaderMap::new(),
+            Json(ContextPackBody {
+                tenant_id: "tnA".to_string(),
+                query: "deployment".to_string(),
+                token_budget: 1,
+                include_private: false,
+                source_labels: vec!["fact_store".to_string()],
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_of(resp).await;
+        assert_eq!(body["pack"]["token_budget"], 128, "budget clamps up to the floor");
+        assert_eq!(body["pack"]["source_labels"][0], "fact_store");
+        assert!(body["receipt"]["receipt_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("workbench:context_pack:"));
+    }
+
+    /// Redaction invariant: a private fact must not ride out in a context pack
+    /// unless the caller explicitly asked for private material.
+    #[tokio::test]
+    async fn context_pack_hides_private_facts_unless_explicitly_requested() {
+        let st = st_pro(&["context_pack:budgeted"]);
+        {
+            let mut store = st.fact_store.write().await;
+            seed_private(&mut store, "tnA::open", "note", "deployment runbook for tnA", false);
+            seed_private(&mut store, "tnA::closed", "note", "deployment secret for tnA", true);
+        }
+        let pack = |include_private: bool| {
+            let st = st.clone();
+            async move {
+                let resp = post_context_pack(
+                    State(st),
+                    HeaderMap::new(),
+                    Json(ContextPackBody {
+                        tenant_id: "tnA".to_string(),
+                        query: "deployment".to_string(),
+                        token_budget: 4000,
+                        include_private,
+                        source_labels: Vec::new(),
+                    }),
+                )
+                .await;
+                assert_eq!(resp.status(), StatusCode::OK);
+                body_of(resp).await
+            }
+        };
+
+        // Opt-in first: at this point exactly the two seeded facts exist. (Each
+        // call persists its own pack as a PRIVATE `__workbench__::` fact, so a
+        // later include_private run would also see the earlier pack.)
+        let with_private = pack(true).await;
+        assert_eq!(with_private["pack"]["items"].as_array().unwrap().len(), 2);
+
+        let public_only = pack(false).await;
+        let items = public_only["pack"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(
+            !serde_json::to_string(items).unwrap().contains("secret"),
+            "private fact text must not transit the pack"
+        );
+    }
+
+    /// Pins CURRENT behaviour: tenant scoping in the context pack is a SUBSTRING
+    /// test over entity/value/key, so a fact belonging to `tnA10` is served to a
+    /// caller asking for `tnA1`. Reported, not fixed.
+    #[tokio::test]
+    async fn context_pack_tenant_scoping_is_substring_not_exact() {
+        let st = st_pro(&["context_pack:budgeted"]);
+        {
+            let mut store = st.fact_store.write().await;
+            seed_private(&mut store, "tnA10::note", "note", "deployment plan for tnA10", false);
+        }
+        let resp = post_context_pack(
+            State(st),
+            HeaderMap::new(),
+            Json(ContextPackBody {
+                tenant_id: "tnA1".to_string(),
+                query: "deployment".to_string(),
+                token_budget: 4000,
+                include_private: false,
+                source_labels: Vec::new(),
+            }),
+        )
+        .await;
+        let body = body_of(resp).await;
+        assert_eq!(
+            body["pack"]["items"].as_array().unwrap().len(),
+            1,
+            "current behaviour: the tnA10 fact leaks into the tnA1 pack"
+        );
+    }
+
+    // ── Command ledger ───────────────────────────────────────────────────
+
+    fn ledger_body(tenant_id: &str, command: &str) -> CommandLedgerBody {
+        CommandLedgerBody {
+            tenant_id: tenant_id.to_string(),
+            command: command.to_string(),
+            args: vec!["--release".to_string()],
+            cwd: Some("/repo".to_string()),
+            exit_status: Some(0),
+            duration_ms: Some(12),
+            started_at_unix_ms: None,
+            completed_at_unix_ms: None,
+            stdout_hash: None,
+            stderr_hash: None,
+            linked_receipts: Vec::new(),
+            project_id: Some("p1".to_string()),
+            work_id: None,
+        }
+    }
+
+    /// Both command-ledger routes are unreachable by design, in both
+    /// directions, even when a caller explicitly asks for `ledger:history`.
+    ///
+    /// `5e6543a` (ExecPlan `crux-command-ledger-claim-truth-2026-07-30`) dropped
+    /// `ledger:history` from `PRO_CAPABILITY_CLAIMS` because nothing has ever
+    /// written a record, so the surface could only render an empty page.
+    /// `ProductPosture::new` filters `enabled_pro_services` through that list,
+    /// so the capability cannot be switched back on from config alone.
+    ///
+    /// `product.rs`'s `workbench_command_ledger_is_not_a_sold_claim_without_a_producer`
+    /// pins this at the posture layer; this pins it at the route layer, so a
+    /// future producer landing must consciously flip both. Until then the
+    /// entitlement gate runs *before* body validation — a blank command still
+    /// yields 402, not 400.
+    #[tokio::test]
+    async fn command_ledger_routes_are_not_sellable_without_a_producer() {
+        let st = st_pro(&["ledger:history"]);
+
+        let resp = post_command_ledger(
+            State(st.clone()),
+            HeaderMap::new(),
+            Json(ledger_body("tnL", "cargo build")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+
+        let resp = get_command_ledger(State(st.clone()), HeaderMap::new(), tenant_query("tnL")).await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+
+        // The entitlement gate precedes body validation: an invalid body is
+        // still 402, never 400, so the refusal cannot be probed for validity.
+        let resp = post_command_ledger(State(st), HeaderMap::new(), Json(ledger_body("tnL", "   "))).await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    // ── Impact preflight / audit triage / timeline ────────────────────────
+
+    #[tokio::test]
+    async fn impact_preflight_without_a_scan_is_honestly_empty() {
+        let st = st_pro(&["impact:preflight"]);
+        let resp = post_impact_preflight(
+            State(st),
+            HeaderMap::new(),
+            Json(ImpactPreflightBody {
+                tenant_id: "tnP".to_string(),
+                changed_paths: vec!["src/lib.rs".to_string()],
+                routes: vec!["GET /v1/facts".to_string()],
+                selected_tests: vec!["t1".to_string()],
+                include_storyline: true,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let pre = body_of(resp).await;
+        let pf = &pre["preflight"];
+        assert_eq!(pf["impacted_routes"].as_array().unwrap().len(), 0);
+        assert_eq!(pf["requested_routes"][0], "GET /v1/facts");
+        // No living-object rows tracked → "not_recorded", NOT "current": an
+        // absent signal must not read as a clean bill of health.
+        assert_eq!(pf["living_objects"]["status"], "not_recorded");
+        assert_eq!(pf["living_objects"]["tracked_artifact_count"], 0);
+        assert_eq!(pf["living_objects"]["changed_path_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn impact_preflight_reports_route_impact_from_a_stored_scan() {
+        let st = st_pro(&["impact:preflight"]);
+        store_scan(
+            &st,
+            &scan_with_routes(vec![route_hit(
+                "GET",
+                "/v1/alpha",
+                Some("crates/corecruxd/src/http/alpha.rs"),
+            )]),
+        )
+        .await;
+        let resp = post_impact_preflight(
+            State(st),
+            HeaderMap::new(),
+            Json(ImpactPreflightBody {
+                tenant_id: "tnP".to_string(),
+                changed_paths: vec!["http/alpha.rs".to_string()],
+                routes: Vec::new(),
+                selected_tests: Vec::new(),
+                include_storyline: false,
+            }),
+        )
+        .await;
+        let pf = body_of(resp).await;
+        let routes = pf["preflight"]["impacted_routes"].as_array().unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0]["path"], "/v1/alpha");
+        assert!(routes[0]["scope_hints"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("query:read")));
+    }
+
+    #[tokio::test]
+    async fn audit_triage_reports_all_four_queues_clean_on_an_empty_store() {
+        let st = st_pro(&["audit:triage"]);
+        let resp = get_audit_triage(State(st), HeaderMap::new(), tenant_query("tnT")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_of(resp).await;
+        let queues = body["queues"].as_array().unwrap();
+        let categories: Vec<&str> = queues.iter().filter_map(|q| q["category"].as_str()).collect();
+        assert_eq!(
+            categories,
+            vec![
+                "receipt_anomalies",
+                "sync_conflicts",
+                "route_resolution_drift",
+                "replay_failures"
+            ]
+        );
+        assert_eq!(queues[0]["severity"], "ok");
+        assert_eq!(queues[3]["severity"], "ok");
+    }
+
+    #[tokio::test]
+    async fn reasoning_timeline_labels_events_by_source_prefix() {
+        let st = st_pro(&["reasoning:timeline"]);
+        {
+            let mut store = st.fact_store.write().await;
+            seed_private(&mut store, "__work__::tnR::w1", "record", "{}", false);
+            seed_private(&mut store, "__gpu1_receipt__::tnR::r1", "record", "{}", false);
+            seed_private(&mut store, "person:alice", "city", "NYC", false);
+        }
+        let resp = get_reasoning_timeline(State(st), HeaderMap::new(), tenant_query("tnR")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_of(resp).await;
+        assert_eq!(body["count"], 2, "unrelated facts are not timeline events");
+        let kinds: BTreeSet<&str> = body["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+        assert!(kinds.contains("work") && kinds.contains("gpu1_compute"));
+    }
+
+    // ── Handoff v2 ───────────────────────────────────────────────────────
+
+    fn handoff_body(tenant_id: &str, goal: &str, session_id: Option<&str>) -> HandoffV2Body {
+        HandoffV2Body {
+            tenant_id: tenant_id.to_string(),
+            goal: goal.to_string(),
+            session_id: session_id.map(str::to_string),
+            project_id: Some("p1".to_string()),
+            source_agent: Some("claude".to_string()),
+            target_agent: Some("codex".to_string()),
+            evidence_refs: vec!["ad_r1".to_string()],
+            next_actions: vec!["run the gate".to_string()],
+        }
+    }
+
+    #[tokio::test]
+    async fn handoff_v2_rejects_a_blank_goal() {
+        let st = st_pro(&["handoff:v2"]);
+        let resp = post_handoff_v2(State(st), HeaderMap::new(), Json(handoff_body("tnH", "  ", None))).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn handoff_v2_packages_session_state_constraints_and_ledger() {
+        let st = st_pro(&["handoff:v2", "ledger:history"]);
+        {
+            let mut sessions = st.session_store.write().await;
+            sessions.put("s-tnH", json!({ "note": "resume here" }), None);
+        }
+        {
+            let mut store = st.fact_store.write().await;
+            seed_private(
+                &mut store,
+                "__constraints__::tnH::c1",
+                "record",
+                r#"{"assertion":"no prod writes","severity":"high"}"#,
+                false,
+            );
+            seed_private(
+                &mut store,
+                "__decisions__::tnH::d1",
+                "record",
+                r#"{"decision":"ship it"}"#,
+                false,
+            );
+        }
+        let resp = post_handoff_v2(
+            State(st),
+            HeaderMap::new(),
+            Json(handoff_body("tnH", "finish M4", Some("s-tnH"))),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_of(resp).await;
+        let package = &body["package"];
+        assert_eq!(package["goal"], "finish M4");
+        assert_eq!(package["session_state"]["state"]["note"], "resume here");
+        assert_eq!(package["constraints"].as_array().unwrap().len(), 1);
+        assert_eq!(package["open_decisions"].as_array().unwrap().len(), 1);
+        assert_eq!(package["evidence_refs"][0], "ad_r1");
+        // Observation emission is opt-in; the default posture adds no id.
+        assert!(body.get("handoff_observation_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn handoff_v2_with_an_unknown_session_id_is_null_not_an_error() {
+        let st = st_pro(&["handoff:v2"]);
+        let resp = post_handoff_v2(
+            State(st),
+            HeaderMap::new(),
+            Json(handoff_body("tnH", "finish M4", Some("nope"))),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_of(resp).await["package"]["session_state"].is_null());
+    }
+
+    // ── Route probe / api drift ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn route_probe_404s_without_a_scan_and_for_an_unknown_route() {
+        let st = st_pro(&["route_probe:lab"]);
+        let probe = |state: AppState, route: &str| {
+            let route = route.to_string();
+            async move {
+                post_route_probe(
+                    State(state),
+                    HeaderMap::new(),
+                    Json(RouteProbeBody {
+                        route,
+                        include_storyline: false,
+                        include_tests: false,
+                    }),
+                )
+                .await
+            }
+        };
+        let resp = probe(st.clone(), "GET /v1/alpha").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(body_of(resp)
+            .await
+            .to_string()
+            .contains("POST /v1/workspace/scan to run one"));
+
+        store_scan(&st, &scan_with_routes(vec![route_hit("GET", "/v1/alpha", None)])).await;
+        let resp = probe(st.clone(), "GET /v1/missing").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // A route string with no method at all also 404s rather than panicking.
+        let resp = probe(st.clone(), "/v1/alpha").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = probe(st, "get /v1/alpha").await;
+        assert_eq!(resp.status(), StatusCode::OK, "method matching is case-insensitive");
+        let body = body_of(resp).await;
+        assert_eq!(body["route"]["path"], "/v1/alpha");
+        assert_eq!(
+            body["warnings"][0], "handler_file_unresolved",
+            "an unresolved handler is surfaced, not silently omitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_drift_handler_reports_the_missing_scan() {
+        let st = st_pro(&["api_drift:check"]);
+        let resp = get_api_drift(State(st), HeaderMap::new(), tenant_query("tnD")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_of(resp).await["status"], "no_workspace_scan");
+    }
+
+    // ── Policy simulation ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn policy_simulation_blocks_on_a_matching_critical_constraint() {
+        let st = st_pro(&["policy:simulate"]);
+        {
+            let mut store = st.fact_store.write().await;
+            seed_private(
+                &mut store,
+                "__constraints__::tnS::c1",
+                "record",
+                r#"{"constraint_id":"c1","assertion":"never delete the production database","severity":"critical","tenant_id":"tnS"}"#,
+                false,
+            );
+        }
+        let resp = post_policy_simulation(
+            State(st),
+            HeaderMap::new(),
+            Json(PolicySimulationBody {
+                action: ActionEnrichmentInput {
+                    tenant_id: Some("tnS".to_string()),
+                    tool_name: "bash".to_string(),
+                    tool_parameters: json!({ "command": "dropdb" }),
+                    action_description: Some("delete the production database".to_string()),
+                    include_first_party_enrichers: false,
+                },
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_of(resp).await;
+        assert_eq!(body["simulation"]["verdict"], "block");
+        assert_eq!(body["simulation"]["matched_constraints"][0]["constraint_id"], "c1");
+        assert_eq!(body["simulation"]["tenant_id"], "tnS");
+    }
+
+    #[tokio::test]
+    async fn policy_simulation_with_no_constraints_matches_nothing() {
+        let st = st_pro(&["policy:simulate"]);
+        let resp = post_policy_simulation(
+            State(st),
+            HeaderMap::new(),
+            Json(PolicySimulationBody {
+                action: ActionEnrichmentInput {
+                    tenant_id: Some("tnS".to_string()),
+                    tool_name: "read_file".to_string(),
+                    tool_parameters: json!({}),
+                    action_description: None,
+                    include_first_party_enrichers: false,
+                },
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_of(resp).await;
+        assert!(body["simulation"]["matched_constraints"].as_array().unwrap().is_empty());
+        assert!(["pass", "warn", "block"].contains(&body["simulation"]["verdict"].as_str().unwrap()));
+    }
+
+    // ── Agent brief ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn agent_brief_reports_memory_sessions_and_ranked_work() {
+        let st = st_pro(&["agent_brief:pro"]);
+        {
+            let mut sessions = st.session_store.write().await;
+            sessions.put("s1", json!({ "note": "hi" }), None);
+        }
+        {
+            let mut store = st.fact_store.write().await;
+            seed_private(
+                &mut store,
+                "__constraints__::tnB::c1",
+                "record",
+                r#"{"assertion":"tnB stays local"}"#,
+                false,
+            );
+        }
+        let resp = get_agent_brief(State(st), HeaderMap::new(), tenant_query("tnB")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_of(resp).await;
+        assert_eq!(body["schema"], "crux.agent_workbench.brief.v1");
+        assert_eq!(body["tenant_id"], "tnB");
+        assert_eq!(body["sessions"]["count"], 1);
+        assert_eq!(body["active_constraints"].as_array().unwrap().len(), 1);
+        assert_eq!(body["open_work_order"], "ranked");
+        assert!(body["workspace"].is_null(), "no scan → honest null, not a stub");
     }
 }
