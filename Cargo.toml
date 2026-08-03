@@ -26,6 +26,7 @@ members = [
   "crates/crux-mcp",
   "crates/crux-session",
   "crates/rcx-capability-token",
+  "crates/rcx-revocation",
   "crates/crux-router",
   "crates/crux-enterprise-shim",
   "crates/corecruxd",

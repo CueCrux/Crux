@@ -41,6 +41,16 @@ pub const RCX_CT_HASH_LEN: usize = 32;
 pub const RCX_CT_PUBLIC_KEY_LEN: usize = 32;
 pub const RCX_DELEGATION_ENVELOPE_VERSION: u8 = 1;
 pub const RCX_SYNC_DELEGATION_AUDIENCE: &str = "crux-sync";
+/// Delegation audience a hosted-relay device envelope carries, and the
+/// `AttenuationContext.audience` the relay presents at session attach
+/// (ExecPlan `crux-hosted-relay-gateway-2026-07-30`, contract v1 §6).
+pub const RCX_RELAY_DELEGATION_AUDIENCE: &str = "crux-relay";
+/// Backend id the hosted relay carries in `backends[]`, and the
+/// `AttenuationContext.backend_id` the relay presents. Must not begin with
+/// `customer:` — that prefix reclassifies the router mode.
+pub const RCX_RELAY_BACKEND_ID: &str = "hosted.relay.cuecrux.com";
+/// Capability for attaching one relay session.
+pub const RCX_RELAY_SESSION_CAPABILITY: &str = "crux.relay.session";
 /// Backend id a CruxEngine-issued sync-delegation token carries, and the
 /// `AttenuationContext.backend_id` the sync boundary presents (macaroon M3′).
 /// Distinct from `"local"` (the router's signature short-circuit) and from the
@@ -459,12 +469,22 @@ impl DelegationPresentation {
 #[serde(rename_all = "kebab-case")]
 pub enum DelegationAudience {
     CruxSync,
+    /// Hosted relay gateway (ExecPlan `crux-hosted-relay-gateway-2026-07-30`, M0).
+    ///
+    /// A separate audience is a security boundary, not a label: reusing
+    /// `CruxSync` would make a relay envelope byte-identical to a sync envelope
+    /// for the same device, so a relay-paired daemon could present its envelope
+    /// at the sync handshake (which supplies `audience: CruxSync`). The audience
+    /// equality checks in [`verify_token_attenuated`] then separate the two
+    /// boundaries structurally rather than relying on a `ScopeSubset` caveat.
+    CruxRelay,
 }
 
 impl DelegationAudience {
     fn as_str(self) -> &'static str {
         match self {
             Self::CruxSync => RCX_SYNC_DELEGATION_AUDIENCE,
+            Self::CruxRelay => RCX_RELAY_DELEGATION_AUDIENCE,
         }
     }
 }
@@ -1243,14 +1263,22 @@ impl RcxCapabilityToken {
                     && policy.allowed_delegate_fprs.len() <= RCX_MAX_DELEGATION_PRINCIPALS
                     && policy.allowed_delegate_fprs.iter().all(|fpr| valid_passport_fpr(fpr))
                     && policy.allowed_delegate_fprs.windows(2).all(|pair| pair[0] < pair[1]);
+                // The audience is deliberately NOT pinned here. It is a closed
+                // enum, so deserialization already rejects unknown audiences,
+                // and the boundary separation that matters is enforced
+                // contextually at verify time: `verify_token_attenuated`
+                // requires `policy.audience == context.audience ==
+                // envelope.audience`, so a relay envelope cannot be presented at
+                // the sync handshake (which supplies `CruxSync`) and vice versa.
+                // Pinning it structurally here would instead make every
+                // non-sync audience an invalid *token*, which is wrong.
                 if policy.presentation != DelegationPresentation::ProofOfPossession
                     || policy.max_depth != 1
-                    || policy.audience != DelegationAudience::CruxSync
                     || !delegates_valid
                 {
                     issues.push(TokenValidationIssue::new(
                         "invalid_delegation_policy",
-                        "delegation policy must be canonical PoP-only, one-hop, crux-sync policy",
+                        "delegation policy must be canonical PoP-only, one-hop policy with a valid delegate set",
                     ));
                 }
             }
@@ -1434,6 +1462,32 @@ pub enum VerifyOutcome {
     StructuralFailure(Vec<String>),
     BadSignature,
     BadTrustRoot,
+}
+
+/// Establish that a token was really issued by the trust root — and **nothing
+/// more**.
+///
+/// **This is NOT an authorization check.** It answers exactly one question: did
+/// this issuer sign these bytes, and is the base envelope structurally valid and
+/// unexpired. It deliberately does *not* apply the contextual gate, so a
+/// delegation-capable `rcx-ct/1.1` token passes here even though it must still
+/// be presented through [`verify_token_attenuated`] before it authorizes
+/// anything.
+///
+/// It exists because a daemon has to *load* a hosted token at startup — to
+/// discover which backends it was granted and where they live — long before any
+/// session presents it. [`verify_token`] cannot serve that purpose: it fails
+/// every delegation-bearing token closed by design
+/// (ExecPlan `crux-hosted-relay-gateway-2026-07-30`, contract v1 §8).
+///
+/// If you are deciding whether a caller may *do* something, you want
+/// [`verify_token_attenuated`], not this.
+pub fn verify_issuer_provenance(
+    token: &RcxCapabilityToken,
+    trust_root_pubkey: &[u8],
+    now_unix_seconds: u64,
+) -> VerifyOutcome {
+    verify_issuer_signed_token(token, trust_root_pubkey, now_unix_seconds)
 }
 
 pub fn verify_token(token: &RcxCapabilityToken, trust_root_pubkey: &[u8], now_unix_seconds: u64) -> VerifyOutcome {
@@ -2731,6 +2785,162 @@ mod tests {
                 AttenuatedOutcome::ContextDenied | AttenuatedOutcome::CaveatDenied
             ));
         }
+    }
+
+    // ── crux-relay audience separation (ExecPlan crux-hosted-relay-gateway M0) ──
+    //
+    // The relay reuses the sync boundary's machinery, so the ONLY thing keeping a
+    // relay-paired device out of the sync boundary is the audience triple-equality
+    // in `verify_token_attenuated`. These four tests pin that property in both
+    // directions; if they ever pass vacuously the boundary has collapsed.
+
+    /// Build a relay-audience delegation: policy audience, envelope audience and
+    /// the presented context all say `crux-relay`.
+    fn relay_delegation(issuer: &SigningKey, subject: &SigningKey, delegate: &SigningKey) -> RcxCapabilityToken {
+        let mut base = delegation_enabled_fixture(issuer, subject, delegate);
+        base.backends[0].permitted_capabilities.push(PermittedCapability {
+            capability: RCX_RELAY_SESSION_CAPABILITY.to_string(),
+            data_egress_classes: vec![DataEgressClass::Text],
+            required_attestations: vec![RCX_SYNC_PASSPORT_ATTESTATION.to_string()],
+            credit_cost: None,
+        });
+        let policy = base
+            .delegation_policy
+            .as_mut()
+            .unwrap_or_else(|| panic!("fixture must carry a delegation policy"));
+        policy.audience = DelegationAudience::CruxRelay;
+        base.signature.sig = issuer.sign(&base.token_hash()).to_bytes();
+        base.attenuate_for(
+            vec![
+                Caveat::TenantIdEq {
+                    tenant_id: "default".to_string(),
+                },
+                Caveat::ExpiresAtLe {
+                    expires_at: 1_780_143_100,
+                },
+            ],
+            delegate.verifying_key().to_bytes(),
+            "relay-delegation-1",
+            subject,
+        )
+        .unwrap_or_else(|error| panic!("relay delegation fixture failed: {error:?}"))
+    }
+
+    fn relay_context<'a>(tenant_id: &'a str, attestations: &'a [&'a str]) -> AttenuationContext<'a> {
+        AttenuationContext {
+            audience: DelegationAudience::CruxRelay,
+            tenant_id,
+            backend_id: "local",
+            capability: RCX_RELAY_SESSION_CAPABILITY,
+            data_egress_classes: &[DataEgressClass::Text],
+            present_attestations: attestations,
+        }
+    }
+
+    #[test]
+    fn relay_audience_delegation_verifies_at_a_relay_context() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let token = relay_delegation(&issuer, &subject, &delegate);
+        let context = relay_context("default", &[RCX_SYNC_PASSPORT_ATTESTATION]);
+
+        let outcome = verify_as(&token, &issuer, &delegate, context, M2_NONCE, M2_NONCE);
+
+        assert!(
+            matches!(outcome, AttenuatedOutcome::Verified(_)),
+            "a canonical relay delegation must verify at a relay context, got {outcome:?}"
+        );
+    }
+
+    // Both cross-boundary tests are DIFFERENTIAL: they assert the baseline
+    // context verifies, then flip *only* `audience` and assert denial. The
+    // capability/egress check at the top of `verify_token_attenuated` also
+    // returns `ContextDenied`, so asserting the variant alone would pass
+    // vacuously if the fixture happened to lack the capability. Proving the
+    // baseline first is what makes the audience the sole variable.
+
+    #[test]
+    fn relay_delegation_is_refused_at_the_sync_boundary() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let token = relay_delegation(&issuer, &subject, &delegate);
+
+        let baseline = relay_context("default", &[RCX_SYNC_PASSPORT_ATTESTATION]);
+        assert!(
+            matches!(
+                verify_as(&token, &issuer, &delegate, baseline, M2_NONCE, M2_NONCE),
+                AttenuatedOutcome::Verified(_)
+            ),
+            "baseline relay context must verify, else the flip below proves nothing"
+        );
+
+        // Flip ONLY the audience — this is what the sync handshake presents.
+        let mut crossed = baseline;
+        crossed.audience = DelegationAudience::CruxSync;
+
+        assert_eq!(
+            verify_as(&token, &issuer, &delegate, crossed, M2_NONCE, M2_NONCE),
+            AttenuatedOutcome::ContextDenied,
+            "a relay-audience envelope must not be presentable at the sync boundary"
+        );
+    }
+
+    #[test]
+    fn sync_delegation_is_refused_at_the_relay_boundary() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let token = valid_delegation(&issuer, &subject, &delegate);
+
+        let baseline = query_context("corecrux.query.explain", "default", &[RCX_SYNC_PASSPORT_ATTESTATION]);
+        assert!(
+            matches!(
+                verify_as(&token, &issuer, &delegate, baseline, M2_NONCE, M2_NONCE),
+                AttenuatedOutcome::Verified(_)
+            ),
+            "baseline sync context must verify, else the flip below proves nothing"
+        );
+
+        // Flip ONLY the audience — this is what the relay attach presents.
+        let mut crossed = baseline;
+        crossed.audience = DelegationAudience::CruxRelay;
+
+        assert_eq!(
+            verify_as(&token, &issuer, &delegate, crossed, M2_NONCE, M2_NONCE),
+            AttenuatedOutcome::ContextDenied,
+            "a sync-audience envelope must not be presentable at the relay boundary"
+        );
+    }
+
+    #[test]
+    fn relay_audience_round_trips_through_canonical_cbor() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let token = relay_delegation(&issuer, &subject, &delegate);
+
+        let encoded = hex::encode(token.to_canonical_cbor());
+        assert!(
+            encoded.contains(&hex::encode(RCX_RELAY_DELEGATION_AUDIENCE)),
+            "the relay audience must appear in the canonical encoding"
+        );
+        // The wire form must decode back to the same audience — this is what the
+        // TS minter has to reproduce byte-for-byte.
+        let policy = token
+            .delegation_policy
+            .as_ref()
+            .unwrap_or_else(|| panic!("relay fixture must carry a policy"));
+        assert_eq!(policy.audience, DelegationAudience::CruxRelay);
+        assert_eq!(
+            token
+                .delegation_envelope
+                .as_ref()
+                .unwrap_or_else(|| panic!("relay fixture must carry an envelope"))
+                .audience,
+            DelegationAudience::CruxRelay,
+        );
     }
 
     #[test]
