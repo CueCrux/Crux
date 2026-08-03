@@ -22074,3 +22074,109 @@ async fn m8_renaming_the_seat_cannot_mint_a_fresh_allowance() {
     );
     std::env::remove_var(crate::enrich_budget::SEAT_CEILING_ENV);
 }
+
+// ── attention roll-up (ExecPlan crux-hosted-relay-gateway M7a) ──────────────
+
+/// The endpoint agrees with `GET /v1/work` about what is on the board, and
+/// says nothing beyond the counts.
+///
+/// The classifier's truth table is exercised in `crate::attention`'s own tests;
+/// what is asserted here is the wiring those tests cannot see — that the same
+/// item set feeds both surfaces, and that the response body carries no
+/// identifier.
+#[tokio::test]
+async fn attention_summary_counts_the_board_without_naming_any_of_it() {
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    bind_test_state_to_root_passport_key(&mut state);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+        crate::projects::seed_default_if_missing(&mut store, 1).expect("project seed");
+        for (title, work_state) in [
+            ("a plan under way", "in_progress"),
+            ("a plan that is stuck", "blocked"),
+            ("a plan that is finished", "complete"),
+            ("a plan not started", "planned"),
+        ] {
+            let item = crate::work::create_work(
+                &mut store,
+                crate::work::CreateWorkInput {
+                    project_id: "default".to_string(),
+                    title: title.to_string(),
+                    body: None,
+                    state: None,
+                    assignee_passport: None,
+                    tenant_id: None,
+                    linked_pr: None,
+                    linked_issue: None,
+                    created_by_passport: "personal-default".to_string(),
+                },
+                1_000,
+            )
+            .expect("create");
+            crate::work::update_work(
+                &mut store,
+                &item.id,
+                crate::work::UpdateWorkInput {
+                    title: None,
+                    body: None,
+                    state: Some(work_state.to_string()),
+                    assignee_passport: None,
+                    tenant_id: None,
+                    linked_pr: None,
+                    linked_issue: None,
+                    // `blocked` is refused without a reason, so supply one; it
+                    // is also a second thing the response must not echo.
+                    blocker_reason: Some(Some("waiting on a decision".to_string())),
+                    blocker_kind: None,
+                },
+                crate::work::UpdateWorkContext {
+                    by_passport: "personal-default".to_string(),
+                    passport_gated: false,
+                    now_unix_ms: 1_001,
+                },
+            )
+            .expect("set state");
+        }
+    }
+
+    let resp = super::attention::get_attention_summary(
+        State(state),
+        Query(super::attention::SummaryQuery { project_id: None }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["needs_you"], 1, "the blocked plan");
+    assert_eq!(body["running"], 1, "the in_progress plan");
+    assert_eq!(body["done_review"], 1, "the complete plan");
+    assert_eq!(body["gate_pending"], 0, "no gate was queued");
+    assert!(body["now_unix_ms"].as_u64().is_some_and(|ms| ms > 0));
+
+    // The reason this endpoint exists rather than shipping `/v1/work` to a
+    // hosted viewer: the titles above are customer plan names.
+    let rendered = body.to_string();
+    for title in ["a plan under way", "a plan that is stuck", "a plan that is finished"] {
+        assert!(!rendered.contains(title), "a plan title reached the wire: {rendered}");
+    }
+}
+
+/// Reading the roll-up needs the same scope as reading the feeds behind it.
+/// Aggregating into counts must not become a way around authorization.
+#[tokio::test]
+async fn attention_summary_requires_admin_read() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let resp = super::attention::get_attention_summary(
+        State(state),
+        Query(super::attention::SummaryQuery { project_id: None }),
+        dev_scope_headers("facts:read"),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}

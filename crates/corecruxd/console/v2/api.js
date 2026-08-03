@@ -15,7 +15,7 @@
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
 //
-// 189 read endpoints, generated from the route manifest.
+// 190 read endpoints, generated from the route manifest.
 
 /**
  * Append a plain query object to a path as a URL search string.
@@ -50,6 +50,7 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/admin/segments/fingerprints': true,
   '/v1/admin/sharing/posture': true,
   '/v1/admin/version': true,
+  '/v1/attention/summary': true,
   '/v1/auth/whoami': true,
   '/v1/bootstrap/status': true,
   '/v1/cloud/access-contract': true,
@@ -240,6 +241,9 @@ const CruxApi = Object.freeze({
   },
   agentsByPassportUsage(passport, query) {
     return fetch(withQuery(`/v1/agents/${encodeURIComponent(passport)}/usage`, query), { credentials: 'same-origin' });
+  },
+  attentionSummary(query) {
+    return fetch(withQuery(`/v1/attention/summary`, query), { credentials: 'same-origin' });
   },
   authWhoami(query) {
     return fetch(withQuery(`/v1/auth/whoami`, query), { credentials: 'same-origin' });

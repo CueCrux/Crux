@@ -397,6 +397,10 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
     }
 
     if path.starts_with("/v1/work")
+        // Counts-only roll-up over the work / gate / coord feeds. It reads the
+        // same surfaces as `/v1/work`, so it takes the same contract —
+        // aggregating into integers is not a reason to authorize it any lower.
+        || path.starts_with("/v1/attention/")
         || path.starts_with("/v1/status-feed")
         || path.starts_with("/v1/projects")
         || path.starts_with("/v1/rcx/publish/")
