@@ -32,7 +32,11 @@ pub(super) enum WorkSource {
     All,
 }
 
-#[derive(Debug, serde::Deserialize)]
+/// `Default` is what the attention roll-up constructs against — it needs the
+/// unfiltered, unranked board and only ever sets `project_id`, so every other
+/// field must default to "as if the caller omitted it". `WorkSource::All`
+/// already defaults that way.
+#[derive(Debug, Default, serde::Deserialize)]
 pub(super) struct ListWorkQuery {
     pub project_id: Option<String>,
     pub state: Option<String>,
@@ -211,18 +215,7 @@ pub(super) async fn get_work(
     }
     let store = state.fact_store.read().await;
 
-    let kanban_items = if matches!(q.source, WorkSource::Kanban | WorkSource::All) {
-        crate::work::list_work(
-            &store,
-            q.project_id.as_deref(),
-            q.state.as_deref(),
-            q.tenant_id.as_deref(),
-            q.assignee_passport.as_deref(),
-        )
-    } else {
-        Vec::new()
-    };
-
+    let kanban_items = kanban_items_for_query(&store, &q);
     let mut execplan_items = if matches!(q.source, WorkSource::Execplans | WorkSource::All) {
         execplan_items_for_query(&store, &q)
     } else {
@@ -257,20 +250,7 @@ pub(super) async fn get_work(
         crate::cost_attribution::stamp_token_burn(&mut execplan_items, &sessions);
     }
 
-    // Merge: kanban first (wins on id collision), then execplan items not
-    // already present. ExecPlan ids are namespaced (`execplan:<slug>`) so
-    // collisions are not expected in practice — the dedup is defence in depth.
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::with_capacity(kanban_items.len());
-    let mut items = Vec::with_capacity(kanban_items.len() + execplan_items.len());
-    for w in kanban_items {
-        seen.insert(w.id.clone());
-        items.push(w);
-    }
-    for w in execplan_items {
-        if !seen.contains(&w.id) {
-            items.push(w);
-        }
-    }
+    let mut items = merge_work_sources(kanban_items, execplan_items);
 
     // Orchestration is the parent, so make the relationship TOTAL: anything no
     // orchestrator claims belongs to the default one. This runs BEFORE the
@@ -384,10 +364,54 @@ pub(super) async fn get_work(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+/// Build the kanban slice of the response.
+///
+/// Extracted, with [`merge_work_sources`], so the attention roll-up
+/// (`GET /v1/attention/summary`) derives its counts from the *same* item set
+/// this endpoint returns. Two surfaces quoting different numbers for one daemon
+/// is a discrepancy an operator cannot diagnose from either one, and a
+/// duplicated source-merge is how that happens.
+pub(super) fn kanban_items_for_query(
+    store: &corecrux_memory::FactStore,
+    q: &ListWorkQuery,
+) -> Vec<crate::work::WorkItem> {
+    if !matches!(q.source, WorkSource::Kanban | WorkSource::All) {
+        return Vec::new();
+    }
+    crate::work::list_work(
+        store,
+        q.project_id.as_deref(),
+        q.state.as_deref(),
+        q.tenant_id.as_deref(),
+        q.assignee_passport.as_deref(),
+    )
+}
+
+/// Merge: kanban first (wins on id collision), then ExecPlan items not already
+/// present. ExecPlan ids are namespaced (`execplan:<slug>`) so collisions are
+/// not expected in practice — the dedup is defence in depth.
+pub(super) fn merge_work_sources(
+    kanban_items: Vec<crate::work::WorkItem>,
+    execplan_items: Vec<crate::work::WorkItem>,
+) -> Vec<crate::work::WorkItem> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::with_capacity(kanban_items.len());
+    let mut items = Vec::with_capacity(kanban_items.len() + execplan_items.len());
+    for w in kanban_items {
+        seen.insert(w.id.clone());
+        items.push(w);
+    }
+    for w in execplan_items {
+        if !seen.contains(&w.id) {
+            items.push(w);
+        }
+    }
+    items
+}
+
 /// Build the ExecPlan slice of the response. Applies the same state /
 /// tenant / assignee filters that kanban uses so `?source=all&state=planned`
 /// returns a coherent merged list.
-fn execplan_items_for_query(
+pub(super) fn execplan_items_for_query(
     store: &corecrux_memory::fact_store::FactStore,
     q: &ListWorkQuery,
 ) -> Vec<crate::work::WorkItem> {

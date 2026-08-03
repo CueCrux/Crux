@@ -11,6 +11,7 @@ mod admin;
 mod agent_usage;
 mod append;
 mod approval_receipts;
+mod attention;
 pub(crate) mod auth_device;
 mod auth_rails;
 mod cases;
@@ -911,6 +912,10 @@ pub(crate) fn router_with_route_auth(
             "/v1/coord/announce",
             axum::routing::post(self::coord::post_coord_announce),
         )
+        // Counts-only attention roll-up over work + gates + coord sessions. The
+        // three feeds it aggregates are disqualified from the hosted read-only
+        // subset (plan names, local paths); four integers are not.
+        .route("/v1/attention/summary", get(self::attention::get_attention_summary))
         // Work coordination — kanban over `__work__::*` facts.
         .route(
             "/v1/execplans/refresh",
