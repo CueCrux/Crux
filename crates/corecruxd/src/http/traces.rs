@@ -17,6 +17,56 @@ use super::{
     Path, Query, State, StatusCode,
 };
 
+/// The tier the cross-repo aggregate surface is *sold* at, echoed for display.
+///
+/// This is a label, not a gate. See [`with_tier_advisory`].
+pub(super) const AGGREGATE_REQUIRED_TIER: &str = "pro";
+
+/// Annotate a cross-repo aggregate response with its advisory tier.
+///
+/// # `required_tier` is ADVISORY here — deliberately
+///
+/// P1 cross-repo aggregation is sold inside Pro, and **the daemon does not
+/// enforce that**. Crux is Apache-2.0: any operator can rebuild it with the
+/// check removed, so an in-daemon tier gate is security theatre that only
+/// inconveniences honest users. This is the same conclusion
+/// [`super::studio_library`] reached for `required_tier` on catalog entries,
+/// and it is reached the same way — the enforcement point is the service that
+/// decides whether to serve a caller at all, not the handler.
+///
+/// For code intelligence that enforcement point is **admission to a hosted
+/// daemon**: who is granted a tenant on CueCrux-hosted infrastructure. A
+/// customer running their own daemon over their own repositories is aggregating
+/// data they already hold on hardware they already pay for — there is nothing
+/// there to meter, and gating it would only punish the self-hosted case the
+/// free tier exists to win.
+///
+/// Two mechanisms look like they could close this and cannot. Both resolve a
+/// tier for the *process*, not for the requester, so on a shared daemon every
+/// tenant gets the same answer — the exact process-configuration defect M3b
+/// removed:
+/// - `OperatingMode::includes_pro()`, already ruled out in the plan;
+/// - `entitlement::resolve_entitlement`, which is **also** daemon-scoped (one
+///   `__entitlement__::rcx` record, resolved against `daemon_tenant_id`). It is
+///   the natural substitution to reach for and it is the same defect wearing a
+///   different hat.
+///
+/// Responses are therefore stamped `tier_enforcement: "advisory"` so no client
+/// mistakes the echo for a gate.
+///
+/// ExecPlan `crux-code-intel-pro-hosted-surface-2026-07-28`, Constraint 3
+/// re-scoped 2026-08-01.
+pub(super) fn with_tier_advisory(mut body: serde_json::Value) -> serde_json::Value {
+    if let Some(map) = body.as_object_mut() {
+        map.insert(
+            "required_tier".to_string(),
+            serde_json::Value::from(AGGREGATE_REQUIRED_TIER),
+        );
+        map.insert("tier_enforcement".to_string(), serde_json::Value::from("advisory"));
+    }
+    body
+}
+
 /// Open the persisted store, or `None` when persistence is off.
 fn open_store(state: &AppState) -> Option<crate::trace_store::TraceStore> {
     if !crate::trace_store::persist_enabled() {
@@ -413,11 +463,11 @@ pub(super) async fn get_code_path(
         // body cannot tell "already aggregate" from "silently ignored".
         return (
             StatusCode::OK,
-            Json(serde_json::json!({
+            Json(with_tier_advisory(serde_json::json!({
                 "aggregate": true,
                 "aggregate_basis": "runtime spans are tenant-wide; no static scan is consulted",
                 "path": path,
-            })),
+            }))),
         )
             .into_response();
     }
@@ -656,7 +706,7 @@ pub(super) async fn get_blast_radius(
         let radius = crate::code_intel::blast_radius(&scan, &spans, symbol, q.token_budget);
         return (
             StatusCode::OK,
-            Json(serde_json::json!({
+            Json(with_tier_advisory(serde_json::json!({
                 "aggregate": true,
                 "repos": repos,
                 "radius": radius,
@@ -665,7 +715,7 @@ pub(super) async fn get_blast_radius(
                 // name merge. Sound for "what might break", not precise enough to
                 // delete from without reading.
                 "precision": "superset: cross-repo edges resolve by symbol name",
-            })),
+            }))),
         )
             .into_response();
     }
@@ -702,12 +752,12 @@ pub(super) async fn get_liveness(
         let l = crate::code_intel::liveness(&scan, &spans, symbol);
         return (
             StatusCode::OK,
-            Json(serde_json::json!({
+            Json(with_tier_advisory(serde_json::json!({
                 "aggregate": true,
                 "repos": repos,
                 "liveness": l,
                 "precision": "superset: cross-repo edges resolve by symbol name",
-            })),
+            }))),
         )
             .into_response();
     }
@@ -781,11 +831,11 @@ pub(super) async fn get_trace_diff(
         // annotated rather than silently dropping the flag.
         return (
             StatusCode::OK,
-            Json(serde_json::json!({
+            Json(with_tier_advisory(serde_json::json!({
                 "aggregate": true,
                 "aggregate_basis": "runtime spans are tenant-wide; no static scan is consulted",
                 "diff": d,
-            })),
+            }))),
         )
             .into_response();
     }
@@ -822,12 +872,12 @@ pub(super) async fn get_dead_code_ladder(
         let ladder = crate::code_intel::dead_code_ladder(&scan, &spans, q.symbol.as_deref(), q.token_budget);
         return (
             StatusCode::OK,
-            Json(serde_json::json!({
+            Json(with_tier_advisory(serde_json::json!({
                 "aggregate": true,
                 "repos": repos,
                 "ladder": ladder,
                 "precision": "superset: cross-repo edges resolve by symbol name",
-            })),
+            }))),
         )
             .into_response();
     }

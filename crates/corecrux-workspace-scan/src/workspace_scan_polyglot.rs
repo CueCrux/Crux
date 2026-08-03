@@ -7959,4 +7959,1157 @@ function useWidget() {
         assert_eq!(scan.stats.crate_count, scan.crates.len());
         assert_eq!(scan.stats.symbol_count, scan.symbols.len());
     }
+
+    // ---------------------------------------------------------------------
+    // Language selection and skip rules
+    // ---------------------------------------------------------------------
+
+    fn options(v2: bool, v3: bool) -> PolyglotScanOptions {
+        PolyglotScanOptions {
+            v2_enabled: v2,
+            v3_enabled: v3,
+        }
+    }
+
+    #[test]
+    fn language_for_path_is_gated_by_the_v2_and_v3_flags() {
+        let base = options(false, false);
+        for (name, expected) in [
+            ("a.rs", Some(LanguageKind::Rust)),
+            ("a.ts", Some(LanguageKind::TypeScript)),
+            ("a.tsx", Some(LanguageKind::Tsx)),
+            ("a.py", Some(LanguageKind::Python)),
+            ("a.vue", Some(LanguageKind::Vue)),
+            ("a.js", None),
+            ("a.jsx", None),
+            ("a.go", None),
+            ("a.java", None),
+            ("a.svelte", None),
+            ("a.txt", None),
+            ("noextension", None),
+        ] {
+            assert_eq!(language_for_path(Path::new(name), base), expected, "{name}");
+        }
+
+        let v2 = options(true, false);
+        for (name, expected) in [
+            ("a.js", Some(LanguageKind::TypeScript)),
+            ("a.mjs", Some(LanguageKind::TypeScript)),
+            ("a.cjs", Some(LanguageKind::TypeScript)),
+            ("a.jsx", Some(LanguageKind::Tsx)),
+            ("a.go", Some(LanguageKind::Go)),
+            ("a.java", None),
+            ("a.svelte", None),
+        ] {
+            assert_eq!(language_for_path(Path::new(name), v2), expected, "v2 {name}");
+        }
+
+        let v3 = options(false, true);
+        for (name, expected) in [
+            ("a.svelte", Some(LanguageKind::Svelte)),
+            ("a.java", Some(LanguageKind::Java)),
+            ("a.c", Some(LanguageKind::C)),
+            ("a.h", Some(LanguageKind::C)),
+            ("a.cpp", Some(LanguageKind::Cpp)),
+            ("a.cc", Some(LanguageKind::Cpp)),
+            ("a.cxx", Some(LanguageKind::Cpp)),
+            ("a.hpp", Some(LanguageKind::Cpp)),
+            ("a.hh", Some(LanguageKind::Cpp)),
+            ("a.hxx", Some(LanguageKind::Cpp)),
+            ("a.cs", Some(LanguageKind::CSharp)),
+            ("a.rb", Some(LanguageKind::Ruby)),
+            ("a.swift", Some(LanguageKind::Swift)),
+            ("a.php", Some(LanguageKind::Php)),
+            ("a.js", Some(LanguageKind::TypeScript)),
+            ("a.go", None),
+        ] {
+            assert_eq!(language_for_path(Path::new(name), v3), expected, "v3 {name}");
+        }
+    }
+
+    #[test]
+    fn ambiguous_h_headers_upgrade_to_cpp_only_on_an_obvious_cpp_marker() {
+        for cpp in [
+            "namespace demo { }",
+            "template<class T> void f();",
+            "template <class T> void f();",
+            "extern \"C++\" void f();",
+        ] {
+            assert!(header_looks_cpp(cpp), "{cpp}");
+            assert_eq!(
+                language_for_source(LanguageKind::C, Path::new("a.h"), cpp),
+                LanguageKind::Cpp
+            );
+        }
+        assert!(!header_looks_cpp("int plain(void);"));
+        assert_eq!(
+            language_for_source(LanguageKind::C, Path::new("a.h"), "int plain(void);"),
+            LanguageKind::C
+        );
+        // Only `.h` is ambiguous — a `.c` stays C even with a C++ marker.
+        assert_eq!(
+            language_for_source(LanguageKind::C, Path::new("a.c"), "namespace demo {}"),
+            LanguageKind::C
+        );
+        // Non-C languages are never re-sniffed.
+        assert_eq!(
+            language_for_source(LanguageKind::Python, Path::new("a.h"), "namespace demo {}"),
+            LanguageKind::Python
+        );
+    }
+
+    #[test]
+    fn generated_directory_skips_apply_only_to_the_extensions_their_tier_owns() {
+        let generated = ["dist", "build", "out", ".next", ".nuxt", ".output", "coverage"];
+        let v3_only = ["target", "vendor", "vendored", "third_party"];
+
+        for dir in generated {
+            let js = PathBuf::from(dir).join("bundle.js");
+            assert!(!should_skip_generated_polyglot_file(&js, options(false, false)));
+            assert!(should_skip_generated_polyglot_file(&js, options(true, false)));
+            assert!(should_skip_generated_polyglot_file(&js, options(false, true)));
+            let java = PathBuf::from(dir).join("Gen.java");
+            assert!(!should_skip_generated_polyglot_file(&java, options(true, false)));
+            assert!(should_skip_generated_polyglot_file(&java, options(false, true)));
+            // TypeScript predates both tiers and is never skipped by directory.
+            let ts = PathBuf::from(dir).join("gen.ts");
+            assert!(!should_skip_generated_polyglot_file(&ts, options(true, true)));
+        }
+        for dir in v3_only {
+            let js = PathBuf::from(dir).join("bundle.js");
+            assert!(
+                !should_skip_generated_polyglot_file(&js, options(true, true)),
+                "{dir} is a V3-only vendor directory for JS"
+            );
+            let c = PathBuf::from(dir).join("gen.c");
+            assert!(should_skip_generated_polyglot_file(&c, options(false, true)), "{dir}");
+        }
+        assert!(!should_skip_generated_polyglot_file(
+            Path::new("src/app.js"),
+            options(true, true)
+        ));
+    }
+
+    #[test]
+    fn v2_js_paths_and_source_limits_are_per_language() {
+        for path in ["a.js", "a/b.jsx", "a.mjs", "a.cjs"] {
+            assert!(is_v2_js_path(path), "{path}");
+        }
+        for path in ["a.ts", "a.tsx", "a", "a.json"] {
+            assert!(!is_v2_js_path(path), "{path}");
+        }
+        assert_eq!(
+            v3_source_limits(LanguageKind::Java),
+            Some((POLYGLOT_JAVA_MAX_BYTES, POLYGLOT_JAVA_MAX_LINE_BYTES))
+        );
+        assert_eq!(
+            v3_source_limits(LanguageKind::C),
+            Some((POLYGLOT_C_MAX_BYTES, POLYGLOT_C_MAX_LINE_BYTES))
+        );
+        assert_eq!(
+            v3_source_limits(LanguageKind::Cpp),
+            Some((POLYGLOT_CPP_MAX_BYTES, POLYGLOT_CPP_MAX_LINE_BYTES))
+        );
+        assert_eq!(
+            v3_source_limits(LanguageKind::CSharp),
+            Some((POLYGLOT_CSHARP_MAX_BYTES, POLYGLOT_CSHARP_MAX_LINE_BYTES))
+        );
+        assert_eq!(
+            v3_source_limits(LanguageKind::Ruby),
+            Some((POLYGLOT_RUBY_MAX_BYTES, POLYGLOT_RUBY_MAX_LINE_BYTES))
+        );
+        assert_eq!(
+            v3_source_limits(LanguageKind::Swift),
+            Some((POLYGLOT_SWIFT_MAX_BYTES, POLYGLOT_SWIFT_MAX_LINE_BYTES))
+        );
+        assert_eq!(
+            v3_source_limits(LanguageKind::Php),
+            Some((POLYGLOT_PHP_MAX_BYTES, POLYGLOT_PHP_MAX_LINE_BYTES))
+        );
+        assert!(v3_source_limits(LanguageKind::Svelte).is_none());
+        assert!(v3_source_limits(LanguageKind::TypeScript).is_none());
+        assert!(v3_source_limits(LanguageKind::Go).is_none());
+    }
+
+    #[test]
+    fn v2_js_pathology_skip_is_flag_and_extension_gated() {
+        let long_line = "x".repeat(POLYGLOT_JS_MAX_LINE_BYTES + 1);
+        assert!(!should_skip_pathological_v2_js(
+            "a.js",
+            &long_line,
+            options(false, false)
+        ));
+        assert!(should_skip_pathological_v2_js("a.js", &long_line, options(true, false)));
+        assert!(should_skip_pathological_v2_js("a.js", &long_line, options(false, true)));
+        assert!(
+            !should_skip_pathological_v2_js("a.ts", &long_line, options(true, true)),
+            "the JS pathology gate is JS-only"
+        );
+        assert!(!should_skip_pathological_v2_js(
+            "a.js",
+            "const a = 1;\n",
+            options(true, true)
+        ));
+    }
+
+    #[test]
+    fn ast_walk_guard_counts_only_the_calls_past_the_limit() {
+        let mut guard = AstWalkGuard::default();
+        assert!(guard.allow_depth(0));
+        assert!(guard.allow_depth(POLYGLOT_AST_MAX_DEPTH));
+        assert_eq!(guard.depth_limit_hits, 0);
+        assert!(!guard.allow_depth(POLYGLOT_AST_MAX_DEPTH + 1));
+        assert!(!guard.allow_depth(POLYGLOT_AST_MAX_DEPTH + 2));
+        assert_eq!(guard.depth_limit_hits, 2);
+    }
+
+    // ---------------------------------------------------------------------
+    // Degenerate sources
+    // ---------------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial]
+    fn empty_comment_only_and_broken_sources_scan_without_symbols_or_errors() {
+        let _v2 = EnvVarGuard::set(POLYGLOT_V2_ENV, "1");
+        let _v3 = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for (name, source) in [
+            ("empty.ts", ""),
+            ("comments.ts", "// nothing here\n// really nothing\n"),
+            ("broken.ts", "export function ( { { {\n"),
+            ("empty.py", ""),
+            ("broken.py", "def (:\n  ???\n"),
+            ("empty.go", ""),
+            ("broken.go", "func ( { }{\n"),
+            ("Broken.java", "class { public void ( }\n"),
+            ("broken.rb", "class ; def ; end\n"),
+            ("broken.php", "<?php class { function ( }\n"),
+            ("notes.txt", "not a source file at all\n"),
+            ("noextension", "still not a source file\n"),
+        ] {
+            std::fs::write(tmp.path().join(name), source).expect("source");
+        }
+
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        for unscanned in ["notes.txt", "noextension"] {
+            assert!(
+                !scan.files.iter().any(|f| f.rel_path == unscanned),
+                "{unscanned} is not a supported extension"
+            );
+        }
+        for scanned in ["empty.ts", "comments.ts", "broken.ts", "broken.py", "Broken.java"] {
+            assert!(
+                scan.files.iter().any(|f| f.rel_path == scanned),
+                "{scanned} should still be listed"
+            );
+        }
+        let empty = scan.files.iter().find(|f| f.rel_path == "empty.ts").expect("empty.ts");
+        assert_eq!(empty.loc, 0);
+        assert_eq!(empty.symbol_count, 0);
+        assert!(
+            scan.diagnostics.v3_skipped_files.is_empty(),
+            "a broken source is not a skipped source"
+        );
+    }
+
+    /// DEFECT PIN — a source whose parse produces no usable nodes is reported
+    /// exactly like a source that genuinely declares nothing: present in
+    /// `files`, `symbol_count` 0, no diagnostic. `v3_skipped_files` records only
+    /// files rejected *before* parsing (size/line/depth caps), never a parse that
+    /// yielded nothing.
+    #[test]
+    #[serial_test::serial]
+    fn a_broken_source_is_indistinguishable_from_an_empty_one_in_the_scan() {
+        let _v3 = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let broken = tempfile::tempdir().expect("tempdir");
+        std::fs::write(broken.path().join("a.ts"), "export function ( { {\n").expect("broken");
+        let empty = tempfile::tempdir().expect("tempdir");
+        std::fs::write(empty.path().join("a.ts"), "// a comment\n").expect("empty");
+
+        let broken_file = run_repo_scan_at(broken.path())
+            .expect("scan")
+            .files
+            .into_iter()
+            .find(|f| f.rel_path == "a.ts")
+            .expect("broken a.ts");
+        let empty_file = run_repo_scan_at(empty.path())
+            .expect("scan")
+            .files
+            .into_iter()
+            .find(|f| f.rel_path == "a.ts")
+            .expect("empty a.ts");
+        assert_eq!(broken_file.symbol_count, empty_file.symbol_count);
+        assert_eq!(broken_file.loc, empty_file.loc);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn svelte_files_are_listed_but_never_extracted() {
+        let _v3 = EnvVarGuard::set(POLYGLOT_V3_ENV, "1");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("Page.svelte"),
+            "<script>export function handler() {}</script>\n<h1>hi</h1>\n",
+        )
+        .expect("svelte");
+        let scan = run_repo_scan_at(tmp.path()).expect("scan");
+        assert!(scan.files.iter().any(|f| f.rel_path == "Page.svelte"));
+        assert!(
+            symbol_set(&scan, "Page.svelte").is_empty(),
+            "Svelte extraction is deliberately a no-op"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Package naming and module paths
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn package_name_prefers_package_json_then_pyproject_then_setup_cfg_then_the_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("fallback-dir");
+        std::fs::create_dir_all(&dir).expect("dir");
+        assert_eq!(discover_package_name(&dir), "fallback-dir");
+
+        std::fs::write(dir.join("setup.cfg"), "[metadata]\nname = from_setup_cfg\n").expect("setup.cfg");
+        assert_eq!(discover_package_name(&dir), "from_setup_cfg");
+
+        std::fs::write(dir.join("pyproject.toml"), "[project]\nname = \"from_pyproject\"\n").expect("pyproject");
+        assert_eq!(discover_package_name(&dir), "from_pyproject");
+
+        std::fs::write(dir.join("package.json"), r#"{"name":"from-package-json"}"#).expect("package.json");
+        assert_eq!(discover_package_name(&dir), "from-package-json");
+    }
+
+    #[test]
+    fn package_name_readers_ignore_unreadable_malformed_and_wrong_section_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(package_json_name(&tmp.path().join("absent.json")).is_none());
+        assert!(pyproject_name(&tmp.path().join("absent.toml")).is_none());
+        assert!(setup_cfg_name(&tmp.path().join("absent.cfg")).is_none());
+
+        std::fs::write(tmp.path().join("bad.json"), "{not json").expect("bad json");
+        assert!(package_json_name(&tmp.path().join("bad.json")).is_none());
+        std::fs::write(tmp.path().join("nameless.json"), "{}").expect("nameless");
+        assert!(package_json_name(&tmp.path().join("nameless.json")).is_none());
+
+        std::fs::write(
+            tmp.path().join("other-section.toml"),
+            "[tool.poetry]\nname = \"ignored\"\n",
+        )
+        .expect("pyproject");
+        assert!(pyproject_name(&tmp.path().join("other-section.toml")).is_none());
+
+        std::fs::write(tmp.path().join("other.cfg"), "[options]\nname = ignored\n").expect("cfg");
+        assert!(setup_cfg_name(&tmp.path().join("other.cfg")).is_none());
+        assert_eq!(quoted_value("name = 'single'").as_deref(), Some("single"));
+        assert!(quoted_value("no equals sign").is_none());
+    }
+
+    #[test]
+    fn module_path_strips_language_suffixes_and_normalizes_separators() {
+        assert_eq!(module_path("pkg", "src/app.ts"), "pkg::src::app");
+        assert_eq!(module_path("my-pkg", "src/app.tsx"), "my_pkg::src::app");
+        assert_eq!(module_path("pkg", "src/mod.py"), "pkg::src::mod");
+        assert_eq!(module_path("pkg", "a/b.vue"), "pkg::a::b");
+        assert_eq!(module_path("pkg", "a/b.svelte"), "pkg::a::b");
+        assert_eq!(module_path("pkg", "a/b.go"), "pkg::a::b");
+        assert_eq!(module_path("pkg", "a/b.rs"), "pkg::a::b");
+        assert_eq!(module_path("pkg", "Svc.java"), "pkg::Svc");
+        assert_eq!(module_path("pkg", "Svc.swift"), "pkg::Svc");
+        assert_eq!(module_path("pkg", "svc.php"), "pkg::svc");
+        assert_eq!(module_path("pkg", "svc.cpp"), "pkg::svc");
+        assert_eq!(module_path("pkg", "svc.h"), "pkg::svc");
+        assert_eq!(module_path("pkg", "kebab-name.ts"), "pkg::kebab::name");
+        assert_eq!(
+            module_path("pkg", "web.c.ts"),
+            "pkg::web.c",
+            "a V3 suffix must not eat a legacy file's `.c` component"
+        );
+        assert_eq!(module_path("pkg", "README"), "pkg::README");
+    }
+
+    #[test]
+    fn rel_string_keeps_paths_outside_the_root_absolute() {
+        assert_eq!(rel_string(Path::new("/repo"), Path::new("/repo/a/b.ts")), "a/b.ts");
+        assert_eq!(rel_string(Path::new("/repo"), Path::new("/other/b.ts")), "/other/b.ts");
+    }
+
+    #[test]
+    fn package_infos_falls_back_to_the_default_name_for_an_empty_scan() {
+        let scan = WorkspaceScan::default();
+        let packages = package_infos(Path::new("/repo"), &scan, "fallback");
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "fallback");
+        assert_eq!(packages[0].file_count, 0);
+        assert_eq!(packages[0].total_loc, 0);
+        assert_eq!(packages[0].rel_path, "/repo");
+        assert!(packages[0].internal_deps.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rust_workspace_detection_needs_both_a_manifest_and_a_rust_file() {
+        let _v2 = EnvVarGuard::unset(POLYGLOT_V2_ENV);
+        let _v3 = EnvVarGuard::unset(POLYGLOT_V3_ENV);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(!has_rust_workspace(tmp.path()));
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").expect("manifest");
+        assert!(!has_rust_workspace(tmp.path()), "a manifest alone is not a workspace");
+        std::fs::create_dir_all(tmp.path().join("src")).expect("src");
+        std::fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").expect("main.rs");
+        assert!(has_rust_workspace(tmp.path()));
+        assert!(should_use_rust_workspace_scan(tmp.path()));
+
+        // A polyglot file flips the scan into hybrid mode.
+        std::fs::write(tmp.path().join("src/app.ts"), "export const x = 1;\n").expect("ts");
+        assert!(!should_use_rust_workspace_scan(tmp.path()));
+    }
+
+    #[test]
+    fn polyglot_non_rust_detection_widens_with_each_flag_tier() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.go"), "package main\n").expect("go");
+        assert!(!has_polyglot_non_rust_files(tmp.path(), options(false, false)));
+        assert!(has_polyglot_non_rust_files(tmp.path(), options(true, false)));
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("A.java"), "class A {}\n").expect("java");
+        assert!(!has_polyglot_non_rust_files(tmp.path(), options(true, false)));
+        assert!(has_polyglot_non_rust_files(tmp.path(), options(false, true)));
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.ts"), "export const x = 1;\n").expect("ts");
+        assert!(has_polyglot_non_rust_files(tmp.path(), options(false, false)));
+        assert!(has_supported_file(tmp.path(), &[Some("ts")]));
+        assert!(!has_supported_file(tmp.path(), &[Some("rs")]));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn polyglot_flags_read_the_shared_env_flag_helper() {
+        {
+            let _v2 = EnvVarGuard::set(POLYGLOT_V2_ENV, "1");
+            let _v3 = EnvVarGuard::set(POLYGLOT_V3_ENV, "off");
+            assert!(polyglot_v2_enabled_from_env());
+            assert!(!polyglot_v3_enabled());
+        }
+        let _v2 = EnvVarGuard::unset(POLYGLOT_V2_ENV);
+        let _v3 = EnvVarGuard::unset(POLYGLOT_V3_ENV);
+        assert!(!polyglot_v2_enabled_from_env());
+        assert!(!polyglot_v3_enabled());
+    }
+
+    // ---------------------------------------------------------------------
+    // Shared literal / comment scanning helpers
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn literal_text_value_honours_string_prefixes_and_backtick_gating() {
+        assert_eq!(literal_text_value("\"plain\"", false).as_deref(), Some("plain"));
+        assert_eq!(literal_text_value("  'single'", false).as_deref(), Some("single"));
+        assert_eq!(literal_text_value("r\"raw\"", false).as_deref(), Some("raw"));
+        assert_eq!(literal_text_value("b'bytes'", false).as_deref(), Some("bytes"));
+        assert_eq!(literal_text_value("U\"unicode\"", false).as_deref(), Some("unicode"));
+        assert!(
+            literal_text_value("f\"{interpolated}\"", false).is_none(),
+            "f-strings are not static literals"
+        );
+        assert!(
+            literal_text_value("name(\"x\")", false).is_none(),
+            "a non-prefix character before the quote disqualifies the literal"
+        );
+        assert!(literal_text_value("`tpl`", false).is_none());
+        assert_eq!(literal_text_value("`tpl`", true).as_deref(), Some("tpl"));
+        assert!(literal_text_value("no quotes", false).is_none());
+        assert!(literal_text_value("\"unterminated", false).is_none());
+        assert_eq!(
+            first_literal_from_arg_text("   \"padded\"", false).as_deref(),
+            Some("padded")
+        );
+    }
+
+    #[test]
+    fn find_closing_quote_respects_escapes_except_inside_backticks() {
+        assert_eq!(find_closing_quote("abc\"rest", b'"'), Some(3));
+        assert_eq!(find_closing_quote("a\\\"b\"rest", b'"'), Some(4));
+        assert_eq!(
+            find_closing_quote("a\\`b`", b'`'),
+            Some(2),
+            "a backslash does not escape inside backticks"
+        );
+        assert!(find_closing_quote("no close", b'"').is_none());
+    }
+
+    #[test]
+    fn quoted_and_ruby_literal_scanners_stop_at_an_unterminated_quote() {
+        assert_eq!(
+            quoted_literals("a \"one\" b 'two' c"),
+            vec!["one".to_string(), "two".to_string()]
+        );
+        assert!(quoted_literals("\"unterminated").is_empty());
+        assert!(quoted_literals("no literals").is_empty());
+        assert_eq!(
+            ruby_static_literals("only: [:index, :show], path: \"p\""),
+            vec!["index".to_string(), "show".to_string(), "p".to_string()],
+            "`path:` is an option name, not a symbol literal"
+        );
+        assert!(
+            ruby_static_literals("Demo::Service").is_empty(),
+            "`::` is not a symbol marker"
+        );
+        assert!(ruby_static_literals("\"unterminated").is_empty());
+    }
+
+    #[test]
+    fn line_comment_stripping_ignores_markers_inside_quotes() {
+        assert_eq!(strip_hash_comment("gem \"a\" # trailing"), "gem \"a\" ");
+        assert_eq!(strip_hash_comment("gem \"a#b\""), "gem \"a#b\"");
+        assert_eq!(strip_hash_comment("no comment"), "no comment");
+        assert_eq!(strip_double_slash_comment("code // trailing"), "code ");
+        assert_eq!(
+            strip_double_slash_comment("url(\"https://example.invalid\")"),
+            "url(\"https://example.invalid\")"
+        );
+        assert_eq!(strip_double_slash_comment("a / b"), "a / b");
+        assert_eq!(strip_php_line_comment("$x = 1; # hash"), "$x = 1; ");
+        assert_eq!(strip_php_line_comment("$x = 1; // slash"), "$x = 1; ");
+        assert_eq!(strip_line_comment_outside_quotes("a 'b\\'c' # d", '#'), "a 'b\\'c' ");
+    }
+
+    #[test]
+    fn brace_delta_ignores_braces_inside_strings_and_saturates_at_zero() {
+        assert_eq!(source_brace_delta("{ {"), 2);
+        assert_eq!(source_brace_delta("} }"), -2);
+        assert_eq!(source_brace_delta("{ }"), 0);
+        assert_eq!(source_brace_delta("\"{ { {\""), 0);
+        assert_eq!(source_brace_delta("'{' + x + '}'"), 0);
+        assert_eq!(source_brace_delta("\"a\" {"), 1);
+        assert_eq!(apply_brace_delta(3, 2), 5);
+        assert_eq!(apply_brace_delta(3, -2), 1);
+        assert_eq!(apply_brace_delta(1, -5), 0);
+    }
+
+    #[test]
+    fn join_route_paths_normalizes_every_empty_and_slash_combination() {
+        assert_eq!(join_route_paths("", ""), "");
+        assert_eq!(join_route_paths("", "users"), "/users");
+        assert_eq!(join_route_paths("/api/", "/users/"), "/api/users");
+        assert_eq!(join_route_paths("api", ""), "/api");
+        assert_eq!(join_route_paths("/", "/"), "");
+        assert_eq!(join_spring_paths("", ""), "/", "spring never emits an empty path");
+        assert_eq!(join_spring_paths("/api", "users"), "/api/users");
+    }
+
+    #[test]
+    fn vue_script_blocks_span_multiple_blocks_and_stop_at_malformed_tags() {
+        let blocks = vue_script_blocks(
+            "<template>x</template>\n<script>const a = 1;</script>\n<script setup>const b = 2;</script>\n",
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].text, "const a = 1;");
+        assert_eq!(blocks[0].start_line_offset, 1);
+        assert_eq!(blocks[1].text, "const b = 2;");
+        assert_eq!(blocks[1].start_line_offset, 2);
+        assert!(vue_script_blocks("<template>only</template>").is_empty());
+        assert!(
+            vue_script_blocks("<script>never closed").is_empty(),
+            "an unclosed script block yields nothing"
+        );
+        assert!(vue_script_blocks("<script").is_empty());
+    }
+
+    #[test]
+    fn line_of_reports_a_one_based_line_or_zero_when_absent() {
+        assert_eq!(line_of("a\nneedle\nb\n", "needle"), 2);
+        assert_eq!(line_of("a\nb\n", "needle"), 0);
+    }
+
+    #[test]
+    fn rust_use_paths_flattens_every_tree_shape() {
+        let mut guard = AstWalkGuard::default();
+        let parse = |src: &str, guard: &mut AstWalkGuard| {
+            let item: syn::ItemUse = syn::parse_str(src).expect("use item");
+            rust_use_paths(&item.tree, guard)
+        };
+        assert_eq!(parse("use a::b::c;", &mut guard), vec!["a::b::c".to_string()]);
+        assert_eq!(parse("use a::b as c;", &mut guard), vec!["a::b".to_string()]);
+        assert_eq!(parse("use a::*;", &mut guard), vec!["a::*".to_string()]);
+        assert_eq!(
+            parse("use a::{b, c::d};", &mut guard),
+            vec!["a::b".to_string(), "a::c::d".to_string()]
+        );
+        assert_eq!(guard.depth_limit_hits, 0);
+    }
+
+    #[test]
+    fn polyglot_is_pub_matches_public_and_restricted_visibility() {
+        assert!(is_pub(&syn::parse_str::<syn::Visibility>("pub").expect("pub")));
+        assert!(is_pub(
+            &syn::parse_str::<syn::Visibility>("pub(crate)").expect("pub(crate)")
+        ));
+        assert!(!is_pub(&syn::Visibility::Inherited));
+    }
+
+    #[test]
+    fn python_import_module_reads_from_and_import_forms() {
+        assert_eq!(python_import_module("from a.b import c").as_deref(), Some("a.b"));
+        assert_eq!(python_import_module("  import a.b  ").as_deref(), Some("a.b"));
+        assert_eq!(python_import_module("import a, b").as_deref(), Some("a"));
+        assert!(python_import_module("x = 1").is_none());
+        assert!(python_import_module("import ").is_none());
+    }
+
+    #[test]
+    fn qualify_parts_and_c_family_name_normalizers() {
+        assert_eq!(
+            qualify_parts(&["Ns".to_string()], &["Cls".to_string()], "method", "."),
+            "Ns.Cls.method"
+        );
+        assert_eq!(qualify_parts(&["Ns".to_string()], &[], "fn", "\\"), "Ns\\fn");
+        assert_eq!(qualify_parts(&[], &[], "bare", "::"), "bare");
+        assert_eq!(
+            qualify_parts(&["Ns".to_string()], &["Cls".to_string()], "", "::"),
+            "Ns::Cls"
+        );
+        assert_eq!(normalize_c_family_name("  a b\tc "), "abc");
+    }
+
+    #[test]
+    fn qualify_cpp_callable_avoids_double_qualification() {
+        let state = CFamilyWalkState {
+            namespaces: vec!["ns".to_string()],
+            classes: vec!["Cls".to_string()],
+            ..CFamilyWalkState::default()
+        };
+        assert_eq!(qualify_cpp_callable("method", &state), "ns::Cls::method");
+        assert_eq!(
+            qualify_cpp_callable("ns::Cls::method", &state),
+            "ns::Cls::method",
+            "an already-qualified name is not re-prefixed"
+        );
+        assert_eq!(qualify_cpp_callable("::ns::Cls::m", &state), "ns::Cls::m");
+        assert_eq!(qualify_cpp_callable("Other::m", &state), "ns::Other::m");
+        let bare = CFamilyWalkState::default();
+        assert_eq!(qualify_cpp_callable("Other::m", &bare), "Other::m");
+        assert_eq!(qualify_cpp_callable("plain", &bare), "plain");
+    }
+
+    #[test]
+    fn source_word_scanning_skips_declaration_keywords() {
+        assert_eq!(first_source_identifier("let name = 1").as_deref(), Some("name"));
+        assert_eq!(
+            first_source_identifier("public static Thing x").as_deref(),
+            Some("Thing")
+        );
+        assert_eq!(first_source_identifier("class Foo").as_deref(), Some("Foo"));
+        assert!(first_source_identifier("   ").is_none());
+        assert_eq!(source_words("a.b-c_d").collect::<Vec<_>>(), vec!["a", "b", "c_d"]);
+    }
+
+    // ---------------------------------------------------------------------
+    // Route helper matrices
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn express_methods_and_receiver_allowlists() {
+        for (name, expected) in [
+            ("get", Some("GET")),
+            ("post", Some("POST")),
+            ("put", Some("PUT")),
+            ("delete", Some("DELETE")),
+            ("patch", Some("PATCH")),
+            ("head", Some("HEAD")),
+            ("options", Some("OPTIONS")),
+            ("all", Some("ANY")),
+            ("listen", None),
+        ] {
+            assert_eq!(express_method(name).as_deref(), expected, "{name}");
+        }
+        for allowed in ["app", "router", "server", "srv", "fastify", "express", "r", "apiRouter"] {
+            assert!(ts_express_receiver_allowed(allowed), "{allowed}");
+        }
+        assert!(!ts_express_receiver_allowed("axios"));
+        for allowed in [
+            "r", "router", "mux", "engine", "g", "e", "app", "srv", "group", "apiMux", "v1Group", "myEngine",
+        ] {
+            assert!(go_route_receiver_allowed(allowed), "{allowed}");
+        }
+        assert!(!go_route_receiver_allowed("client"));
+    }
+
+    #[test]
+    fn nest_method_decorators_map_verbs_and_optional_paths() {
+        assert_eq!(
+            parse_nest_method_decorator("@Get()"),
+            Some(("GET".to_string(), String::new()))
+        );
+        assert_eq!(
+            parse_nest_method_decorator("@Post('items')"),
+            Some(("POST".to_string(), "items".to_string()))
+        );
+        for (raw, method) in [
+            ("@Put()", "PUT"),
+            ("@Delete()", "DELETE"),
+            ("@Patch()", "PATCH"),
+            ("@Head()", "HEAD"),
+            ("@Options()", "OPTIONS"),
+            ("@All()", "ANY"),
+        ] {
+            assert_eq!(
+                parse_nest_method_decorator(raw).map(|(m, _)| m),
+                Some(method.to_string())
+            );
+        }
+        assert!(parse_nest_method_decorator("@Injectable()").is_none());
+        assert!(parse_nest_method_decorator("@Get").is_some());
+    }
+
+    #[test]
+    fn aspnet_route_paths_substitute_tokens_and_honour_absolute_forms() {
+        assert_eq!(aspnet_route_path("api/[controller]", "", "Users", "List"), "/api/Users");
+        assert_eq!(
+            aspnet_route_path("api/[Controller]", "[action]", "Users", "List"),
+            "/api/Users/List"
+        );
+        assert_eq!(
+            aspnet_route_path("api/[controller]", "/absolute/[Action]", "Users", "List"),
+            "/absolute/List"
+        );
+        assert_eq!(
+            aspnet_route_path("api/[controller]", "~/root/[controller]", "Users", "List"),
+            "/root/Users"
+        );
+        assert_eq!(
+            aspnet_route_path("api/[area]", "", "Users", "List"),
+            "/api/[area]",
+            "[area] is deliberately left unresolved"
+        );
+    }
+
+    #[test]
+    fn spring_annotation_names_args_paths_and_methods() {
+        assert_eq!(
+            spring_annotation_name("@org.springframework.GetMapping(\"/x\")"),
+            "GetMapping"
+        );
+        assert_eq!(spring_annotation_name("  @RestController  "), "RestController");
+        assert_eq!(spring_annotation_args("@GetMapping(\"/x\", y)"), "\"/x\", y");
+        assert_eq!(spring_annotation_args("@RestController"), "");
+
+        assert!(matches!(
+            spring_annotation_paths("@GetMapping"),
+            SpringAnnotationPaths::Static(paths) if paths == vec![String::new()]
+        ));
+        assert!(matches!(
+            spring_annotation_paths("@GetMapping(\"/a\")"),
+            SpringAnnotationPaths::Static(paths) if paths == vec!["/a".to_string()]
+        ));
+        assert!(matches!(
+            spring_annotation_paths("@RequestMapping(value = {\"/a\", \"/b\"})"),
+            SpringAnnotationPaths::Static(paths) if paths == vec!["/a".to_string(), "/b".to_string()]
+        ));
+        assert!(matches!(
+            spring_annotation_paths("@GetMapping(path = PATH_CONSTANT)"),
+            SpringAnnotationPaths::Dynamic
+        ));
+        assert!(matches!(
+            spring_annotation_paths("@RequestMapping(method = RequestMethod.GET)"),
+            SpringAnnotationPaths::Static(paths) if paths == vec![String::new()]
+        ));
+
+        assert_eq!(
+            spring_request_methods("@RequestMapping(\"/a\")"),
+            vec!["ANY".to_string()]
+        );
+        assert_eq!(
+            spring_request_methods("@RequestMapping(method = RequestMethod.GET)"),
+            vec!["GET".to_string()]
+        );
+        assert_eq!(
+            spring_request_methods("@RequestMapping(method = {RequestMethod.PUT, RequestMethod.PATCH})"),
+            vec!["PUT".to_string(), "PATCH".to_string()]
+        );
+        assert_eq!(
+            spring_request_methods("@RequestMapping(method = someExpression)"),
+            vec!["ANY".to_string()]
+        );
+    }
+
+    #[test]
+    fn top_level_argument_splitting_respects_nesting_quotes_and_escapes() {
+        assert_eq!(split_top_level_args(""), vec![""]);
+        assert_eq!(split_top_level_args("a, b"), vec!["a", "b"]);
+        assert_eq!(split_top_level_args("a, {b, c}, d"), vec!["a", "{b, c}", "d"]);
+        assert_eq!(split_top_level_args("\"a, b\", c"), vec!["\"a, b\"", "c"]);
+        assert_eq!(split_top_level_args("f(x, y), z"), vec!["f(x, y)", "z"]);
+        assert_eq!(split_top_level_args("[a, b], c"), vec!["[a, b]", "c"]);
+        assert_eq!(split_top_level_args(r#""a\", b", c"#), vec![r#""a\", b""#, "c"]);
+        assert_eq!(
+            all_literal_values("{\"/a\", \"/b\"}"),
+            vec!["/a".to_string(), "/b".to_string()]
+        );
+        assert!(all_literal_values("CONSTANT").is_empty());
+    }
+
+    #[test]
+    fn rails_route_path_gate_and_line_helpers() {
+        assert!(is_rails_routes_path("config/routes.rb"));
+        assert!(is_rails_routes_path("apps/web/config/routes.rb"));
+        assert!(!is_rails_routes_path("config/routes_draw.rb"));
+        assert!(!is_rails_routes_path("app/models/user.rb"));
+
+        assert_eq!(rails_route_method("get \"/a\""), Some(("GET", " \"/a\"")));
+        assert_eq!(rails_route_method("post(\"/a\")"), Some(("POST", "(\"/a\")")));
+        assert_eq!(rails_route_method("put \"/a\"").map(|(m, _)| m), Some("PUT"));
+        assert_eq!(rails_route_method("patch \"/a\"").map(|(m, _)| m), Some("PATCH"));
+        assert_eq!(rails_route_method("delete \"/a\"").map(|(m, _)| m), Some("DELETE"));
+        assert!(rails_route_method("getter \"/a\"").is_none());
+        assert!(rails_route_method("resources :users").is_none());
+
+        assert_eq!(rails_scope_path("scope \"/admin\"").as_deref(), Some("/admin"));
+        assert_eq!(rails_scope_path("scope(\"/admin\")").as_deref(), Some("/admin"));
+        assert_eq!(
+            rails_scope_path("scope module: :admin, path: \"/a\"").as_deref(),
+            Some("/a")
+        );
+        assert!(rails_scope_path("namespace :admin").is_none());
+
+        assert_eq!(
+            rails_option_value("to: \"users#index\"", "to").as_deref(),
+            Some("users#index")
+        );
+        assert_eq!(
+            rails_option_value("to: :symbolic, x: 1", "to").as_deref(),
+            Some("symbolic")
+        );
+        assert!(rails_option_value("to: SOME_CONST", "to").is_none());
+        assert!(rails_option_value("no option here", "to").is_none());
+
+        assert_eq!(
+            rails_symbol_argument("namespace :admin do", "namespace").as_deref(),
+            Some("admin")
+        );
+        assert_eq!(
+            rails_symbol_argument("namespace \"admin\" do", "namespace").as_deref(),
+            Some("admin")
+        );
+        assert!(rails_symbol_argument("namespaced :admin", "namespace").is_none());
+        assert!(rails_symbol_argument("namespace admin", "namespace").is_none());
+    }
+
+    #[test]
+    fn rails_resource_names_and_action_filters() {
+        assert_eq!(
+            rails_resource_names("resources :users, :posts"),
+            vec!["users".to_string(), "posts".to_string()]
+        );
+        assert_eq!(rails_resource_names("resources(:users)"), vec!["users".to_string()]);
+        assert_eq!(
+            rails_resource_names("resources :users, only: [:index]"),
+            vec!["users".to_string()],
+            "option values are not resource names"
+        );
+        assert!(rails_resource_names("resourceful :users").is_empty());
+        assert!(rails_resource_names("resource :user").is_empty());
+
+        let all: BTreeSet<String> = ["index", "show", "new", "create", "edit", "update", "destroy"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            rails_resource_actions("resources :users")
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            all
+        );
+        assert_eq!(
+            rails_resource_actions("resources :users, only: [:index, :show]")
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["index".to_string(), "show".to_string()])
+        );
+        assert!(!rails_resource_actions("resources :users, except: [:destroy]").contains("destroy"));
+        assert!(
+            rails_resource_actions("resources :users, only: [:bogus]").is_empty(),
+            "unknown actions are filtered out rather than invented"
+        );
+        assert_eq!(
+            rails_option_symbols("only: :index", "only"),
+            Some(HashSet::from(["index".to_string()]))
+        );
+        assert!(rails_option_symbols("no such option", "only").is_none());
+    }
+
+    #[test]
+    fn laravel_route_gate_group_prefixes_and_handlers() {
+        assert!(is_laravel_routes_path("routes/web.php"));
+        assert!(is_laravel_routes_path("apps/api/routes/api.php"));
+        assert!(!is_laravel_routes_path("routes/web.rb"));
+        assert!(!is_laravel_routes_path("app/Http/Controllers/UserController.php"));
+
+        assert_eq!(laravel_route_method("Route::get('/a', X)").map(|(m, _)| m), Some("GET"));
+        assert_eq!(
+            laravel_route_method("Route::post('/a', X)").map(|(m, _)| m),
+            Some("POST")
+        );
+        assert_eq!(laravel_route_method("Route::put('/a', X)").map(|(m, _)| m), Some("PUT"));
+        assert_eq!(
+            laravel_route_method("Route::patch('/a', X)").map(|(m, _)| m),
+            Some("PATCH")
+        );
+        assert_eq!(
+            laravel_route_method("Route::delete('/a', X)").map(|(m, _)| m),
+            Some("DELETE")
+        );
+        assert!(laravel_route_method("Route::getSomething('/a')").is_none());
+        assert!(laravel_route_method("Router::get('/a')").is_none());
+
+        assert_eq!(
+            laravel_group_prefix("Route::group(['prefix' => 'admin'], function () {").as_deref(),
+            Some("admin")
+        );
+        assert_eq!(
+            laravel_group_prefix("Route::group([], function () {").as_deref(),
+            Some(""),
+            "a group without a prefix is still a group frame"
+        );
+        assert_eq!(
+            laravel_group_prefix("Route::prefix('api')->group(function () {").as_deref(),
+            Some("api")
+        );
+        assert!(laravel_group_prefix("Route::get('/a', X);").is_none());
+        assert_eq!(
+            laravel_fluent_prefix("Route::prefix('v1')->group(").as_deref(),
+            Some("v1")
+        );
+        assert!(laravel_fluent_prefix("Route::middleware('auth')->group(").is_none());
+
+        assert_eq!(laravel_handler("function () {}").as_deref(), Some("closure"));
+        assert_eq!(laravel_handler("static function () {}").as_deref(), Some("closure"));
+        assert_eq!(laravel_handler("fn () => 1").as_deref(), Some("closure"));
+        assert_eq!(
+            laravel_handler("[UserController::class, 'index']").as_deref(),
+            Some("UserController::index")
+        );
+        assert!(laravel_handler("'UserController@index'").is_none());
+        assert!(laravel_array_handler("[UserController::class]").is_none());
+        assert!(laravel_array_handler("no array").is_none());
+    }
+
+    #[test]
+    fn laravel_argument_splitting_and_php_class_literals() {
+        assert_eq!(
+            laravel_call_arguments("Route::get('/a', [C::class, 'm'])"),
+            vec!["'/a'".to_string(), "[C::class, 'm']".to_string()]
+        );
+        assert_eq!(
+            laravel_call_arguments("f('a, b', c)"),
+            vec!["'a, b'".to_string(), "c".to_string()]
+        );
+        assert_eq!(
+            laravel_call_arguments("f(g(1, 2), 3)"),
+            vec!["g(1, 2)".to_string(), "3".to_string()]
+        );
+        assert!(laravel_call_arguments("no parens").is_empty());
+        assert_eq!(
+            laravel_call_arguments("f(unterminated, args"),
+            vec!["unterminated".to_string(), "args".to_string()]
+        );
+
+        assert_eq!(
+            php_class_literal("App\\Http\\C::class").as_deref(),
+            Some("App\\Http\\C")
+        );
+        assert_eq!(php_class_literal("[C::class, 'm']").as_deref(), Some("C"));
+        assert!(php_class_literal("::class").is_none());
+        assert!(php_class_literal("no class literal").is_none());
+
+        assert_eq!(
+            laravel_resource_arguments("Route::resource('users', UserController::class)"),
+            Some(("users".to_string(), "UserController".to_string()))
+        );
+        assert!(laravel_resource_arguments("Route::resource($dynamic, C::class)").is_none());
+        assert!(laravel_resource_arguments("Route::resource('users', $controller)").is_none());
+    }
+
+    #[test]
+    fn go_receiver_and_export_helpers() {
+        assert_eq!(go_receiver_type_name("(s *Server)"), "Server");
+        assert_eq!(go_receiver_type_name("(s Server)"), "Server");
+        assert_eq!(go_receiver_type_name("Server"), "Server");
+        assert_eq!(go_receiver_type_name("  ( s   *pkg.Server )  "), "pkg.Server");
+        assert!(go_is_pub("Exported"));
+        assert!(!go_is_pub("unexported"));
+        assert!(!go_is_pub(""));
+        assert!(is_go_path("a/b.go"));
+        assert!(is_go_path("a/b.GO"));
+        assert!(!is_go_path("a/b.rs"));
+        assert_eq!(path_dir("a/b/c.go"), "a/b");
+        assert_eq!(path_dir("c.go"), "");
+        assert_eq!(path_dir("a\\b\\c.go"), "a\\b");
+    }
+
+    // ---------------------------------------------------------------------
+    // File-based route path derivation
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn nextjs_file_routes_cover_pages_app_and_the_reserved_names() {
+        assert_eq!(nextjs_file_route("pages/index.tsx"), Some(("/".to_string(), false)));
+        assert_eq!(
+            nextjs_file_route("src/pages/blog/[slug].tsx"),
+            Some(("/blog/[slug]".to_string(), false))
+        );
+        assert_eq!(
+            nextjs_file_route("pages/api/users.ts"),
+            Some(("/api/users".to_string(), true))
+        );
+        for reserved in [
+            "pages/_app.tsx",
+            "pages/_document.tsx",
+            "pages/_error.tsx",
+            "pages/api/_helper.ts",
+        ] {
+            assert!(nextjs_file_route(reserved).is_none(), "{reserved}");
+        }
+        assert_eq!(
+            nextjs_file_route("app/dashboard/page.tsx"),
+            Some(("/dashboard".to_string(), false))
+        );
+        assert_eq!(
+            nextjs_file_route("app/api/items/route.ts"),
+            Some(("/api/items".to_string(), true))
+        );
+        assert_eq!(nextjs_file_route("app/page.tsx"), Some(("/".to_string(), false)));
+        assert!(nextjs_file_route("app/dashboard/layout.tsx").is_none());
+        assert!(
+            nextjs_file_route("app/api/items/route.tsx").is_none(),
+            "route.tsx is not a handler"
+        );
+        assert!(nextjs_file_route("components/Button.tsx").is_none());
+        assert!(nextjs_file_route("pages/styles.css").is_none());
+        assert!(nextjs_file_route("").is_none());
+    }
+
+    #[test]
+    fn next_app_router_segment_normalization_drops_groups_slots_and_interceptors() {
+        assert_eq!(
+            normalize_next_app_segments(&["(marketing)", "about"]),
+            vec!["about".to_string()]
+        );
+        assert_eq!(
+            normalize_next_app_segments(&["@modal", "photo"]),
+            vec!["photo".to_string()]
+        );
+        assert_eq!(normalize_next_app_segments(&["(.)photo"]), vec!["photo".to_string()]);
+        assert_eq!(normalize_next_app_segments(&["(..)photo"]), vec!["photo".to_string()]);
+        assert_eq!(normalize_next_app_segments(&["(...)photo"]), vec!["photo".to_string()]);
+        assert_eq!(
+            normalize_next_app_segments(&["(..)(..)photo"]),
+            vec!["photo".to_string()]
+        );
+        assert!(normalize_next_app_segments(&["(.)"]).is_empty());
+        assert_eq!(normalize_next_app_segments(&["[id]"]), vec!["[id]".to_string()]);
+    }
+
+    #[test]
+    fn nuxt_and_sveltekit_file_routes_are_derived_from_their_conventions() {
+        assert_eq!(nuxt_file_route("pages/index.vue").as_deref(), Some("/"));
+        assert_eq!(
+            nuxt_file_route("src/pages/blog/[id].vue").as_deref(),
+            Some("/blog/[id]")
+        );
+        assert!(nuxt_file_route("pages/index.ts").is_none());
+        assert!(nuxt_file_route("components/Card.vue").is_none());
+
+        assert_eq!(
+            sveltekit_file_route("src/routes/+page.svelte"),
+            Some(("/".to_string(), false))
+        );
+        assert_eq!(
+            sveltekit_file_route("src/routes/(app)/dash/+page.svelte"),
+            Some(("/dash".to_string(), false))
+        );
+        assert_eq!(
+            sveltekit_file_route("src/routes/api/+server.ts"),
+            Some(("/api".to_string(), true))
+        );
+        assert_eq!(
+            sveltekit_file_route("src/routes/api/+server.js").map(|(_, server)| server),
+            Some(true)
+        );
+        assert!(sveltekit_file_route("src/routes/+layout.svelte").is_none());
+        assert!(sveltekit_file_route("routes/+page.svelte").is_none());
+    }
+
+    #[test]
+    fn router_root_index_and_path_segment_helpers() {
+        assert_eq!(router_root_index(&["pages", "a"], "pages"), Some(0));
+        assert_eq!(router_root_index(&["src", "pages", "a"], "pages"), Some(1));
+        assert!(router_root_index(&["app", "src", "pages"], "pages").is_none());
+        assert_eq!(path_parts("a//b\\c/"), vec!["a", "b", "c"]);
+        assert!(path_parts("").is_empty());
+        assert_eq!(conventional_page_path(&["blog", "index.tsx"], "index"), "/blog");
+        assert_eq!(conventional_page_path(&["blog", "post.tsx"], "post"), "/blog/post");
+        assert_eq!(conventional_page_path(&["index.tsx"], "index"), "/");
+        assert_eq!(segments_to_route_path(&[]), "/");
+        assert_eq!(segments_to_route_path(&["a", "b"]), "/a/b");
+        assert_eq!(owned_segments_to_route_path(&[]), "/");
+        assert_eq!(
+            owned_segments_to_route_path(&["a".to_string(), "b".to_string()]),
+            "/a/b"
+        );
+    }
+
+    #[test]
+    fn framework_scope_lookup_prefers_a_scope_whose_directory_contains_the_file() {
+        let scopes = vec![
+            FileRouteScope {
+                directory: PathBuf::from("apps/web"),
+                frameworks: FileRouteFrameworks {
+                    nextjs: true,
+                    nuxt: false,
+                    sveltekit: false,
+                },
+            },
+            FileRouteScope {
+                directory: PathBuf::new(),
+                frameworks: FileRouteFrameworks {
+                    nextjs: false,
+                    nuxt: true,
+                    sveltekit: false,
+                },
+            },
+        ];
+        let scoped = framework_scope_for_file("apps/web/pages/index.tsx", &scopes).expect("scoped");
+        assert!(scoped.frameworks.nextjs);
+        let root = framework_scope_for_file("pages/index.vue", &scopes).expect("root scope");
+        assert!(root.frameworks.nuxt);
+        assert!(framework_scope_for_file("a.ts", &[]).is_none());
+    }
+
+    #[test]
+    fn package_json_framework_detection_reads_both_dependency_sections() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("package.json");
+        std::fs::write(
+            &path,
+            r#"{"dependencies":{"next":"14"},"devDependencies":{"@sveltejs/kit":"2"}}"#,
+        )
+        .expect("package.json");
+        let frameworks = package_json_frameworks(&path);
+        assert!(frameworks.nextjs);
+        assert!(frameworks.sveltekit);
+        assert!(!frameworks.nuxt);
+
+        std::fs::write(&path, r#"{"dependencies":{"nuxt":"3"}}"#).expect("package.json");
+        assert!(package_json_frameworks(&path).nuxt);
+
+        std::fs::write(&path, "{not json").expect("package.json");
+        let none = package_json_frameworks(&path);
+        assert!(!none.nextjs && !none.nuxt && !none.sveltekit);
+        let absent = package_json_frameworks(&tmp.path().join("absent.json"));
+        assert!(!absent.nextjs && !absent.nuxt && !absent.sveltekit);
+    }
 }

@@ -465,7 +465,7 @@ fn now_unix_ns() -> u64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{has_partial_scope, reconcile_maps, ReconcilePostgresOptions, ReconcileRecord};
     use std::collections::HashMap;
@@ -1370,5 +1370,570 @@ mod tests {
         assert!(s.missing_in_postgres.is_empty());
         assert!(s.missing_in_corecrux.is_empty());
         assert!(s.hash_mismatch.is_empty());
+    }
+
+    // ══ CoreCrux-side collection over real on-disk segments ══════════
+    //
+    // `collect_corecrux_records` is the half of the reconcile driver that can
+    // run without a Postgres server: it walks `<data_dir>/shards/shard-NNNN`,
+    // decodes every sealed segment, and folds the canonical headers into the
+    // event map that `reconcile_maps` later diffs. The helpers below build a
+    // byte-real shard (segment file + MANIFEST add-segment record) in a
+    // tempdir so the scan path, the scope filters, and the conflict/parse
+    // failure paths are all exercised against genuine encodings rather than
+    // hand-stubbed structs.
+
+    use corecrux_frame::{
+        canonical_header_bytes_v1, compute_header_hash, compute_payload_hash, stream_hash_xxhash64, CanonicalHeaderV1,
+    };
+    use corecrux_segment::{build_segment_v1, FrameInput, SegmentId};
+    use corecrux_storage::{encode_manifest_add_segment_v1, encode_manifest_header_v1, frame_manifest_record};
+    use std::path::Path;
+
+    use super::SegmentMeta;
+
+    /// One frame's worth of raw bytes, deliberately *not* forced through the
+    /// canonical-header encoder so malformed-header cases stay expressible.
+    struct RawFrame {
+        stream_hash: u64,
+        seq: u64,
+        event_id: String,
+        header_bytes: Vec<u8>,
+        payload: Vec<u8>,
+    }
+
+    /// A well-formed frame: canonical header bytes followed by the 32-byte
+    /// header hash, exactly as `corecrux-storage`'s append path lays it out
+    /// (see `crates/corecrux-storage/src/append.rs` `header_bytes_for_frame`).
+    fn canonical_frame(
+        tenant: &str,
+        stream_type: &str,
+        stream_id: &str,
+        event_id: &str,
+        seq: u64,
+        payload: &[u8],
+    ) -> RawFrame {
+        let payload_hash = compute_payload_hash(payload);
+        let canonical = CanonicalHeaderV1 {
+            tenant_id: tenant.to_string(),
+            stream_id: stream_id.to_string(),
+            stream_type: stream_type.to_string(),
+            seq,
+            event_id: event_id.to_string(),
+            occurred_at: "2026-01-01T00:00:00Z".to_string(),
+            ingested_at: "2026-01-01T00:00:01Z".to_string(),
+            event_type: "test.event".to_string(),
+            content_type: "application/json".to_string(),
+            payload_len: payload.len() as u32,
+            payload_hash,
+        };
+        let canonical_bytes = canonical_header_bytes_v1(&canonical);
+        let header_hash = compute_header_hash(&canonical_bytes);
+        let mut header_bytes = Vec::with_capacity(canonical_bytes.len() + 32);
+        header_bytes.extend_from_slice(&canonical_bytes);
+        header_bytes.extend_from_slice(&header_hash);
+        RawFrame {
+            stream_hash: stream_hash_xxhash64(tenant, stream_type, stream_id).unwrap(),
+            seq,
+            event_id: event_id.to_string(),
+            header_bytes,
+            payload: payload.to_vec(),
+        }
+    }
+
+    /// Build `<data_dir>/shards/shard-NNNN` containing one sealed segment per
+    /// `(segment_seq, sealed_at_unix_ns, frames)` tuple plus a MANIFEST that
+    /// lists them all.
+    fn build_shard(data_dir: &Path, shard_id: u32, segments: &[(u64, u64, Vec<RawFrame>)]) {
+        let shard_dir = data_dir.join("shards").join(format!("shard-{shard_id:04}"));
+        std::fs::create_dir_all(shard_dir.join("segments")).unwrap();
+
+        let epoch = 1u64;
+        let mut manifest = Vec::new();
+        manifest.extend_from_slice(&encode_manifest_header_v1(shard_id, epoch, 1).unwrap());
+
+        for (segment_seq, sealed_at_unix_ns, frames) in segments {
+            let inputs: Vec<FrameInput<'_>> = frames
+                .iter()
+                .map(|f| FrameInput {
+                    stream_hash: f.stream_hash,
+                    seq: f.seq,
+                    event_id: f.event_id.as_str(),
+                    header_hash: compute_header_hash(&f.header_bytes),
+                    payload_hash: compute_payload_hash(&f.payload),
+                    header_bytes: &f.header_bytes,
+                    payload_bytes: &f.payload,
+                })
+                .collect();
+            let built = build_segment_v1(
+                shard_id,
+                epoch,
+                *segment_seq,
+                SegmentId([u8::try_from(*segment_seq % 256).unwrap(); 16]),
+                1,
+                *sealed_at_unix_ns,
+                &inputs,
+            )
+            .unwrap();
+
+            let relative_path = format!("segments/{segment_seq:012}.ccxseg");
+            std::fs::write(shard_dir.join(&relative_path), &built.bytes).unwrap();
+
+            let meta = SegmentMeta {
+                level: 0,
+                shard_id,
+                epoch,
+                segment_seq: built.footer.segment_seq,
+                segment_id: built.footer.segment_id,
+                relative_path,
+                file_len: built.footer.file_len,
+                created_at_unix_ns: built.footer.created_at_unix_ns,
+                sealed_at_unix_ns: built.footer.sealed_at_unix_ns,
+                toc_offset: built.footer.toc_offset,
+                toc_len: built.footer.toc_len,
+                toc_entry_count: built.footer.toc_entry_count,
+                min_stream_hash: built.footer.min_stream_hash,
+                min_seq: built.footer.min_seq,
+                max_stream_hash: built.footer.max_stream_hash,
+                max_seq: built.footer.max_seq,
+                segment_hash: built.footer.segment_hash,
+            };
+            manifest.extend_from_slice(&frame_manifest_record(&encode_manifest_add_segment_v1(&meta).unwrap()));
+        }
+
+        std::fs::write(shard_dir.join("MANIFEST"), manifest).unwrap();
+    }
+
+    fn options_for(data_dir: &Path) -> ReconcilePostgresOptions {
+        ReconcilePostgresOptions {
+            data_dir: data_dir.to_path_buf(),
+            // Deliberately unreachable/unparsable: every test in this section
+            // must fail before any socket is opened.
+            connection_string: String::new(),
+            tenant_id: "tenant-a".to_string(),
+            stream_type: None,
+            stream_id: None,
+            shard: None,
+            window_days: None,
+            max_segments: None,
+            batch_size: 100,
+            sample_limit: 10,
+            evidence_out: None,
+        }
+    }
+
+    #[test]
+    fn collect_corecrux_records_decodes_events_from_a_real_segment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        build_shard(
+            tmp.path(),
+            0,
+            &[(
+                1,
+                2_000_000_000_000_000_000,
+                vec![
+                    canonical_frame("tenant-a", "knowledge", "s1", "evt-1", 1, b"one"),
+                    canonical_frame("tenant-a", "knowledge", "s1", "evt-2", 2, b"two"),
+                ],
+            )],
+        );
+
+        let result = super::collect_corecrux_records(&options_for(tmp.path())).unwrap();
+        assert_eq!(result.segments_scanned, 1);
+        assert!(!result.partial);
+        assert_eq!(result.records.len(), 2);
+        let first = result.records.get("evt-1").unwrap();
+        assert_eq!(first.stream_type, "knowledge");
+        assert_eq!(first.stream_id, "s1");
+        assert_eq!(first.payload_hash, super::hex_bytes(&compute_payload_hash(b"one")));
+    }
+
+    /// Regression: a tenant that is not the reconcile scope must not leak into
+    /// the CoreCrux side of the diff — otherwise every other tenant's events
+    /// would be reported as `missingInPostgres`.
+    #[test]
+    fn collect_corecrux_records_skips_other_tenants() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        build_shard(
+            tmp.path(),
+            0,
+            &[(
+                1,
+                2_000_000_000_000_000_000,
+                vec![
+                    canonical_frame("tenant-a", "knowledge", "s1", "evt-mine", 1, b"a"),
+                    canonical_frame("tenant-b", "knowledge", "s1", "evt-theirs", 1, b"b"),
+                ],
+            )],
+        );
+
+        let result = super::collect_corecrux_records(&options_for(tmp.path())).unwrap();
+        assert_eq!(result.records.len(), 1);
+        assert!(result.records.contains_key("evt-mine"));
+        assert!(!result.records.contains_key("evt-theirs"));
+    }
+
+    #[test]
+    fn collect_corecrux_records_applies_stream_type_and_stream_id_filters() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        build_shard(
+            tmp.path(),
+            0,
+            &[(
+                1,
+                2_000_000_000_000_000_000,
+                vec![
+                    canonical_frame("tenant-a", "knowledge", "s1", "evt-k1", 1, b"a"),
+                    canonical_frame("tenant-a", "knowledge", "s2", "evt-k2", 1, b"b"),
+                    canonical_frame("tenant-a", "audit", "s1", "evt-a1", 1, b"c"),
+                ],
+            )],
+        );
+
+        let mut opts = options_for(tmp.path());
+        opts.stream_type = Some("knowledge".to_string());
+        let by_type = super::collect_corecrux_records(&opts).unwrap();
+        assert_eq!(by_type.records.len(), 2);
+        assert!(!by_type.records.contains_key("evt-a1"));
+
+        opts.stream_id = Some("s1".to_string());
+        let by_type_and_id = super::collect_corecrux_records(&opts).unwrap();
+        assert_eq!(by_type_and_id.records.len(), 1);
+        assert!(by_type_and_id.records.contains_key("evt-k1"));
+    }
+
+    /// Two segments carrying the same `event_id` with *different* payload
+    /// hashes is a CoreCrux-internal divergence. It must abort the reconcile
+    /// rather than silently pick a winner and report parity.
+    #[test]
+    fn collect_corecrux_records_rejects_conflicting_payload_hashes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        build_shard(
+            tmp.path(),
+            0,
+            &[
+                (
+                    1,
+                    2_000_000_000_000_000_000,
+                    vec![canonical_frame("tenant-a", "knowledge", "s1", "evt-dup", 1, b"first")],
+                ),
+                (
+                    2,
+                    2_000_000_000_000_000_001,
+                    vec![canonical_frame("tenant-a", "knowledge", "s1", "evt-dup", 2, b"second")],
+                ),
+            ],
+        );
+
+        let err = super::collect_corecrux_records(&options_for(tmp.path())).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("conflicting payload hashes across CoreCrux segments"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The same event replayed byte-identically across two segments is not a
+    /// conflict — it collapses to one record.
+    #[test]
+    fn collect_corecrux_records_dedupes_identical_repeats() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        build_shard(
+            tmp.path(),
+            0,
+            &[
+                (
+                    1,
+                    2_000_000_000_000_000_000,
+                    vec![canonical_frame("tenant-a", "knowledge", "s1", "evt-dup", 1, b"same")],
+                ),
+                (
+                    2,
+                    2_000_000_000_000_000_001,
+                    vec![canonical_frame("tenant-a", "knowledge", "s1", "evt-dup", 1, b"same")],
+                ),
+            ],
+        );
+
+        let result = super::collect_corecrux_records(&options_for(tmp.path())).unwrap();
+        assert_eq!(result.segments_scanned, 2);
+        assert_eq!(result.records.len(), 1);
+    }
+
+    /// `--window-days` drops segments sealed before the cutoff; the events in
+    /// them must not appear (and so must not be counted as scanned).
+    #[test]
+    fn collect_corecrux_records_window_days_excludes_stale_segments() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let now = super::now_unix_ns();
+        let recent = now.saturating_sub(super::DAY_NS / 2);
+        let ancient = now.saturating_sub(super::DAY_NS * 30);
+        build_shard(
+            tmp.path(),
+            0,
+            &[
+                (
+                    1,
+                    ancient,
+                    vec![canonical_frame("tenant-a", "knowledge", "s1", "evt-old", 1, b"old")],
+                ),
+                (
+                    2,
+                    recent,
+                    vec![canonical_frame("tenant-a", "knowledge", "s1", "evt-new", 2, b"new")],
+                ),
+            ],
+        );
+
+        let mut opts = options_for(tmp.path());
+        opts.window_days = Some(7);
+        let result = super::collect_corecrux_records(&opts).unwrap();
+        assert_eq!(result.segments_scanned, 1);
+        assert_eq!(result.records.len(), 1);
+        assert!(result.records.contains_key("evt-new"));
+    }
+
+    #[test]
+    fn collect_corecrux_records_shard_filter_selects_one_shard() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        build_shard(
+            tmp.path(),
+            0,
+            &[(
+                1,
+                2_000_000_000_000_000_000,
+                vec![canonical_frame("tenant-a", "knowledge", "s1", "evt-shard0", 1, b"a")],
+            )],
+        );
+        build_shard(
+            tmp.path(),
+            3,
+            &[(
+                1,
+                2_000_000_000_000_000_000,
+                vec![canonical_frame("tenant-a", "knowledge", "s2", "evt-shard3", 1, b"b")],
+            )],
+        );
+
+        let all = super::collect_corecrux_records(&options_for(tmp.path())).unwrap();
+        assert_eq!(all.records.len(), 2);
+
+        let mut opts = options_for(tmp.path());
+        opts.shard = Some(3);
+        let one = super::collect_corecrux_records(&opts).unwrap();
+        assert_eq!(one.segments_scanned, 1);
+        assert_eq!(one.records.len(), 1);
+        assert!(one.records.contains_key("evt-shard3"));
+    }
+
+    /// `--max-segments` keeps the newest segments and *always* marks the run
+    /// partial — a capped scan that reported `partial: false` would let a
+    /// truncated view be read as full parity.
+    #[test]
+    fn collect_corecrux_records_max_segments_keeps_newest_and_marks_partial() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        build_shard(
+            tmp.path(),
+            0,
+            &[
+                (
+                    1,
+                    2_000_000_000_000_000_000,
+                    vec![canonical_frame("tenant-a", "knowledge", "s1", "evt-oldest", 1, b"a")],
+                ),
+                (
+                    2,
+                    2_000_000_000_000_000_500,
+                    vec![canonical_frame("tenant-a", "knowledge", "s1", "evt-middle", 2, b"b")],
+                ),
+                (
+                    3,
+                    2_000_000_000_000_001_000,
+                    vec![canonical_frame("tenant-a", "knowledge", "s1", "evt-newest", 3, b"c")],
+                ),
+            ],
+        );
+
+        let mut opts = options_for(tmp.path());
+        opts.max_segments = Some(2);
+        let result = super::collect_corecrux_records(&opts).unwrap();
+        assert!(result.partial);
+        assert_eq!(result.segments_scanned, 2);
+        assert!(result.records.contains_key("evt-newest"));
+        assert!(result.records.contains_key("evt-middle"));
+        assert!(!result.records.contains_key("evt-oldest"));
+    }
+
+    /// A cap larger than the segment count still marks the run partial (the
+    /// flag tracks the *scope*, not whether truncation actually happened).
+    #[test]
+    fn collect_corecrux_records_max_segments_above_count_still_partial() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        build_shard(
+            tmp.path(),
+            0,
+            &[(
+                1,
+                2_000_000_000_000_000_000,
+                vec![canonical_frame("tenant-a", "knowledge", "s1", "evt-1", 1, b"a")],
+            )],
+        );
+
+        let mut opts = options_for(tmp.path());
+        opts.max_segments = Some(50);
+        let result = super::collect_corecrux_records(&opts).unwrap();
+        assert!(result.partial);
+        assert_eq!(result.segments_scanned, 1);
+    }
+
+    /// A frame whose stored header is shorter than the trailing 32-byte header
+    /// hash is unusable; the scan must fail loudly instead of skipping the
+    /// record (a skipped record reads as `missingInCoreCrux`, i.e. a real
+    /// divergence attributed to the wrong side).
+    #[test]
+    fn collect_corecrux_records_rejects_truncated_stored_header() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        build_shard(
+            tmp.path(),
+            0,
+            &[(
+                1,
+                2_000_000_000_000_000_000,
+                vec![RawFrame {
+                    stream_hash: 42,
+                    seq: 1,
+                    event_id: "evt-short".to_string(),
+                    header_bytes: vec![0u8; 8],
+                    payload: b"x".to_vec(),
+                }],
+            )],
+        );
+
+        let err = super::collect_corecrux_records(&options_for(tmp.path())).unwrap_err();
+        assert!(
+            err.to_string().contains("stored header too short"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Same contract for a header that is long enough but is not a decodable
+    /// canonical header.
+    #[test]
+    fn collect_corecrux_records_rejects_undecodable_canonical_header() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        build_shard(
+            tmp.path(),
+            0,
+            &[(
+                1,
+                2_000_000_000_000_000_000,
+                vec![RawFrame {
+                    stream_hash: 42,
+                    seq: 1,
+                    event_id: "evt-garbage".to_string(),
+                    header_bytes: vec![0xFFu8; 64],
+                    payload: b"x".to_vec(),
+                }],
+            )],
+        );
+
+        let err = super::collect_corecrux_records(&options_for(tmp.path())).unwrap_err();
+        assert!(
+            err.to_string().contains("failed to decode canonical header"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn collect_corecrux_records_missing_shards_root_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = super::collect_corecrux_records(&options_for(tmp.path())).unwrap_err();
+        // std::fs::read_dir on the absent `shards/` directory.
+        assert!(!err.to_string().is_empty());
+    }
+
+    /// DEFECT PIN (absent signal reads as pass): a `shards/` directory with no
+    /// shard subdirectories — a wrong `--data-dir`, or a node whose data was
+    /// never mounted — yields `Ok` with zero records, zero segments scanned,
+    /// and `partial: false`. Downstream that becomes a report with
+    /// `checked: 0, matched: 0, missingInPostgres: 0`, indistinguishable from
+    /// genuine parity. This test pins the CURRENT behaviour; it is not an
+    /// endorsement of it.
+    #[test]
+    fn collect_corecrux_records_empty_shards_root_is_silently_clean() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("shards")).unwrap();
+        let result = super::collect_corecrux_records(&options_for(tmp.path())).unwrap();
+        assert_eq!(result.segments_scanned, 0);
+        assert!(result.records.is_empty());
+        assert!(!result.partial);
+    }
+
+    /// A shard directory without a MANIFEST is a hard error, not an empty scan.
+    #[test]
+    fn collect_corecrux_records_shard_without_manifest_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("shards").join("shard-0000")).unwrap();
+        let err = super::collect_corecrux_records(&options_for(tmp.path())).unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    /// The segment file named by the MANIFEST having been deleted must surface
+    /// as an error rather than a short read.
+    #[test]
+    fn collect_corecrux_records_missing_segment_file_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        build_shard(
+            tmp.path(),
+            0,
+            &[(
+                1,
+                2_000_000_000_000_000_000,
+                vec![canonical_frame("tenant-a", "knowledge", "s1", "evt-1", 1, b"a")],
+            )],
+        );
+        std::fs::remove_file(
+            tmp.path()
+                .join("shards")
+                .join("shard-0000")
+                .join("segments")
+                .join("000000000001.ccxseg"),
+        )
+        .unwrap();
+
+        let err = super::collect_corecrux_records(&options_for(tmp.path())).unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    // ── Postgres side: connection failures (no server contacted) ──────
+
+    #[test]
+    fn collect_postgres_records_rejects_unparsable_connection_string() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut opts = options_for(tmp.path());
+        opts.connection_string = "definitely not a postgres url".to_string();
+        let err = super::collect_postgres_records(&opts).unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    /// `reconcile_postgres` scans CoreCrux first, so a bad `--data-dir` fails
+    /// before any database connection is attempted.
+    #[test]
+    fn reconcile_postgres_fails_on_corecrux_scan_before_touching_postgres() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = super::reconcile_postgres(&options_for(tmp.path())).unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    /// With a scannable (empty) CoreCrux side, the driver proceeds to the
+    /// Postgres collector and surfaces its connection failure.
+    #[test]
+    fn reconcile_postgres_propagates_postgres_connection_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("shards")).unwrap();
+        let mut opts = options_for(tmp.path());
+        opts.connection_string = "definitely not a postgres url".to_string();
+        let err = super::reconcile_postgres(&opts).unwrap_err();
+        assert!(!err.to_string().is_empty());
     }
 }

@@ -516,7 +516,7 @@ fn canonical_hex(input: &str) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use corecrux_types::{
@@ -1335,5 +1335,700 @@ mod tests {
         };
         let dbg = format!("{:?}", report);
         assert!(dbg.contains("j1"));
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // HTTP client paths, driven against the shared loopback stub in
+    // `crate::test_support`. Note: neither `CoordinatorClient` nor
+    // `CoreCruxClient` calls `http_status_as_error(false)`, so a 4xx/5xx
+    // reaches the caller as a ureq `Transport`/status error and never
+    // produces a parsed body — the assertions below are `is_err()` on
+    // purpose, not on a status branch (there is none).
+    // ══════════════════════════════════════════════════════════════════
+
+    use crate::test_support::serve_responses;
+
+    fn record_json(job_id: &str, shard_id: &str, kind: &str) -> String {
+        serde_json::to_string(&OrchestrationRecord {
+            job_id: job_id.to_string(),
+            kind: kind.to_string(),
+            shard_id: shard_id.to_string(),
+            source_node_id: Some("node-a".to_string()),
+            target_node_id: Some("node-b".to_string()),
+            at_hash_hex: Some("0x4000000000000000".to_string()),
+            new_shard_id: Some("shard-0003".to_string()),
+            status: "completed".to_string(),
+            created_unix_ms: 1,
+            updated_unix_ms: 2,
+        })
+        .expect("record json")
+    }
+
+    fn lease_json(shard_id: &str, leader: &str, epoch: u64) -> String {
+        serde_json::to_string(&LeaseRecord {
+            shard_id: shard_id.to_string(),
+            leader_node_id: leader.to_string(),
+            epoch,
+            lease_expires_unix_ms: 1_700_000_000_000,
+            updated_unix_ms: 1_700_000_000_000,
+        })
+        .expect("lease json")
+    }
+
+    fn shard_map_body(map: &ShardMapV1) -> String {
+        serde_json::json!({ "shardMap": map }).to_string()
+    }
+
+    // ── CoordinatorClient ───────────────────────────────────────────
+
+    #[test]
+    fn list_moves_parses_array_body() {
+        let body = format!("[{}]", record_json("job-1", "shard-0001", "move"));
+        let (port, h) = serve_responses(vec![(200, body)]);
+        let client = CoordinatorClient::new(&format!("http://127.0.0.1:{port}"));
+        let moves = client.list_moves().expect("list moves");
+        let reqs = h.join().expect("stub thread");
+        assert_eq!(moves.len(), 1);
+        assert_eq!(moves[0].job_id, "job-1");
+        assert!(reqs[0].starts_with("GET /v1/moves "), "req={:?}", reqs[0]);
+    }
+
+    #[test]
+    fn list_splits_parses_array_body() {
+        let body = format!("[{}]", record_json("job-9", "shard-0001", "split"));
+        let (port, h) = serve_responses(vec![(200, body)]);
+        let client = CoordinatorClient::new(&format!("http://127.0.0.1:{port}"));
+        let splits = client.list_splits().expect("list splits");
+        let reqs = h.join().expect("stub thread");
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].kind, "split");
+        assert!(reqs[0].starts_with("GET /v1/splits "), "req={:?}", reqs[0]);
+    }
+
+    #[test]
+    fn list_leases_parses_array_body() {
+        let body = format!("[{}]", lease_json("shard-0001", "node-b", 3));
+        let (port, h) = serve_responses(vec![(200, body)]);
+        let client = CoordinatorClient::new(&format!("http://127.0.0.1:{port}"));
+        let leases = client.list_leases().expect("list leases");
+        let reqs = h.join().expect("stub thread");
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].epoch, 3);
+        assert!(reqs[0].starts_with("GET /v1/leases "), "req={:?}", reqs[0]);
+    }
+
+    #[test]
+    fn list_moves_empty_array_is_not_an_error() {
+        let (port, h) = serve_responses(vec![(200, "[]".to_string())]);
+        let client = CoordinatorClient::new(&format!("http://127.0.0.1:{port}"));
+        let moves = client.list_moves().expect("list moves");
+        h.join().ok();
+        assert!(moves.is_empty());
+    }
+
+    /// A body that is not the expected shape must surface as an error, never
+    /// as an empty list that a caller would read as "no in-flight moves".
+    #[test]
+    fn list_moves_rejects_non_array_body() {
+        let (port, h) = serve_responses(vec![(200, r#"{"moves":[]}"#.to_string())]);
+        let client = CoordinatorClient::new(&format!("http://127.0.0.1:{port}"));
+        let err = client.list_moves().expect_err("object body must not parse as a list");
+        h.join().ok();
+        assert!(!format!("{err}").is_empty());
+    }
+
+    #[test]
+    fn list_moves_rejects_truncated_json() {
+        let (port, h) = serve_responses(vec![(200, "[{\"jobId\":".to_string())]);
+        let client = CoordinatorClient::new(&format!("http://127.0.0.1:{port}"));
+        assert!(client.list_moves().is_err());
+        h.join().ok();
+    }
+
+    /// Coordinator 5xx must propagate as an error rather than a default record.
+    #[test]
+    fn list_leases_surfaces_server_error() {
+        let (port, h) = serve_responses(vec![(503, "unavailable".to_string())]);
+        let client = CoordinatorClient::new(&format!("http://127.0.0.1:{port}"));
+        assert!(client.list_leases().is_err());
+        h.join().ok();
+    }
+
+    #[test]
+    fn create_move_posts_request_body() {
+        let (port, h) = serve_responses(vec![(200, record_json("job-1", "shard-0001", "move"))]);
+        let client = CoordinatorClient::new(&format!("http://127.0.0.1:{port}"));
+        let record = client
+            .create_move(&MoveCreateRequest {
+                job_id: Some("job-1".to_string()),
+                shard_id: "shard-0001".to_string(),
+                source_node_id: "node-a".to_string(),
+                target_node_id: "node-b".to_string(),
+                status: None,
+            })
+            .expect("create move");
+        let reqs = h.join().expect("stub thread");
+        assert_eq!(record.job_id, "job-1");
+        assert!(reqs[0].starts_with("POST /v1/moves "), "req={:?}", reqs[0]);
+        assert!(reqs[0].contains("\"shardId\": \"shard-0001\""), "req={:?}", reqs[0]);
+        assert!(reqs[0].contains("\"targetNodeId\": \"node-b\""), "req={:?}", reqs[0]);
+    }
+
+    #[test]
+    fn create_split_posts_request_body() {
+        let (port, h) = serve_responses(vec![(200, record_json("job-2", "shard-0001", "split"))]);
+        let client = CoordinatorClient::new(&format!("http://127.0.0.1:{port}"));
+        let record = client
+            .create_split(&SplitCreateRequest {
+                job_id: None,
+                shard_id: "shard-0001".to_string(),
+                at_hash_hex: "0x4000000000000000".to_string(),
+                new_shard_id: "shard-0003".to_string(),
+                status: None,
+            })
+            .expect("create split");
+        let reqs = h.join().expect("stub thread");
+        assert_eq!(record.kind, "split");
+        assert!(reqs[0].starts_with("POST /v1/splits "), "req={:?}", reqs[0]);
+        assert!(
+            reqs[0].contains("\"atHashHex\": \"0x4000000000000000\""),
+            "req={:?}",
+            reqs[0]
+        );
+        assert!(!reqs[0].contains("jobId"), "None jobId must be omitted: {:?}", reqs[0]);
+    }
+
+    #[test]
+    fn create_move_surfaces_server_error() {
+        let (port, h) = serve_responses(vec![(409, "conflict".to_string())]);
+        let client = CoordinatorClient::new(&format!("http://127.0.0.1:{port}"));
+        let result = client.create_move(&MoveCreateRequest {
+            job_id: None,
+            shard_id: "shard-0001".to_string(),
+            source_node_id: "node-a".to_string(),
+            target_node_id: "node-b".to_string(),
+            status: None,
+        });
+        h.join().ok();
+        assert!(result.is_err());
+    }
+
+    // ── CoreCruxClient::get_shard_map ───────────────────────────────
+
+    #[test]
+    fn get_shard_map_unwraps_envelope() {
+        let map = sample_map();
+        let (port, h) = serve_responses(vec![(200, shard_map_body(&map))]);
+        let client = CoreCruxClient::new(&format!("http://127.0.0.1:{port}"));
+        let out = client.get_shard_map().expect("shard map");
+        let reqs = h.join().expect("stub thread");
+        assert_eq!(out.version, map.version);
+        assert_eq!(out.shards.len(), 2);
+        assert!(reqs[0].starts_with("GET /v1/shard-map "), "req={:?}", reqs[0]);
+    }
+
+    /// A bare shard map (no `shardMap` envelope) must not silently deserialize
+    /// into a default/empty map.
+    #[test]
+    fn get_shard_map_rejects_unenveloped_body() {
+        let map = sample_map();
+        let body = serde_json::to_string(&map).expect("map json");
+        let (port, h) = serve_responses(vec![(200, body)]);
+        let client = CoreCruxClient::new(&format!("http://127.0.0.1:{port}"));
+        assert!(client.get_shard_map().is_err());
+        h.join().ok();
+    }
+
+    #[test]
+    fn get_shard_map_surfaces_server_error() {
+        let (port, h) = serve_responses(vec![(500, "boom".to_string())]);
+        let client = CoreCruxClient::new(&format!("http://127.0.0.1:{port}"));
+        assert!(client.get_shard_map().is_err());
+        h.join().ok();
+    }
+
+    // ── submit_move / submit_split ──────────────────────────────────
+
+    #[test]
+    fn submit_move_returns_report_with_normalized_base() {
+        let (port, h) = serve_responses(vec![(200, record_json("job-1", "shard-0001", "move"))]);
+        let report = submit_move(
+            &format!("http://127.0.0.1:{port}/"),
+            MoveCreateRequest {
+                job_id: None,
+                shard_id: "shard-0001".to_string(),
+                source_node_id: "node-a".to_string(),
+                target_node_id: "node-b".to_string(),
+                status: None,
+            },
+        )
+        .expect("submit move");
+        h.join().ok();
+        assert!(report.ok);
+        assert_eq!(report.coordinator_base, format!("http://127.0.0.1:{port}"));
+        assert_eq!(report.record.job_id, "job-1");
+        assert!(report.next_hint.contains("corecruxctl shard status"));
+    }
+
+    #[test]
+    fn submit_split_returns_report_with_normalized_base() {
+        let (port, h) = serve_responses(vec![(200, record_json("job-2", "shard-0001", "split"))]);
+        let report = submit_split(
+            &format!("http://127.0.0.1:{port}//"),
+            SplitCreateRequest {
+                job_id: None,
+                shard_id: "shard-0001".to_string(),
+                at_hash_hex: "0x4000000000000000".to_string(),
+                new_shard_id: "shard-0003".to_string(),
+                status: None,
+            },
+        )
+        .expect("submit split");
+        h.join().ok();
+        assert!(report.ok);
+        assert_eq!(report.coordinator_base, format!("http://127.0.0.1:{port}"));
+        assert_eq!(report.record.kind, "split");
+    }
+
+    #[test]
+    fn submit_move_propagates_coordinator_failure() {
+        let (port, h) = serve_responses(vec![(500, "boom".to_string())]);
+        let result = submit_move(
+            &format!("http://127.0.0.1:{port}"),
+            MoveCreateRequest {
+                job_id: None,
+                shard_id: "shard-0001".to_string(),
+                source_node_id: "node-a".to_string(),
+                target_node_id: "node-b".to_string(),
+                status: None,
+            },
+        );
+        h.join().ok();
+        assert!(result.is_err(), "a failed submit must not report ok:true");
+    }
+
+    // ── status ──────────────────────────────────────────────────────
+
+    /// `status` issues leases, then moves, then splits. Filters must drop
+    /// records for other shards/jobs on every one of the three lists.
+    #[test]
+    fn status_applies_shard_and_job_filters() {
+        let leases = format!(
+            "[{},{}]",
+            lease_json("shard-0001", "node-b", 3),
+            lease_json("shard-0002", "node-c", 1)
+        );
+        let moves = format!(
+            "[{},{},{}]",
+            record_json("job-1", "shard-0001", "move"),
+            record_json("job-2", "shard-0001", "move"),
+            record_json("job-3", "shard-0002", "move")
+        );
+        let splits = format!(
+            "[{},{}]",
+            record_json("job-1", "shard-0001", "split"),
+            record_json("job-4", "shard-0002", "split")
+        );
+        let (port, h) = serve_responses(vec![(200, leases), (200, moves), (200, splits)]);
+
+        let report = status(&format!("http://127.0.0.1:{port}"), Some("shard-0001"), Some("job-1")).expect("status");
+        h.join().ok();
+
+        assert!(report.ok);
+        assert_eq!(report.leases.len(), 1, "shard filter applies to leases");
+        assert_eq!(report.moves.len(), 1);
+        assert_eq!(report.moves[0].job_id, "job-1");
+        assert_eq!(report.splits.len(), 1);
+        assert_eq!(report.shard_filter.as_deref(), Some("shard-0001"));
+        assert_eq!(report.job_id_filter.as_deref(), Some("job-1"));
+    }
+
+    #[test]
+    fn status_without_filters_returns_every_record() {
+        let leases = format!("[{}]", lease_json("shard-0002", "node-c", 1));
+        let moves = format!(
+            "[{},{}]",
+            record_json("job-1", "shard-0001", "move"),
+            record_json("job-3", "shard-0002", "move")
+        );
+        let splits = "[]".to_string();
+        let (port, h) = serve_responses(vec![(200, leases), (200, moves), (200, splits)]);
+
+        let report = status(&format!("http://127.0.0.1:{port}"), None, None).expect("status");
+        h.join().ok();
+        assert_eq!(report.leases.len(), 1);
+        assert_eq!(report.moves.len(), 2);
+        assert!(report.splits.is_empty());
+        assert!(report.shard_filter.is_none());
+        assert!(report.job_id_filter.is_none());
+    }
+
+    /// A filter that matches nothing yields empty lists — but the call still
+    /// succeeded, so `ok` stays true. Pins that "no matching records" is not
+    /// conflated with "coordinator unreachable" (which errors instead).
+    #[test]
+    fn status_filter_matching_nothing_is_empty_not_error() {
+        let leases = format!("[{}]", lease_json("shard-0001", "node-b", 3));
+        let moves = format!("[{}]", record_json("job-1", "shard-0001", "move"));
+        let (port, h) = serve_responses(vec![(200, leases), (200, moves), (200, "[]".to_string())]);
+        let report = status(&format!("http://127.0.0.1:{port}"), Some("shard-9999"), None).expect("status");
+        h.join().ok();
+        assert!(report.ok);
+        assert!(report.leases.is_empty());
+        assert!(report.moves.is_empty());
+        assert!(report.splits.is_empty());
+    }
+
+    #[test]
+    fn status_propagates_lease_fetch_failure() {
+        let (port, h) = serve_responses(vec![(500, "boom".to_string())]);
+        let result = status(&format!("http://127.0.0.1:{port}"), None, None);
+        h.join().ok();
+        assert!(result.is_err());
+    }
+
+    // ── verify_move / verify_split ──────────────────────────────────
+
+    #[test]
+    fn verify_move_end_to_end_passes_for_consistent_cluster() {
+        let map = sample_map();
+        let moves = format!("[{}]", record_json("job-1", "shard-0001", "move"));
+        let leases = format!("[{}]", lease_json("shard-0001", "node-b", 3));
+        let (port, h) = serve_responses(vec![(200, shard_map_body(&map)), (200, moves), (200, leases)]);
+        let base = format!("http://127.0.0.1:{port}");
+
+        let report = verify_move(&base, &base, "shard-0001", Some("job-1"), None, true).expect("verify move");
+        h.join().ok();
+
+        assert_eq!(report.kind, "move");
+        assert_eq!(report.shard_map_version, 7);
+        assert_eq!(
+            report.selected_record.as_ref().map(|r| r.job_id.clone()),
+            Some("job-1".to_string())
+        );
+        assert!(report.ok, "checks={:?}", report.checks);
+    }
+
+    /// The lease says a different leader than the shard map. `verify_move`
+    /// must report `ok:false` — a mid-move cluster is not a verified move.
+    #[test]
+    fn verify_move_flags_lease_disagreement() {
+        let map = sample_map();
+        let moves = format!("[{}]", record_json("job-1", "shard-0001", "move"));
+        let leases = format!("[{}]", lease_json("shard-0001", "node-a", 2));
+        let (port, h) = serve_responses(vec![(200, shard_map_body(&map)), (200, moves), (200, leases)]);
+        let base = format!("http://127.0.0.1:{port}");
+
+        let report = verify_move(&base, &base, "shard-0001", None, None, true).expect("verify move");
+        h.join().ok();
+        assert!(!report.ok);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "lease_matches_shard_map")
+            .expect("lease check");
+        assert!(!check.ok);
+    }
+
+    /// With no coordinator record and no explicit `--expect-target`, there is
+    /// nothing to compare the leader against, so the `leader_matches_target`
+    /// check is omitted entirely and the report can still be `ok`. Pins the
+    /// current behaviour: an unverifiable move target is not a failure.
+    #[test]
+    fn verify_move_without_record_or_expected_target_omits_leader_check() {
+        let map = sample_map();
+        let leases = format!("[{}]", lease_json("shard-0001", "node-b", 3));
+        let (port, h) = serve_responses(vec![
+            (200, shard_map_body(&map)),
+            (200, "[]".to_string()),
+            (200, leases),
+        ]);
+        let base = format!("http://127.0.0.1:{port}");
+
+        let report = verify_move(&base, &base, "shard-0001", None, None, false).expect("verify move");
+        h.join().ok();
+        assert!(report.selected_record.is_none());
+        assert!(report.checks.iter().all(|c| c.name != "leader_matches_target"));
+        assert!(report.ok);
+    }
+
+    #[test]
+    fn verify_move_explicit_expected_target_overrides_record() {
+        let map = sample_map();
+        let moves = format!("[{}]", record_json("job-1", "shard-0001", "move"));
+        let leases = format!("[{}]", lease_json("shard-0001", "node-b", 3));
+        let (port, h) = serve_responses(vec![(200, shard_map_body(&map)), (200, moves), (200, leases)]);
+        let base = format!("http://127.0.0.1:{port}");
+
+        let report = verify_move(&base, &base, "shard-0001", None, Some("node-ZZZ"), false).expect("verify move");
+        h.join().ok();
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "leader_matches_target")
+            .expect("leader check");
+        assert!(!check.ok);
+        assert!(
+            check.detail.contains("expectedTarget=node-ZZZ"),
+            "detail={}",
+            check.detail
+        );
+        assert!(!report.ok);
+    }
+
+    #[test]
+    fn verify_move_propagates_shard_map_failure() {
+        let (port, h) = serve_responses(vec![(500, "boom".to_string())]);
+        let base = format!("http://127.0.0.1:{port}");
+        assert!(verify_move(&base, &base, "shard-0001", None, None, false).is_err());
+        h.join().ok();
+    }
+
+    #[test]
+    fn verify_split_end_to_end_passes_for_consistent_cluster() {
+        let mut map = sample_map();
+        map.shards[0].ranges[0].end_exclusive = "0x4000000000000000".to_string();
+        map.shards.push(ShardDescriptor {
+            shard_id: "shard-0003".to_string(),
+            epoch: 1,
+            state: ShardState::Active,
+            ranges: vec![HashRange {
+                start_inclusive: "0x4000000000000000".to_string(),
+                end_exclusive: "0x8000000000000000".to_string(),
+            }],
+            leader: node("node-b"),
+            followers: Some(vec![node("node-a")]),
+            data_dir: None,
+            gpu_id: Some(0),
+        });
+        map.blake3 = compute_shard_map_v1_blake3_hex(&map).expect("hash");
+
+        let splits = format!("[{}]", record_json("job-2", "shard-0001", "split"));
+        let (port, h) = serve_responses(vec![(200, shard_map_body(&map)), (200, splits)]);
+        let base = format!("http://127.0.0.1:{port}");
+
+        let report = verify_split(&base, &base, "shard-0001", "shard-0003", None, Some("job-2")).expect("verify split");
+        h.join().ok();
+        assert_eq!(report.kind, "split");
+        assert!(report.ok, "checks={:?}", report.checks);
+    }
+
+    /// An empty `new_shard_id` falls back to the coordinator record's
+    /// `newShardId`; if the record names a shard the map does not have, the
+    /// split must be reported as unverified.
+    #[test]
+    fn verify_split_falls_back_to_record_new_shard_id() {
+        let map = sample_map();
+        let splits = format!("[{}]", record_json("job-2", "shard-0001", "split"));
+        let (port, h) = serve_responses(vec![(200, shard_map_body(&map)), (200, splits)]);
+        let base = format!("http://127.0.0.1:{port}");
+
+        let report = verify_split(&base, &base, "shard-0001", "", None, Some("job-2")).expect("verify split");
+        h.join().ok();
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "new_shard_exists")
+            .expect("child check");
+        assert!(!check.ok);
+        assert!(check.detail.contains("shard-0003"), "detail={}", check.detail);
+        assert!(!report.ok);
+    }
+
+    /// DEFECT-ADJACENT PIN: when neither `--at` nor a matching coordinator
+    /// record supplies a split point, `split_point_boundary_present` is never
+    /// emitted, so a split can be reported `ok` without its boundary ever
+    /// being checked.
+    #[test]
+    fn verify_split_without_split_point_skips_boundary_check() {
+        let map = sample_map();
+        let (port, h) = serve_responses(vec![(200, shard_map_body(&map)), (200, "[]".to_string())]);
+        let base = format!("http://127.0.0.1:{port}");
+
+        let report = verify_split(&base, &base, "shard-0001", "shard-0002", None, None).expect("verify split");
+        h.join().ok();
+        assert!(report.selected_record.is_none());
+        assert!(report.checks.iter().all(|c| c.name != "split_point_boundary_present"));
+        assert!(report.ok);
+    }
+
+    #[test]
+    fn verify_split_propagates_coordinator_failure() {
+        let map = sample_map();
+        let (port, h) = serve_responses(vec![(200, shard_map_body(&map)), (503, "down".to_string())]);
+        let base = format!("http://127.0.0.1:{port}");
+        assert!(verify_split(&base, &base, "shard-0001", "shard-0002", None, None).is_err());
+        h.join().ok();
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Boundary + malformed-id cases for the pure check builders.
+    // ══════════════════════════════════════════════════════════════════
+
+    /// `parse_u64_hex` treats the `0x` prefix as optional, so a split point
+    /// given without it still normalizes onto a shard-map boundary.
+    #[test]
+    fn build_split_checks_split_point_without_0x_prefix_matches_boundary() {
+        let mut map = sample_map();
+        map.shards[0].ranges[0].end_exclusive = "0x4000000000000000".to_string();
+        map.shards.push(ShardDescriptor {
+            shard_id: "shard-0003".to_string(),
+            epoch: 1,
+            state: ShardState::Active,
+            ranges: vec![HashRange {
+                start_inclusive: "4000000000000000".to_string(),
+                end_exclusive: "0x8000000000000000".to_string(),
+            }],
+            leader: node("node-b"),
+            followers: Some(vec![node("node-a")]),
+            data_dir: None,
+            gpu_id: Some(0),
+        });
+        map.blake3 = compute_shard_map_v1_blake3_hex(&map).expect("hash");
+
+        let checks = build_split_checks(&map, "shard-0001", "shard-0003", Some("4000000000000000"));
+        let boundary = checks
+            .iter()
+            .find(|c| c.name == "split_point_boundary_present")
+            .expect("boundary check");
+        assert!(boundary.ok, "detail={}", boundary.detail);
+    }
+
+    /// A split point that overflows u64 is unparsable: the builder reports it
+    /// and returns immediately, so no later check can mask the failure.
+    #[test]
+    fn build_split_checks_overflowing_split_point_short_circuits() {
+        let map = sample_map();
+        let checks = build_split_checks(&map, "shard-0001", "shard-0002", Some("0x1FFFFFFFFFFFFFFFF"));
+        let parse = checks
+            .iter()
+            .find(|c| c.name == "split_point_parseable")
+            .expect("parse check");
+        assert!(!parse.ok);
+        assert!(
+            checks.iter().all(|c| c.name != "epoch_nonzero"),
+            "must return before the epoch check"
+        );
+    }
+
+    #[test]
+    fn build_split_checks_empty_split_point_is_unparsable() {
+        let map = sample_map();
+        let checks = build_split_checks(&map, "shard-0001", "shard-0002", Some(""));
+        let parse = checks
+            .iter()
+            .find(|c| c.name == "split_point_parseable")
+            .expect("parse check");
+        assert!(!parse.ok);
+        assert!(parse.detail.contains("empty hex"), "detail={}", parse.detail);
+    }
+
+    /// The parent's `end_exclusive` matches but no child range starts there:
+    /// half a boundary is not a boundary.
+    #[test]
+    fn build_split_checks_parent_boundary_without_child_boundary_fails() {
+        let mut map = sample_map();
+        map.shards[0].ranges[0].end_exclusive = "0x4000000000000000".to_string();
+        map.blake3 = compute_shard_map_v1_blake3_hex(&map).expect("hash");
+
+        let checks = build_split_checks(&map, "shard-0001", "shard-0002", Some("0x4000000000000000"));
+        let boundary = checks
+            .iter()
+            .find(|c| c.name == "split_point_boundary_present")
+            .expect("boundary check");
+        assert!(!boundary.ok);
+        assert!(
+            boundary.detail.contains("parentHasEnd=true"),
+            "detail={}",
+            boundary.detail
+        );
+        assert!(
+            boundary.detail.contains("childHasStart=false"),
+            "detail={}",
+            boundary.detail
+        );
+    }
+
+    /// A shard map whose recorded digest no longer covers its contents must
+    /// fail `shard_map_valid` on both builders.
+    #[test]
+    fn build_checks_flag_tampered_shard_map_digest() {
+        let mut map = sample_map();
+        map.blake3 = "0".repeat(64);
+
+        let move_checks = build_move_checks(&map, &[], "shard-0001", None, false);
+        let move_valid = move_checks
+            .iter()
+            .find(|c| c.name == "shard_map_valid")
+            .expect("valid check");
+        assert!(!move_valid.ok);
+        assert_eq!(move_valid.detail, "shard map validation failed");
+
+        let split_checks = build_split_checks(&map, "shard-0001", "shard-0002", None);
+        let split_valid = split_checks
+            .iter()
+            .find(|c| c.name == "shard_map_valid")
+            .expect("valid check");
+        assert!(!split_valid.ok);
+    }
+
+    /// Shard ids are compared byte-for-byte: a differently-formatted id
+    /// ("shard-1" vs "shard-0001") must NOT resolve to the same shard.
+    #[test]
+    fn build_move_checks_shard_id_matching_is_exact() {
+        let map = sample_map();
+        for malformed in ["shard-1", "SHARD-0001", "shard-0001 ", "0001"] {
+            let checks = build_move_checks(&map, &[], malformed, None, false);
+            let exists = checks.iter().find(|c| c.name == "shard_exists").expect("exists check");
+            assert!(!exists.ok, "'{malformed}' must not match shard-0001");
+            // A missing shard also suppresses the lease checks entirely.
+            assert!(checks.iter().all(|c| c.name != "lease_record_present"));
+        }
+    }
+
+    #[test]
+    fn build_split_checks_parent_and_child_can_be_the_same_shard() {
+        // Degenerate input: the caller passed the parent id as the new shard.
+        let map = sample_map();
+        let checks = build_split_checks(&map, "shard-0001", "shard-0001", None);
+        assert!(checks
+            .iter()
+            .find(|c| c.name == "parent_shard_exists")
+            .is_some_and(|c| c.ok));
+        assert!(checks
+            .iter()
+            .find(|c| c.name == "new_shard_exists")
+            .is_some_and(|c| c.ok));
+    }
+
+    /// `select_record` with an explicit job id never falls back to the shard
+    /// id, so an unknown job must not silently select a same-shard record.
+    #[test]
+    fn select_record_unknown_job_id_does_not_fall_back_to_shard() {
+        let records = vec![OrchestrationRecord {
+            job_id: "job-1".to_string(),
+            kind: "move".to_string(),
+            shard_id: "shard-0001".to_string(),
+            source_node_id: None,
+            target_node_id: None,
+            at_hash_hex: None,
+            new_shard_id: None,
+            status: "pending".to_string(),
+            created_unix_ms: 0,
+            updated_unix_ms: 0,
+        }];
+        assert!(select_record(&records, "shard-0001", Some("job-999")).is_none());
+    }
+
+    #[test]
+    fn canonical_hex_normalizes_short_and_unprefixed_forms() {
+        assert_eq!(canonical_hex("0x0"), "0x0000000000000000");
+        assert_eq!(canonical_hex("4000000000000000"), "0x4000000000000000");
+        assert_eq!(canonical_hex("0X4000000000000000"), "0X4000000000000000");
+    }
+
+    #[test]
+    fn canonical_hex_overflowing_value_is_returned_verbatim() {
+        assert_eq!(canonical_hex("0x1FFFFFFFFFFFFFFFF"), "0x1FFFFFFFFFFFFFFFF");
     }
 }

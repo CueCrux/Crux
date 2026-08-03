@@ -108,7 +108,7 @@ To understand what makes this tamper-evident, read these symbols in order:
 
 ## Build / test
 
-- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.54
+- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.55
   (`[workspace.package]` in `Cargo.toml` is authoritative, and
   `scripts/check-agent-docs.sh` fails the build when this line disagrees with it).
 - `cargo build --workspace --locked`
@@ -451,7 +451,7 @@ schema: crux-agent-manifest/v1
 summary: Local-first, tamper-evident retrieval + memory engine with signed, replayable receipts.
 msrv: "1.88.0"
 edition: "2021"
-workspace_version: "0.5.54"
+workspace_version: "0.5.55"
 
 verify_commands:
   - cargo test --workspace
@@ -4064,6 +4064,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.55] - 2026-08-02
+
+### Added
+
+- **Account entitlement is now a verified property of a signed token, not an
+  environment variable.** Three milestones of
+  `crux-pro-capabilities-rcx-entitled-2026-07-27` land together, all **dark** —
+  nothing enforces on them yet, `OperatingMode` still comes from
+  `CORECRUXD_OPERATING_MODE`, and the cutover is a later milestone.
+  - `corecruxd::entitlement` — an on-disk entitlement store on the reserved
+    `__entitlement__::rcx` entity (born private, no freshness horizon), plus
+    `resolve_entitlement`: revocation → presence → parse → tenant scope →
+    signature → expiry → tier. Forgery and revocation always resolve
+    `FreeLocal`; an expired token follows its own `FallbackPolicy`, so a paying
+    user who is merely offline keeps working.
+  - `corecruxd::pairing` — the daemon half of account pairing, reusing the
+    RFC 8628 device grant already shipped at `/v1/auth/device/*`. No licence key
+    and no typed secret: the `user_code` is a short-lived, single-use public
+    correlator, useless without an authenticated browser session, and never
+    written to configuration.
+  - `OperatingMode::GovernanceHosted`. `MaxPrivate` remains a composite —
+    Governance entitlement plus a private deployment shape — so no issuer can
+    hand it out.
+
+### Changed
+
+- **`RcxTier` cut over to the published ladder: `Free | Pro | Governance`.**
+  The previous `Free | Pro | Team | Enterprise` matched no product CueCrux
+  sells. `Team` is retired outright and `Enterprise` becomes `Governance`;
+  `crux-enterprise-shim` re-gates accordingly (`not_enterprise_tier` →
+  `not_governance_tier`). Retired values now fail *deserialisation*, which is
+  what makes a stale token fail closed to `FreeLocal` rather than resolve to
+  some default. `team_scope` and `enterprise_scope` stay on the token: removing
+  either would change the signed bytes for every tier, not just the retired one.
+- **New spec version `rcx-ct/1.2`, accepted alongside `rcx-ct/1.1` rather than
+  replacing it.** The spec-version check is not a version ladder but a match
+  with a rejecting catch-all, so repointing the 1.1 constant would have failed
+  every delegation token already minted. `1.2` is a *tier-vocabulary* version and
+  is orthogonal to delegation: 1.0 forbids a delegation policy, 1.1 requires
+  one, 1.2 makes it optional — a plain entitlement token carries none. A
+  cross-language byte-parity vector pins the Rust and TypeScript encoders
+  together on a `1.2` token with `tier: governance`.
+- **`corecruxd` split into sibling crates** — `corecrux-workspace-scan`,
+  `corecrux-billing`, `corecrux-providers` and `corecrux-secrets` — with the
+  unwrap ratchet re-baselined across the new boundary and `AGENTS.md` added for
+  the extracted crates.
+- Desktop shell gains isolated Registry and WikiCrux tabs.
+- Workspace test coverage raised from 88.49% to 90.11% across the nine
+  highest-debt files.
+
+### Fixed
+
+- **Seat identity is taken from the credential, not the request body**, closing
+  a bypass of the M8 per-seat rate ceiling on enriched verdicts.
+- **`dossier` and `storybook` now authorise against the tenant they answer for**
+  (code-intel M3b).
+- `ledger:history` is no longer advertised as a Pro claim. The route is fully
+  implemented but nothing produces a record, and selling a capability with no
+  producer is a truth-in-selling problem; the route and its handlers stay.
+- `run_git` gained a real wall-clock deadline. `GIT_TIMEOUT_SECS` fed only
+  `GIT_HTTP_LOW_SPEED_TIME`, an HTTP-transport setting that neither a local
+  `git blame` nor an SSH remote ever consults, so the call could block
+  unbounded on a stale `index.lock`.
+- `corecruxctl --version` now exists. It had no version surface at all, unlike
+  `crux-hook` and `corecruxd`.
+- The console `.mcpb` is rebuilt so it ships Apache-2.0 rather than the retired
+  CCL-1.0.
+- The config wizard parses profile frontmatter on a CRLF checkout.
+- The release path and a hang guard that was failing tests are unbroken.
+
+### Security
+
+- **wasmtime 47.0.2 → 47.0.3**, clearing [RUSTSEC-2026-0222] (stores can mix up
+  type indices between engines) and [RUSTSEC-2026-0223] (preemption and traps
+  during bulk operations break internal VM state). Lockfile only; `wasmtime` is
+  optional behind the default-off `wasm-extensions` feature, so default builds
+  never compiled it.
+
+[RUSTSEC-2026-0222]: https://rustsec.org/advisories/RUSTSEC-2026-0222
+[RUSTSEC-2026-0223]: https://rustsec.org/advisories/RUSTSEC-2026-0223
+
 ## [0.5.54] - 2026-07-30
 
 ### Changed
@@ -4670,6 +4751,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-audit` CVE scanning in CI
 
 [unreleased]: https://github.com/CueCrux/Crux/compare/v0.5.54...HEAD
+[0.5.55]: https://github.com/CueCrux/Crux/compare/v0.5.54...v0.5.55
 [0.5.54]: https://github.com/CueCrux/Crux/compare/v0.5.53...v0.5.54
 [0.4.6]: https://github.com/CueCrux/Crux/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/CueCrux/Crux/compare/v0.4.4...v0.4.5
