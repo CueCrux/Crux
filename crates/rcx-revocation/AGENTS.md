@@ -16,11 +16,16 @@ revoked?" in a shape the caller can **fail closed** on. Single-file crate
   never invoked unless revocation is known
 - `RevocationFeed` — the cache; `refresh`, `snapshot`, `snapshot_refreshing`, `apply_push`
 - `CrlTransport` / `HttpCrlTransport` — fetch seam; `CrlDocument`, `CRL_SCHEMA_V1`
+- `CrlCredential` — `x-api-key` + `x-tenant-id` for the authenticated CRL route;
+  `API_KEY_ENV` / `TENANT_ID_ENV`
 
 ## Test & verify
 - `cargo test -p rcx-revocation` (tests module at the bottom of `src/lib.rs`)
-- All tests use a scripted transport — no network, and time is injected, so
-  freshness and rollback are deterministic
+- Cache/freshness/rollback tests use a scripted transport — no network, and time
+  is injected, so they are deterministic
+- The HTTP-transport tests use a loopback stub to assert what goes **on the
+  wire**; "the field is set" and "the header was sent" are different claims and
+  only the second one was the bug
 
 ## Local rules
 - **Why tri-state.** `verify_token_attenuated` takes `Fn(&str) -> bool`, and a bare
@@ -36,6 +41,16 @@ revoked?" in a shape the caller can **fail closed** on. Single-file crate
   refused and the prior cache is retained.
 - **HTTPS only**, enforced in the transport rather than left to callers: a
   cleartext CRL is attacker-editable and stripping entries un-revokes devices.
+  The loopback carve-out is `cfg!(test)`-gated, so it is false in every dependent
+  crate — do not widen it to a runtime flag.
+- **The CRL route is authenticated and must stay that way.** It derives its
+  tenant from the auth context, not the URL. Making it public would be the wrong
+  fix for a 401: `crl_url` is one static config value with no tenant scope, so a
+  public CRL leaks per-tenant revocation volume to anyone who can enumerate
+  tenant ids. Send the credential instead.
+- **`CORECRUXD_ENGINE_*` is a borrowed name, not an owned one.** The source of
+  truth for that env family is `corecrux_memory::snapshot_sync`; the constants
+  here must stay in step with it.
 - **`apply_push` is additive only.** A push may add revocations, never remove
   them. The push transport needs a WebSocket (none in this tree yet — M4
   introduces the first), so only the hook lives here.

@@ -32,6 +32,20 @@
 //! This crate is the opposite: absence means "could not ask", and a relay
 //! session must not start on an unanswered question.
 //!
+//! # Credential model
+//!
+//! The CRL endpoint (`GET /v1/rcx-ct/crl`) is authenticated, and it derives the
+//! tenant it serves from the request's auth context rather than from the URL.
+//! [`HttpCrlTransport`] therefore presents `x-api-key` + `x-tenant-id`
+//! ([`API_KEY_ENV`] / [`TENANT_ID_ENV`], the same `CORECRUXD_ENGINE_*` family
+//! the daemon already uses to reach CruxEngine `apps/api`). An unauthenticated
+//! fetch gets a `401`, which this crate fails closed on — safe, but no relay
+//! session can ever start.
+//!
+//! Making the route public instead would be the wrong repair: `crl_url` is a
+//! single static config value with no tenant scope, so a public CRL leaks
+//! per-tenant revocation volume to anyone who can enumerate tenant ids.
+//!
 //! # Not included
 //!
 //! The `push_channel` half is a live push for bounded revocation latency. It
@@ -73,6 +87,14 @@ pub const DEFAULT_FRESHNESS_SECS: u64 = 300;
 pub enum RevocationError {
     #[error("transport failure: {0}")]
     Transport(String),
+    /// The CRL endpoint rejected the credential (HTTP 401/403).
+    ///
+    /// Split from [`RevocationError::Transport`] because the two demand opposite
+    /// operator responses and are indistinguishable in a log line otherwise: a
+    /// transport failure is "the endpoint is down", this is "this daemon is not
+    /// configured to talk to it". Both still fail closed.
+    #[error("CRL endpoint rejected the credential (HTTP {status}); check {API_KEY_ENV} and {TENANT_ID_ENV}")]
+    Unauthorized { status: u16 },
     #[error("malformed CRL: {0}")]
     Malformed(String),
     #[error("unsupported CRL schema: {0}")]
@@ -168,31 +190,159 @@ pub trait CrlTransport {
     fn fetch(&self, url: &str) -> Result<String, RevocationError>;
 }
 
+/// Credential for the hosted CRL endpoint.
+///
+/// `GET /v1/rcx-ct/crl` is authenticated like every other `/v1/rcx-ct/*` route
+/// (CruxEngine `apps/api/src/plugins/auth.ts`, `ApiKeyAuth` + `TenantHeader`)
+/// and derives the tenant it serves from `request.authContext`, never from the
+/// URL. That is deliberate and must not be relaxed: `crl_url` is a single static
+/// config value with no tenant scope, so a public CRL would expose per-tenant
+/// revocation volume to anyone able to enumerate tenant ids.
+///
+/// The consequence for this client is that an unauthenticated `GET` gets a
+/// `401`, which fails closed as `Unavailable` — safe, but the feature cannot
+/// work. Hence this type.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CrlCredential {
+    api_key: String,
+    tenant_id: String,
+}
+
+/// CruxEngine API key, sent as `x-api-key`.
+///
+/// Deliberately the **same** env family the daemon already uses to reach
+/// CruxEngine `apps/api` (`corecrux_memory::snapshot_sync`, which is the source
+/// of truth for these names — they must stay in step). A CRL fetch is one more
+/// call to the same API with the same credential; a second credential family
+/// would be a second thing to rotate for no gain.
+pub const API_KEY_ENV: &str = "CORECRUXD_ENGINE_API_KEY";
+/// The daemon's own CruxEngine tenant id, sent as `x-tenant-id`.
+pub const TENANT_ID_ENV: &str = "CORECRUXD_ENGINE_TENANT_ID";
+
+/// Grounded from CruxEngine openapi `securitySchemes.ApiKeyAuth.name`.
+const API_KEY_HEADER: &str = "x-api-key";
+/// Required by CruxEngine's auth middleware for per-tenant routes (`TenantHeader`).
+const TENANT_HEADER: &str = "x-tenant-id";
+
+impl CrlCredential {
+    #[must_use]
+    pub fn new(api_key: impl Into<String>, tenant_id: impl Into<String>) -> Self {
+        Self {
+            api_key: api_key.into(),
+            tenant_id: tenant_id.into(),
+        }
+    }
+
+    /// Resolve from the environment. `None` when either half is absent or blank
+    /// — a half credential is not a credential, and sending one produces the
+    /// same `401` as sending none while looking configured.
+    #[must_use]
+    pub fn from_env() -> Option<Self> {
+        let api_key = trimmed_env(API_KEY_ENV)?;
+        let tenant_id = trimmed_env(TENANT_ID_ENV)?;
+        Some(Self::new(api_key, tenant_id))
+    }
+
+    /// The tenant this credential authenticates as. The API key is deliberately
+    /// not exposed — it is a secret, and nothing outside the transport needs it.
+    #[must_use]
+    pub fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+}
+
+/// Redacts the key. A CRL fetch failure is exactly the moment someone reaches
+/// for a debug log, so the `Debug` impl must not be the thing that leaks it.
+impl std::fmt::Debug for CrlCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CrlCredential")
+            .field("api_key", &"<redacted>")
+            .field("tenant_id", &self.tenant_id)
+            .finish()
+    }
+}
+
+fn trimmed_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// Real HTTP transport. `ureq` with rustls, matching the workspace posture (no
 /// openssl anywhere in the dependency surface).
 pub struct HttpCrlTransport {
     timeout: Duration,
+    credential: Option<CrlCredential>,
 }
 
 impl HttpCrlTransport {
+    /// An **unauthenticated** transport.
+    ///
+    /// Correct only for a CRL whose endpoint authenticates by some other means
+    /// (an enterprise deployment behind mTLS or a private network). Against the
+    /// hosted CueCrux endpoint this always yields
+    /// [`RevocationError::Unauthorized`] — use [`HttpCrlTransport::from_env`] or
+    /// [`HttpCrlTransport::with_credential`] there.
     #[must_use]
     pub fn new(timeout: Duration) -> Self {
-        Self { timeout }
+        Self {
+            timeout,
+            credential: None,
+        }
+    }
+
+    /// Attach a credential.
+    #[must_use]
+    pub fn with_credential(mut self, credential: CrlCredential) -> Self {
+        self.credential = Some(credential);
+        self
+    }
+
+    /// Build from the environment, attaching a credential when one is fully
+    /// configured. An unconfigured daemon still gets a transport — it will fail
+    /// closed at the first fetch with a message naming the missing vars, rather
+    /// than failing to construct and losing that context.
+    #[must_use]
+    pub fn from_env(timeout: Duration) -> Self {
+        let mut transport = Self::new(timeout);
+        transport.credential = CrlCredential::from_env();
+        transport
+    }
+
+    /// Whether this transport will present a credential. For a boot-time log —
+    /// `false` against the hosted endpoint means every relay session will be
+    /// refused, and an operator wants to learn that at boot, not at handshake.
+    #[must_use]
+    pub fn is_authenticated(&self) -> bool {
+        self.credential.is_some()
     }
 }
 
 impl Default for HttpCrlTransport {
+    /// Reads the environment. The unauthenticated form has to be asked for by
+    /// name ([`HttpCrlTransport::new`]) because against the hosted endpoint it
+    /// cannot work.
     fn default() -> Self {
-        Self::new(Duration::from_secs(10))
+        Self::from_env(Duration::from_secs(10))
     }
+}
+
+/// A CRL is only ever fetched over TLS: it is the input to an authorization
+/// decision, so a plaintext fetch would let anyone on the path un-revoke a
+/// device by stripping entries.
+///
+/// The loopback exception exists only inside this crate's own test binary, so
+/// the header contract can be asserted against a local stub. `cfg!(test)` is
+/// false in every dependent crate, so what ships is https-only.
+fn scheme_is_permitted(url: &str) -> bool {
+    url.starts_with("https://")
+        || (cfg!(test) && (url.starts_with("http://127.0.0.1:") || url.starts_with("http://[::1]:")))
 }
 
 impl CrlTransport for HttpCrlTransport {
     fn fetch(&self, url: &str) -> Result<String, RevocationError> {
-        // A CRL is only ever fetched over TLS: it is the input to an
-        // authorization decision, so a plaintext fetch would let anyone on the
-        // path un-revoke a device by stripping entries.
-        if !url.starts_with("https://") {
+        if !scheme_is_permitted(url) {
             return Err(RevocationError::Transport(
                 "crl_url must be https (a plaintext CRL is attacker-editable)".to_string(),
             ));
@@ -201,10 +351,21 @@ impl CrlTransport for HttpCrlTransport {
             .timeout_global(Some(self.timeout))
             .build()
             .new_agent();
-        agent
-            .get(url)
+        let mut request = agent.get(url).header("accept", "application/json");
+        if let Some(credential) = &self.credential {
+            request = request
+                .header(API_KEY_HEADER, &credential.api_key)
+                .header(TENANT_HEADER, &credential.tenant_id);
+        }
+        request
             .call()
-            .map_err(|err| RevocationError::Transport(err.to_string()))?
+            .map_err(|err| match err {
+                // 401 with no credential is the misconfiguration this exists to
+                // fix; 403 is a credential valid for a different tenant. Neither
+                // is retryable, and neither is "the endpoint is down".
+                ureq::Error::StatusCode(status @ (401 | 403)) => RevocationError::Unauthorized { status },
+                other => RevocationError::Transport(other.to_string()),
+            })?
             .body_mut()
             .read_to_string()
             .map_err(|err| RevocationError::Transport(err.to_string()))
@@ -549,11 +710,143 @@ mod tests {
     fn plaintext_crl_urls_are_refused_by_the_http_transport() {
         // A plaintext CRL is attacker-editable, and stripping entries un-revokes
         // devices. Enforced in the transport so no caller can opt out.
-        let transport = HttpCrlTransport::default();
+        let transport = HttpCrlTransport::new(Duration::from_secs(1));
         let err = transport
             .fetch("http://crl.example/crl.json")
             .expect_err("http must be refused");
         assert!(matches!(err, RevocationError::Transport(_)));
+        // The in-crate loopback exception must not widen to arbitrary hosts.
+        assert!(!scheme_is_permitted("http://evil.example/crl.json"));
+        assert!(!scheme_is_permitted("http://127.0.0.1.evil.example/crl.json"));
+        assert!(scheme_is_permitted("https://auth.cuecrux.com/v1/rcx-ct/crl"));
+    }
+
+    // ── HTTP transport auth ──────────────────────────────────────────────────
+    //
+    // The route derives the tenant it serves from `authContext`, so these
+    // headers are not decoration: without them the daemon gets a 401 and
+    // refuses every relay session. Asserted on the wire rather than on the
+    // struct, because "the field is set" and "the header was sent" are
+    // different claims and only the second one is the bug that shipped.
+
+    /// One-shot HTTP stub mirroring `corecrux_memory::snapshot_sync`'s. Captures
+    /// the raw request and returns a canned status + body.
+    fn spawn_stub(status_line: &'static str, body: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let url = format!("http://{}/v1/rcx-ct/crl", listener.local_addr().expect("addr"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut bytes = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => bytes.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&bytes).to_string());
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+        (url, rx)
+    }
+
+    const STUB_CRL: &str = r#"{"schema":"rcx-crl/1","sequence":4,"revoked_fprs":["p_revoked"]}"#;
+
+    #[test]
+    fn the_http_transport_sends_the_engine_credential_headers() {
+        let (url, rx) = spawn_stub("200 OK", STUB_CRL);
+        let transport =
+            HttpCrlTransport::new(Duration::from_secs(5)).with_credential(CrlCredential::new("sk-test-secret", "acme"));
+
+        let body = transport.fetch(&url).expect("stub must answer");
+
+        assert_eq!(body, STUB_CRL);
+        let request = rx.recv().expect("captured request").to_ascii_lowercase();
+        assert!(request.starts_with("get /v1/rcx-ct/crl "), "request line: {request}");
+        assert!(request.contains("x-api-key: sk-test-secret"), "x-api-key: {request}");
+        assert!(request.contains("x-tenant-id: acme"), "x-tenant-id: {request}");
+    }
+
+    #[test]
+    fn an_authenticated_fetch_reaches_fresh_through_the_feed() {
+        // The gate for this change, end to end through the cache: authenticated
+        // transport in, `Fresh` and a working checker out.
+        let (url, _rx) = spawn_stub("200 OK", STUB_CRL);
+        let transport =
+            HttpCrlTransport::new(Duration::from_secs(5)).with_credential(CrlCredential::new("sk-test-secret", "acme"));
+        let mut feed = RevocationFeed::new(transport, Some(url));
+
+        let snapshot = feed.snapshot_refreshing(1_000);
+
+        assert!(snapshot.is_authorizable(), "an authenticated fetch must reach Fresh");
+        let checker = snapshot.checker().expect("fresh data must yield a checker");
+        assert!(checker("p_revoked"));
+        assert!(!checker("p_live"));
+    }
+
+    #[test]
+    fn an_unauthenticated_transport_sends_no_credential_headers() {
+        let (url, rx) = spawn_stub("200 OK", STUB_CRL);
+
+        let _ = HttpCrlTransport::new(Duration::from_secs(5)).fetch(&url);
+
+        let request = rx.recv().expect("captured request").to_ascii_lowercase();
+        assert!(!request.contains("x-api-key"), "no key must be invented: {request}");
+        assert!(
+            !request.contains("x-tenant-id"),
+            "no tenant must be invented: {request}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_credential_is_reported_as_unauthorized_not_as_an_outage() {
+        // This is the shipped bug's signature. It must still fail closed, but an
+        // operator has to be able to tell it from an unreachable endpoint --
+        // one is a config fix, the other is an incident.
+        let (url, _rx) = spawn_stub("401 Unauthorized", r#"{"ok":false}"#);
+        let transport = HttpCrlTransport::new(Duration::from_secs(5));
+        let mut feed = RevocationFeed::new(transport, Some(url));
+
+        let err = feed.refresh(1_000).expect_err("a 401 must not read as success");
+
+        assert_eq!(err, RevocationError::Unauthorized { status: 401 });
+        assert!(err.to_string().contains(API_KEY_ENV), "the message must name the fix");
+        assert!(
+            !feed.snapshot(1_000).is_authorizable(),
+            "a rejected credential must still fail closed"
+        );
+    }
+
+    #[test]
+    fn a_credential_for_the_wrong_tenant_is_unauthorized_too() {
+        let (url, _rx) = spawn_stub("403 Forbidden", r#"{"ok":false}"#);
+        let transport = HttpCrlTransport::new(Duration::from_secs(5))
+            .with_credential(CrlCredential::new("sk-test-secret", "someone-else"));
+
+        let err = transport.fetch(&url).expect_err("403 must not read as success");
+
+        assert_eq!(err, RevocationError::Unauthorized { status: 403 });
+    }
+
+    #[test]
+    fn the_credential_never_appears_in_debug_output() {
+        // A CRL fetch failure is exactly when someone reaches for a debug log.
+        let credential = CrlCredential::new("sk-live-do-not-log", "acme");
+
+        let rendered = format!("{credential:?}");
+
+        assert!(!rendered.contains("sk-live-do-not-log"), "the key must be redacted");
+        assert!(rendered.contains("acme"), "the tenant is not secret and aids diagnosis");
+        assert_eq!(credential.tenant_id(), "acme");
     }
 
     #[test]
