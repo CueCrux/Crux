@@ -2955,4 +2955,1058 @@ let package = Package(
         assert!(scan.external_deps.is_empty());
         assert_eq!(scan.stats.external_dep_count, 0);
     }
+
+    // ---------------------------------------------------------------------
+    // Flag plumbing
+    // ---------------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial]
+    fn env_flag_reads_falsey_words_as_off_and_everything_else_as_on() {
+        for off in ["", "  ", "0", "false", "FALSE", "off", "No", " no "] {
+            let _env = EnvVarGuard::set(EXTERNAL_DEPS_ENV, off);
+            assert!(!external_deps_enabled_from_env(), "expected {off:?} to read as off");
+        }
+        for on in ["1", "true", "YES", "on", "enabled", "00"] {
+            let _env = EnvVarGuard::set(EXTERNAL_DEPS_ENV, on);
+            assert!(external_deps_enabled_from_env(), "expected {on:?} to read as on");
+        }
+        let _unset = EnvVarGuard::unset(EXTERNAL_DEPS_ENV);
+        assert!(!external_deps_enabled_from_env());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn attach_external_deps_populates_scan_and_stats_only_when_enabled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("package.json"), r#"{"dependencies":{"express":"^4"}}"#).expect("package");
+
+        let mut scan = crate::workspace_scan::WorkspaceScan::default();
+        {
+            let _env = EnvVarGuard::unset(EXTERNAL_DEPS_ENV);
+            attach_external_deps_if_enabled(tmp.path(), &mut scan);
+            assert!(scan.external_deps.is_empty());
+            assert_eq!(scan.stats.external_dep_count, 0);
+        }
+        let _env = EnvVarGuard::set(EXTERNAL_DEPS_ENV, "1");
+        attach_external_deps_if_enabled(tmp.path(), &mut scan);
+        assert_eq!(scan.external_deps.len(), 1);
+        assert_eq!(scan.stats.external_dep_count, 1);
+    }
+
+    // ---------------------------------------------------------------------
+    // Discovery: skipped directories, depth cap, path classification
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn manifests_inside_build_and_vendor_directories_are_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for skipped in [
+            "node_modules",
+            "target",
+            "vendor",
+            ".git",
+            "dist",
+            "build",
+            ".venv",
+            "venv",
+            "__pycache__",
+        ] {
+            assert!(should_skip_dir(skipped), "{skipped} must be skipped");
+            let dir = tmp.path().join(skipped).join("inner");
+            std::fs::create_dir_all(&dir).expect("skipped dir");
+            std::fs::write(dir.join("package.json"), r#"{"dependencies":{"ghost":"1"}}"#).expect("ghost manifest");
+        }
+        assert!(!should_skip_dir("src"));
+        assert!(!should_skip_dir("packages"));
+        std::fs::write(tmp.path().join("package.json"), r#"{"dependencies":{"real":"1"}}"#).expect("real manifest");
+
+        let deps = scan_external_deps(tmp.path());
+        assert_eq!(deps.len(), 1, "vendored manifests leaked: {deps:?}");
+        assert_eq!(deps[0].name, "real");
+    }
+
+    #[test]
+    fn manifests_below_the_depth_cap_are_scanned_and_deeper_ones_are_not() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut at_cap = tmp.path().to_path_buf();
+        for level in 1..=MAX_DEPTH {
+            at_cap = at_cap.join(format!("d{level}"));
+        }
+        let past_cap = at_cap.join("deeper");
+        std::fs::create_dir_all(&past_cap).expect("nested dirs");
+        std::fs::write(at_cap.join("package.json"), r#"{"dependencies":{"at-cap":"1"}}"#).expect("at cap");
+        std::fs::write(past_cap.join("package.json"), r#"{"dependencies":{"past-cap":"1"}}"#).expect("past cap");
+
+        let deps = scan_external_deps(tmp.path());
+        assert!(deps.iter().any(|dep| dep.name == "at-cap"));
+        assert!(
+            deps.iter().all(|dep| dep.name != "past-cap"),
+            "the depth cap must stop the walk"
+        );
+    }
+
+    #[test]
+    fn manifest_path_classification_covers_every_supported_name() {
+        for name in [
+            "Cargo.toml",
+            "package.json",
+            "pyproject.toml",
+            "go.mod",
+            "pom.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "Gemfile",
+            "Package.swift",
+            "composer.json",
+            "requirements.txt",
+            "requirements-dev.txt",
+        ] {
+            assert!(is_manifest_name(name), "{name}");
+            assert!(is_manifest_path(Path::new(name)), "{name}");
+        }
+        for name in ["README.md", "Cargo.lock", "requirements", "requirements.in", "gemfile"] {
+            assert!(!is_manifest_name(name), "{name}");
+        }
+        assert!(is_manifest_path(Path::new("src/App.csproj")));
+        assert!(is_manifest_path(Path::new("requirements/base.txt")));
+        assert!(!is_manifest_path(Path::new("docs/notes.txt")));
+        assert!(!is_manifest_path(Path::new("src/App.vbproj")));
+    }
+
+    #[test]
+    fn requirements_files_are_recognised_by_name_or_parent_directory() {
+        assert!(is_requirements_file("requirements.txt"));
+        assert!(is_requirements_file("requirements-dev.txt"));
+        assert!(!is_requirements_file("requirements"));
+        assert!(!is_requirements_file("dev-requirements.txt"));
+        assert!(is_requirements_path(Path::new("requirements/base.txt")));
+        assert!(is_requirements_path(Path::new("requirements-ci/base.txt")));
+        assert!(!is_requirements_path(Path::new("requirements/base.in")));
+        assert!(!is_requirements_path(Path::new("docs/base.txt")));
+        assert!(!is_requirements_path(Path::new("base.txt")));
+    }
+
+    #[test]
+    fn manifest_cap_tiers_partition_pre_m2_m2_and_m4_paths() {
+        for path in [
+            "Cargo.toml",
+            "package.json",
+            "pyproject.toml",
+            "go.mod",
+            "requirements.txt",
+        ] {
+            assert!(is_pre_m2_manifest_path(Path::new(path)), "{path}");
+            assert!(!is_m2_manifest_path(Path::new(path)), "{path}");
+        }
+        assert!(is_pre_m2_manifest_path(Path::new("requirements/base.txt")));
+        for path in ["pom.xml", "build.gradle", "build.gradle.kts", "Gemfile", "App.csproj"] {
+            assert!(is_m2_manifest_path(Path::new(path)), "{path}");
+            assert!(!is_pre_m2_manifest_path(Path::new(path)), "{path}");
+        }
+        for path in ["Package.swift", "composer.json"] {
+            assert!(!is_pre_m2_manifest_path(Path::new(path)), "{path}");
+            assert!(!is_m2_manifest_path(Path::new(path)), "{path}");
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // File reading guards
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn unreadable_oversized_and_non_utf8_files_read_as_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(read_utf8_file(&tmp.path().join("absent.toml"), "Cargo.toml").is_none());
+
+        let binary = tmp.path().join("binary.json");
+        std::fs::write(&binary, b"\xFF\xFE\0").expect("binary file");
+        assert!(read_utf8_file(&binary, "package.json").is_none());
+
+        let big = tmp.path().join("big.json");
+        std::fs::write(&big, "{}").expect("big file");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&big)
+            .expect("open big")
+            .set_len(MAX_FILE_BYTES + 1)
+            .expect("oversize");
+        assert!(read_utf8_file(&big, "package.json").is_none());
+        assert!(
+            read_utf8_lockfile(&big, "package-lock.json").is_some(),
+            "the lockfile cap is larger than the manifest cap"
+        );
+
+        let ok = tmp.path().join("ok.json");
+        std::fs::write(&ok, "{}").expect("ok file");
+        assert_eq!(read_utf8_file(&ok, "package.json").as_deref(), Some("{}"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_manifests_are_never_read() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().join("real.json");
+        std::fs::write(&real, r#"{"dependencies":{"linked":"1"}}"#).expect("real file");
+        let link = tmp.path().join("package.json");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert!(read_utf8_file(&link, "package.json").is_none());
+        assert!(
+            scan_external_deps(tmp.path()).is_empty(),
+            "a symlinked manifest must not be followed"
+        );
+    }
+
+    #[test]
+    fn rel_path_keeps_paths_outside_the_root_verbatim() {
+        assert_eq!(
+            rel_path(Path::new("/repo"), Path::new("/repo/crates/a/Cargo.toml")).as_deref(),
+            Some("crates/a/Cargo.toml")
+        );
+        assert_eq!(
+            rel_path(Path::new("/repo"), Path::new("/elsewhere/Cargo.toml")).as_deref(),
+            Some("/elsewhere/Cargo.toml")
+        );
+    }
+
+    #[test]
+    fn find_nearest_file_walks_up_and_stops_at_the_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let nested = tmp.path().join("a/b/c");
+        std::fs::create_dir_all(&nested).expect("dirs");
+        std::fs::write(tmp.path().join("Cargo.lock"), "").expect("lock");
+        assert_eq!(
+            find_nearest_file(&nested, tmp.path(), "Cargo.lock"),
+            Some(tmp.path().join("Cargo.lock"))
+        );
+        assert!(find_nearest_file(&nested, tmp.path(), "absent.lock").is_none());
+        // A closer file wins over the root one.
+        std::fs::write(nested.join("Cargo.lock"), "").expect("nested lock");
+        assert_eq!(
+            find_nearest_file(&nested, tmp.path(), "Cargo.lock"),
+            Some(nested.join("Cargo.lock"))
+        );
+    }
+
+    #[test]
+    fn dedup_and_sort_keeps_the_first_entry_per_manifest_ecosystem_name_key() {
+        let make = |name: &str, ecosystem: &str, manifest: &str, version: &str| ExternalDep {
+            name: name.to_string(),
+            ecosystem: ecosystem.to_string(),
+            version_req: Some(version.to_string()),
+            version_locked: None,
+            source_manifest: manifest.to_string(),
+            kind: "normal".to_string(),
+        };
+        let deduped = dedup_and_sort(vec![
+            make("z", "npm", "b/package.json", "1"),
+            make("a", "npm", "a/package.json", "1"),
+            make("a", "npm", "a/package.json", "2"),
+            make("a", "cargo", "a/package.json", "3"),
+        ]);
+        assert_eq!(deduped.len(), 3);
+        assert_eq!(
+            deduped
+                .iter()
+                .map(|dep| (dep.source_manifest.as_str(), dep.ecosystem.as_str(), dep.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("a/package.json", "cargo", "a"),
+                ("a/package.json", "npm", "a"),
+                ("b/package.json", "npm", "z"),
+            ]
+        );
+        assert_eq!(
+            deduped
+                .iter()
+                .find(|dep| dep.ecosystem == "npm" && dep.name == "a")
+                .and_then(|dep| dep.version_req.as_deref()),
+            Some("1"),
+            "the first entry for a key wins"
+        );
+    }
+
+    #[test]
+    fn malformed_toml_and_json_manifests_yield_no_dependencies() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("a")).expect("a dir");
+        std::fs::create_dir_all(tmp.path().join("b")).expect("b dir");
+        std::fs::write(tmp.path().join("a/Cargo.toml"), "[dependencies\nbroken = ").expect("broken cargo");
+        std::fs::write(tmp.path().join("b/pyproject.toml"), "[project\n").expect("broken pyproject");
+        std::fs::write(tmp.path().join("package.json"), "{not json").expect("broken package");
+        assert!(scan_external_deps(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn empty_manifests_and_manifests_without_dependency_sections_yield_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("py")).expect("py dir");
+        std::fs::create_dir_all(tmp.path().join("rs")).expect("rs dir");
+        std::fs::write(tmp.path().join("package.json"), "{}").expect("package");
+        std::fs::write(tmp.path().join("py/pyproject.toml"), "[build-system]\nrequires = []\n").expect("pyproject");
+        std::fs::write(
+            tmp.path().join("rs/Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("cargo");
+        std::fs::write(
+            tmp.path().join("go.mod"),
+            "module example.com/app\n\n// only a comment\n",
+        )
+        .expect("go mod");
+        std::fs::write(tmp.path().join("requirements.txt"), "\n# nothing but a comment\n").expect("requirements");
+        std::fs::write(tmp.path().join("Gemfile"), "source \"https://rubygems.org\"\n").expect("Gemfile");
+        assert!(scan_external_deps(tmp.path()).is_empty());
+    }
+
+    /// DEFECT PIN — a missing lockfile and an unparsable one are the same
+    /// observable outcome: every `version_locked` is simply `None`. Nothing in
+    /// the scan distinguishes "this dependency is not pinned" from "the lockfile
+    /// that pins it could not be read".
+    #[test]
+    fn unparsable_lockfile_is_indistinguishable_from_a_missing_one() {
+        let with_broken_lock = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            with_broken_lock.path().join("package.json"),
+            r#"{"dependencies":{"express":"^4"}}"#,
+        )
+        .expect("package");
+        std::fs::write(with_broken_lock.path().join("package-lock.json"), "{ not json").expect("broken lock");
+
+        let without_lock = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            without_lock.path().join("package.json"),
+            r#"{"dependencies":{"express":"^4"}}"#,
+        )
+        .expect("package");
+
+        let broken = scan_external_deps(with_broken_lock.path());
+        let missing = scan_external_deps(without_lock.path());
+        assert_eq!(broken, missing);
+        assert!(broken[0].version_locked.is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // Cargo specifics
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn workspace_dependency_inherits_rename_and_optional_from_the_workspace_table() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("crates/app")).expect("crate dir");
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/app"]
+
+[workspace.dependencies]
+renamed = { package = "real-crate", version = "2.1", optional = true }
+plain = "3.0"
+"#,
+        )
+        .expect("workspace manifest");
+        std::fs::write(
+            tmp.path().join("crates/app/Cargo.toml"),
+            r#"[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+renamed = { workspace = true }
+plain = { workspace = true }
+pinned = { workspace = true, version = "9" }
+unknown_in_workspace = { workspace = true }
+"#,
+        )
+        .expect("member manifest");
+        std::fs::write(
+            tmp.path().join("Cargo.lock"),
+            "[[package]]\nname = \"real-crate\"\nversion = \"2.1.4\"\n\n[[package]]\nname = \"plain\"\nversion = \"3.0.1\"\n",
+        )
+        .expect("lock");
+
+        let deps = scan_external_deps(tmp.path());
+        let source = "crates/app/Cargo.toml";
+        let renamed = dep(&deps, "cargo", source, "renamed");
+        assert_eq!(renamed.version_req.as_deref(), Some("2.1"));
+        assert_eq!(renamed.version_locked.as_deref(), Some("2.1.4"));
+        assert_eq!(renamed.kind, "optional", "workspace optional propagates");
+        assert_eq!(
+            dep(&deps, "cargo", source, "plain").version_locked.as_deref(),
+            Some("3.0.1")
+        );
+        assert_eq!(
+            dep(&deps, "cargo", source, "pinned").version_req.as_deref(),
+            Some("9"),
+            "an explicit version wins over the workspace table"
+        );
+        assert!(dep(&deps, "cargo", source, "unknown_in_workspace")
+            .version_req
+            .is_none());
+    }
+
+    #[test]
+    fn path_dependency_with_a_version_or_git_is_kept_and_a_bare_path_dependency_is_dropped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            r#"[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+bare_path = { path = "../bare" }
+published_path = { path = "../pub", version = "1.2" }
+git_and_path = { path = "../git", git = "https://example.invalid/r.git" }
+renamed = { package = "other-name", version = "1" }
+not_a_table_or_string = [1, 2]
+"#,
+        )
+        .expect("manifest");
+
+        let deps = scan_external_deps(tmp.path());
+        let names: BTreeSet<&str> = deps.iter().map(|dep| dep.name.as_str()).collect();
+        assert_eq!(
+            names,
+            BTreeSet::from(["published_path", "git_and_path", "renamed"]),
+            "{names:?}"
+        );
+        assert_eq!(
+            dep(&deps, "cargo", "Cargo.toml", "published_path")
+                .version_req
+                .as_deref(),
+            Some("1.2")
+        );
+    }
+
+    #[test]
+    fn cargo_lock_without_packages_or_with_nameless_entries_locks_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nanyhow = \"1\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(
+            tmp.path().join("Cargo.lock"),
+            "version = 3\n\n[[package]]\nversion = \"1.0.0\"\n\n[[package]]\nname = \"anyhow\"\n",
+        )
+        .expect("lock");
+        assert!(dep(&scan_external_deps(tmp.path()), "cargo", "Cargo.toml", "anyhow")
+            .version_locked
+            .is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // npm / pnpm specifics
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn npm_intra_repo_protocol_specs_and_non_string_values_are_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"dependencies":{
+              "ws-dep":"workspace:^",
+              "link-dep":"link:../a",
+              "file-dep":"file:../b",
+              "portal-dep":"portal:../c",
+              "object-dep":{"version":"1"},
+              "real":"^1.2.3"
+            }}"#,
+        )
+        .expect("package");
+        let deps = scan_external_deps(tmp.path());
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "real");
+    }
+
+    #[test]
+    fn package_lock_without_packages_or_dependencies_locks_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("package.json"), r#"{"dependencies":{"express":"^4"}}"#).expect("package");
+        std::fs::write(tmp.path().join("package-lock.json"), r#"{"lockfileVersion":3}"#).expect("lock");
+        assert!(dep(&scan_external_deps(tmp.path()), "npm", "package.json", "express")
+            .version_locked
+            .is_none());
+    }
+
+    #[test]
+    fn pnpm_lock_without_importers_or_without_this_importer_locks_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("package.json"), r#"{"dependencies":{"react":"^18"}}"#).expect("package");
+        std::fs::write(tmp.path().join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").expect("lock");
+        assert!(dep(&scan_external_deps(tmp.path()), "npm", "package.json", "react")
+            .version_locked
+            .is_none());
+
+        std::fs::write(
+            tmp.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\nimporters:\n  packages/other:\n    dependencies:\n      react:\n        version: 18.0.0\n",
+        )
+        .expect("lock");
+        assert!(dep(&scan_external_deps(tmp.path()), "npm", "package.json", "react")
+            .version_locked
+            .is_none());
+    }
+
+    #[test]
+    fn pnpm_workspace_member_reads_its_own_importer_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("packages/web")).expect("member dir");
+        std::fs::write(
+            tmp.path().join("packages/web/package.json"),
+            r#"{"dependencies":{"react":"^18"}}"#,
+        )
+        .expect("member package");
+        std::fs::write(
+            tmp.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\nimporters:\n  packages/web:\n    dependencies:\n      react: 18.3.1\n",
+        )
+        .expect("lock");
+        assert_eq!(
+            dep(
+                &scan_external_deps(tmp.path()),
+                "npm",
+                "packages/web/package.json",
+                "react"
+            )
+            .version_locked
+            .as_deref(),
+            Some("18.3.1"),
+            "a plain scalar importer entry is a version too"
+        );
+    }
+
+    #[test]
+    fn pnpm_importer_key_is_dot_at_the_lock_root_and_a_relative_path_below_it() {
+        assert_eq!(pnpm_importer_key(Path::new("/repo"), Path::new("/repo")), ".");
+        assert_eq!(
+            pnpm_importer_key(Path::new("/repo"), Path::new("/repo/packages/web")),
+            "packages/web"
+        );
+        assert_eq!(
+            pnpm_importer_key(Path::new("/repo"), Path::new("/elsewhere")),
+            ".",
+            "a manifest outside the lock directory falls back to the root importer"
+        );
+    }
+
+    #[test]
+    fn pnpm_peer_suffixes_are_stripped_at_the_first_marker() {
+        assert_eq!(strip_pnpm_peer_suffix("1.2.3"), "1.2.3");
+        assert_eq!(strip_pnpm_peer_suffix("1.2.3(peer@1)"), "1.2.3");
+        assert_eq!(strip_pnpm_peer_suffix("1.2.3_peer@1"), "1.2.3");
+        assert_eq!(strip_pnpm_peer_suffix("1.2.3_a(b)"), "1.2.3");
+        assert_eq!(strip_pnpm_peer_suffix("1.2.3(a)_b"), "1.2.3");
+    }
+
+    #[test]
+    fn yaml_get_returns_none_for_non_mappings() {
+        let scalar = serde_yaml::Value::String("x".to_string());
+        assert!(yaml_get(&scalar, "anything").is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // Python specifics
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn requirement_lines_cover_markers_extras_options_and_every_rejection() {
+        let source = Path::new("requirements.txt");
+        let parse = |line: &str| parse_requirement_line(line, source);
+        assert_eq!(parse("requests"), Some(("requests".to_string(), None)));
+        assert_eq!(
+            parse("requests[security,socks] >= 2.31 ; python_version >= '3.10'"),
+            Some(("requests".to_string(), Some(">= 2.31".to_string())))
+        );
+        assert_eq!(
+            parse("pkg == 1.0 --hash=sha256:aa"),
+            Some(("pkg".to_string(), Some("== 1.0".to_string())))
+        );
+        assert_eq!(
+            parse("pkg===1.0"),
+            Some(("pkg".to_string(), Some("===1.0".to_string())))
+        );
+        assert_eq!(parse("pkg~=1.0"), Some(("pkg".to_string(), Some("~=1.0".to_string()))));
+        assert_eq!(parse("pkg!=1.0"), Some(("pkg".to_string(), Some("!=1.0".to_string()))));
+        assert_eq!(parse("pkg<2"), Some(("pkg".to_string(), Some("<2".to_string()))));
+        assert_eq!(parse("pkg<=2"), Some(("pkg".to_string(), Some("<=2".to_string()))));
+        assert_eq!(parse("pkg>2"), Some(("pkg".to_string(), Some(">2".to_string()))));
+        assert_eq!(
+            parse("pkg (>=1)"),
+            Some(("pkg".to_string(), Some(">=1".to_string()))),
+            "a PEP 508 parenthesised specifier is unwrapped"
+        );
+        assert_eq!(
+            parse("pkg @ https://example.invalid/pkg.tar.gz"),
+            None,
+            "direct references are skipped"
+        );
+        assert_eq!(parse("pkg [unterminated"), None, "malformed extras are skipped");
+        assert_eq!(
+            parse("pkg ; python_version < '3'  # trailing"),
+            Some(("pkg".to_string(), None))
+        );
+        assert_eq!(
+            parse("pkg extra-token"),
+            Some(("pkg".to_string(), None)),
+            "an unrecognised suffix simply carries no version_req"
+        );
+        for rejected in [
+            "",
+            "   ",
+            "# comment only",
+            "-r other.txt",
+            "-r",
+            "--requirement other.txt",
+            "-e .",
+            "-e",
+            "--editable .",
+            "--index-url https://example.invalid",
+            "==1.0",
+            "/abs/path",
+            "./local",
+            "../local",
+            "https://example.invalid/pkg.whl",
+            "dist/pkg.zip",
+            "dist/pkg.tar.gz",
+        ] {
+            assert_eq!(parse(rejected), None, "expected {rejected:?} to be skipped");
+        }
+    }
+
+    #[test]
+    fn python_version_specifier_unwrapping_rejects_bare_and_unrecognised_suffixes() {
+        assert!(version_req_from_python_suffix("").is_none());
+        assert!(version_req_from_python_suffix("   ").is_none());
+        assert!(version_req_from_python_suffix("()").is_none());
+        assert!(version_req_from_python_suffix("1.0").is_none());
+        assert_eq!(version_req_from_python_suffix(">=1").as_deref(), Some(">=1"));
+        assert_eq!(version_req_from_python_suffix("(>=1,<2)").as_deref(), Some(">=1,<2"));
+    }
+
+    #[test]
+    fn url_and_local_path_requirements_are_recognised() {
+        for line in [
+            "https://example.invalid/x.whl",
+            "git+ssh://example.invalid/x",
+            "/abs",
+            "./rel",
+            "../rel",
+            "PKG.WHL",
+            "x.tar.gz",
+            "x.zip",
+        ] {
+            assert!(looks_like_url_or_local_path(line), "{line}");
+        }
+        assert!(!looks_like_url_or_local_path("requests>=2"));
+    }
+
+    #[test]
+    fn pypi_names_normalize_runs_of_separators_and_case() {
+        assert_eq!(normalize_pypi_name("Requests"), "requests");
+        assert_eq!(normalize_pypi_name("zope.interface"), "zope-interface");
+        assert_eq!(normalize_pypi_name("typing_extensions"), "typing-extensions");
+        assert_eq!(normalize_pypi_name("A__b--C..d"), "a-b-c-d");
+        assert_eq!(normalize_pypi_name(""), "");
+    }
+
+    #[test]
+    fn poetry_dependency_values_that_are_not_strings_or_versioned_tables_are_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            r#"[tool.poetry.dependencies]
+python = "^3.11"
+good = "^1"
+pathdep = { path = "../local" }
+listdep = ["a", "b"]
+"#,
+        )
+        .expect("pyproject");
+        let deps = scan_external_deps(tmp.path());
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "good");
+        assert_eq!(poetry_dep_spec(&toml::Value::Integer(1)), (None, false));
+    }
+
+    #[test]
+    fn pypi_lock_without_packages_or_with_partial_entries_locks_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("requirements.txt"), "requests>=2\n").expect("requirements");
+        std::fs::write(tmp.path().join("poetry.lock"), "lock-version = \"2.0\"\n").expect("poetry lock");
+        assert!(
+            dep(&scan_external_deps(tmp.path()), "pypi", "requirements.txt", "requests")
+                .version_locked
+                .is_none()
+        );
+
+        std::fs::write(
+            tmp.path().join("poetry.lock"),
+            "[[package]]\nname = \"requests\"\n\n[[package]]\nversion = \"1\"\n",
+        )
+        .expect("poetry lock");
+        assert!(
+            dep(&scan_external_deps(tmp.path()), "pypi", "requirements.txt", "requests")
+                .version_locked
+                .is_none()
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Go specifics
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn go_require_block_start_needs_an_opening_paren() {
+        assert!(go_require_block_start("require ("));
+        assert!(go_require_block_start("require("));
+        assert!(!go_require_block_start("require example.com/a v1"));
+        assert!(!go_require_block_start("module example.com/app"));
+    }
+
+    #[test]
+    fn go_require_lines_without_a_version_and_nested_directives_are_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("go.mod"),
+            r#"module example.com/app
+
+require (
+  example.com/ok v1.0.0
+  nameonly
+  replace example.com/x => ../x
+  exclude example.com/y v1.0.0
+)
+"#,
+        )
+        .expect("go mod");
+        let deps = scan_external_deps(tmp.path());
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "example.com/ok");
+    }
+
+    #[test]
+    fn go_sum_lines_missing_a_hash_field_are_ignored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("go.mod"),
+            "module example.com/app\nrequire example.com/a v1.0.0\n",
+        )
+        .expect("go mod");
+        std::fs::write(tmp.path().join("go.sum"), "example.com/a v1.0.0\n\n").expect("go sum");
+        assert!(dep(&scan_external_deps(tmp.path()), "go", "go.mod", "example.com/a")
+            .version_locked
+            .is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // Maven / Gradle specifics
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn maven_property_interpolation_handles_missing_keys_and_unterminated_placeholders() {
+        let properties: BTreeMap<String, String> =
+            [("a".to_string(), "A".to_string()), ("b".to_string(), "B".to_string())]
+                .into_iter()
+                .collect();
+        assert_eq!(interpolate_maven_properties("plain", &properties), "plain");
+        assert_eq!(interpolate_maven_properties("${a}-${b}", &properties), "A-B");
+        assert_eq!(
+            interpolate_maven_properties("${missing}-${a}", &properties),
+            "${missing}-A"
+        );
+        assert_eq!(
+            interpolate_maven_properties("${unterminated", &properties),
+            "${unterminated"
+        );
+        assert_eq!(
+            interpolate_maven_properties("no placeholder }", &properties),
+            "no placeholder }"
+        );
+    }
+
+    #[test]
+    fn maven_dependencies_missing_a_group_or_artifact_are_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("pom.xml"),
+            r#"<project>
+  <dependencies>
+    <dependency><artifactId>no-group</artifactId></dependency>
+    <dependency><groupId>no.artifact</groupId></dependency>
+    <dependency><groupId>ok</groupId><artifactId>dep</artifactId></dependency>
+  </dependencies>
+  <build><plugins><plugin><dependencies>
+    <dependency><groupId>plugin</groupId><artifactId>dep</artifactId></dependency>
+  </dependencies></plugin></plugins></build>
+</project>"#,
+        )
+        .expect("pom");
+        let deps = scan_external_deps(tmp.path());
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "ok:dep");
+        assert!(deps[0].version_req.is_none());
+    }
+
+    #[test]
+    fn gradle_dynamic_versions_are_never_reported() {
+        for version in ["1.+", "[1,2)", "(1,2]", "latest.release", "LATEST.INTEGRATION", "${v}"] {
+            assert!(gradle_version_is_dynamic(version), "{version}");
+        }
+        assert!(!gradle_version_is_dynamic("1.2.3"));
+        assert!(!gradle_version_is_dynamic("33.3.0-jre"));
+    }
+
+    #[test]
+    fn gradle_comment_stripping_respects_quotes_escapes_and_block_spans() {
+        let mut in_block = false;
+        assert_eq!(
+            strip_gradle_comments("implementation \"a:b:1\"", &mut in_block),
+            "implementation \"a:b:1\""
+        );
+        assert_eq!(strip_gradle_comments("code // trailing", &mut in_block), "code ");
+        assert_eq!(
+            strip_gradle_comments("keep \"http://not-a-comment\" end", &mut in_block),
+            "keep \"http://not-a-comment\" end"
+        );
+        assert_eq!(strip_gradle_comments("a /* mid */ b", &mut in_block), "a  b");
+        assert!(!in_block);
+        assert_eq!(strip_gradle_comments("start /* open", &mut in_block), "start ");
+        assert!(in_block, "an unterminated block comment carries to the next line");
+        assert_eq!(strip_gradle_comments("still inside", &mut in_block), "");
+        assert_eq!(strip_gradle_comments("close */ tail", &mut in_block), " tail");
+        assert!(!in_block);
+        assert_eq!(
+            strip_gradle_comments(r#"a "esc\"aped // still string" b"#, &mut in_block),
+            r#"a "esc\"aped // still string" b"#
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Ruby specifics
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn ruby_quoted_literals_track_escapes_and_unterminated_quotes() {
+        let literals = ruby_quoted_literals(r#" "first", 'second', "esc\"aped" "#);
+        let values: Vec<&str> = literals.iter().map(|literal| literal.value.as_str()).collect();
+        assert_eq!(values, vec!["first", "second", "esc\"aped"]);
+        assert!(literals[0].start < literals[1].start);
+        assert!(
+            ruby_quoted_literals("\"unterminated").is_empty(),
+            "an unterminated literal is not a value"
+        );
+    }
+
+    #[test]
+    fn gem_version_shapes_and_option_boundaries_are_recognised() {
+        for shaped in ["1.2", "~> 3", ">= 1", "<= 1", "!= 1", "> 1", "< 1", "= 1"] {
+            assert!(gem_version_shaped(shaped), "{shaped}");
+        }
+        assert!(!gem_version_shaped("elasticsearch/model"));
+        // Both option spellings start at the first option token, not the gem name.
+        assert_eq!(gem_option_start("\"rails\", require: false"), Some(9));
+        assert_eq!(gem_option_start("\"rails\", \"~> 7\", :git => \"x\""), Some(17));
+        assert!(gem_option_start("\"rails\", \"~> 7\"").is_none());
+    }
+
+    #[test]
+    fn platform_specific_gemfile_lock_versions_lose_to_the_generic_one_in_either_order() {
+        for lock in [
+            "GEM\n  specs:\n    nokogiri (1.16.5-x86_64-linux)\n    nokogiri (1.16.5)\n",
+            "GEM\n  specs:\n    nokogiri (1.16.5)\n    nokogiri (1.16.5-x86_64-linux)\n",
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            std::fs::write(tmp.path().join("Gemfile"), "gem \"nokogiri\"\n").expect("Gemfile");
+            std::fs::write(tmp.path().join("Gemfile.lock"), lock).expect("Gemfile.lock");
+            assert_eq!(
+                dep(&scan_external_deps(tmp.path()), "rubygems", "Gemfile", "nokogiri")
+                    .version_locked
+                    .as_deref(),
+                Some("1.16.5"),
+                "lock: {lock}"
+            );
+        }
+        assert!(gem_version_is_platform_specific("1.0-x86_64-linux"));
+        assert!(gem_version_is_platform_specific("1.0-java"));
+        assert!(!gem_version_is_platform_specific("1.0"));
+        assert!(!gem_version_is_platform_specific("1.0-rc1"));
+    }
+
+    #[test]
+    fn gemfile_lock_sections_other_than_gem_specs_are_ignored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("Gemfile"), "gem \"rails\"\ngem \"other\"\n").expect("Gemfile");
+        std::fs::write(
+            tmp.path().join("Gemfile.lock"),
+            "PATH\n  specs:\n    other (9.9.9)\nGEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.2.1)\n\nDEPENDENCIES\n  rails\n",
+        )
+        .expect("Gemfile.lock");
+        let deps = scan_external_deps(tmp.path());
+        assert_eq!(
+            dep(&deps, "rubygems", "Gemfile", "rails").version_locked.as_deref(),
+            Some("7.2.1")
+        );
+        assert!(
+            dep(&deps, "rubygems", "Gemfile", "other").version_locked.is_none(),
+            "only the GEM section's specs are lock versions"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // NuGet / SwiftPM / Composer specifics
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn nuget_central_versions_accept_update_attributes_and_child_version_elements() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("Directory.Packages.props"),
+            r#"<Project><ItemGroup>
+  <PackageVersion Update="Updated.Pkg" Version="1.0.0" />
+  <PackageVersion Include="Child.Pkg"><Version>2.0.0</Version></PackageVersion>
+  <PackageVersion Include="No.Version" />
+  <PackageVersion Version="3.0.0" />
+</ItemGroup></Project>"#,
+        )
+        .expect("central props");
+        std::fs::write(
+            tmp.path().join("App.csproj"),
+            r#"<Project><ItemGroup>
+  <PackageReference Include="Updated.Pkg" />
+  <PackageReference Include="Child.Pkg" />
+  <PackageReference Include="No.Version" />
+</ItemGroup></Project>"#,
+        )
+        .expect("csproj");
+
+        let deps = scan_external_deps(tmp.path());
+        assert_eq!(
+            dep(&deps, "nuget", "App.csproj", "Updated.Pkg").version_req.as_deref(),
+            Some("1.0.0")
+        );
+        assert_eq!(
+            dep(&deps, "nuget", "App.csproj", "Child.Pkg").version_req.as_deref(),
+            Some("2.0.0")
+        );
+        assert!(dep(&deps, "nuget", "App.csproj", "No.Version").version_req.is_none());
+    }
+
+    #[test]
+    fn nuget_lock_without_dependencies_or_with_transitive_only_entries_locks_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("App.csproj"),
+            "<Project><ItemGroup><PackageReference Include=\"Pkg\" Version=\"1\" /></ItemGroup></Project>",
+        )
+        .expect("csproj");
+        std::fs::write(tmp.path().join("packages.lock.json"), r#"{"version":1}"#).expect("lock");
+        assert!(dep(&scan_external_deps(tmp.path()), "nuget", "App.csproj", "Pkg")
+            .version_locked
+            .is_none());
+
+        std::fs::write(
+            tmp.path().join("packages.lock.json"),
+            r#"{"dependencies":{"net8.0":{"Pkg":{"type":"Transitive","resolved":"1.0.0"},"Other":{"type":"Direct"}}}}"#,
+        )
+        .expect("lock");
+        assert!(dep(&scan_external_deps(tmp.path()), "nuget", "App.csproj", "Pkg")
+            .version_locked
+            .is_none());
+    }
+
+    #[test]
+    fn swift_package_names_come_from_the_url_tail() {
+        assert_eq!(
+            package_name_from_url("https://example.invalid/Repo.git").as_deref(),
+            Some("Repo")
+        );
+        assert_eq!(
+            package_name_from_url("https://example.invalid/Repo/").as_deref(),
+            Some("Repo")
+        );
+        assert_eq!(package_name_from_url("Repo").as_deref(), Some("Repo"));
+        assert!(package_name_from_url("").is_none());
+        assert!(package_name_from_url("https://example.invalid/.git").is_none());
+    }
+
+    #[test]
+    fn swift_package_resolved_v1_shape_and_pins_without_versions_are_handled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("Package.swift"),
+            ".package(url: \"https://github.com/apple/swift-nio.git\", from: \"2.0.0\")\n.package(url: \"https://github.com/acme/NoPin.git\", from: \"1.0.0\")\n",
+        )
+        .expect("Package.swift");
+        std::fs::write(
+            tmp.path().join("Package.resolved"),
+            r#"{"object":{"pins":[
+{"package":"swift-nio","state":{"version":"2.70.1"}},
+{"repositoryURL":"https://github.com/acme/NoPin.git","state":{"branch":"main"}}
+]}}"#,
+        )
+        .expect("Package.resolved");
+        let deps = scan_external_deps(tmp.path());
+        assert_eq!(
+            dep(&deps, "swiftpm", "Package.swift", "swift-nio")
+                .version_locked
+                .as_deref(),
+            Some("2.70.1")
+        );
+        assert!(dep(&deps, "swiftpm", "Package.swift", "NoPin").version_locked.is_none());
+    }
+
+    #[test]
+    fn swift_package_declarations_without_a_url_are_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("Package.swift"),
+            ".package(name: \"Local\", path: \"../Local\")\n.package(url: \"https://example.invalid/Real.git\", from: \"1\")\n",
+        )
+        .expect("Package.swift");
+        let deps = scan_external_deps(tmp.path());
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "Real");
+    }
+
+    #[test]
+    fn composer_platform_packages_cover_php_variants_and_ext_lib_prefixes() {
+        for platform in [
+            "php",
+            "php-64bit",
+            "php-ipv6",
+            "php-zts",
+            "php-debug",
+            "hhvm",
+            "composer",
+            "composer-plugin-api",
+            "composer-runtime-api",
+            "ext-json",
+            "lib-openssl",
+        ] {
+            assert!(is_composer_platform_package(platform), "{platform}");
+        }
+        assert!(!is_composer_platform_package("laravel/framework"));
+        assert!(!is_composer_platform_package("phpunit/phpunit"));
+    }
+
+    #[test]
+    fn composer_lock_sections_missing_or_malformed_lock_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("composer.json"),
+            r#"{"require":{"acme/pkg":"^1"},"require-dev":{"nonstring":{"version":"1"}}}"#,
+        )
+        .expect("composer.json");
+        std::fs::write(
+            tmp.path().join("composer.lock"),
+            r#"{"packages":[{"name":"acme/pkg"},{"version":"1"}]}"#,
+        )
+        .expect("composer.lock");
+        let deps = scan_external_deps(tmp.path());
+        assert_eq!(deps.len(), 1);
+        assert!(deps[0].version_locked.is_none());
+    }
 }
