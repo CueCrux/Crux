@@ -21850,10 +21850,33 @@ fn tier_advisory_declares_the_tier_and_that_it_is_not_enforced() {
     let annotated = super::traces::with_tier_advisory(serde_json::json!({"aggregate": true}));
     assert_eq!(annotated["required_tier"], super::traces::AGGREGATE_REQUIRED_TIER);
     assert_eq!(
-        annotated["tier_enforcement"], "advisory",
-        "the stamp must say advisory; a client that sees a tier and no enforcement note will assume a gate"
+        annotated["tier_enforcement"], "not_gated",
+        "the stamp must say the capability is not gated; a client that sees a tier and no \
+         enforcement note will assume a gate"
     );
     assert_eq!(annotated["aggregate"], true, "annotation must not disturb the payload");
+}
+
+#[test]
+fn the_aggregate_surface_is_not_advertised_as_a_paid_tier() {
+    // Operator decision 2026-08-03: `code_intel_multi_repo` was removed from Pro
+    // and Governance because it ships in the free local build and is
+    // self-providable, which the published vow says cannot be sold as a gated
+    // capability. The daemon must not go on advertising a paid tier the price
+    // list no longer charges for — that is the same "sold but not enforced"
+    // mismatch as before, pointing the other way.
+    //
+    // Pinned as a constant assertion rather than left to the response tests
+    // because the failure mode is someone restoring "pro" here to make a
+    // marketing page line up, without touching the price list.
+    assert_eq!(
+        super::traces::AGGREGATE_REQUIRED_TIER,
+        "free",
+        "cross-repo aggregation is sold at Free as of the 2026-08-03 price list. If this is being \
+         changed back to a paid tier, the signed price list has to change with it — and if the \
+         capability still ships in the local Apache-2.0 build, selling it contradicts the vow that \
+         the free/paid boundary is architectural and never a licence key."
+    );
 }
 
 #[test]

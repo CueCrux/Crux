@@ -17,52 +17,53 @@ use super::{
     Path, Query, State, StatusCode,
 };
 
-/// The tier the cross-repo aggregate surface is *sold* at, echoed for display.
-///
-/// This is a label, not a gate. See [`with_tier_advisory`].
-pub(super) const AGGREGATE_REQUIRED_TIER: &str = "pro";
+/// The tier the cross-repo aggregate surface is sold at: **free**, as of the
+/// 2026-08-03 price list. See [`with_tier_advisory`] for why it changed.
+pub(super) const AGGREGATE_REQUIRED_TIER: &str = "free";
 
-/// Annotate a cross-repo aggregate response with its advisory tier.
+/// Annotate a cross-repo aggregate response with the tier it is sold at.
 ///
-/// # `required_tier` is ADVISORY here — deliberately
+/// # This surface is not sold, and that is the resolution — not the workaround
 ///
-/// P1 cross-repo aggregation is sold inside Pro, and **the daemon does not
-/// enforce that**. Crux is Apache-2.0: any operator can rebuild it with the
-/// check removed, so an in-daemon tier gate is security theatre that only
-/// inconveniences honest users. This is the same conclusion
-/// [`super::studio_library`] reached for `required_tier` on catalog entries,
-/// and it is reached the same way — the enforcement point is the service that
-/// decides whether to serve a caller at all, not the handler.
+/// It used to stamp `required_tier: "pro"` with `tier_enforcement: "advisory"`,
+/// because P1 cross-repo aggregation was sold inside Pro and the daemon did not
+/// enforce it. The advisory stamp was honest about the gap, and it was still a
+/// gap: the price list sold a capability that nothing checked.
 ///
-/// For code intelligence that enforcement point is **admission to a hosted
-/// daemon**: who is granted a tenant on CueCrux-hosted infrastructure. A
-/// customer running their own daemon over their own repositories is aggregating
-/// data they already hold on hardware they already pay for — there is nothing
-/// there to meter, and gating it would only punish the self-hosted case the
-/// free tier exists to win.
+/// **Operator decision 2026-08-03: stop selling it.** `code_intel_multi_repo`
+/// was removed from Pro and Governance in the 2026-08-03 price list, so this
+/// surface is free, and `required_tier: "free"` is now simply true.
 ///
-/// Two mechanisms look like they could close this and cannot. Both resolve a
-/// tier for the *process*, not for the requester, so on a shared daemon every
-/// tenant gets the same answer — the exact process-configuration defect M3b
-/// removed:
-/// - `OperatingMode::includes_pro()`, already ruled out in the plan;
+/// The reasoning is worth keeping, because the tempting fix was the wrong one.
+/// The published vow — in the signed price list and on `/free-vs-paid` — is that
+/// the free/paid boundary is *"architectural (hosted-only capabilities), never a
+/// license key"*. Aggregating your own repositories on your own hardware is
+/// self-providable, so it cannot honestly be sold as hosted-only; and the
+/// mechanism that would have made it enforceable — a per-tenant grant this
+/// daemon verifies before answering — is a licence key wearing a different noun.
+/// Building that would have satisfied the milestone by breaking the promise.
+///
+/// Two mechanisms still look like they could gate this, and both remain wrong
+/// for the older reason as well: they resolve a tier for the *process*, not the
+/// requester, so on a shared daemon every tenant gets the same answer — the
+/// process-configuration defect M3b removed.
+/// - `OperatingMode::includes_pro()`;
 /// - `entitlement::resolve_entitlement`, which is **also** daemon-scoped (one
-///   `__entitlement__::rcx` record, resolved against `daemon_tenant_id`). It is
-///   the natural substitution to reach for and it is the same defect wearing a
-///   different hat.
+///   `__entitlement__::rcx` record, resolved against `daemon_tenant_id`).
 ///
-/// Responses are therefore stamped `tier_enforcement: "advisory"` so no client
-/// mistakes the echo for a gate.
+/// `tier_enforcement: "not_gated"` rather than dropping the field: clients that
+/// already read it should see the capability become ungated, not see the key
+/// vanish and have to guess whether that means free or forgotten.
 ///
-/// ExecPlan `crux-code-intel-pro-hosted-surface-2026-07-28`, Constraint 3
-/// re-scoped 2026-08-01.
+/// ExecPlans `crux-code-intel-pro-hosted-surface-2026-07-28` (Constraint 3,
+/// re-scoped 2026-08-01) and `crux-hosted-admission-boundary-2026-08-03` (M0).
 pub(super) fn with_tier_advisory(mut body: serde_json::Value) -> serde_json::Value {
     if let Some(map) = body.as_object_mut() {
         map.insert(
             "required_tier".to_string(),
             serde_json::Value::from(AGGREGATE_REQUIRED_TIER),
         );
-        map.insert("tier_enforcement".to_string(), serde_json::Value::from("advisory"));
+        map.insert("tier_enforcement".to_string(), serde_json::Value::from("not_gated"));
     }
     body
 }
