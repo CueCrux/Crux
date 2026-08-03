@@ -137,7 +137,7 @@ pub async fn aggregate_tenant(
     let mut inputs = Vec::new();
     let mut included = Vec::new();
     for repo in repos.into_iter().filter(|r| r.enabled) {
-        if let Some(json) = crate::repo_registry::load_scan_json(&store, tenant_id, &repo.repo_id) {
+        if let Some(json) = crate::repo_registry::load_scan_json(&store, scope, &repo.repo_id) {
             if let Ok(scan) = serde_json::from_str::<WorkspaceScan>(&json) {
                 included.push(repo.repo_id.clone());
                 inputs.push(RepoScan {

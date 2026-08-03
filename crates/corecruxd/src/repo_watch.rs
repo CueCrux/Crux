@@ -456,7 +456,9 @@ mod tests {
         repo: &str,
     ) -> Option<crate::workspace_scan::WorkspaceScan> {
         let store = fact_store.read().await;
-        let json = crate::repo_registry::load_scan_json(&store, tenant, repo)?;
+        // Background: the watcher reacts to filesystem events, not requests.
+        let scope = crate::auth::TenantScope::background(tenant, "repo watch: reload scan after change");
+        let json = crate::repo_registry::load_scan_json(&store, &scope, repo)?;
         Some(serde_json::from_str(&json).expect("stored scan must decode"))
     }
 

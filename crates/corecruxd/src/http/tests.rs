@@ -21836,6 +21836,36 @@ fn every_aggregate_response_carries_the_advisory_stamp() {
     );
 }
 
+#[test]
+fn background_scopes_are_not_minted_in_handlers() {
+    // `TenantScope::background` is the one constructor that can name an
+    // arbitrary tenant, so it is the weak point in the argument the type makes.
+    // It exists for work with no request behind it — repo watching, retention,
+    // the flusher's resolver cache. A handler always has a request, and
+    // therefore always has a real authorization to derive its scope from;
+    // reaching for `background` there would launder an unauthorised read into a
+    // typed one that looks exactly like an authorised one.
+    //
+    // Source-level because that is the shape of the failure: not a wrong answer
+    // from an existing handler, but a *new* handler taking the shortcut.
+    const HTTP_SOURCES: &[(&str, &str)] = &[
+        ("traces.rs", include_str!("traces.rs")),
+        ("dossier.rs", include_str!("dossier.rs")),
+        ("storybook.rs", include_str!("storybook.rs")),
+        ("repos.rs", include_str!("repos.rs")),
+        ("mod.rs", include_str!("mod.rs")),
+    ];
+    for (name, src) in HTTP_SOURCES {
+        assert!(
+            !src.contains("TenantScope::background"),
+            "{name} mints a background TenantScope. Handlers must derive their scope from the \
+             authorization that admitted the request (require_http_scopes_for_tenant / \
+             runtime_tenant_for). If this is genuinely request-less work, move it out of the \
+             http module rather than widening the exception."
+        );
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // M8 — enrichment behind a per-seat rate ceiling.
 // crux-code-intel-pro-hosted-surface-2026-07-28.

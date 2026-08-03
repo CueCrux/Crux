@@ -848,16 +848,17 @@ pub(super) async fn get_symbol_resolve(
     Query(query): Query<SymbolResolveQuery>,
 ) -> impl IntoResponse {
     let tenant_id = query.tenant_id.trim().to_string();
-    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &tenant_id) {
-        return problem.into_response();
-    }
+    let scope = match require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &tenant_id) {
+        Ok(scope) => scope,
+        Err(problem) => return problem.into_response(),
+    };
 
     let store = state.fact_store.read().await;
     if crate::repo_registry::get_repo(&store, &tenant_id, &repo_id).is_none() {
         drop(store);
         return problem_response(StatusCode::NOT_FOUND, "repo not found");
     }
-    let scan_json = crate::repo_registry::load_scan_json(&store, &tenant_id, &repo_id);
+    let scan_json = crate::repo_registry::load_scan_json(&store, &scope, &repo_id);
     drop(store);
 
     let Some(scan_json) = scan_json else {
@@ -930,9 +931,10 @@ pub(super) async fn get_repo_codemap(
     Query(query): Query<CodemapQuery>,
 ) -> impl IntoResponse {
     let tenant_id = query.tenant_id.trim().to_string();
-    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &tenant_id) {
-        return problem.into_response();
-    }
+    let scope = match require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &tenant_id) {
+        Ok(scope) => scope,
+        Err(problem) => return problem.into_response(),
+    };
     let format = query.format.as_deref().unwrap_or("summary");
     if !matches!(format, "summary" | "full") {
         return problem_response(
@@ -946,7 +948,7 @@ pub(super) async fn get_repo_codemap(
         drop(store);
         return problem_response(StatusCode::NOT_FOUND, "repo not found");
     };
-    let scan_json = crate::repo_registry::load_scan_json(&store, &tenant_id, &repo_id);
+    let scan_json = crate::repo_registry::load_scan_json(&store, &scope, &repo_id);
     drop(store);
 
     let Some(scan_json) = scan_json else {
