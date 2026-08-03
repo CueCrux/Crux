@@ -20745,6 +20745,7 @@ fn m2_runtime_span_plane_is_tenant_partitioned() {
             duration_ns: 1,
             depth: 0,
             had_error: false,
+            outcome: Default::default(),
         },
         symbol_id: None,
         join: "miss".into(),

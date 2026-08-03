@@ -449,6 +449,7 @@ mod tests {
                 duration_ns: ns,
                 depth,
                 had_error: false,
+                outcome: Default::default(),
             },
             symbol_id: Some(format!("sym_{name}")),
             join: "extracted".into(),

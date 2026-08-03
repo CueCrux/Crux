@@ -1110,6 +1110,7 @@ mod tests {
                 duration_ns: 10,
                 depth: 0,
                 had_error: false,
+                outcome: Default::default(),
             },
             symbol_id: None,
             join: "extracted".into(),
