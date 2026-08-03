@@ -1504,6 +1504,7 @@ fn decode_frame_projection_inputs(frame_bytes: &[u8]) -> Result<Option<Projectio
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
@@ -2266,5 +2267,1136 @@ mod tests {
         assert_eq!(cursor.epoch, 5);
         assert_eq!(cursor.segment_seq, 42);
         assert_eq!(cursor.offset, 100);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Failure-detection coverage for the cold-block / cold-segment plane
+    // and the GC reporter. These paths decide whether a corrupted or
+    // partially-GC'd projection is *noticed*; the happy paths already
+    // live in `runner_tests.rs`.
+    // ══════════════════════════════════════════════════════════════════
+
+    fn rel_edge(at: i64) -> crate::RelationEdgeV1 {
+        crate::RelationEdgeV1 {
+            confidence_q16: 32_768,
+            evidence_ref_hash16: [0x5A; 16],
+            created_at_micros: at,
+            updated_at_micros: at,
+        }
+    }
+
+    fn dep_edge(at: i64) -> crate::DependentEdgeV1 {
+        crate::DependentEdgeV1 {
+            last_seen_at_micros: at,
+            usage_weight_q16: 4_096,
+        }
+    }
+
+    /// Encode one relations block for `(tenant, src)` and return
+    /// `(bytes, hot_ptr)` with a correct content-addressed hash.
+    fn relations_block(tenant: u64, src: u32) -> (Vec<u8>, HotPtrEntryV1) {
+        let mut edges: BTreeMap<(u64, u32, u32, u8), crate::RelationEdgeV1> = BTreeMap::new();
+        edges.insert((tenant, src, src + 1, 0u8), rel_edge(10));
+        edges.insert((tenant, src, src + 2, 1u8), rel_edge(20));
+        let bytes = encode_relations_edges_for_src_v1(&edges, tenant, src);
+        let ptr = HotPtrEntryV1 {
+            edge_count: (bytes.len() / RELATION_EDGE_STRIDE_V1) as u32,
+            block_len: bytes.len() as u32,
+            codec: 0,
+            blake3: *blake3::hash(&bytes).as_bytes(),
+        };
+        (bytes, ptr)
+    }
+
+    /// Encode one dependents block for `(tenant, artifact)` and return
+    /// `(bytes, hot_ptr)` with a correct content-addressed hash.
+    fn dependents_block(tenant: u64, artifact: u32) -> (Vec<u8>, HotPtrEntryV1) {
+        let mut edges: BTreeMap<(u64, u32, u8, uuid::Uuid), crate::DependentEdgeV1> = BTreeMap::new();
+        edges.insert((tenant, artifact, 0u8, uuid::Uuid::from_bytes([1u8; 16])), dep_edge(11));
+        let bytes = encode_dependents_edges_for_artifact_v1(&edges, tenant, artifact);
+        let ptr = HotPtrEntryV1 {
+            edge_count: (bytes.len() / DEPENDENT_EDGE_STRIDE_V1) as u32,
+            block_len: bytes.len() as u32,
+            codec: 0,
+            blake3: *blake3::hash(&bytes).as_bytes(),
+        };
+        (bytes, ptr)
+    }
+
+    fn write_cold_block(dir: &Path, blake3_bytes: &[u8; 32], bytes: &[u8]) {
+        let path = cold_block_path_v1(dir, blake3_bytes);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+    }
+
+    fn files_in(tmp: &TempDir) -> ProjectionFilesV1 {
+        let files = ProjectionFilesV1::for_shard_dir(tmp.path());
+        std::fs::create_dir_all(&files.cold_relations_segments_dir).unwrap();
+        std::fs::create_dir_all(&files.cold_dependents_segments_dir).unwrap();
+        files
+    }
+
+    // ── build_reachable_segment_dir ─────────────────────────────────
+
+    #[test]
+    fn build_reachable_segment_dir_empty_is_empty() {
+        let out = build_reachable_segment_dir(&BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new()).unwrap();
+        assert!(out.is_empty());
+    }
+
+    /// A hot pointer with no matching cold-block location means the snapshot
+    /// we are about to write would dangle. Catch it at build time, not at the
+    /// next load.
+    #[test]
+    fn build_reachable_segment_dir_missing_block_loc_errors() {
+        let (_bytes, ptr) = relations_block(7, 1);
+        let mut ptrs = BTreeMap::new();
+        ptrs.insert((7u64, 1u32), ptr.clone());
+        let err = build_reachable_segment_dir(&ptrs, &BTreeMap::new(), &BTreeMap::new()).unwrap_err();
+        assert!(
+            format!("{err}").contains("missing cold block location"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A block location that names a segment absent from the segment table is
+    /// equally fatal: the dir block would reference a file we never wrote.
+    #[test]
+    fn build_reachable_segment_dir_missing_segment_errors() {
+        let (_bytes, ptr) = relations_block(7, 1);
+        let mut ptrs = BTreeMap::new();
+        ptrs.insert((7u64, 1u32), ptr.clone());
+        let mut locs = BTreeMap::new();
+        locs.insert(
+            ptr.blake3,
+            ColdBlockLocV1 {
+                segment_blake3: [0xAB; 32],
+                offset: 128,
+                len: ptr.block_len,
+                codec: 0,
+            },
+        );
+        let err = build_reachable_segment_dir(&ptrs, &locs, &BTreeMap::new()).unwrap_err();
+        assert!(
+            format!("{err}").contains("missing cold segment"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn build_reachable_segment_dir_dedups_shared_segment() {
+        let (_b1, p1) = relations_block(7, 1);
+        let (_b2, p2) = relations_block(7, 2);
+        let seg = [0xCD; 32];
+        let mut ptrs = BTreeMap::new();
+        ptrs.insert((7u64, 1u32), p1.clone());
+        ptrs.insert((7u64, 2u32), p2.clone());
+        let mut locs = BTreeMap::new();
+        for p in [p1, p2] {
+            locs.insert(
+                p.blake3,
+                ColdBlockLocV1 {
+                    segment_blake3: seg,
+                    offset: 128,
+                    len: p.block_len,
+                    codec: 0,
+                },
+            );
+        }
+        let mut segs = BTreeMap::new();
+        segs.insert(seg, 4_242u64);
+        let out = build_reachable_segment_dir(&ptrs, &locs, &segs).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.get(&seg), Some(&4_242u64));
+    }
+
+    // ── write_cold_segments_for_blocks + load_cold_segment_indexes ──
+
+    #[test]
+    fn write_cold_segments_for_empty_block_set_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("segments");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut segs = BTreeMap::new();
+        let mut locs = BTreeMap::new();
+        write_cold_segments_for_blocks(&dir, &mut segs, &mut locs, BTreeMap::new()).unwrap();
+        assert!(segs.is_empty());
+        assert!(locs.is_empty());
+        assert!(collect_files_recursive_v1(&dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn write_then_load_cold_segment_indexes_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("segments");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (b1, p1) = relations_block(9, 1);
+        let (b2, p2) = relations_block(9, 2);
+        let mut blocks = BTreeMap::new();
+        blocks.insert(p1.blake3, b1);
+        blocks.insert(p2.blake3, b2);
+
+        let mut segs = BTreeMap::new();
+        let mut locs = BTreeMap::new();
+        write_cold_segments_for_blocks(&dir, &mut segs, &mut locs, blocks).unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(locs.len(), 2);
+
+        let dir_entries: Vec<ColdSegmentDirEntryV1> = segs
+            .iter()
+            .map(|(segment_blake3, file_len)| ColdSegmentDirEntryV1 {
+                segment_blake3: *segment_blake3,
+                file_len: *file_len,
+            })
+            .collect();
+        let (segs2, locs2) = load_cold_segment_indexes(&dir, &dir_entries).unwrap();
+        assert_eq!(segs2, segs);
+        assert_eq!(locs2.len(), 2);
+        assert!(locs2.contains_key(&p1.blake3));
+        assert!(locs2.contains_key(&p2.blake3));
+    }
+
+    #[test]
+    fn load_cold_segment_indexes_empty_dir_yields_empty_maps() {
+        let tmp = TempDir::new().unwrap();
+        let (segs, locs) = load_cold_segment_indexes(tmp.path(), &[]).unwrap();
+        assert!(segs.is_empty());
+        assert!(locs.is_empty());
+    }
+
+    #[test]
+    fn load_cold_segment_indexes_duplicate_segment_id_errors() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("segments");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (bytes, ptr) = relations_block(1, 1);
+        let mut blocks = BTreeMap::new();
+        blocks.insert(ptr.blake3, bytes);
+        let (seg_bytes, seg_blake3, _idx) = build_cold_segment_v1(&blocks);
+        ensure_cold_segment_written(&dir, &seg_blake3, &seg_bytes).unwrap();
+
+        let entry = ColdSegmentDirEntryV1 {
+            segment_blake3: seg_blake3,
+            file_len: seg_bytes.len() as u64,
+        };
+        let err = load_cold_segment_indexes(&dir, &[entry, entry]).unwrap_err();
+        assert!(
+            format!("{err}").contains("duplicate segment id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A dir entry naming a segment file that is not on disk must surface as an
+    /// error, never as "no blocks found".
+    #[test]
+    fn load_cold_segment_indexes_missing_segment_file_errors() {
+        let tmp = TempDir::new().unwrap();
+        let entry = ColdSegmentDirEntryV1 {
+            segment_blake3: [0x22; 32],
+            file_len: 4_096,
+        };
+        assert!(load_cold_segment_indexes(tmp.path(), &[entry]).is_err());
+    }
+
+    /// Two distinct segments carrying the same content-addressed block make the
+    /// block -> location mapping ambiguous; that must be rejected rather than
+    /// silently resolved last-writer-wins.
+    #[test]
+    fn load_cold_segment_indexes_duplicate_block_across_segments_errors() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("segments");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (b1, p1) = relations_block(3, 1);
+        let (b2, p2) = relations_block(3, 2);
+
+        let mut only_first = BTreeMap::new();
+        only_first.insert(p1.blake3, b1.clone());
+        let mut both = BTreeMap::new();
+        both.insert(p1.blake3, b1);
+        both.insert(p2.blake3, b2);
+
+        let mut entries = Vec::new();
+        for blocks in [only_first, both] {
+            let (seg_bytes, seg_blake3, _idx) = build_cold_segment_v1(&blocks);
+            ensure_cold_segment_written(&dir, &seg_blake3, &seg_bytes).unwrap();
+            entries.push(ColdSegmentDirEntryV1 {
+                segment_blake3: seg_blake3,
+                file_len: seg_bytes.len() as u64,
+            });
+        }
+
+        let err = load_cold_segment_indexes(&dir, &entries).unwrap_err();
+        assert!(
+            format!("{err}").contains("duplicate block blake3"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── ensure_cold_segment_written ─────────────────────────────────
+
+    /// Content-addressed segments are never rewritten. Pins that an existing
+    /// file short-circuits the write, so a concurrent publisher cannot be
+    /// clobbered mid-read.
+    #[test]
+    fn ensure_cold_segment_written_does_not_rewrite_existing_path() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("segments");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = [0x77u8; 32];
+        let path = cold_segment_path_v1(&dir, &id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"original").unwrap();
+
+        let out = ensure_cold_segment_written(&dir, &id, b"replacement bytes").unwrap();
+        assert_eq!(out, path);
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    }
+
+    // ── load_relations_from_cold_blocks (schema v2) ─────────────────
+
+    #[test]
+    fn load_relations_from_cold_blocks_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let files = files_in(&tmp);
+        let (bytes, ptr) = relations_block(5, 42);
+        write_cold_block(&files.cold_relations_dir, &ptr.blake3, &bytes);
+
+        let mut ptrs = BTreeMap::new();
+        ptrs.insert((5u64, 42u32), ptr.clone());
+        let edges = load_relations_from_cold_blocks(&files, &ptrs).unwrap();
+        assert_eq!(edges.len(), 2);
+        assert!(edges.keys().all(|k| k.0 == 5 && k.1 == 42));
+    }
+
+    #[test]
+    fn load_relations_from_cold_blocks_missing_file_errors() {
+        let tmp = TempDir::new().unwrap();
+        let files = files_in(&tmp);
+        let (_bytes, ptr) = relations_block(5, 42);
+        let mut ptrs = BTreeMap::new();
+        ptrs.insert((5u64, 42u32), ptr.clone());
+        assert!(load_relations_from_cold_blocks(&files, &ptrs).is_err());
+    }
+
+    /// A truncated block file must be reported, not decoded to a shorter edge
+    /// list that would silently drop relations.
+    #[test]
+    fn load_relations_from_cold_blocks_truncated_block_errors() {
+        let tmp = TempDir::new().unwrap();
+        let files = files_in(&tmp);
+        let (bytes, ptr) = relations_block(5, 42);
+        write_cold_block(
+            &files.cold_relations_dir,
+            &ptr.blake3,
+            &bytes[..RELATION_EDGE_STRIDE_V1],
+        );
+
+        let mut ptrs = BTreeMap::new();
+        ptrs.insert((5u64, 42u32), ptr.clone());
+        let err = load_relations_from_cold_blocks(&files, &ptrs).unwrap_err();
+        assert!(format!("{err}").contains("length mismatch"), "unexpected error: {err}");
+    }
+
+    /// Same length, different bytes: only the blake3 check can catch this.
+    #[test]
+    fn load_relations_from_cold_blocks_hash_mismatch_errors() {
+        let tmp = TempDir::new().unwrap();
+        let files = files_in(&tmp);
+        let (mut bytes, ptr) = relations_block(5, 42);
+        bytes[RELATION_EDGE_STRIDE_V1 - 1] ^= 0xFF;
+        write_cold_block(&files.cold_relations_dir, &ptr.blake3, &bytes);
+
+        let mut ptrs = BTreeMap::new();
+        ptrs.insert((5u64, 42u32), ptr.clone());
+        let err = load_relations_from_cold_blocks(&files, &ptrs).unwrap_err();
+        assert!(format!("{err}").contains("hash mismatch"), "unexpected error: {err}");
+    }
+
+    /// A block whose contents belong to a different `(tenant, src)` than the
+    /// hot pointer claims would leak edges across tenants if accepted.
+    #[test]
+    fn load_relations_from_cold_blocks_wrong_tenant_keys_error() {
+        let tmp = TempDir::new().unwrap();
+        let files = files_in(&tmp);
+        let (bytes, ptr) = relations_block(5, 42);
+        write_cold_block(&files.cold_relations_dir, &ptr.blake3, &bytes);
+
+        // Same block, but filed under a different tenant/src in the hot ptrs.
+        let mut ptrs = BTreeMap::new();
+        ptrs.insert((6u64, 42u32), ptr.clone());
+        let err = load_relations_from_cold_blocks(&files, &ptrs).unwrap_err();
+        assert!(
+            format!("{err}").contains("wrong tenant_hash/src keys"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── load_dependents_from_cold_blocks (schema v2) ────────────────
+
+    #[test]
+    fn load_dependents_from_cold_blocks_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let files = files_in(&tmp);
+        let (bytes, ptr) = dependents_block(8, 3);
+        write_cold_block(&files.cold_dependents_dir, &ptr.blake3, &bytes);
+
+        let mut ptrs = BTreeMap::new();
+        ptrs.insert((8u64, 3u32), ptr.clone());
+        let edges = load_dependents_from_cold_blocks(&files, &ptrs).unwrap();
+        assert_eq!(edges.len(), 1);
+    }
+
+    #[test]
+    fn load_dependents_from_cold_blocks_truncated_block_errors() {
+        let tmp = TempDir::new().unwrap();
+        let files = files_in(&tmp);
+        let (bytes, ptr) = dependents_block(8, 3);
+        write_cold_block(&files.cold_dependents_dir, &ptr.blake3, &bytes[..8]);
+
+        let mut ptrs = BTreeMap::new();
+        ptrs.insert((8u64, 3u32), ptr.clone());
+        let err = load_dependents_from_cold_blocks(&files, &ptrs).unwrap_err();
+        assert!(format!("{err}").contains("length mismatch"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn load_dependents_from_cold_blocks_hash_mismatch_errors() {
+        let tmp = TempDir::new().unwrap();
+        let files = files_in(&tmp);
+        let (mut bytes, ptr) = dependents_block(8, 3);
+        bytes[DEPENDENT_EDGE_STRIDE_V1 - 1] ^= 0xFF;
+        write_cold_block(&files.cold_dependents_dir, &ptr.blake3, &bytes);
+
+        let mut ptrs = BTreeMap::new();
+        ptrs.insert((8u64, 3u32), ptr.clone());
+        let err = load_dependents_from_cold_blocks(&files, &ptrs).unwrap_err();
+        assert!(format!("{err}").contains("hash mismatch"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn load_dependents_from_cold_blocks_wrong_artifact_keys_error() {
+        let tmp = TempDir::new().unwrap();
+        let files = files_in(&tmp);
+        let (bytes, ptr) = dependents_block(8, 3);
+        write_cold_block(&files.cold_dependents_dir, &ptr.blake3, &bytes);
+
+        let mut ptrs = BTreeMap::new();
+        ptrs.insert((8u64, 4u32), ptr.clone());
+        let err = load_dependents_from_cold_blocks(&files, &ptrs).unwrap_err();
+        assert!(
+            format!("{err}").contains("wrong tenant_hash/artifact_id keys"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── load_*_from_cold_segments (schema v3) ───────────────────────
+
+    /// Build a one-block segment on disk under `segments_dir` and return the
+    /// location record for it.
+    fn write_single_block_segment(segments_dir: &Path, block_hash: [u8; 32], bytes: &[u8]) -> ColdBlockLocV1 {
+        let mut blocks = BTreeMap::new();
+        blocks.insert(block_hash, bytes.to_vec());
+        let (seg_bytes, seg_blake3, idx) = build_cold_segment_v1(&blocks);
+        ensure_cold_segment_written(segments_dir, &seg_blake3, &seg_bytes).unwrap();
+        let e = idx.first().unwrap();
+        ColdBlockLocV1 {
+            segment_blake3: seg_blake3,
+            offset: e.offset,
+            len: e.len,
+            codec: e.codec,
+        }
+    }
+
+    #[test]
+    fn load_relations_from_cold_segments_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let files = files_in(&tmp);
+        let (bytes, ptr) = relations_block(2, 9);
+        let loc = write_single_block_segment(&files.cold_relations_segments_dir, ptr.blake3, &bytes);
+
+        let mut ptrs = BTreeMap::new();
+        ptrs.insert((2u64, 9u32), ptr.clone());
+        let mut locs = BTreeMap::new();
+        locs.insert(ptr.blake3, loc);
+
+        let edges = load_relations_from_cold_segments(&files, &ptrs, &locs).unwrap();
+        assert_eq!(edges.len(), 2);
+    }
+
+    #[test]
+    fn load_relations_from_cold_segments_missing_loc_errors() {
+        let tmp = TempDir::new().unwrap();
+        let files = files_in(&tmp);
+        let (_bytes, ptr) = relations_block(2, 9);
+        let mut ptrs = BTreeMap::new();
+        ptrs.insert((2u64, 9u32), ptr.clone());
+        let err = load_relations_from_cold_segments(&files, &ptrs, &BTreeMap::new()).unwrap_err();
+        assert!(
+            format!("{err}").contains("missing cold block loc"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The hot pointer's `block_len` and the segment index's `len` must agree;
+    /// a disagreement means one of the two is stale.
+    #[test]
+    fn load_relations_from_cold_segments_len_disagreement_errors() {
+        let tmp = TempDir::new().unwrap();
+        let files = files_in(&tmp);
+        let (bytes, ptr) = relations_block(2, 9);
+        let mut loc = write_single_block_segment(&files.cold_relations_segments_dir, ptr.blake3, &bytes);
+        loc.len = loc.len.saturating_sub(RELATION_EDGE_STRIDE_V1 as u32);
+
+        let mut ptrs = BTreeMap::new();
+        ptrs.insert((2u64, 9u32), ptr.clone());
+        let mut locs = BTreeMap::new();
+        locs.insert(ptr.blake3, loc);
+
+        let err = load_relations_from_cold_segments(&files, &ptrs, &locs).unwrap_err();
+        assert!(
+            format!("{err}").contains("block_len != cold block loc len"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Bytes stored under a block id that does not hash to them: the segment
+    /// index is intact but the payload is not what it claims to be.
+    #[test]
+    fn load_relations_from_cold_segments_hash_mismatch_errors() {
+        let tmp = TempDir::new().unwrap();
+        let files = files_in(&tmp);
+        let (mut bytes, ptr) = relations_block(2, 9);
+        bytes[0] ^= 0xFF;
+        let loc = write_single_block_segment(&files.cold_relations_segments_dir, ptr.blake3, &bytes);
+
+        let mut ptrs = BTreeMap::new();
+        ptrs.insert((2u64, 9u32), ptr.clone());
+        let mut locs = BTreeMap::new();
+        locs.insert(ptr.blake3, loc);
+
+        let err = load_relations_from_cold_segments(&files, &ptrs, &locs).unwrap_err();
+        assert!(format!("{err}").contains("hash mismatch"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn load_dependents_from_cold_segments_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let files = files_in(&tmp);
+        let (bytes, ptr) = dependents_block(4, 6);
+        let loc = write_single_block_segment(&files.cold_dependents_segments_dir, ptr.blake3, &bytes);
+
+        let mut ptrs = BTreeMap::new();
+        ptrs.insert((4u64, 6u32), ptr.clone());
+        let mut locs = BTreeMap::new();
+        locs.insert(ptr.blake3, loc);
+
+        let edges = load_dependents_from_cold_segments(&files, &ptrs, &locs).unwrap();
+        assert_eq!(edges.len(), 1);
+    }
+
+    #[test]
+    fn load_dependents_from_cold_segments_missing_loc_errors() {
+        let tmp = TempDir::new().unwrap();
+        let files = files_in(&tmp);
+        let (_bytes, ptr) = dependents_block(4, 6);
+        let mut ptrs = BTreeMap::new();
+        ptrs.insert((4u64, 6u32), ptr.clone());
+        let err = load_dependents_from_cold_segments(&files, &ptrs, &BTreeMap::new()).unwrap_err();
+        assert!(
+            format!("{err}").contains("missing cold block loc"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn load_dependents_from_cold_segments_len_disagreement_errors() {
+        let tmp = TempDir::new().unwrap();
+        let files = files_in(&tmp);
+        let (bytes, ptr) = dependents_block(4, 6);
+        let mut loc = write_single_block_segment(&files.cold_dependents_segments_dir, ptr.blake3, &bytes);
+        loc.len = loc.len.saturating_add(1);
+
+        let mut ptrs = BTreeMap::new();
+        ptrs.insert((4u64, 6u32), ptr.clone());
+        let mut locs = BTreeMap::new();
+        locs.insert(ptr.blake3, loc);
+
+        let err = load_dependents_from_cold_segments(&files, &ptrs, &locs).unwrap_err();
+        assert!(
+            format!("{err}").contains("block_len != cold block loc len"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── reachable_cold_segments_from_snapshot_v1 ────────────────────
+
+    fn write_relations_snapshot_v3(path: &Path, segs: &BTreeMap<[u8; 32], u64>) -> String {
+        let snap = CcxsSnapshot {
+            header: CcxsSnapshotHeaderV1 {
+                projection_id: CcxsProjectionId::ArtifactRelations,
+                schema_version: 3,
+                created_at_unix_ns: 0,
+                shard_id: 1,
+                epoch: 1,
+                cursor_segment_seq: 0,
+                cursor_offset: 0,
+                block_count: 2,
+                codec: CCXS_CODEC_NONE,
+            },
+            blocks: vec![
+                (CCXS_BLOCK_HOT_PTRS_V1, encode_hot_ptrs_v1(&BTreeMap::new())),
+                (CCXS_BLOCK_COLD_SEGMENT_DIR_V1, encode_cold_segment_dir_v1(segs)),
+            ],
+        };
+        let bytes = snap.encode().unwrap();
+        write_atomic(path, &bytes).unwrap();
+        CcxsSnapshot::snapshot_blake3_hex(&bytes)
+    }
+
+    #[test]
+    fn reachable_cold_segments_schema_below_v3_is_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("relations.ccxs");
+        assert!(reachable_cold_segments_from_snapshot_v1(&path, 2, Some("deadbeef"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn reachable_cold_segments_without_expected_hash_is_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("relations.ccxs");
+        assert!(reachable_cold_segments_from_snapshot_v1(&path, 3, None)
+            .unwrap()
+            .is_none());
+    }
+
+    /// Meta claims a snapshot hash but the snapshot file is gone: that is a
+    /// hard error, not "nothing is reachable" (which would make GC delete
+    /// every live segment).
+    #[test]
+    fn reachable_cold_segments_missing_snapshot_file_errors() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("relations.ccxs");
+        let err = reachable_cold_segments_from_snapshot_v1(&path, 3, Some(&"a".repeat(64))).unwrap_err();
+        assert!(
+            format!("{err}").contains("snapshot missing but"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reachable_cold_segments_hash_mismatch_errors() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("relations.ccxs");
+        let mut segs = BTreeMap::new();
+        segs.insert([0x31u8; 32], 99u64);
+        let _hash = write_relations_snapshot_v3(&path, &segs);
+        let err = reachable_cold_segments_from_snapshot_v1(&path, 3, Some(&"b".repeat(64))).unwrap_err();
+        assert!(
+            format!("{err}").contains("snapshot blake3 mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reachable_cold_segments_missing_dir_block_errors() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("relations.ccxs");
+        let snap = CcxsSnapshot {
+            header: CcxsSnapshotHeaderV1 {
+                projection_id: CcxsProjectionId::ArtifactRelations,
+                schema_version: 3,
+                created_at_unix_ns: 0,
+                shard_id: 1,
+                epoch: 1,
+                cursor_segment_seq: 0,
+                cursor_offset: 0,
+                block_count: 1,
+                codec: CCXS_CODEC_NONE,
+            },
+            blocks: vec![(CCXS_BLOCK_HOT_PTRS_V1, encode_hot_ptrs_v1(&BTreeMap::new()))],
+        };
+        let bytes = snap.encode().unwrap();
+        write_atomic(&path, &bytes).unwrap();
+        let hash = CcxsSnapshot::snapshot_blake3_hex(&bytes);
+        let err = reachable_cold_segments_from_snapshot_v1(&path, 3, Some(&hash)).unwrap_err();
+        assert!(
+            format!("{err}").contains("missing cold segment dir block"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reachable_cold_segments_reads_dir_block() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("relations.ccxs");
+        let mut segs = BTreeMap::new();
+        segs.insert([0x41u8; 32], 1_024u64);
+        segs.insert([0x42u8; 32], 2_048u64);
+        let hash = write_relations_snapshot_v3(&path, &segs);
+
+        let out = reachable_cold_segments_from_snapshot_v1(&path, 3, Some(&hash))
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, segs);
+    }
+
+    // ── gc_cold_segments_dir_v1 ─────────────────────────────────────
+
+    fn gc_opts(dry_run: bool, min_age_seconds: u64, max_delete: u64) -> ColdSegmentGcOptionsV1 {
+        ColdSegmentGcOptionsV1 {
+            dry_run,
+            min_age_seconds,
+            max_delete,
+        }
+    }
+
+    fn touch_segment(dir: &Path, id: [u8; 32], len: usize) -> PathBuf {
+        let path = cold_segment_path_v1(dir, &id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![0xEEu8; len]).unwrap();
+        path
+    }
+
+    /// Reachability unknown (schema<3 or missing snapshot) must produce a
+    /// `skipped` report with a reason. It counts what is on disk but deletes
+    /// nothing — the caller must be able to tell "verified clean" apart from
+    /// "could not check".
+    #[test]
+    fn gc_cold_segments_dir_reports_skipped_when_reachability_unknown() {
+        let tmp = TempDir::new().unwrap();
+        touch_segment(tmp.path(), [0x01; 32], 16);
+        touch_segment(tmp.path(), [0x02; 32], 16);
+
+        let (report, deleted) =
+            gc_cold_segments_dir_v1("relations", 2, tmp.path(), None, &gc_opts(false, 0, 0)).unwrap();
+        assert!(report.skipped);
+        assert!(report.skip_reason.is_some());
+        assert_eq!(report.segments_on_disk, 2);
+        assert_eq!(report.deleted_segments, 0);
+        assert_eq!(report.reachable_segments, 0);
+        assert!(deleted.is_empty());
+        // Nothing was removed.
+        assert_eq!(collect_files_recursive_v1(tmp.path()).unwrap().len(), 2);
+    }
+
+    /// Documented current behaviour: a segments directory that does not exist
+    /// yields an all-zero, `skipped:false` report — i.e. "nothing on disk,
+    /// nothing orphaned", indistinguishable from a directory that was scanned
+    /// and found clean. `collect_files_recursive_v1` swallows the read_dir
+    /// error by design. Pins the behaviour; does not endorse it.
+    #[test]
+    fn gc_cold_segments_dir_missing_directory_reports_clean_not_error() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let reachable = BTreeMap::new();
+        let (report, deleted) =
+            gc_cold_segments_dir_v1("relations", 3, &missing, Some(&reachable), &gc_opts(false, 0, 0)).unwrap();
+        assert!(!report.skipped);
+        assert_eq!(report.segments_on_disk, 0);
+        assert_eq!(report.orphan_segments, 0);
+        assert_eq!(report.unparseable_segment_files, 0);
+        assert!(deleted.is_empty());
+    }
+
+    #[test]
+    fn gc_cold_segments_dir_ignores_non_segment_extensions() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("notes.txt"), b"hello").unwrap();
+        std::fs::write(tmp.path().join("block.ccxblk"), b"hello").unwrap();
+        let reachable = BTreeMap::new();
+        let (report, deleted) =
+            gc_cold_segments_dir_v1("relations", 3, tmp.path(), Some(&reachable), &gc_opts(false, 0, 0)).unwrap();
+        assert_eq!(report.segments_on_disk, 0);
+        assert!(deleted.is_empty());
+        assert_eq!(collect_files_recursive_v1(tmp.path()).unwrap().len(), 2);
+    }
+
+    /// A `.ccxcseg` whose stem is not a blake3 hex id is counted as
+    /// unparsable and left alone rather than deleted on a guess.
+    #[test]
+    fn gc_cold_segments_dir_counts_unparsable_stem_and_keeps_file() {
+        let tmp = TempDir::new().unwrap();
+        let bad = tmp.path().join("not-a-hash.ccxcseg");
+        std::fs::write(&bad, b"junk").unwrap();
+        let reachable = BTreeMap::new();
+        let (report, deleted) =
+            gc_cold_segments_dir_v1("relations", 3, tmp.path(), Some(&reachable), &gc_opts(false, 0, 0)).unwrap();
+        assert_eq!(report.segments_on_disk, 1);
+        assert_eq!(report.unparseable_segment_files, 1);
+        assert_eq!(report.orphan_segments, 0);
+        assert_eq!(report.deleted_segments, 0);
+        assert!(deleted.is_empty());
+        assert!(bad.exists());
+    }
+
+    #[test]
+    fn gc_cold_segments_dir_keeps_reachable_and_deletes_orphans() {
+        let tmp = TempDir::new().unwrap();
+        let keep = [0xA1u8; 32];
+        let drop_id = [0xB2u8; 32];
+        let keep_path = touch_segment(tmp.path(), keep, 32);
+        let drop_path = touch_segment(tmp.path(), drop_id, 64);
+
+        let mut reachable = BTreeMap::new();
+        reachable.insert(keep, 32u64);
+
+        let (report, deleted) =
+            gc_cold_segments_dir_v1("relations", 3, tmp.path(), Some(&reachable), &gc_opts(false, 0, 0)).unwrap();
+        assert_eq!(report.segments_on_disk, 2);
+        assert_eq!(report.reachable_segments, 1);
+        assert_eq!(report.orphan_segments, 1);
+        assert_eq!(report.deleted_segments, 1);
+        assert_eq!(report.deleted_bytes, 64);
+        assert!(deleted.contains(&drop_id));
+        assert!(keep_path.exists());
+        assert!(!drop_path.exists());
+    }
+
+    /// Dry-run must report exactly what it *would* delete while leaving the
+    /// files in place.
+    #[test]
+    fn gc_cold_segments_dir_dry_run_reports_without_deleting() {
+        let tmp = TempDir::new().unwrap();
+        let orphan = [0xC3u8; 32];
+        let path = touch_segment(tmp.path(), orphan, 128);
+        let reachable = BTreeMap::new();
+
+        let (report, deleted) =
+            gc_cold_segments_dir_v1("dependents", 3, tmp.path(), Some(&reachable), &gc_opts(true, 0, 0)).unwrap();
+        assert_eq!(report.orphan_segments, 1);
+        assert_eq!(report.deleted_segments, 1);
+        assert_eq!(report.deleted_bytes, 128);
+        assert!(deleted.contains(&orphan));
+        assert!(path.exists(), "dry run must not remove the file");
+    }
+
+    #[test]
+    fn gc_cold_segments_dir_respects_max_delete_limit() {
+        let tmp = TempDir::new().unwrap();
+        for i in 0..4u8 {
+            touch_segment(tmp.path(), [0xD0 | i; 32], 8);
+        }
+        let reachable = BTreeMap::new();
+        let (report, deleted) =
+            gc_cold_segments_dir_v1("relations", 3, tmp.path(), Some(&reachable), &gc_opts(false, 0, 2)).unwrap();
+        assert_eq!(report.orphan_segments, 4);
+        assert_eq!(report.deleted_segments, 2);
+        assert_eq!(report.kept_orphans_due_to_limit, 2);
+        assert_eq!(deleted.len(), 2);
+        assert_eq!(collect_files_recursive_v1(tmp.path()).unwrap().len(), 2);
+    }
+
+    /// Freshly written orphans are within `min_age_seconds` and must be held
+    /// back — deleting a segment a concurrent commit just published would
+    /// corrupt the projection.
+    #[test]
+    fn gc_cold_segments_dir_skips_young_orphans() {
+        let tmp = TempDir::new().unwrap();
+        let orphan = [0xE4u8; 32];
+        let path = touch_segment(tmp.path(), orphan, 16);
+        let reachable = BTreeMap::new();
+        let (report, deleted) =
+            gc_cold_segments_dir_v1("relations", 3, tmp.path(), Some(&reachable), &gc_opts(false, 86_400, 0)).unwrap();
+        assert_eq!(report.orphan_segments, 1);
+        assert_eq!(report.skipped_young_segments, 1);
+        assert_eq!(report.deleted_segments, 0);
+        assert!(deleted.is_empty());
+        assert!(path.exists());
+    }
+
+    // ── ProjectionStoreV1::gc_orphan_cold_segments_v1 ───────────────
+
+    /// After GC the store's hot pointers must still resolve. A dangling
+    /// pointer under schema v3 is an error, not a silently degraded store.
+    #[test]
+    fn gc_orphan_cold_segments_errors_on_dangling_relations_hot_ptr() {
+        let tmp = TempDir::new().unwrap();
+        let shard_dir = tmp.path().join("shard-0001");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let mut store = ProjectionStoreV1::load_or_init(&shard_dir, 1, 1).unwrap();
+        store.meta.artifact_relations.schema_version = 3;
+        store.meta.artifact_relations.snapshot_blake3 = None; // reachability unknown -> skip
+        let (_bytes, ptr) = relations_block(1, 1);
+        store.relations_hot_ptrs.insert((1, 1), ptr);
+
+        let err = store.gc_orphan_cold_segments_v1(gc_opts(true, 0, 0)).unwrap_err();
+        assert!(
+            format!("{err}").contains("relations hot ptr references missing cold block loc"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn gc_orphan_cold_segments_errors_on_dangling_dependents_hot_ptr() {
+        let tmp = TempDir::new().unwrap();
+        let shard_dir = tmp.path().join("shard-0001");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let mut store = ProjectionStoreV1::load_or_init(&shard_dir, 1, 1).unwrap();
+        store.meta.artifact_dependents.schema_version = 3;
+        store.meta.artifact_dependents.snapshot_blake3 = None;
+        let (_bytes, ptr) = dependents_block(1, 1);
+        store.dependents_hot_ptrs.insert((1, 1), ptr);
+
+        let err = store.gc_orphan_cold_segments_v1(gc_opts(true, 0, 0)).unwrap_err();
+        assert!(
+            format!("{err}").contains("dependents hot ptr references missing cold block loc"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn gc_orphan_cold_segments_on_fresh_store_reports_both_projections_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let shard_dir = tmp.path().join("shard-0001");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let mut store = ProjectionStoreV1::load_or_init(&shard_dir, 3, 9).unwrap();
+        let report = store.gc_orphan_cold_segments_v1(gc_opts(true, 60, 5)).unwrap();
+        assert_eq!(report.shard_id, 3);
+        assert_eq!(report.epoch, 9);
+        assert!(report.dry_run);
+        assert_eq!(report.min_age_seconds, 60);
+        assert_eq!(report.max_delete, 5);
+        assert!(report.relations.skipped);
+        assert!(report.dependents.skipped);
+        assert_eq!(report.relations.projection, "relations");
+        assert_eq!(report.dependents.projection, "dependents");
+    }
+
+    // ── decode_frame_projection_inputs ──────────────────────────────
+
+    #[test]
+    fn decode_frame_projection_inputs_rejects_garbage_bytes() {
+        assert!(decode_frame_projection_inputs(&[0u8; 64]).is_err());
+    }
+
+    /// A frame whose header region is shorter than the 32-byte trailing header
+    /// hash cannot be split into (canonical, hash); reject rather than index
+    /// out of bounds or read a truncated canonical header.
+    #[test]
+    fn decode_frame_projection_inputs_rejects_short_header() {
+        let frame = corecrux_segment::encode_frame_v1(&[0u8; 8], b"payload").unwrap();
+        let err = decode_frame_projection_inputs(&frame).unwrap_err();
+        assert!(
+            matches!(&err, ProjectionError::InvalidFrameHeader { msg } if msg.contains("too small")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_frame_projection_inputs_rejects_undecodable_canonical_header() {
+        let frame = corecrux_segment::encode_frame_v1(&[0xFFu8; 96], b"payload").unwrap();
+        let err = decode_frame_projection_inputs(&frame).unwrap_err();
+        assert!(
+            matches!(&err, ProjectionError::InvalidFrameHeader { msg } if msg.contains("canonical header decode failed")),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── ProjectionStoreV1::load_or_init recovery paths ──────────────
+
+    /// A living-state snapshot whose bytes no longer hash to the value recorded
+    /// in `projections.meta.json` must reset meta AND state, so the next tick
+    /// replays from genesis instead of resuming on top of a corrupt snapshot.
+    #[test]
+    fn load_or_init_snapshot_hash_mismatch_resets_meta_to_genesis() {
+        let tmp = TempDir::new().unwrap();
+        let shard_dir = tmp.path().join("shard-0001");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let files = ProjectionFilesV1::for_shard_dir(&shard_dir);
+        std::fs::create_dir_all(&files.projections_dir).unwrap();
+
+        let mut meta = crate::meta::ProjectionsMetaV1::empty_now();
+        meta.commit_id = 17;
+        meta.artifact_living_state.snapshot_blake3 = Some("c".repeat(64));
+        meta.artifact_living_state.cursor = Some(ProjectionCursorV1 {
+            shard_id: 1,
+            epoch: 1,
+            segment_seq: 4,
+            offset: 900,
+        });
+        store_projections_meta_v1(&files.meta_path, &meta).unwrap();
+        std::fs::write(&files.living_snapshot_path, b"not the recorded snapshot").unwrap();
+
+        let store = ProjectionStoreV1::load_or_init(&shard_dir, 1, 1).unwrap();
+        assert_eq!(store.meta.commit_id, 0, "meta must be reset to genesis");
+        assert!(store.meta.artifact_living_state.cursor.is_none());
+        assert!(store.meta.artifact_living_state.snapshot_blake3.is_none());
+        assert!(store.state.living.is_empty());
+        assert!(store.cursor_from_meta().is_none());
+    }
+
+    /// A snapshot whose recorded hash matches but whose body is not a decodable
+    /// `.ccxs` container is equally a reset, not a partial load.
+    #[test]
+    fn load_or_init_undecodable_snapshot_resets_meta_to_genesis() {
+        let tmp = TempDir::new().unwrap();
+        let shard_dir = tmp.path().join("shard-0001");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let files = ProjectionFilesV1::for_shard_dir(&shard_dir);
+        std::fs::create_dir_all(&files.projections_dir).unwrap();
+
+        let garbage = b"CCXS-ish but not really".to_vec();
+        let mut meta = crate::meta::ProjectionsMetaV1::empty_now();
+        meta.commit_id = 5;
+        meta.artifact_living_state.snapshot_blake3 = Some(CcxsSnapshot::snapshot_blake3_hex(&garbage));
+        store_projections_meta_v1(&files.meta_path, &meta).unwrap();
+        std::fs::write(&files.living_snapshot_path, &garbage).unwrap();
+
+        let store = ProjectionStoreV1::load_or_init(&shard_dir, 1, 1).unwrap();
+        assert_eq!(store.meta.commit_id, 0);
+        assert!(store.state.living.is_empty());
+    }
+
+    /// An unknown relations `schemaVersion` is a hard error rather than a
+    /// silent reset: the operator must be told the binary is too old.
+    #[test]
+    fn load_or_init_unsupported_relations_schema_version_errors() {
+        let tmp = TempDir::new().unwrap();
+        let shard_dir = tmp.path().join("shard-0001");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let files = ProjectionFilesV1::for_shard_dir(&shard_dir);
+        std::fs::create_dir_all(&files.projections_dir).unwrap();
+
+        let snap = CcxsSnapshot {
+            header: CcxsSnapshotHeaderV1 {
+                projection_id: CcxsProjectionId::ArtifactRelations,
+                schema_version: 99,
+                created_at_unix_ns: 0,
+                shard_id: 1,
+                epoch: 1,
+                cursor_segment_seq: 0,
+                cursor_offset: 0,
+                block_count: 1,
+                codec: CCXS_CODEC_NONE,
+            },
+            blocks: vec![(CCXS_BLOCK_EDGES_V1, Vec::new())],
+        };
+        let bytes = snap.encode().unwrap();
+        std::fs::write(&files.relations_snapshot_path, &bytes).unwrap();
+
+        let mut meta = crate::meta::ProjectionsMetaV1::empty_now();
+        meta.artifact_relations.schema_version = 99;
+        meta.artifact_relations.snapshot_blake3 = Some(CcxsSnapshot::snapshot_blake3_hex(&bytes));
+        store_projections_meta_v1(&files.meta_path, &meta).unwrap();
+
+        let Err(err) = ProjectionStoreV1::load_or_init(&shard_dir, 1, 1) else {
+            panic!("expected an unsupported-schema error");
+        };
+        assert!(
+            format!("{err}").contains("unsupported relations schema_version 99"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn load_or_init_unsupported_dependents_schema_version_errors() {
+        let tmp = TempDir::new().unwrap();
+        let shard_dir = tmp.path().join("shard-0001");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let files = ProjectionFilesV1::for_shard_dir(&shard_dir);
+        std::fs::create_dir_all(&files.projections_dir).unwrap();
+
+        let snap = CcxsSnapshot {
+            header: CcxsSnapshotHeaderV1 {
+                projection_id: CcxsProjectionId::ArtifactDependents,
+                schema_version: 42,
+                created_at_unix_ns: 0,
+                shard_id: 1,
+                epoch: 1,
+                cursor_segment_seq: 0,
+                cursor_offset: 0,
+                block_count: 1,
+                codec: CCXS_CODEC_NONE,
+            },
+            blocks: vec![(CCXS_BLOCK_EDGES_V1, Vec::new())],
+        };
+        let bytes = snap.encode().unwrap();
+        std::fs::write(&files.dependents_snapshot_path, &bytes).unwrap();
+
+        let mut meta = crate::meta::ProjectionsMetaV1::empty_now();
+        meta.artifact_dependents.schema_version = 42;
+        meta.artifact_dependents.snapshot_blake3 = Some(CcxsSnapshot::snapshot_blake3_hex(&bytes));
+        store_projections_meta_v1(&files.meta_path, &meta).unwrap();
+
+        let Err(err) = ProjectionStoreV1::load_or_init(&shard_dir, 1, 1) else {
+            panic!("expected an unsupported-schema error");
+        };
+        assert!(
+            format!("{err}").contains("unsupported dependents schema_version 42"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// DEFECT PIN (absent signal reads as pass): when `projections.meta.json`
+    /// records a `snapshotBlake3` and an advanced cursor but the snapshot FILE
+    /// is missing, the `.filter(|_| path.exists())` guard at
+    /// `load_or_init` skips the whole verification block, leaves `ok = true`,
+    /// and the store is returned with the cursor INTACT and state EMPTY. The
+    /// next `tick` therefore resumes past frames it never applied. A deleted
+    /// snapshot is indistinguishable from a clean load. Reported, not fixed;
+    /// this test pins current behaviour so a fix is a deliberate change.
+    #[test]
+    fn load_or_init_missing_snapshot_file_keeps_cursor_with_empty_state() {
+        let tmp = TempDir::new().unwrap();
+        let shard_dir = tmp.path().join("shard-0001");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let files = ProjectionFilesV1::for_shard_dir(&shard_dir);
+        std::fs::create_dir_all(&files.projections_dir).unwrap();
+
+        let mut meta = crate::meta::ProjectionsMetaV1::empty_now();
+        meta.commit_id = 12;
+        meta.artifact_living_state.snapshot_blake3 = Some("d".repeat(64));
+        meta.artifact_living_state.row_count = 500;
+        meta.artifact_living_state.cursor = Some(ProjectionCursorV1 {
+            shard_id: 1,
+            epoch: 1,
+            segment_seq: 7,
+            offset: 4_096,
+        });
+        store_projections_meta_v1(&files.meta_path, &meta).unwrap();
+        assert!(!files.living_snapshot_path.exists());
+
+        let store = ProjectionStoreV1::load_or_init(&shard_dir, 1, 1).unwrap();
+        assert_eq!(store.meta.commit_id, 12, "meta is NOT reset (current behaviour)");
+        assert!(store.state.living.is_empty(), "but no rows were loaded");
+        let cursor = store.cursor_from_meta().expect("cursor survives");
+        assert_eq!(cursor.segment_seq, 7);
+        assert_eq!(cursor.offset, 4_096);
+    }
+
+    // ── cursor plumbing ─────────────────────────────────────────────
+
+    #[test]
+    fn cursor_from_meta_reflects_stored_cursor() {
+        let tmp = TempDir::new().unwrap();
+        let shard_dir = tmp.path().join("shard-0001");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let mut store = ProjectionStoreV1::load_or_init(&shard_dir, 1, 1).unwrap();
+        store.meta.artifact_living_state.cursor = Some(ProjectionCursorV1 {
+            shard_id: 1,
+            epoch: 1,
+            segment_seq: 11,
+            offset: 22,
+        });
+        let cursor = store.cursor_from_meta().unwrap();
+        assert_eq!(cursor.segment_seq, 11);
+        assert_eq!(cursor.offset, 22);
+    }
+
+    #[test]
+    fn infer_cursor_after_frames_saturates_on_huge_offset() {
+        let loc = corecrux_storage::FrameLocation {
+            shard_id: 1,
+            epoch: 1,
+            segment_seq: 3,
+            offset: u64::MAX,
+        };
+        let frames: ReplayFrames = vec![(loc, vec![0u8; 8])];
+        let cursor = infer_cursor_after_frames(&frames).unwrap();
+        assert_eq!(cursor.offset, u64::MAX, "saturating_add must not wrap to 7");
     }
 }

@@ -438,13 +438,13 @@ This is the body.
     /// `docs/execplan-drift-guard.md`. The body keeps only what an agent needs
     /// mid-session; operator setup is read on demand. Guard both halves.
     #[test]
-    fn execplan_discipline_v4_defers_drift_guard_setup_and_pins_the_real_gap_preflight() {
+    fn execplan_discipline_v5_pins_the_refresh_step_and_still_defers_setup_detail() {
         let bundled = load_bundled_profiles().unwrap();
         let p = bundled
             .iter()
             .find(|f| f.frontmatter.name == "execplan-discipline")
             .expect("execplan-discipline fragment must be bundled");
-        assert_eq!(p.frontmatter.version, 4);
+        assert_eq!(p.frontmatter.version, 5);
 
         let body = p.body.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
 
@@ -465,6 +465,18 @@ This is the body.
 
         // Agent-time behaviour must survive: the hook can fire mid-session, and the
         // leading-token rule is a real semantic gotcha that is not inferable.
+        // v5: the propagation step. The board is a read-time projection over the
+        // daemon's replica, so a locally-committed plan is invisible to every other
+        // session until it is pushed and refreshed — and an untracked plan can be
+        // destroyed outright by a sibling checkout (one was, on 2026-07-31).
+        assert!(
+            body.contains("/v1/execplans/refresh"),
+            "the gate routine must name the refresh call"
+        );
+        assert!(
+            body.contains("untracked"),
+            "commit-on-create must survive: an untracked plan is one checkout from gone"
+        );
         assert!(body.contains("posttooluse"), "the agent must know the hook exists");
         assert!(body.contains("leading"), "leading-Status:-token semantics must survive");
         assert!(

@@ -1,7 +1,7 @@
 +++
 name = "execplan-discipline"
-version = 4
-description = "Multi-milestone work goes through an ExecPlan first. Codifies the Insights-report `ExecPlan Workflow` snippet (M1..Mn pattern in 15+ sessions), plus the board-drift guard that keeps plan `Status:` lines aligned with derived state. v4 corrects the Pre-flight step: it pointed at `get_gaps(query=...)`, which reads retrieval-coverage facts rather than the capability registry, and at a Feature Registry endpoint that moved into the Crux daemon when the PlanCrux API was retired 2026-07-24. Now gives the real HTTP call, its auth scope, and the dev-mode path. v3 moved the drift guard's install and wiring detail (hook paths, per-agent JSON matchers, script flags) out of this always-loaded body and into `docs/execplan-drift-guard.md`, keeping only the behaviour an agent needs mid-session: that the hook may fire, and that only the leading `Status:` token counts."
+version = 5
+description = "Multi-milestone work goes through an ExecPlan first. Codifies the Insights-report `ExecPlan Workflow` snippet (M1..Mn pattern in 15+ sessions), plus the board-drift guard that keeps plan `Status:` lines aligned with derived state. v5 closes the propagation gap the gate routine never named: the board is a read-time projection over the daemon's replica, so a locally-committed plan is invisible until it is pushed and refreshed — and an *untracked* plan can be silently destroyed by a sibling session's checkout, which is how one closed plan was lost on 2026-07-31. Adds the push + `POST /v1/execplans/refresh` step and a commit-on-create rule. v4 corrects the Pre-flight step: it pointed at `get_gaps(query=...)`, which reads retrieval-coverage facts rather than the capability registry, and at a Feature Registry endpoint that moved into the Crux daemon when the PlanCrux API was retired 2026-07-24."
 targets = ["claude_md", "agents_md"]
 order = 30
 risk_class = "low"
@@ -28,7 +28,15 @@ Required sections in each plan: Purpose, Non-goals, Context, Constraints, Propos
   - Update the plan's `Progress` checklist inline.
   - Update the `Decision Log` with any non-trivial choice + commit_sha.
   - `store_fact(entity="execplan:<slug>", key="gate:M<n>", value={status, date, commit_sha, tests_passing, ...})`.
+  - **Commit and push the plan file**, then `POST /v1/execplans/refresh`. The work board is a
+    *read-time* projection over the daemon's replica of `*.md` — nothing is pushed to it, so a plan
+    that is only committed locally is invisible to every other session. Refresh collapses the wait
+    for the periodic pull; `409` means git backing is not configured, which is a different problem
+    from a failed pull. Agents with no checkout author via `POST /v1/execplans` instead.
 - Test + commit per milestone. Don't batch milestones into one commit.
+- **Never leave a plan file untracked.** An untracked plan lives only in one working tree: a sibling
+  session's `git checkout` takes it away, and the loss is silent because the board projects over the
+  daemon's replica, not yours. Commit the file the moment you create it, not when the plan closes.
 - When the plan's assumptions change mid-flight, record the reason in `Decision Log` first, then act.
 
 ### Risk class on every plan
