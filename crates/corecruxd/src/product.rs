@@ -154,6 +154,65 @@ pub const DAEMON_IMPLEMENTED_PRO_CLAIMS: &[&str] = &[
     "tenant:business_offboarding",
 ];
 
+/// Where each [`DAEMON_IMPLEMENTED_PRO_CLAIMS`] entry is actually enforced.
+///
+/// `pro_claim_placements` derives `implementation: "daemon"` from list
+/// membership alone — it never checks that a gate exists — so adding a string
+/// to two arrays is enough to make the daemon report a capability as
+/// implemented. The M4 vow audit found four claims in exactly that state.
+///
+/// This table is the missing check. A claim earns `daemon_implemented` by
+/// naming the `file:line` that refuses it, and
+/// `daemon_implemented_pro_claims_have_a_gate_site` fails the build if the two
+/// lists drift apart in either direction.
+///
+/// `None` means **sold, declared daemon-implemented, and enforced nowhere**.
+/// Do not add a `None` row to make a new claim compile. The four below are
+/// recorded findings awaiting the M5 human gate, not a pattern to follow —
+/// and note the `ledger:history` trap above: dropping one from
+/// `DAEMON_IMPLEMENTED_PRO_CLAIMS` alone re-labels it `contracted_external`,
+/// asserting an outside implementer that does not exist. They leave both lists
+/// together or not at all.
+///
+/// The classification behind the four, for the record: of the twenty claims
+/// declared daemon-implemented, five egress (the GPU-1 bridge, the only Pro
+/// handler that reaches the network), eleven are local compute that answers on
+/// a network-severed daemon, and these four have no gate and no handler at all.
+#[cfg(test)]
+const DAEMON_CLAIM_GATE_SITES: &[(&str, Option<&str>)] = &[
+    ("gpu1:answer", Some("http/gpu1.rs:801 service_enabled")),
+    ("gpu1:rerank", Some("http/gpu1.rs:801 service_enabled")),
+    ("gpu1:enrich", Some("http/gpu1.rs:801 service_enabled")),
+    ("gpu1:coverage", Some("http/gpu1.rs:801 service_enabled")),
+    ("gpu1:developer", Some("http/gpu1.rs:801 service_enabled")),
+    ("replay:answer", Some("http/replay.rs:214")),
+    ("agent_brief:pro", Some("http/workbench.rs:875 require_surface_enabled")),
+    (
+        "context_pack:budgeted",
+        Some("http/workbench.rs:875 require_surface_enabled"),
+    ),
+    (
+        "impact:preflight",
+        Some("http/workbench.rs:875 require_surface_enabled"),
+    ),
+    ("audit:triage", Some("http/workbench.rs:875 require_surface_enabled")),
+    (
+        "reasoning:timeline",
+        Some("http/workbench.rs:875 require_surface_enabled"),
+    ),
+    ("handoff:v2", Some("http/workbench.rs:875 require_surface_enabled")),
+    ("route_probe:lab", Some("http/workbench.rs:875 require_surface_enabled")),
+    ("api_drift:check", Some("http/workbench.rs:875 require_surface_enabled")),
+    ("policy:simulate", Some("http/workbench.rs:875 require_surface_enabled")),
+    ("enrichers:first_party", Some("http/actions.rs:59")),
+    // M4 findings — no gate, no handler, claim string occurs only in the
+    // PRO_CAPABILITY_CLAIMS / DAEMON_IMPLEMENTED_PRO_CLAIMS arrays.
+    ("sync:mirror", None),
+    ("sync:promote", None),
+    ("console:workbench", None),
+    ("tenant:business_offboarding", None),
+];
+
 pub const HOSTED_CONTROL_PLANE_PRO_CLAIMS: &[&str] = &[
     "memorycrux:tenant",
     "sync:managed_backup",
@@ -1135,6 +1194,60 @@ mod tests {
         assert_eq!(OperatingMode::parse("cloud_only"), Some(OperatingMode::ProCloudOnly));
         assert_eq!(OperatingMode::parse("pro"), Some(OperatingMode::ProHybrid));
         assert_eq!(OperatingMode::parse("onsite"), Some(OperatingMode::MaxPrivate));
+    }
+
+    /// A claim may not be sold as daemon-implemented without a gate that
+    /// refuses it.
+    ///
+    /// `pro_claim_placements` reports `implementation: "daemon"` from list
+    /// membership, so without this the only thing standing between "we built
+    /// it" and "we added a string to an array" is review. M4 found four claims
+    /// that had crossed that line.
+    #[test]
+    fn daemon_implemented_pro_claims_have_a_gate_site() {
+        for claim in DAEMON_IMPLEMENTED_PRO_CLAIMS {
+            assert!(
+                DAEMON_CLAIM_GATE_SITES.iter().any(|(name, _)| name == claim),
+                "{claim} is declared daemon-implemented but has no DAEMON_CLAIM_GATE_SITES row. \
+                 Add the file:line of the gate that refuses it — or, if nothing enforces it, do not \
+                 declare it daemon-implemented."
+            );
+        }
+
+        for (claim, _) in DAEMON_CLAIM_GATE_SITES {
+            assert!(
+                contains_claim(DAEMON_IMPLEMENTED_PRO_CLAIMS, claim),
+                "{claim} has a gate-site row but is no longer in DAEMON_IMPLEMENTED_PRO_CLAIMS; \
+                 drop the stale row so the table keeps meaning what it says"
+            );
+        }
+    }
+
+    /// The four ungated claims are pinned by name so that fixing one is a
+    /// deliberate edit to this list rather than a silent drift, and so that a
+    /// *fifth* cannot appear unnoticed.
+    ///
+    /// This asserts a known defect, not a desired state. It goes away at M5,
+    /// which is a human gate because it changes what is sold.
+    #[test]
+    fn the_only_ungated_daemon_claims_are_the_four_m4_found() {
+        let ungated: Vec<&str> = DAEMON_CLAIM_GATE_SITES
+            .iter()
+            .filter_map(|(claim, gate)| gate.is_none().then_some(*claim))
+            .collect();
+
+        assert_eq!(
+            ungated,
+            vec![
+                "sync:mirror",
+                "sync:promote",
+                "console:workbench",
+                "tenant:business_offboarding",
+            ],
+            "the set of sold-but-unenforced Pro claims changed. If you added one, don't — wire a \
+             gate. If you removed one, remove it from PRO_CAPABILITY_CLAIMS too (see the \
+             ledger:history note) and update this assertion."
+        );
     }
 
     #[test]
