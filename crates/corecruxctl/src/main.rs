@@ -105,6 +105,11 @@ enum Command {
         /// Skip the post-login tools/list + fact round-trip verification.
         #[arg(long, default_value_t = false)]
         no_verify: bool,
+        /// Exit non-zero if a post-login self-check RAN and FAILED. A check
+        /// that could not run at all (daemon unreachable) is still tolerated —
+        /// `corecruxctl login` is expected to work offline.
+        #[arg(long, default_value_t = false)]
+        strict_verify: bool,
         /// Skip installing the Claude Code hooks (banner + observe capture).
         #[arg(long, default_value_t = false)]
         no_hooks: bool,
@@ -2618,6 +2623,7 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             token,
             device,
             no_verify,
+            strict_verify,
             no_hooks,
             no_register,
         } => login::run(login::LoginArgs {
@@ -2625,6 +2631,7 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             token,
             device,
             no_verify,
+            strict_verify,
             no_hooks,
             no_register,
         }),
