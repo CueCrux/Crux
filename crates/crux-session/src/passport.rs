@@ -172,6 +172,27 @@ impl LocalPassportKey {
     }
 
     /// Public Ed25519 verifier bytes for locally issued RCX tokens.
+    /// Borrow the signing key for RCX **delegation attenuation**.
+    ///
+    /// This is the one place the passport's key leaves the module as a key
+    /// rather than as a signature, and it exists because
+    /// `RcxCapabilityToken::attenuate_for` takes `&SigningKey` directly — it
+    /// derives the delegator fingerprint from the key in order to check it
+    /// against `subject.passport_fpr`, so a `sign_hash`-shaped callback would
+    /// not be enough.
+    ///
+    /// Deliberately narrow: named for its purpose rather than a general
+    /// `signing_key()`, so a future caller wanting the raw key for something
+    /// else has to add its own accessor and justify it. The cleaner shape is
+    /// for `attenuate_for` to take a signer trait; that is a change to
+    /// `rcx-capability-token`'s public API and every one of its call sites, and
+    /// is worth doing separately rather than as a rider on M1.
+    ///
+    /// See ExecPlan `crux-hosted-relay-gateway-2026-07-30` M1 / OD-44.
+    pub fn delegation_signing_key(&self) -> &SigningKey {
+        &self.signing_key
+    }
+
     pub fn verifying_key_bytes(&self) -> [u8; 32] {
         self.signing_key.verifying_key().to_bytes()
     }

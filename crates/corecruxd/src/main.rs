@@ -58,6 +58,7 @@ mod grpc;
 mod hosted_token;
 mod http;
 mod local_ingest;
+mod relay_device;
 // Candidate proposers are staged behind the identity-candidates rollout path; tests
 // exercise creation/proposal before daemon startup wires automatic proposer runs.
 #[allow(dead_code)]
@@ -160,7 +161,7 @@ use fs2::{available_space, total_space, FileExt};
 use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use corecrux_types::{
     BuildInfo, CapacityThresholdBreachedV1, CompatContract, ControlCheckpointMaterializedV1, ControlStateMutationV1,
@@ -913,7 +914,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // is the first consumer and will own the storage. Loading here still earns
     // its keep — an operator sees at boot whether the grant is usable, rather
     // than discovering it at the first connect attempt.
-    let _ = crate::hosted_token::load_from_env(now_unix_ms() / 1000);
+    //
+    // M1 extends that: the device identity is surfaced (the operator needs the
+    // fingerprint to register the device) and, when a relay grant is present,
+    // the delegation envelope is minted once as a **boot-time rehearsal**. It is
+    // dropped rather than kept — M4b owns the storage — but minting it here
+    // means a daemon that cannot produce a valid envelope says so at boot,
+    // beside the grant it belongs to, instead of failing at the first connect.
+    {
+        let now_seconds = now_unix_ms() / 1000;
+        let hosted = crate::hosted_token::load_from_env(now_seconds);
+        let device = crate::relay_device::DeviceIdentity::derive(&rcx_passport_key);
+        info!(
+            device_fpr = %device.fpr(),
+            "relay device identity derived; register this fingerprint to pair this daemon"
+        );
+        if let Some(hosted) = hosted.as_ref() {
+            if hosted.relay.is_some() {
+                match crate::relay_device::attenuate_for_relay(
+                    hosted,
+                    &rcx_passport_key,
+                    &device,
+                    "boot-rehearsal",
+                    now_seconds,
+                    crate::relay_device::DEFAULT_ENVELOPE_TTL_SECONDS,
+                ) {
+                    Ok(_) => info!(
+                        device_fpr = %device.fpr(),
+                        "relay delegation envelope mints cleanly"
+                    ),
+                    // Not fatal: the daemon serves local capability with or
+                    // without a relay. Warn loudly and carry on, rather than
+                    // refusing to boot over a hosted feature.
+                    Err(error) => warn!(
+                        device_fpr = %device.fpr(),
+                        %error,
+                        "relay grant present but the delegation envelope cannot be minted; \
+                         the relay session will not establish until this is resolved"
+                    ),
+                }
+            }
+        }
+    }
     {
         let mut store = state.fact_store.write().await;
         match crate::repo_registry::fail_incomplete_scans(
