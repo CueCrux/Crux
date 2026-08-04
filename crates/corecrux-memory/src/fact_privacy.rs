@@ -124,6 +124,11 @@ pub const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
     "__incident__::",
     "__legal_hold__::",
     "__legal_hold_receipt__::",
+    // Vault key escrow (ExecPlan crux-key-escrow-and-recovery M3b): wrapped
+    // DEK ciphertext and the pointer to a vault's latest release request.
+    // Born private — a wrapped DEK pushed to a remote would put ciphertext
+    // somewhere the customer did not choose to put it.
+    "__escrow__::",
     "__bootstrap__::",
     "__project__::",
     "__tenant_metadata__::",
@@ -142,6 +147,7 @@ pub const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
 /// not enforce this policy because legal-hold, incident, and mint-request
 /// implementations persist their own state through direct store calls.
 pub const DAEMON_OWNED_ENTITY_PREFIXES: &[&str] = &[
+    "__escrow__::",
     "__legal_hold__::",
     "__legal_hold_receipt__::",
     "__incident__::",

@@ -287,6 +287,33 @@ fn decode_creds(facts: Vec<corecrux_memory::Fact>) -> Vec<(String, RefreshCred)>
         .collect()
 }
 
+/// Device ids currently paired with this daemon for `tenant`, revoked ones
+/// excluded, in a stable order.
+///
+/// This is "every registered device" for a daemon the customer runs themselves —
+/// escrow release notifications go here (ExecPlan
+/// `crux-key-escrow-and-recovery-2026-07-31`, M3b). Deliberately local: reaching
+/// for a hosted registry would make key recovery depend on a network the
+/// customer may have just lost access to.
+///
+/// A poisoned registry lock yields an empty list rather than a panic. The
+/// consequence is visible in the receipt chain — a release with no `Notified`
+/// events shows plainly that nobody could have cancelled it.
+pub(super) fn paired_device_ids(tenant: &str) -> Vec<String> {
+    let Ok(reg) = REGISTRY.lock() else {
+        tracing::warn!("device registry unavailable; escrow release will notify nobody");
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = reg
+        .refresh
+        .iter()
+        .filter(|(_, cred)| !cred.revoked && cred.tenant_id == tenant)
+        .map(|(cred_id, _)| cred_id.clone())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
 /// Query used by both the live hydrate path and its tests.
 fn cred_query() -> corecrux_memory::fact_store::FactQuery {
     corecrux_memory::fact_store::FactQuery {

@@ -17,7 +17,7 @@ SPA — `dist/` only, not a cargo member — and is excluded below.)
 | `corecrux-frame` | Canonical v1 frame encoding + hash helpers (header / payload / stream) | `canonical_header_bytes_v1`, `compute_header_hash`, `compute_payload_hash`, `decode_canonical_header_bytes_v1` | corecrux-{index,projections,storage,segment}, corecruxctl, corecruxd | 0.3k |
 | `rcx-capability-token` | RCX capability token v1.0 (schema-lock, CBOR/JSON mirror, validation) | `RcxCapabilityToken`, `verify_token`, `validate_basic`, `RcxTier`, `ReceiptClass` | crux-enterprise-shim, crux-mcp, crux-router | 1.1k |
 | `rcx-revocation` | CRL feed behind `Revocation.crl_url`; tri-state freshness so callers fail closed | `RevocationSnapshot`, `authorize_when_known`, `RevocationFeed`, `CrlTransport`, `CrlDocument` | (relay accept path — M5) | 0.5k |
-| `crux-escrow` | Vault key recovery: recovery-code wrapped DEKs, Shamir 2-of-3 escrow, delayed cancellable share release | `RecoveryCode`, `WrappedDek`, `wrap_dek`/`unwrap_dek`, `VaultSetup::acknowledge`, `split_escrow`/`combine_shares`, `release::ReleaseRequest` | (not wired yet — see crate AGENTS.md) | 0.7k |
+| `crux-escrow` | Vault key recovery: recovery-code wrapped DEKs, Shamir 2-of-3 escrow, delayed cancellable share release | `RecoveryCode`, `WrappedDek`, `wrap_dek`/`unwrap_dek`, `VaultSetup::acknowledge`, `split_escrow`/`combine_shares`, `release::ReleaseRequest` | corecruxd | 0.7k |
 
 ## Memory & retrieval
 

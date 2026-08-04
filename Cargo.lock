@@ -1052,6 +1052,7 @@ dependencies = [
  "crc32fast",
  "crux-cost",
  "crux-enterprise-shim",
+ "crux-escrow",
  "crux-integrations",
  "crux-lens-features",
  "crux-mcp",

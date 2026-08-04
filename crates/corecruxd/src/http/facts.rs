@@ -175,7 +175,7 @@ fn raw_admin_write(ctx: &crate::auth::HttpScopeContext) -> bool {
 /// - The MCP write plane has no per-token tenant claim, so it uniformly stamps `default`
 ///   (no cross-tenant bypass); MCP-plane multi-tenancy is a scoped follow-up.
 #[allow(clippy::result_large_err)]
-fn tenant_hash_for_write_context(ctx: &crate::auth::HttpScopeContext) -> Result<String, Response> {
+pub(super) fn tenant_hash_for_write_context(ctx: &crate::auth::HttpScopeContext) -> Result<String, Response> {
     match ctx.resolve_write_tenant() {
         Ok(Some(tenant)) => Ok(tenant),
         Ok(None) => Ok(corecrux_memory::fact_store::default_tenant_hash()),
