@@ -42,6 +42,7 @@ mod memory_capture;
 // Pro GPU-1 compute bridge (`/v1/gpu1/*`). Compiled out of the default
 // Community Edition binary; see the `hosted-surfaces` feature.
 mod audit_verify;
+mod escrow;
 #[cfg(feature = "hosted-surfaces")]
 mod gpu1;
 mod health;
@@ -496,6 +497,26 @@ pub(crate) fn router_with_route_auth(
             axum::routing::post(self::compute::post_compute_embed).layer(
                 axum::extract::DefaultBodyLimit::max(self::compute::COMPUTE_EMBED_MAX_REQUEST_BYTES),
             ),
+        )
+        .route(
+            "/v1/escrow/vaults/{vault_id}",
+            axum::routing::put(self::escrow::put_wrapped_dek).get(self::escrow::get_wrapped_dek),
+        )
+        .route(
+            "/v1/escrow/vaults/{vault_id}/release",
+            axum::routing::post(self::escrow::post_release),
+        )
+        .route(
+            "/v1/escrow/releases/{request_id}",
+            axum::routing::get(self::escrow::get_release),
+        )
+        .route(
+            "/v1/escrow/releases/{request_id}/cancel",
+            axum::routing::post(self::escrow::post_release_cancel),
+        )
+        .route(
+            "/v1/escrow/releases/{request_id}/complete",
+            axum::routing::post(self::escrow::post_release_complete),
         )
         .route("/v1/legal-holds", axum::routing::post(self::legal_holds::post_legal_hold))
         .route(
@@ -1852,6 +1873,15 @@ fn problem_for_status(status: StatusCode, detail: impl Into<String>) -> ProblemR
             StatusCode::NO_CONTENT.as_u16(),
             "https://errors.cuecrux.com/no-content",
             "No Content",
+        )
+        .with_detail(detail),
+        // 425. A mandatory waiting period has not elapsed — distinct from a
+        // conflict, because the caller should retry later rather than give up.
+        // Used by the escrow custodian-share release delay.
+        StatusCode::TOO_EARLY => ProblemDetails::new(
+            StatusCode::TOO_EARLY.as_u16(),
+            "https://errors.cuecrux.com/too-early",
+            "Too Early",
         )
         .with_detail(detail),
         _ => ProblemDetails::internal(detail),

@@ -506,6 +506,15 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
         ));
     }
 
+    // Escrow holds customer key ciphertext and the custodian-share release
+    // lane; reads and writes are both admin-scoped, never public or query-read.
+    if path.starts_with("/v1/escrow/") {
+        return Some(if method == "GET" {
+            RouteAuthContract::new(RouteAuthClass::AdminRead, &["admin:read"])
+        } else {
+            RouteAuthContract::new(RouteAuthClass::AdminWrite, &["admin:write"])
+        });
+    }
     if path.starts_with("/v1/legal-holds") {
         return Some(RouteAuthContract::gated(
             RouteAuthClass::FeatureGated,

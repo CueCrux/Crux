@@ -60,6 +60,9 @@ pub const CRUXPACK_RESERVED_PREFIXES: &[&str] = &[
     // Auto-capture review-only candidates (M1) — must mirror the daemon
     // born-private prefix in fact_privacy::DEFAULT_PRIVATE_PREFIXES.
     "__candidate_fact__::",
+    // Vault key escrow: wrapped DEK ciphertext. Exporting it into a .cruxpack
+    // would put a customer's key material somewhere they did not choose.
+    "__escrow__::",
     "__agent::",
     "__ops::",
     "__ops__::",

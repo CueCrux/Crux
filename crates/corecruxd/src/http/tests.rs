@@ -1131,7 +1131,7 @@ fn pro_workbench_state(services: &[&str]) -> AppState {
     state
 }
 
-fn bind_test_state_to_root_passport_key(state: &mut AppState) {
+pub(super) fn bind_test_state_to_root_passport_key(state: &mut AppState) {
     let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).expect("root passport key");
     state.passport_fpr = key.passport_fpr().to_string();
     state.passport_public_key_hex = key.public_key_hex().to_string();
