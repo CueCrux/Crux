@@ -70,6 +70,31 @@ if [ "$mode" = "check" ]; then
       printf '  ok        %s\n' "$h"
     fi
   done
+  # Link topology being right is not the same as the hooks being CURRENT.
+  # Observed 2026-07-30: all four links resolved and --check said "ok" while the
+  # target checkout sat on a feature branch 192 commits behind main, so the live
+  # hooks were stale drafts. A link check that cannot see that is misleading.
+  #
+  # Staleness is reported, not failed: pointing at a branch is exactly what you
+  # want while testing a hook change. Failing would punish the legitimate case.
+  if git -C "$here" rev-parse --git-dir >/dev/null 2>&1; then
+    branch="$(git -C "$here" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    behind="$(git -C "$here" rev-list --count HEAD..origin/main 2>/dev/null || echo '?')"
+    stale=0
+    for h in "${hooks[@]}"; do
+      if git -C "$here" show "origin/main:scripts/hooks/$h" >/dev/null 2>&1; then
+        if ! git -C "$here" show "origin/main:scripts/hooks/$h" | diff -q - "$here/$h" >/dev/null 2>&1; then
+          printf '  differs from origin/main: %s\n' "$h"
+          stale=$((stale + 1))
+        fi
+      fi
+    done
+    if [ "$stale" -gt 0 ]; then
+      printf 'note: target checkout is on %s (%s behind origin/main); %d hook(s) differ from main.\n' \
+        "$branch" "$behind" "$stale"
+      printf '      Intentional while testing a hook change. Otherwise link at a main-tracking checkout.\n'
+    fi
+  fi
   [ "$rc" -eq 0 ] && echo "hooks: all ${#hooks[@]} linked to $here" || echo "hooks: drift detected — run scripts/hooks/install.sh" >&2
   exit "$rc"
 fi
