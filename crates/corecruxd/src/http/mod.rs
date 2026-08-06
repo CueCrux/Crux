@@ -90,6 +90,7 @@ mod tenant_erasure;
 mod traces;
 mod witness;
 mod work;
+mod work_graph;
 mod workbench;
 mod workspace;
 // session_metrics: Prometheus register!() at init — safe, panics only on
@@ -966,6 +967,10 @@ pub(crate) fn router_with_route_auth(
         )
         .route("/v1/execplans", axum::routing::post(self::work::post_execplan))
         .route("/v1/work", get(self::work::get_work))
+        // Spatial projection of the open ExecPlan board (console Patchbay).
+        // Same source and scope as `/v1/work`; adds plane/services/blurb.
+        // Registered before `/v1/work/{id}` so the literal path wins the match.
+        .route("/v1/work/graph", get(self::work_graph::get_work_graph))
         .route("/v1/work", axum::routing::post(self::work::post_work))
         .route("/v1/work/gate/pending", get(self::work::get_pending_gates))
         .route(

@@ -193,7 +193,7 @@ pub fn plane_for(slug: &str, title: &str, body: &str) -> &'static str {
 
 /// Shared services this plan touches, most-mentioned first, capped at
 /// [`SERVICE_MAX`]. Only services clearing [`SERVICE_MIN_HITS`] are returned.
-pub fn services_for(body: &str) -> Vec<String> {
+pub fn services_for(body: &str) -> Vec<&'static str> {
     let body_l = body.to_ascii_lowercase();
     let mut scored: Vec<(&'static str, u32)> = Vec::new();
     for (name, _side, pats) in SERVICES {
@@ -206,20 +206,12 @@ pub fn services_for(body: &str) -> Vec<String> {
     }
     // Descending by hits; ties keep table order, which is the rail order.
     scored.sort_by(|a, b| b.1.cmp(&a.1));
-    scored
-        .into_iter()
-        .take(SERVICE_MAX)
-        .map(|(name, _)| name.to_string())
-        .collect()
+    scored.into_iter().take(SERVICE_MAX).map(|(name, _)| name).collect()
 }
 
-/// The perimeter rail a service belongs to (`top`/`bottom`/`left`/`right`), so
-/// the console does not have to carry a second copy of this table.
-pub fn service_side(name: &str) -> Option<&'static str> {
-    SERVICES.iter().find(|(n, _, _)| *n == name).map(|(_, side, _)| *side)
-}
-
-/// Every known service, in rail order, as `(name, side)`.
+/// Every known service, in rail order, as `(name, side)`. The endpoint emits
+/// `side` alongside each service so the console carries no second copy of this
+/// table — which is why there is no separate lookup-by-name helper here.
 pub fn all_services() -> Vec<(&'static str, &'static str)> {
     SERVICES.iter().map(|(n, s, _)| (*n, *s)).collect()
 }
@@ -231,7 +223,8 @@ fn plain_text(s: &str) -> String {
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '*' | '`' | '_' => continue,
+            // Emphasis and code ticks are dropped outright.
+            '*' | '`' | '_' => {}
             '[' => {
                 // `[[slug]]` and `[text](url)` both reduce to their inner text.
                 if chars.peek() == Some(&'[') {

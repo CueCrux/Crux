@@ -111,7 +111,7 @@ fn a_single_passing_mention_is_not_a_dependency() {
 #[test]
 fn repeated_mentions_count_as_a_dependency() {
     let svc = services_for("postgres migration postgres psql postgres");
-    assert!(svc.iter().any(|s| s == "Postgres"), "got {svc:?}");
+    assert!(svc.contains(&"Postgres"), "got {svc:?}");
 }
 
 #[test]
@@ -124,17 +124,27 @@ fn services_are_capped_and_ordered_by_weight() {
                 minio minio object storage object-storage";
     let svc = services_for(body);
     assert!(svc.len() <= SERVICE_MAX, "not capped: {svc:?}");
-    assert_eq!(svc.first().map(String::as_str), Some("Paddle"), "got {svc:?}");
+    assert_eq!(svc.first().copied(), Some("Paddle"), "got {svc:?}");
 }
 
 #[test]
 fn every_service_has_a_rail() {
     for (name, side) in all_services() {
-        assert_eq!(service_side(name), Some(side));
         assert!(
             matches!(side, "top" | "bottom" | "left" | "right"),
             "service {name} has an unknown rail {side}"
         );
+    }
+}
+
+#[test]
+fn a_returned_service_is_always_a_known_rail_key() {
+    // services_for hands back &'static str keys straight from the table, so the
+    // endpoint can count them without a lookup. Guard that they stay in sync.
+    let svc = services_for("paddle paddle paddle postgres postgres postgres");
+    let known: Vec<&str> = all_services().into_iter().map(|(n, _)| n).collect();
+    for s in svc {
+        assert!(known.contains(&s), "unknown service key {s}");
     }
 }
 

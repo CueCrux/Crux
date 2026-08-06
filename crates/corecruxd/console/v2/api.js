@@ -153,6 +153,7 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/witness/smoke': true,
   '/v1/work': true,
   '/v1/work/gate/pending': true,
+  '/v1/work/graph': true,
   '/v1/workbench/api-drift': true,
   '/v1/workbench/audit-triage': true,
   '/v1/workbench/brief': true,
@@ -727,6 +728,9 @@ const CruxApi = Object.freeze({
   },
   workGatePending(query) {
     return fetch(withQuery(`/v1/work/gate/pending`, query), { credentials: 'same-origin' });
+  },
+  workGraph(query) {
+    return fetch(withQuery(`/v1/work/graph`, query), { credentials: 'same-origin' });
   },
   workById(id, query) {
     return fetch(withQuery(`/v1/work/${encodeURIComponent(id)}`, query), { credentials: 'same-origin' });

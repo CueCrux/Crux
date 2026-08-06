@@ -460,6 +460,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/execplans/refresh", methods: &["POST"], tag: "Work", auth: "write", summary: "Refresh the git-backed ExecPlan replica" },
     RouteEntry { path: "/v1/attention/summary", methods: &["GET"], tag: "Work", auth: "read", summary: "Attention roll-up (counts only)" },
     RouteEntry { path: "/v1/work", methods: &["GET", "POST"], tag: "Work", auth: "read-write", summary: "Work" },
+    RouteEntry { path: "/v1/work/graph", methods: &["GET"], tag: "Work", auth: "read", summary: "Spatial projection of the open ExecPlan board" },
     RouteEntry { path: "/v1/work/gate/pending", methods: &["GET"], tag: "Work", auth: "read", summary: "Work gate pending" },
     RouteEntry { path: "/v1/work/gate/{actionId}/approve", methods: &["POST"], tag: "Work", auth: "write", summary: "Work gate {actionId} approve" },
     RouteEntry { path: "/v1/work/gate/{actionId}/reject", methods: &["POST"], tag: "Work", auth: "write", summary: "Work gate {actionId} reject" },
