@@ -10504,6 +10504,106 @@
     return hit || 'sitemap';
   }
 
+  // ---- Patchbay (console-execplan-patchbay M3) ---------------------------
+  // The open board laid out in SPACE: every open ExecPlan as a card, ringed per
+  // system with the system name in the middle, wired to the shared services it
+  // touches. M3 lands the destination and the live read + summary; M4 draws the
+  // canvas underneath it.
+  //
+  // One read, through the GENERATED client (CruxApi.workGraph → GET
+  // /v1/work/graph). render.js keeps zero raw network calls, so the fetch lives
+  // in api.js exactly like every other console read.
+  //
+  // Three honest states, kept distinct rather than collapsed into "no data":
+  //   · read failed        — the daemon said no (status shown verbatim)
+  //   · aggregator off     — 200 with zero plans: CRUX_EXECPLANS_ROOT is unset,
+  //                          which is a configuration fact, not an error
+  //   · verified empty     — plans exist but none are open
+  function renderPatchbay(host, ctx) {
+    host.textContent = '';
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    if (!api || typeof api.workGraph !== 'function') {
+      host.appendChild(el('p', { 'class': 'v2card-sub', text: 'Patchbay client method unavailable — regenerate console/v2/api.js from the route manifest.' }));
+      return Promise.resolve();
+    }
+    var loading = el('p', { 'class': 'v2card-sub', text: 'Reading the board…' });
+    host.appendChild(loading);
+
+    return api.workGraph()
+      .then(function (r) {
+        return r.json().then(
+          function (d) { return { ok: r.ok, status: r.status, data: d }; },
+          function () { return { ok: r.ok, status: r.status, data: null }; }
+        );
+      })
+      .catch(function () { return { ok: false, status: 0, data: null }; })
+      .then(function (res) {
+        host.textContent = '';
+        if (!res.ok || !res.data) {
+          host.appendChild(el('p', { 'class': 'v2card-sub', text: 'Could not read the work graph (HTTP ' + String(res.status) + ').' }));
+          return;
+        }
+        var d = res.data;
+        var plans = (d && d.plans) || [];
+        var planes = (d && d.planes) || [];
+        var services = (d && d.services) || [];
+
+        if (!plans.length) {
+          host.appendChild(el('p', {
+            'class': 'v2card-sub',
+            text: 'No open ExecPlans are projected. This daemon has no ExecPlan root configured (CRUX_EXECPLANS_ROOT), or every plan is closed.'
+          }));
+          return;
+        }
+
+        // Summary strip — the same counts the canvas will carry above it.
+        var blurbs = 0;
+        for (var i = 0; i < plans.length; i++) { if (plans[i].blurb) { blurbs++; } }
+        var stats = [
+          { n: plans.length, l: 'open plans' },
+          { n: planes.length, l: 'systems' },
+          { n: (d.link_count || 0), l: 'declared edges' },
+          { n: services.length, l: 'services touched' },
+          { n: blurbs, l: 'with a blurb' }
+        ];
+        var strip = el('div', { 'class': 'v2card' });
+        var row = el('div', { 'class': 'ow-stat-row' });
+        stats.forEach(function (s) {
+          row.appendChild(el('div', { 'class': 'ow-stat' }, [
+            el('b', { text: String(s.n) }),
+            el('span', { text: s.l })
+          ]));
+        });
+        strip.appendChild(row);
+        host.appendChild(strip);
+
+        // Per-system breakdown, largest first (the endpoint already sorts).
+        var sec = el('div', { 'class': 'v2card' });
+        sec.appendChild(el('h3', { text: 'By system' }));
+        var list = el('div', { 'class': 'ow-fleet' });
+        planes.forEach(function (p) {
+          list.appendChild(el('div', { 'class': 'ow-fleet-row' }, [
+            el('span', { text: p.key }),
+            el('span', { 'class': 'v2card-sub', text: String(p.n) + (p.n === 1 ? ' plan' : ' plans') })
+          ]));
+        });
+        sec.appendChild(list);
+        host.appendChild(sec);
+
+        var svc = el('div', { 'class': 'v2card' });
+        svc.appendChild(el('h3', { text: 'Services touched' }));
+        var slist = el('div', { 'class': 'ow-fleet' });
+        services.forEach(function (s) {
+          slist.appendChild(el('div', { 'class': 'ow-fleet-row' }, [
+            el('span', { text: s.key }),
+            el('span', { 'class': 'v2card-sub', text: String(s.n) + ' · ' + s.side + ' rail' })
+          ]));
+        });
+        svc.appendChild(slist);
+        host.appendChild(svc);
+      });
+  }
+
   function renderSiteMap(host) {
     host.textContent = '';
     var isOp = (typeof window !== 'undefined' && window.CRUX_POSTURE === 'operator');
@@ -15846,6 +15946,8 @@
     // capabilityAvailable gates the DEST on the daemon's runtime capability plan.
     renderLinkGraph: renderLinkGraph,
     capabilityAvailable: capabilityAvailable,
+    // Patchbay — the open board in space (GET /v1/work/graph).
+    renderPatchbay: renderPatchbay,
     // Site map — static reference destination (rail → destinations map).
     renderSiteMap: renderSiteMap,
     // M2 (console-surfaces-remediation) — the paged, searchable facts browser.

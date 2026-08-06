@@ -1671,6 +1671,133 @@ function extractThemeVars(theme) {
 //  module (zero new vendored files, T.5). Reduced-motion: render-on-demand only.
 // =========================================================================
 (function checkLinkGraphDestination() {
+  // ---- Patchbay (console-execplan-patchbay M3) --------------------------
+  // A registry-driven destination is silently absent if any one of its four
+  // wiring points is missed, and the rest of the smoke passes regardless — so
+  // assert all four, plus the two invariants the operator asked for: that it
+  // sits directly under Rings, and that adding it moved nobody's shortcut.
+  const destList = pages.DESTS || [];
+  const pb = destList.filter(function (d) { return d.id === 'patchbay'; })[0];
+  check(!!pb, '[patchbay] pages.DESTS must register the patchbay destination');
+  if (pb) {
+    check(pb.icon === 'patchbay', '[patchbay] the patchbay destination must use the patchbay icon');
+    check(pb.key === '6', '[patchbay] the patchbay destination must claim shortcut 6 (the free slot — taking a used one would renumber an existing destination)');
+    check(!pb.capability, '[patchbay] the patchbay destination must NOT be capability-gated: the route is always mounted and self-degrades to an empty graph');
+    check(!pb.railHidden, '[patchbay] the patchbay destination must be visible in the Command rail');
+  }
+  // Rail order is array position: patchbay sits immediately after rings.
+  const idxRings = destList.findIndex(function (d) { return d.id === 'rings'; });
+  const idxPb = destList.findIndex(function (d) { return d.id === 'patchbay'; });
+  check(idxRings === 0, '[patchbay] rings must remain the first destination (the console index)');
+  check(idxPb === idxRings + 1, '[patchbay] patchbay must sit directly under rings in the rail');
+  // No incumbent shortcut moved.
+  const EXPECTED_KEYS = { rings: '1', work: '2', memory: '3', trust: '4', meters: '5', sitemap: '7' };
+  Object.keys(EXPECTED_KEYS).forEach(function (id) {
+    const d = destList.filter(function (x) { return x.id === id; })[0];
+    check(!!d && d.key === EXPECTED_KEYS[id],
+      '[patchbay] adding patchbay must not renumber the ' + id + ' shortcut (expected ' + EXPECTED_KEYS[id] + ')');
+  });
+  // No two destinations may claim the same shortcut.
+  const seenKeys = {};
+  destList.forEach(function (d) {
+    if (!d.key) { return; }
+    check(!seenKeys[d.key], '[patchbay] duplicate keyboard shortcut ' + d.key + ' claimed by ' + d.id);
+    seenKeys[d.key] = d.id;
+  });
+  // Shell + render wiring.
+  check(/patchbay:\s*'<svg/.test(shellHtml), '[patchbay] shell.html must define the "patchbay" icon glyph');
+  check(/destId === 'patchbay'/.test(shellHtml) && /renderPatchbay/.test(shellHtml),
+    '[patchbay] shell.html must route the patchbay destination to render.renderPatchbay');
+  check(typeof render.renderPatchbay === 'function', '[patchbay] render.js must export renderPatchbay');
+  // The page reads ONLY through the generated client — no raw fetch in render.js.
+  check(renderSrc.indexOf('api.workGraph') >= 0,
+    '[patchbay] renderPatchbay must read through the generated CruxApi.workGraph client method');
+  {
+    const apiSrcPb = fs.readFileSync(path.join(DIR, 'api.js'), 'utf8');
+    check(apiSrcPb.indexOf("'/v1/work/graph': true") >= 0,
+      '[patchbay] api.js LITERAL_GET_PATHS must allowlist /v1/work/graph (regenerate from the ROUTES manifest)');
+    check(/workGraph\(query\)/.test(apiSrcPb),
+      '[patchbay] api.js must expose the generated workGraph client method');
+  }
+
+  // Mock-DOM paint: registration alone proves nothing about what the route
+  // draws. Drive the renderer over a fixture and over each failure shape, and
+  // assert the three states stay DISTINCT — an aggregator that is switched off
+  // must not read as "the board is empty", and a failed read must not read as
+  // either. This is the console's own verification idiom (model + mock paint).
+  if (typeof render.renderPatchbay === 'function') {
+    function pbRes(ok, status, data) {
+      return Promise.resolve({ ok: ok, status: status, json: function () { return Promise.resolve(data); } });
+    }
+    const pbFixture = {
+      plans: [
+        { id: 'execplan:a-2026-01-01', slug: 'a-2026-01-01', title: 'Alpha', state: 'in_progress',
+          plane: 'Crux daemon', services: ['Postgres'], links: ['b-2026-01-01'],
+          blurb: 'Does a thing.', milestones_done: 1, milestones_total: 4, updated_at_unix_ms: 1 },
+        { id: 'execplan:b-2026-01-01', slug: 'b-2026-01-01', title: 'Bravo', state: 'blocked',
+          plane: 'Commerce', services: [], links: [], milestones_done: 0, milestones_total: 2,
+          updated_at_unix_ms: 2 }
+      ],
+      planes: [{ key: 'Crux daemon', n: 1 }, { key: 'Commerce', n: 1 }],
+      services: [{ key: 'Postgres', side: 'bottom', n: 1 }],
+      link_count: 1,
+      generated_at_unix_ms: 3
+    };
+    const pbMock = newMockDom();
+    const mkNode = pbMock.mkNode, mockDoc = pbMock.doc, collectNodes = pbMock.collect;
+    const pbSavedDoc = global.document, pbSavedWin = global.window;
+    const textOf = function (host) {
+      return collectNodes(host, [host]).map(function (n) { return n.textContent || ''; }).join(' | ');
+    };
+    global.document = mockDoc;
+
+    // 1. healthy read paints the counts and every system
+    global.window = { CruxApi: { workGraph: function () { return pbRes(true, 200, pbFixture); } } };
+    const pbHost = mkNode('div');
+    asyncChecks.push(Promise.resolve(render.renderPatchbay(pbHost, {})).then(function () {
+      const t = textOf(pbHost);
+      check(t.indexOf('open plans') >= 0, '[patchbay] renderPatchbay must paint the summary strip');
+      check(t.indexOf('Crux daemon') >= 0 && t.indexOf('Commerce') >= 0,
+        '[patchbay] renderPatchbay must paint every system returned by the projection');
+      check(t.indexOf('declared edges') >= 0,
+        '[patchbay] renderPatchbay must surface the declared-edge count');
+      check(t.indexOf('Postgres') >= 0 && t.indexOf('bottom rail') >= 0,
+        '[patchbay] renderPatchbay must paint touched services with the rail the endpoint assigned');
+      check(t.indexOf('Reading the board') < 0,
+        '[patchbay] the loading line must be cleared once the read resolves');
+    }).catch(function (e) {
+      check(false, '[patchbay] renderPatchbay drive threw: ' + (e && e.stack || e));
+    }));
+
+    // 2. aggregator off (200 + zero plans) is a CONFIGURATION statement
+    const pbEmptyHost = mkNode('div');
+    global.window = { CruxApi: { workGraph: function () { return pbRes(true, 200, { plans: [], planes: [], services: [], link_count: 0 }); } } };
+    asyncChecks.push(Promise.resolve(render.renderPatchbay(pbEmptyHost, {})).then(function () {
+      const t = textOf(pbEmptyHost);
+      check(/CRUX_EXECPLANS_ROOT/.test(t),
+        '[patchbay] an empty graph must name the missing ExecPlan root, not read as a healthy empty board');
+      check(t.indexOf('open plans') < 0,
+        '[patchbay] an empty graph must not paint a summary strip of zeroes');
+    }).catch(function (e) {
+      check(false, '[patchbay] renderPatchbay empty-state drive threw: ' + (e && e.stack || e));
+    }));
+
+    // 3. failed read states the status verbatim and never fabricates a board
+    const pbFailHost = mkNode('div');
+    global.window = { CruxApi: { workGraph: function () { return pbRes(false, 503, null); } } };
+    asyncChecks.push(Promise.resolve(render.renderPatchbay(pbFailHost, {})).then(function () {
+      const t = textOf(pbFailHost);
+      check(/503/.test(t), '[patchbay] a failed read must state the HTTP status verbatim');
+      check(t.indexOf('open plans') < 0 && !/CRUX_EXECPLANS_ROOT/.test(t),
+        '[patchbay] a failed read must be distinct from both a healthy board and a switched-off aggregator');
+    }).catch(function (e) {
+      check(false, '[patchbay] renderPatchbay failure drive threw: ' + (e && e.stack || e));
+    }).then(function () {
+      if (pbSavedDoc === undefined) { delete global.document; } else { global.document = pbSavedDoc; }
+      if (pbSavedWin === undefined) { delete global.window; } else { global.window = pbSavedWin; }
+    }));
+  }
+
   const lg = (pages.DESTS || []).filter(function (d) { return d.id === 'linkgraph'; })[0];
   check(!!lg, '[linkgraph] pages.DESTS must register the linkgraph destination');
   if (lg) {
