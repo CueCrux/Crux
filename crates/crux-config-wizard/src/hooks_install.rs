@@ -264,6 +264,14 @@ const CRUX_HOOK_MARKERS: &[&str] = &[
     "crux-filemod.sh",
     "crux-observe.sh",
     "crux-scratchpad-persist",
+    // `crux-coord` must be here even though it was installed before this entry
+    // existed. Until the Bash guard, every group carrying `crux-coord` also
+    // carried another marker (`filemod pre` on PreToolUse, the banner on
+    // SessionStart), so the omission was invisible. The Bash group carries
+    // `crux-coord check` alone: without this marker the merge reads it as a
+    // foreign operator hook, preserves it, re-adds ours, and the group doubles
+    // on every install. Caught by `merge_is_idempotent_and_preserves_other_keys`.
+    "crux-coord",
 ];
 
 /// True if `group` (a `{matcher, hooks:[…]}` entry) is Crux-managed.
@@ -348,6 +356,12 @@ fn event_matched(matcher: &str, hooks: Vec<serde_json::Value>) -> serde_json::Va
 /// own `case "$TOOL"` allowlist).
 const FILEMOD_MATCHER: &str = "Edit|Write|MultiEdit|NotebookEdit";
 
+/// Matcher for the coord destructive-command guard. Bash is the only tool that
+/// can wipe a tree the coordination plane is tracking; the hook then self-filters
+/// to `git clean` / `reset --hard` / `checkout -f` / `stash` / `worktree remove`,
+/// so a normal `cargo test` costs one process that exits immediately.
+const BASH_MATCHER: &str = "Bash";
+
 /// Build the `hooks` block. Observe runs on all five lifecycle events. The
 /// SessionStart banner prefers the Python banner stack (`crux-claude-banner`,
 /// gated on `python3`); absent python3, it falls back to the legacy wrapper
@@ -390,7 +404,25 @@ fn build_hooks_block(wrapper: &Path, local_bin: &Path, have_binary: bool, have_p
     if have_python {
         pre_tool.push(coord(local_bin, "check"));
     }
-    map.insert("PreToolUse".to_string(), event_matched(FILEMOD_MATCHER, pre_tool));
+    let mut pre_tool_groups = event_matched(FILEMOD_MATCHER, pre_tool);
+    // …and a second group on Bash, for the destructive half. Announcing intent
+    // only covers edits: a peer saying "I am working in this tree" says nothing
+    // about the session about to `git clean` it. On 2026-08-06 one session
+    // cleaned a shared checkout and destroyed another's uncommitted artefact,
+    // both live, neither warned, because coord only ever saw Edit/Write. The
+    // hook self-filters to tree-destroying git verbs, so the overwhelming
+    // majority of Bash calls cost one no-op process.
+    if have_python {
+        if let Some(arr) = pre_tool_groups.as_array_mut() {
+            if let Some(group) = event_matched(BASH_MATCHER, vec![coord(local_bin, "check")])
+                .as_array_mut()
+                .and_then(|g| g.first().cloned())
+            {
+                arr.push(group);
+            }
+        }
+    }
+    map.insert("PreToolUse".to_string(), pre_tool_groups);
     // PostToolUse: the existing observe (`.*`) group, plus the opt-in filemod
     // post leg scoped to the edit tools (hash + line-delta → daemon).
     let mut post_tool_groups = event(post_tool);
@@ -855,6 +887,70 @@ mod tests {
     }
 
     #[test]
+    /// The destructive-command guard: a second PreToolUse group on Bash running
+    /// `coord check`. Without it the coordination plane sees edits only, which
+    /// is how a `git clean` destroyed a live peer's work on 2026-08-06.
+    #[test]
+    fn hooks_block_wires_coord_check_on_bash_when_python_present() {
+        let w = Path::new("/x/crux-hook-env.sh");
+        let h = build_hooks_block(w, Path::new(LB), true, true);
+        let pre = h.as_object().and_then(|m| m.get("PreToolUse")).expect("PreToolUse");
+        let groups = pre.as_array().expect("PreToolUse is an array");
+        assert!(
+            groups
+                .iter()
+                .any(|g| g["matcher"] == BASH_MATCHER && g["hooks"].to_string().contains("coord")),
+            "PreToolUse must wire `coord check` on {BASH_MATCHER}: {pre}"
+        );
+        // The edit-scoped group must survive alongside it, not be replaced.
+        assert!(
+            groups
+                .iter()
+                .any(|g| g["matcher"] == FILEMOD_MATCHER && g["hooks"].to_string().contains("filemod pre")),
+            "the Bash group must be additive to the edit group: {pre}"
+        );
+        // No Python ⇒ no coord leg at all; the Bash group would be a process
+        // spawned on every command for a script that cannot run.
+        let no_py = build_hooks_block(w, Path::new(LB), true, false);
+        let no_py_pre = no_py.as_object().and_then(|m| m.get("PreToolUse")).expect("PreToolUse");
+        assert!(
+            !no_py_pre
+                .as_array()
+                .expect("array")
+                .iter()
+                .any(|g| g["matcher"] == BASH_MATCHER),
+            "without python3 there must be no Bash group: {no_py_pre}"
+        );
+    }
+
+    /// Gate the hook's own offline assertions in CI. The matcher decides whether
+    /// a command is tree-destroying; a false negative is a silently-missed
+    /// warning, which is the exact failure the guard exists to close. Skipped
+    /// (not failed) where python3 is absent — the banner stack is already inert
+    /// there and `hooks_install` handles that case explicitly.
+    #[test]
+    fn coord_hook_selftest_passes() {
+        if !python3_present() {
+            eprintln!("python3 absent — skipping coord selftest");
+            return;
+        }
+        let dir = tests::tmp();
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let script = dir.join("crux-coord.py");
+        std::fs::write(&script, COORD_PY).expect("write hook");
+        let out = std::process::Command::new("python3")
+            .arg(&script)
+            .arg("selftest")
+            .output()
+            .expect("run python3");
+        assert!(
+            out.status.success(),
+            "coord selftest failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     fn hooks_block_wires_opt_in_filemod_pre_and_post() {
         let w = Path::new("/x/crux-hook-env.sh");
         // Wiring is present regardless of the crux-hook binary (filemod is
