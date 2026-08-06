@@ -91,29 +91,31 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: [self-hosted, ci, Linux]
-    env:
-      # Per-job CARGO_HOME isolates the cargo package-cache file lock so the
-      # four concurrent jobs on this self-hosted runner don't serialise
-      # through one mutex. See run 26575505389 (40m Coverage block, 1h28m
-      # Test job stuck, runner cancelled). github.job + github.run_id give
-      # a unique cache dir per job per run; the seed step below symlinks
-      # the toolchain binaries from the shared CARGO_HOME so cargo/rustc
-      # discovery keeps working without copying gigabytes.
-      CARGO_HOME: ${{ runner.temp }}/cargo-${{ github.job }}-${{ github.run_id }}
+    # Per-job CARGO_HOME isolates the cargo package-cache file lock so the
+    # four concurrent jobs on this self-hosted runner don't serialise
+    # through one mutex. See run 26575505389 (40m Coverage block, 1h28m
+    # Test job stuck, runner cancelled). github.job + github.run_id give
+    # a unique cache dir per job per run; the seed step below symlinks
+    # the toolchain binaries from the shared CARGO_HOME so cargo/rustc
+    # discovery keeps working without copying gigabytes.
     steps:
       - name: Resolve CARGO_HOME (shared toolchain when the runner has one)
         run: |
-          # CARGO_HOME lives under RUNNER_TEMP so it is writable on EVERY runner
-          # pool, not just the one whose host happens to have /home/gha-runner.
-          # Hardcoding that path is what made 17 jobs a scheduling coin flip:
-          # they passed on hel1 and died in 13s on vukgpu02 with
-          # "mkdir: cannot create directory '/home/gha-runner': Permission denied".
+          # $RUNNER_TEMP is writable on EVERY runner pool, unlike the
+          # /home/gha-runner path this used to hardcode — which is what made
+          # these jobs a scheduling coin flip (pass on hel1, die in 13s on
+          # vukgpu02 with "mkdir: cannot create directory ... Permission denied").
           #
-          # The symlink loop is the FAST PATH, not a requirement. Where a shared
-          # toolchain exists it is linked in so rustup/cargo are already present
-          # and the toolchain action becomes a no-op; where it does not, the glob
-          # stays literal, `-e` fails, and the action installs into this writable
-          # home instead. Same workflow, both pools.
+          # Set HERE and not in the job-level `env:` because the `runner` context
+          # is not available there; only `github`/`needs`/`matrix` etc. are.
+          # Using it at job level makes the whole workflow file invalid.
+          #
+          # The symlink loop is the FAST PATH, not a requirement: where a shared
+          # toolchain exists it is linked in and the toolchain action becomes a
+          # no-op; where it does not, the glob stays literal, `-e` fails, and the
+          # action installs into this writable home. Same workflow, both pools.
+          CARGO_HOME="${RUNNER_TEMP}/cargo-${{ github.job }}-${{ github.run_id }}"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
           mkdir -p "$CARGO_HOME/bin"
           for tool in "${CRUX_SHARED_CARGO_HOME:-/home/gha-runner/.cargo}"/bin/*; do
             [ -e "$tool" ] || continue
@@ -161,23 +163,25 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: [self-hosted, ci, Linux]
-    env:
-      # See `lint` job above for the per-job CARGO_HOME rationale.
-      CARGO_HOME: ${{ runner.temp }}/cargo-${{ github.job }}-${{ github.run_id }}
+    # See `lint` job above for the per-job CARGO_HOME rationale.
     steps:
       - name: Resolve CARGO_HOME (shared toolchain when the runner has one)
         run: |
-          # CARGO_HOME lives under RUNNER_TEMP so it is writable on EVERY runner
-          # pool, not just the one whose host happens to have /home/gha-runner.
-          # Hardcoding that path is what made 17 jobs a scheduling coin flip:
-          # they passed on hel1 and died in 13s on vukgpu02 with
-          # "mkdir: cannot create directory '/home/gha-runner': Permission denied".
+          # $RUNNER_TEMP is writable on EVERY runner pool, unlike the
+          # /home/gha-runner path this used to hardcode — which is what made
+          # these jobs a scheduling coin flip (pass on hel1, die in 13s on
+          # vukgpu02 with "mkdir: cannot create directory ... Permission denied").
           #
-          # The symlink loop is the FAST PATH, not a requirement. Where a shared
-          # toolchain exists it is linked in so rustup/cargo are already present
-          # and the toolchain action becomes a no-op; where it does not, the glob
-          # stays literal, `-e` fails, and the action installs into this writable
-          # home instead. Same workflow, both pools.
+          # Set HERE and not in the job-level `env:` because the `runner` context
+          # is not available there; only `github`/`needs`/`matrix` etc. are.
+          # Using it at job level makes the whole workflow file invalid.
+          #
+          # The symlink loop is the FAST PATH, not a requirement: where a shared
+          # toolchain exists it is linked in and the toolchain action becomes a
+          # no-op; where it does not, the glob stays literal, `-e` fails, and the
+          # action installs into this writable home. Same workflow, both pools.
+          CARGO_HOME="${RUNNER_TEMP}/cargo-${{ github.job }}-${{ github.run_id }}"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
           mkdir -p "$CARGO_HOME/bin"
           for tool in "${CRUX_SHARED_CARGO_HOME:-/home/gha-runner/.cargo}"/bin/*; do
             [ -e "$tool" ] || continue
@@ -315,23 +319,25 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: [self-hosted, ci, Linux]
-    env:
-      # See `lint` job above for the per-job CARGO_HOME rationale.
-      CARGO_HOME: ${{ runner.temp }}/cargo-${{ github.job }}-${{ github.run_id }}
+    # See `lint` job above for the per-job CARGO_HOME rationale.
     steps:
       - name: Resolve CARGO_HOME (shared toolchain when the runner has one)
         run: |
-          # CARGO_HOME lives under RUNNER_TEMP so it is writable on EVERY runner
-          # pool, not just the one whose host happens to have /home/gha-runner.
-          # Hardcoding that path is what made 17 jobs a scheduling coin flip:
-          # they passed on hel1 and died in 13s on vukgpu02 with
-          # "mkdir: cannot create directory '/home/gha-runner': Permission denied".
+          # $RUNNER_TEMP is writable on EVERY runner pool, unlike the
+          # /home/gha-runner path this used to hardcode — which is what made
+          # these jobs a scheduling coin flip (pass on hel1, die in 13s on
+          # vukgpu02 with "mkdir: cannot create directory ... Permission denied").
           #
-          # The symlink loop is the FAST PATH, not a requirement. Where a shared
-          # toolchain exists it is linked in so rustup/cargo are already present
-          # and the toolchain action becomes a no-op; where it does not, the glob
-          # stays literal, `-e` fails, and the action installs into this writable
-          # home instead. Same workflow, both pools.
+          # Set HERE and not in the job-level `env:` because the `runner` context
+          # is not available there; only `github`/`needs`/`matrix` etc. are.
+          # Using it at job level makes the whole workflow file invalid.
+          #
+          # The symlink loop is the FAST PATH, not a requirement: where a shared
+          # toolchain exists it is linked in and the toolchain action becomes a
+          # no-op; where it does not, the glob stays literal, `-e` fails, and the
+          # action installs into this writable home. Same workflow, both pools.
+          CARGO_HOME="${RUNNER_TEMP}/cargo-${{ github.job }}-${{ github.run_id }}"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
           mkdir -p "$CARGO_HOME/bin"
           for tool in "${CRUX_SHARED_CARGO_HOME:-/home/gha-runner/.cargo}"/bin/*; do
             [ -e "$tool" ] || continue
@@ -352,23 +358,25 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: [self-hosted, ci, Linux]
-    env:
-      # See `lint` job above for the per-job CARGO_HOME rationale.
-      CARGO_HOME: ${{ runner.temp }}/cargo-${{ github.job }}-${{ github.run_id }}
+    # See `lint` job above for the per-job CARGO_HOME rationale.
     steps:
       - name: Resolve CARGO_HOME (shared toolchain when the runner has one)
         run: |
-          # CARGO_HOME lives under RUNNER_TEMP so it is writable on EVERY runner
-          # pool, not just the one whose host happens to have /home/gha-runner.
-          # Hardcoding that path is what made 17 jobs a scheduling coin flip:
-          # they passed on hel1 and died in 13s on vukgpu02 with
-          # "mkdir: cannot create directory '/home/gha-runner': Permission denied".
+          # $RUNNER_TEMP is writable on EVERY runner pool, unlike the
+          # /home/gha-runner path this used to hardcode — which is what made
+          # these jobs a scheduling coin flip (pass on hel1, die in 13s on
+          # vukgpu02 with "mkdir: cannot create directory ... Permission denied").
           #
-          # The symlink loop is the FAST PATH, not a requirement. Where a shared
-          # toolchain exists it is linked in so rustup/cargo are already present
-          # and the toolchain action becomes a no-op; where it does not, the glob
-          # stays literal, `-e` fails, and the action installs into this writable
-          # home instead. Same workflow, both pools.
+          # Set HERE and not in the job-level `env:` because the `runner` context
+          # is not available there; only `github`/`needs`/`matrix` etc. are.
+          # Using it at job level makes the whole workflow file invalid.
+          #
+          # The symlink loop is the FAST PATH, not a requirement: where a shared
+          # toolchain exists it is linked in and the toolchain action becomes a
+          # no-op; where it does not, the glob stays literal, `-e` fails, and the
+          # action installs into this writable home. Same workflow, both pools.
+          CARGO_HOME="${RUNNER_TEMP}/cargo-${{ github.job }}-${{ github.run_id }}"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
           mkdir -p "$CARGO_HOME/bin"
           for tool in "${CRUX_SHARED_CARGO_HOME:-/home/gha-runner/.cargo}"/bin/*; do
             [ -e "$tool" ] || continue
@@ -401,7 +409,6 @@ jobs:
     runs-on: [self-hosted, ci, Linux]
     env:
       # See `lint` job above for the per-job CARGO_HOME rationale.
-      CARGO_HOME: ${{ runner.temp }}/cargo-${{ github.job }}-${{ github.run_id }}
       # Coverage scope. The exclusion list is deliberately narrow — only code
       # that is not meaningfully unit-testable:
       #   * binary entry points: `main.rs` (#[tokio::main] bootstrap / clap
@@ -427,17 +434,21 @@ jobs:
     steps:
       - name: Resolve CARGO_HOME (shared toolchain when the runner has one)
         run: |
-          # CARGO_HOME lives under RUNNER_TEMP so it is writable on EVERY runner
-          # pool, not just the one whose host happens to have /home/gha-runner.
-          # Hardcoding that path is what made 17 jobs a scheduling coin flip:
-          # they passed on hel1 and died in 13s on vukgpu02 with
-          # "mkdir: cannot create directory '/home/gha-runner': Permission denied".
+          # $RUNNER_TEMP is writable on EVERY runner pool, unlike the
+          # /home/gha-runner path this used to hardcode — which is what made
+          # these jobs a scheduling coin flip (pass on hel1, die in 13s on
+          # vukgpu02 with "mkdir: cannot create directory ... Permission denied").
           #
-          # The symlink loop is the FAST PATH, not a requirement. Where a shared
-          # toolchain exists it is linked in so rustup/cargo are already present
-          # and the toolchain action becomes a no-op; where it does not, the glob
-          # stays literal, `-e` fails, and the action installs into this writable
-          # home instead. Same workflow, both pools.
+          # Set HERE and not in the job-level `env:` because the `runner` context
+          # is not available there; only `github`/`needs`/`matrix` etc. are.
+          # Using it at job level makes the whole workflow file invalid.
+          #
+          # The symlink loop is the FAST PATH, not a requirement: where a shared
+          # toolchain exists it is linked in and the toolchain action becomes a
+          # no-op; where it does not, the glob stays literal, `-e` fails, and the
+          # action installs into this writable home. Same workflow, both pools.
+          CARGO_HOME="${RUNNER_TEMP}/cargo-${{ github.job }}-${{ github.run_id }}"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
           mkdir -p "$CARGO_HOME/bin"
           for tool in "${CRUX_SHARED_CARGO_HOME:-/home/gha-runner/.cargo}"/bin/*; do
             [ -e "$tool" ] || continue

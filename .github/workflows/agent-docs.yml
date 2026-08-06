@@ -30,17 +30,25 @@ jobs:
   check:
     name: Verify agent-doc references resolve
     runs-on: [self-hosted, ci, Linux]
-    env:
-      CARGO_HOME: ${{ runner.temp }}/cargo-${{ github.job }}-${{ github.run_id }}
     steps:
       - uses: actions/checkout@v7
       - name: Resolve CARGO_HOME (shared toolchain when the runner has one)
         run: |
-          # `check-agent-docs.sh --exec` runs `cargo fmt --check`, so this job
-          # needs a toolchain even though it builds nothing. It previously got
-          # one only by accident: the hel1 runners have cargo on PATH via a
-          # shared home. On a runner without one it failed as
-          # "MISS exec cargo fmt --check" — a Rust dependency with no Rust setup.
+          # $RUNNER_TEMP is writable on EVERY runner pool, unlike the
+          # /home/gha-runner path this used to hardcode — which is what made
+          # these jobs a scheduling coin flip (pass on hel1, die in 13s on
+          # vukgpu02 with "mkdir: cannot create directory ... Permission denied").
+          #
+          # Set HERE and not in the job-level `env:` because the `runner` context
+          # is not available there; only `github`/`needs`/`matrix` etc. are.
+          # Using it at job level makes the whole workflow file invalid.
+          #
+          # The symlink loop is the FAST PATH, not a requirement: where a shared
+          # toolchain exists it is linked in and the toolchain action becomes a
+          # no-op; where it does not, the glob stays literal, `-e` fails, and the
+          # action installs into this writable home. Same workflow, both pools.
+          CARGO_HOME="${RUNNER_TEMP}/cargo-${{ github.job }}-${{ github.run_id }}"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
           mkdir -p "$CARGO_HOME/bin"
           for tool in "${CRUX_SHARED_CARGO_HOME:-/home/gha-runner/.cargo}"/bin/*; do
             [ -e "$tool" ] || continue

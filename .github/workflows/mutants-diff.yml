@@ -38,22 +38,25 @@ jobs:
     runs-on: [self-hosted, ci, Linux]
     timeout-minutes: 60
     env:
-      CARGO_HOME: ${{ runner.temp }}/cargo-mutants-diff-${{ github.run_id }}
       CARGO_BUILD_JOBS: "4"
     steps:
       - name: Resolve CARGO_HOME (shared toolchain when the runner has one)
         run: |
-          # CARGO_HOME lives under RUNNER_TEMP so it is writable on EVERY runner
-          # pool, not just the one whose host happens to have /home/gha-runner.
-          # Hardcoding that path is what made 17 jobs a scheduling coin flip:
-          # they passed on hel1 and died in 13s on vukgpu02 with
-          # "mkdir: cannot create directory '/home/gha-runner': Permission denied".
+          # $RUNNER_TEMP is writable on EVERY runner pool, unlike the
+          # /home/gha-runner path this used to hardcode — which is what made
+          # these jobs a scheduling coin flip (pass on hel1, die in 13s on
+          # vukgpu02 with "mkdir: cannot create directory ... Permission denied").
           #
-          # The symlink loop is the FAST PATH, not a requirement. Where a shared
-          # toolchain exists it is linked in so rustup/cargo are already present
-          # and the toolchain action becomes a no-op; where it does not, the glob
-          # stays literal, `-e` fails, and the action installs into this writable
-          # home instead. Same workflow, both pools.
+          # Set HERE and not in the job-level `env:` because the `runner` context
+          # is not available there; only `github`/`needs`/`matrix` etc. are.
+          # Using it at job level makes the whole workflow file invalid.
+          #
+          # The symlink loop is the FAST PATH, not a requirement: where a shared
+          # toolchain exists it is linked in and the toolchain action becomes a
+          # no-op; where it does not, the glob stays literal, `-e` fails, and the
+          # action installs into this writable home. Same workflow, both pools.
+          CARGO_HOME="${RUNNER_TEMP}/cargo-mutants-diff-${{ github.run_id }}"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
           mkdir -p "$CARGO_HOME/bin"
           for tool in "${CRUX_SHARED_CARGO_HOME:-/home/gha-runner/.cargo}"/bin/*; do
             [ -e "$tool" ] || continue
