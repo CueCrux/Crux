@@ -45,6 +45,13 @@ pub(super) struct AnnounceBody {
     /// `deploy_target` warning. Advisory only.
     #[serde(default)]
     pub deploy_target: Option<String>,
+    /// Absolute path of the git worktree this session is working in. Optional.
+    /// Recorded so a worktree can be tied to the plan that created it — a
+    /// worktree whose plan has closed is an orphan, and without this the only
+    /// way to find one is to walk every repo and test each branch against
+    /// `origin/main`.
+    #[serde(default)]
+    pub worktree: Option<String>,
     #[serde(default)]
     pub paths: Vec<String>,
     #[serde(default)]
@@ -213,6 +220,7 @@ pub(super) async fn post_coord_announce(
         execplan_slug: body.execplan_slug.filter(|s| !s.trim().is_empty()),
         milestone: body.milestone.filter(|s| !s.trim().is_empty()),
         deploy_target: body.deploy_target.filter(|s| !s.trim().is_empty()),
+        worktree: body.worktree.filter(|s| !s.trim().is_empty()),
         paths: body.paths,
         note: body.note.filter(|s| !s.trim().is_empty()),
         announced_at_unix_ms: now,
@@ -286,6 +294,7 @@ mod tests {
             execplan_slug: Some("plan-x".to_string()),
             milestone: Some("M2".to_string()),
             deploy_target: None,
+            worktree: None,
             paths: vec!["crates/corecruxd/src/coord.rs".to_string()],
             note: None,
             ttl_seconds: None,
@@ -336,6 +345,81 @@ mod tests {
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A worktree announced on the intent must survive the fact round-trip and
+    /// reappear on `/v1/coord/active` — that read is the only way another
+    /// session (or the reaper) can learn which checkout belongs to which plan.
+    #[tokio::test]
+    async fn announce_carries_worktree_through_to_active() {
+        let state = test_app_state(1);
+        seed_live_session(&state, "aaaa", "proj").await;
+
+        let mut body = announce_body("aaaa", "proj");
+        body.worktree = Some("/w/Crux-worktrees/coord-board-honesty".to_string());
+        let resp = post_coord_announce(StateExtract(state.clone()), HeaderMap::new(), JsonExtract(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let announced = body_json(resp).await;
+        assert_eq!(
+            announced["intent"]["worktree"], "/w/Crux-worktrees/coord-board-honesty",
+            "announce response must echo the worktree"
+        );
+
+        let active = get_coord_active(
+            StateExtract(state.clone()),
+            Query(ActiveQuery {
+                project_id: Some("proj".to_string()),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        let view = body_json(active).await;
+        assert_eq!(
+            view["active_sessions"][0]["intent"]["worktree"], "/w/Crux-worktrees/coord-board-honesty",
+            "worktree must survive the fact round-trip onto the active board: {view}"
+        );
+    }
+
+    /// Omitting it must leave the wire shape exactly as it was — the field is
+    /// `skip_serializing_if`, so an intent that declares no worktree carries no
+    /// `worktree` key at all, not a null.
+    #[tokio::test]
+    async fn announce_without_worktree_is_wire_identical() {
+        let state = test_app_state(1);
+        seed_live_session(&state, "aaaa", "proj").await;
+        let resp = post_coord_announce(
+            StateExtract(state.clone()),
+            HeaderMap::new(),
+            JsonExtract(announce_body("aaaa", "proj")),
+        )
+        .await
+        .into_response();
+        let announced = body_json(resp).await;
+        assert!(
+            announced["intent"].get("worktree").is_none(),
+            "an intent with no worktree must omit the key, not emit null: {announced}"
+        );
+    }
+
+    /// Whitespace is filtered to `None` like `deploy_target`, so a client that
+    /// sends `""` does not pin an empty string onto the board.
+    #[tokio::test]
+    async fn announce_blank_worktree_is_treated_as_absent() {
+        let state = test_app_state(1);
+        seed_live_session(&state, "aaaa", "proj").await;
+        let mut body = announce_body("aaaa", "proj");
+        body.worktree = Some("   ".to_string());
+        let resp = post_coord_announce(StateExtract(state.clone()), HeaderMap::new(), JsonExtract(body))
+            .await
+            .into_response();
+        let announced = body_json(resp).await;
+        assert!(
+            announced["intent"].get("worktree").is_none(),
+            "blank worktree must be dropped: {announced}"
+        );
     }
 
     #[tokio::test]
