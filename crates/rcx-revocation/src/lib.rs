@@ -224,6 +224,21 @@ const API_KEY_HEADER: &str = "x-api-key";
 /// Required by CruxEngine's auth middleware for per-tenant routes (`TenantHeader`).
 const TENANT_HEADER: &str = "x-tenant-id";
 
+/// The hosted token and the environment name different tenants.
+///
+/// Deliberately not a variant of a broader error: this is a configuration
+/// contradiction the operator must resolve, not a runtime failure to retry.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "tenant mismatch: the hosted RCX token is scoped to `{token_tenant}` but \
+     {TENANT_ID_ENV} is set to `{env_tenant}`. Unset the env var, or pair the \
+     daemon against the tenant it is configured for."
+)]
+pub struct TenantSourceConflict {
+    pub token_tenant: String,
+    pub env_tenant: String,
+}
+
 impl CrlCredential {
     #[must_use]
     pub fn new(api_key: impl Into<String>, tenant_id: impl Into<String>) -> Self {
@@ -241,6 +256,43 @@ impl CrlCredential {
         let api_key = trimmed_env(API_KEY_ENV)?;
         let tenant_id = trimmed_env(TENANT_ID_ENV)?;
         Some(Self::new(api_key, tenant_id))
+    }
+
+    /// Resolve, preferring the tenant carried by a hosted token.
+    ///
+    /// M5 of ExecPlan `auth-principal-separation-2026-08-05`. A hosted token
+    /// already carries `tenant_scope.tenant_id`, and the daemon already reads it
+    /// elsewhere, so requiring `CORECRUXD_ENGINE_TENANT_ID` as well is a second
+    /// source for one fact. Two sources that can disagree is not redundancy, it
+    /// is a bug waiting for a deployment to trigger it.
+    ///
+    /// **A disagreement is an error, never a silent winner.** Picking either
+    /// side quietly would mean a daemon fetching one tenant's revocation list
+    /// while believing it is another's — precisely the failure a CRL exists to
+    /// prevent. Refusing to start is the honest response, and the message names
+    /// both values so the fix is obvious.
+    ///
+    /// An unpaired daemon (no hosted token) keeps today's behaviour exactly.
+    pub fn resolve(token_tenant_id: Option<&str>) -> Result<Option<Self>, TenantSourceConflict> {
+        let env_tenant = trimmed_env(TENANT_ID_ENV);
+        let Some(token_tenant) = token_tenant_id.map(str::trim).filter(|t| !t.is_empty()) else {
+            // No hosted token: unchanged.
+            return Ok(Self::from_env());
+        };
+        if let Some(env_tenant) = env_tenant.as_deref() {
+            if env_tenant != token_tenant {
+                return Err(TenantSourceConflict {
+                    token_tenant: token_tenant.to_string(),
+                    env_tenant: env_tenant.to_string(),
+                });
+            }
+        }
+        // The env var is not read for the value even when it agrees — the token
+        // is the source of truth once one exists.
+        let Some(api_key) = trimmed_env(API_KEY_ENV) else {
+            return Ok(None);
+        };
+        Ok(Some(Self::new(api_key, token_tenant.to_string())))
     }
 
     /// The tenant this credential authenticates as. The API key is deliberately
@@ -885,5 +937,86 @@ mod tests {
 
         assert_eq!(after_first, 1);
         assert_eq!(after_second, 1, "a fresh cache must not trigger a fetch");
+    }
+}
+
+#[cfg(test)]
+mod m5_tenant_source_tests {
+    use super::*;
+
+    /// Env access is process-global, so these run under one lock rather than
+    /// racing each other through the same two variables.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env<T>(api: Option<&str>, tenant: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        match api {
+            Some(v) => std::env::set_var(API_KEY_ENV, v),
+            None => std::env::remove_var(API_KEY_ENV),
+        }
+        match tenant {
+            Some(v) => std::env::set_var(TENANT_ID_ENV, v),
+            None => std::env::remove_var(TENANT_ID_ENV),
+        }
+        let out = f();
+        std::env::remove_var(API_KEY_ENV);
+        std::env::remove_var(TENANT_ID_ENV);
+        out
+    }
+
+    #[test]
+    fn an_unpaired_daemon_keeps_todays_behaviour() {
+        with_env(Some("k"), Some("tenant-env"), || {
+            let resolved = CrlCredential::resolve(None).expect("no token, no conflict");
+            assert_eq!(resolved.as_ref().map(CrlCredential::tenant_id), Some("tenant-env"));
+        });
+    }
+
+    #[test]
+    fn a_hosted_token_supplies_the_tenant_and_the_env_var_is_not_needed() {
+        with_env(Some("k"), None, || {
+            let resolved = CrlCredential::resolve(Some("tenant-token")).expect("no conflict");
+            assert_eq!(resolved.as_ref().map(CrlCredential::tenant_id), Some("tenant-token"));
+        });
+    }
+
+    #[test]
+    fn agreement_is_not_a_conflict_and_the_token_still_wins() {
+        with_env(Some("k"), Some("tenant-same"), || {
+            let resolved = CrlCredential::resolve(Some("tenant-same")).expect("agreement");
+            assert_eq!(resolved.as_ref().map(CrlCredential::tenant_id), Some("tenant-same"));
+        });
+    }
+
+    #[test]
+    fn disagreement_is_an_error_not_a_silent_winner() {
+        // The whole point of M5. Quietly picking either side means fetching one
+        // tenant's revocation list while believing it is another's.
+        with_env(Some("k"), Some("tenant-env"), || {
+            let err = CrlCredential::resolve(Some("tenant-token")).expect_err("must refuse");
+            assert_eq!(err.token_tenant, "tenant-token");
+            assert_eq!(err.env_tenant, "tenant-env");
+            // The message names both, so the operator does not have to guess.
+            let rendered = err.to_string();
+            assert!(rendered.contains("tenant-token") && rendered.contains("tenant-env"));
+        });
+    }
+
+    #[test]
+    fn a_blank_token_tenant_is_treated_as_absent() {
+        with_env(Some("k"), Some("tenant-env"), || {
+            let resolved = CrlCredential::resolve(Some("   ")).expect("blank is absent");
+            assert_eq!(resolved.as_ref().map(CrlCredential::tenant_id), Some("tenant-env"));
+        });
+    }
+
+    #[test]
+    fn a_token_without_an_api_key_yields_no_credential() {
+        // Half a credential is still not a credential.
+        with_env(None, None, || {
+            assert!(CrlCredential::resolve(Some("tenant-token"))
+                .expect("no conflict")
+                .is_none());
+        });
     }
 }
