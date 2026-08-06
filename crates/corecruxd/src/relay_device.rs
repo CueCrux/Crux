@@ -217,22 +217,28 @@ pub fn attenuate_for_relay(
     Ok(attenuated)
 }
 
+/// Fixtures shared with `relay_client`'s tests.
+///
+/// Crate-visible rather than private to `mod tests` on purpose: the relay
+/// handshake is built from this exact token shape, so a copy in the other
+/// module would let the two drift and quietly stop testing the same thing.
 #[cfg(test)]
-mod tests {
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+pub(crate) mod test_support {
     use super::*;
     use rcx_capability_token::{
         Backend, DataEgressClass, DelegationAudience, DelegationPolicy, DelegationPresentation, PermittedCapability,
         RCX_CT_DELEGATION_SPEC_VERSION, RCX_RELAY_BACKEND_ID,
     };
 
-    fn issuer() -> SigningKey {
+    pub(crate) fn issuer() -> SigningKey {
         SigningKey::from_bytes(&[9u8; 32])
     }
 
     /// A hosted grant shaped the way CruxEngine mints one for a paid tenant:
     /// delegation-enabled, subject = this daemon's passport, the device named as
     /// an allowed delegate, and a relay backend carrying the session capability.
-    fn hosted(
+    pub(crate) fn hosted(
         passport: &LocalPassportKey,
         delegate_fprs: Vec<String>,
         with_relay_capability: bool,
@@ -281,12 +287,18 @@ mod tests {
             .expect("fixture must verify")
     }
 
-    fn passport() -> LocalPassportKey {
+    pub(crate) fn passport() -> LocalPassportKey {
         LocalPassportKey::from_seed([7u8; 32]).expect("seed must load")
     }
 
-    const NOW: u64 = 1_800_000_000;
-    const BASE_EXPIRY: u64 = 1_900_000_000;
+    pub(crate) const NOW: u64 = 1_800_000_000;
+    pub(crate) const BASE_EXPIRY: u64 = 1_900_000_000;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
 
     #[test]
     fn mints_an_envelope_naming_the_device_as_delegate() {

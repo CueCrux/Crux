@@ -58,6 +58,7 @@ mod grpc;
 mod hosted_token;
 mod http;
 mod local_ingest;
+mod relay_client;
 mod relay_device;
 // Candidate proposers are staged behind the identity-candidates rollout path; tests
 // exercise creation/proposal before daemon startup wires automatic proposer runs.
