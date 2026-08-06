@@ -43,7 +43,7 @@ pub struct IndexManager {
 
 struct LoadedSegment {
     reader: CcxiReader,
-    #[allow(dead_code)]
+    /// Source `.ccxi` path. Empty for segments loaded from bytes.
     path: PathBuf,
     tier: IndexTier,
     size_bytes: usize,
@@ -240,6 +240,119 @@ impl IndexManager {
             }
         }
     }
+}
+
+/// One segment's contribution to a tenant's on-disk corpus footprint.
+///
+/// Tenant membership is read from the `.ccxi` doc table (`tenant_hash_full`),
+/// so a footprint never touches segment frames.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SegmentFootprint {
+    pub segment_seq: u64,
+    pub docs_total: usize,
+    pub docs_tenant: usize,
+    /// Size of the whole segment file group — every file sharing the `.ccxi`
+    /// stem (`.ccxseg`, `.ccxi`, `.ccxv`, `.ccxp`). Zero for segments loaded
+    /// from bytes rather than from disk.
+    pub bytes: u64,
+    /// Every doc in the segment belongs to this tenant — the precondition for
+    /// reclaiming the file group wholesale.
+    pub whole_tenant: bool,
+}
+
+/// A tenant's retrieval-corpus footprint across all loaded segments.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct TenantFootprint {
+    pub segments: Vec<SegmentFootprint>,
+    pub docs: usize,
+    pub bytes: u64,
+    /// Segments the tenant shares with at least one other tenant. These cannot
+    /// be reclaimed by deleting the file group.
+    pub mixed_segments: usize,
+}
+
+impl IndexManager {
+    /// Read-only inventory of the segments holding `tenant_hash`'s documents.
+    ///
+    /// Segments with no docs for the tenant are omitted. `bytes` is the size of
+    /// the on-disk file group, so the reported total is what a reclaim would
+    /// actually free.
+    pub fn tenant_footprint(&self, tenant_hash: u64) -> TenantFootprint {
+        let mut out = TenantFootprint::default();
+        let mut hits: Vec<(u64, usize, usize, Option<PathBuf>)> = Vec::new();
+        for (&seq, seg) in &self.segments {
+            let docs_total = seg.reader.docs.len();
+            let docs_tenant = seg
+                .reader
+                .docs
+                .iter()
+                .filter(|d| d.tenant_hash_full == tenant_hash)
+                .count();
+            if docs_tenant == 0 {
+                continue;
+            }
+            let path = (!seg.path.as_os_str().is_empty()).then(|| seg.path.clone());
+            hits.push((seq, docs_total, docs_tenant, path));
+        }
+
+        let group_sizes = segment_group_sizes(hits.iter().filter_map(|(_, _, _, p)| p.as_deref()));
+        for (segment_seq, docs_total, docs_tenant, path) in hits {
+            let bytes = path.as_deref().and_then(|p| group_sizes.get(p).copied()).unwrap_or(0);
+            let whole_tenant = docs_tenant == docs_total;
+            if !whole_tenant {
+                out.mixed_segments += 1;
+            }
+            out.docs += docs_tenant;
+            out.bytes += bytes;
+            out.segments.push(SegmentFootprint {
+                segment_seq,
+                docs_total,
+                docs_tenant,
+                bytes,
+                whole_tenant,
+            });
+        }
+        out
+    }
+}
+
+/// Total bytes of each segment's file group, keyed by its `.ccxi` path.
+///
+/// One `read_dir` per distinct parent directory rather than per segment — a
+/// footprint over a 47-segment corpus is a single directory listing.
+fn segment_group_sizes<'a, I: Iterator<Item = &'a Path>>(paths: I) -> std::collections::HashMap<PathBuf, u64> {
+    let mut wanted: std::collections::HashMap<PathBuf, Vec<(PathBuf, String)>> = std::collections::HashMap::new();
+    for path in paths {
+        let (Some(dir), Some(stem)) = (path.parent(), path.file_stem().and_then(|s| s.to_str())) else {
+            continue;
+        };
+        wanted
+            .entry(dir.to_path_buf())
+            .or_default()
+            .push((path.to_path_buf(), stem.to_string()));
+    }
+
+    let mut out = std::collections::HashMap::new();
+    for (dir, members) in wanted {
+        let mut by_stem: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                // `.ccxv.partial` and friends stem to "seg-…-….ccxv"; take the
+                // leading segment stem so partials count against their group.
+                let stem = stem.split_once(".ccx").map_or(stem, |(head, _)| head);
+                let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                *by_stem.entry(stem.to_string()).or_default() += len;
+            }
+        }
+        for (path, stem) in members {
+            out.insert(path, by_stem.get(&stem).copied().unwrap_or(0));
+        }
+    }
+    out
 }
 
 impl Default for IndexManager {
@@ -552,6 +665,87 @@ mod tests {
         let dbg = format!("{:?}", mgr);
         assert!(dbg.contains("IndexManager"));
         assert!(dbg.contains("segments"));
+    }
+
+    // ── tenant_footprint ─────────────────────────────────────────────
+
+    fn build_ccxi_for(segment_seq: u64, tenants: &[u64]) -> Vec<u8> {
+        let mut builder = CcxiBuilder::new(0, segment_seq, 100);
+        for (i, &th) in tenants.iter().enumerate() {
+            builder.add_document(i as u32, "terraform drift detection", (i * 100) as u32, th);
+        }
+        builder.build()
+    }
+
+    #[test]
+    fn footprint_of_unknown_tenant_is_empty() {
+        let mut mgr = IndexManager::new();
+        mgr.load_ccxi_bytes(&build_ccxi_for(1, &[0xAAAA])).unwrap();
+        let fp = mgr.tenant_footprint(0xBBBB);
+        assert!(fp.segments.is_empty());
+        assert_eq!(fp.docs, 0);
+        assert_eq!(fp.bytes, 0);
+        assert_eq!(fp.mixed_segments, 0);
+    }
+
+    #[test]
+    fn footprint_counts_only_the_named_tenant() {
+        let mut mgr = IndexManager::new();
+        mgr.load_ccxi_bytes(&build_ccxi_for(1, &[0xAAAA, 0xAAAA])).unwrap();
+        mgr.load_ccxi_bytes(&build_ccxi_for(2, &[0xBBBB])).unwrap();
+
+        let fp = mgr.tenant_footprint(0xAAAA);
+        assert_eq!(fp.segments.len(), 1, "segment 2 holds no docs for this tenant");
+        assert_eq!(fp.segments[0].segment_seq, 1);
+        assert_eq!(fp.docs, 2);
+        assert!(fp.segments[0].whole_tenant);
+        assert_eq!(fp.mixed_segments, 0);
+    }
+
+    #[test]
+    fn footprint_flags_mixed_segments() {
+        let mut mgr = IndexManager::new();
+        mgr.load_ccxi_bytes(&build_ccxi_for(1, &[0xAAAA, 0xBBBB])).unwrap();
+
+        let fp = mgr.tenant_footprint(0xAAAA);
+        assert_eq!(fp.segments.len(), 1);
+        assert_eq!(fp.segments[0].docs_total, 2);
+        assert_eq!(fp.segments[0].docs_tenant, 1);
+        assert!(!fp.segments[0].whole_tenant, "shared segment is not reclaimable");
+        assert_eq!(fp.mixed_segments, 1);
+        assert_eq!(fp.docs, 1);
+    }
+
+    #[test]
+    fn footprint_bytes_cover_the_whole_file_group() {
+        let tmp = TempDir::new().unwrap();
+        let stem = "seg-00000000000000000007-abcdef";
+        let ccxi = build_ccxi_for(7, &[0xAAAA]);
+        std::fs::write(tmp.path().join(format!("{stem}.ccxi")), &ccxi).unwrap();
+        // Siblings written by the seal path — they are what a reclaim frees too.
+        std::fs::write(tmp.path().join(format!("{stem}.ccxseg")), vec![0u8; 500]).unwrap();
+        std::fs::write(tmp.path().join(format!("{stem}.ccxv")), vec![0u8; 250]).unwrap();
+        std::fs::write(tmp.path().join(format!("{stem}.ccxp")), vec![0u8; 50]).unwrap();
+        // A different segment in the same directory must not be counted.
+        std::fs::write(
+            tmp.path().join("seg-00000000000000000008-fedcba.ccxseg"),
+            vec![0u8; 999],
+        )
+        .unwrap();
+
+        let mut mgr = IndexManager::new();
+        mgr.scan_and_load(tmp.path()).unwrap();
+
+        let fp = mgr.tenant_footprint(0xAAAA);
+        assert_eq!(fp.segments.len(), 1);
+        assert_eq!(fp.bytes, ccxi.len() as u64 + 500 + 250 + 50);
+    }
+
+    #[test]
+    fn footprint_bytes_are_zero_for_in_memory_segments() {
+        let mut mgr = IndexManager::new();
+        mgr.load_ccxi_bytes(&build_ccxi_for(1, &[0xAAAA])).unwrap();
+        assert_eq!(mgr.tenant_footprint(0xAAAA).bytes, 0);
     }
 
     // ── min_residency protection ─────────────────────────────────────
