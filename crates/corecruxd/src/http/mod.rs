@@ -609,6 +609,19 @@ pub(crate) fn router_with_route_auth(
             "/v1/admin/tenants/{tenantId}/footprint",
             get(self::tenant_erasure::get_tenant_footprint),
         )
+        .route(
+            "/v1/admin/forget-tenants",
+            axum::routing::post(self::tenant_erasure::post_forget_tenants),
+        )
+        // Singular alias so CoreCrux's single-tenant runbook still reads true.
+        .route(
+            "/v1/admin/forget-tenant",
+            axum::routing::post(self::tenant_erasure::post_forget_tenants),
+        )
+        .route(
+            "/v1/admin/forget-tenants/{tenantId}",
+            axum::routing::delete(self::tenant_erasure::delete_forget_tenant),
+        )
         .route("/v1/admin/ops-log", get(self::admin::get_ops_log))
         .route("/v1/admin/valves", axum::routing::post(self::admin::post_valves))
         .route("/v1/admin/replication/status", get(self::admin::get_replication_status))
