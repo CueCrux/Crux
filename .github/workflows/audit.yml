@@ -18,12 +18,31 @@ permissions:
 jobs:
   advisories:
     name: Cargo deny policy
-    runs-on: [self-hosted, hel1]
+    runs-on: [self-hosted, ci, Linux]
     env:
-      CARGO_HOME: /home/gha-runner/.cargo
+      CARGO_HOME: ${{ runner.temp }}/cargo-${{ github.job }}-${{ github.run_id }}
       CARGO_DENY_VERSION: 0.19.4
     steps:
       - uses: actions/checkout@v7
+      - name: Resolve CARGO_HOME (shared toolchain when the runner has one)
+        run: |
+          # CARGO_HOME lives under RUNNER_TEMP so it is writable on EVERY runner
+          # pool, not just the one whose host happens to have /home/gha-runner.
+          # Hardcoding that path is what made 17 jobs a scheduling coin flip:
+          # they passed on hel1 and died in 13s on vukgpu02 with
+          # "mkdir: cannot create directory '/home/gha-runner': Permission denied".
+          #
+          # The symlink loop is the FAST PATH, not a requirement. Where a shared
+          # toolchain exists it is linked in so rustup/cargo are already present
+          # and the toolchain action becomes a no-op; where it does not, the glob
+          # stays literal, `-e` fails, and the action installs into this writable
+          # home instead. Same workflow, both pools.
+          mkdir -p "$CARGO_HOME/bin"
+          for tool in "${CRUX_SHARED_CARGO_HOME:-/home/gha-runner/.cargo}"/bin/*; do
+            [ -e "$tool" ] || continue
+            ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
+          done
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@stable
       - name: Ensure cargo-deny
         run: |
@@ -46,12 +65,31 @@ jobs:
 
   cargo-audit:
     name: Cargo audit
-    runs-on: [self-hosted, hel1]
+    runs-on: [self-hosted, ci, Linux]
     env:
-      CARGO_HOME: /home/gha-runner/.cargo
+      CARGO_HOME: ${{ runner.temp }}/cargo-${{ github.job }}-${{ github.run_id }}
       CARGO_AUDIT_VERSION: 0.22.1
     steps:
       - uses: actions/checkout@v7
+      - name: Resolve CARGO_HOME (shared toolchain when the runner has one)
+        run: |
+          # CARGO_HOME lives under RUNNER_TEMP so it is writable on EVERY runner
+          # pool, not just the one whose host happens to have /home/gha-runner.
+          # Hardcoding that path is what made 17 jobs a scheduling coin flip:
+          # they passed on hel1 and died in 13s on vukgpu02 with
+          # "mkdir: cannot create directory '/home/gha-runner': Permission denied".
+          #
+          # The symlink loop is the FAST PATH, not a requirement. Where a shared
+          # toolchain exists it is linked in so rustup/cargo are already present
+          # and the toolchain action becomes a no-op; where it does not, the glob
+          # stays literal, `-e` fails, and the action installs into this writable
+          # home instead. Same workflow, both pools.
+          mkdir -p "$CARGO_HOME/bin"
+          for tool in "${CRUX_SHARED_CARGO_HOME:-/home/gha-runner/.cargo}"/bin/*; do
+            [ -e "$tool" ] || continue
+            ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
+          done
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@stable
       - name: Ensure cargo-audit
         run: |
@@ -71,12 +109,31 @@ jobs:
 
   licenses:
     name: Licence check
-    runs-on: [self-hosted, hel1]
+    runs-on: [self-hosted, ci, Linux]
     env:
-      CARGO_HOME: /home/gha-runner/.cargo
+      CARGO_HOME: ${{ runner.temp }}/cargo-${{ github.job }}-${{ github.run_id }}
       CARGO_DENY_VERSION: 0.19.4
     steps:
       - uses: actions/checkout@v7
+      - name: Resolve CARGO_HOME (shared toolchain when the runner has one)
+        run: |
+          # CARGO_HOME lives under RUNNER_TEMP so it is writable on EVERY runner
+          # pool, not just the one whose host happens to have /home/gha-runner.
+          # Hardcoding that path is what made 17 jobs a scheduling coin flip:
+          # they passed on hel1 and died in 13s on vukgpu02 with
+          # "mkdir: cannot create directory '/home/gha-runner': Permission denied".
+          #
+          # The symlink loop is the FAST PATH, not a requirement. Where a shared
+          # toolchain exists it is linked in so rustup/cargo are already present
+          # and the toolchain action becomes a no-op; where it does not, the glob
+          # stays literal, `-e` fails, and the action installs into this writable
+          # home instead. Same workflow, both pools.
+          mkdir -p "$CARGO_HOME/bin"
+          for tool in "${CRUX_SHARED_CARGO_HOME:-/home/gha-runner/.cargo}"/bin/*; do
+            [ -e "$tool" ] || continue
+            ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
+          done
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@stable
       - name: Ensure cargo-deny
         run: |

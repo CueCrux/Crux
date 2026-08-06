@@ -37,7 +37,7 @@ permissions:
 jobs:
   probe:
     name: Probe Sigstore + Trivy egress (self-hosted)
-    runs-on: [self-hosted, hel1]
+    runs-on: [self-hosted, ci, Linux]
     timeout-minutes: 5
     steps:
       - name: Probe endpoints

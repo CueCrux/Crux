@@ -29,9 +29,27 @@ concurrency:
 jobs:
   check:
     name: Verify agent-doc references resolve
-    runs-on: [self-hosted, hel1]
+    runs-on: [self-hosted, ci, Linux]
+    env:
+      CARGO_HOME: ${{ runner.temp }}/cargo-${{ github.job }}-${{ github.run_id }}
     steps:
       - uses: actions/checkout@v7
+      - name: Resolve CARGO_HOME (shared toolchain when the runner has one)
+        run: |
+          # `check-agent-docs.sh --exec` runs `cargo fmt --check`, so this job
+          # needs a toolchain even though it builds nothing. It previously got
+          # one only by accident: the hel1 runners have cargo on PATH via a
+          # shared home. On a runner without one it failed as
+          # "MISS exec cargo fmt --check" — a Rust dependency with no Rust setup.
+          mkdir -p "$CARGO_HOME/bin"
+          for tool in "${CRUX_SHARED_CARGO_HOME:-/home/gha-runner/.cargo}"/bin/*; do
+            [ -e "$tool" ] || continue
+            ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
+          done
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - name: Check agent docs
         # --exec also runs the cheap documented commands (cargo fmt --check);
         # heavyweight build/test/clippy stay in ci.yml.

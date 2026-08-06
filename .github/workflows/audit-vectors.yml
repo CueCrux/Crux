@@ -29,7 +29,7 @@ concurrency:
 jobs:
   verify:
     name: Verify audit-bundle-v1 vectors
-    runs-on: [self-hosted, hel1]
+    runs-on: [self-hosted, ci, Linux]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v6
