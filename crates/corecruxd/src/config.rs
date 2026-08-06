@@ -535,6 +535,11 @@ pub struct Config {
     /// Gated auto-capture surface (`/v1/memory/*`). Default OFF.
     pub auto_capture_enabled: bool,
 
+    /// Tenant corpus erasure (`/v1/admin/forget-tenants`,
+    /// `/v1/admin/tenants/{id}/footprint`). Default OFF
+    /// (`CORECRUXD_TENANT_ERASURE=1`); when off the routes return 404.
+    pub tenant_erasure_enabled: bool,
+
     // Local CPU prose-ingest door (`/v1/local/ingest`,
     // `crate::http::local_ingest`). Seals pre-formatted prose payloads into
     // local segments served over BM25 — no GPU dataplane. Default ON;
@@ -1341,6 +1346,7 @@ pub fn load_config() -> Config {
             .clamp(60, crate::coord::MAX_TTL_SECS),
         context_surface_enabled: env_bool("CORECRUXD_CONTEXT_SURFACE").unwrap_or(false),
         auto_capture_enabled: env_bool("CORECRUXD_AUTO_CAPTURE").unwrap_or(false),
+        tenant_erasure_enabled: env_bool("CORECRUXD_TENANT_ERASURE").unwrap_or(false),
         local_ingest_enabled: env_default_on("CORECRUXD_LOCAL_INGEST"),
         stream_receipts_enabled: env_bool("CORECRUXD_STREAM_RECEIPTS").unwrap_or(false),
         usage_receipts_enabled: env_bool("CORECRUXD_FEATURE_USAGE_RECEIPTS").unwrap_or(false),

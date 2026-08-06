@@ -500,6 +500,7 @@ pub(super) async fn post_query_text_search(
         tenant_filter,
         &corecrux_retrieval::bm25::Bm25Params::default(),
         body.min_score,
+        tenant_filter.and_then(|h| index.forgotten_watermark(h)),
     );
 
     // Dense re-rank (buyer-fit M3.2): when the node has an embedder (the

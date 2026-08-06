@@ -86,6 +86,7 @@ mod stream_receipts;
 mod studio_library;
 mod studio_pack;
 mod sync;
+mod tenant_erasure;
 mod traces;
 mod witness;
 mod work;
@@ -248,6 +249,10 @@ pub struct AppState {
     /// Provider-agnostic injection-bundle surface (`/v1/context`). Default
     /// OFF (`CORECRUXD_CONTEXT_SURFACE=1`); when off, routes return 404.
     pub context_surface_enabled: bool,
+    /// Tenant corpus erasure (`/v1/admin/forget-tenants`,
+    /// `/v1/admin/tenants/{id}/footprint`). Default OFF
+    /// (`CORECRUXD_TENANT_ERASURE=1`); when off, the routes return 404.
+    pub tenant_erasure_enabled: bool,
     /// Authenticated daemon-to-daemon embedding provider
     /// (`POST /v1/compute/embed`). Default OFF
     /// (`CORECRUXD_COMPUTE_PROVIDER=1`); the route remains mounted while off
@@ -600,6 +605,23 @@ pub(crate) fn router_with_route_auth(
         .route("/v1/admin/segments/fingerprints", get(self::admin::get_segment_fingerprints))
         .route("/v1/admin/sharing/posture", get(self::admin::get_sharing_posture))
         .route("/v1/admin/sharing/backfill", axum::routing::post(self::admin::post_sharing_backfill))
+        .route(
+            "/v1/admin/tenants/{tenantId}/footprint",
+            get(self::tenant_erasure::get_tenant_footprint),
+        )
+        .route(
+            "/v1/admin/forget-tenants",
+            axum::routing::post(self::tenant_erasure::post_forget_tenants),
+        )
+        // Singular alias so CoreCrux's single-tenant runbook still reads true.
+        .route(
+            "/v1/admin/forget-tenant",
+            axum::routing::post(self::tenant_erasure::post_forget_tenants),
+        )
+        .route(
+            "/v1/admin/forget-tenants/{tenantId}",
+            axum::routing::delete(self::tenant_erasure::delete_forget_tenant),
+        )
         .route("/v1/admin/ops-log", get(self::admin::get_ops_log))
         .route("/v1/admin/valves", axum::routing::post(self::admin::post_valves))
         .route("/v1/admin/replication/status", get(self::admin::get_replication_status))

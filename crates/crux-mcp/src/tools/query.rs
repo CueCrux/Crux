@@ -49,6 +49,7 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
         Some(tenant_hash),
         &Bm25Params::default(),
         min_score,
+        index.forgotten_watermark(tenant_hash),
     );
 
     // Dense re-rank (parity with `POST /v1/query/text-search`): when the
@@ -192,7 +193,15 @@ pub async fn handle_query_scan(params: &Value, ctx: &McpContext) -> Result<Value
     }
 
     let readers = index.readers();
-    let result = bm25::bm25_search(&readers, query, limit, Some(tenant_hash), &Bm25Params::default(), None);
+    let result = bm25::bm25_search(
+        &readers,
+        query,
+        limit,
+        Some(tenant_hash),
+        &Bm25Params::default(),
+        None,
+        index.forgotten_watermark(tenant_hash),
+    );
 
     let mut tokens_returned = 0usize;
     let mut budget_truncated = false;
