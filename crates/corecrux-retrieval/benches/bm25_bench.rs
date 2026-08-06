@@ -53,6 +53,7 @@ fn bench_bm25_search(c: &mut Criterion) {
                     None,
                     &params,
                     Some(0.1),
+                    None,
                 )
             });
         });
@@ -82,6 +83,7 @@ fn bench_bm25_score_multi(c: &mut Criterion) {
                     black_box(10),
                     None,
                     &params,
+                    None,
                 )
             });
         });

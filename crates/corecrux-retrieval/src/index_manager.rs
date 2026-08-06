@@ -27,10 +27,31 @@ pub enum IndexTier {
     Cold,
 }
 
+/// A tenant whose retrieval corpus has been erased, and the segment sequence
+/// at which the erasure happened.
+///
+/// Segments sealed at or below `watermark_segment_seq` are invisible to this
+/// tenant; anything ingested afterwards is served normally, so a corpus can be
+/// erased and then re-paved under the same tenant id.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ForgottenTenant {
+    pub tenant_id: String,
+    pub tenant_hash: u64,
+    pub watermark_segment_seq: u64,
+    /// RFC3339. Supplied by the caller — this crate has no clock.
+    pub forgotten_at: String,
+    /// Segment file groups physically deleted (Layer 2). Zero while the
+    /// erasure is mask-only and therefore still reversible.
+    #[serde(default)]
+    pub segments_reclaimed: usize,
+}
+
 /// Manages loaded .ccxi indexes across multiple sealed segments.
 pub struct IndexManager {
     /// segment_seq → loaded CcxiReader
     segments: BTreeMap<u64, LoadedSegment>,
+    /// tenant_hash → erasure record. Consulted on every tenant-scoped query.
+    forgotten: BTreeMap<u64, ForgottenTenant>,
     /// Maximum bytes of index data to keep in hot tier (memory budget).
     hot_budget_bytes: usize,
     /// Current hot tier usage in bytes.
@@ -43,7 +64,7 @@ pub struct IndexManager {
 
 struct LoadedSegment {
     reader: CcxiReader,
-    #[allow(dead_code)]
+    /// Source `.ccxi` path. Empty for segments loaded from bytes.
     path: PathBuf,
     tier: IndexTier,
     size_bytes: usize,
@@ -55,6 +76,7 @@ impl IndexManager {
     pub fn new() -> Self {
         Self {
             segments: BTreeMap::new(),
+            forgotten: BTreeMap::new(),
             hot_budget_bytes: 4 * 1024 * 1024 * 1024, // 4GB default
             hot_bytes: 0,
             min_residency: std::time::Duration::from_secs(60),
@@ -240,6 +262,234 @@ impl IndexManager {
             }
         }
     }
+}
+
+/// One segment's contribution to a tenant's on-disk corpus footprint.
+///
+/// Tenant membership is read from the `.ccxi` doc table (`tenant_hash_full`),
+/// so a footprint never touches segment frames.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SegmentFootprint {
+    pub segment_seq: u64,
+    pub docs_total: usize,
+    pub docs_tenant: usize,
+    /// Size of the whole segment file group — every file sharing the `.ccxi`
+    /// stem (`.ccxseg`, `.ccxi`, `.ccxv`, `.ccxp`). Zero for segments loaded
+    /// from bytes rather than from disk.
+    pub bytes: u64,
+    /// Every doc in the segment belongs to this tenant — the precondition for
+    /// reclaiming the file group wholesale.
+    pub whole_tenant: bool,
+}
+
+/// A tenant's retrieval-corpus footprint across all loaded segments.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct TenantFootprint {
+    pub segments: Vec<SegmentFootprint>,
+    pub docs: usize,
+    pub bytes: u64,
+    /// Segments the tenant shares with at least one other tenant. These cannot
+    /// be reclaimed by deleting the file group.
+    pub mixed_segments: usize,
+}
+
+/// File name of the erasure mask inside the daemon's data dir.
+pub const FORGOTTEN_TENANTS_FILE: &str = "forgotten-tenants.json";
+
+impl IndexManager {
+    /// The querying tenant's erasure watermark, or `None` if it has never been
+    /// forgotten. Pass the result straight to the BM25 scorers.
+    pub fn forgotten_watermark(&self, tenant_hash: u64) -> Option<u64> {
+        self.forgotten.get(&tenant_hash).map(|f| f.watermark_segment_seq)
+    }
+
+    /// Highest loaded segment sequence — the watermark a fresh erasure takes.
+    pub fn max_segment_seq(&self) -> Option<u64> {
+        self.segments.keys().next_back().copied()
+    }
+
+    /// Mask a tenant's corpus. Reversible until the segment files are reclaimed.
+    /// Returns the previous record when the tenant was already forgotten.
+    pub fn forget_tenant(&mut self, record: ForgottenTenant) -> Option<ForgottenTenant> {
+        self.forgotten.insert(record.tenant_hash, record)
+    }
+
+    /// Lift a mask. Layer-1 rollback; meaningless once the files are gone,
+    /// which is why the caller must refuse it for a reclaimed tenant.
+    pub fn unforget_tenant(&mut self, tenant_hash: u64) -> Option<ForgottenTenant> {
+        self.forgotten.remove(&tenant_hash)
+    }
+
+    pub fn forgotten_tenant(&self, tenant_hash: u64) -> Option<&ForgottenTenant> {
+        self.forgotten.get(&tenant_hash)
+    }
+
+    pub fn forgotten_tenants(&self) -> Vec<&ForgottenTenant> {
+        self.forgotten.values().collect()
+    }
+
+    /// Persist the mask atomically (tmp + rename).
+    ///
+    /// Ordering contract: this must succeed *before* any segment file is
+    /// deleted. A crash between the two then leaves a tenant masked with its
+    /// files intact — recoverable — rather than files gone with no mask.
+    pub fn save_forgotten(&self, path: &Path) -> crate::Result<()> {
+        let json = serde_json::to_vec_pretty(&self.forgotten.values().collect::<Vec<_>>())
+            .map_err(|e| crate::RetrievalError::Internal { msg: e.to_string() })?;
+        let tmp = path.with_extension("json.partial");
+        std::fs::write(&tmp, &json)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Load the mask at startup. A missing file is not an error (no tenant has
+    /// ever been forgotten); an unreadable one is, because silently serving an
+    /// erased corpus is the failure this whole surface exists to prevent.
+    pub fn load_forgotten(&mut self, path: &Path) -> crate::Result<usize> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        let records: Vec<ForgottenTenant> =
+            serde_json::from_slice(&bytes).map_err(|e| crate::RetrievalError::Internal { msg: e.to_string() })?;
+        let count = records.len();
+        self.forgotten = records.into_iter().map(|r| (r.tenant_hash, r)).collect();
+        Ok(count)
+    }
+
+    /// Physically reclaim one segment: evict it from the index, then delete its
+    /// whole file group. Returns the bytes freed (0 if the segment was not
+    /// loaded or was loaded from bytes rather than from disk).
+    ///
+    /// **Irreversible.** The ordering is the contract: the reader is dropped
+    /// before the files go, so the daemon can never serve a segment whose files
+    /// have already been deleted. A crash in the window leaves files on disk
+    /// under a persisted mask — inert, and reclaimable again later.
+    ///
+    /// Only call this for a segment whose documents all belong to the tenant
+    /// being erased ([`SegmentFootprint::whole_tenant`]); deleting a shared
+    /// segment would erase a co-tenant's data.
+    pub fn reclaim_segment(&mut self, segment_seq: u64) -> crate::Result<u64> {
+        let Some(seg) = self.segments.remove(&segment_seq) else {
+            return Ok(0);
+        };
+        if seg.tier == IndexTier::Hot {
+            self.hot_bytes = self.hot_bytes.saturating_sub(seg.size_bytes);
+        }
+        let path = seg.path.clone();
+        drop(seg); // reader released before any unlink
+        if path.as_os_str().is_empty() {
+            return Ok(0);
+        }
+        delete_segment_group(&path)
+    }
+
+    /// Read-only inventory of the segments holding `tenant_hash`'s documents.
+    ///
+    /// Segments with no docs for the tenant are omitted. `bytes` is the size of
+    /// the on-disk file group, so the reported total is what a reclaim would
+    /// actually free.
+    pub fn tenant_footprint(&self, tenant_hash: u64) -> TenantFootprint {
+        let mut out = TenantFootprint::default();
+        let mut hits: Vec<(u64, usize, usize, Option<PathBuf>)> = Vec::new();
+        for (&seq, seg) in &self.segments {
+            let docs_total = seg.reader.docs.len();
+            let docs_tenant = seg
+                .reader
+                .docs
+                .iter()
+                .filter(|d| d.tenant_hash_full == tenant_hash)
+                .count();
+            if docs_tenant == 0 {
+                continue;
+            }
+            let path = (!seg.path.as_os_str().is_empty()).then(|| seg.path.clone());
+            hits.push((seq, docs_total, docs_tenant, path));
+        }
+
+        let group_sizes = segment_group_sizes(hits.iter().filter_map(|(_, _, _, p)| p.as_deref()));
+        for (segment_seq, docs_total, docs_tenant, path) in hits {
+            let bytes = path.as_deref().and_then(|p| group_sizes.get(p).copied()).unwrap_or(0);
+            let whole_tenant = docs_tenant == docs_total;
+            if !whole_tenant {
+                out.mixed_segments += 1;
+            }
+            out.docs += docs_tenant;
+            out.bytes += bytes;
+            out.segments.push(SegmentFootprint {
+                segment_seq,
+                docs_total,
+                docs_tenant,
+                bytes,
+                whole_tenant,
+            });
+        }
+        out
+    }
+}
+
+/// Delete every file sharing the segment's stem (`.ccxseg`, `.ccxi`, `.ccxv`,
+/// `.ccxp`, and any `.partial` left by an interrupted write) and return the
+/// bytes freed. The `stem.` prefix is exact, so a neighbouring segment in the
+/// same directory is never touched.
+fn delete_segment_group(ccxi_path: &Path) -> crate::Result<u64> {
+    let (Some(dir), Some(stem)) = (ccxi_path.parent(), ccxi_path.file_stem().and_then(|s| s.to_str())) else {
+        return Ok(0);
+    };
+    let prefix = format!("{stem}.");
+    let mut freed = 0u64;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        std::fs::remove_file(entry.path())?;
+        freed += len;
+    }
+    Ok(freed)
+}
+
+/// Total bytes of each segment's file group, keyed by its `.ccxi` path.
+///
+/// One `read_dir` per distinct parent directory rather than per segment — a
+/// footprint over a 47-segment corpus is a single directory listing.
+fn segment_group_sizes<'a, I: Iterator<Item = &'a Path>>(paths: I) -> std::collections::HashMap<PathBuf, u64> {
+    let mut wanted: std::collections::HashMap<PathBuf, Vec<(PathBuf, String)>> = std::collections::HashMap::new();
+    for path in paths {
+        let (Some(dir), Some(stem)) = (path.parent(), path.file_stem().and_then(|s| s.to_str())) else {
+            continue;
+        };
+        wanted
+            .entry(dir.to_path_buf())
+            .or_default()
+            .push((path.to_path_buf(), stem.to_string()));
+    }
+
+    let mut out = std::collections::HashMap::new();
+    for (dir, members) in wanted {
+        let mut by_stem: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                // `.ccxv.partial` and friends stem to "seg-…-….ccxv"; take the
+                // leading segment stem so partials count against their group.
+                let stem = stem.split_once(".ccx").map_or(stem, |(head, _)| head);
+                let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                *by_stem.entry(stem.to_string()).or_default() += len;
+            }
+        }
+        for (path, stem) in members {
+            out.insert(path, by_stem.get(&stem).copied().unwrap_or(0));
+        }
+    }
+    out
 }
 
 impl Default for IndexManager {
@@ -552,6 +802,238 @@ mod tests {
         let dbg = format!("{:?}", mgr);
         assert!(dbg.contains("IndexManager"));
         assert!(dbg.contains("segments"));
+    }
+
+    // ── tenant_footprint ─────────────────────────────────────────────
+
+    fn build_ccxi_for(segment_seq: u64, tenants: &[u64]) -> Vec<u8> {
+        let mut builder = CcxiBuilder::new(0, segment_seq, 100);
+        for (i, &th) in tenants.iter().enumerate() {
+            builder.add_document(i as u32, "terraform drift detection", (i * 100) as u32, th);
+        }
+        builder.build()
+    }
+
+    #[test]
+    fn footprint_of_unknown_tenant_is_empty() {
+        let mut mgr = IndexManager::new();
+        mgr.load_ccxi_bytes(&build_ccxi_for(1, &[0xAAAA])).unwrap();
+        let fp = mgr.tenant_footprint(0xBBBB);
+        assert!(fp.segments.is_empty());
+        assert_eq!(fp.docs, 0);
+        assert_eq!(fp.bytes, 0);
+        assert_eq!(fp.mixed_segments, 0);
+    }
+
+    #[test]
+    fn footprint_counts_only_the_named_tenant() {
+        let mut mgr = IndexManager::new();
+        mgr.load_ccxi_bytes(&build_ccxi_for(1, &[0xAAAA, 0xAAAA])).unwrap();
+        mgr.load_ccxi_bytes(&build_ccxi_for(2, &[0xBBBB])).unwrap();
+
+        let fp = mgr.tenant_footprint(0xAAAA);
+        assert_eq!(fp.segments.len(), 1, "segment 2 holds no docs for this tenant");
+        assert_eq!(fp.segments[0].segment_seq, 1);
+        assert_eq!(fp.docs, 2);
+        assert!(fp.segments[0].whole_tenant);
+        assert_eq!(fp.mixed_segments, 0);
+    }
+
+    #[test]
+    fn footprint_flags_mixed_segments() {
+        let mut mgr = IndexManager::new();
+        mgr.load_ccxi_bytes(&build_ccxi_for(1, &[0xAAAA, 0xBBBB])).unwrap();
+
+        let fp = mgr.tenant_footprint(0xAAAA);
+        assert_eq!(fp.segments.len(), 1);
+        assert_eq!(fp.segments[0].docs_total, 2);
+        assert_eq!(fp.segments[0].docs_tenant, 1);
+        assert!(!fp.segments[0].whole_tenant, "shared segment is not reclaimable");
+        assert_eq!(fp.mixed_segments, 1);
+        assert_eq!(fp.docs, 1);
+    }
+
+    #[test]
+    fn footprint_bytes_cover_the_whole_file_group() {
+        let tmp = TempDir::new().unwrap();
+        let stem = "seg-00000000000000000007-abcdef";
+        let ccxi = build_ccxi_for(7, &[0xAAAA]);
+        std::fs::write(tmp.path().join(format!("{stem}.ccxi")), &ccxi).unwrap();
+        // Siblings written by the seal path — they are what a reclaim frees too.
+        std::fs::write(tmp.path().join(format!("{stem}.ccxseg")), vec![0u8; 500]).unwrap();
+        std::fs::write(tmp.path().join(format!("{stem}.ccxv")), vec![0u8; 250]).unwrap();
+        std::fs::write(tmp.path().join(format!("{stem}.ccxp")), vec![0u8; 50]).unwrap();
+        // A different segment in the same directory must not be counted.
+        std::fs::write(
+            tmp.path().join("seg-00000000000000000008-fedcba.ccxseg"),
+            vec![0u8; 999],
+        )
+        .unwrap();
+
+        let mut mgr = IndexManager::new();
+        mgr.scan_and_load(tmp.path()).unwrap();
+
+        let fp = mgr.tenant_footprint(0xAAAA);
+        assert_eq!(fp.segments.len(), 1);
+        assert_eq!(fp.bytes, ccxi.len() as u64 + 500 + 250 + 50);
+    }
+
+    #[test]
+    fn footprint_bytes_are_zero_for_in_memory_segments() {
+        let mut mgr = IndexManager::new();
+        mgr.load_ccxi_bytes(&build_ccxi_for(1, &[0xAAAA])).unwrap();
+        assert_eq!(mgr.tenant_footprint(0xAAAA).bytes, 0);
+    }
+
+    // ── forgotten-tenant mask (Layer 1) ──────────────────────────────
+
+    fn record(tenant_id: &str, tenant_hash: u64, watermark: u64) -> ForgottenTenant {
+        ForgottenTenant {
+            tenant_id: tenant_id.to_string(),
+            tenant_hash,
+            watermark_segment_seq: watermark,
+            forgotten_at: "2026-08-06T00:00:00Z".to_string(),
+            segments_reclaimed: 0,
+        }
+    }
+
+    #[test]
+    fn watermark_is_none_until_a_tenant_is_forgotten() {
+        let mut mgr = IndexManager::new();
+        mgr.load_ccxi_bytes(&build_ccxi_for(1, &[0xAAAA])).unwrap();
+        assert_eq!(mgr.forgotten_watermark(0xAAAA), None);
+
+        mgr.forget_tenant(record("acme", 0xAAAA, 1));
+        assert_eq!(mgr.forgotten_watermark(0xAAAA), Some(1));
+        assert_eq!(mgr.forgotten_watermark(0xBBBB), None, "sibling tenant unaffected");
+    }
+
+    #[test]
+    fn unforget_lifts_the_mask() {
+        let mut mgr = IndexManager::new();
+        mgr.forget_tenant(record("acme", 0xAAAA, 4));
+        assert!(mgr.unforget_tenant(0xAAAA).is_some());
+        assert_eq!(mgr.forgotten_watermark(0xAAAA), None);
+        assert!(mgr.unforget_tenant(0xAAAA).is_none(), "second lift is a no-op");
+    }
+
+    #[test]
+    fn max_segment_seq_picks_the_watermark() {
+        let mut mgr = IndexManager::new();
+        assert_eq!(mgr.max_segment_seq(), None);
+        mgr.load_ccxi_bytes(&build_ccxi_for(3, &[0xAAAA])).unwrap();
+        mgr.load_ccxi_bytes(&build_ccxi_for(11, &[0xAAAA])).unwrap();
+        mgr.load_ccxi_bytes(&build_ccxi_for(7, &[0xAAAA])).unwrap();
+        assert_eq!(mgr.max_segment_seq(), Some(11));
+    }
+
+    #[test]
+    fn mask_survives_a_save_load_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(FORGOTTEN_TENANTS_FILE);
+
+        let mut mgr = IndexManager::new();
+        mgr.forget_tenant(record("acme", 0xAAAA, 18));
+        mgr.forget_tenant(record("globex", 0xBBBB, 4));
+        mgr.save_forgotten(&path).unwrap();
+
+        // Simulate a daemon restart.
+        let mut cold = IndexManager::new();
+        assert_eq!(cold.load_forgotten(&path).unwrap(), 2);
+        assert_eq!(cold.forgotten_watermark(0xAAAA), Some(18));
+        assert_eq!(cold.forgotten_watermark(0xBBBB), Some(4));
+        assert_eq!(cold.forgotten_tenant(0xAAAA).unwrap().tenant_id, "acme");
+    }
+
+    #[test]
+    fn missing_mask_file_is_not_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = IndexManager::new();
+        assert_eq!(mgr.load_forgotten(&tmp.path().join(FORGOTTEN_TENANTS_FILE)).unwrap(), 0);
+    }
+
+    #[test]
+    fn corrupt_mask_file_is_an_error_not_an_empty_mask() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(FORGOTTEN_TENANTS_FILE);
+        std::fs::write(&path, b"{ not json").unwrap();
+        let mut mgr = IndexManager::new();
+        assert!(
+            mgr.load_forgotten(&path).is_err(),
+            "an unreadable mask must never degrade to 'nothing is forgotten'"
+        );
+    }
+
+    #[test]
+    fn save_leaves_no_partial_file_behind() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(FORGOTTEN_TENANTS_FILE);
+        let mut mgr = IndexManager::new();
+        mgr.forget_tenant(record("acme", 0xAAAA, 1));
+        mgr.save_forgotten(&path).unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("partial"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "tmp file must be renamed, not left: {leftovers:?}"
+        );
+    }
+
+    // ── reclaim_segment (Layer 2) ────────────────────────────────────
+
+    fn write_group(dir: &Path, seq: u64, tenants: &[u64]) -> u64 {
+        let stem = format!("seg-{seq:020}-abcdef");
+        let ccxi = build_ccxi_for(seq, tenants);
+        std::fs::write(dir.join(format!("{stem}.ccxi")), &ccxi).unwrap();
+        std::fs::write(dir.join(format!("{stem}.ccxseg")), vec![0u8; 400]).unwrap();
+        std::fs::write(dir.join(format!("{stem}.ccxv")), vec![0u8; 100]).unwrap();
+        ccxi.len() as u64 + 400 + 100
+    }
+
+    #[test]
+    fn reclaim_evicts_then_deletes_the_whole_group() {
+        let tmp = TempDir::new().unwrap();
+        let expected = write_group(tmp.path(), 1, &[0xAAAA]);
+        write_group(tmp.path(), 2, &[0xBBBB]);
+
+        let mut mgr = IndexManager::new();
+        mgr.scan_and_load(tmp.path()).unwrap();
+        assert_eq!(mgr.segment_count(), 2);
+
+        let freed = mgr.reclaim_segment(1).unwrap();
+        assert_eq!(freed, expected);
+        assert_eq!(mgr.segment_count(), 1, "evicted before the unlink");
+        assert_eq!(mgr.tenant_footprint(0xAAAA).segments.len(), 0);
+
+        let left: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(left.len(), 3, "only segment 2's group survives: {left:?}");
+        assert!(left.iter().all(|n| n.contains("00000000000000000002")));
+
+        // A cold rescan must not resurrect the deleted segment.
+        let mut cold = IndexManager::new();
+        assert_eq!(cold.scan_and_load(tmp.path()).unwrap(), 1);
+    }
+
+    #[test]
+    fn reclaim_of_an_unloaded_segment_is_a_no_op() {
+        let mut mgr = IndexManager::new();
+        assert_eq!(mgr.reclaim_segment(42).unwrap(), 0);
+    }
+
+    #[test]
+    fn reclaim_of_an_in_memory_segment_frees_nothing_but_still_evicts() {
+        let mut mgr = IndexManager::new();
+        mgr.load_ccxi_bytes(&build_ccxi_for(1, &[0xAAAA])).unwrap();
+        assert_eq!(mgr.reclaim_segment(1).unwrap(), 0);
+        assert_eq!(mgr.segment_count(), 0);
     }
 
     // ── min_residency protection ─────────────────────────────────────
