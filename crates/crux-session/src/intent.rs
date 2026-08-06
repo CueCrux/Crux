@@ -55,6 +55,16 @@ pub fn default_intent_table() -> IntentTable {
         "knowledge_query",
         vec![("retrieval", 30), ("memory", 20), ("session", 5)],
     );
+    // Executing an ExecPlan milestone-by-milestone: the agent needs the work
+    // board and the coordination plane first (what is open, who else is live,
+    // claim it), then session continuity to resume, then memory to record the
+    // gate. Without this entry the `work` affinity has no intent that biases
+    // it, so those tools never rise above the floor and an agent can only
+    // reach them by already knowing their names.
+    t.insert(
+        "execplan_execution",
+        vec![("work", 30), ("session", 20), ("memory", 10)],
+    );
     t
 }
 
