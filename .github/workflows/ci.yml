@@ -178,6 +178,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: bash scripts/ci-cargo-with-fallback.sh build --workspace
+      - name: Escrow verification cross-check (Rust vs Python reference)
+        # The published verification page (docs/verify-key-escrow.md) tells
+        # customers that two independent implementations agree and that CI fails
+        # if they diverge. CRUX_REQUIRE_PYTHON_REFERENCE=1 makes that true: the
+        # test refuses to skip here, so a runner that lost the dependency fails
+        # the build instead of quietly leaving the claim unchecked.
+        run: |
+          python3 -m venv /tmp/crux-escrow-venv
+          /tmp/crux-escrow-venv/bin/pip install --quiet pynacl blake3
+          PATH="/tmp/crux-escrow-venv/bin:$PATH" CRUX_REQUIRE_PYTHON_REFERENCE=1 \
+            bash scripts/ci-cargo-with-fallback.sh test -p crux-escrow --test python_reference_agrees
       - name: HTTP auth boundary contracts
         run: bash scripts/ci-cargo-with-fallback.sh test -p corecruxd route_auth
       - name: HTTP boundary smoke contracts

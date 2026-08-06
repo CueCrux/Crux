@@ -13,13 +13,13 @@ chrono = { workspace = true, features = ["clock", "serde"] }
 data-encoding = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 vsss-rs = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 
 [lints]
 workspace = true
