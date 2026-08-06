@@ -263,6 +263,10 @@ pub struct TestDaemon {
     pub base_url: String,
     pub mcp_base_url: String,
     stderr_log_path: PathBuf,
+    /// Remembered so [`TestDaemon::restart`] can bring the same daemon back up
+    /// against the same data dir and ports.
+    agent_token: Option<String>,
+    extra_env: Vec<(String, String)>,
 }
 
 impl TestDaemon {
@@ -271,18 +275,45 @@ impl TestDaemon {
     /// Set `CORECRUXD_BINARY` to override the daemon binary path (useful when
     /// `cargo llvm-cov` or other tools use a non-standard target directory).
     pub fn start() -> Self {
-        Self::start_with_retry(None)
+        Self::start_with_retry(None, &[])
     }
 
     /// Start a corecruxd instance that requires an MCP bearer token.
     pub fn start_with_agent_token(token: &str) -> Self {
-        Self::start_with_retry(Some(token))
+        Self::start_with_retry(Some(token), &[])
     }
 
-    fn start_with_retry(agent_token: Option<&str>) -> Self {
+    /// Start a corecruxd instance with extra environment variables — for
+    /// surfaces that are flag-gated off by default.
+    pub fn start_with_env(env: &[(&str, &str)]) -> Self {
+        Self::start_with_retry(None, env)
+    }
+
+    /// Stop the daemon and bring it back up on the same data dir, ports and
+    /// environment. Restart-survival tests need the on-disk state to be the
+    /// only thing carried across.
+    pub fn restart(&mut self) {
+        self.stop();
+        let command = Self::build_command(
+            &Self::binary_path().expect("daemon binary"),
+            self.data_dir.path(),
+            &self.stderr_log_path,
+            self.http_port,
+            self.grpc_port,
+            self.mcp_port,
+            self.agent_token.as_deref(),
+            &self.extra_env,
+        );
+        self.process = { command }.spawn().expect("restart corecruxd");
+        if let Err(err) = self.wait_healthy(startup_timeout()) {
+            panic!("daemon did not come back after restart: {err}");
+        }
+    }
+
+    fn start_with_retry(agent_token: Option<&str>, extra_env: &[(&str, &str)]) -> Self {
         let mut failures = Vec::new();
         for attempt in 1..=START_ATTEMPTS {
-            match Self::spawn_once(agent_token) {
+            match Self::spawn_once(agent_token, extra_env) {
                 Ok(mut daemon) => match daemon.wait_healthy(startup_timeout()) {
                     Ok(()) => return daemon,
                     Err(err) => {
@@ -300,33 +331,34 @@ impl TestDaemon {
         );
     }
 
-    fn spawn_once(agent_token: Option<&str>) -> Result<Self, String> {
-        let data_dir = tempfile::tempdir().expect("create tempdir");
-        let mut ports = std::collections::BTreeSet::new();
-        while ports.len() < 3 {
-            ports.insert(portpicker::pick_unused_port().expect("pick unused port"));
-        }
-        let mut ports = ports.into_iter();
-        let http_port = ports.next().expect("pick HTTP port");
-        let grpc_port = ports.next().expect("pick gRPC port");
-        let mcp_port = ports.next().expect("pick MCP port");
-
-        let binary = if let Ok(path) = std::env::var("CORECRUXD_BINARY") {
-            std::path::PathBuf::from(path)
+    fn binary_path() -> Result<std::path::PathBuf, String> {
+        if let Ok(path) = std::env::var("CORECRUXD_BINARY") {
+            Ok(std::path::PathBuf::from(path))
         } else {
-            default_binary_path()?
-        };
-        let stderr_log_path = data_dir.path().join("corecruxd.stderr.log");
+            default_binary_path()
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)] // one cohesive spawn recipe; splitting it just moves the args
+    fn build_command(
+        binary: &std::path::Path,
+        data_dir: &std::path::Path,
+        stderr_log_path: &std::path::Path,
+        http_port: u16,
+        grpc_port: u16,
+        mcp_port: u16,
+        agent_token: Option<&str>,
+        extra_env: &[(String, String)],
+    ) -> Command {
         let stderr_log = OpenOptions::new()
             .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&stderr_log_path)
-            .map_err(|err| format!("open stderr log {}: {err}", stderr_log_path.display()))?;
+            .append(true)
+            .open(stderr_log_path)
+            .expect("open stderr log");
 
-        let mut command = Command::new(&binary);
+        let mut command = Command::new(binary);
         command
-            .env("CORECRUXD_DATA_DIR", data_dir.path())
+            .env("CORECRUXD_DATA_DIR", data_dir)
             .env("CORECRUXD_HTTP_PORT", http_port.to_string())
             .env("CORECRUXD_HTTP_HOST", "127.0.0.1")
             .env("CORECRUXD_GRPC_PORT", grpc_port.to_string())
@@ -344,10 +376,43 @@ impl TestDaemon {
             .env_remove("CRUX_AGENT_TOKENS")
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_log));
-
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
         if let Some(token) = agent_token {
             command.env("CRUX_AGENT_TOKEN", token);
         }
+        command
+    }
+
+    fn spawn_once(agent_token: Option<&str>, extra_env: &[(&str, &str)]) -> Result<Self, String> {
+        let data_dir = tempfile::tempdir().expect("create tempdir");
+        let mut ports = std::collections::BTreeSet::new();
+        while ports.len() < 3 {
+            ports.insert(portpicker::pick_unused_port().expect("pick unused port"));
+        }
+        let mut ports = ports.into_iter();
+        let http_port = ports.next().expect("pick HTTP port");
+        let grpc_port = ports.next().expect("pick gRPC port");
+        let mcp_port = ports.next().expect("pick MCP port");
+
+        let binary = Self::binary_path()?;
+        let stderr_log_path = data_dir.path().join("corecruxd.stderr.log");
+        let extra_env: Vec<(String, String)> = extra_env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+
+        let mut command = Self::build_command(
+            &binary,
+            data_dir.path(),
+            &stderr_log_path,
+            http_port,
+            grpc_port,
+            mcp_port,
+            agent_token,
+            &extra_env,
+        );
 
         let process = command
             .spawn()
@@ -364,6 +429,8 @@ impl TestDaemon {
             base_url,
             mcp_base_url,
             stderr_log_path,
+            agent_token: agent_token.map(str::to_string),
+            extra_env,
         })
     }
 
