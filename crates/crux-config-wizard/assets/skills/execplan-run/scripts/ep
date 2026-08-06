@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# ep — ExecPlan execution mechanics. Shell-side only: the model keeps facts
+# (store_fact / query_facts) on MCP; this script does board reads, coordination,
+# worktrees, PR shepherding and reaping, so those never cost model tokens.
+#
+# Every subcommand prints a compact block. No JSON dumps.
+set -uo pipefail
+
+CRUX="${CRUX_HTTP_URL:-http://100.70.12.73:14800}"   # tailnet, not loopback (sweeps fail on loopback)
+TOK="${CRUX_AGENT_TOKEN:-}"
+WS="${CUECRUX_ROOT:-$HOME/CueCrux}"
+# Planning repo is a sibling dir under $WS, named by env so this script carries no
+# hard-coded path into a private tree (Crux CI rejects those in tracked files).
+PLAN_REPO="${EP_PLAN_REPO:-PlanCrux}"
+PLANS="${EP_PLANS:-$WS/$PLAN_REPO/.agent/execplans}"
+OD_REGISTRY="${EP_OD_REGISTRY:-$WS/$PLAN_REPO/docs/master-plan/tracking/open-decisions.md}"
+
+die() { echo "ep: $*" >&2; exit 1; }
+api() { # api <method> <path> [body]
+  local m=$1 p=$2 b=${3:-}
+  if [ -n "$b" ]; then
+    curl -sS -m 20 -X "$m" -H "Authorization: Bearer $TOK" -H 'content-type: application/json' -d "$b" "$CRUX$p"
+  else
+    curl -sS -m 20 -X "$m" -H "Authorization: Bearer $TOK" "$CRUX$p"
+  fi
+}
+plan_path() { echo "$PLANS/${1%.md}.md"; }
+
+# Which repo does a path belong to, and where do its worktrees live?
+repo_root() { git -C "${1:-.}" rev-parse --show-toplevel 2>/dev/null; }
+wt_dir() { local r; r=$(basename "$1"); echo "$WS/${r}-worktrees"; }
+
+# ── board ──────────────────────────────────────────────────────────────────
+# Ranked open work, already in recommended order. ~650 tokens vs ~164k unranked.
+cmd_board() {
+  local n=${1:-10}
+  api GET "/v1/work?ranked=1&limit=$n&fields=slim" | jq -r '
+    (if .dependency_cycles then "!! dependency_cycles: \(.dependency_cycles)" else empty end),
+    (.work[] | "\(.state)\t\(.id)\t\(.milestones_done // 0)/\(.milestones_total // "?")"
+      + (if ((.blocked_by // []) | length) > 0 then "\tblocked_by=\((.blocked_by|join(",")))" else "" end))'
+}
+
+# ── preflight ──────────────────────────────────────────────────────────────
+# Everything you must know before touching a plan, in one block.
+# Grounding rule: read Status from origin/main, never the working tree — a main
+# checkout often sits on another session's branch.
+cmd_preflight() {
+  local slug=${1:?slug required}; local f; f=$(plan_path "$slug")
+  echo "── preflight: $slug"
+
+  # 1. plan exists + grounded against origin/main
+  if [ -f "$f" ]; then
+    local rel; rel=${f#"$WS"/"$PLAN_REPO"/}
+    ( cd "$WS/$PLAN_REPO" && git fetch -q origin main 2>/dev/null
+      if git show "origin/main:$rel" >/dev/null 2>&1; then
+        echo "plan     : tracked on origin/main"
+        git show "origin/main:$rel" | grep -m1 -E '^\s*(\*\*)?(Status|Risk class)\s*:' | sed 's/^/  main   : /'
+        git diff --quiet "origin/main" -- "$rel" 2>/dev/null && echo "  tree   : matches origin/main" || echo "  tree   : ⚠ DIFFERS from origin/main (uncommitted or other branch)"
+      else
+        echo "plan     : ⚠ NOT on origin/main — uncommitted draft, invisible to the board/daemon"
+      fi )
+    grep -c '^\s*-\s*\[ \]' "$f" 2>/dev/null | sed 's/^/  open Progress boxes: /'
+    grep -oE 'OD-[0-9]+' "$f" 2>/dev/null | sort -u | tr '\n' ' ' | sed 's/^/  OD refs: /'; echo
+    grep -E '^\s*(\*\*)?(Depends on|Superseded by|Extended by)' "$f" 2>/dev/null | sed 's/^/  lineage: /'
+  else
+    echo "plan     : ⚠ no file at $f"
+  fi
+
+  # 2. board row
+  echo "board    :"
+  api GET "/v1/work?ranked=1&limit=300&fields=slim" \
+    | jq -r --arg s "execplan:$slug" '.work[] | select(.id==$s) | "  state=\(.state) milestone=\(.current_milestone // "-") done=\(.milestones_done // 0)/\(.milestones_total // "?") blocked_by=\(.blocked_by // [] | join(",") | if .=="" then "-" else . end)"' \
+    | grep . || echo "  (not on the open board — already closed, or never committed)"
+
+  # 3. live-session collisions — advisory, never blocking
+  echo "peers    :"
+  api GET "/v1/coord/active" | jq -r --arg me "${EP_SESSION:-}" '
+    .active_sessions[] | select(.session_id_hex != $me) |
+    "  \(.passport_id) \(.intent.execplan_slug // "-")@\(.intent.milestone // "-") paths=\(.intent.paths // [] | join(","))"' \
+    | grep . || echo "  (no other live sessions)"
+
+  # 4. worktrees — this slug's own, plus the workspace reap tally
+  echo "worktrees:"
+  ls -d "$WS"/*-worktrees/*"$slug"* 2>/dev/null | sed 's/^/  mine: /' | head -4
+  cmd_reap --dry 2>/dev/null | tail -1 | sed 's/^── /  workspace: /'
+}
+
+# ── announce ───────────────────────────────────────────────────────────────
+# Declare focus so peers see you. ttl 0 clears. Advisory: overlaps warn, never block.
+cmd_announce() {
+  local slug=${1:?slug} ms=${2:-} paths=${3:-} ttl=${4:-14400}
+  [ -n "${EP_SESSION:-}" ] || die "EP_SESSION unset — export the session_id_hex from cuecrux_session"
+  local body; body=$(jq -nc --arg s "$EP_SESSION" --arg p "${EP_PROJECT:-default}" --arg e "$slug" \
+    --arg m "$ms" --arg paths "$paths" --argjson ttl "$ttl" \
+    '{session_id:$s,project_id:$p,execplan_slug:$e,ttl_seconds:$ttl}
+     + (if $m=="" then {} else {milestone:$m} end)
+     + (if $paths=="" then {} else {paths:($paths|split(","))} end)')
+  api POST "/v1/coord/announce" "$body" | jq -r '
+    "announced \(.intent.execplan_slug // "-")@\(.intent.milestone // "-") peers=\(.live_peer_intents // 0)",
+    (.overlaps[]? | "⚠ overlap \(.kind): \(.peer_passport_id) has \(.theirs)")'
+}
+
+# ── worktree ───────────────────────────────────────────────────────────────
+# One worktree per plan, named for the slug so `reap` can find it later.
+cmd_worktree() {
+  local repo=${1:?repo path} slug=${2:?slug} branch=${3:-}
+  local root; root=$(repo_root "$repo") || die "not a git repo: $repo"
+  local dir; dir="$(wt_dir "$root")/$slug"
+  branch=${branch:-"feat/$slug"}
+  [ -d "$dir" ] && { echo "worktree exists: $dir ($branch)"; echo "$dir"; return 0; }
+  git -C "$root" fetch -q origin main
+  git -C "$root" worktree add -b "$branch" "$dir" origin/main >&2 \
+    || git -C "$root" worktree add "$dir" "$branch" >&2 \
+    || die "worktree add failed"
+  echo "created: $dir on $branch (from origin/main)"
+  echo "$dir"
+}
+
+# ── reap ───────────────────────────────────────────────────────────────────
+# Delete worktrees whose branch is already an ancestor of origin/main. This is
+# the leak: 9 of 16 Crux worktrees measured stale on 2026-08-06.
+# --dry lists only. Never touches the primary checkout or a dirty tree.
+cmd_reap() {
+  local dry=0 only=""
+  for a in "$@"; do case "$a" in --dry) dry=1;; *) only=$a;; esac; done
+  local repos; repos=$(ls -d "$WS"/*-worktrees 2>/dev/null | sed 's/-worktrees$//')
+  [ -n "$only" ] && repos=$(echo "$repos" | grep -i "$only")
+  local n_stale=0 n_live=0 n_dirty=0
+  for root in $repos; do
+    [ -d "$root/.git" ] || continue
+    git -C "$root" fetch -q origin main 2>/dev/null
+    while read -r dir; do
+      [ -n "$dir" ] || continue
+      [ "$dir" = "$root" ] && continue                      # never the primary checkout
+      case "$dir" in "$WS"/*-worktrees/*) ;; *) continue;; esac  # only our own layout
+      local br; br=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
+      if [ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]; then
+        echo "dirty  $dir ($br) — uncommitted work, skipped"; n_dirty=$((n_dirty+1)); continue
+      fi
+      if [ "$br" != HEAD ] && git -C "$root" merge-base --is-ancestor "$br" origin/main 2>/dev/null; then
+        n_stale=$((n_stale+1))
+        if [ "$dry" = 1 ]; then echo "stale  $dir ($br) — merged"
+        else
+          git -C "$root" worktree remove "$dir" --force >/dev/null 2>&1 \
+            && git -C "$root" branch -d "$br" >/dev/null 2>&1
+          echo "reaped $dir ($br)"
+        fi
+      else
+        n_live=$((n_live+1)); [ "$dry" = 1 ] && echo "live   $dir ($br)"
+      fi
+    done < <(git -C "$root" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}')
+    [ "$dry" = 1 ] || git -C "$root" worktree prune 2>/dev/null
+  done
+  echo "── stale=$n_stale live=$n_live dirty-skipped=$n_dirty$([ "$dry" = 1 ] && echo ' (dry run)')"
+}
+
+# ── pr ─────────────────────────────────────────────────────────────────────
+# open|watch|merge. Never stacks PRs (workspace rule): base is always main.
+cmd_pr() {
+  local action=${1:?open|watch|merge} dir=${2:-.}
+  case "$action" in
+    open)
+      local title=${3:?title} bodyfile=${4:-}
+      local br; br=$(git -C "$dir" rev-parse --abbrev-ref HEAD)
+      git -C "$dir" push -u origin "$br" 2>&1 | tail -2
+      if [ -n "$bodyfile" ]; then
+        gh pr create -R "$(gh repo view --json nameWithOwner -q .nameWithOwner -C "$dir" 2>/dev/null)" \
+          --head "$br" --base main --title "$title" --body-file "$bodyfile" 2>&1 | tail -3
+      else
+        gh pr create --head "$br" --base main --title "$title" --body-file - 2>&1 | tail -3
+      fi ;;
+    watch)   # poll until checks settle; prints one line per state change
+      local br; br=$(git -C "$dir" rev-parse --abbrev-ref HEAD)
+      local num; num=$(gh pr list --head "$br" --json number -q '.[0].number' 2>/dev/null)
+      [ -n "$num" ] || die "no open PR for $br (was it merged? check gh pr list --state all)"
+      gh pr checks "$num" --watch --fail-fast 2>&1 | tail -20
+      gh pr view "$num" --json state,mergeStateStatus,statusCheckRollup \
+        -q '"pr=\(.state) merge=\(.mergeStateStatus)"' ;;
+    merge)
+      local br; br=$(git -C "$dir" rev-parse --abbrev-ref HEAD)
+      local num; num=$(gh pr list --head "$br" --json number -q '.[0].number' 2>/dev/null)
+      [ -n "$num" ] || die "no open PR for $br"
+      # --auto disarms on UNKNOWN mergeability; re-arm rather than assume it stuck.
+      gh pr merge "$num" --squash --auto --delete-branch 2>&1 | tail -3
+      gh pr view "$num" --json state,autoMergeRequest -q '"pr=\(.state) auto=\(.autoMergeRequest != null)"' ;;
+    *) die "pr: open|watch|merge" ;;
+  esac
+}
+
+case "${1:-}" in
+  board)     shift; cmd_board "$@" ;;
+  preflight) shift; cmd_preflight "$@" ;;
+  announce)  shift; cmd_announce "$@" ;;
+  worktree)  shift; cmd_worktree "$@" ;;
+  reap)      shift; cmd_reap "$@" ;;
+  pr)        shift; cmd_pr "$@" ;;
+  *) cat >&2 <<'USAGE'
+ep <cmd>
+  board [n]                          ranked open work, recommended order
+  preflight <slug>                   plan grounding + board row + live peers + worktrees
+  announce <slug> [M<n>] [paths] [ttl]   declare focus (ttl 0 clears)
+  worktree <repo> <slug> [branch]    create/reuse a plan worktree off origin/main
+  reap [--dry] [repo]                delete worktrees whose branch merged to main
+  pr open|watch|merge <dir> [...]    push, poll checks, squash-merge
+env: CRUX_HTTP_URL CRUX_AGENT_TOKEN CUECRUX_ROOT EP_SESSION EP_PROJECT
+     EP_PLAN_REPO EP_PLANS EP_OD_REGISTRY (planning-repo layout)
+USAGE
+     exit 2 ;;
+esac

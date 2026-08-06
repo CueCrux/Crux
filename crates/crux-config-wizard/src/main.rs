@@ -36,6 +36,12 @@ fn main() -> ExitCode {
         return run_hooks(&workspace, action);
     }
 
+    // Same reasoning as `hooks`: skills compose nothing, so they bypass the
+    // CommandReport pipeline rather than faking a report.
+    if let cli::Command::Skills { action } = args.command {
+        return run_skills(action);
+    }
+
     match run(&workspace, args.command) {
         Ok(code) => code,
         Err(e) => {
@@ -65,13 +71,26 @@ fn run(workspace: &Path, cmd: cli::Command) -> std::io::Result<ExitCode> {
         _ => None,
     };
 
+    // Skills follow the same opt-out/opt-in shape as hooks, but need no
+    // prompt: they touch no operator settings file, only `~/.claude/skills/`.
+    let install_skills = match &cmd {
+        cli::Command::Init { no_skills, .. } => !no_skills,
+        cli::Command::Regenerate { skills, .. } => *skills,
+        _ => false,
+    };
+
     let report = match cmd {
         cli::Command::Init {
             non_interactive,
             profiles,
             no_hooks: _,
+            no_skills: _,
         } => init_dispatch(&workspace, non_interactive, profiles)?,
-        cli::Command::Regenerate { force, hooks: _ } => run_regenerate(&workspace, force)?,
+        cli::Command::Regenerate {
+            force,
+            hooks: _,
+            skills: _,
+        } => run_regenerate(&workspace, force)?,
         cli::Command::Check { strict } => run_check(&workspace, strict)?,
         cli::Command::List => run_list(&workspace)?,
         cli::Command::Add { name } => run_add(&workspace, &name)?,
@@ -79,6 +98,7 @@ fn run(workspace: &Path, cmd: cli::Command) -> std::io::Result<ExitCode> {
         cli::Command::Diff { strict } => run_diff(&workspace, strict)?,
         // Dispatched in `main` before this pipeline runs.
         cli::Command::Hooks { .. } => unreachable!("hooks is handled in main()"),
+        cli::Command::Skills { .. } => unreachable!("skills is handled in main()"),
     };
     emit(&report);
 
@@ -87,6 +107,15 @@ fn run(workspace: &Path, cmd: cli::Command) -> std::io::Result<ExitCode> {
     if matches!(report.outcome, CommandOutcome::Ok) {
         if let Some(mode) = hooks_plan {
             hooks_bridge::ensure_hooks(mode);
+        }
+        // Non-fatal, exactly like hooks: a skills problem is reported but never
+        // changes the wizard's exit code, because the composed profile files —
+        // the actual product of this command — are already written and correct.
+        if install_skills {
+            match crux_config_wizard::skills_install::install() {
+                Ok(summary) => println!("{summary}"),
+                Err(e) => eprintln!("skills install: {e} (profiles were written)"),
+            }
         }
     }
 
@@ -154,6 +183,26 @@ fn is_tty() -> bool {
 /// so a client machine with only `crux-hook` installed can repair its own banner
 /// stack without `corecruxctl` or a source checkout. A hooks failure is reported
 /// and exits non-zero, but it never touches the composed profile files.
+/// `skills install|status` — writes/verifies `~/.claude/skills/`. Workspace-
+/// independent: skills are per-user, not per-checkout, so unlike `hooks` there
+/// is no project-local variant.
+fn run_skills(action: cli::SkillsAction) -> ExitCode {
+    let (result, what) = match action {
+        cli::SkillsAction::Install => (crux_config_wizard::skills_install::install(), "install"),
+        cli::SkillsAction::Status => (crux_config_wizard::skills_install::status(), "status"),
+    };
+    match result {
+        Ok(out) => {
+            println!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("skills {what}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn run_hooks(workspace: &Path, action: cli::HooksAction) -> ExitCode {
     let (result, what) = match action {
         cli::HooksAction::Install { user } => {

@@ -39,6 +39,11 @@ pub enum Command {
         /// `init` installs them so one command sets up the whole workspace.
         #[arg(long)]
         no_hooks: bool,
+        /// Don't install the bundled Claude Code skills (e.g. `execplan-run`)
+        /// into `~/.claude/skills/`. By default `init` installs them alongside
+        /// the hooks, for the same reason: one command sets up the workspace.
+        #[arg(long)]
+        no_skills: bool,
     },
     /// Re-compose CLAUDE.md and AGENTS.md from the saved .crux/agent-profile.toml.
     /// Refuses to overwrite hand-edited managed sections unless --force.
@@ -49,6 +54,11 @@ pub enum Command {
         /// (e.g. after a corecruxctl upgrade adds a new hook). Off by default.
         #[arg(long)]
         hooks: bool,
+        /// Also refresh the bundled Claude Code skills in `~/.claude/skills/`
+        /// (e.g. after an upgrade revises the `execplan-run` procedure).
+        /// Off by default.
+        #[arg(long)]
+        skills: bool,
     },
     /// CI mode: exit 0 if files match what regenerate would produce, non-zero otherwise.
     Check {
@@ -77,6 +87,25 @@ pub enum Command {
         #[command(subcommand)]
         action: HooksAction,
     },
+    /// Install or inspect the bundled Claude Code skills.
+    ///
+    /// Skills are files under `~/.claude/skills/<name>/` — no `settings.json`
+    /// wiring, so unlike `hooks` this is purely a write-and-verify operation.
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillsAction {
+    /// Write the bundled skills into `~/.claude/skills/`. Idempotent: unchanged
+    /// files are not rewritten, and an operator edit is backed up to `.bak`
+    /// before being replaced.
+    Install,
+    /// Report which bundled skill files are installed and whether each matches
+    /// the bytes this binary ships (a present-but-stale file looks installed).
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
