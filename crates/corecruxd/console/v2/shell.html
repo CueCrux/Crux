@@ -3141,7 +3141,31 @@
   .act-livedot { width: 8px; height: 8px; border-radius: 999px; background: var(--ink3); flex: none; }
   .act-livedot.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
   .act-list { display: flex; flex-direction: column; gap: 8px; }
-  .act-row { border: 1px solid var(--edge); border-left: 4px solid var(--ink3); border-radius: 10px; padding: 10px 13px; background: var(--surface); cursor: pointer; }
+  /* ---- Patchbay canvas (console-execplan-patchbay M4) -------------------
+     The open board in space. Plates are ground-coloured and read by their
+     shadow; cards use the same --surface/--edge material as every other card
+     in the console; wires are declared dependencies drawn X/Y only. */
+  .pb-canvas { display: block; width: 100%; height: auto; max-height: 78vh; margin: 4px 0 2px; }
+  .pb-plate { fill: var(--bg, var(--surface2)); stroke: none; filter: drop-shadow(0 6px 10px rgba(0,0,0,.30)); }
+  .pb-centre { fill: var(--surface); stroke: var(--edge); stroke-width: 1; }
+  .pb-centre-t { fill: var(--acc); font-size: 12px; font-weight: 700; letter-spacing: .12em; }
+  .pb-centre-n { fill: var(--ink3); font-size: 9.5px; }
+  .pb-chip-bg { fill: var(--surface); stroke: var(--edge); stroke-width: 1; }
+  .pb-chip-t { fill: var(--ink); font-size: 10.5px; }
+  .pb-chip-m { fill: var(--ink3); font-size: 9px; font-variant-numeric: tabular-nums; }
+  .pb-meter { fill: var(--surface2); stroke: var(--edge); stroke-width: 1; }
+  .pb-rail { fill: var(--surface2); stroke: var(--edge); stroke-width: 1; }
+  .pb-rail-t { fill: var(--ink2); font-size: 10.5px; }
+  .pb-rail-n { fill: var(--ink3); font-size: 9px; }
+  .pb-wire { fill: none; stroke: var(--acc); stroke-width: 1.8; opacity: .32;
+             stroke-linejoin: round; stroke-linecap: round; }
+  .pb-chip:hover .pb-chip-bg { stroke: var(--acc); }
+  .pb-legend { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin-top: 6px; }
+  .pb-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+  .pb-swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  @media (prefers-reduced-motion: reduce) { .pb-canvas { transition: none; } }
+
+  .act-row { border: 1px solid var(--edge); border-left: 4px solid var(--ink3); border-radius:10px; padding: 10px 13px; background: var(--surface); cursor: pointer; }
   .act-row:hover { border-color: var(--edge-strong); }
   .act-meta { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-family: var(--font-mono); font-size: 10.5px; color: var(--ink3); }
   .act-kind { font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--ink2); }

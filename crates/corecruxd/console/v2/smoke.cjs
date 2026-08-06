@@ -1757,12 +1757,31 @@ function extractThemeVars(theme) {
     asyncChecks.push(Promise.resolve(render.renderPatchbay(pbHost, {})).then(function () {
       const t = textOf(pbHost);
       check(t.indexOf('open plans') >= 0, '[patchbay] renderPatchbay must paint the summary strip');
-      check(t.indexOf('Crux daemon') >= 0 && t.indexOf('Commerce') >= 0,
-        '[patchbay] renderPatchbay must paint every system returned by the projection');
+      // The canvas is the surface, so assert against its nodes, not prose. It
+      // uppercases the system label, which is exactly the kind of drift a text
+      // assertion hides.
+      const nodes = collectNodes(pbHost, [pbHost]);
+      const byClass = function (c) {
+        return nodes.filter(function (n) { return String(n.className || '').split(/\s+/).indexOf(c) >= 0; });
+      };
+      check(byClass('pb-chip').length === pbFixture.plans.length,
+        '[patchbay] the canvas must draw one card per open plan');
+      check(byClass('pb-centre').length === pbFixture.planes.length,
+        '[patchbay] the canvas must draw one label block per system');
+      check(byClass('pb-plate').length === pbFixture.planes.length,
+        '[patchbay] the canvas must draw one raised plate per system');
+      check(byClass('pb-rail').length === pbFixture.services.length,
+        '[patchbay] the canvas must draw one rail per touched service');
+      check(byClass('pb-wire').length === pbFixture.link_count,
+        '[patchbay] the canvas must draw one wire per declared edge');
+      check(t.indexOf('CRUX DAEMON') >= 0 && t.indexOf('COMMERCE') >= 0,
+        '[patchbay] the canvas must label every system it draws');
       check(t.indexOf('declared edges') >= 0,
         '[patchbay] renderPatchbay must surface the declared-edge count');
-      check(t.indexOf('Postgres') >= 0 && t.indexOf('bottom rail') >= 0,
-        '[patchbay] renderPatchbay must paint touched services with the rail the endpoint assigned');
+      check(t.indexOf('Postgres') >= 0,
+        '[patchbay] the canvas must name the services it wires to');
+      check(t.indexOf('not mentions') >= 0,
+        '[patchbay] the legend must state that wires are declared dependencies, not mentions');
       check(t.indexOf('Reading the board') < 0,
         '[patchbay] the loading line must be cleared once the read resolves');
     }).catch(function (e) {
@@ -1796,6 +1815,125 @@ function extractThemeVars(theme) {
       if (pbSavedDoc === undefined) { delete global.document; } else { global.document = pbSavedDoc; }
       if (pbSavedWin === undefined) { delete global.window; } else { global.window = pbSavedWin; }
     }));
+  }
+
+  // Geometry gates (M4). Layout and routing are pure, so the invariants that
+  // make the picture readable are assertable here — no DOM, no daemon, no
+  // screenshot (which headless cannot take of this SPA anyway, see D11).
+  if (typeof render.patchbayLayout === 'function' && typeof render.patchbayRoutes === 'function') {
+    // A board-sized synthetic fixture: 63 plans over 10 systems with 30 declared
+    // edges, matching the real projection's shape.
+    const PLANE_NAMES = ['Crux daemon', 'CoreCrux/Engine', 'Commerce', 'Surfaces/Web', 'Benchmarks',
+      'WikiCrux', 'RCX protocol', 'Agents/Harness', 'VaultCrux', 'ChainCrux'];
+    const PLANE_N = [14, 11, 10, 6, 6, 5, 5, 3, 2, 1];
+    const gPlans = [];
+    let gi = 0;
+    PLANE_NAMES.forEach(function (pn, pi) {
+      for (let k = 0; k < PLANE_N[pi]; k++) {
+        gPlans.push({
+          id: 'execplan:p' + gi, slug: 'p' + gi, title: 'Plan number ' + gi + ' with a longish title',
+          state: ['in_progress', 'blocked', 'planned', 'drafting'][gi % 4],
+          plane: pn, services: [], links: [], milestones_done: gi % 5, milestones_total: 5,
+          updated_at_unix_ms: gi
+        });
+        gi++;
+      }
+    });
+    // 30 edges, deliberately including long cross-system ones.
+    for (let e = 0; e < 30; e++) {
+      const a = gPlans[(e * 7) % gPlans.length], b = gPlans[(e * 13 + 5) % gPlans.length];
+      if (a.slug !== b.slug && a.links.indexOf(b.slug) < 0) { a.links.push(b.slug); }
+    }
+    const gGraph = {
+      plans: gPlans,
+      planes: PLANE_NAMES.map(function (pn, pi) { return { key: pn, n: PLANE_N[pi] }; }),
+      services: [
+        { key: 'Anthropic API', side: 'top', n: 9 }, { key: 'GitHub / CI', side: 'top', n: 14 },
+        { key: 'Postgres', side: 'bottom', n: 12 }, { key: 'GPU-1 / embedders', side: 'bottom', n: 18 },
+        { key: 'Crux HTTP :14800', side: 'left', n: 7 }, { key: 'Paddle', side: 'right', n: 5 }
+      ],
+      link_count: 30
+    };
+    const L = render.patchbayLayout(gGraph);
+    const cw = L.cw, chh = L.ch;
+    check(L.chips.length === gPlans.length,
+      '[patchbay] every open plan must get a card (got ' + L.chips.length + ' of ' + gPlans.length + ')');
+    check(L.chips.length >= 60, '[patchbay] the board-sized fixture must render >= 60 cards');
+    check(L.sections.length === PLANE_NAMES.length, '[patchbay] every system must get a plate');
+
+    function rectsOverlap(a, b) {
+      return !(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y);
+    }
+    const chipRects = L.chips.map(function (c) { return { x: c.x, y: c.y, w: cw, h: chh, slug: c.plan.slug }; });
+    let chipOverlaps = 0, centreOverlaps = 0, landlocked = 0;
+    for (let a = 0; a < chipRects.length; a++) {
+      if (!L.chips[a].out || !L.chips[a].out.length) { landlocked++; }
+      for (let b = a + 1; b < chipRects.length; b++) {
+        if (rectsOverlap(chipRects[a], chipRects[b])) { chipOverlaps++; }
+      }
+      for (let c2 = 0; c2 < L.centres.length; c2++) {
+        if (rectsOverlap(chipRects[a], L.centres[c2])) { centreOverlaps++; }
+      }
+    }
+    check(chipOverlaps === 0, '[patchbay] no two cards may overlap (got ' + chipOverlaps + ')');
+    check(centreOverlaps === 0, '[patchbay] no card may overlap its system label block (got ' + centreOverlaps + ')');
+    check(landlocked === 0,
+      '[patchbay] every card must sit on the ring perimeter with an outward face — a landlocked card cannot route out (got ' + landlocked + ')');
+
+    const R = render.patchbayRoutes(L, gGraph);
+    let expectedEdges = 0;
+    gPlans.forEach(function (p) { expectedEdges += p.links.length; });
+    check(R.length === expectedEdges,
+      '[patchbay] every declared edge must be routed, none dropped (got ' + R.length + ' of ' + expectedEdges + ')');
+    check(R.length >= 25, '[patchbay] the board-sized fixture must route >= 25 wires');
+
+    // Which plate does a card belong to? A wire legitimately crosses only its
+    // OWN two plates, and only where it emerges from the card.
+    function plateOf(slug) {
+      const chip = L.chips.filter(function (c) { return c.plan.slug === slug; })[0];
+      if (!chip) { return null; }
+      for (let s = 0; s < L.sections.length; s++) {
+        const sec = L.sections[s];
+        if (chip.x >= sec.x - 1 && chip.x + cw <= sec.x + sec.w + 1 &&
+            chip.y >= sec.y - 1 && chip.y + chh <= sec.y + sec.h + 1) { return sec; }
+      }
+      return null;
+    }
+    let diagonals = 0, plateCrossings = 0;
+    R.forEach(function (w) {
+      const own = [plateOf(w.from), plateOf(w.to)];
+      for (let i2 = 0; i2 + 1 < w.pts.length; i2++) {
+        const p1 = w.pts[i2], p2 = w.pts[i2 + 1];
+        const dx = Math.abs(p1.x - p2.x), dy = Math.abs(p1.y - p2.y);
+        if (dx > 0.6 && dy > 0.6) { diagonals++; continue; }
+        for (let s = 0; s < L.sections.length; s++) {
+          const sec = L.sections[s];
+          if (own.indexOf(sec) >= 0) { continue; }           // its own plate: the stub
+          const rx = sec.x + 2, ry = sec.y + 2, rw = sec.w - 4, rh = sec.h - 4;
+          let hit = false;
+          if (dx < 0.6) {
+            hit = rx < p1.x && p1.x < rx + rw &&
+              Math.max(ry, Math.min(p1.y, p2.y)) < Math.min(ry + rh, Math.max(p1.y, p2.y));
+          } else {
+            hit = ry < p1.y && p1.y < ry + rh &&
+              Math.max(rx, Math.min(p1.x, p2.x)) < Math.min(rx + rw, Math.max(p1.x, p2.x));
+          }
+          if (hit) { plateCrossings++; }
+        }
+      }
+    });
+    check(diagonals === 0,
+      '[patchbay] every wire segment must run in X or Y only — no diagonals (got ' + diagonals + ')');
+    check(plateCrossings === 0,
+      '[patchbay] no wire may cross a system plate it does not belong to (got ' + plateCrossings + ')');
+
+    // A board with no declared edges must still lay out (the endpoint can
+    // legitimately return zero links) rather than throw.
+    const noEdge = { plans: gPlans.map(function (p) { return Object.assign({}, p, { links: [] }); }),
+      planes: gGraph.planes, services: [], link_count: 0 };
+    const L2 = render.patchbayLayout(noEdge);
+    check(render.patchbayRoutes(L2, noEdge).length === 0,
+      '[patchbay] a board with no declared edges must route nothing and not throw');
   }
 
   const lg = (pages.DESTS || []).filter(function (d) { return d.id === 'linkgraph'; })[0];
