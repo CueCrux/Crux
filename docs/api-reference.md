@@ -28,6 +28,29 @@ Crux Daemon exposes three network surfaces by default:
 
 \* Requires a dataplane-enabled deployment. Returns 501 in Crux Daemon.
 
+### Local prose ingest
+
+| Method | Path | Description | Auth Scope |
+|--------|------|-------------|------------|
+| POST | `/v1/local/ingest` | Seal pre-chunked prose into a local segment (BM25 + optional dense) | `admin:write` (tenant-scoped) |
+
+The 202 response reports the dense lane explicitly, because a corpus that failed
+to embed still indexes over BM25 and otherwise looks healthy:
+
+| Field | Meaning |
+|---|---|
+| `dense_vectors` | Vectors actually persisted to the segment's `.ccxv` companion |
+| `dense_expected` | Vectors this ingest expected — every chunk when the node embeds server-side, the caller-vectored subset otherwise |
+| `dense_status` | `ok`, `partial`, `skipped`, `not_configured` (no vectors expected — BM25-only by configuration), or `not_applicable` (idempotent re-ingest, nothing sealed) |
+
+**Assert `dense_status == "ok"`** (or `dense_vectors == dense_expected`) after
+every ingest that expects semantic recall. `skipped` means the embed step failed
+and the segment sealed lexical-only; the daemon logs
+`local-ingest-dense-gap-sealed` at WARN with the segment sequence, and the cause
+in the preceding `local-ingest-embedding-failed` line. Both fields are additive —
+a client that ignores them sees the response shape it saw before
+([local_ingest.rs](../crates/corecruxd/src/http/local_ingest.rs)).
+
 ### Fact Store
 
 | Method | Path | Description | Auth Scope |
