@@ -27,10 +27,31 @@ pub enum IndexTier {
     Cold,
 }
 
+/// A tenant whose retrieval corpus has been erased, and the segment sequence
+/// at which the erasure happened.
+///
+/// Segments sealed at or below `watermark_segment_seq` are invisible to this
+/// tenant; anything ingested afterwards is served normally, so a corpus can be
+/// erased and then re-paved under the same tenant id.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ForgottenTenant {
+    pub tenant_id: String,
+    pub tenant_hash: u64,
+    pub watermark_segment_seq: u64,
+    /// RFC3339. Supplied by the caller — this crate has no clock.
+    pub forgotten_at: String,
+    /// Segment file groups physically deleted (Layer 2). Zero while the
+    /// erasure is mask-only and therefore still reversible.
+    #[serde(default)]
+    pub segments_reclaimed: usize,
+}
+
 /// Manages loaded .ccxi indexes across multiple sealed segments.
 pub struct IndexManager {
     /// segment_seq → loaded CcxiReader
     segments: BTreeMap<u64, LoadedSegment>,
+    /// tenant_hash → erasure record. Consulted on every tenant-scoped query.
+    forgotten: BTreeMap<u64, ForgottenTenant>,
     /// Maximum bytes of index data to keep in hot tier (memory budget).
     hot_budget_bytes: usize,
     /// Current hot tier usage in bytes.
@@ -55,6 +76,7 @@ impl IndexManager {
     pub fn new() -> Self {
         Self {
             segments: BTreeMap::new(),
+            forgotten: BTreeMap::new(),
             hot_budget_bytes: 4 * 1024 * 1024 * 1024, // 4GB default
             hot_bytes: 0,
             min_residency: std::time::Duration::from_secs(60),
@@ -271,7 +293,71 @@ pub struct TenantFootprint {
     pub mixed_segments: usize,
 }
 
+/// File name of the erasure mask inside the daemon's data dir.
+pub const FORGOTTEN_TENANTS_FILE: &str = "forgotten-tenants.json";
+
 impl IndexManager {
+    /// The querying tenant's erasure watermark, or `None` if it has never been
+    /// forgotten. Pass the result straight to the BM25 scorers.
+    pub fn forgotten_watermark(&self, tenant_hash: u64) -> Option<u64> {
+        self.forgotten.get(&tenant_hash).map(|f| f.watermark_segment_seq)
+    }
+
+    /// Highest loaded segment sequence — the watermark a fresh erasure takes.
+    pub fn max_segment_seq(&self) -> Option<u64> {
+        self.segments.keys().next_back().copied()
+    }
+
+    /// Mask a tenant's corpus. Reversible until the segment files are reclaimed.
+    /// Returns the previous record when the tenant was already forgotten.
+    pub fn forget_tenant(&mut self, record: ForgottenTenant) -> Option<ForgottenTenant> {
+        self.forgotten.insert(record.tenant_hash, record)
+    }
+
+    /// Lift a mask. Layer-1 rollback; meaningless once the files are gone,
+    /// which is why the caller must refuse it for a reclaimed tenant.
+    pub fn unforget_tenant(&mut self, tenant_hash: u64) -> Option<ForgottenTenant> {
+        self.forgotten.remove(&tenant_hash)
+    }
+
+    pub fn forgotten_tenant(&self, tenant_hash: u64) -> Option<&ForgottenTenant> {
+        self.forgotten.get(&tenant_hash)
+    }
+
+    pub fn forgotten_tenants(&self) -> Vec<&ForgottenTenant> {
+        self.forgotten.values().collect()
+    }
+
+    /// Persist the mask atomically (tmp + rename).
+    ///
+    /// Ordering contract: this must succeed *before* any segment file is
+    /// deleted. A crash between the two then leaves a tenant masked with its
+    /// files intact — recoverable — rather than files gone with no mask.
+    pub fn save_forgotten(&self, path: &Path) -> crate::Result<()> {
+        let json = serde_json::to_vec_pretty(&self.forgotten.values().collect::<Vec<_>>())
+            .map_err(|e| crate::RetrievalError::Internal { msg: e.to_string() })?;
+        let tmp = path.with_extension("json.partial");
+        std::fs::write(&tmp, &json)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Load the mask at startup. A missing file is not an error (no tenant has
+    /// ever been forgotten); an unreadable one is, because silently serving an
+    /// erased corpus is the failure this whole surface exists to prevent.
+    pub fn load_forgotten(&mut self, path: &Path) -> crate::Result<usize> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        let records: Vec<ForgottenTenant> =
+            serde_json::from_slice(&bytes).map_err(|e| crate::RetrievalError::Internal { msg: e.to_string() })?;
+        let count = records.len();
+        self.forgotten = records.into_iter().map(|r| (r.tenant_hash, r)).collect();
+        Ok(count)
+    }
+
     /// Read-only inventory of the segments holding `tenant_hash`'s documents.
     ///
     /// Segments with no docs for the tenant are omitted. `bytes` is the size of
@@ -746,6 +832,104 @@ mod tests {
         let mut mgr = IndexManager::new();
         mgr.load_ccxi_bytes(&build_ccxi_for(1, &[0xAAAA])).unwrap();
         assert_eq!(mgr.tenant_footprint(0xAAAA).bytes, 0);
+    }
+
+    // ── forgotten-tenant mask (Layer 1) ──────────────────────────────
+
+    fn record(tenant_id: &str, tenant_hash: u64, watermark: u64) -> ForgottenTenant {
+        ForgottenTenant {
+            tenant_id: tenant_id.to_string(),
+            tenant_hash,
+            watermark_segment_seq: watermark,
+            forgotten_at: "2026-08-06T00:00:00Z".to_string(),
+            segments_reclaimed: 0,
+        }
+    }
+
+    #[test]
+    fn watermark_is_none_until_a_tenant_is_forgotten() {
+        let mut mgr = IndexManager::new();
+        mgr.load_ccxi_bytes(&build_ccxi_for(1, &[0xAAAA])).unwrap();
+        assert_eq!(mgr.forgotten_watermark(0xAAAA), None);
+
+        mgr.forget_tenant(record("acme", 0xAAAA, 1));
+        assert_eq!(mgr.forgotten_watermark(0xAAAA), Some(1));
+        assert_eq!(mgr.forgotten_watermark(0xBBBB), None, "sibling tenant unaffected");
+    }
+
+    #[test]
+    fn unforget_lifts_the_mask() {
+        let mut mgr = IndexManager::new();
+        mgr.forget_tenant(record("acme", 0xAAAA, 4));
+        assert!(mgr.unforget_tenant(0xAAAA).is_some());
+        assert_eq!(mgr.forgotten_watermark(0xAAAA), None);
+        assert!(mgr.unforget_tenant(0xAAAA).is_none(), "second lift is a no-op");
+    }
+
+    #[test]
+    fn max_segment_seq_picks_the_watermark() {
+        let mut mgr = IndexManager::new();
+        assert_eq!(mgr.max_segment_seq(), None);
+        mgr.load_ccxi_bytes(&build_ccxi_for(3, &[0xAAAA])).unwrap();
+        mgr.load_ccxi_bytes(&build_ccxi_for(11, &[0xAAAA])).unwrap();
+        mgr.load_ccxi_bytes(&build_ccxi_for(7, &[0xAAAA])).unwrap();
+        assert_eq!(mgr.max_segment_seq(), Some(11));
+    }
+
+    #[test]
+    fn mask_survives_a_save_load_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(FORGOTTEN_TENANTS_FILE);
+
+        let mut mgr = IndexManager::new();
+        mgr.forget_tenant(record("acme", 0xAAAA, 18));
+        mgr.forget_tenant(record("globex", 0xBBBB, 4));
+        mgr.save_forgotten(&path).unwrap();
+
+        // Simulate a daemon restart.
+        let mut cold = IndexManager::new();
+        assert_eq!(cold.load_forgotten(&path).unwrap(), 2);
+        assert_eq!(cold.forgotten_watermark(0xAAAA), Some(18));
+        assert_eq!(cold.forgotten_watermark(0xBBBB), Some(4));
+        assert_eq!(cold.forgotten_tenant(0xAAAA).unwrap().tenant_id, "acme");
+    }
+
+    #[test]
+    fn missing_mask_file_is_not_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = IndexManager::new();
+        assert_eq!(mgr.load_forgotten(&tmp.path().join(FORGOTTEN_TENANTS_FILE)).unwrap(), 0);
+    }
+
+    #[test]
+    fn corrupt_mask_file_is_an_error_not_an_empty_mask() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(FORGOTTEN_TENANTS_FILE);
+        std::fs::write(&path, b"{ not json").unwrap();
+        let mut mgr = IndexManager::new();
+        assert!(
+            mgr.load_forgotten(&path).is_err(),
+            "an unreadable mask must never degrade to 'nothing is forgotten'"
+        );
+    }
+
+    #[test]
+    fn save_leaves_no_partial_file_behind() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(FORGOTTEN_TENANTS_FILE);
+        let mut mgr = IndexManager::new();
+        mgr.forget_tenant(record("acme", 0xAAAA, 1));
+        mgr.save_forgotten(&path).unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("partial"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "tmp file must be renamed, not left: {leftovers:?}"
+        );
     }
 
     // ── min_residency protection ─────────────────────────────────────

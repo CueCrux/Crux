@@ -152,6 +152,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/admin/append", methods: &["POST"], tag: "Admin", auth: "admin-write", summary: "Admin append" },
     RouteEntry { path: "/v1/admin/control", methods: &["GET"], tag: "Admin", auth: "admin-read", summary: "Admin control" },
     RouteEntry { path: "/v1/admin/ops-log", methods: &["GET"], tag: "Admin", auth: "admin-read", summary: "Admin ops log" },
+    RouteEntry { path: "/v1/admin/tenants/{tenantId}/footprint", methods: &["GET"], tag: "Admin", auth: "admin-read", summary: "Tenant retrieval-corpus footprint" },
     RouteEntry { path: "/v1/admin/projections/artifacts/{artifactId}/dependents", methods: &["GET"], tag: "Admin", auth: "admin-read", summary: "Admin projections artifacts {artifactId} dependents" },
     RouteEntry { path: "/v1/admin/projections/artifacts/{artifactId}/pressure-events", methods: &["GET"], tag: "Admin", auth: "admin-read", summary: "Admin projections artifacts {artifactId} pressure events" },
     RouteEntry { path: "/v1/admin/projections/artifacts/{artifactId}/relations", methods: &["GET"], tag: "Admin", auth: "admin-read", summary: "Admin projections artifacts {artifactId} relations" },
