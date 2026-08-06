@@ -178,6 +178,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: bash scripts/ci-cargo-with-fallback.sh build --workspace
+      # setup-python brings its own interpreter, so this does not depend on the
+      # host having python3-venv and does not install into the persistent
+      # runner's system python. Same action, pin and runner label as
+      # audit-vectors.yml, which is the proven pattern here.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v6
+        with:
+          python-version: '3.12'
       - name: Escrow verification cross-check (Rust vs Python reference)
         # The published verification page (docs/verify-key-escrow.md) tells
         # customers that two independent implementations agree and that CI fails
@@ -185,9 +192,8 @@ jobs:
         # test refuses to skip here, so a runner that lost the dependency fails
         # the build instead of quietly leaving the claim unchecked.
         run: |
-          python3 -m venv /tmp/crux-escrow-venv
-          /tmp/crux-escrow-venv/bin/pip install --quiet pynacl blake3
-          PATH="/tmp/crux-escrow-venv/bin:$PATH" CRUX_REQUIRE_PYTHON_REFERENCE=1 \
+          python3 -m pip install --disable-pip-version-check pynacl blake3
+          CRUX_REQUIRE_PYTHON_REFERENCE=1 \
             bash scripts/ci-cargo-with-fallback.sh test -p crux-escrow --test python_reference_agrees
       - name: HTTP auth boundary contracts
         run: bash scripts/ci-cargo-with-fallback.sh test -p corecruxd route_auth
