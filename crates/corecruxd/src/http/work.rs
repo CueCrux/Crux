@@ -12,6 +12,140 @@ use super::{
     StatusCode,
 };
 
+/// The `fields=slim` row: the minimum a client needs to decide what to work on
+/// next. Exists because the full board is ~164k tokens and the ranked slim list
+/// is ~650, so this projection — not the full row — is what the boot banner and
+/// every token-conscious agent actually reads.
+///
+/// Optional fields are omitted rather than emitted as null, so a row never
+/// carries a key that means nothing for its kind.
+fn slim_row(w: &crate::work::WorkItem) -> serde_json::Value {
+    let mut o = serde_json::Map::new();
+    o.insert("id".into(), serde_json::json!(w.id));
+    o.insert("state".into(), serde_json::json!(w.state));
+    if let Some(m) = &w.current_milestone {
+        o.insert("current_milestone".into(), serde_json::json!(m));
+    }
+    if let Some(d) = w.milestones_done {
+        o.insert("milestones_done".into(), serde_json::json!(d));
+    }
+    if let Some(t) = w.milestones_total {
+        o.insert("milestones_total".into(), serde_json::json!(t));
+    }
+    if !w.blocked_by.is_empty() {
+        o.insert("blocked_by".into(), serde_json::json!(w.blocked_by));
+    }
+    // Staleness is computed on every request (`STALE_AGE_MS`) and `rank_open`
+    // already sorts stale-first — but omitting it here meant the signal was
+    // computed, ranked on, and then discarded before reaching any client that
+    // reads `slim`. Measured 2026-08-06: 37 of 63 `in_progress` plans were
+    // stale and not one of them said so on the wire.
+    if let Some(s) = w.stale {
+        o.insert("stale".into(), serde_json::json!(s));
+    }
+    serde_json::Value::Object(o)
+}
+
+#[cfg(test)]
+mod slim_tests {
+    use super::slim_row;
+    use crate::work::WorkItem;
+
+    fn item(state: &str) -> WorkItem {
+        WorkItem {
+            id: "execplan:demo-2026-08-06".into(),
+            project_id: "execplans".into(),
+            state: state.into(),
+            title: "demo".into(),
+            body: String::new(),
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: None,
+            blocker_kind: None,
+            created_by_passport: "test".into(),
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+            plan_path: None,
+            plan_content_hash: None,
+            current_milestone: None,
+            next_ready_milestone: None,
+            superseded_by: None,
+            depends_on: Vec::new(),
+            extended_by: Vec::new(),
+            blocked_by: Vec::new(),
+            open_decisions: Vec::new(),
+            orchestrator_id: None,
+            milestones_done: None,
+            milestones_total: None,
+            notes_count: None,
+            provenance: None,
+            stale: None,
+            token_burn: None,
+        }
+    }
+
+    /// The regression this milestone exists for: `stale` is computed and ranked
+    /// on, and used to be dropped before it reached any `slim` client.
+    #[test]
+    fn slim_row_carries_stale_when_the_projection_set_it() {
+        let mut w = item("in_progress");
+        w.stale = Some(true);
+        assert_eq!(
+            slim_row(&w).get("stale").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+
+        w.stale = Some(false);
+        assert_eq!(
+            slim_row(&w).get("stale").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "a fresh in_progress plan must say so explicitly — absent would read as unknown"
+        );
+    }
+
+    /// `None` means "this flag is meaningless here" (kanban items, terminal
+    /// states). Emitting `null` would grow every row on the board's hottest
+    /// projection for no information.
+    #[test]
+    fn slim_row_omits_stale_when_unset() {
+        assert!(
+            !slim_row(&item("planned"))
+                .as_object()
+                .is_some_and(|o| o.contains_key("stale")),
+            "unset staleness must be omitted, not null"
+        );
+    }
+
+    /// Guards the rest of the contract: adding a field must not drop or rename
+    /// one. These six are what the boot banner and `ep board` parse.
+    #[test]
+    fn slim_row_keeps_its_existing_keys() {
+        let mut w = item("in_progress");
+        w.current_milestone = Some("M3".into());
+        w.milestones_done = Some(3);
+        w.milestones_total = Some(5);
+        w.blocked_by = vec!["execplan:other".into()];
+        let v = slim_row(&w);
+        let o = v.as_object().expect("slim row is an object");
+        for k in [
+            "id",
+            "state",
+            "current_milestone",
+            "milestones_done",
+            "milestones_total",
+            "blocked_by",
+        ] {
+            assert!(o.contains_key(k), "slim row lost `{k}`");
+        }
+        assert!(
+            !o.contains_key("body") && !o.contains_key("provenance"),
+            "slim must stay slim — the full board is ~164k tokens for this reason"
+        );
+    }
+}
+
 /// Where `/v1/work` reads from.
 ///
 /// - `Kanban` (default for backwards-compat with existing callers that omit
@@ -308,29 +442,7 @@ pub(super) async fn get_work(
 
     let slim = q.fields.as_deref() == Some("slim");
     let work_json: serde_json::Value = if slim {
-        serde_json::Value::Array(
-            items
-                .iter()
-                .map(|w| {
-                    let mut o = serde_json::Map::new();
-                    o.insert("id".into(), serde_json::json!(w.id));
-                    o.insert("state".into(), serde_json::json!(w.state));
-                    if let Some(m) = &w.current_milestone {
-                        o.insert("current_milestone".into(), serde_json::json!(m));
-                    }
-                    if let Some(d) = w.milestones_done {
-                        o.insert("milestones_done".into(), serde_json::json!(d));
-                    }
-                    if let Some(t) = w.milestones_total {
-                        o.insert("milestones_total".into(), serde_json::json!(t));
-                    }
-                    if !w.blocked_by.is_empty() {
-                        o.insert("blocked_by".into(), serde_json::json!(w.blocked_by));
-                    }
-                    serde_json::Value::Object(o)
-                })
-                .collect(),
-        )
+        serde_json::Value::Array(items.iter().map(slim_row).collect())
     } else {
         serde_json::json!(items)
     };
