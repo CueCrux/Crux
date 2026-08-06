@@ -294,18 +294,25 @@ impl TestDaemon {
     /// only thing carried across.
     pub fn restart(&mut self) {
         self.stop();
-        let command = Self::build_command(
-            &Self::binary_path().expect("daemon binary"),
-            self.data_dir.path(),
-            &self.stderr_log_path,
-            self.http_port,
-            self.grpc_port,
-            self.mcp_port,
-            self.agent_token.as_deref(),
-            &self.extra_env,
-        );
-        self.process = { command }.spawn().expect("restart corecruxd");
-        if let Err(err) = self.wait_healthy(startup_timeout()) {
+        let outcome = Self::binary_path()
+            .and_then(|binary| {
+                Self::build_command(
+                    &binary,
+                    self.data_dir.path(),
+                    &self.stderr_log_path,
+                    self.http_port,
+                    self.grpc_port,
+                    self.mcp_port,
+                    self.agent_token.as_deref(),
+                    &self.extra_env,
+                )
+            })
+            .and_then(|mut command| command.spawn().map_err(|err| format!("respawn corecruxd: {err}")))
+            .and_then(|process| {
+                self.process = process;
+                self.wait_healthy(startup_timeout())
+            });
+        if let Err(err) = outcome {
             panic!("daemon did not come back after restart: {err}");
         }
     }
@@ -349,12 +356,12 @@ impl TestDaemon {
         mcp_port: u16,
         agent_token: Option<&str>,
         extra_env: &[(String, String)],
-    ) -> Command {
+    ) -> Result<Command, String> {
         let stderr_log = OpenOptions::new()
             .create(true)
             .append(true)
             .open(stderr_log_path)
-            .expect("open stderr log");
+            .map_err(|err| format!("open stderr log {}: {err}", stderr_log_path.display()))?;
 
         let mut command = Command::new(binary);
         command
@@ -382,7 +389,7 @@ impl TestDaemon {
         if let Some(token) = agent_token {
             command.env("CRUX_AGENT_TOKEN", token);
         }
-        command
+        Ok(command)
     }
 
     fn spawn_once(agent_token: Option<&str>, extra_env: &[(&str, &str)]) -> Result<Self, String> {
@@ -412,7 +419,7 @@ impl TestDaemon {
             mcp_port,
             agent_token,
             &extra_env,
-        );
+        )?;
 
         let process = command
             .spawn()
