@@ -102,6 +102,11 @@ pub(super) struct ForgetTenantsBody {
     tenant_ids: Vec<String>,
     #[serde(default, alias = "tenantId")]
     tenant_id: Option<String>,
+    /// Layer 2 — delete the segment files of every whole-tenant segment.
+    /// **Irreversible**, so it is opt-in: the default leaves an erasure
+    /// reversible via `DELETE /v1/admin/forget-tenants/{tenantId}`.
+    #[serde(default)]
+    reclaim: bool,
 }
 
 /// Signed erasure receipt — counts, the watermark, and the erasure's scope.
@@ -116,6 +121,10 @@ struct TenantCorpusErasureReceiptV1<'a> {
     segments_masked: usize,
     docs_masked: usize,
     mixed_segments_retained: usize,
+    /// Segment file groups deleted. Non-zero means the erasure is no longer
+    /// reversible.
+    segments_reclaimed: usize,
+    bytes_reclaimed: u64,
     /// Names what was erased. The corpus only — a tenant's facts, sessions and
     /// activity rows are untouched, so this is not a full Art.17 erasure.
     scope: &'a str,
@@ -130,13 +139,25 @@ struct ErasureOutcome {
     segments_scanned: usize,
     docs_masked: usize,
     mixed_segments_retained: usize,
+    /// Segment sequences whose every document belongs to this tenant — the
+    /// only ones a reclaim may delete.
+    reclaimable: Vec<u64>,
+    segments_reclaimed: usize,
+    bytes_reclaimed: u64,
 }
 
 /// `POST /v1/admin/forget-tenants` — erase the named tenants' retrieval corpora.
 ///
-/// Layer 1 only: the segments are masked and the mask is persisted, so the
-/// operation is reversible via `DELETE /v1/admin/forget-tenants/{tenantId}`
-/// until the files are reclaimed.
+/// Two layers, in this order. Layer 1 masks the segments and persists the mask,
+/// which is reversible via `DELETE /v1/admin/forget-tenants/{tenantId}`. Layer 2
+/// (`"reclaim": true`, opt-in) then deletes the file group of every whole-tenant
+/// segment and is **irreversible** — recovery is restore-from-backup only.
+/// Mixed-tenant segments are never deleted; they stay masked and are reported
+/// as `mixed_segments_retained`.
+///
+/// The mask is made durable before any file is unlinked, so a crash in between
+/// leaves files on disk under a live mask — inert, and reclaimable again — never
+/// files deleted with no mask.
 ///
 /// Auth is `admin:write` **per named tenant**; the whole batch is rejected if
 /// any tenant fails, and nothing is masked (CoreCrux audit Finding #5 parity —
@@ -151,6 +172,7 @@ pub(super) async fn post_forget_tenants(
         return tenant_erasure_disabled_response();
     }
 
+    let reclaim = body.reclaim;
     let mut raw = body.tenant_ids;
     raw.extend(body.tenant_id);
     let tenant_ids = normalize_forget_tenant_ids(raw);
@@ -221,6 +243,14 @@ pub(super) async fn post_forget_tenants(
                 segments_scanned: footprint.segments.len(),
                 docs_masked: footprint.docs,
                 mixed_segments_retained: footprint.mixed_segments,
+                reclaimable: footprint
+                    .segments
+                    .iter()
+                    .filter(|s| s.whole_tenant)
+                    .map(|s| s.segment_seq)
+                    .collect(),
+                segments_reclaimed: 0,
+                bytes_reclaimed: 0,
             });
         }
 
@@ -244,6 +274,47 @@ pub(super) async fn post_forget_tenants(
                 format!("erasure mask could not be persisted ({err}); nothing was erased"),
             )
             .into_response();
+        }
+
+        // ── Layer 2 (irreversible) — only after the mask is durable ─────────
+        if reclaim {
+            for outcome in &mut outcomes {
+                for &segment_seq in &outcome.reclaimable {
+                    match index.reclaim_segment(segment_seq) {
+                        Ok(bytes) => {
+                            outcome.segments_reclaimed += 1;
+                            outcome.bytes_reclaimed += bytes;
+                        }
+                        Err(err) => {
+                            // The mask still hides the segment, so retrieval
+                            // stays correct; the disk space is simply not
+                            // freed. Loud, not fatal.
+                            tracing::error!(
+                                tenant_id = %outcome.tenant_id,
+                                segment_seq,
+                                ?err,
+                                "tenant-erasure-segment-reclaim-failed"
+                            );
+                        }
+                    }
+                }
+                if outcome.segments_reclaimed > 0 {
+                    if let Some(mut record) = index.forgotten_tenant(outcome.tenant_hash).cloned() {
+                        record.segments_reclaimed = outcome.segments_reclaimed;
+                        index.forget_tenant(record);
+                    }
+                }
+            }
+            // Re-persist so a later unmask attempt sees that the files are gone.
+            // The erasure itself already succeeded; a failure here is audit
+            // debt, never a rollback.
+            if let Err(err) = index.save_forgotten(&forgotten_path) {
+                tracing::error!(
+                    ?err,
+                    path = ?forgotten_path,
+                    "AUDIT DEBT: reclaim counts not persisted; segment files are already deleted"
+                );
+            }
         }
         outcomes
     };
@@ -270,6 +341,8 @@ pub(super) async fn post_forget_tenants(
                     segments_masked: outcome.segments_scanned,
                     docs_masked: outcome.docs_masked,
                     mixed_segments_retained: outcome.mixed_segments_retained,
+                    segments_reclaimed: outcome.segments_reclaimed,
+                    bytes_reclaimed: outcome.bytes_reclaimed,
                     scope: "retrieval_corpus",
                     recorded_at: recorded_at.clone(),
                 },
@@ -281,6 +354,8 @@ pub(super) async fn post_forget_tenants(
                 segments = outcome.segments_scanned,
                 docs = outcome.docs_masked,
                 mixed_segments_retained = outcome.mixed_segments_retained,
+                segments_reclaimed = outcome.segments_reclaimed,
+                bytes_reclaimed = outcome.bytes_reclaimed,
                 receipt_id = ?receipt_id,
                 "tenant-corpus-erased"
             );
@@ -291,8 +366,8 @@ pub(super) async fn post_forget_tenants(
                 "watermark_segment_seq": outcome.watermark_segment_seq,
                 "segments_scanned": outcome.segments_scanned,
                 "docs_masked": outcome.docs_masked,
-                "segments_reclaimed": 0,
-                "bytes_reclaimed": 0,
+                "segments_reclaimed": outcome.segments_reclaimed,
+                "bytes_reclaimed": outcome.bytes_reclaimed,
                 "mixed_segments_retained": outcome.mixed_segments_retained,
                 "receipt_id": receipt_id,
             })
@@ -306,7 +381,12 @@ pub(super) async fn post_forget_tenants(
             "tenants": per_tenant.len(),
             "per_tenant": per_tenant,
             "scope": "retrieval_corpus",
-            "durability": "mask persisted; segment files retained (reversible until reclaimed)",
+            "reclaimed": reclaim,
+            "durability": if reclaim {
+                "mask persisted; whole-tenant segment files deleted (irreversible)"
+            } else {
+                "mask persisted; segment files retained (reversible until reclaimed)"
+            },
         })),
     )
         .into_response()
@@ -665,6 +745,119 @@ mod tests {
         std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
         std::env::remove_var("CORECRUXD_JWT_ISS");
         std::env::remove_var("CORECRUXD_JWT_AUD");
+    }
+
+    // ── Layer 2 physical reclaim ─────────────────────────────────────
+
+    /// Seed `data_dir/shards/shard-0000/segments` with real segment file groups
+    /// and load them, so `path` is set and a reclaim has something to delete.
+    async fn on_disk_state() -> (AppState, std::path::PathBuf) {
+        let state = test_app_state(1);
+        let segments = state.data_dir.join("shards").join("shard-0000").join("segments");
+        std::fs::create_dir_all(&segments).unwrap();
+
+        for (seq, tenants) in [
+            (1u64, vec!["acme", "acme"]),
+            (2, vec!["acme", "globex"]),
+            (3, vec!["globex"]),
+        ] {
+            let stem = format!("seg-{seq:020}-abcdef{seq}");
+            std::fs::write(segments.join(format!("{stem}.ccxi")), segment_bytes(&tenants, seq)).unwrap();
+            std::fs::write(segments.join(format!("{stem}.ccxseg")), vec![0u8; 400]).unwrap();
+            std::fs::write(segments.join(format!("{stem}.ccxv")), vec![0u8; 100]).unwrap();
+        }
+        state.retrieval_index.write().await.scan_and_load(&segments).unwrap();
+        (state, segments)
+    }
+
+    fn segment_files(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn reclaim_deletes_whole_tenant_segments_and_keeps_mixed_ones() {
+        let (state, segments) = on_disk_state().await;
+
+        let footprint_bytes = state
+            .retrieval_index
+            .read()
+            .await
+            .tenant_footprint(tenant_hash_xxhash64("acme"))
+            .segments
+            .iter()
+            .filter(|s| s.whole_tenant)
+            .map(|s| s.bytes)
+            .sum::<u64>();
+
+        let (status, body) = forget(&state, serde_json::json!({ "tenant_ids": ["acme"], "reclaim": true })).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let row = &body["per_tenant"][0];
+        assert_eq!(row["segments_reclaimed"], 1, "only the whole-tenant segment goes");
+        assert_eq!(row["mixed_segments_retained"], 1);
+        assert_eq!(
+            row["bytes_reclaimed"].as_u64().unwrap(),
+            footprint_bytes,
+            "bytes freed match what the footprint promised"
+        );
+
+        // Segment 1's whole file group is gone; 2 and 3 are untouched.
+        let remaining = segment_files(&segments);
+        assert!(
+            !remaining.iter().any(|n| n.starts_with("seg-00000000000000000001-")),
+            "reclaimed group still on disk: {remaining:?}"
+        );
+        for seq in ["seg-00000000000000000002-", "seg-00000000000000000003-"] {
+            assert_eq!(
+                remaining.iter().filter(|n| n.starts_with(seq)).count(),
+                3,
+                "co-tenant segment files must survive: {remaining:?}"
+            );
+        }
+
+        // The daemon no longer holds a reader for the deleted segment, so a
+        // restart-equivalent rescan finds nothing dangling.
+        let index = state.retrieval_index.read().await;
+        assert_eq!(index.segment_count(), 2);
+        drop(index);
+        let mut cold = corecrux_retrieval::IndexManager::new();
+        assert_eq!(cold.scan_and_load(&segments).unwrap(), 2, "clean restart");
+    }
+
+    #[tokio::test]
+    async fn a_reclaimed_mask_cannot_be_lifted() {
+        let (state, _) = on_disk_state().await;
+        forget(&state, serde_json::json!({ "tenant_ids": ["acme"], "reclaim": true })).await;
+
+        let resp = delete_forget_tenant(State(state.clone()), Path("acme".to_string()), HeaderMap::new()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "there is nothing to unmask once the files are deleted"
+        );
+        assert!(state
+            .retrieval_index
+            .read()
+            .await
+            .forgotten_watermark(tenant_hash_xxhash64("acme"))
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn reclaim_is_opt_in() {
+        let (state, segments) = on_disk_state().await;
+        let before = segment_files(&segments);
+
+        let (_, body) = forget(&state, serde_json::json!({ "tenant_ids": ["acme"] })).await;
+        assert_eq!(body["per_tenant"][0]["segments_reclaimed"], 0);
+        assert_eq!(body["reclaimed"], false);
+        assert_eq!(segment_files(&segments), before, "no file touched without reclaim=true");
     }
 
     #[test]

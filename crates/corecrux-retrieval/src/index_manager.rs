@@ -358,6 +358,33 @@ impl IndexManager {
         Ok(count)
     }
 
+    /// Physically reclaim one segment: evict it from the index, then delete its
+    /// whole file group. Returns the bytes freed (0 if the segment was not
+    /// loaded or was loaded from bytes rather than from disk).
+    ///
+    /// **Irreversible.** The ordering is the contract: the reader is dropped
+    /// before the files go, so the daemon can never serve a segment whose files
+    /// have already been deleted. A crash in the window leaves files on disk
+    /// under a persisted mask — inert, and reclaimable again later.
+    ///
+    /// Only call this for a segment whose documents all belong to the tenant
+    /// being erased ([`SegmentFootprint::whole_tenant`]); deleting a shared
+    /// segment would erase a co-tenant's data.
+    pub fn reclaim_segment(&mut self, segment_seq: u64) -> crate::Result<u64> {
+        let Some(seg) = self.segments.remove(&segment_seq) else {
+            return Ok(0);
+        };
+        if seg.tier == IndexTier::Hot {
+            self.hot_bytes = self.hot_bytes.saturating_sub(seg.size_bytes);
+        }
+        let path = seg.path.clone();
+        drop(seg); // reader released before any unlink
+        if path.as_os_str().is_empty() {
+            return Ok(0);
+        }
+        delete_segment_group(&path)
+    }
+
     /// Read-only inventory of the segments holding `tenant_hash`'s documents.
     ///
     /// Segments with no docs for the tenant are omitted. `bytes` is the size of
@@ -400,6 +427,30 @@ impl IndexManager {
         }
         out
     }
+}
+
+/// Delete every file sharing the segment's stem (`.ccxseg`, `.ccxi`, `.ccxv`,
+/// `.ccxp`, and any `.partial` left by an interrupted write) and return the
+/// bytes freed. The `stem.` prefix is exact, so a neighbouring segment in the
+/// same directory is never touched.
+fn delete_segment_group(ccxi_path: &Path) -> crate::Result<u64> {
+    let (Some(dir), Some(stem)) = (ccxi_path.parent(), ccxi_path.file_stem().and_then(|s| s.to_str())) else {
+        return Ok(0);
+    };
+    let prefix = format!("{stem}.");
+    let mut freed = 0u64;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        std::fs::remove_file(entry.path())?;
+        freed += len;
+    }
+    Ok(freed)
 }
 
 /// Total bytes of each segment's file group, keyed by its `.ccxi` path.
@@ -930,6 +981,59 @@ mod tests {
             leftovers.is_empty(),
             "tmp file must be renamed, not left: {leftovers:?}"
         );
+    }
+
+    // ── reclaim_segment (Layer 2) ────────────────────────────────────
+
+    fn write_group(dir: &Path, seq: u64, tenants: &[u64]) -> u64 {
+        let stem = format!("seg-{seq:020}-abcdef");
+        let ccxi = build_ccxi_for(seq, tenants);
+        std::fs::write(dir.join(format!("{stem}.ccxi")), &ccxi).unwrap();
+        std::fs::write(dir.join(format!("{stem}.ccxseg")), vec![0u8; 400]).unwrap();
+        std::fs::write(dir.join(format!("{stem}.ccxv")), vec![0u8; 100]).unwrap();
+        ccxi.len() as u64 + 400 + 100
+    }
+
+    #[test]
+    fn reclaim_evicts_then_deletes_the_whole_group() {
+        let tmp = TempDir::new().unwrap();
+        let expected = write_group(tmp.path(), 1, &[0xAAAA]);
+        write_group(tmp.path(), 2, &[0xBBBB]);
+
+        let mut mgr = IndexManager::new();
+        mgr.scan_and_load(tmp.path()).unwrap();
+        assert_eq!(mgr.segment_count(), 2);
+
+        let freed = mgr.reclaim_segment(1).unwrap();
+        assert_eq!(freed, expected);
+        assert_eq!(mgr.segment_count(), 1, "evicted before the unlink");
+        assert_eq!(mgr.tenant_footprint(0xAAAA).segments.len(), 0);
+
+        let left: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(left.len(), 3, "only segment 2's group survives: {left:?}");
+        assert!(left.iter().all(|n| n.contains("00000000000000000002")));
+
+        // A cold rescan must not resurrect the deleted segment.
+        let mut cold = IndexManager::new();
+        assert_eq!(cold.scan_and_load(tmp.path()).unwrap(), 1);
+    }
+
+    #[test]
+    fn reclaim_of_an_unloaded_segment_is_a_no_op() {
+        let mut mgr = IndexManager::new();
+        assert_eq!(mgr.reclaim_segment(42).unwrap(), 0);
+    }
+
+    #[test]
+    fn reclaim_of_an_in_memory_segment_frees_nothing_but_still_evicts() {
+        let mut mgr = IndexManager::new();
+        mgr.load_ccxi_bytes(&build_ccxi_for(1, &[0xAAAA])).unwrap();
+        assert_eq!(mgr.reclaim_segment(1).unwrap(), 0);
+        assert_eq!(mgr.segment_count(), 0);
     }
 
     // ── min_residency protection ─────────────────────────────────────
