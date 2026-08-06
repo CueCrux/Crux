@@ -886,7 +886,20 @@ impl FactStore {
             {
                 continue;
             }
-            let sim = crate::embeddings::cosine_similarity(new_vec, other_vec);
+            // D-25: a dimension mismatch means the two vectors came from
+            // different embedding profiles and cannot be compared at all.
+            // Scoring that 0.0 silently declares them dissimilar, which is a
+            // *decision* here — it suppresses a near-duplicate link.
+            let Some(sim) = crate::embeddings::try_cosine_similarity(new_vec, other_vec) else {
+                tracing::warn!(
+                    fact_id = %fact.fact_id,
+                    other_id = %other_id,
+                    new_dim = new_vec.len(),
+                    other_dim = other_vec.len(),
+                    "near-duplicate check skipped: embedding dimensions differ (mixed semantic profiles)"
+                );
+                continue;
+            };
             if sim >= threshold && best.as_ref().is_none_or(|(_, s)| sim > *s) {
                 best = Some((other_id.clone(), sim));
             }

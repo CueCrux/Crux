@@ -4,7 +4,7 @@
 > Anchored by **symbol name** (greppable), not line number (rots). Verified against
 > the tree by `scripts/check-agent-docs.sh` in CI.
 
-The workspace has **28 cargo crates** under `crates/`. (`crux-console-ui` is a built
+The workspace has **34 cargo crates** under `crates/`. (`crux-console-ui` is a built
 SPA — `dist/` only, not a cargo member — and is excluded below.)
 
 ## Trust core (read these first)
@@ -16,6 +16,8 @@ SPA — `dist/` only, not a cargo member — and is excluded below.)
 | `corecrux-receipts` | Receipt formats, Ed25519 signing, strict verification, witness anchoring, export bundles | `verify_receipt_v1`, `build_c2pa_manifest_v1`/`verify_c2pa_manifest_v1`, `build_bundle_v1`/`verify_bundle_v1`, `build_external_anchor_body_v1`/`verify_rfc6962_inclusion_proof_v1`, `sign_stream_v1` | crux-integrations, crux-mcp, corecruxctl, corecruxd | 12.0k |
 | `corecrux-frame` | Canonical v1 frame encoding + hash helpers (header / payload / stream) | `canonical_header_bytes_v1`, `compute_header_hash`, `compute_payload_hash`, `decode_canonical_header_bytes_v1` | corecrux-{index,projections,storage,segment}, corecruxctl, corecruxd | 0.3k |
 | `rcx-capability-token` | RCX capability token v1.0 (schema-lock, CBOR/JSON mirror, validation) | `RcxCapabilityToken`, `verify_token`, `validate_basic`, `RcxTier`, `ReceiptClass` | crux-enterprise-shim, crux-mcp, crux-router | 1.1k |
+| `rcx-revocation` | CRL feed behind `Revocation.crl_url`; tri-state freshness so callers fail closed | `RevocationSnapshot`, `authorize_when_known`, `RevocationFeed`, `CrlTransport`, `CrlDocument` | (relay accept path — M5) | 0.5k |
+| `crux-escrow` | Vault key recovery: recovery-code wrapped DEKs, Shamir 2-of-3 escrow, delayed cancellable share release | `RecoveryCode`, `WrappedDek`, `wrap_dek`/`unwrap_dek`, `VaultSetup::acknowledge`, `split_escrow`/`combine_shares`, `release::ReleaseRequest` | corecruxd | 0.7k |
 
 ## Memory & retrieval
 

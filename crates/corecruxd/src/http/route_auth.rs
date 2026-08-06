@@ -502,6 +502,10 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
     }
 
     if path.starts_with("/v1/work")
+        // Counts-only roll-up over the work / gate / coord feeds. It reads the
+        // same surfaces as `/v1/work`, so it takes the same contract —
+        // aggregating into integers is not a reason to authorize it any lower.
+        || path.starts_with("/v1/attention/")
         || path.starts_with("/v1/status-feed")
         || path.starts_with("/v1/projects")
         || path.starts_with("/v1/rcx/publish/")
@@ -624,6 +628,15 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
         ));
     }
 
+    // Escrow holds customer key ciphertext and the custodian-share release
+    // lane; reads and writes are both admin-scoped, never public or query-read.
+    if path.starts_with("/v1/escrow/") {
+        return Some(if method == "GET" {
+            RouteAuthContract::new(RouteAuthClass::AdminRead, &["admin:read"])
+        } else {
+            RouteAuthContract::new(RouteAuthClass::AdminWrite, &["admin:write"])
+        });
+    }
     if path.starts_with("/v1/legal-holds") {
         return Some(RouteAuthContract::gated(
             RouteAuthClass::FeatureGated,

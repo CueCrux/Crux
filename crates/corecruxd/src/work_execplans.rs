@@ -346,10 +346,18 @@ pub fn parse_plan(md: &str) -> ParsedPlan {
         }
 
         if out.status_line.is_none() {
-            if let Some(rest) = trimmed.strip_prefix("Status:") {
-                out.status_line = Some(rest.trim().to_string());
-            } else if let Some(rest) = trimmed.strip_prefix("> **Status:**") {
-                out.status_line = Some(rest.trim().to_string());
+            // Enumerating spellings has now failed twice. `> Status:` was added
+            // 2026-08-03 after 117 of 1,115 plans turned out to use it; the very
+            // next audit found `**Status:**` and `- **Status:**` missing too.
+            // `status_declaration` instead accepts whatever `strip_markup`
+            // accepts, which is the same markup set the rest of this module has
+            // always tolerated — so the extractor can no longer be narrower than
+            // its own consumers. Case-sensitivity is preserved deliberately: a
+            // lowercase `status: draft` in YAML frontmatter is metadata, not a
+            // declaration, and matching it would shadow the real `Status:` line
+            // below (three plans do exactly this).
+            if let Some(rest) = status_declaration(line) {
+                out.status_line = Some(rest.to_string());
             }
         }
 
@@ -485,8 +493,15 @@ fn declared_status(value: &str) -> Option<DeclaredStatus> {
         ("code-complete", DeclaredStatus::Complete),
         ("in_progress", DeclaredStatus::InProgress),
         ("in progress", DeclaredStatus::InProgress),
+        // 17 plans lead with `Active — …`; it was falling through to
+        // fact-inference. Unambiguously live work, so it reads as InProgress —
+        // which `terminal_completion` can still override for a finished plan.
+        ("active", DeclaredStatus::InProgress),
         ("superseded", DeclaredStatus::Superseded),
         ("completed", DeclaredStatus::Complete),
+        // `Closed <date> — …` is how a closing session spells Complete when it
+        // is thinking in board terms rather than plan terms.
+        ("closed", DeclaredStatus::Complete),
         ("complete", DeclaredStatus::Complete),
         ("deployed", DeclaredStatus::Complete),
         ("shipped", DeclaredStatus::Complete),
@@ -519,6 +534,22 @@ fn declared_status(value: &str) -> Option<DeclaredStatus> {
 /// declarations like `"Status: Superseded by \[\[next-plan\]\]"` or
 /// `"> **Status:** Superseded by \[\[next-plan\]\]"`.
 fn strip_leading_markup(line: &str) -> &str {
+    let s = strip_markup(line);
+    // Optional `Status:` (case-insensitive). ASCII-only, so byte-indexing
+    // into `s` after measuring against `lower` is safe.
+    let lower = s.to_ascii_lowercase();
+    if lower.starts_with("status:") {
+        return s[7..].trim_start_matches([' ', '*']);
+    }
+    s
+}
+
+/// The markup half of [`strip_leading_markup`]: leading whitespace, blockquote
+/// arrows, list markers and bold asterisks, but *not* a `Status:` prefix.
+/// Split out so [`status_declaration`] can ask "was there a `Status:` token
+/// here?" — a question [`strip_leading_markup`] cannot answer, because it
+/// strips the token and returns the remainder either way.
+fn strip_markup(line: &str) -> &str {
     let mut s = line.trim_start();
     // Blockquote arrows, possibly nested or separated by whitespace.
     while let Some(rest) = s.strip_prefix('>') {
@@ -536,14 +567,39 @@ fn strip_leading_markup(line: &str) -> &str {
         }
     }
     // Bold markers around the next token.
-    s = s.trim_start_matches('*');
-    // Optional `Status:` (case-insensitive). ASCII-only, so byte-indexing
-    // into `s` after measuring against `lower` is safe.
-    let lower = s.to_ascii_lowercase();
-    if lower.starts_with("status:") {
-        s = s[7..].trim_start_matches([' ', '*']);
-    }
-    s
+    s.trim_start_matches('*')
+}
+
+/// Match a `Status:` *declaration* at the start of a line and return its value.
+///
+/// Accepts every leading-markup form [`strip_markup`] handles, so `Status: X`,
+/// `**Status:** X`, `- **Status:** X` and `> **Status:**  X` all read alike.
+/// This is the whole point: the extractor used to accept exactly two literal
+/// prefixes while everything downstream already tolerated the full set, so a
+/// bold or list-item Status line parsed as *absent* and its plan silently fell
+/// through to fact-derived state. Sixty plans in the working corpus declared a
+/// status the board could not see, twenty-three of them terminal.
+///
+/// Deliberately CASE-SENSITIVE on `Status:`, matching the pre-existing
+/// contract: a lowercase `status: draft` in YAML frontmatter must not shadow
+/// the real declaration below it. Every real declaration in the corpus
+/// capitalises it.
+fn status_declaration(line: &str) -> Option<&str> {
+    let s = strip_markup(line);
+    // `trim_start_matches('*')` BEFORE `trim()`, deliberately, and not
+    // `trim_start_matches([' ', '*'])`. It is what the bare-`Status:` arm has
+    // always done, and the ordering carries meaning:
+    //   `Status: **Complete**`      -> value starts with a space, so the `*`
+    //                                  strip is a no-op and the operator's bold
+    //                                  survives intact as `**Complete**`.
+    //   `- **Status:** Complete`    -> `strip_markup` already ate the opening
+    //                                  `**`, leaving `** Complete` after the
+    //                                  token; the `*` strip removes the orphaned
+    //                                  closing pair, and `trim` the gap.
+    // Without the strip, `declared_status` would lowercase `** Complete` to a
+    // value with a leading space and match no token at all.
+    s.strip_prefix("Status:")
+        .map(|rest| rest.trim_start_matches('*').trim())
 }
 
 /// Match a "Superseded by …" *declaration* at the start of a line, after
@@ -1825,6 +1881,105 @@ pub fn apply_default_orchestrator(items: &mut [WorkItem], default_id: &str) {
 
 #[cfg(test)]
 mod tests {
+
+    /// `> Status:` — blockquote, no bold — is a live spelling: 117 of 1,115
+    /// plans used it on 2026-08-03 and every one of those declarations was
+    /// invisible to the board, which fell through to fact-inference instead.
+    #[test]
+    fn status_is_read_from_all_three_spellings() {
+        for md in [
+            "# P\n\nStatus: Complete\n",
+            "# P\n\n> **Status:** Complete\n",
+            "# P\n\n> Status: Complete\n",
+        ] {
+            let parsed = parse_plan(md);
+            assert_eq!(
+                parsed.status_line.as_deref(),
+                Some("Complete"),
+                "failed to read status from: {md:?}"
+            );
+        }
+    }
+
+    /// The extractor must accept every leading-markup form `strip_markup`
+    /// accepts, not an enumerated subset. Enumerating failed twice: `> Status:`
+    /// was added after 117 plans turned out to use it, and the next audit found
+    /// `**Status:**` (bold, no blockquote) and `- **Status:**` (list item)
+    /// equally invisible — 71 plans in the corpus, 28 of them declaring a
+    /// terminal state the board was ignoring.
+    #[test]
+    fn status_is_read_through_any_leading_markup() {
+        for md in [
+            "# P\n\n**Status:** Complete\n",
+            "# P\n\n- **Status:** Complete\n",
+            "# P\n\n* **Status:** Complete\n",
+            "# P\n\n1. **Status:** Complete\n",
+            "# P\n\n>**Status:** Complete\n",
+            "# P\n\n> > **Status:**   Complete\n",
+            "# P\n\n  - Status:  Complete  \n",
+        ] {
+            assert_eq!(
+                parse_plan(md).status_line.as_deref(),
+                Some("Complete"),
+                "failed to read status from: {md:?}"
+            );
+        }
+    }
+
+    /// Trailing bold must survive: `Status: Complete — landed in **PR #429**`
+    /// must not have its closing `**` eaten, or the prose the operator reads on
+    /// the board loses the reference.
+    #[test]
+    fn status_value_keeps_trailing_bold() {
+        let parsed = parse_plan("# P\n\n- **Status:** Complete — landed in **PR #429**\n");
+        assert_eq!(parsed.status_line.as_deref(), Some("Complete — landed in **PR #429**"));
+        assert_eq!(
+            declared_status(parsed.status_line.as_deref().unwrap()),
+            Some(DeclaredStatus::Complete)
+        );
+    }
+
+    /// `Active` and `Closed` are in live use as leading declaration tokens (17
+    /// and 1 plans respectively) and used to fall through to fact-inference.
+    #[test]
+    fn active_and_closed_are_declaration_tokens() {
+        assert_eq!(
+            declared_status("Active — M0–M4 landed, M5 next"),
+            Some(DeclaredStatus::InProgress)
+        );
+        assert_eq!(
+            declared_status("Closed 2026-08-03 — all milestones merged"),
+            Some(DeclaredStatus::Complete)
+        );
+        // Boundary discipline is unchanged: a longer word that merely starts
+        // with a token is not that token.
+        assert_eq!(declared_status("Activewear taxonomy audit"), None);
+        assert_eq!(declared_status("Closedown checklist"), None);
+    }
+
+    /// A bold Status line in the body must not be able to declare on behalf of
+    /// a plan whose header already declared. First declaration wins, as before.
+    #[test]
+    fn first_status_declaration_still_wins() {
+        let md =
+            "# P\n\nStatus: In progress — M2 next\n\n## Notes\n\n- **Status:** Complete (an example of the format)\n";
+        assert_eq!(parse_plan(md).status_line.as_deref(), Some("In progress — M2 next"));
+    }
+
+    /// A lowercase `status:` in YAML frontmatter is metadata, not a declaration.
+    /// Matching it would shadow the real `Status:` line below — three plans
+    /// (`corecrux-kv-*`, `llm-gate-*`) carry `status: draft` in frontmatter while
+    /// declaring `Status: Parked` / `Status: Archived` further down.
+    #[test]
+    fn frontmatter_status_does_not_shadow_the_real_declaration() {
+        let md = "---\nstatus: draft\n---\n\n# P\n\nStatus: Parked — superseded by the follow-up\n";
+        let parsed = parse_plan(md);
+        assert!(
+            parsed.status_line.as_deref().unwrap_or("").starts_with("Parked"),
+            "frontmatter shadowed the declaration: {:?}",
+            parsed.status_line
+        );
+    }
     use super::*;
     use chrono::TimeZone;
     use corecrux_memory::fact_store::StoreFact;

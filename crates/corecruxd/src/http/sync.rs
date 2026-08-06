@@ -415,7 +415,10 @@ async fn require_sync_read(state: &AppState, headers: &HeaderMap, tenant_id: &st
     if ctx.has_scope("admin:read") {
         return Ok(());
     }
+    // The scope is discarded here deliberately: sync reads go through the peer
+    // path below, not the tenant-scoped readers this type guards (M1 non-goal).
     require_http_scopes_for_tenant(&state.auth, headers, &["facts:read"], tenant_id)
+        .map(|_| ())
         .map_err(IntoResponse::into_response)
 }
 
@@ -429,7 +432,9 @@ async fn require_sync_write(state: &AppState, headers: &HeaderMap, tenant_id: &s
     if ctx.has_scope("admin:write") {
         return Ok(());
     }
+    // Scope discarded for the same reason as the read side above.
     require_http_scopes_for_tenant(&state.auth, headers, &["facts:write"], tenant_id)
+        .map(|_| ())
         .map_err(IntoResponse::into_response)
 }
 

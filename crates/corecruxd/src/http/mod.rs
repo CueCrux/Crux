@@ -11,7 +11,8 @@ mod admin;
 mod agent_usage;
 mod append;
 mod approval_receipts;
-mod auth_device;
+mod attention;
+pub(crate) mod auth_device;
 mod auth_rails;
 mod cases;
 // Hosted-service HTTP surface (ExecPlan crux-external-findings-remediation M4):
@@ -41,6 +42,7 @@ mod memory_capture;
 // Pro GPU-1 compute bridge (`/v1/gpu1/*`). Compiled out of the default
 // Community Edition binary; see the `hosted-surfaces` feature.
 mod audit_verify;
+mod escrow;
 #[cfg(feature = "hosted-surfaces")]
 mod gpu1;
 mod health;
@@ -314,6 +316,12 @@ pub struct AppState {
     /// 500 until restart; recovering potentially inconsistent money-path state
     /// could otherwise permit an untracked debit or compute without a debit.
     pub credit_meter: Option<Arc<std::sync::Mutex<crate::credit_meter::CreditMeterStore>>>,
+    /// Per-seat rate ceiling on LLM-enriched verdicts (M8).
+    ///
+    /// Always present, unlike `credit_meter`: the ceiling is a safety limit and
+    /// must hold whether or not billing is switched on. A daemon with the meter
+    /// off still refuses a runaway loop.
+    pub enrich_budgets: Arc<std::sync::Mutex<crate::enrich_budget::EnrichBudgets>>,
     /// G21b assembly cache over
     /// `corecrux_projections::assembly_cache::AssemblyCache` — memoizes
     /// assembled `/v1/context` bundles keyed by
@@ -493,6 +501,26 @@ pub(crate) fn router_with_route_auth(
             axum::routing::post(self::compute::post_compute_embed).layer(
                 axum::extract::DefaultBodyLimit::max(self::compute::COMPUTE_EMBED_MAX_REQUEST_BYTES),
             ),
+        )
+        .route(
+            "/v1/escrow/vaults/{vault_id}",
+            axum::routing::put(self::escrow::put_wrapped_dek).get(self::escrow::get_wrapped_dek),
+        )
+        .route(
+            "/v1/escrow/vaults/{vault_id}/release",
+            axum::routing::post(self::escrow::post_release),
+        )
+        .route(
+            "/v1/escrow/releases/{request_id}",
+            axum::routing::get(self::escrow::get_release),
+        )
+        .route(
+            "/v1/escrow/releases/{request_id}/cancel",
+            axum::routing::post(self::escrow::post_release_cancel),
+        )
+        .route(
+            "/v1/escrow/releases/{request_id}/complete",
+            axum::routing::post(self::escrow::post_release_complete),
         )
         .route("/v1/legal-holds", axum::routing::post(self::legal_holds::post_legal_hold))
         .route(
@@ -919,6 +947,10 @@ pub(crate) fn router_with_route_auth(
             "/v1/coord/announce",
             axum::routing::post(self::coord::post_coord_announce),
         )
+        // Counts-only attention roll-up over work + gates + coord sessions. The
+        // three feeds it aggregates are disqualified from the hosted read-only
+        // subset (plan names, local paths); four integers are not.
+        .route("/v1/attention/summary", get(self::attention::get_attention_summary))
         // Work coordination — kanban over `__work__::*` facts.
         .route(
             "/v1/execplans/refresh",
@@ -1009,6 +1041,13 @@ pub(crate) fn router_with_route_auth(
         .route("/v1/code-intel/blast-radius", get(self::traces::get_blast_radius))
         .route("/v1/code-intel/liveness", get(self::traces::get_liveness))
         .route("/v1/code-intel/trace-diff", get(self::traces::get_trace_diff))
+        .route("/v1/code-intel/volume", get(self::traces::get_span_volume))
+        .route("/v1/code-intel/enrich-budget", get(self::traces::get_enrich_budget))
+        .route(
+            "/v1/code-intel/enrich",
+            axum::routing::post(self::traces::post_enrich_verdict),
+        )
+        .route("/v1/code-intel/releases", get(self::traces::get_releases))
         .route("/v1/code-intel/dead-code", get(self::traces::get_dead_code_ladder))
         .route("/v1/repos/{repo_id}/spatial", get(self::traces::get_repo_spatial))
         .route(
@@ -1852,6 +1891,15 @@ fn problem_for_status(status: StatusCode, detail: impl Into<String>) -> ProblemR
             StatusCode::NO_CONTENT.as_u16(),
             "https://errors.cuecrux.com/no-content",
             "No Content",
+        )
+        .with_detail(detail),
+        // 425. A mandatory waiting period has not elapsed — distinct from a
+        // conflict, because the caller should retry later rather than give up.
+        // Used by the escrow custodian-share release delay.
+        StatusCode::TOO_EARLY => ProblemDetails::new(
+            StatusCode::TOO_EARLY.as_u16(),
+            "https://errors.cuecrux.com/too-early",
+            "Too Early",
         )
         .with_detail(detail),
         _ => ProblemDetails::internal(detail),

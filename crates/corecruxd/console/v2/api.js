@@ -15,7 +15,7 @@
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
 //
-// 186 read endpoints, generated from the route manifest.
+// 192 read endpoints, generated from the route manifest.
 
 /**
  * Append a plain query object to a path as a URL search string.
@@ -50,14 +50,18 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/admin/segments/fingerprints': true,
   '/v1/admin/sharing/posture': true,
   '/v1/admin/version': true,
+  '/v1/attention/summary': true,
   '/v1/auth/whoami': true,
   '/v1/bootstrap/status': true,
   '/v1/cloud/access-contract': true,
   '/v1/code-intel/blast-radius': true,
   '/v1/code-intel/dead-code': true,
+  '/v1/code-intel/enrich-budget': true,
   '/v1/code-intel/liveness': true,
   '/v1/code-intel/path': true,
+  '/v1/code-intel/releases': true,
   '/v1/code-intel/trace-diff': true,
+  '/v1/code-intel/volume': true,
   '/v1/console/connections': true,
   '/v1/console/corecrux/graph/ego': true,
   '/v1/console/corecrux/graph/path': true,
@@ -238,6 +242,9 @@ const CruxApi = Object.freeze({
   agentsByPassportUsage(passport, query) {
     return fetch(withQuery(`/v1/agents/${encodeURIComponent(passport)}/usage`, query), { credentials: 'same-origin' });
   },
+  attentionSummary(query) {
+    return fetch(withQuery(`/v1/attention/summary`, query), { credentials: 'same-origin' });
+  },
   authWhoami(query) {
     return fetch(withQuery(`/v1/auth/whoami`, query), { credentials: 'same-origin' });
   },
@@ -253,14 +260,23 @@ const CruxApi = Object.freeze({
   codeIntelDeadCode(query) {
     return fetch(withQuery(`/v1/code-intel/dead-code`, query), { credentials: 'same-origin' });
   },
+  codeIntelEnrichBudget(query) {
+    return fetch(withQuery(`/v1/code-intel/enrich-budget`, query), { credentials: 'same-origin' });
+  },
   codeIntelLiveness(query) {
     return fetch(withQuery(`/v1/code-intel/liveness`, query), { credentials: 'same-origin' });
   },
   codeIntelPath(query) {
     return fetch(withQuery(`/v1/code-intel/path`, query), { credentials: 'same-origin' });
   },
+  codeIntelReleases(query) {
+    return fetch(withQuery(`/v1/code-intel/releases`, query), { credentials: 'same-origin' });
+  },
   codeIntelTraceDiff(query) {
     return fetch(withQuery(`/v1/code-intel/trace-diff`, query), { credentials: 'same-origin' });
+  },
+  codeIntelVolume(query) {
+    return fetch(withQuery(`/v1/code-intel/volume`, query), { credentials: 'same-origin' });
   },
   consoleChunksByChunkDigest(chunkDigest, query) {
     return fetch(withQuery(`/v1/console/chunks/${encodeURIComponent(chunkDigest)}`, query), { credentials: 'same-origin' });
@@ -363,6 +379,12 @@ const CruxApi = Object.freeze({
   },
   entitiesByKindByIdHistory(kind, id, query) {
     return fetch(withQuery(`/v1/entities/${encodeURIComponent(kind)}/${encodeURIComponent(id)}/history`, query), { credentials: 'same-origin' });
+  },
+  escrowReleasesByRequestId(request_id, query) {
+    return fetch(withQuery(`/v1/escrow/releases/${encodeURIComponent(request_id)}`, query), { credentials: 'same-origin' });
+  },
+  escrowVaultsByVaultId(vault_id, query) {
+    return fetch(withQuery(`/v1/escrow/vaults/${encodeURIComponent(vault_id)}`, query), { credentials: 'same-origin' });
   },
   eventsStream(query) {
     return fetch(withQuery(`/v1/events/stream`, query), { credentials: 'same-origin' });

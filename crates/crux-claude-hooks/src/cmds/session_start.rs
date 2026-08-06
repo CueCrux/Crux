@@ -74,6 +74,33 @@ fn order_sections(sections: Vec<(Stability, String)>, align: bool) -> Vec<String
     stable.into_iter().chain(volatile).collect()
 }
 
+/// Boot self-check section, or `None` when the environment looks healthy.
+///
+/// Only the daemon-version probe touches the network; the cost-capture
+/// observations are a local file read (the SessionEnd hook's last outcome, plus
+/// whether the installed launcher is the one this build ships). Both fail soft —
+/// an unreadable state file reports "nothing recorded" rather than erroring, so
+/// this can run on every boot.
+///
+/// Callers reach here only after `sync_status` succeeded, hence
+/// `sync_reachable: true`.
+fn selfcheck_section(sync_degraded: bool, bootstrap_loaded: bool) -> Option<String> {
+    let daemon_version = mcp_client::server_version();
+    let cost = crux_config_wizard::hooks_install::cost_capture().ok();
+    let obs = crux_config_wizard::selfcheck::BootObservations {
+        hook_version: env!("CARGO_PKG_VERSION"),
+        daemon_version: daemon_version.as_deref(),
+        sync_reachable: true,
+        sync_degraded,
+        bootstrap_loaded,
+        cost_last_result: cost.as_ref().and_then(|c| c.result.as_deref()),
+        cost_launcher_stale: cost
+            .as_ref()
+            .is_some_and(|c| c.installed_version.is_some() && !c.launcher_current()),
+    };
+    crux_config_wizard::selfcheck::render_section(&crux_config_wizard::selfcheck::evaluate(&obs))
+}
+
 pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
     let input = HookInput::read_from(reader)?;
 
@@ -207,18 +234,7 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
     // means `sync_status` succeeded (the `Err` arm returned early), so the daemon
     // was reachable this boot.
     if std::env::var("CRUX_HOOK_WIZARD_CHECK").as_deref() != Ok("off") {
-        let hook_version = env!("CARGO_PKG_VERSION");
-        let daemon_version = mcp_client::server_version();
-        let obs = crux_config_wizard::selfcheck::BootObservations {
-            hook_version,
-            daemon_version: daemon_version.as_deref(),
-            sync_reachable: true,
-            sync_degraded,
-            bootstrap_loaded,
-        };
-        if let Some(section) =
-            crux_config_wizard::selfcheck::render_section(&crux_config_wizard::selfcheck::evaluate(&obs))
-        {
+        if let Some(section) = selfcheck_section(sync_degraded, bootstrap_loaded) {
             // Volatile: reflects live daemon/hook state, not stable playbook text.
             sections.push((Stability::Volatile, section));
         }

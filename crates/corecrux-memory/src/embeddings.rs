@@ -1097,6 +1097,26 @@ impl EmbeddingClient {
 }
 
 /// Compute cosine similarity between two vectors.
+/// Cosine similarity, or `None` when the two vectors are **not comparable**.
+///
+/// D-25: `cosine_similarity` collapses a dimension mismatch to `0.0`, which is
+/// exactly the score of two genuinely orthogonal vectors — so a caller that
+/// has mixed two embedding profiles reads "not similar" and never "not
+/// comparable". Callers that must tell the two apart use this.
+///
+/// `None` means the vectors have different lengths, or either is empty.
+pub fn try_cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    Some(cosine_similarity(a, b))
+}
+
+/// Cosine similarity, with **incomparable treated as `0.0`**.
+///
+/// Prefer [`try_cosine_similarity`] wherever "not comparable" must be
+/// distinguishable from "not similar" — see D-25 in ExecPlan
+/// `crux-pinned-defect-remediation-2026-07-31`.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -1305,6 +1325,26 @@ mod tests {
     fn cosine_empty_vectors() {
         let sim = cosine_similarity(&[], &[]);
         assert_eq!(sim, 0.0);
+    }
+
+    /// D-25: `cosine_similarity` collapses a dimension mismatch to `0.0`,
+    /// which is exactly the score of two genuinely orthogonal vectors, so a
+    /// caller that has mixed two embedding profiles reads "not similar" and
+    /// never "not comparable".
+    #[test]
+    fn try_cosine_similarity_distinguishes_incomparable_from_orthogonal() {
+        // Genuinely orthogonal: comparable, and the answer is 0.
+        let orthogonal = try_cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).expect("same dimension is comparable");
+        assert!(orthogonal.abs() < 1e-6);
+
+        // Different profiles: NOT comparable at all.
+        assert_eq!(try_cosine_similarity(&[1.0, 0.0], &[1.0, 0.0, 0.0]), None);
+        assert_eq!(try_cosine_similarity(&[], &[]), None);
+
+        // The lossy wrapper still returns 0.0 for both, which is the whole
+        // reason the fallible form exists.
+        assert_eq!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]), 0.0);
+        assert_eq!(cosine_similarity(&[1.0, 0.0], &[1.0, 0.0, 0.0]), 0.0);
     }
 
     #[test]
@@ -1678,5 +1718,746 @@ mod tests {
         ));
         assert!(provider.requests()?.is_empty());
         Ok(())
+    }
+
+    // ── cosine_similarity edge cases ───────────────────────────────────
+
+    /// Regression: [`cosine_similarity`] answers a **dimension mismatch** with
+    /// `0.0` — the same value it returns for genuinely orthogonal vectors —
+    /// rather than an error. A caller that mixes two semantic profiles
+    /// therefore reads "not similar" instead of "not comparable". This test
+    /// pins the current behaviour so the ambiguity is deliberate and visible;
+    /// the dense lane must keep enforcing profile compatibility upstream
+    /// (see [`DelegatingEmbedder::validate_and_pin_response`]) because this
+    /// function will not raise the alarm.
+    #[test]
+    fn cosine_dimension_mismatch_is_indistinguishable_from_orthogonal() {
+        let short = vec![1.0f32, 2.0];
+        let long = vec![1.0f32, 2.0, 3.0];
+        assert_eq!(cosine_similarity(&short, &long), 0.0);
+        assert_eq!(cosine_similarity(&long, &short), 0.0);
+        // Identical value to the honest "no similarity" answer:
+        assert_eq!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]), 0.0);
+    }
+
+    /// A zero vector has no direction, so the denominator guard must return
+    /// `0.0` instead of producing `NaN` from a `0.0 / 0.0` division.
+    #[test]
+    fn cosine_zero_vector_returns_zero_not_nan() {
+        let zeros = vec![0.0f32; 4];
+        let other = vec![1.0f32, 2.0, 3.0, 4.0];
+        let sim = cosine_similarity(&zeros, &other);
+        assert_eq!(sim, 0.0);
+        assert!(!sim.is_nan(), "zero-norm must not produce NaN");
+        assert_eq!(cosine_similarity(&zeros, &zeros), 0.0);
+    }
+
+    /// Sub-normal magnitudes fall under the `1e-12` denominator floor, so they
+    /// are treated as directionless rather than amplified into a garbage score.
+    #[test]
+    fn cosine_below_denominator_floor_returns_zero() {
+        let tiny = vec![1e-30f32, 1e-30];
+        assert_eq!(cosine_similarity(&tiny, &tiny), 0.0);
+    }
+
+    /// NaN inputs are *not* filtered by `cosine_similarity`; the score
+    /// propagates as NaN. Callers ranking on this value must reject non-finite
+    /// vectors at ingest — which the delegation path does via
+    /// [`EmbeddingError::InvalidVectorValue`].
+    #[test]
+    fn cosine_nan_input_propagates_nan() {
+        let a = vec![f32::NAN, 1.0];
+        let b = vec![1.0f32, 1.0];
+        assert!(cosine_similarity(&a, &b).is_nan());
+    }
+
+    #[test]
+    fn cosine_anti_parallel_vectors_score_minus_one() {
+        let a = vec![1.0f32, 2.0, 3.0];
+        let b = vec![-1.0f32, -2.0, -3.0];
+        assert!((cosine_similarity(&a, &b) + 1.0).abs() < 1e-6);
+    }
+
+    // ── LocalHashEmbedder edge cases ───────────────────────────────────
+
+    /// A text with no alphanumeric tokens produces no features, so the L2
+    /// normalisation is skipped and the vector stays all-zero. Pinned because
+    /// the zero vector then scores 0.0 against everything — the "absent signal"
+    /// must not become an accidental match.
+    #[test]
+    fn local_hash_embedder_tokenless_text_is_all_zero() -> Result<(), EmbeddingError> {
+        let embedder = LocalHashEmbedder::new(16);
+        let vector = embedder.embed_one("   --- !!! ")?;
+        assert_eq!(vector.len(), 16);
+        assert!(vector.iter().all(|value| *value == 0.0));
+        let other = embedder.embed_one("real words here")?;
+        assert_eq!(cosine_similarity(&vector, &other), 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn local_hash_embedder_clamps_zero_dimensions_to_one() -> Result<(), EmbeddingError> {
+        let embedder = LocalHashEmbedder::new(0);
+        assert_eq!(embedder.dimensions(), 1);
+        assert_eq!(embedder.embed_one("alpha beta")?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn local_hash_embedder_empty_batch_returns_no_vectors() -> Result<(), EmbeddingError> {
+        assert!(LocalHashEmbedder::default().embed_batch(&[])?.is_empty());
+        Ok(())
+    }
+
+    /// The trait's default capability answers: a local embedder reports
+    /// `runs_locally`, has no delegation status, and its mismatch hooks are
+    /// inert no-ops (they must not panic when a caller reports drift against
+    /// an embedder that keeps no live state).
+    #[test]
+    fn local_embedder_trait_defaults_are_inert() {
+        let embedder: Box<dyn Embedder> = Box::new(LocalHashEmbedder::new(32));
+        assert!(embedder.runs_locally());
+        assert!(embedder.delegation_status().is_none());
+        embedder.report_semantic_profile_mismatch();
+        embedder.clear_semantic_profile_mismatch();
+        assert_eq!(embedder.dimensions(), 32);
+    }
+
+    // ── SemanticProfile derivation ─────────────────────────────────────
+
+    /// A detected dimension overrides a `0` (auto-detect) configuration, and a
+    /// profile derived from the config is byte-identical to the equivalent
+    /// [`SemanticProfile::from_parts`] — the two constructors must stay
+    /// comparable or a delegating client can never pin a provider profile.
+    #[test]
+    fn semantic_profile_detected_dimensions_win_over_autodetect_config() {
+        let config = EmbeddingConfig {
+            base_url: "http://localhost:11434".to_string(),
+            model: "auto-dim-model".to_string(),
+            dimensions: 0,
+        };
+        let detected = SemanticProfile::from_embedding_config(&config, 384);
+        assert_eq!(detected.dimensions, 384);
+        assert_eq!(
+            detected,
+            SemanticProfile::from_parts("auto-dim-model", 384, "model_default", "none", "none")
+        );
+
+        let undetected = SemanticProfile::from_embedding_config(&config, 0);
+        assert_eq!(undetected.dimensions, 0);
+        assert_ne!(detected.profile_id, undetected.profile_id);
+    }
+
+    // ── validate_delegating_config ─────────────────────────────────────
+
+    /// Every fail-closed configuration rejection, one row per guard. A missing
+    /// guard here means a delegating embedder starts up pointed at an
+    /// unauthenticated or unbounded provider.
+    #[test]
+    fn validate_delegating_config_rejects_every_unsafe_field() {
+        let cases: Vec<(&str, Box<dyn Fn(&mut DelegatingEmbeddingConfig)>, &str)> = vec![
+            (
+                "blank base url",
+                Box::new(|c: &mut DelegatingEmbeddingConfig| c.base_url = "   ".to_string()),
+                "base URL",
+            ),
+            (
+                "empty bearer token",
+                Box::new(|c: &mut DelegatingEmbeddingConfig| c.bearer_token = String::new()),
+                "bearer token must not be empty",
+            ),
+            (
+                "header-splitting bearer token",
+                Box::new(|c: &mut DelegatingEmbeddingConfig| c.bearer_token = "tok\r\nX-Evil: 1".to_string()),
+                "invalid header characters",
+            ),
+            (
+                "blank expected model",
+                Box::new(|c: &mut DelegatingEmbeddingConfig| c.expected_model = "\t".to_string()),
+                "expected model",
+            ),
+            (
+                "zero dimensions",
+                Box::new(|c: &mut DelegatingEmbeddingConfig| c.expected_dimensions = 0),
+                "dimensions",
+            ),
+            (
+                "zero timeout",
+                Box::new(|c: &mut DelegatingEmbeddingConfig| c.request_timeout = Duration::ZERO),
+                "timeout",
+            ),
+            (
+                "timeout above ceiling",
+                Box::new(|c: &mut DelegatingEmbeddingConfig| {
+                    c.request_timeout = DELEGATION_MAX_TIMEOUT + Duration::from_secs(1);
+                }),
+                "timeout",
+            ),
+            (
+                "zero attempts",
+                Box::new(|c: &mut DelegatingEmbeddingConfig| c.max_attempts = 0),
+                "max attempts",
+            ),
+            (
+                "attempts above ceiling",
+                Box::new(|c: &mut DelegatingEmbeddingConfig| {
+                    c.max_attempts = DELEGATION_MAX_ATTEMPTS_CEILING + 1;
+                }),
+                "max attempts",
+            ),
+            (
+                "backoff above ceiling",
+                Box::new(|c: &mut DelegatingEmbeddingConfig| {
+                    c.initial_backoff = DELEGATION_MAX_BACKOFF + Duration::from_millis(1);
+                }),
+                "initial backoff",
+            ),
+            (
+                "zero breaker threshold",
+                Box::new(|c: &mut DelegatingEmbeddingConfig| c.breaker_failure_threshold = 0),
+                "breaker threshold",
+            ),
+            (
+                "zero breaker cooldown",
+                Box::new(|c: &mut DelegatingEmbeddingConfig| c.breaker_open_for = Duration::ZERO),
+                "breaker cooldown",
+            ),
+            (
+                "breaker cooldown above ceiling",
+                Box::new(|c: &mut DelegatingEmbeddingConfig| {
+                    c.breaker_open_for = DELEGATION_MAX_BREAKER_OPEN_FOR + Duration::from_secs(1);
+                }),
+                "breaker cooldown",
+            ),
+        ];
+
+        for (label, mutate, expected_fragment) in cases {
+            let mut config = delegation_config("provider-a", 2);
+            mutate(&mut config);
+            match validate_delegating_config(&config) {
+                Err(EmbeddingError::Configuration(message)) => {
+                    assert!(
+                        message.contains(expected_fragment),
+                        "{label}: message {message:?} missing {expected_fragment:?}"
+                    );
+                }
+                other => panic!("{label} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    /// The real constructor (which builds the `ureq` agent) must accept a
+    /// valid config without performing any I/O — construction alone must never
+    /// dial the provider.
+    #[test]
+    fn delegating_embedder_new_builds_a_client_without_touching_the_network() -> Result<(), EmbeddingError> {
+        let embedder = DelegatingEmbedder::new(delegation_config("provider-a", 4))?;
+        assert_eq!(embedder.endpoint, "https://provider.example.test/v1/compute/embed");
+        assert_eq!(embedder.expected_profile.model, "provider-a");
+        assert_eq!(embedder.expected_profile.dimensions, 4);
+        assert_eq!(embedder.status().availability, DelegationAvailability::Available);
+        // The batch caps are enforced before any transport call, so this stays
+        // offline even with a live `ureq` agent behind it.
+        assert!(embedder.embed_batch(&[])?.is_empty());
+        Ok(())
+    }
+
+    /// The trait's `embed_one` default must surface an empty provider response
+    /// as [`EmbeddingError::EmptyResponse`] rather than panicking on the
+    /// missing vector.
+    #[test]
+    fn embed_one_default_reports_an_empty_provider_response() {
+        #[derive(Debug)]
+        struct EmptyEmbedder;
+        impl Embedder for EmptyEmbedder {
+            fn embed_batch(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+                Ok(Vec::new())
+            }
+            fn dimensions(&self) -> usize {
+                8
+            }
+            fn model(&self) -> &str {
+                "empty-test-embedder"
+            }
+            fn semantic_profile(&self) -> SemanticProfile {
+                SemanticProfile::from_parts("empty-test-embedder", 8, "none", "none", "none")
+            }
+        }
+
+        let embedder: Box<dyn Embedder> = Box::new(EmptyEmbedder);
+        assert!(matches!(
+            embedder.embed_one("anything"),
+            Err(EmbeddingError::EmptyResponse)
+        ));
+    }
+
+    #[test]
+    fn validate_delegating_config_accepts_the_shipped_defaults() -> Result<(), EmbeddingError> {
+        let config = delegation_config("provider-a", 2);
+        assert_eq!(config.max_attempts, DELEGATION_DEFAULT_MAX_ATTEMPTS);
+        assert_eq!(config.request_timeout, DELEGATION_DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(config.initial_backoff, DELEGATION_DEFAULT_INITIAL_BACKOFF);
+        assert_eq!(
+            config.breaker_failure_threshold,
+            DELEGATION_DEFAULT_BREAKER_FAILURE_THRESHOLD
+        );
+        assert_eq!(config.breaker_open_for, DELEGATION_DEFAULT_BREAKER_OPEN_FOR);
+        validate_delegating_config(&config)
+    }
+
+    /// `new_with_transport` re-validates rather than trusting its caller, so a
+    /// hand-built (non-`new`) config cannot smuggle an unsafe setting past the
+    /// constructor.
+    #[test]
+    fn delegating_embedder_with_transport_revalidates_config() {
+        let provider = MockDelegationProvider::new(Vec::new());
+        let mut config = delegation_config("provider-a", 2);
+        config.bearer_token = String::new();
+        assert!(matches!(
+            mock_delegating_embedder(config, provider),
+            Err(EmbeddingError::Configuration(_))
+        ));
+    }
+
+    // ── Delegation response validation ─────────────────────────────────
+
+    #[test]
+    fn delegating_embedder_empty_batch_short_circuits_without_request() -> Result<(), EmbeddingError> {
+        let provider = MockDelegationProvider::new(Vec::new());
+        let embedder = mock_delegating_embedder(delegation_config("provider-a", 2), provider.clone())?;
+        assert!(embedder.embed_batch(&[])?.is_empty());
+        assert!(provider.requests()?.is_empty());
+        assert_eq!(embedder.status().availability, DelegationAvailability::Available);
+        Ok(())
+    }
+
+    /// The fingerprint is what a persisted vector is compared against, so a
+    /// provider whose fingerprint disagrees with its own outer profile is
+    /// refused before its vectors are handed back.
+    #[test]
+    fn delegating_embedder_rejects_fingerprint_disagreeing_with_profile() -> Result<(), EmbeddingError> {
+        let mut profile = delegation_profile("provider-a", 2, "tokenizer-a");
+        profile.embedding_fingerprint.dimensions = 3;
+        let provider = MockDelegationProvider::new(vec![delegation_response(profile, vec![vec![0.1, 0.9]])]);
+        let embedder = mock_delegating_embedder(delegation_config("provider-a", 2), provider)?;
+
+        assert!(matches!(
+            embedder.embed_batch(&["alpha"]),
+            Err(EmbeddingError::InvalidSemanticProfile(message)) if message.contains("fingerprint")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn delegating_embedder_rejects_fingerprint_model_drift() -> Result<(), EmbeddingError> {
+        let mut profile = delegation_profile("provider-a", 2, "tokenizer-a");
+        profile.embedding_fingerprint.model = "other-model".to_string();
+        let provider = MockDelegationProvider::new(vec![delegation_response(profile, vec![vec![0.1, 0.9]])]);
+        let embedder = mock_delegating_embedder(delegation_config("provider-a", 2), provider)?;
+
+        assert!(matches!(
+            embedder.embed_batch(&["alpha"]),
+            Err(EmbeddingError::InvalidSemanticProfile(_))
+        ));
+        Ok(())
+    }
+
+    /// One vector per input, in order — a short or long response would
+    /// silently misalign vectors against the texts that produced them.
+    #[test]
+    fn delegating_embedder_rejects_response_count_mismatch() -> Result<(), EmbeddingError> {
+        let profile = delegation_profile("provider-a", 2, "tokenizer-a");
+        let provider =
+            MockDelegationProvider::new(vec![delegation_response(profile, vec![vec![0.1, 0.9], vec![0.2, 0.8]])]);
+        let embedder = mock_delegating_embedder(delegation_config("provider-a", 2), provider)?;
+
+        assert!(matches!(
+            embedder.embed_batch(&["only one text"]),
+            Err(EmbeddingError::LengthMismatch { expected: 1, got: 2 })
+        ));
+        Ok(())
+    }
+
+    /// A vector whose width disagrees with the profile it arrived under would
+    /// be scored in the wrong space; it is refused and classed as a profile
+    /// mismatch (not a transient outage) so the breaker reason stays honest.
+    #[test]
+    fn delegating_embedder_rejects_vector_width_disagreeing_with_profile() -> Result<(), EmbeddingError> {
+        let profile = delegation_profile("provider-a", 2, "tokenizer-a");
+        let provider = MockDelegationProvider::new(vec![delegation_response(
+            profile,
+            vec![vec![0.1, 0.9], vec![0.2, 0.8, 0.3]],
+        )]);
+        let embedder = mock_delegating_embedder(delegation_config("provider-a", 2), provider)?;
+
+        assert!(matches!(
+            embedder.embed_batch(&["a", "b"]),
+            Err(EmbeddingError::VectorDimensionMismatch {
+                index: 1,
+                expected: 2,
+                got: 3
+            })
+        ));
+        assert_eq!(embedder.status().reason_code, "embedding_semantic_profile_mismatch");
+        Ok(())
+    }
+
+    /// NaN/infinity poison every downstream cosine score (see
+    /// `cosine_nan_input_propagates_nan`), so they are rejected at the boundary
+    /// rather than persisted.
+    #[test]
+    fn delegating_embedder_rejects_non_finite_vector_values() -> Result<(), EmbeddingError> {
+        for (label, poison) in [("nan", f32::NAN), ("inf", f32::INFINITY), ("-inf", f32::NEG_INFINITY)] {
+            let profile = delegation_profile("provider-a", 2, "tokenizer-a");
+            let provider = MockDelegationProvider::new(vec![delegation_response(
+                profile,
+                vec![vec![0.5, 0.5], vec![poison, 1.0]],
+            )]);
+            let embedder = mock_delegating_embedder(delegation_config("provider-a", 2), provider)?;
+            assert!(
+                matches!(
+                    embedder.embed_batch(&["a", "b"]),
+                    Err(EmbeddingError::InvalidVectorValue { index: 1 })
+                ),
+                "{label} must be rejected"
+            );
+        }
+        Ok(())
+    }
+
+    // ── Circuit-breaker states ─────────────────────────────────────────
+
+    /// Below the breaker threshold the circuit stays closed but availability
+    /// must already read Degraded — reporting Available after a failed call
+    /// would be an "absent signal reads as pass" bug in `/v1/version`.
+    #[test]
+    fn delegating_embedder_reports_degraded_before_the_breaker_opens() -> Result<(), EmbeddingError> {
+        let provider = MockDelegationProvider::new(vec![MockDelegationResponse::Failure(EmbeddingError::Network(
+            "connection refused".to_string(),
+        ))]);
+        let mut config = delegation_config("provider-a", 2);
+        config.max_attempts = 1;
+        config.breaker_failure_threshold = 5;
+        let embedder = mock_delegating_embedder(config, provider)?;
+
+        assert!(matches!(
+            embedder.embed_batch(&["alpha"]),
+            Err(EmbeddingError::Network(_))
+        ));
+        let status = embedder.status();
+        assert_eq!(status.availability, DelegationAvailability::Degraded);
+        assert_eq!(status.circuit_state, DelegationCircuitState::Closed);
+        assert_eq!(status.reason_code, "embedding_delegate_unavailable");
+        assert_eq!(status.consecutive_failures, 1);
+        Ok(())
+    }
+
+    /// Exactly one caller owns the half-open recovery probe. A concurrent
+    /// caller must fail fast instead of joining a recovery stampede against a
+    /// provider that is already known to be sick.
+    #[test]
+    fn delegating_embedder_half_open_rejects_a_second_concurrent_probe() -> Result<(), EmbeddingError> {
+        let provider = MockDelegationProvider::new(Vec::new());
+        let embedder = mock_delegating_embedder(delegation_config("provider-a", 2), provider.clone())?;
+        embedder
+            .runtime
+            .lock()
+            .map_err(|_| EmbeddingError::DelegationState("runtime lock".to_string()))?
+            .circuit = DelegationCircuit::HalfOpen;
+
+        let status = embedder.status();
+        assert_eq!(status.availability, DelegationAvailability::Degraded);
+        assert_eq!(status.circuit_state, DelegationCircuitState::HalfOpen);
+        assert_eq!(status.reason_code, "embedding_delegate_half_open");
+
+        assert!(matches!(
+            embedder.embed_batch(&["probe"]),
+            Err(EmbeddingError::HalfOpenProbeInFlight)
+        ));
+        assert!(provider.requests()?.is_empty(), "no request while a probe is in flight");
+        Ok(())
+    }
+
+    /// While the circuit is open the reported status names the breaker, and
+    /// the retry-after countdown is surfaced to the caller.
+    #[test]
+    fn delegating_embedder_open_circuit_reports_retry_after() -> Result<(), EmbeddingError> {
+        let provider = MockDelegationProvider::new(Vec::new());
+        let mut config = delegation_config("provider-a", 2);
+        config.breaker_open_for = Duration::from_secs(30);
+        let embedder = mock_delegating_embedder(config, provider.clone())?;
+        {
+            let mut runtime = embedder
+                .runtime
+                .lock()
+                .map_err(|_| EmbeddingError::DelegationState("runtime lock".to_string()))?;
+            runtime.circuit = DelegationCircuit::Open {
+                retry_at: Instant::now() + Duration::from_secs(30),
+            };
+            runtime.consecutive_failures = 3;
+        }
+
+        let status = embedder.status();
+        assert_eq!(status.circuit_state, DelegationCircuitState::Open);
+        assert_eq!(status.reason_code, "embedding_delegate_circuit_open");
+        assert_eq!(status.consecutive_failures, 3);
+
+        match embedder.embed_batch(&["blocked"]) {
+            Err(EmbeddingError::CircuitOpen { retry_after_ms }) => {
+                assert!(retry_after_ms > 0 && retry_after_ms <= 30_000, "got {retry_after_ms}ms");
+            }
+            other => panic!("open circuit must refuse the call, got {other:?}"),
+        }
+        assert!(provider.requests()?.is_empty());
+        Ok(())
+    }
+
+    /// If the delegation state mutex is poisoned the client must fail *closed*:
+    /// report Degraded/Open at the maximum failure count rather than returning
+    /// the default "Available" of an unreadable state.
+    #[test]
+    fn delegating_embedder_status_fails_closed_when_state_lock_is_poisoned() -> Result<(), EmbeddingError> {
+        let provider = MockDelegationProvider::new(Vec::new());
+        let mut config = delegation_config("provider-a", 2);
+        config.breaker_failure_threshold = 7;
+        let embedder = Arc::new(mock_delegating_embedder(config, provider.clone())?);
+
+        let poisoner = Arc::clone(&embedder);
+        // The panic below is deliberate (it is how a `std::sync::Mutex` becomes
+        // poisoned) and is contained inside the joined helper thread.
+        let joined = std::thread::spawn(move || {
+            let _held = poisoner.runtime.lock();
+            panic!("poison delegation runtime");
+        })
+        .join();
+        assert!(joined.is_err(), "helper thread must have panicked");
+
+        let status = embedder.status();
+        assert_eq!(status.availability, DelegationAvailability::Degraded);
+        assert_eq!(status.circuit_state, DelegationCircuitState::Open);
+        assert_eq!(status.reason_code, "embedding_delegate_state_unavailable");
+        assert_eq!(status.consecutive_failures, 7);
+
+        // The semantic profile falls back to the configured expectation, and a
+        // call refuses rather than proceeding on unreadable breaker state.
+        assert_eq!(embedder.semantic_profile().model, "provider-a");
+        assert!(matches!(
+            embedder.embed_batch(&["blocked"]),
+            Err(EmbeddingError::DelegationState(_))
+        ));
+        assert!(provider.requests()?.is_empty());
+        Ok(())
+    }
+
+    // ── Embedder trait surface for the delegating client ───────────────
+
+    #[test]
+    fn delegating_embedder_trait_surface_reports_expected_identity() -> Result<(), EmbeddingError> {
+        let provider = MockDelegationProvider::new(Vec::new());
+        let embedder: Box<dyn Embedder> =
+            Box::new(mock_delegating_embedder(delegation_config("provider-a", 7), provider)?);
+        assert_eq!(embedder.dimensions(), 7);
+        assert_eq!(embedder.model(), "provider-a");
+        assert_eq!(embedder.semantic_profile().dimensions, 7);
+        assert!(!embedder.runs_locally(), "delegation must fail closed on locality");
+
+        let status = embedder
+            .delegation_status()
+            .ok_or_else(|| EmbeddingError::DelegationState("delegation status missing".to_string()))?;
+        assert_eq!(status.availability, DelegationAvailability::Available);
+
+        embedder.report_semantic_profile_mismatch();
+        assert_eq!(
+            embedder
+                .delegation_status()
+                .map(|status| status.reason_code)
+                .unwrap_or_default(),
+            "embedding_semantic_profile_mismatch"
+        );
+        embedder.clear_semantic_profile_mismatch();
+        assert_eq!(
+            embedder
+                .delegation_status()
+                .map(|status| status.availability)
+                .ok_or_else(|| EmbeddingError::DelegationState("delegation status missing".to_string()))?,
+            DelegationAvailability::Available
+        );
+        Ok(())
+    }
+
+    // ── EmbeddingClient (no network touched) ───────────────────────────
+
+    #[test]
+    fn embedding_client_accessors_and_empty_batch_need_no_network() -> Result<(), EmbeddingError> {
+        let client = EmbeddingClient::new(EmbeddingConfig {
+            base_url: "http://embedding.invalid:1/".to_string(),
+            model: "nomic-embed-text".to_string(),
+            dimensions: 768,
+        });
+        assert_eq!(client.model(), "nomic-embed-text");
+        assert_eq!(client.base_url(), "http://embedding.invalid:1/");
+        assert_eq!(client.dimensions(), 768);
+        assert_eq!(client.semantic_profile().dimensions, 768);
+        assert!(client.embed_batch(&[])?.is_empty(), "empty batch must not dial out");
+
+        let rendered = format!("{client:?}");
+        assert!(rendered.contains("EmbeddingClient"));
+        assert!(rendered.contains("nomic-embed-text"));
+        Ok(())
+    }
+
+    #[test]
+    fn embedding_client_autodetect_dimensions_start_at_zero() {
+        let client = EmbeddingClient::new(EmbeddingConfig {
+            base_url: "http://embedding.invalid:1".to_string(),
+            model: "auto".to_string(),
+            dimensions: 0,
+        });
+        assert_eq!(client.dimensions(), 0);
+        assert_eq!(client.semantic_profile().dimensions, 0);
+    }
+
+    #[test]
+    fn embedding_client_trait_surface_reports_remote_and_no_delegation() -> Result<(), EmbeddingError> {
+        let client: Box<dyn Embedder> = Box::new(EmbeddingClient::new(EmbeddingConfig {
+            base_url: "http://embedding.invalid:1".to_string(),
+            model: "ollama-model".to_string(),
+            dimensions: 512,
+        }));
+        assert_eq!(client.dimensions(), 512);
+        assert_eq!(client.model(), "ollama-model");
+        assert_eq!(client.semantic_profile().model, "ollama-model");
+        // An Ollama client is not the authenticated Crux delegation contract.
+        assert!(client.delegation_status().is_none());
+        assert!(!client.runs_locally());
+        assert!(client.embed_batch(&[])?.is_empty());
+        Ok(())
+    }
+
+    // ── Error classification ───────────────────────────────────────────
+
+    /// Only transport faults and retryable upstream statuses may be retried.
+    /// Retrying a 4xx (or a profile mismatch) would burn the breaker budget on
+    /// a fault that will never clear by itself.
+    #[test]
+    fn delegation_retryable_classification_is_narrow() {
+        assert!(EmbeddingError::Network("timeout".to_string()).delegation_retryable());
+        for status in [408_u16, 429, 500, 502, 503, 599] {
+            assert!(
+                EmbeddingError::UpstreamStatus { status }.delegation_retryable(),
+                "HTTP {status} must be retryable"
+            );
+        }
+        for status in [400_u16, 401, 403, 404, 409, 418, 600] {
+            assert!(
+                !EmbeddingError::UpstreamStatus { status }.delegation_retryable(),
+                "HTTP {status} must not be retryable"
+            );
+        }
+        assert!(!EmbeddingError::EmptyResponse.delegation_retryable());
+        assert!(!EmbeddingError::Serialize("bad".to_string()).delegation_retryable());
+        assert!(!EmbeddingError::HalfOpenProbeInFlight.delegation_retryable());
+    }
+
+    /// Profile faults and outages must not share a failure class: the status
+    /// reason code shown to operators is derived from it.
+    #[test]
+    fn delegation_failure_class_separates_profile_faults_from_outages() {
+        let profile_faults = [
+            EmbeddingError::SemanticProfileMismatch {
+                expected_model: "a".to_string(),
+                expected_dimensions: 1,
+                got_model: "b".to_string(),
+                got_dimensions: 2,
+            },
+            EmbeddingError::SemanticProfileChanged {
+                expected_profile_id: "sp_a".to_string(),
+                got_profile_id: "sp_b".to_string(),
+            },
+            EmbeddingError::InvalidSemanticProfile("inconsistent".to_string()),
+            EmbeddingError::VectorDimensionMismatch {
+                index: 0,
+                expected: 2,
+                got: 3,
+            },
+        ];
+        for err in &profile_faults {
+            assert_eq!(err.delegation_failure_class(), DelegationFailureClass::ProfileMismatch);
+        }
+
+        let outages = [
+            EmbeddingError::Network("reset".to_string()),
+            EmbeddingError::UpstreamStatus { status: 503 },
+            EmbeddingError::InvalidVectorValue { index: 0 },
+            EmbeddingError::CircuitOpen { retry_after_ms: 10 },
+        ];
+        for err in &outages {
+            assert_eq!(err.delegation_failure_class(), DelegationFailureClass::Unavailable);
+        }
+    }
+
+    /// A 409 body only maps to a mismatch when the provider supplied the code
+    /// **and** both profiles. Anything less falls through to a plain
+    /// `UpstreamStatus` rather than inventing a mismatch it cannot describe.
+    #[test]
+    fn semantic_profile_mismatch_from_problem_requires_code_and_both_profiles() -> Result<(), EmbeddingError> {
+        let parse = |value: serde_json::Value| -> Result<DelegationProblemDetails, EmbeddingError> {
+            serde_json::from_value(value).map_err(|err| EmbeddingError::Deserialize(err.to_string()))
+        };
+
+        assert!(semantic_profile_mismatch_from_problem(parse(serde_json::json!({
+            "code": "SOMETHING_ELSE",
+            "expected": { "model": "a", "dimensions": 1 },
+            "actual": { "model": "b", "dimensions": 2 }
+        }))?)
+        .is_none());
+
+        assert!(semantic_profile_mismatch_from_problem(parse(serde_json::json!({
+            "expected": { "model": "a", "dimensions": 1 },
+            "actual": { "model": "b", "dimensions": 2 }
+        }))?)
+        .is_none());
+
+        assert!(semantic_profile_mismatch_from_problem(parse(serde_json::json!({
+            "code": "SEMANTIC_PROFILE_MISMATCH",
+            "actual": { "model": "b", "dimensions": 2 }
+        }))?)
+        .is_none());
+
+        assert!(semantic_profile_mismatch_from_problem(parse(serde_json::json!({
+            "code": "SEMANTIC_PROFILE_MISMATCH",
+            "expected": { "model": "a", "dimensions": 1 }
+        }))?)
+        .is_none());
+
+        Ok(())
+    }
+
+    /// Error rendering is part of the operator-facing contract; the size caps
+    /// and the offending index must both appear.
+    #[test]
+    fn delegation_error_messages_name_the_offending_limits() {
+        assert!(EmbeddingError::DelegationTextTooLarge {
+            index: 3,
+            bytes: 99,
+            max_bytes: 10,
+        }
+        .to_string()
+        .contains("text 3 is 99 bytes"));
+        assert!(EmbeddingError::DelegationBatchTooLarge {
+            count: 65,
+            max_count: 64,
+        }
+        .to_string()
+        .contains("65 texts"));
+        assert!(EmbeddingError::DelegationPayloadTooLarge {
+            bytes: 300,
+            max_bytes: 256,
+        }
+        .to_string()
+        .contains("300 bytes"));
+        assert!(EmbeddingError::UpstreamStatus { status: 503 }
+            .to_string()
+            .contains("HTTP 503"));
     }
 }

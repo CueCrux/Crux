@@ -674,6 +674,11 @@ mod tests {
                 started_at: Some(started.to_string()),
                 ended_at: Some(ended.to_string()),
                 execplan_slugs: Vec::new(),
+                model: None,
+                effort: None,
+                cwd: None,
+                git_branch: None,
+                breakdown: None,
                 headline: crux_cost::Headline {
                     assistant_turns: 10,
                     tasks: 2,

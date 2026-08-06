@@ -1898,7 +1898,10 @@ function extractThemeVars(theme) {
   check(wb && wb.load && typeof wb.load.build === 'function', '[m13a] cx-workbench must have a live build (buildWorkbench)');
 
   // buildWorkbench wires the workbench GET read tools through the api.js GET client.
-  const WB_GET_METHODS = ['workbenchApiDrift', 'workbenchCommandLedger', 'workbenchReasoningTimeline', 'workbenchAuditTriage', 'workbenchBrief'];
+  // workbenchCommandLedger is deliberately gone: `ledger:history` is no longer a sold
+  // claim (no producer ever wrote a record), so the route 402s and the tile was removed.
+  // See ExecPlan crux-command-ledger-claim-truth-2026-07-30.
+  const WB_GET_METHODS = ['workbenchApiDrift', 'workbenchReasoningTimeline', 'workbenchAuditTriage', 'workbenchBrief'];
   WB_GET_METHODS.forEach(function (m) {
     check(pagesSrc.indexOf(m) >= 0, '[m13a] buildWorkbench must wire the GET read tool ' + m);
   });
@@ -1919,12 +1922,12 @@ function extractThemeVars(theme) {
   // Every workbench route the port wires live is an allowlisted GET in api.js
   // (LITERAL_GET_PATHS) — proof no wired op is a mutation route.
   const apiSrc = fs.readFileSync(path.join(DIR, 'api.js'), 'utf8');
-  ['/v1/workbench/contract', '/v1/workbench/api-drift', '/v1/workbench/command-ledger',
+  ['/v1/workbench/contract', '/v1/workbench/api-drift',
     '/v1/workbench/reasoning-timeline', '/v1/workbench/audit-triage', '/v1/workbench/brief'].forEach(function (p) {
     check(new RegExp("'" + p.replace(/[-/]/g, '\\$&') + "': true").test(apiSrc),
       '[m13a] wired workbench read ' + p + ' must be an allowlisted GET in api.js (never a mutation route)');
   });
-  notes.push('m13a workbench + control-diff: CONTROL_DIFF covers all 26 legacy CX pages; cx-workbench is native (loads /v1/workbench/contract + 5 live GET read tools via a GET-only self-loader); every newly-wired op is an allowlisted GET.');
+  notes.push('m13a workbench + control-diff: CONTROL_DIFF covers all 26 legacy CX pages; cx-workbench is native (loads /v1/workbench/contract + 4 live GET read tools via a GET-only self-loader); every newly-wired op is an allowlisted GET.');
 })();
 
 // =========================================================================
@@ -3170,7 +3173,18 @@ function extractThemeVars(theme) {
   check(typeof render.buildSessionDetail === 'function', '[session-detail] render.js must export buildSessionDetail()');
   check(typeof render.paintSessionDetail === 'function', '[session-detail] render.js must export paintSessionDetail()');
   check(typeof render.renderSessionDetail === 'function', '[session-detail] render.js must export renderSessionDetail()');
+  check(typeof render.registryVerifyUrl === 'function', '[session-detail] render.js must export registryVerifyUrl()');
   if (typeof render.buildSessionDetail !== 'function') { return; }
+
+  if (typeof render.registryVerifyUrl === 'function') {
+    check(render.registryVerifyUrl('blake3:deadbeef') ===
+      'https://registry.rcxprotocol.org/v0/receipts/blake3%3Adeadbeef',
+      '[session-detail] registryVerifyUrl must resolve a receipt/hash against the fixed HTTPS Registry origin');
+    ['', '../escape', 'hash/segment', ' hash with spaces ', 'https://evil.invalid/x', 'x\u0000y'].forEach(function (bad) {
+      check(render.registryVerifyUrl(bad) === null,
+        '[session-detail] registryVerifyUrl must reject an unsafe/empty receipt reference: ' + JSON.stringify(bad));
+    });
+  }
 
   const sessionNode = {
     key: 'session:aaaa', type: 'session', id: 'aaaa1111beef', label: 'aaaa1111',
@@ -3202,7 +3216,9 @@ function extractThemeVars(theme) {
     JSON.stringify(model.focus.paths) === JSON.stringify(['crates/x']) && (model.focus.leases || []).length === 1,
     '[session-detail] model carries the announced focus (milestone, deploy target, paths, leases) from the node — not re-fetched');
   check(model.receipts && model.receipts.present === true && model.receipts.items.length === 1 &&
-    model.receipts.items[0].body_hash === 'blake3:deadbeefcafe0000' && model.receipts.chain && model.receipts.chain.status === 'ok',
+    model.receipts.items[0].body_hash === 'blake3:deadbeefcafe0000' &&
+    model.receipts.items[0].registry_ref === 'blake3:deadbeefcafe0000' &&
+    model.receipts.chain && model.receipts.chain.status === 'ok',
     '[session-detail] receipts come from the observations feed (receipt envelope + daemon chain status)');
   check(model.provenance && model.provenance.present === true && model.provenance.entity === 'execplan:alpha' &&
     model.provenance.items.length === 3 && model.provenance.items[0].source_receipt === 'blake3:aaaabbbbcccc',
@@ -3262,6 +3278,12 @@ function extractThemeVars(theme) {
       '[session-detail] receipts render a neutral "receipt envelope" chip, never a "signed" claim the browser did not verify');
     check(/chain: ok/.test(paintedText) && !/intact/.test(paintedText),
       '[session-detail] chain status renders VERBATIM from the daemon ("chain: ok"), never a client-computed "intact" verdict');
+    const verifyLinks = mock.findByClass(painted, 'session-detail-verify');
+    check(verifyLinks.length === 1 && verifyLinks[0].tagName === 'A' &&
+      verifyLinks[0].getAttribute('href') === 'https://registry.rcxprotocol.org/v0/receipts/blake3%3Adeadbeefcafe0000' &&
+      verifyLinks[0].getAttribute('target') === '_blank' && verifyLinks[0].getAttribute('rel') === 'noopener noreferrer' &&
+      verifyLinks[0].getAttribute('data-shell-tab') === 'registry',
+      '[session-detail] a receipt body hash renders one fixed-origin, noopener Registry lookup link for the shell-tab policy');
     check(mock.findByClass(painted, 'session-detail-item').length >= 4,
       '[session-detail] painted DOM renders receipt + provenance evidence items');
     check(mock.findByClass(painted, 'session-detail-redacted').length === 1,
@@ -3343,6 +3365,47 @@ function extractThemeVars(theme) {
   }
 
   notes.push('session-detail (M4b): buildSessionDetail joins receipts (observations feed — a neutral "receipt envelope" chip + the daemon-reported chain status VERBATIM, never a client-side "signed"/"intact" verification claim) + fact provenance (/v1/facts/entity/<RESOLVED ExecPlan entity> — only for sessions that resolved to an ExecPlan; kanban/unattached → no_plan absent, never guessing execplan:<announced-slug>) + announced focus (from the node — no re-fetch) over EXISTING GET routes only. Transcript is reference-only: rendered from an id/path ALREADY on the node (coord announcement), NEVER by fetching session state (that blob can embed content — no state read is issued). Only a canonical [REDACTED:…] value renders the redaction marker; empty is honest-empty. Any non-ok feed → degraded; reachable-empty → absent. renderSessionDetail drives EXACTLY {observations[, facts]} (asserted as an exact multiset), guards a per-host selection token so a stale slow paint cannot overwrite a newer selection, and adds no transcript route/method.');
+})();
+
+// =========================================================================
+//  Check 44b — (desktop mission control M9 local build) Registry + WikiCrux
+//  public tabs remain a closed native allow-list and receive zero Tauri IPC.
+//  Runtime rendering/SSO/CSP stays an operator+real-webview gate; this source
+//  audit proves the locally testable privilege and lifecycle invariants.
+// =========================================================================
+(function checkDesktopPublicShellTabs() {
+  const desktopRoot = path.join(DIR, '../../../../shells/desktop');
+  const capabilityPath = path.join(desktopRoot, 'app/capabilities/default.json');
+  const appPath = path.join(desktopRoot, 'app/src/main.rs');
+  const navigationPath = path.join(desktopRoot, 'connection/src/navigation.rs');
+  let capability, appSrc, navigationSrc;
+  try {
+    capability = JSON.parse(fs.readFileSync(capabilityPath, 'utf8'));
+    appSrc = fs.readFileSync(appPath, 'utf8');
+    navigationSrc = fs.readFileSync(navigationPath, 'utf8');
+  } catch (e) {
+    check(false, '[desktop-tabs] shell source/config must be readable: ' + (e && e.message || e));
+    return;
+  }
+  const windows = capability.windows || [];
+  check(Array.isArray(capability.permissions) && capability.permissions.length === 0 &&
+    !Object.prototype.hasOwnProperty.call(capability, 'remote'),
+    '[desktop-tabs] capability must keep an empty permission set and no remote URL grant');
+  check(windows.indexOf('shell-tab-registry') >= 0 && windows.indexOf('shell-tab-wikicrux') >= 0,
+    '[desktop-tabs] the zero-permission capability must enumerate both stable public-tab labels');
+  check(/registry\.rcxprotocol\.org/.test(navigationSrc) && /wiki\.cuecrux\.com/.test(navigationSrc) &&
+    /parsed\.scheme != "https"/.test(navigationSrc) && /parsed\.port != 443/.test(navigationSrc),
+    '[desktop-tabs] navigation.rs must pin the two exact HTTPS:443 product origins');
+  check(/fn build_shell_tab_window\b/.test(appSrc) &&
+    /\.on_navigation\(move \|url\| navigation_tab\.allows/.test(appSrc) &&
+    /\.on_new_window\(\|_url, _features\| NewWindowResponse::Deny\)/.test(appSrc) &&
+    /\.on_download\(\|_webview, _event\| false\)/.test(appSrc),
+    '[desktop-tabs] the public-tab builder must origin-lock top-level navigation and deny popups/downloads');
+  check(!/invoke_handler\s*\(/.test(appSrc),
+    '[desktop-tabs] the desktop app must register no Tauri invoke handler reachable by remote page script');
+  check(/shell_tab_for_window_label\(window\.label\(\)\)/.test(appSrc) && /close_shell_tabs\(app\)/.test(appSrc),
+    '[desktop-tabs] closing a public tab must not exit the app, and profile switches must close stale public tabs');
+  notes.push('desktop M9 local build: exact Registry/WikiCrux HTTPS:443 tab allow-list; separate origin-locked webviews; no remote capability/invoke surface; popups + downloads denied; profile switch closes tabs; receipt link uses fixed Registry origin.');
 })();
 
 // =========================================================================

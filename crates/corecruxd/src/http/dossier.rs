@@ -26,9 +26,10 @@
 //! carries is reported separately as `claims_omitted`.
 
 use super::context_budget::{payload_budget, serialised_tokens};
-use super::{
-    problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode,
-};
+// No `require_http_scopes` here on purpose. Every handler on this surface reads
+// or writes a tenant's derived artifact, so every one of them goes through
+// `runtime_tenant_for`. The tenant-blind variant being unimportable is the point.
+use super::{problem_response, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode};
 
 const DOSSIER_PREFIX: &str = "__dossier__";
 const DOSSIER_KEY: &str = "content";
@@ -52,15 +53,24 @@ fn extract_passport_id(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| "anonymous".to_string())
 }
 
+/// Persist a dossier under the tenant it was derived for.
+///
+/// The stamp used to be a hardcoded `"default"` regardless of whose spans the
+/// dossier summarised, and the reads that serve it back passed
+/// `tenant_hash: None` — no filter. M3b bound generation on this surface and
+/// left publication and read unbound, so a dossier built from tenant A's runtime
+/// was readable by anyone holding `admin:read` who named A's `project_id`. The
+/// scope is the same one that authorised the request.
 async fn persist_dossier(
     fact_store: &std::sync::Arc<tokio::sync::RwLock<corecrux_memory::FactStore>>,
+    scope: &crate::auth::TenantScope,
     dossier: &crate::dossier::Dossier,
 ) -> Result<String, String> {
     let value = serde_json::to_string(dossier).map_err(|e| format!("encode: {e}"))?;
     let entity = entity_for(&dossier.project_id, &dossier.dossier_id);
     let mut store = fact_store.write().await;
     let mut sf = corecrux_memory::fact_store::StoreFact {
-        tenant_hash: "default".to_string(),
+        tenant_hash: scope.as_str().to_string(),
         entity,
         key: DOSSIER_KEY.to_string(),
         value,
@@ -80,26 +90,32 @@ pub(super) async fn post_auto(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
     headers: HeaderMap,
+    Query(tenant_q): Query<super::traces::OptionalTenantQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
-        return problem.into_response();
-    }
-    if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
-        return problem.into_response();
-    }
     let agent = extract_passport_id(&headers);
     let now = now_unix_ms();
     // The same window /v1/code-intel/dead-code answers from. Empty unless
     // CORECRUXD_TRACE_CAPTURE is on, in which case the dead-code claims stay
     // exactly as they were before the runtime tier existed.
-    // Scoped to this daemon's own capture tenant. This surface has no tenant
-    // binding of its own (it authorises with `require_http_scopes`, not the
-    // per-tenant variant), so there is no requester tenant to honour. Pinning it
-    // to the capture tenant preserves single-tenant behaviour exactly and fails
-    // closed if this daemon ever holds more than one tenant's spans — it will
-    // simply not see them. Giving this surface real tenant binding is a
-    // prerequisite for hosting it (crux-code-intel-pro-hosted-surface M3).
-    let spans = super::traces::load_spans(&state, &crate::trace_store::TraceStore::capture_tenant());
+    // M3b: the runtime tier is read for whichever tenant the request names, and
+    // `runtime_tenant_for` authorises against that tenant — it is the only
+    // authorization on this handler, deliberately, because a tenant-blind check
+    // followed by a caller-supplied `tenant_id` is a cross-tenant read. With no
+    // `tenant_id` it falls back to the daemon's capture tenant — correct on a
+    // single-tenant daemon and deliberately NOT hostable, because every customer
+    // on a shared daemon resolves to the same tenant. The fallback is reported
+    // on the response as `runtime_tenant_scope` rather than being left to be
+    // inferred.
+    let (runtime_tenant, runtime_bound) = match super::traces::runtime_tenant_for(
+        &state,
+        &headers,
+        &["admin:read", "facts:write"],
+        tenant_q.tenant_id.as_deref(),
+    ) {
+        Ok(resolved) => resolved,
+        Err(problem) => return problem.into_response(),
+    };
+    let spans = super::traces::load_spans(&state, &runtime_tenant);
     let store = state.fact_store.read().await;
     let dossier = match crate::dossier::generate_auto(
         &store,
@@ -114,10 +130,25 @@ pub(super) async fn post_auto(
         None => return problem_response(StatusCode::NOT_FOUND, format!("project '{project_id}' not found")),
     };
     drop(store);
-    if let Err(err) = persist_dossier(&state.fact_store, &dossier).await {
+    if let Err(err) = persist_dossier(&state.fact_store, &runtime_tenant, &dossier).await {
         return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err);
     }
-    (StatusCode::OK, Json(dossier)).into_response()
+    // M3b: state the runtime tier's tenant scope in a header rather than the
+    // body — the body is a typed payload and existing clients must not break,
+    // but "which tenant did this answer for" cannot be left to inference.
+    (
+        StatusCode::OK,
+        [(
+            "x-crux-runtime-tenant-scope",
+            if runtime_bound {
+                "request"
+            } else {
+                "daemon-capture-tenant"
+            },
+        )],
+        Json(dossier),
+    )
+        .into_response()
 }
 
 #[tracing::instrument(level = "info", skip_all)]
@@ -125,11 +156,21 @@ pub(super) async fn post_publish(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
     headers: HeaderMap,
+    Query(tq): Query<super::traces::OptionalTenantQuery>,
     Json(mut dossier): Json<crate::dossier::Dossier>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
-        return problem.into_response();
-    }
+    // Publication is bound to a tenant for the same reason generation is: the
+    // artifact is derived from that tenant's runtime, and an unbound write lands
+    // in a namespace every other tenant can read.
+    let (scope, _bound) = match super::traces::runtime_tenant_for(
+        &state,
+        &headers,
+        &["admin:read", "facts:write"],
+        tq.tenant_id.as_deref(),
+    ) {
+        Ok(resolved) => resolved,
+        Err(problem) => return problem.into_response(),
+    };
     let agent = extract_passport_id(&headers);
     if dossier.agent_passport.is_empty() {
         dossier.agent_passport = agent;
@@ -159,7 +200,7 @@ pub(super) async fn post_publish(
         dossier.contradictions.len(),
         dossier.open_questions.len(),
     );
-    if let Err(err) = persist_dossier(&state.fact_store, &dossier).await {
+    if let Err(err) = persist_dossier(&state.fact_store, &scope, &dossier).await {
         return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err);
     }
     (
@@ -176,6 +217,7 @@ pub(super) async fn post_publish(
 
 async fn list_dossier_ids_internal(
     fact_store: &std::sync::Arc<tokio::sync::RwLock<corecrux_memory::FactStore>>,
+    scope: &crate::auth::TenantScope,
     project_id: &str,
 ) -> Vec<(String, u64, String)> {
     // Returns (dossier_id, generated_at_unix_ms, agent_passport).
@@ -193,6 +235,7 @@ async fn list_dossier_ids_internal(
     let latest = crate::fact_helpers::dedup_latest(result.facts);
     let mut out: Vec<(String, u64, String)> = latest
         .into_iter()
+        .filter(|f| scope.may_read_fact_tenant(&f.tenant_hash))
         .filter(|f| f.entity.starts_with(&prefix) && f.key == DOSSIER_KEY && !f.value.is_empty())
         .filter_map(|f| {
             let id = f.entity[prefix.len()..].to_string();
@@ -212,6 +255,7 @@ async fn list_dossier_ids_internal(
 
 async fn load_dossier(
     fact_store: &std::sync::Arc<tokio::sync::RwLock<corecrux_memory::FactStore>>,
+    scope: &crate::auth::TenantScope,
     project_id: &str,
     dossier_id: &str,
 ) -> Option<crate::dossier::Dossier> {
@@ -229,7 +273,7 @@ async fn load_dossier(
     let latest = crate::fact_helpers::dedup_latest(result.facts);
     let fact = latest
         .into_iter()
-        .find(|f| f.entity == entity && f.key == DOSSIER_KEY)?;
+        .find(|f| f.entity == entity && f.key == DOSSIER_KEY && scope.may_read_fact_tenant(&f.tenant_hash))?;
     serde_json::from_str::<crate::dossier::Dossier>(&fact.value).ok()
 }
 
@@ -322,14 +366,16 @@ pub(super) async fn list_dossiers(
     Path(project_id): Path<String>,
     Query(q): Query<BudgetQuery>,
     headers: HeaderMap,
+    Query(tq): Query<super::traces::OptionalTenantQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-        return problem.into_response();
-    }
-    if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
-        return problem.into_response();
-    }
-    let ids = list_dossier_ids_internal(&state.fact_store, &project_id).await;
+    // Bound the same way generation is (M3b): resolution and authorization in one
+    // operation, so a caller reads the tenant it was authorised for and no other.
+    let (scope, _bound) =
+        match super::traces::runtime_tenant_for(&state, &headers, &["admin:read"], tq.tenant_id.as_deref()) {
+            Ok(resolved) => resolved,
+            Err(problem) => return problem.into_response(),
+        };
+    let ids = list_dossier_ids_internal(&state.fact_store, &scope, &project_id).await;
     let total = ids.len();
     let mut summaries: Vec<serde_json::Value> = ids
         .into_iter()
@@ -386,14 +432,16 @@ pub(super) async fn get_dossier(
     Path((project_id, dossier_id)): Path<(String, String)>,
     Query(q): Query<BudgetQuery>,
     headers: HeaderMap,
+    Query(tq): Query<super::traces::OptionalTenantQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-        return problem.into_response();
-    }
-    if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
-        return problem.into_response();
-    }
-    match load_dossier(&state.fact_store, &project_id, &dossier_id).await {
+    // Bound the same way generation is (M3b): resolution and authorization in one
+    // operation, so a caller reads the tenant it was authorised for and no other.
+    let (scope, _bound) =
+        match super::traces::runtime_tenant_for(&state, &headers, &["admin:read"], tq.tenant_id.as_deref()) {
+            Ok(resolved) => resolved,
+            Err(problem) => return problem.into_response(),
+        };
+    match load_dossier(&state.fact_store, &scope, &project_id, &dossier_id).await {
         Some(d) => (StatusCode::OK, Json(budget_dossier(d, q.token_budget))).into_response(),
         None => problem_response(StatusCode::NOT_FOUND, "dossier not found"),
     }
@@ -411,18 +459,20 @@ pub(super) async fn get_diff(
     Path(project_id): Path<String>,
     Query(q): Query<DiffQuery>,
     headers: HeaderMap,
+    Query(tq): Query<super::traces::OptionalTenantQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-        return problem.into_response();
-    }
-    if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
-        return problem.into_response();
-    }
-    let a = match load_dossier(&state.fact_store, &project_id, &q.a).await {
+    // Bound the same way generation is (M3b): resolution and authorization in one
+    // operation, so a caller reads the tenant it was authorised for and no other.
+    let (scope, _bound) =
+        match super::traces::runtime_tenant_for(&state, &headers, &["admin:read"], tq.tenant_id.as_deref()) {
+            Ok(resolved) => resolved,
+            Err(problem) => return problem.into_response(),
+        };
+    let a = match load_dossier(&state.fact_store, &scope, &project_id, &q.a).await {
         Some(d) => d,
         None => return problem_response(StatusCode::NOT_FOUND, format!("dossier 'a' ({}) not found", q.a)),
     };
-    let b = match load_dossier(&state.fact_store, &project_id, &q.b).await {
+    let b = match load_dossier(&state.fact_store, &scope, &project_id, &q.b).await {
         Some(d) => d,
         None => return problem_response(StatusCode::NOT_FOUND, format!("dossier 'b' ({}) not found", q.b)),
     };
@@ -527,16 +577,18 @@ pub(super) async fn get_reconciliation(
     Path(project_id): Path<String>,
     Query(q): Query<BudgetQuery>,
     headers: HeaderMap,
+    Query(tq): Query<super::traces::OptionalTenantQuery>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-        return problem.into_response();
-    }
-    if let Err(problem) = super::workspace::require_workspace_scan_global_authority(&state, &headers) {
-        return problem.into_response();
-    }
+    // Bound the same way generation is (M3b): resolution and authorization in one
+    // operation, so a caller reads the tenant it was authorised for and no other.
+    let (scope, _bound) =
+        match super::traces::runtime_tenant_for(&state, &headers, &["admin:read"], tq.tenant_id.as_deref()) {
+            Ok(resolved) => resolved,
+            Err(problem) => return problem.into_response(),
+        };
     // For reconciliation, prefer the LATEST dossier per agent (so an agent
     // that re-published after learning more wins over its older self).
-    let ids = list_dossier_ids_internal(&state.fact_store, &project_id).await;
+    let ids = list_dossier_ids_internal(&state.fact_store, &scope, &project_id).await;
     let mut latest_per_agent: std::collections::BTreeMap<String, (String, u64)> = std::collections::BTreeMap::new();
     for (id, ts, agent) in ids {
         latest_per_agent
@@ -550,7 +602,7 @@ pub(super) async fn get_reconciliation(
     }
     let mut dossiers: Vec<crate::dossier::Dossier> = Vec::new();
     for (id, _) in latest_per_agent.values() {
-        if let Some(d) = load_dossier(&state.fact_store, &project_id, id).await {
+        if let Some(d) = load_dossier(&state.fact_store, &scope, &project_id, id).await {
             dossiers.push(d);
         }
     }
@@ -605,10 +657,16 @@ mod tests {
     }
 
     async fn publish(st: &AppState, d: Dossier) -> StatusCode {
-        post_publish(State(st.clone()), Path(d.project_id.clone()), HeaderMap::new(), Json(d))
-            .await
-            .into_response()
-            .status()
+        post_publish(
+            State(st.clone()),
+            Path(d.project_id.clone()),
+            HeaderMap::new(),
+            Query(super::super::traces::OptionalTenantQuery::default()),
+            Json(d),
+        )
+        .await
+        .into_response()
+        .status()
     }
 
     #[test]
@@ -636,6 +694,7 @@ mod tests {
                 Path("proj".into()),
                 Query(BudgetQuery::default()),
                 HeaderMap::new(),
+                Query(super::super::traces::OptionalTenantQuery::default()),
             )
             .await
             .into_response(),
@@ -651,6 +710,7 @@ mod tests {
                 Path(("proj".into(), "d1".into())),
                 Query(BudgetQuery::default()),
                 HeaderMap::new(),
+                Query(super::super::traces::OptionalTenantQuery::default()),
             )
             .await
             .into_response(),
@@ -668,6 +728,7 @@ mod tests {
             State(st.clone()),
             Path("urlproj".into()),
             HeaderMap::new(),
+            Query(super::super::traces::OptionalTenantQuery::default()),
             Json(dossier("d1", "otherproj", "a", 1, vec![])),
         )
         .await
@@ -680,6 +741,7 @@ mod tests {
             State(st.clone()),
             Path("proj".into()),
             HeaderMap::new(),
+            Query(super::super::traces::OptionalTenantQuery::default()),
             Json(dossier("", "proj", "a", 1, vec![])),
         )
         .await
@@ -695,6 +757,7 @@ mod tests {
                 State(st.clone()),
                 Path("proj".into()),
                 headers,
+                Query(crate::http::traces::OptionalTenantQuery::default()),
                 Json(dossier("d2", "proj", "", 0, vec![claim("c1")])),
             )
             .await
@@ -750,6 +813,7 @@ mod tests {
                 Path("proj".into()),
                 Query(BudgetQuery::default()),
                 HeaderMap::new(),
+                Query(super::super::traces::OptionalTenantQuery::default()),
             )
             .await
             .into_response(),
@@ -771,6 +835,7 @@ mod tests {
                 Path(("proj".into(), "nope".into())),
                 Query(BudgetQuery::default()),
                 HeaderMap::new(),
+                Query(super::super::traces::OptionalTenantQuery::default()),
             )
             .await
             .into_response(),
@@ -798,6 +863,7 @@ mod tests {
                     b: "b".into(),
                 }),
                 HeaderMap::new(),
+                Query(super::super::traces::OptionalTenantQuery::default()),
             )
             .await
             .into_response(),
@@ -815,6 +881,7 @@ mod tests {
                     b: "b".into(),
                 }),
                 HeaderMap::new(),
+                Query(super::super::traces::OptionalTenantQuery::default()),
             )
             .await
             .into_response(),
@@ -832,6 +899,7 @@ mod tests {
                     b: "ghost".into(),
                 }),
                 HeaderMap::new(),
+                Query(super::super::traces::OptionalTenantQuery::default()),
             )
             .await
             .into_response(),
@@ -858,6 +926,7 @@ mod tests {
                 Path("proj".into()),
                 Query(BudgetQuery::default()),
                 HeaderMap::new(),
+                Query(super::super::traces::OptionalTenantQuery::default()),
             )
             .await
             .into_response(),
@@ -968,6 +1037,7 @@ mod tests {
                     token_budget: Some(160),
                 }),
                 HeaderMap::new(),
+                Query(super::super::traces::OptionalTenantQuery::default()),
             )
             .await
             .into_response(),
@@ -999,6 +1069,7 @@ mod tests {
                     token_budget: Some(600),
                 }),
                 HeaderMap::new(),
+                Query(super::super::traces::OptionalTenantQuery::default()),
             )
             .await
             .into_response(),
@@ -1056,6 +1127,7 @@ mod tests {
                     token_budget: Some(300),
                 }),
                 HeaderMap::new(),
+                Query(super::super::traces::OptionalTenantQuery::default()),
             )
             .await
             .into_response(),
@@ -1117,6 +1189,7 @@ mod tests {
                 Path(("proj".into(), "d-minimal".into())),
                 Query(BudgetQuery::default()),
                 HeaderMap::new(),
+                Query(super::super::traces::OptionalTenantQuery::default()),
             )
             .await
             .into_response(),
@@ -1146,6 +1219,7 @@ mod tests {
                 Path(("proj".into(), "d-lying".into())),
                 Query(BudgetQuery::default()),
                 HeaderMap::new(),
+                Query(super::super::traces::OptionalTenantQuery::default()),
             )
             .await
             .into_response(),
@@ -1158,9 +1232,14 @@ mod tests {
     async fn post_auto_missing_project_is_404() {
         let st = state();
         let (status, _) = parts(
-            post_auto(State(st), Path("no-such-project".into()), HeaderMap::new())
-                .await
-                .into_response(),
+            post_auto(
+                State(st),
+                Path("no-such-project".into()),
+                HeaderMap::new(),
+                Query(crate::http::traces::OptionalTenantQuery::default()),
+            )
+            .await
+            .into_response(),
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);

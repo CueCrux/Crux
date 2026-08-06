@@ -20,7 +20,7 @@ use crate::workspace_scan::{
     ScanError, ScanStats, StubHit, SymbolInfo, UnresolvedRoute, WorkspaceScan,
 };
 
-pub(crate) fn run_scan_ast_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
+pub fn run_scan_ast_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
     let started_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
@@ -34,7 +34,7 @@ pub(crate) fn run_scan_ast_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct IncrementalUpdateStats {
+pub struct IncrementalUpdateStats {
     pub files_reparsed: usize,
     pub cache_hits: usize,
     pub files_dropped: usize,
@@ -42,13 +42,13 @@ pub(crate) struct IncrementalUpdateStats {
 
 #[cfg(test)]
 #[derive(Debug, Clone)]
-pub(crate) struct IncrementalScanResult {
+pub struct IncrementalScanResult {
     pub scan: WorkspaceScan,
     pub stats: IncrementalUpdateStats,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct AstScanCache {
+pub struct AstScanCache {
     #[cfg(test)]
     pub root_path: PathBuf,
     crate_dirs: BTreeMap<String, PathBuf>,
@@ -58,7 +58,7 @@ pub(crate) struct AstScanCache {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CachedFile {
+pub struct CachedFile {
     pub rel_path: String,
     pub crate_name: String,
     pub module_path: String,
@@ -73,6 +73,11 @@ pub(crate) struct CachedFile {
     pub doc_full: Option<String>,
     pub is_test_file: bool,
     pub stubs: Vec<StubHit>,
+    /// `Some(reason)` when `syn::parse_file` REFUSED this file. Cached with
+    /// the rest of the entry so an incremental rescan does not lose the
+    /// signal. Without it, an unparsable file's empty `symbols` was
+    /// indistinguishable from a file that genuinely declares none (D-22).
+    pub parse_error: Option<String>,
     pub symbols: Vec<SymbolInfo>,
     fns: Vec<CachedFnDef>,
     deps: Vec<DepEdge>,
@@ -103,7 +108,7 @@ struct FileSignature {
 }
 
 impl AstScanCache {
-    pub(crate) fn from_root(root: &Path) -> Result<Self, ScanError> {
+    pub fn from_root(root: &Path) -> Result<Self, ScanError> {
         let workspace = discover_workspace(root)?;
         crate::repo_scan_policy::charge_generated_work(
             workspace.crate_dirs.len(),
@@ -144,7 +149,7 @@ impl AstScanCache {
     }
 }
 
-pub(crate) fn assemble_scan(root: &Path, cache: &AstScanCache) -> Result<WorkspaceScan, ScanError> {
+pub fn assemble_scan(root: &Path, cache: &AstScanCache) -> Result<WorkspaceScan, ScanError> {
     let started_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
@@ -152,7 +157,7 @@ pub(crate) fn assemble_scan(root: &Path, cache: &AstScanCache) -> Result<Workspa
 }
 
 #[cfg(test)]
-pub(crate) fn update_cache_incremental(
+pub fn update_cache_incremental(
     root: &Path,
     cache: &mut AstScanCache,
     changed_paths: &[PathBuf],
@@ -330,6 +335,24 @@ fn assemble_scan_at(root: &Path, cache: &AstScanCache, started_ms: u64) -> Resul
             total_loc: crate_loc,
         });
     }
+
+    // D-22: an unparsable file still contributes LOC and a `FileInfo`, so
+    // without this the scan reports it as a file with no symbols. Surface the
+    // refusal alongside the pre-parse skips.
+    for file in cache.files.values() {
+        if let Some(reason) = &file.parse_error {
+            scan.diagnostics
+                .parse_failures
+                .push(crate::workspace_scan::ParseFailure {
+                    rel_path: file.rel_path.clone(),
+                    language: "rust".to_string(),
+                    reason: reason.clone(),
+                });
+        }
+    }
+    scan.diagnostics
+        .parse_failures
+        .sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 
     for file in cache.files.values() {
         crate::repo_scan_policy::check_deadline()?;
@@ -1124,8 +1147,8 @@ fn parse_file_ast(
         "AST file cache",
     )?;
     let mut stubs = Vec::new();
-    let is_scanner_source = rel_str.ends_with("corecruxd/src/workspace_scan.rs")
-        || rel_str.ends_with("corecruxd/src/workspace_scan_ast.rs");
+    let is_scanner_source = rel_str.ends_with("corecrux-workspace-scan/src/workspace_scan.rs")
+        || rel_str.ends_with("corecrux-workspace-scan/src/workspace_scan_ast.rs");
     if !is_scanner_source {
         for (line_no, line) in src.lines().enumerate() {
             if line_no % 256 == 0 {
@@ -1195,6 +1218,7 @@ fn parse_file_ast(
             doc_full,
             is_test_file,
             stubs,
+            parse_error: None,
             symbols: parts.symbols,
             fns: parts.fns,
             deps: parts.deps,
@@ -1203,6 +1227,11 @@ fn parse_file_ast(
             ident_refs_nontest,
         })
     } else {
+        // D-22: the file was read but `syn` refused it. Record WHY, so the
+        // empty symbol set below cannot read as "this file declares nothing".
+        let parse_error = parse_result
+            .err()
+            .map_or_else(|| "rust parse failed".to_string(), |err| err.to_string());
         Ok(CachedFile {
             rel_path: rel_str.clone(),
             crate_name: crate_name.to_string(),
@@ -1218,6 +1247,7 @@ fn parse_file_ast(
             doc_full,
             is_test_file,
             stubs,
+            parse_error: Some(parse_error),
             symbols: Vec::new(),
             fns: Vec::new(),
             deps: Vec::new(),
@@ -1585,7 +1615,7 @@ fn is_rs_path(path: &Path) -> bool {
 }
 
 #[cfg(test)]
-pub(crate) fn should_ignore_path(path: &Path) -> bool {
+pub fn should_ignore_path(path: &Path) -> bool {
     path.components().any(|component| {
         let name = component.as_os_str().to_string_lossy();
         name.starts_with('.') || matches!(name.as_ref(), "target" | "node_modules" | ".git" | ".worktrees")
@@ -1956,6 +1986,48 @@ fn roll_up_stats(scan: &mut WorkspaceScan) -> Result<(), ScanError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D-22: an unparsable Rust file produced a `CachedFile` with empty
+    /// symbols while still counting LOC, so `blast_radius` and dead-code
+    /// answers over its contents read as "nothing here". Nothing recorded the
+    /// parse failure.
+    #[test]
+    fn an_unparsable_rust_file_is_recorded_as_a_parse_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("crates/alpha/src")).expect("mkdir");
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/alpha\"]\n").expect("ws");
+        std::fs::write(
+            root.join("crates/alpha/Cargo.toml"),
+            "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("crate toml");
+        std::fs::write(root.join("crates/alpha/src/lib.rs"), "pub fn ok() {}\n").expect("good");
+        // Syntactically invalid: `syn` refuses it.
+        std::fs::write(root.join("crates/alpha/src/broken.rs"), "pub fn ( { ] not rust\n").expect("bad");
+        // Genuinely empty: no symbols, but also no failure.
+        std::fs::write(root.join("crates/alpha/src/empty.rs"), "").expect("empty");
+
+        let scan = run_scan_ast_at(root).expect("scan");
+        let failures = &scan.diagnostics.parse_failures;
+        assert_eq!(
+            failures.iter().map(|f| f.rel_path.as_str()).collect::<Vec<_>>(),
+            vec!["crates/alpha/src/broken.rs"],
+            "only the unparsable file is recorded, not the empty one"
+        );
+        assert_eq!(failures[0].language, "rust");
+        assert!(!failures[0].reason.is_empty(), "the parser's reason is carried");
+        assert!(!scan.diagnostics.is_empty());
+
+        // Both files are still in the scan with no symbols — which is exactly
+        // why the diagnostic is needed to tell them apart.
+        let broken = scan
+            .files
+            .iter()
+            .find(|f| f.rel_path == "crates/alpha/src/broken.rs")
+            .expect("broken file is still scanned");
+        assert_eq!(broken.symbol_count, 0);
+    }
     use crate::test_support::EnvVarGuard;
 
     fn write_fixture(root: &Path) {
@@ -2348,5 +2420,964 @@ fn private_helper() {}
             serde_json::to_value(assembled).expect("assembled json"),
             serde_json::to_value(fresh).expect("fresh json")
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Path filtering
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn should_ignore_path_excludes_build_vendor_and_vcs_directories() {
+        for ignored in [
+            "target/debug/build.rs",
+            "crates/demo/target/x.rs",
+            "node_modules/pkg/index.rs",
+            ".git/hooks/pre-commit.rs",
+            ".worktrees/other/src/lib.rs",
+            "crates/.hidden/src/lib.rs",
+            ".cargo/config.rs",
+        ] {
+            assert!(
+                should_ignore_path(Path::new(ignored)),
+                "expected {ignored} to be ignored — a regression here balloons every scan"
+            );
+        }
+        for kept in ["crates/demo/src/lib.rs", "src/main.rs", "a/b/c/d/e/f.rs"] {
+            assert!(!should_ignore_path(Path::new(kept)), "expected {kept} to be scanned");
+        }
+    }
+
+    #[test]
+    fn build_and_vendor_directories_are_not_scanned() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_fixture(tmp.path());
+        let src = tmp.path().join("crates/demo/src");
+        for dir in ["target", "node_modules", ".hidden"] {
+            std::fs::create_dir_all(src.join(dir)).expect("skipped dir");
+            std::fs::write(src.join(dir).join("generated.rs"), "pub fn generated_symbol() {}\n").expect("skipped file");
+        }
+        // A vendored crate manifest under `target/` must not become a crate.
+        std::fs::create_dir_all(tmp.path().join("target/vendored/src")).expect("vendored dirs");
+        std::fs::write(
+            tmp.path().join("target/vendored/Cargo.toml"),
+            "[package]\nname = \"vendored\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("vendored toml");
+        std::fs::write(
+            tmp.path().join("target/vendored/src/lib.rs"),
+            "pub fn vendored_fn() {}\n",
+        )
+        .expect("vendored lib");
+
+        let scan = run_scan_ast_at(tmp.path()).expect("ast scan");
+        assert!(
+            !scan.files.iter().any(|f| f.rel_path.contains("target")
+                || f.rel_path.contains("node_modules")
+                || f.rel_path.contains(".hidden")),
+            "build/vendor directories leaked into the scan: {:?}",
+            scan.files.iter().map(|f| &f.rel_path).collect::<Vec<_>>()
+        );
+        assert!(!scan.crates.iter().any(|c| c.name == "vendored"));
+        assert!(!scan.symbols.iter().any(|s| s.name == "generated_symbol"));
+    }
+
+    #[test]
+    fn deeply_nested_module_files_are_scanned_with_full_module_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_fixture(tmp.path());
+        let deep = tmp.path().join("crates/demo/src/a1/b2/c3/d4/e5");
+        std::fs::create_dir_all(&deep).expect("deep dirs");
+        std::fs::write(deep.join("f6.rs"), "pub fn deep_symbol() {}\n").expect("deep file");
+
+        let scan = run_scan_ast_at(tmp.path()).expect("ast scan");
+        let deep_symbol = scan
+            .symbols
+            .iter()
+            .find(|s| s.name == "deep_symbol")
+            .expect("deep symbol");
+        assert_eq!(deep_symbol.module_path, "demo::a1::b2::c3::d4::e5::f6");
+    }
+
+    // ---------------------------------------------------------------------
+    // Degenerate source files
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn empty_and_comment_only_files_contribute_no_symbols() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_fixture(tmp.path());
+        let src = tmp.path().join("crates/demo/src");
+        std::fs::write(src.join("empty.rs"), "").expect("empty file");
+        std::fs::write(src.join("comments.rs"), "// just a comment\n// and another\n").expect("comment file");
+
+        let scan = run_scan_ast_at(tmp.path()).expect("ast scan");
+        let empty = scan
+            .files
+            .iter()
+            .find(|f| f.rel_path.ends_with("empty.rs"))
+            .expect("empty.rs");
+        assert_eq!(empty.loc, 0);
+        assert_eq!(empty.symbol_count, 0);
+        assert!(empty.doc_summary.is_none());
+        let comments = scan
+            .files
+            .iter()
+            .find(|f| f.rel_path.ends_with("comments.rs"))
+            .expect("comments.rs");
+        assert_eq!(comments.loc, 2);
+        assert_eq!(comments.symbol_count, 0);
+    }
+
+    /// DEFECT PIN — an unparsable Rust file is indistinguishable from a clean
+    /// one in the emitted scan: it is counted in `file_count`/`total_loc`, its
+    /// LOC are attributed to the crate, and it carries zero symbols with **no
+    /// diagnostic anywhere**. Absence of signal reads as "this file has nothing
+    /// in it" rather than "this file was not understood".
+    ///
+    /// This test pins the current behaviour; it is not an endorsement of it.
+    #[test]
+    fn unparsable_rust_file_is_counted_as_scanned_with_no_symbols_and_no_diagnostic() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_fixture(tmp.path());
+        std::fs::write(
+            tmp.path().join("crates/demo/src/broken.rs"),
+            "//! Broken module.\npub fn broken( {\n    todo!();\n}\n",
+        )
+        .expect("broken file");
+
+        let scan = run_scan_ast_at(tmp.path()).expect("ast scan");
+        let broken = scan
+            .files
+            .iter()
+            .find(|f| f.rel_path.ends_with("broken.rs"))
+            .expect("broken.rs is present in the scan");
+        assert_eq!(broken.symbol_count, 0, "syn could not parse this file");
+        assert_eq!(broken.loc, 4, "its lines are still counted toward total_loc");
+        assert_eq!(
+            broken.doc_summary.as_deref(),
+            Some("Broken module."),
+            "the line-based doc header pass still runs"
+        );
+        // Line-based passes (stubs, routes) still fire on unparsable sources.
+        assert!(scan.stubs.iter().any(|s| s.file_rel_path.ends_with("broken.rs")));
+        // …but nothing anywhere says the file failed to parse.
+        assert!(scan.diagnostics.unresolved_routes.is_empty());
+        let json = serde_json::to_string(&scan).expect("scan json");
+        assert!(
+            !json.contains("broken.rs\",\"reason"),
+            "no parse diagnostic is emitted for an unparsable file"
+        );
+    }
+
+    /// The scanner's own sources mention stub markers as *data*. The exemption
+    /// in `is_scanner_source` keys on the path, so this fixture must use the
+    /// crate the scanner actually lives in: PR #593 moved it out of `corecruxd`
+    /// into `corecrux-workspace-scan` and renamed the exemption, but this
+    /// fixture (added by the second coverage sweep) still built a `corecruxd`
+    /// tree — so the test asserted an exemption that could no longer match.
+    #[test]
+    fn scanner_sources_are_exempt_from_stub_detection() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let crate_dir = tmp.path().join("corecrux-workspace-scan");
+        std::fs::create_dir_all(crate_dir.join("src")).expect("dirs");
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").expect("workspace toml");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"corecrux-workspace-scan\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("crate toml");
+        // The scanner's own sources mention `todo!(` as data, not as a stub.
+        std::fs::write(
+            crate_dir.join("src/workspace_scan.rs"),
+            "pub fn scanner_marker() {\n    let _ = \"todo!(\";\n}\n",
+        )
+        .expect("scanner source");
+        std::fs::write(
+            crate_dir.join("src/other.rs"),
+            "pub fn other_marker() {\n    todo!();\n}\n",
+        )
+        .expect("other source");
+
+        let scan = run_scan_ast_at(tmp.path()).expect("ast scan");
+        assert!(
+            !scan.stubs.iter().any(|s| s
+                .file_rel_path
+                .ends_with("corecrux-workspace-scan/src/workspace_scan.rs")),
+            "the scanner's own source must not report its stub markers"
+        );
+        assert!(scan.stubs.iter().any(|s| s.file_rel_path.ends_with("other.rs")));
+    }
+
+    // ---------------------------------------------------------------------
+    // Workspace discovery
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn crate_without_src_directory_is_absent_and_nameless_manifest_falls_back_to_dir_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").expect("workspace toml");
+        // No `src/` at all.
+        std::fs::create_dir_all(tmp.path().join("crates/no_src")).expect("no_src dir");
+        std::fs::write(
+            tmp.path().join("crates/no_src/Cargo.toml"),
+            "[package]\nname = \"no_src\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("no_src toml");
+        // Manifest with no `[package] name` — crate name falls back to the dir.
+        std::fs::create_dir_all(tmp.path().join("crates/dirnamed/src")).expect("dirnamed dirs");
+        std::fs::write(tmp.path().join("crates/dirnamed/Cargo.toml"), "[lib]\npath = \"x\"\n").expect("dirnamed toml");
+        std::fs::write(tmp.path().join("crates/dirnamed/src/lib.rs"), "pub fn only_fn() {}\n").expect("dirnamed lib");
+
+        let scan = run_scan_ast_at(tmp.path()).expect("ast scan");
+        assert!(!scan.crates.iter().any(|c| c.name == "no_src"));
+        let dirnamed = scan
+            .crates
+            .iter()
+            .find(|c| c.name == "dirnamed")
+            .expect("dir-name fallback crate");
+        assert_eq!(dirnamed.rel_path, "crates/dirnamed");
+        assert_eq!(dirnamed.file_count, 1);
+        assert_eq!(dirnamed.total_loc, 1);
+    }
+
+    #[test]
+    fn crate_internal_path_deps_are_recorded_on_the_crate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").expect("workspace toml");
+        for (name, extra) in [
+            ("upper", "\n[dependencies]\nlower = { path = \"../lower\" }\n"),
+            ("lower", ""),
+        ] {
+            let dir = tmp.path().join(format!("crates/{name}"));
+            std::fs::create_dir_all(dir.join("src")).expect("crate dirs");
+            std::fs::write(
+                dir.join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n{extra}"),
+            )
+            .expect("crate toml");
+            std::fs::write(dir.join("src/lib.rs"), "pub fn noop() {}\n").expect("crate lib");
+        }
+
+        let scan = run_scan_ast_at(tmp.path()).expect("ast scan");
+        let upper = scan.crates.iter().find(|c| c.name == "upper").expect("upper crate");
+        assert_eq!(upper.internal_deps, vec!["lower".to_string()]);
+    }
+
+    // ---------------------------------------------------------------------
+    // Item indexing
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn every_indexed_item_kind_produces_a_symbol_with_its_declaration_line() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let crate_dir = tmp.path().join("crates/kinds");
+        std::fs::create_dir_all(crate_dir.join("src")).expect("dirs");
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").expect("workspace toml");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"kinds\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("crate toml");
+        std::fs::write(
+            crate_dir.join("src/lib.rs"),
+            r#"pub struct AStruct;
+pub enum AnEnum { One }
+pub trait ATrait {}
+pub type AnAlias = u8;
+pub const A_CONST: u8 = 1;
+pub static A_STATIC: u8 = 2;
+pub mod inner {
+    pub fn inner_fn() {}
+}
+pub union AUnion { a: u8 }
+impl AStruct {
+    pub fn method_fn(&self) {}
+}
+impl ATrait for AStruct {}
+"#,
+        )
+        .expect("lib");
+
+        let scan = run_scan_ast_at(tmp.path()).expect("ast scan");
+        let by_name = |name: &str| scan.symbols.iter().find(|s| s.name == name).cloned();
+        for (name, kind, line) in [
+            ("AStruct", "struct", 1),
+            ("AnEnum", "enum", 2),
+            ("ATrait", "trait", 3),
+            ("AnAlias", "type", 4),
+            ("A_CONST", "const", 5),
+            ("A_STATIC", "static", 6),
+            ("inner", "mod", 7),
+            ("inner_fn", "fn", 8),
+        ] {
+            let symbol = by_name(name).unwrap_or_else(|| panic!("missing symbol {name}"));
+            assert_eq!(symbol.kind, kind, "{name}");
+            assert_eq!(symbol.line, line, "{name}");
+            assert!(symbol.is_pub, "{name}");
+        }
+        // Nested module items are qualified through the module.
+        assert_eq!(by_name("inner_fn").expect("inner_fn").module_path, "kinds::inner");
+        // `union` is not an indexed item kind.
+        assert!(by_name("AUnion").is_none());
+        // Inherent impl methods are indexed; the method's module path stays the
+        // file's, while its qualified name goes through the impl type.
+        let method = by_name("method_fn").expect("method_fn");
+        assert_eq!(method.kind, "fn");
+        assert_eq!(method.module_path, "kinds");
+    }
+
+    #[test]
+    fn use_statements_produce_dep_edges_only_for_workspace_targets() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_fixture(tmp.path());
+        std::fs::write(
+            tmp.path().join("crates/demo/src/uses.rs"),
+            r#"use crate::b::called;
+use demo::b::called as aliased;
+use std::collections::HashMap;
+use serde::Serialize;
+"#,
+        )
+        .expect("uses");
+
+        let scan = run_scan_ast_at(tmp.path()).expect("ast scan");
+        let edges: Vec<&DepEdge> = scan.deps.iter().filter(|d| d.from_file.ends_with("uses.rs")).collect();
+        let targets: BTreeSet<&str> = edges.iter().map(|d| d.to_module.as_str()).collect();
+        assert!(targets.contains("demo::crate::b::called"), "{targets:?}");
+        assert!(targets.contains("demo::b::called"), "{targets:?}");
+        assert!(
+            !targets.iter().any(|t| t.starts_with("std") || t.starts_with("serde")),
+            "external crates must not become internal dep edges: {targets:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Reference resolution / dead code / test-only
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn ambiguous_method_name_resolves_to_no_edge() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let crate_dir = tmp.path().join("crates/ambig");
+        std::fs::create_dir_all(crate_dir.join("src")).expect("dirs");
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").expect("workspace toml");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"ambig\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("crate toml");
+        std::fs::write(
+            crate_dir.join("src/lib.rs"),
+            r#"pub struct Left;
+pub struct Right;
+impl Left {
+    pub fn shared_name(&self) -> u8 { 1 }
+}
+impl Right {
+    pub fn shared_name(&self) -> u8 { 2 }
+}
+pub fn caller(l: Left) -> u8 {
+    l.shared_name()
+}
+"#,
+        )
+        .expect("lib");
+
+        let scan = run_scan_ast_at(tmp.path()).expect("ast scan");
+        assert!(
+            refs_to(&scan, "shared_name").is_empty(),
+            "a method name with two definitions must not manufacture an edge"
+        );
+    }
+
+    #[test]
+    fn calls_inside_macro_bodies_are_recovered_as_references() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let crate_dir = tmp.path().join("crates/macros");
+        std::fs::create_dir_all(crate_dir.join("src")).expect("dirs");
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").expect("workspace toml");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"macros\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("crate toml");
+        std::fs::write(
+            crate_dir.join("src/lib.rs"),
+            r#"pub fn select_witness_signer() -> u8 { 7 }
+
+pub fn driver() {
+    println!("{}", select_witness_signer());
+}
+"#,
+        )
+        .expect("lib");
+
+        let scan = run_scan_ast_at(tmp.path()).expect("ast scan");
+        assert!(
+            !refs_to(&scan, "select_witness_signer").is_empty(),
+            "a call inside a macro body must still be an edge"
+        );
+        assert!(
+            !scan.dead_code.iter().any(|d| d.name == "select_witness_signer"),
+            "macro-only callers must not read as dead code"
+        );
+    }
+
+    #[test]
+    fn dead_code_skips_private_underscored_short_and_common_names() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let crate_dir = tmp.path().join("crates/dead");
+        std::fs::create_dir_all(crate_dir.join("src")).expect("dirs");
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").expect("workspace toml");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"dead\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("crate toml");
+        std::fs::write(
+            crate_dir.join("src/lib.rs"),
+            r#"fn private_unreferenced_fn() {}
+pub fn _underscored_unreferenced() {}
+pub fn abc() {}
+pub fn build() {}
+pub fn genuinely_unreferenced() {}
+"#,
+        )
+        .expect("lib");
+
+        let scan = run_scan_ast_at(tmp.path()).expect("ast scan");
+        let dead: BTreeSet<&str> = scan.dead_code.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(dead, BTreeSet::from(["genuinely_unreferenced"]), "{dead:?}");
+        let reported = scan
+            .dead_code
+            .iter()
+            .find(|d| d.name == "genuinely_unreferenced")
+            .expect("dead symbol");
+        assert!((reported.confidence - 0.75).abs() < f32::EPSILON);
+        assert_eq!(reported.crate_name, "dead");
+    }
+
+    #[test]
+    fn symbols_referenced_only_from_cfg_test_scopes_are_named_test_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let crate_dir = tmp.path().join("crates/testonly");
+        std::fs::create_dir_all(crate_dir.join("src")).expect("dirs");
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").expect("workspace toml");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"testonly\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("crate toml");
+        std::fs::write(
+            crate_dir.join("src/lib.rs"),
+            r#"pub fn production_helper() {}
+
+pub fn used_by_production() {}
+
+pub fn entrypoint() {
+    used_by_production();
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn exercises_it() {
+        super::production_helper();
+    }
+}
+"#,
+        )
+        .expect("lib");
+
+        let scan = run_scan_ast_at(tmp.path()).expect("ast scan");
+        assert!(
+            scan.test_only_symbols.contains(&"production_helper".to_string()),
+            "expected production_helper to be test-only: {:?}",
+            scan.test_only_symbols
+        );
+        assert!(!scan.test_only_symbols.contains(&"used_by_production".to_string()));
+        // Test-only and dead are deliberately disjoint.
+        assert!(!scan.dead_code.iter().any(|d| d.name == "production_helper"));
+    }
+
+    // ---------------------------------------------------------------------
+    // Routes
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn routes_resolve_to_handlers_and_report_not_found_and_ambiguous() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let crate_dir = tmp.path().join("crates/routed");
+        std::fs::create_dir_all(crate_dir.join("src")).expect("dirs");
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").expect("workspace toml");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"routed\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("crate toml");
+        std::fs::write(
+            crate_dir.join("src/lib.rs"),
+            r#"pub mod first;
+pub mod second;
+
+pub fn only_handler() {}
+
+pub fn router() {
+    let _ = ()
+        .route("/ok", get(only_handler))
+        .route("/missing", post(absent_handler))
+        .route("/dup", get(duplicated_handler));
+}
+"#,
+        )
+        .expect("lib");
+        std::fs::write(crate_dir.join("src/first.rs"), "pub fn duplicated_handler() {}\n").expect("first");
+        std::fs::write(crate_dir.join("src/second.rs"), "pub fn duplicated_handler() {}\n").expect("second");
+
+        let scan = run_scan_ast_at(tmp.path()).expect("ast scan");
+        let ok = scan.routes.iter().find(|r| r.path == "/ok").expect("/ok route");
+        assert_eq!(ok.method, "GET");
+        assert_eq!(ok.handler_fn, "only_handler");
+        assert!(ok.handler_file.as_deref().is_some_and(|f| f.ends_with("lib.rs")));
+        assert_eq!(ok.handler_line, Some(4));
+        assert!(ok.framework.is_none());
+
+        let reasons: BTreeMap<&str, &str> = scan
+            .diagnostics
+            .unresolved_routes
+            .iter()
+            .map(|u| (u.path.as_str(), u.reason.as_str()))
+            .collect();
+        assert_eq!(reasons.get("/missing"), Some(&"not_found"));
+        assert_eq!(reasons.get("/dup"), Some(&"ambiguous"));
+        assert!(!reasons.contains_key("/ok"));
+        // Unresolved routes are still emitted as route hits, with no handler.
+        let missing = scan
+            .routes
+            .iter()
+            .find(|r| r.path == "/missing")
+            .expect("/missing route");
+        assert!(missing.handler_file.is_none() && missing.handler_line.is_none());
+    }
+
+    #[test]
+    fn stats_roll_up_routes_by_crate_and_doc_coverage() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_fixture(tmp.path());
+        std::fs::write(
+            tmp.path().join("crates/demo/src/routes.rs"),
+            "pub fn wire() {\n    let _ = ().route(\"/b\", get(called));\n}\n",
+        )
+        .expect("routes");
+
+        let scan = run_scan_ast_at(tmp.path()).expect("ast scan");
+        assert_eq!(scan.stats.route_count, 1);
+        assert_eq!(scan.stats.routes_by_crate.get("demo").copied(), Some(1));
+        assert_eq!(scan.stats.crate_count, scan.crates.len());
+        assert_eq!(scan.stats.file_count, scan.files.len());
+        assert_eq!(scan.stats.symbol_count, scan.symbols.len());
+        assert_eq!(scan.stats.dep_count, scan.deps.len());
+        assert_eq!(scan.stats.dead_code_count, scan.dead_code.len());
+        assert_eq!(
+            scan.stats.doc_coverage_files,
+            scan.files.iter().filter(|f| f.doc_summary.is_some()).count()
+        );
+        assert_eq!(scan.stats.total_loc, scan.files.iter().map(|f| f.loc).sum::<usize>());
+    }
+
+    // ---------------------------------------------------------------------
+    // Incremental cache
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn unchanged_signature_and_content_is_a_cache_hit_even_when_explicitly_changed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_fixture(tmp.path());
+        let mut cache = AstScanCache::from_root(tmp.path()).expect("full cache");
+        let total = cache.files.len();
+        let touched = tmp.path().join("crates/demo/src/a.rs");
+
+        let result = update_cache_incremental(tmp.path(), &mut cache, std::slice::from_ref(&touched))
+            .expect("incremental update");
+        assert_eq!(result.stats.files_reparsed, 0);
+        assert_eq!(result.stats.cache_hits, total);
+        assert_eq!(result.stats.files_dropped, 0);
+    }
+
+    #[test]
+    fn same_signature_but_different_content_is_reparsed_when_explicitly_changed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_fixture(tmp.path());
+        let mut cache = AstScanCache::from_root(tmp.path()).expect("full cache");
+        let changed = tmp.path().join("crates/demo/src/b.rs");
+        let before = std::fs::metadata(&changed).expect("metadata");
+        let original_len = before.len();
+        let original_mtime = before.modified().expect("mtime");
+
+        // Same byte length, different bytes — the (mtime, len) signature alone
+        // cannot see this, so only the content hash catches it.
+        let rewritten = "//! B module.\npub fn kalled() {}\n";
+        assert_eq!(rewritten.len() as u64, original_len);
+        std::fs::write(&changed, rewritten).expect("rewrite");
+        let handle = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&changed)
+            .expect("open for mtime");
+        handle.set_modified(original_mtime).expect("restore mtime");
+        drop(handle);
+
+        let result = update_cache_incremental(tmp.path(), &mut cache, std::slice::from_ref(&changed))
+            .expect("incremental update");
+        assert_eq!(result.stats.files_reparsed, 1);
+        assert!(result.scan.symbols.iter().any(|s| s.name == "kalled"));
+        assert!(!result.scan.symbols.iter().any(|s| s.name == "called"));
+    }
+
+    #[test]
+    fn new_file_is_picked_up_by_an_incremental_update_that_did_not_name_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_fixture(tmp.path());
+        let mut cache = AstScanCache::from_root(tmp.path()).expect("full cache");
+        std::fs::write(
+            tmp.path().join("crates/demo/src/c.rs"),
+            "//! C module.\npub fn brand_new() {}\n",
+        )
+        .expect("new file");
+
+        let result = update_cache_incremental(tmp.path(), &mut cache, &[]).expect("incremental update");
+        assert_eq!(result.stats.files_reparsed, 1);
+        assert!(result.scan.symbols.iter().any(|s| s.name == "brand_new"));
+    }
+
+    #[test]
+    fn incremental_update_relativizes_changed_paths_against_the_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_fixture(tmp.path());
+        let mut cache = AstScanCache::from_root(tmp.path()).expect("full cache");
+        std::fs::write(
+            tmp.path().join("crates/demo/src/b.rs"),
+            "//! B module.\npub fn called() {}\npub fn relative_marker() {}\n",
+        )
+        .expect("rewrite");
+
+        let relative = PathBuf::from("crates/demo/src/b.rs");
+        let result = update_cache_incremental(tmp.path(), &mut cache, std::slice::from_ref(&relative))
+            .expect("incremental update");
+        assert_eq!(result.stats.files_reparsed, 1);
+        assert!(result.scan.symbols.iter().any(|s| s.name == "relative_marker"));
+    }
+
+    #[test]
+    fn file_signature_of_a_missing_path_is_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(file_signature(&tmp.path().join("absent.rs")).is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // Pure helpers
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn parse_decl_line_recognises_each_declaration_kind_and_visibility() {
+        for (line, expected) in [
+            ("fn plain() {}", Some(("fn", "plain"))),
+            ("pub fn public_fn() {}", Some(("fn", "public_fn"))),
+            ("pub(crate) fn crate_fn() {}", Some(("fn", "crate_fn"))),
+            ("pub(super) fn super_fn() {}", Some(("fn", "super_fn"))),
+            ("    async fn async_fn() {}", Some(("fn", "async_fn"))),
+            ("unsafe fn unsafe_fn() {}", Some(("fn", "unsafe_fn"))),
+            ("const fn const_fn() {}", Some(("fn", "const_fn"))),
+            ("struct AStruct;", Some(("struct", "AStruct"))),
+            ("enum AnEnum {}", Some(("enum", "AnEnum"))),
+            ("trait ATrait {}", Some(("trait", "ATrait"))),
+            ("type Alias = u8;", Some(("type", "Alias"))),
+            ("const A_CONST: u8 = 1;", Some(("const", "A_CONST"))),
+            ("static A_STATIC: u8 = 1;", Some(("static", "A_STATIC"))),
+            ("mod inner;", Some(("mod", "inner"))),
+            ("// fn commented_out() {}", None),
+            ("let x = 1;", None),
+            ("fn () {}", None),
+            ("", None),
+        ] {
+            let actual = parse_decl_line(line).map(|(kind, name)| (kind, name));
+            let expected = expected.map(|(kind, name)| (kind, name.to_string()));
+            assert_eq!(actual, expected, "line: {line:?}");
+        }
+    }
+
+    #[test]
+    fn line_lookup_hands_out_declaration_lines_in_order_then_zero() {
+        let mut lookup = LineLookup::new("fn dup() {}\n// noise\nfn dup() {}\n");
+        assert_eq!(lookup.take("fn", "dup"), 1);
+        assert_eq!(lookup.take("fn", "dup"), 3);
+        assert_eq!(lookup.take("fn", "dup"), 0, "exhausted lookups fall back to line 0");
+        assert_eq!(lookup.take("fn", "never_declared"), 0);
+    }
+
+    #[test]
+    fn qualify_joins_only_when_the_base_is_non_empty() {
+        assert_eq!(qualify("", "name"), "name");
+        assert_eq!(qualify("a::b", "name"), "a::b::name");
+    }
+
+    #[test]
+    fn is_pub_accepts_public_and_restricted_visibility() {
+        assert!(is_pub(&syn::parse_str::<syn::Visibility>("pub").expect("pub")));
+        assert!(is_pub(
+            &syn::parse_str::<syn::Visibility>("pub(crate)").expect("pub(crate)")
+        ));
+        assert!(!is_pub(&syn::Visibility::Inherited));
+    }
+
+    #[test]
+    fn impl_type_name_reads_path_types_only() {
+        let path_ty: syn::Type = syn::parse_str("std::vec::Vec<u8>").expect("path type");
+        assert_eq!(impl_type_name(&path_ty).as_deref(), Some("Vec"));
+        let ref_ty: syn::Type = syn::parse_str("&'a str").expect("ref type");
+        assert!(impl_type_name(&ref_ty).is_none());
+    }
+
+    #[test]
+    fn is_rs_path_only_matches_the_rs_extension() {
+        assert!(is_rs_path(Path::new("a/b.rs")));
+        assert!(!is_rs_path(Path::new("a/b.rss")));
+        assert!(!is_rs_path(Path::new("a/b")));
+    }
+
+    #[test]
+    fn absolutize_and_rel_string_round_trip_relative_and_absolute_paths() {
+        let root = Path::new("/repo");
+        assert_eq!(
+            absolutize(root, Path::new("src/lib.rs")),
+            PathBuf::from("/repo/src/lib.rs")
+        );
+        assert_eq!(
+            absolutize(root, Path::new("/elsewhere/lib.rs")),
+            PathBuf::from("/elsewhere/lib.rs")
+        );
+        assert_eq!(rel_string(root, Path::new("/repo/src/lib.rs")), "src/lib.rs");
+        assert_eq!(
+            rel_string(root, Path::new("/elsewhere/lib.rs")),
+            "/elsewhere/lib.rs",
+            "a path outside the root keeps its absolute form"
+        );
+    }
+
+    #[test]
+    fn use_tree_paths_flattens_every_use_tree_shape() {
+        let parse = |src: &str| {
+            let item: syn::ItemUse = syn::parse_str(src).expect("use item");
+            use_tree_paths(&item.tree)
+        };
+        assert_eq!(parse("use a::b::c;"), vec!["a::b::c".to_string()]);
+        assert_eq!(parse("use a::b as c;"), vec!["a::b".to_string()]);
+        assert_eq!(parse("use a::b::*;"), vec!["a::b::*".to_string()]);
+        assert_eq!(
+            parse("use a::{b, c::d, e::*};"),
+            vec!["a::b".to_string(), "a::c::d".to_string(), "a::e::*".to_string()]
+        );
+    }
+
+    #[test]
+    fn use_path_to_module_maps_relative_and_workspace_paths_only() {
+        let known: BTreeSet<String> = ["corecrux-storage".to_string(), "demo".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            use_path_to_module("crate::a::b", "my-crate", &known).as_deref(),
+            Some("my_crate::crate::a::b")
+        );
+        assert_eq!(
+            use_path_to_module("self::a", "my-crate", &known).as_deref(),
+            Some("my_crate::self::a")
+        );
+        assert_eq!(
+            use_path_to_module("super::a", "my-crate", &known).as_deref(),
+            Some("my_crate::super::a")
+        );
+        assert_eq!(
+            use_path_to_module("demo::a", "my-crate", &known).as_deref(),
+            Some("demo::a")
+        );
+        assert_eq!(
+            use_path_to_module("corecrux_storage::a", "my-crate", &known).as_deref(),
+            Some("corecrux_storage::a"),
+            "underscored crate names normalize back to their hyphenated manifest name"
+        );
+        assert!(use_path_to_module("std::io", "my-crate", &known).is_none());
+        assert!(use_path_to_module("", "my-crate", &known).is_none());
+    }
+
+    fn fn_def(qualified: &str, simple: &str, crate_name: &str, module_path: &str, file: &str) -> FnDef {
+        FnDef {
+            qualified: qualified.to_string(),
+            simple: simple.to_string(),
+            crate_name: crate_name.to_string(),
+            module_path: module_path.to_string(),
+            file: file.to_string(),
+            symbol_idx: 0,
+            calls: Vec::new(),
+        }
+    }
+
+    fn call(segs: &[&str], kind: CallKind) -> CallRef {
+        CallRef {
+            segs: segs.iter().map(|s| (*s).to_string()).collect(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn normalize_call_segs_expands_crate_self_and_super_prefixes() {
+        let from = fn_def(
+            "my_crate::a::b::caller",
+            "caller",
+            "my-crate",
+            "my_crate::a::b",
+            "a/b.rs",
+        );
+        assert!(normalize_call_segs(&[], &from).is_empty());
+        assert_eq!(
+            normalize_call_segs(&["crate".to_string(), "x".to_string()], &from),
+            vec!["my_crate".to_string(), "x".to_string()]
+        );
+        assert_eq!(
+            normalize_call_segs(&["self".to_string(), "x".to_string()], &from),
+            vec![
+                "my_crate".to_string(),
+                "a".to_string(),
+                "b".to_string(),
+                "x".to_string()
+            ]
+        );
+        assert_eq!(
+            normalize_call_segs(&["super".to_string(), "x".to_string()], &from),
+            vec!["my_crate".to_string(), "a".to_string(), "x".to_string()]
+        );
+        assert_eq!(
+            normalize_call_segs(&["other-crate".to_string(), "x".to_string()], &from),
+            vec!["other_crate".to_string(), "x".to_string()]
+        );
+    }
+
+    #[test]
+    fn index_resolves_only_unambiguous_calls() {
+        let mut index = Index::default();
+        index.push(fn_def("k::m::target", "target", "k", "k::m", "m.rs"));
+        index.push(fn_def("k::other::target", "target", "k", "k::other", "other.rs"));
+        index.push(fn_def("k::m::unique", "unique", "k", "k::m", "m.rs"));
+        let from = fn_def("k::m::caller", "caller", "k", "k::m", "m.rs");
+
+        // Macros never resolve.
+        assert!(index.resolve(&call(&["unique"], CallKind::Macro), &from).is_none());
+        // Empty segment lists never resolve.
+        assert!(index.resolve(&call(&[], CallKind::Func), &from).is_none());
+        // A multi-segment path resolves through the suffix index when unique…
+        assert_eq!(
+            index.resolve(&call(&["other", "target"], CallKind::Func), &from),
+            Some(1)
+        );
+        // …and not at all when the suffix is unknown.
+        assert!(index
+            .resolve(&call(&["nowhere", "target"], CallKind::Func), &from)
+            .is_none());
+        // A bare name prefers the caller's own module.
+        assert_eq!(index.resolve(&call(&["target"], CallKind::Func), &from), Some(0));
+        // A method resolves only when exactly one definition bears the name.
+        assert_eq!(index.resolve(&call(&["unique"], CallKind::Method), &from), Some(2));
+        assert!(index.resolve(&call(&["target"], CallKind::Method), &from).is_none());
+        assert!(index.resolve(&call(&["a", "b"], CallKind::Method), &from).is_none());
+        // An unknown bare name resolves to nothing.
+        assert!(index.resolve(&call(&["absent"], CallKind::Func), &from).is_none());
+    }
+
+    #[test]
+    fn index_falls_back_from_module_to_file_to_crate_then_gives_up() {
+        // Same simple name in three places, none in the caller's module.
+        let mut index = Index::default();
+        index.push(fn_def("k::x::dup", "dup", "k", "k::x", "caller.rs"));
+        index.push(fn_def("k::y::dup", "dup", "k", "k::y", "y.rs"));
+        index.push(fn_def("j::z::dup", "dup", "j", "j::z", "z.rs"));
+        let from = fn_def("k::caller_mod::caller", "caller", "k", "k::caller_mod", "caller.rs");
+        // Same-file wins over same-crate.
+        assert_eq!(index.resolve(&call(&["dup"], CallKind::Func), &from), Some(0));
+
+        // With no same-file candidate, the single same-crate candidate wins.
+        let mut index = Index::default();
+        index.push(fn_def("k::y::dup", "dup", "k", "k::y", "y.rs"));
+        index.push(fn_def("j::z::dup", "dup", "j", "j::z", "z.rs"));
+        assert_eq!(index.resolve(&call(&["dup"], CallKind::Func), &from), Some(0));
+
+        // With two candidates in the caller's crate and none in its file, the
+        // call is genuinely ambiguous and resolves to nothing.
+        let mut index = Index::default();
+        index.push(fn_def("k::y::dup", "dup", "k", "k::y", "y.rs"));
+        index.push(fn_def("k::z::dup", "dup", "k", "k::z", "z.rs"));
+        assert!(index.resolve(&call(&["dup"], CallKind::Func), &from).is_none());
+
+        // A single global candidate resolves even from another crate.
+        let mut index = Index::default();
+        index.push(fn_def("j::z::dup", "dup", "j", "j::z", "z.rs"));
+        assert_eq!(index.resolve(&call(&["dup"], CallKind::Func), &from), Some(0));
+    }
+
+    #[test]
+    fn item_is_cfg_test_matches_only_test_gated_supported_items() {
+        let parse = |src: &str| syn::parse_str::<syn::Item>(src).expect("item");
+        assert!(item_is_cfg_test(&parse("#[cfg(test)] mod tests {}")));
+        assert!(item_is_cfg_test(&parse("#[cfg(all(test, feature = \"x\"))] fn f() {}")));
+        assert!(item_is_cfg_test(&parse("#[cfg(any(test))] struct S;")));
+        assert!(item_is_cfg_test(&parse("#[cfg(test)] enum E {}")));
+        assert!(item_is_cfg_test(&parse("#[cfg(test)] impl S {}")));
+        assert!(!item_is_cfg_test(&parse("#[cfg(feature = \"x\")] fn f() {}")));
+        assert!(!item_is_cfg_test(&parse("#[derive(Debug)] struct S;")));
+        assert!(!item_is_cfg_test(&parse("fn f() {}")));
+        assert!(
+            !item_is_cfg_test(&parse("#[cfg(test)] const C: u8 = 1;")),
+            "consts are not one of the item kinds this check inspects"
+        );
+    }
+
+    #[test]
+    fn collect_calls_in_tokens_recovers_path_method_and_nested_call_shapes() {
+        let stream: proc_macro2::TokenStream = "crate::a::b(1); receiver.method(2); plain(); { inner(3) } bare"
+            .parse()
+            .expect("token stream");
+        let mut out = Vec::new();
+        collect_calls_in_tokens(stream, &mut out);
+        let shapes: BTreeSet<(String, bool)> = out
+            .iter()
+            .map(|c| (c.segs.join("::"), c.kind == CallKind::Method))
+            .collect();
+        assert!(shapes.contains(&("crate::a::b".to_string(), false)), "{shapes:?}");
+        assert!(shapes.contains(&("method".to_string(), true)), "{shapes:?}");
+        assert!(shapes.contains(&("plain".to_string(), false)), "{shapes:?}");
+        assert!(shapes.contains(&("inner".to_string(), false)), "{shapes:?}");
+        assert!(
+            !shapes.iter().any(|(name, _)| name == "bare"),
+            "an identifier not followed by `(` is not a call: {shapes:?}"
+        );
+    }
+
+    #[test]
+    fn is_path_sep_matches_only_a_double_colon_pair() {
+        let sep: Vec<proc_macro2::TokenTree> = "::"
+            .parse::<proc_macro2::TokenStream>()
+            .expect("sep")
+            .into_iter()
+            .collect();
+        assert!(is_path_sep(&sep));
+        let not_sep: Vec<proc_macro2::TokenTree> = ". ."
+            .parse::<proc_macro2::TokenStream>()
+            .expect("dots")
+            .into_iter()
+            .collect();
+        assert!(!is_path_sep(&not_sep));
+        let ident_pair: Vec<proc_macro2::TokenTree> = "a b"
+            .parse::<proc_macro2::TokenStream>()
+            .expect("idents")
+            .into_iter()
+            .collect();
+        assert!(!is_path_sep(&ident_pair));
     }
 }

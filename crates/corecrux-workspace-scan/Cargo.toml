@@ -1,0 +1,58 @@
+[package]
+name = "corecrux-workspace-scan"
+publish.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Scan results are deduped through the shared fact helper before they are
+# returned; the daemon persists them, this crate does not.
+corecrux-memory = { path = "../corecrux-memory" }
+blake3 = { workspace = true }
+# repo_scan_policy's containment needs the raw syscall surface: openat2-style
+# anchored opens, O_NOFOLLOW, and fd-level metadata, so a scan cannot be walked
+# out of its root by a symlink swapped in mid-scan.
+libc = "0.2.186"
+rustix = { version = "1.1.4", features = ["fs"] }
+proc-macro2 = { workspace = true }
+regex = { workspace = true }
+roxmltree = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+syn = { workspace = true, features = ["full", "visit"] }
+thiserror = { workspace = true }
+# `sync` only: the scan entry point takes the daemon's fact store as
+# `Arc<tokio::sync::RwLock<..>>`. No runtime is started here.
+tokio = { workspace = true, features = ["sync"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+
+# Polyglot extraction: one tree-sitter grammar per supported non-Rust language.
+# Rust itself is handled by `syn` above, not by a grammar.
+uuid = { workspace = true, features = ["v4"] }
+
+tree-sitter = "0.26.10"
+# Rust goes through `syn` for AST extraction; this grammar is used by the
+# polyglot path's own admission checks, not as a second Rust parser.
+tree-sitter-rust = "=0.24.2"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-java = "=0.23.5"
+tree-sitter-c = "=0.24.2"
+tree-sitter-cpp = "=0.23.4"
+tree-sitter-c-sharp = "=0.23.5"
+tree-sitter-ruby = "=0.23.1"
+tree-sitter-swift = "=0.7.3"
+tree-sitter-php = "=0.24.2"
+
+[dev-dependencies]
+# Env-mutating scan-config tests opt into the crate-wide serial group; env is
+# process-global and shared with every other test thread in this binary.
+serial_test = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

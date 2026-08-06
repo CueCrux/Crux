@@ -16,9 +16,7 @@ use std::path::Path;
 use corecrux_memory::fact_store::{FactStore, StoreFact};
 use serde::{Deserialize, Serialize};
 
-use crate::integrations_github::{
-    decrypt_pat, list_selected_repos, read_credentials, GithubIntegrationError, SelectedRepo,
-};
+use crate::github::{decrypt_pat, list_selected_repos, read_credentials, GithubIntegrationError, SelectedRepo};
 
 #[allow(dead_code)] // documentation marker — used by the MCP tool descriptions in G5.
 pub const COMMIT_ENTITY_TEMPLATE: &str = "github::{owner}/{repo}::commit/{sha}";
@@ -50,7 +48,8 @@ pub struct SyncRunResult {
     pub repos: Vec<RepoSyncOutcome>,
 }
 
-/// Sync entry point — needs the integration encryption key (held in AppState).
+/// Sync entry point — the caller supplies the integration encryption key
+/// (the daemon holds it in its application state; this crate never sources it).
 /// Blocking — caller dispatches via `tokio::task::spawn_blocking`. The first
 /// call after `select_repo` does a full first-sync (capped at
 /// `PER_REPO_MAX_PAGES * PER_REPO_PAGE_SIZE`); subsequent calls use the
@@ -611,6 +610,9 @@ fn write_selected_for_sync(data_dir: &Path, repos: &[SelectedRepo]) -> Result<()
     // Mirrors integrations_github::write_selected_repos but reachable from this
     // module without a circular dep. Rewrites the whole file.
     let path = data_dir.join("integrations").join("github").join("selected_repos.json");
+    // Same guard as the sibling writer: never clobber a selection we could not
+    // read (D-8).
+    crate::github::ensure_selection_writable(&path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -647,6 +649,7 @@ fn urlencoding(s: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
@@ -771,5 +774,472 @@ mod tests {
         let result = run_sync_with_key(&dir, &mut store, &[0u8; 32], 1_000);
         assert!(matches!(result, Err(GithubIntegrationError::NotConnected)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Fixtures ──────────────────────────────────────────────────────────
+
+    /// Write a credentials file whose PAT envelope is sealed with `key`. The
+    /// token is an obvious fake; nothing here reaches api.github.com because
+    /// every test that uses it keeps the selected-repo set empty.
+    fn write_fake_credentials(dir: &Path, key: &[u8; 32]) {
+        let creds = crate::github::GithubCredentials {
+            encrypted_pat: corecrux_secrets::seal(b"github_pat_FAKE_not_a_real_token", key),
+            username: "octocat".to_string(),
+            scopes: vec!["repo".to_string()],
+            connected_at_unix_ms: 1_700_000_000_000,
+            last_verified_at_unix_ms: None,
+        };
+        crate::github::write_credentials(dir, &creds).expect("write credentials");
+    }
+
+    fn store_record(store: &mut FactStore, entity: &str, private: bool) {
+        store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: entity.to_string(),
+            key: "record".to_string(),
+            value: "{}".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+
+    // ── run_sync_with_key gating (no network reached) ─────────────────────
+
+    /// Credentials present but nothing selected: the sync must complete
+    /// successfully with zero repo outcomes and — critically — must not
+    /// attempt any outbound call.
+    #[test]
+    fn run_sync_with_no_selected_repos_is_a_successful_no_op() {
+        let dir = temp_dir("no-repos");
+        let key = [3u8; 32];
+        write_fake_credentials(&dir, &key);
+        let mut store = FactStore::new();
+        let result = run_sync_with_key(&dir, &mut store, &key, 1_234).expect("sync");
+        assert!(result.repos.is_empty());
+        assert_eq!(result.started_at_unix_ms, 1_234);
+        assert!(
+            result.finished_at_unix_ms > 0,
+            "finished_at is stamped from the wall clock"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rotated passport (wrong integration key) must fail loudly at decrypt
+    /// time rather than falling through to an unauthenticated sync.
+    #[test]
+    fn run_sync_with_wrong_key_fails_before_any_fetch() {
+        let dir = temp_dir("wrong-key");
+        write_fake_credentials(&dir, &[3u8; 32]);
+        // A repo IS selected — so if decrypt did not hard-fail first, this
+        // test would try to reach the network.
+        crate::github::select_repo(&dir, "cuecrux", "Crux", false, 1).expect("select");
+        let mut store = FactStore::new();
+        let err = run_sync_with_key(&dir, &mut store, &[9u8; 32], 1).expect_err("must fail");
+        assert!(
+            matches!(
+                err,
+                GithubIntegrationError::Encryption(corecrux_secrets::EncryptedSecretError::DecryptionFailed)
+            ),
+            "got {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── record_exists (idempotency guard) ─────────────────────────────────
+
+    /// `record_exists` is the only thing stopping a re-sync from duplicating
+    /// every commit fact. It must match on the exact entity + the `record` key.
+    #[test]
+    fn record_exists_matches_only_exact_entity_and_record_key() {
+        let mut store = FactStore::new();
+        let entity = "github::cuecrux/Crux::commit/abc123";
+        assert!(!record_exists(&store, entity), "empty store has no record");
+        store_record(&mut store, entity, false);
+        assert!(record_exists(&store, entity));
+        assert!(
+            !record_exists(&store, "github::cuecrux/Crux::commit/other"),
+            "a different sha must not be treated as already-synced"
+        );
+    }
+
+    /// A fact stored under the same entity but a different key must not be
+    /// mistaken for a synced record.
+    #[test]
+    fn record_exists_ignores_other_keys_on_the_same_entity() {
+        let mut store = FactStore::new();
+        let entity = "github::o/r::comment/1";
+        store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: entity.to_string(),
+            key: "note".to_string(),
+            value: "{}".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        assert!(!record_exists(&store, entity));
+    }
+
+    // ── Cursor persistence ────────────────────────────────────────────────
+
+    /// A successful repo sync must stamp the cursor and clear any previous
+    /// error, so the next run uses `since=` instead of doing a full re-pull.
+    #[test]
+    fn persist_repo_synced_sets_cursor_and_clears_previous_error() {
+        let dir = temp_dir("persist-ok");
+        let repo = crate::github::select_repo(&dir, "a", "b", false, 1).expect("select");
+        persist_repo_error(&dir, &repo, "earlier failure".to_string());
+        assert_eq!(
+            crate::github::list_selected_repos(&dir)[0].last_sync_error.as_deref(),
+            Some("earlier failure")
+        );
+        persist_repo_synced(&dir, &repo, 9_999);
+        let after = crate::github::list_selected_repos(&dir);
+        assert_eq!(after[0].last_synced_at_unix_ms, Some(9_999));
+        assert!(after[0].last_sync_error.is_none(), "success must clear the error");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An error must be persisted so the console can surface it, and it must
+    /// NOT advance the cursor (otherwise the failed window would be skipped).
+    #[test]
+    fn persist_repo_error_records_error_without_advancing_cursor() {
+        let dir = temp_dir("persist-err");
+        let repo = crate::github::select_repo(&dir, "a", "b", false, 1).expect("select");
+        persist_repo_synced(&dir, &repo, 500);
+        persist_repo_error(&dir, &repo, "github returned 403".to_string());
+        let after = crate::github::list_selected_repos(&dir);
+        assert_eq!(after[0].last_sync_error.as_deref(), Some("github returned 403"));
+        assert_eq!(after[0].last_synced_at_unix_ms, Some(500), "cursor unchanged");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Persisting for a repo that is no longer in the selected set (operator
+    /// unselected it mid-sync) must be a silent no-op, not a panic or a
+    /// resurrected entry.
+    #[test]
+    fn persist_for_unselected_repo_is_a_no_op() {
+        let dir = temp_dir("persist-gone");
+        let repo = SelectedRepo {
+            owner: "ghost".to_string(),
+            repo: "gone".to_string(),
+            private: false,
+            selected_at_unix_ms: 1,
+            last_synced_at_unix_ms: None,
+            last_sync_error: None,
+            planning: false,
+        };
+        persist_repo_synced(&dir, &repo, 5);
+        persist_repo_error(&dir, &repo, "boom".to_string());
+        assert!(crate::github::list_selected_repos(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sync module writes `selected_repos.json` through its own helper to
+    /// avoid a circular dep — that file must stay readable by the owning
+    /// module, including the `planning` flag it does not itself use.
+    #[test]
+    fn write_selected_for_sync_is_readable_by_the_owning_module() {
+        let dir = temp_dir("write-compat");
+        crate::github::select_repo(&dir, "a", "b", true, 7).expect("select");
+        crate::github::set_planning_repo(&dir, "a", "b", true).expect("planning");
+        let mut repos = crate::github::list_selected_repos(&dir);
+        repos[0].last_synced_at_unix_ms = Some(4_242);
+        write_selected_for_sync(&dir, &repos).expect("write");
+        let reloaded = crate::github::list_selected_repos(&dir);
+        assert_eq!(reloaded.len(), 1);
+        assert!(reloaded[0].private);
+        assert!(reloaded[0].planning, "planning flag survives the sync-side write");
+        assert_eq!(reloaded[0].last_synced_at_unix_ms, Some(4_242));
+        assert_eq!(reloaded[0].selected_at_unix_ms, 7);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_selected_for_sync_creates_missing_directories() {
+        let dir = temp_dir("write-mkdir");
+        write_selected_for_sync(&dir, &[]).expect("write into a fresh data dir");
+        assert!(dir
+            .join("integrations")
+            .join("github")
+            .join("selected_repos.json")
+            .exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Payload parsing: defaults and rejection ───────────────────────────
+
+    /// GitHub omits `commit.author` on some rewritten history; the record must
+    /// still parse with empty strings rather than being dropped.
+    #[test]
+    fn parse_commit_tolerates_missing_author_and_parents() {
+        let raw = serde_json::json!({ "sha": "deadbeef", "commit": {} });
+        let rec = parse_commit(&raw).expect("parsed");
+        assert_eq!(rec.sha, "deadbeef");
+        assert_eq!(rec.message, "");
+        assert_eq!(rec.author_name, "");
+        assert_eq!(rec.committed_at, "");
+        assert!(rec.author_login.is_none());
+        assert!(rec.parents.is_empty());
+        assert_eq!(rec.html_url, "");
+    }
+
+    /// A payload with no `commit` object at all is not a commit — it must be
+    /// rejected, not stored as a fact with an empty message.
+    #[test]
+    fn parse_commit_without_commit_object_returns_none() {
+        assert!(parse_commit(&serde_json::json!({ "sha": "abc" })).is_none());
+    }
+
+    #[test]
+    fn parse_commit_with_non_string_sha_returns_none() {
+        assert!(parse_commit(&serde_json::json!({ "sha": 42, "commit": {} })).is_none());
+    }
+
+    /// The entity id is keyed off the PR number, so a payload without a
+    /// numeric `number` must be dropped rather than collapsing onto one entity.
+    #[test]
+    fn parse_pr_without_number_returns_none() {
+        assert!(parse_pr(&serde_json::json!({ "title": "x" })).is_none());
+        assert!(parse_pr(&serde_json::json!({ "number": "42" })).is_none());
+    }
+
+    #[test]
+    fn parse_pr_defaults_missing_fields_and_keeps_null_timestamps_absent() {
+        let raw = serde_json::json!({ "number": 1 });
+        let pr = parse_pr(&raw).expect("parsed");
+        assert_eq!(pr.title, "");
+        assert_eq!(pr.state, "");
+        assert!(pr.author_login.is_none());
+        assert!(pr.merged_at.is_none());
+        assert!(pr.closed_at.is_none());
+        assert_eq!(pr.head_sha, "");
+        assert_eq!(pr.base_branch, "");
+        assert_eq!(pr.body, "");
+    }
+
+    /// A merged PR carries both timestamps; an open one carries neither. The
+    /// `null` JSON value must map to `None`, not to the string "null".
+    #[test]
+    fn parse_pr_maps_json_null_timestamps_to_none() {
+        let raw = serde_json::json!({
+            "number": 9,
+            "merged_at": serde_json::Value::Null,
+            "closed_at": "2026-05-02T00:00:00Z",
+            "body": serde_json::Value::Null,
+        });
+        let pr = parse_pr(&raw).expect("parsed");
+        assert!(pr.merged_at.is_none());
+        assert_eq!(pr.closed_at.as_deref(), Some("2026-05-02T00:00:00Z"));
+        assert_eq!(pr.body, "", "a null body becomes an empty string");
+    }
+
+    /// `merged_at` is what distinguishes a merged PR from a closed one; it must
+    /// survive the round trip through the stored JSON value.
+    #[test]
+    fn pr_record_round_trips_through_json() {
+        let raw = serde_json::json!({
+            "number": 42,
+            "title": "fix",
+            "state": "closed",
+            "user": { "login": "alice" },
+            "created_at": "2026-05-01T10:00:00Z",
+            "updated_at": "2026-05-01T11:00:00Z",
+            "merged_at": "2026-05-01T11:30:00Z",
+            "head": { "sha": "abc" },
+            "base": { "ref": "main" },
+            "body": "b",
+            "html_url": "u"
+        });
+        let pr = parse_pr(&raw).expect("parsed");
+        let encoded = serde_json::to_string(&pr).expect("encode");
+        let decoded: PrRecord = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded.merged_at.as_deref(), Some("2026-05-01T11:30:00Z"));
+        assert!(decoded.closed_at.is_none());
+        assert_eq!(decoded.number, 42);
+    }
+
+    #[test]
+    fn parse_issue_without_number_returns_none() {
+        assert!(parse_issue(&serde_json::json!({ "title": "x" })).is_none());
+    }
+
+    /// Labels come back as objects; entries without a `name` (and a non-array
+    /// `labels`) must degrade to an empty list rather than dropping the issue.
+    #[test]
+    fn parse_issue_tolerates_malformed_labels() {
+        let unnamed = serde_json::json!({ "number": 1, "labels": [ { "colour": "red" }, { "name": "bug" } ] });
+        assert_eq!(parse_issue(&unnamed).expect("parsed").labels, vec!["bug".to_string()]);
+
+        let not_an_array = serde_json::json!({ "number": 2, "labels": "bug" });
+        assert!(parse_issue(&not_an_array).expect("parsed").labels.is_empty());
+
+        let missing = serde_json::json!({ "number": 3 });
+        assert!(parse_issue(&missing).expect("parsed").labels.is_empty());
+    }
+
+    #[test]
+    fn parse_comment_without_id_returns_none() {
+        assert!(parse_comment(&serde_json::json!({ "body": "hi" })).is_none());
+    }
+
+    /// `parent_number` is derived by string-splitting `issue_url`. A missing or
+    /// non-numeric tail must yield `None` rather than a bogus parent link.
+    #[test]
+    fn parse_comment_parent_number_is_none_for_unusable_issue_url() {
+        let no_url = parse_comment(&serde_json::json!({ "id": 1 })).expect("parsed");
+        assert!(no_url.parent_number.is_none());
+
+        let non_numeric =
+            parse_comment(&serde_json::json!({ "id": 2, "issue_url": "https://api.github.com/repos/o/r/issues/abc" }))
+                .expect("parsed");
+        assert!(non_numeric.parent_number.is_none());
+
+        let trailing_slash =
+            parse_comment(&serde_json::json!({ "id": 3, "issue_url": "https://api.github.com/repos/o/r/issues/7/" }))
+                .expect("parsed");
+        assert!(
+            trailing_slash.parent_number.is_none(),
+            "a trailing slash makes the last segment empty"
+        );
+    }
+
+    // ── parse_work_mentions ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_work_mentions_on_text_without_markers_is_empty() {
+        assert!(parse_work_mentions("").is_empty());
+        assert!(parse_work_mentions("no markers here at all").is_empty());
+        assert!(parse_work_mentions("[work").is_empty(), "truncated prefix");
+    }
+
+    /// An empty marker (`[work:]`) is not an id and must be dropped.
+    #[test]
+    fn parse_work_mentions_rejects_empty_id() {
+        assert!(parse_work_mentions("[work:]").is_empty());
+    }
+
+    /// Repeated mentions of the same id are returned once per occurrence, in
+    /// document order — the caller dedups, the parser does not.
+    #[test]
+    fn parse_work_mentions_preserves_duplicates_in_document_order() {
+        let ids = parse_work_mentions("[work:b] then [work:a] then [work:b]");
+        assert_eq!(ids, vec!["b".to_string(), "a".to_string(), "b".to_string()]);
+    }
+
+    /// Regression for the malformed-span rewind: after rejecting
+    /// `[work:bad id]` the scanner must not skip past a valid marker that
+    /// starts inside the rejected span.
+    #[test]
+    fn parse_work_mentions_recovers_from_a_nested_marker() {
+        let ids = parse_work_mentions("[work:bad [work:good]");
+        assert_eq!(ids, vec!["good".to_string()]);
+    }
+
+    #[test]
+    fn parse_work_mentions_accepts_hyphens_underscores_and_digits() {
+        let ids = parse_work_mentions("[work:a-b_c9]");
+        assert_eq!(ids, vec!["a-b_c9".to_string()]);
+    }
+
+    /// Multi-byte text must not panic the byte-wise scanner.
+    #[test]
+    fn parse_work_mentions_handles_multibyte_text() {
+        let ids = parse_work_mentions("héllo — [work:unicode-ok] — 日本語");
+        assert_eq!(ids, vec!["unicode-ok".to_string()]);
+    }
+
+    // ── Small helpers ─────────────────────────────────────────────────────
+
+    /// `since=` goes into a query string; RFC3339 colons and the `+` in an
+    /// offset must be percent-encoded or GitHub reads a different instant.
+    #[test]
+    fn urlencoding_escapes_rfc3339_timestamps() {
+        assert_eq!(urlencoding("2026-05-01T12:00:00Z"), "2026-05-01T12%3A00%3A00Z");
+        assert_eq!(urlencoding("a+b"), "a%2Bb");
+        assert_eq!(urlencoding("a&b=c"), "a%26b%3Dc");
+        assert_eq!(urlencoding("-_.~"), "-_.~", "unreserved characters pass through");
+    }
+
+    #[test]
+    fn truncate_appends_ellipsis_only_when_over_limit() {
+        assert_eq!(truncate("short", 32), "short");
+        assert_eq!(truncate("abcdef", 6), "abcdef");
+        assert_eq!(truncate("abcdef", 2), "ab...");
+    }
+
+    #[test]
+    fn current_unix_ms_is_after_2020() {
+        assert!(current_unix_ms() > 1_577_836_800_000, "clock reads before 2020");
+    }
+
+    // ── Outcome shapes ────────────────────────────────────────────────────
+
+    /// The additive counters are `#[serde(default)]`, so an outcome recorded by
+    /// an older build (commits only) must still deserialise.
+    #[test]
+    fn repo_sync_outcome_deserialises_legacy_commit_only_shape() {
+        let legacy = serde_json::json!({
+            "owner": "a", "repo": "b", "commits_added": 3, "commits_skipped": 1
+        });
+        let outcome: RepoSyncOutcome = serde_json::from_value(legacy).expect("decode");
+        assert_eq!(outcome.commits_added, 3);
+        assert_eq!(outcome.prs_added, 0);
+        assert_eq!(outcome.issues_added, 0);
+        assert_eq!(outcome.comments_added, 0);
+        assert!(outcome.error.is_none());
+    }
+
+    /// A clean outcome must not emit `"error": null` — the console treats the
+    /// presence of the key as "this repo failed".
+    #[test]
+    fn repo_sync_outcome_omits_error_when_absent() {
+        let json = serde_json::to_value(RepoSyncOutcome::default()).expect("encode");
+        assert!(json.get("error").is_none());
+        let failed = RepoSyncOutcome {
+            error: Some("boom".to_string()),
+            ..RepoSyncOutcome::default()
+        };
+        assert_eq!(
+            serde_json::to_value(failed).expect("encode")["error"],
+            serde_json::json!("boom")
+        );
+    }
+
+    #[test]
+    fn sync_run_result_round_trips() {
+        let result = SyncRunResult {
+            started_at_unix_ms: 1,
+            finished_at_unix_ms: 2,
+            repos: vec![RepoSyncOutcome {
+                owner: "a".to_string(),
+                repo: "b".to_string(),
+                commits_added: 1,
+                ..RepoSyncOutcome::default()
+            }],
+        };
+        let encoded = serde_json::to_string(&result).expect("encode");
+        let decoded: SyncRunResult = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded.repos.len(), 1);
+        assert_eq!(decoded.repos[0].owner, "a");
+        assert_eq!(decoded.finished_at_unix_ms, 2);
+    }
+
+    /// The entity template documents the layout the MCP tool descriptions
+    /// promise; the sync writer must keep producing exactly that shape.
+    #[test]
+    fn commit_entity_template_matches_the_written_entity() {
+        assert_eq!(COMMIT_ENTITY_TEMPLATE, "github::{owner}/{repo}::commit/{sha}");
+        let built = format!("github::{}/{}::commit/{}", "cuecrux", "Crux", "abc123");
+        let rendered = COMMIT_ENTITY_TEMPLATE
+            .replace("{owner}", "cuecrux")
+            .replace("{repo}", "Crux")
+            .replace("{sha}", "abc123");
+        assert_eq!(built, rendered);
     }
 }

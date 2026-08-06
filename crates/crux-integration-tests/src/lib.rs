@@ -27,7 +27,31 @@ use std::time::{Duration, Instant};
 /// (e.g. heavy `cargo llvm-cov` instrumentation) override without a rebuild via
 /// `CORECRUXD_STARTUP_TIMEOUT_SECS`.
 const STARTUP_TIMEOUT_SECS_DEFAULT: u64 = 10;
-const REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
+/// Timeout for the **startup liveness probes** only (`/readyz`, the gRPC port
+/// check). These run in a poll loop *inside* the [`startup_timeout`] budget, so
+/// they must stay short: a long probe timeout would blow the boot budget on the
+/// first closed-port poll rather than retrying.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(750);
+/// Default ceiling for a **test request** to a daemon that is already healthy.
+///
+/// This is a hang guard, not a latency assertion. Its only job is to stop a
+/// wedged request hanging the suite forever; it is not evidence about how fast
+/// the daemon is, and it must never be the thing that fails a test on a busy
+/// machine.
+///
+/// It used to be 750ms — shared with the startup probes above — which put it
+/// roughly 6× above the healthy path (`tools/list`, the heaviest MCP call,
+/// measures 80–120ms warm). One shared `OnceLock` daemon serves all 43 tests in
+/// `tests/daemon.rs` concurrently, so under runner contention that ceiling was
+/// reachable, and it duly failed a release PR with `Timeout(RecvResponse)` on
+/// `mcp_tools_list` — a PR whose diff contained no code at all.
+///
+/// That is the same load-dependence PR #574 removed when it deleted the
+/// workspace's only explicit wall-clock assertion; this one survived because it
+/// was expressed as client config rather than an `assert!`. A hang guard belongs
+/// ~100× above the healthy path, not ~6×. Override without a rebuild via
+/// `CRUX_TEST_REQUEST_TIMEOUT_SECS`, mirroring `CORECRUXD_STARTUP_TIMEOUT_SECS`.
+const REQUEST_TIMEOUT_SECS_DEFAULT: u64 = 15;
 const START_ATTEMPTS: usize = 3;
 /// Cap on the `/readyz` body echoed into a startup-failure message — enough for
 /// the failing-check breakdown, short of dumping an unbounded payload into the
@@ -106,6 +130,18 @@ fn startup_timeout() -> Duration {
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|secs| *secs > 0)
         .unwrap_or(STARTUP_TIMEOUT_SECS_DEFAULT);
+    Duration::from_secs(secs)
+}
+
+/// Per-request hang guard for tests against an already-healthy daemon,
+/// honouring `CRUX_TEST_REQUEST_TIMEOUT_SECS` (falling back to
+/// [`REQUEST_TIMEOUT_SECS_DEFAULT`] when unset or unparseable).
+fn request_timeout() -> Duration {
+    let secs = std::env::var("CRUX_TEST_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(REQUEST_TIMEOUT_SECS_DEFAULT);
     Duration::from_secs(secs)
 }
 
@@ -390,9 +426,9 @@ impl TestDaemon {
     /// read and leave only "http status: 503".
     fn probe_readyz(&self) -> (bool, String) {
         let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_connect(Some(REQUEST_TIMEOUT))
-            .timeout_recv_response(Some(REQUEST_TIMEOUT))
-            .timeout_recv_body(Some(REQUEST_TIMEOUT))
+            .timeout_connect(Some(PROBE_TIMEOUT))
+            .timeout_recv_response(Some(PROBE_TIMEOUT))
+            .timeout_recv_body(Some(PROBE_TIMEOUT))
             .http_status_as_error(false)
             .build()
             .into();
@@ -425,14 +461,15 @@ impl TestDaemon {
 
     fn grpc_listening(&self) -> bool {
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, self.grpc_port));
-        TcpStream::connect_timeout(&addr, REQUEST_TIMEOUT).is_ok()
+        TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok()
     }
 
     fn agent() -> ureq::Agent {
+        let guard = request_timeout();
         ureq::Agent::config_builder()
-            .timeout_connect(Some(REQUEST_TIMEOUT))
-            .timeout_recv_response(Some(REQUEST_TIMEOUT))
-            .timeout_recv_body(Some(REQUEST_TIMEOUT))
+            .timeout_connect(Some(guard))
+            .timeout_recv_response(Some(guard))
+            .timeout_recv_body(Some(guard))
             .build()
             .into()
     }

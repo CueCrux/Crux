@@ -1040,6 +1040,7 @@ pub(crate) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         quota_hosted_surfaces: Arc::new(Vec::new()),
         quota_ledger: Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
         credit_meter: None,
+        enrich_budgets: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
         openai_shim_enabled: false,
         memory_import_enabled: true,
         identity_links_enabled: true,
@@ -1142,7 +1143,7 @@ fn pro_workbench_state(services: &[&str]) -> AppState {
     state
 }
 
-fn bind_test_state_to_root_passport_key(state: &mut AppState) {
+pub(super) fn bind_test_state_to_root_passport_key(state: &mut AppState) {
     let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).expect("root passport key");
     state.passport_fpr = key.passport_fpr().to_string();
     state.passport_public_key_hex = key.public_key_hex().to_string();
@@ -1170,7 +1171,10 @@ fn test_rcx_router(capabilities: Vec<&str>) -> std::sync::Arc<crux_router::RcxRo
     ))
 }
 
-fn dev_scope_headers(scopes: &str) -> HeaderMap {
+/// `X-Corecrux-Scopes` header for [`AuthMode::DevScopes`] handler tests.
+/// `pub(super)` so sibling `http::*` modules with inline test blocks share one
+/// builder instead of re-declaring it per file.
+pub(super) fn dev_scope_headers(scopes: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
         "x-corecrux-scopes",
@@ -2274,6 +2278,42 @@ async fn console_redacts_private_facts_and_session_state() {
     assert_eq!(facts_body["visible_count"], 1);
     let facts_text = serde_json::to_string(&facts_body).expect("facts json");
     assert!(!facts_text.contains("secret-token-123"));
+
+    // D-26: `as_of_unix_ms` was filtered with `.filter(|t| *t > 0)`, so a
+    // client computing 0 silently got ALL current facts while the response
+    // echoed the parameter back — it was told it had time-travelled and had
+    // not. Zero is a valid epoch cutoff: nothing had been stored yet.
+    let epoch_resp = console::get_console_facts(
+        State(state.clone()),
+        Query(console::ConsoleFactsQuery {
+            q: None,
+            top_k: None,
+            as_of_unix_ms: Some(0),
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(epoch_resp.status(), StatusCode::OK);
+    let epoch_body = json_body(epoch_resp).await;
+    assert_eq!(
+        epoch_body["visible_count"], 0,
+        "an epoch cutoff returns nothing, it does not disable the filter"
+    );
+
+    // A cutoff that cannot be applied is refused, not ignored.
+    let negative_resp = console::get_console_facts(
+        State(state.clone()),
+        Query(console::ConsoleFactsQuery {
+            q: None,
+            top_k: None,
+            as_of_unix_ms: Some(-1),
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(negative_resp.status(), StatusCode::BAD_REQUEST);
 
     let sessions_resp = console::get_console_sessions(
         State(state),
@@ -8709,8 +8749,8 @@ async fn workbench_brief_requires_enabled_pro_service() {
 }
 
 #[tokio::test]
-async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
-    let state = pro_workbench_state(&["context_pack:budgeted", "ledger:history"]);
+async fn workbench_context_pack_stores_private_receipts() {
+    let state = pro_workbench_state(&["context_pack:budgeted"]);
     let shared = state.clone();
     {
         let mut store = shared.fact_store.write().await;
@@ -8749,43 +8789,6 @@ async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
         .unwrap()
         .starts_with("workbench:context_pack:"));
 
-    let ledger_resp = super::workbench::post_command_ledger(
-        State(state.clone()),
-        HeaderMap::new(),
-        Json(super::workbench::CommandLedgerBody {
-            tenant_id: "business::acme".to_string(),
-            command: "cargo".to_string(),
-            args: vec!["test".to_string(), "-p".to_string(), "corecruxd".to_string()],
-            cwd: Some("/home/myles/CueCrux/Crux".to_string()),
-            exit_status: Some(0),
-            duration_ms: Some(42),
-            started_at_unix_ms: Some(100),
-            completed_at_unix_ms: Some(142),
-            stdout_hash: Some("blake3:stdout".to_string()),
-            stderr_hash: None,
-            linked_receipts: vec![pack["receipt"]["receipt_id"].as_str().unwrap().to_string()],
-            project_id: Some("alpha".to_string()),
-            work_id: Some("work-1".to_string()),
-        }),
-    )
-    .await;
-    assert_eq!(ledger_resp.status(), StatusCode::OK);
-
-    let list_resp = super::workbench::get_command_ledger(
-        State(state),
-        HeaderMap::new(),
-        Query(super::workbench::TenantWorkbenchQuery {
-            tenant_id: "business::acme".to_string(),
-            project_id: None,
-            limit: Some(10),
-        }),
-    )
-    .await;
-    assert_eq!(list_resp.status(), StatusCode::OK);
-    let list = json_body(list_resp).await;
-    assert_eq!(list["count"], 1);
-    assert_eq!(list["entries"][0]["record"]["command"], "cargo");
-
     let store = shared.fact_store.read().await;
     let facts = store.query(&corecrux_memory::fact_store::FactQuery {
         min_effective_confidence: None,
@@ -8796,8 +8799,76 @@ async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
         top_k: 10,
         token_budget: None,
     });
-    assert_eq!(facts.facts.len(), 2);
+    assert_eq!(facts.facts.len(), 1);
     assert!(facts.facts.iter().all(|fact| fact.private));
+}
+
+/// `ledger:history` is not a sold claim, because nothing in the product ever
+/// writes a command-ledger record. `/v1/workbench/command-ledger` is still
+/// implemented and still routed — it simply cannot be enabled, so it answers
+/// `402 pro_service_not_enabled` in every mode.
+///
+/// This is the regression pin for re-adding the claim without a producer.
+/// If you are here because this test failed, land the producer first.
+/// ExecPlan: `crux-command-ledger-claim-truth-2026-07-30`.
+#[tokio::test]
+async fn workbench_command_ledger_is_not_a_sold_claim_without_a_producer() {
+    // Even asking for it explicitly cannot enable it: `ProductPosture::new`
+    // filters `enabled_pro_services` through `PRO_CAPABILITY_CLAIMS`.
+    let state = pro_workbench_state(&["ledger:history"]);
+    let posture = crate::product::ProductPosture::new(state.operating_mode, &state.enabled_pro_services);
+    assert!(
+        posture.enabled_pro_services.is_empty(),
+        "ledger:history must not survive the PRO_CAPABILITY_CLAIMS filter"
+    );
+
+    // It appears in no catalogue, so it can never be reported as
+    // `contracted_external` by `pro_claim_placements`.
+    assert!(!crate::product::PRO_CAPABILITY_CLAIMS.contains(&"ledger:history"));
+    assert!(!crate::product::DAEMON_IMPLEMENTED_PRO_CLAIMS.contains(&"ledger:history"));
+    assert!(!crate::product::HOSTED_CONTROL_PLANE_PRO_CLAIMS.contains(&"ledger:history"));
+    assert!(!posture
+        .capability_catalog
+        .pro_claim_placements
+        .iter()
+        .any(|placement| placement.claim == "ledger:history"));
+
+    let write_resp = super::workbench::post_command_ledger(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::workbench::CommandLedgerBody {
+            tenant_id: "business::acme".to_string(),
+            command: "cargo".to_string(),
+            args: vec!["test".to_string()],
+            cwd: None,
+            exit_status: Some(0),
+            duration_ms: Some(42),
+            started_at_unix_ms: Some(100),
+            completed_at_unix_ms: Some(142),
+            stdout_hash: None,
+            stderr_hash: None,
+            linked_receipts: Vec::new(),
+            project_id: None,
+            work_id: None,
+        }),
+    )
+    .await;
+    assert_eq!(write_resp.status(), StatusCode::PAYMENT_REQUIRED);
+    let write_body = json_body(write_resp).await;
+    assert_eq!(write_body["status"], "pro_service_not_enabled");
+    assert_eq!(write_body["capability"], "ledger:history");
+
+    let read_resp = super::workbench::get_command_ledger(
+        State(state),
+        HeaderMap::new(),
+        Query(super::workbench::TenantWorkbenchQuery {
+            tenant_id: "business::acme".to_string(),
+            project_id: None,
+            limit: Some(10),
+        }),
+    )
+    .await;
+    assert_eq!(read_resp.status(), StatusCode::PAYMENT_REQUIRED);
 }
 
 #[tokio::test]
@@ -19388,6 +19459,7 @@ async fn dossier_list_when_empty_returns_empty_array() {
         Path("alpha".to_string()),
         Query(Default::default()),
         dev_scope_headers("admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -19403,6 +19475,7 @@ async fn dossier_list_requires_admin_read() {
         Path("alpha".to_string()),
         Query(Default::default()),
         HeaderMap::new(),
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -19418,6 +19491,7 @@ async fn storybook_post_generate_then_get_latest() {
         State(state.clone()),
         Path("alpha".to_string()),
         dev_scope_headers("admin:read facts:write"),
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -19428,6 +19502,7 @@ async fn storybook_post_generate_then_get_latest() {
         Path("alpha".to_string()),
         Query(Default::default()),
         dev_scope_headers("admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -19437,10 +19512,14 @@ async fn storybook_post_generate_then_get_latest() {
         latest_resp.status()
     );
 
-    let versions_resp =
-        super::storybook::list_versions(State(state), Path("alpha".to_string()), dev_scope_headers("admin:read"))
-            .await
-            .into_response();
+    let versions_resp = super::storybook::list_versions(
+        State(state),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
+    )
+    .await
+    .into_response();
     let body = json_body(versions_resp).await;
     assert!(body["versions"].is_array());
 }
@@ -19453,6 +19532,7 @@ async fn storybook_get_latest_when_none_returns_404() {
         Path("nonexistent".to_string()),
         Query(Default::default()),
         dev_scope_headers("admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -19466,6 +19546,7 @@ async fn storybook_post_generate_requires_facts_write() {
         State(state),
         Path("alpha".to_string()),
         dev_scope_headers("admin:read"), // missing facts:write
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -19480,6 +19561,7 @@ async fn dossier_get_unknown_returns_404() {
         Path(("alpha".to_string(), "nonexistent".to_string())),
         Query(Default::default()),
         dev_scope_headers("admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -23436,6 +23518,199 @@ async fn m2_token_without_tenant_claim_is_refused() {
     );
 }
 
+/// Every optional field populated, so no handler can refuse for a missing
+/// parameter and be mistaken for refusing on tenant grounds.
+fn m2_code_intel_query(tenant: &str, all_repos: bool) -> super::traces::CodeIntelQuery {
+    super::traces::CodeIntelQuery {
+        tenant_id: tenant.into(),
+        repo_id: Some("secret-repo".into()),
+        token_budget: 512,
+        entry_point: Some("main".into()),
+        symbol: Some("victim_symbol".into()),
+        release_a: Some("v1".into()),
+        release_b: Some("v2".into()),
+        all_repos,
+        trace_a: Some(1),
+        trace_b: Some(2),
+    }
+}
+
+/// The `/v1/code-intel/*` surface is the hosted Pro product this gate exists to
+/// protect — it is what answers from a customer's code graph. The original M2
+/// suite covered the three `/v1/repos` paths and none of these, so the eight
+/// paths that actually serve customer code were never adversarially tested.
+///
+/// Tenant B holds a valid token for its own tenant and names tenant A. Each path
+/// must refuse at the authorization boundary. `all_repos = true` is exercised
+/// separately because it takes a different data path — `repo_aggregate::
+/// aggregate_tenant` rather than a single `load_scan` — and it is precisely the
+/// cross-repo aggregation P1 sells.
+#[tokio::test]
+#[serial_test::serial]
+async fn m2_tenant_b_cannot_read_tenant_a_code_intel_paths() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-a", "secret-repo", true);
+    }
+    let b = || m2_bearer_for("tenant-b", "admin:read");
+    let victim = || m2_code_intel_query("tenant-a", false);
+
+    macro_rules! assert_refused {
+        ($label:expr, $call:expr) => {{
+            let r = $call.await.into_response();
+            assert_eq!(
+                r.status(),
+                StatusCode::FORBIDDEN,
+                concat!($label, " leaked across tenants")
+            );
+        }};
+    }
+
+    assert_refused!(
+        "code_path",
+        super::traces::get_code_path(State(state.clone()), b(), Query(victim()))
+    );
+    assert_refused!(
+        "blast_radius",
+        super::traces::get_blast_radius(State(state.clone()), b(), Query(victim()))
+    );
+    assert_refused!(
+        "liveness",
+        super::traces::get_liveness(State(state.clone()), b(), Query(victim()))
+    );
+    assert_refused!(
+        "trace_diff",
+        super::traces::get_trace_diff(State(state.clone()), b(), Query(victim()))
+    );
+    // These two take RepoTenantQuery, not CodeIntelQuery — they are whole-tenant
+    // reads (retained span volume, release list), not per-symbol queries.
+    let victim_tenant = || super::repos::RepoTenantQuery {
+        tenant_id: "tenant-a".into(),
+    };
+    assert_refused!(
+        "span_volume",
+        super::traces::get_span_volume(State(state.clone()), b(), Query(victim_tenant()))
+    );
+    assert_refused!(
+        "releases",
+        super::traces::get_releases(State(state.clone()), b(), Query(victim_tenant()))
+    );
+    assert_refused!(
+        "dead_code_ladder",
+        super::traces::get_dead_code_ladder(State(state.clone()), b(), Query(victim()))
+    );
+    assert_refused!(
+        "repo_spatial",
+        super::traces::get_repo_spatial(
+            State(state.clone()),
+            Path("secret-repo".to_string()),
+            b(),
+            Query(super::repos::RepoTenantQuery {
+                tenant_id: "tenant-a".into(),
+            }),
+        )
+    );
+
+    // The cross-repo aggregate is the Pro capability, and a distinct data path.
+    assert_refused!(
+        "blast_radius(all_repos)",
+        super::traces::get_blast_radius(State(state.clone()), b(), Query(m2_code_intel_query("tenant-a", true)),)
+    );
+    assert_refused!(
+        "code_path(all_repos)",
+        super::traces::get_code_path(State(state.clone()), b(), Query(m2_code_intel_query("tenant-a", true)),)
+    );
+}
+
+/// `/v1/repos/dependents` resolves reverse dependency edges by ecosystem and
+/// package name. It was the one `/v1/repos` read the original suite missed.
+#[tokio::test]
+#[serial_test::serial]
+async fn m2_tenant_b_cannot_read_tenant_a_repo_dependents() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-a", "secret-repo", true);
+    }
+    let r = super::repos::get_repo_dependents(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::repos::RepoDependentsQuery {
+            tenant_id: "tenant-a".into(),
+            ecosystem: "cargo".into(),
+            name: "serde".into(),
+            cursor: None,
+            limit: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        r.status(),
+        StatusCode::FORBIDDEN,
+        "repo dependents leaked across tenants"
+    );
+}
+
+/// Positive control for the code-intel refusals above.
+///
+/// Without this, that test would pass against a daemon that refuses every
+/// code-intel request for any reason at all. Tenant B naming *its own* tenant
+/// must clear the authorization boundary. It legitimately gets 404 (no scan
+/// registered) or 400 (parameter shape) — what matters is that it is **not**
+/// 403, which is the only status the isolation check produces.
+#[tokio::test]
+#[serial_test::serial]
+async fn m2_tenant_b_reaches_its_own_code_intel_paths() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-b", "own-repo", true);
+    }
+    let b = || m2_bearer_for("tenant-b", "admin:read");
+    // Built fresh per call rather than cloned: CodeIntelQuery deliberately does
+    // not derive Clone, and this suite adds no production code.
+    let own = || {
+        let mut q = m2_code_intel_query("tenant-b", false);
+        q.repo_id = Some("own-repo".into());
+        q
+    };
+
+    for (label, status) in [
+        (
+            "code_path",
+            super::traces::get_code_path(State(state.clone()), b(), Query(own()))
+                .await
+                .into_response()
+                .status(),
+        ),
+        (
+            "blast_radius",
+            super::traces::get_blast_radius(State(state.clone()), b(), Query(own()))
+                .await
+                .into_response()
+                .status(),
+        ),
+        (
+            "dead_code_ladder",
+            super::traces::get_dead_code_ladder(State(state.clone()), b(), Query(own()))
+                .await
+                .into_response()
+                .status(),
+        ),
+    ] {
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{label}: isolation must not refuse a tenant reading its own code graph"
+        );
+    }
+}
+
 /// The runtime span plane **is** tenant-partitioned (M3).
 ///
 /// This test previously asserted the opposite. It was a deliberate tripwire on
@@ -23464,11 +23739,13 @@ fn m2_runtime_span_plane_is_tenant_partitioned() {
             duration_ns: 1,
             depth: 0,
             had_error: false,
+            outcome: Default::default(),
         },
         symbol_id: None,
         join: "miss".into(),
         stored_at_unix_ms: 0,
         tenant_id: "tenant-a".into(),
+        release: String::new(),
     };
     let encoded = serde_json::to_string(&span).expect("serialise");
     assert!(
@@ -23937,4 +24214,1018 @@ async fn work_orchestrator_scope_composes_with_ranked() {
     )
     .await;
     assert!(empty["work"].as_array().expect("array").is_empty());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M4 — soft cap behaviour. crux-code-intel-pro-hosted-surface-2026-07-28.
+//
+// The whole milestone is one property: going over the allowance must never
+// refuse anything. It is a commercial limit, and turning it into a technical one
+// would break a paying customer mid-sprint over a billing question.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn m4_registering_over_allowance_is_flagged_never_refused() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    // Fill the default allowance (5 base + 3 per seat at seats=1 = 8) exactly.
+    {
+        let mut store = state.fact_store.write().await;
+        for i in 0..8 {
+            seed_repo(&mut store, "tenant-a", &format!("r{i}"), true);
+        }
+    }
+    let at_limit = allowance_body(&state, "tenant-a", 1, 0).await;
+    assert_eq!(at_limit["used"], 8);
+    assert_eq!(at_limit["over_allowance"], false);
+
+    // The ninth. It must land, and the response must say the account is over.
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-a", "the-ninth", true);
+    }
+    let over = allowance_body(&state, "tenant-a", 1, 0).await;
+    assert_eq!(over["used"], 9, "the ninth repo must be registered, not rejected");
+    assert_eq!(over["over_allowance"], true);
+    assert_eq!(over["over_by"], 1);
+
+    // And the repos that were already there keep answering — an over-allowance
+    // account loses no capability on what it already had.
+    let resp = super::repos::get_repos(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-a".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["repos"].as_array().map(Vec::len),
+        Some(9),
+        "existing repos must keep working while over allowance"
+    );
+}
+
+#[tokio::test]
+async fn m4_a_pack_restores_headroom_without_touching_the_repos() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        for i in 0..9 {
+            seed_repo(&mut store, "tenant-a", &format!("r{i}"), true);
+        }
+    }
+    let before = allowance_body(&state, "tenant-a", 1, 0).await;
+    assert_eq!(before["over_allowance"], true);
+
+    let after = allowance_body(&state, "tenant-a", 1, 1).await;
+    assert_eq!(after["over_allowance"], false, "a pack must clear the overage");
+    assert_eq!(after["used"], 9, "buying a pack changes entitlement, not usage");
+    assert_eq!(after["remaining"], 9);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M3b — the three span-reading surfaces now honour a requested tenant.
+//
+// Gate: each names a tenant in the request and is covered by the M2 adversarial
+// pattern (tenant B refused against tenant A) with a positive control. Real
+// HS256 tokens, not DevScopes — DevScopes sets TenantAllow::Any and would make
+// these pass against a daemon with no isolation at all.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_trace_list_refuses_a_tenant_the_caller_does_not_hold() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::traces::list_traces(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::TraceSpansQuery {
+            limit: Some(10),
+            trace_id: None,
+        }),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "naming another tenant must be refused, not silently answered"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_trace_list_allows_the_tenant_the_caller_does_hold() {
+    // Positive control: the refusal above must not be a surface that refuses
+    // everything the moment a tenant is named.
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::traces::list_traces(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::TraceSpansQuery {
+            limit: Some(10),
+            trace_id: None,
+        }),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["tenant_id"], "tenant-b");
+    assert_eq!(
+        body["tenant_scope"], "request",
+        "a named tenant must report request scope, not the daemon fallback"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_unbound_request_declares_the_daemon_fallback() {
+    // The fallback is legitimate on a single-tenant daemon and must be visible.
+    // A surface that answers from process configuration without saying so is
+    // what M2 was written to prevent.
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::traces::list_traces(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::TraceSpansQuery {
+            limit: Some(10),
+            trace_id: None,
+        }),
+        Query(super::traces::OptionalTenantQuery { tenant_id: None }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["tenant_scope"], "daemon-capture-tenant",
+        "an unbound read must declare that it answered for the capture tenant"
+    );
+}
+
+// M3b, the other two surfaces. `dossier` and `storybook` shipped accepting a
+// caller-supplied `tenant_id` while still authorising with the tenant-blind
+// `require_http_scopes`, so any holder of a valid token could read any tenant's
+// spans by naming it. The gate says all three surfaces, and only `/v1/traces*`
+// had tests — which is precisely why it went unnoticed. Each of these fails
+// against the pre-fix handler.
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_dossier_refuses_a_tenant_the_caller_does_not_hold() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::dossier::post_auto(
+        State(state.clone()),
+        Path("proj".to_string()),
+        m2_bearer_for("tenant-b", "admin:read facts:write"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "dossier leaked across tenants: it read tenant-a's spans for a tenant-b caller"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_dossier_allows_the_tenant_the_caller_does_hold() {
+    // Positive control: the refusal must not be a surface that refuses
+    // everything the moment a tenant is named. A missing project answers 404,
+    // which is past authorization and is all this control needs to prove.
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::dossier::post_auto(
+        State(state.clone()),
+        Path("proj".to_string()),
+        m2_bearer_for("tenant-b", "admin:read facts:write"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_ne!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a caller naming its own tenant must get past authorization"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_storybook_refuses_a_tenant_the_caller_does_not_hold() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::storybook::post_generate(
+        State(state.clone()),
+        Path("proj".to_string()),
+        m2_bearer_for("tenant-b", "admin:read facts:write"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "storybook leaked across tenants: it read tenant-a's spans for a tenant-b caller"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_storybook_allows_the_tenant_the_caller_does_hold() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::storybook::post_generate(
+        State(state.clone()),
+        Path("proj".to_string()),
+        m2_bearer_for("tenant-b", "admin:read facts:write"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_ne!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a caller naming its own tenant must get past authorization"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The dossier and storybook *persistence* plane.
+// crux-tenant-scope-by-type-2026-08-02, M2.
+//
+// M3b bound generation on both surfaces and left publication and read unbound:
+// the persist stamped a hardcoded `tenant_hash: "default"` whatever tenant the
+// artifact was derived from, the entity key carried no tenant, and every read
+// queried with `tenant_hash: None` — which is *no filter*, not *default tenant*
+// (`fact_store.rs`, `q.tenant_hash.as_ref().is_none_or(..)`). A dossier built
+// from tenant A's runtime was therefore readable by anyone holding `admin:read`
+// who named A's project. Same defect shape as 2026-07-31a, one layer down, and
+// invisible to the M3b tests because those were scoped to what M3b changed.
+//
+// Each of these fails against the pre-fix reader.
+
+/// Store an artifact fact directly, choosing its tenant stamp — the state the
+/// daemon is in after some other tenant published.
+async fn seed_artifact_fact(state: &AppState, tenant_hash: &str, entity: &str, value: serde_json::Value) {
+    let mut store = state.fact_store.write().await;
+    store.store(corecrux_memory::fact_store::StoreFact {
+        tenant_hash: tenant_hash.to_string(),
+        entity: entity.to_string(),
+        key: "content".to_string(),
+        value: value.to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+        horizon_class: None,
+        actor: None,
+    });
+}
+
+fn seeded_dossier_value(dossier_id: &str, project_id: &str) -> serde_json::Value {
+    serde_json::json!({ "dossier_id": dossier_id, "project_id": project_id })
+}
+
+fn seeded_storybook_value(project_id: &str, ts: u64) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": project_id,
+        "generated_at_unix_ms": ts,
+        "generated_by_passport": "p_a",
+        "markdown": "# secret",
+        "sections": { "00_front": "# secret" },
+        "stats": {
+            "plane_count": 0,
+            "planes_with_vision": 0,
+            "planes_with_mapped_modules": 0,
+            "orphan_planes": [],
+            "workspace_loc": 0,
+            "stub_count": 0,
+            "dead_code_count": 0,
+            "bytes": 0
+        }
+    })
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_dossier_read_refuses_another_tenants_artifact() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    seed_artifact_fact(
+        &state,
+        "tenant-a",
+        "__dossier__::alpha::d1",
+        seeded_dossier_value("d1", "alpha"),
+    )
+    .await;
+
+    // Tenant B, naming its own tenant — a well-formed hosted request, not an
+    // attack on the authorization boundary. The refusal has to come from the
+    // data filter, which is where it was missing.
+    let resp = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "d1".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "dossier leaked across tenants: tenant-b read an artifact stamped tenant-a"
+    );
+
+    // And unbound — the shape the pre-fix handler actually served, since no
+    // caller had to name a tenant to get someone else's dossier.
+    let unbound = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "d1".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        unbound.status(),
+        StatusCode::NOT_FOUND,
+        "dossier leaked to an unbound caller: the daemon-capture scope is not tenant-a"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_dossier_read_allows_the_owning_tenant() {
+    // Positive control: the filter must not be a surface that refuses
+    // everything. Tenant A reads what tenant A published.
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    seed_artifact_fact(
+        &state,
+        "tenant-a",
+        "__dossier__::alpha::d1",
+        seeded_dossier_value("d1", "alpha"),
+    )
+    .await;
+
+    let resp = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "d1".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-a", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the owning tenant must still be able to read its own dossier"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_dossier_list_hides_another_tenants_artifact() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    seed_artifact_fact(
+        &state,
+        "tenant-a",
+        "__dossier__::alpha::d1",
+        seeded_dossier_value("d1", "alpha"),
+    )
+    .await;
+
+    let resp = super::dossier::list_dossiers(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["count"], 0,
+        "dossier list leaked across tenants: tenant-b enumerated tenant-a's artifacts"
+    );
+
+    // Control on the same fixture: tenant A sees exactly the one it owns, so a
+    // zero above is a filter working rather than a seed that never landed.
+    let owner = super::dossier::list_dossiers(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        Query(Default::default()),
+        m2_bearer_for("tenant-a", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    let owner_body = json_body(owner).await;
+    assert_eq!(owner_body["count"], 1, "the owning tenant must see its own dossier");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_storybook_read_refuses_another_tenants_artifact() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    seed_artifact_fact(
+        &state,
+        "tenant-a",
+        "__storybook__::alpha::1000",
+        seeded_storybook_value("alpha", 1000),
+    )
+    .await;
+
+    let resp = super::storybook::get_version(
+        State(state.clone()),
+        Path(("alpha".to_string(), 1000u64)),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "storybook leaked across tenants: tenant-b read a readout stamped tenant-a"
+    );
+
+    let owner = super::storybook::get_version(
+        State(state.clone()),
+        Path(("alpha".to_string(), 1000u64)),
+        Query(Default::default()),
+        m2_bearer_for("tenant-a", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        owner.status(),
+        StatusCode::OK,
+        "the owning tenant must still be able to read its own readout"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_storybook_versions_hides_another_tenants_artifact() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    seed_artifact_fact(
+        &state,
+        "tenant-a",
+        "__storybook__::alpha::1000",
+        seeded_storybook_value("alpha", 1000),
+    )
+    .await;
+
+    let resp = super::storybook::list_versions(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["count"], 0,
+        "storybook versions leaked across tenants: tenant-b enumerated tenant-a's readouts"
+    );
+
+    let owner = super::storybook::list_versions(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        m2_bearer_for("tenant-a", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    let owner_body = json_body(owner).await;
+    assert_eq!(owner_body["count"], 1, "the owning tenant must see its own readout");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_published_dossier_is_stamped_with_the_publishing_tenant() {
+    // The five tests above seed the store directly, so they pin the *read*
+    // filter and would all stay green if `persist_dossier` went back to stamping
+    // `"default"`. This one goes through the publish handler and then reads with
+    // the daemon-capture scope, which is what a `"default"` stamp would satisfy.
+    // Without it the suite would prove half the fix — the exact shape of defect
+    // this plan exists to stop shipping.
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+
+    let published = super::dossier::post_publish(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        m2_bearer_for("tenant-a", "admin:read facts:write"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+        Json(serde_json::from_value(seeded_dossier_value("d9", "alpha")).expect("dossier body")),
+    )
+    .await
+    .into_response();
+    assert_eq!(published.status(), StatusCode::CREATED, "publish should succeed");
+
+    let unbound = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "d9".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        unbound.status(),
+        StatusCode::NOT_FOUND,
+        "a dossier published by tenant-a was stamped so the capture tenant could read it"
+    );
+
+    let owner = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "d9".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-a", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        owner.status(),
+        StatusCode::OK,
+        "the publisher must be able to read it back"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_legacy_default_rows_reach_the_capture_tenant_only() {
+    // Everything written before this change carries the fact store's default
+    // stamp. Those rows must keep working on a single-tenant daemon — that is
+    // Constraint 1 — without becoming readable by a named tenant that never
+    // owned them. Same rule `trace_store` applies to legacy unlabelled spans.
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    seed_artifact_fact(
+        &state,
+        crate::auth::LEGACY_FACT_TENANT,
+        "__dossier__::alpha::legacy",
+        seeded_dossier_value("legacy", "alpha"),
+    )
+    .await;
+
+    // Unbound request → the daemon's capture tenant → the legacy row is visible,
+    // exactly as it was before this change.
+    let capture = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "legacy".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        capture.status(),
+        StatusCode::OK,
+        "a legacy row must still reach the daemon's own capture tenant"
+    );
+
+    // The same row named by a tenant that never owned it: refused.
+    let named = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "legacy".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        named.status(),
+        StatusCode::NOT_FOUND,
+        "a legacy row must not become readable by a named tenant that never owned it"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constraint 3, re-scoped — the aggregate surface declares its tier and says
+// plainly that it does not enforce it.
+//
+// The value being protected is the HONESTY of the annotation, not a gate. A
+// response that carries `aggregate: true` without `tier_enforcement` invites a
+// client to infer that reaching it meant something.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn tier_advisory_declares_the_tier_and_that_it_is_not_enforced() {
+    let annotated = super::traces::with_tier_advisory(serde_json::json!({"aggregate": true}));
+    assert_eq!(annotated["required_tier"], super::traces::AGGREGATE_REQUIRED_TIER);
+    assert_eq!(
+        annotated["tier_enforcement"], "not_gated",
+        "the stamp must say the capability is not gated; a client that sees a tier and no \
+         enforcement note will assume a gate"
+    );
+    assert_eq!(annotated["aggregate"], true, "annotation must not disturb the payload");
+}
+
+#[test]
+fn the_aggregate_surface_is_not_advertised_as_a_paid_tier() {
+    // Operator decision 2026-08-03: `code_intel_multi_repo` was removed from Pro
+    // and Governance because it ships in the free local build and is
+    // self-providable, which the published vow says cannot be sold as a gated
+    // capability. The daemon must not go on advertising a paid tier the price
+    // list no longer charges for — that is the same "sold but not enforced"
+    // mismatch as before, pointing the other way.
+    //
+    // Pinned as a constant assertion rather than left to the response tests
+    // because the failure mode is someone restoring "pro" here to make a
+    // marketing page line up, without touching the price list.
+    assert_eq!(
+        super::traces::AGGREGATE_REQUIRED_TIER,
+        "free",
+        "cross-repo aggregation is sold at Free as of the 2026-08-03 price list. If this is being \
+         changed back to a paid tier, the signed price list has to change with it — and if the \
+         capability still ships in the local Apache-2.0 build, selling it contradicts the vow that \
+         the free/paid boundary is architectural and never a licence key."
+    );
+}
+
+#[test]
+fn every_aggregate_response_carries_the_advisory_stamp() {
+    // A source-level invariant rather than five near-identical response tests.
+    // The failure this guards is a SIXTH aggregate route added later without the
+    // stamp — which no test of the existing five would ever notice.
+    let src = include_str!("traces.rs");
+    let aggregate_bodies = src.matches("\"aggregate\": true").count();
+    let stamped = src.matches("with_tier_advisory(serde_json::json!(").count();
+    assert_eq!(
+        aggregate_bodies, stamped,
+        "every response body carrying `aggregate: true` must be wrapped in with_tier_advisory(); \
+         found {aggregate_bodies} aggregate bodies but {stamped} stamped. A new cross-repo route \
+         was probably added without the advisory annotation."
+    );
+}
+
+#[test]
+fn background_scopes_are_not_minted_in_handlers() {
+    // `TenantScope::background` is the one constructor that can name an
+    // arbitrary tenant, so it is the weak point in the argument the type makes.
+    // It exists for work with no request behind it — repo watching, retention,
+    // the flusher's resolver cache. A handler always has a request, and
+    // therefore always has a real authorization to derive its scope from;
+    // reaching for `background` there would launder an unauthorised read into a
+    // typed one that looks exactly like an authorised one.
+    //
+    // Source-level because that is the shape of the failure: not a wrong answer
+    // from an existing handler, but a *new* handler taking the shortcut.
+    const HTTP_SOURCES: &[(&str, &str)] = &[
+        ("traces.rs", include_str!("traces.rs")),
+        ("dossier.rs", include_str!("dossier.rs")),
+        ("storybook.rs", include_str!("storybook.rs")),
+        ("repos.rs", include_str!("repos.rs")),
+        ("mod.rs", include_str!("mod.rs")),
+    ];
+    for (name, src) in HTTP_SOURCES {
+        assert!(
+            !src.contains("TenantScope::background"),
+            "{name} mints a background TenantScope. Handlers must derive their scope from the \
+             authorization that admitted the request (require_http_scopes_for_tenant / \
+             runtime_tenant_for). If this is genuinely request-less work, move it out of the \
+             http module rather than widening the exception."
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M8 — enrichment behind a per-seat rate ceiling.
+// crux-code-intel-pro-hosted-surface-2026-07-28.
+//
+// Gate: the ceiling holds under a deliberate loop, and the counter is visible
+// before the limit rather than at it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn m8_enrich_query(tenant: &str, _seat: &str) -> super::traces::EnrichQuery {
+    super::traces::EnrichQuery {
+        tenant_id: tenant.to_string(),
+        repo_id: None,
+        symbol: Some("some_symbol".to_string()),
+        token_budget: Some(4000),
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m8_a_deliberate_loop_is_refused_with_429_not_402() {
+    // A rate ceiling is not a billing failure. 429 tells the caller to wait;
+    // 402 would tell them to buy credit they do not need, and they would.
+    std::env::set_var(crate::enrich_budget::SEAT_CEILING_ENV, "3");
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let mut statuses = Vec::new();
+    for _ in 0..12 {
+        let resp = super::traces::post_enrich_verdict(
+            State(state.clone()),
+            dev_scope_headers("admin:write"),
+            Query(m8_enrich_query("tenant-a", "seat-a")),
+        )
+        .await
+        .into_response();
+        statuses.push(resp.status());
+    }
+
+    let refused = statuses.iter().filter(|s| **s == StatusCode::TOO_MANY_REQUESTS).count();
+    assert!(
+        refused >= 8,
+        "a 12-call loop against a ceiling of 3 must be refused most of the time, got {statuses:?}"
+    );
+    assert!(
+        !statuses.iter().any(|s| *s == StatusCode::PAYMENT_REQUIRED),
+        "a rate ceiling must never present as a billing failure"
+    );
+    std::env::remove_var(crate::enrich_budget::SEAT_CEILING_ENV);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m8_the_budget_is_readable_before_the_ceiling_bites() {
+    std::env::set_var(crate::enrich_budget::SEAT_CEILING_ENV, "10");
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    // Reading the counter must never consume it, however often it is polled.
+    for _ in 0..5 {
+        let resp = super::traces::get_enrich_budget(
+            State(state.clone()),
+            dev_scope_headers("admin:read"),
+            Query(m8_enrich_query("tenant-a", "seat-a")),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["budget"]["used_in_window"], 0, "peeking must not spend budget");
+        assert_eq!(body["cost_cr_per_verdict"], 5);
+    }
+    std::env::remove_var(crate::enrich_budget::SEAT_CEILING_ENV);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m8_one_seat_exhausting_itself_leaves_another_working() {
+    // The reason the ceiling is per seat rather than per account: a runaway
+    // agent must not take the team down with it.
+    //
+    // Seats are distinguished by CREDENTIAL, not by a field the caller picks —
+    // so this test uses two distinct passports, which is what two colleagues
+    // actually have.
+    std::env::set_var(crate::enrich_budget::SEAT_CEILING_ENV, "2");
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    for _ in 0..4 {
+        let _ = super::traces::post_enrich_verdict(
+            State(state.clone()),
+            dev_scope_passport_headers("admin:write", "passport-noisy"),
+            Query(m8_enrich_query("tenant-a", "unused")),
+        )
+        .await
+        .into_response();
+    }
+    let noisy = super::traces::get_enrich_budget(
+        State(state.clone()),
+        dev_scope_passport_headers("admin:read", "passport-noisy"),
+        Query(m8_enrich_query("tenant-a", "unused")),
+    )
+    .await
+    .into_response();
+    let noisy_body = json_body(noisy).await;
+    assert_eq!(noisy_body["budget"]["at_ceiling"], true, "the looping seat is capped");
+
+    let quiet = super::traces::get_enrich_budget(
+        State(state.clone()),
+        dev_scope_passport_headers("admin:read", "passport-quiet"),
+        Query(m8_enrich_query("tenant-a", "unused")),
+    )
+    .await
+    .into_response();
+    let quiet_body = json_body(quiet).await;
+    assert_eq!(
+        quiet_body["budget"]["at_ceiling"], false,
+        "a colleague's seat must keep its own headroom"
+    );
+    assert_eq!(quiet_body["budget"]["remaining"], 2);
+    std::env::remove_var(crate::enrich_budget::SEAT_CEILING_ENV);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m8_enrichment_is_refused_across_tenants() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::traces::post_enrich_verdict(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:write"),
+        Query(m8_enrich_query("tenant-a", "seat-a")),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "enrichment must honour tenant scoping like every other code-intel surface"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m8_renaming_the_seat_cannot_mint_a_fresh_allowance() {
+    // Regression. seat_id was once a query parameter, so an agent that exhausted
+    // its allowance named a different seat and carried on — the ceiling was
+    // bypassable by exactly the caller it exists to stop. Seat identity is now
+    // taken from the verified credential.
+    std::env::set_var(crate::enrich_budget::SEAT_CEILING_ENV, "2");
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let mut admitted = 0;
+    for i in 0..20 {
+        let resp = super::traces::post_enrich_verdict(
+            State(state.clone()),
+            dev_scope_headers("admin:write"),
+            Query(m8_enrich_query("tenant-a", &format!("seat-{i}"))),
+        )
+        .await
+        .into_response();
+        // Past the ceiling means anything other than 429 — these return 404 for
+        // "no scan registered", which is still a call the ceiling did not stop.
+        if resp.status() != StatusCode::TOO_MANY_REQUESTS {
+            admitted += 1;
+        }
+    }
+    assert!(
+        admitted <= 3,
+        "renaming the seat must not mint a fresh allowance: {admitted} of 20 calls got \
+         past a ceiling of 2. Seat identity comes from the verified credential, so a \
+         caller cannot choose which bucket it spends from."
+    );
+    std::env::remove_var(crate::enrich_budget::SEAT_CEILING_ENV);
+}
+
+// ── attention roll-up (ExecPlan crux-hosted-relay-gateway M7a) ──────────────
+
+/// The endpoint agrees with `GET /v1/work` about what is on the board, and
+/// says nothing beyond the counts.
+///
+/// The classifier's truth table is exercised in `crate::attention`'s own tests;
+/// what is asserted here is the wiring those tests cannot see — that the same
+/// item set feeds both surfaces, and that the response body carries no
+/// identifier.
+#[tokio::test]
+async fn attention_summary_counts_the_board_without_naming_any_of_it() {
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    bind_test_state_to_root_passport_key(&mut state);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+        crate::projects::seed_default_if_missing(&mut store, 1).expect("project seed");
+        for (title, work_state) in [
+            ("a plan under way", "in_progress"),
+            ("a plan that is stuck", "blocked"),
+            ("a plan that is finished", "complete"),
+            ("a plan not started", "planned"),
+        ] {
+            let item = crate::work::create_work(
+                &mut store,
+                crate::work::CreateWorkInput {
+                    project_id: "default".to_string(),
+                    title: title.to_string(),
+                    body: None,
+                    state: None,
+                    assignee_passport: None,
+                    tenant_id: None,
+                    linked_pr: None,
+                    linked_issue: None,
+                    created_by_passport: "personal-default".to_string(),
+                },
+                1_000,
+            )
+            .expect("create");
+            crate::work::update_work(
+                &mut store,
+                &item.id,
+                crate::work::UpdateWorkInput {
+                    title: None,
+                    body: None,
+                    state: Some(work_state.to_string()),
+                    assignee_passport: None,
+                    tenant_id: None,
+                    linked_pr: None,
+                    linked_issue: None,
+                    // `blocked` is refused without a reason, so supply one; it
+                    // is also a second thing the response must not echo.
+                    blocker_reason: Some(Some("waiting on a decision".to_string())),
+                    blocker_kind: None,
+                },
+                crate::work::UpdateWorkContext {
+                    by_passport: "personal-default".to_string(),
+                    passport_gated: false,
+                    now_unix_ms: 1_001,
+                },
+            )
+            .expect("set state");
+        }
+    }
+
+    let resp = super::attention::get_attention_summary(
+        State(state),
+        Query(super::attention::SummaryQuery { project_id: None }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["needs_you"], 1, "the blocked plan");
+    assert_eq!(body["running"], 1, "the in_progress plan");
+    assert_eq!(body["done_review"], 1, "the complete plan");
+    assert_eq!(body["gate_pending"], 0, "no gate was queued");
+    assert!(body["now_unix_ms"].as_u64().is_some_and(|ms| ms > 0));
+
+    // The reason this endpoint exists rather than shipping `/v1/work` to a
+    // hosted viewer: the titles above are customer plan names.
+    let rendered = body.to_string();
+    for title in ["a plan under way", "a plan that is stuck", "a plan that is finished"] {
+        assert!(!rendered.contains(title), "a plan title reached the wire: {rendered}");
+    }
+}
+
+/// Reading the roll-up needs the same scope as reading the feeds behind it.
+/// Aggregating into counts must not become a way around authorization.
+#[tokio::test]
+async fn attention_summary_requires_admin_read() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let resp = super::attention::get_attention_summary(
+        State(state),
+        Query(super::attention::SummaryQuery { project_id: None }),
+        dev_scope_headers("facts:read"),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }

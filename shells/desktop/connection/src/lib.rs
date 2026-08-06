@@ -31,7 +31,8 @@ pub use health::{probe_health, HealthReport, HealthState, RuntimeCapabilitiesSum
 pub use local_file::authorize_local_plan_path;
 pub use local_plan::{compute_local_plan_hashes, local_plan_hashes_initialization_script};
 pub use navigation::{
-    generation_is_current, is_public_http_link, next_generation, origin_is_allowed, OriginKey, OriginPolicy,
+    generation_is_current, is_public_http_link, next_generation, origin_is_allowed, shell_tab_for_url,
+    shell_tab_for_window_label, OriginKey, OriginPolicy, ShellTab,
 };
 pub use profile::{Profile, ProfileMode, ProfileSet, ProfileStore, PROFILE_SCHEMA_VERSION};
 pub use proxy::{

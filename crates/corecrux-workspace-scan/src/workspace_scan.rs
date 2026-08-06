@@ -33,8 +33,8 @@ use std::path::{Path, PathBuf};
 
 use crate::workspace_scan_manifests::ExternalDep;
 
-pub(crate) const SCAN_METADATA_MAX_BYTES: usize = 256;
-pub(crate) const RUST_SYNTAX_MAX_DEPTH: usize = 128;
+pub const SCAN_METADATA_MAX_BYTES: usize = 256;
+pub const RUST_SYNTAX_MAX_DEPTH: usize = 128;
 const RUST_SOURCE_MAX_LINE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -101,12 +101,33 @@ pub struct ScanDiagnostics {
     /// report here. Empty/off remains absent from serialized scans.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub v3_skipped_files: Vec<V3SkippedFile>,
+    /// Source files that were read but could **not be parsed**.
+    ///
+    /// Distinct from `v3_skipped_files`, which records only files rejected
+    /// *before* parsing. Without this, an unparsable file produced an entry
+    /// with no symbols — byte-identical to a file that genuinely declares
+    /// none — so `blast_radius` and dead-code answers for its contents read
+    /// as "nothing here". A parse that could not run is not a parse that ran
+    /// and found nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parse_failures: Vec<ParseFailure>,
 }
 
 impl ScanDiagnostics {
     pub fn is_empty(&self) -> bool {
-        self.unresolved_routes.is_empty() && self.v3_skipped_files.is_empty()
+        self.unresolved_routes.is_empty() && self.v3_skipped_files.is_empty() && self.parse_failures.is_empty()
     }
+}
+
+/// A file the scanner read but could not parse. See
+/// [`ScanDiagnostics::parse_failures`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParseFailure {
+    pub rel_path: String,
+    /// The parser that was applied: `rust`, `manifest:<ecosystem>`, or the
+    /// polyglot language id.
+    pub language: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -287,7 +308,7 @@ pub struct DeadSymbol {
     pub note: String,
 }
 
-pub(crate) fn run_scan_with_policy(
+pub fn run_scan_with_policy(
     policy: &crate::repo_scan_policy::RepoScanPolicy,
 ) -> Result<WorkspaceScan, ScanError> {
     policy.execute_workspace(|canonical| {
@@ -298,7 +319,7 @@ pub(crate) fn run_scan_with_policy(
     })
 }
 
-pub(crate) fn redact_self_workspace_paths(scan: &mut WorkspaceScan) {
+pub fn redact_self_workspace_paths(scan: &mut WorkspaceScan) {
     let previous_root = PathBuf::from(&scan.root_path);
     for crate_info in &mut scan.crates {
         let path = Path::new(&crate_info.rel_path);
@@ -337,14 +358,14 @@ fn run_scan_at_with_policy(
     })
 }
 
-pub(crate) fn run_scan_at_in_context(root: &Path) -> Result<WorkspaceScan, ScanError> {
+pub fn run_scan_at_in_context(root: &Path) -> Result<WorkspaceScan, ScanError> {
     if ast_scan_enabled_from_env() {
         return crate::workspace_scan_ast::run_scan_ast_at(root);
     }
     run_scan_regex_at(root)
 }
 
-pub(crate) fn ast_scan_enabled_from_env() -> bool {
+pub fn ast_scan_enabled_from_env() -> bool {
     std::env::var("CORECRUXD_AST_SCAN").ok().is_some_and(|v| {
         let v = v.trim().to_ascii_lowercase();
         !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
@@ -354,7 +375,7 @@ pub(crate) fn ast_scan_enabled_from_env() -> bool {
 /// Reject source shapes that can drive `syn` or its recursive visitors beyond
 /// a bounded stack before parsing. This is a lexical admission guard, not a
 /// syntax validator; `syn` remains authoritative after it passes.
-pub(crate) fn validate_rust_syntax_complexity(src: &str) -> Result<(), ScanError> {
+pub fn validate_rust_syntax_complexity(src: &str) -> Result<(), ScanError> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum LexState {
         Code,
@@ -1216,7 +1237,7 @@ fn rust_char_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
     (bytes.get(closing) == Some(&b'\'')).then_some(closing)
 }
 
-pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
+pub fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
     crate::repo_scan_policy::check_deadline()?;
     let started_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1351,7 +1372,12 @@ pub(crate) fn run_scan_regex_at(root: &Path) -> Result<WorkspaceScan, ScanError>
             // as detector tokens (and again as test inputs), which trip the
             // detector against itself. Skip stub-scanning when we encounter
             // this file so the report stays trustworthy.
-            let is_self_source = rel_str.ends_with("corecruxd/src/workspace_scan.rs");
+            //
+            // NOTE: this path is this file's own location, so it must be
+            // updated whenever the file moves — a stale value silently turns
+            // the guard off and the scanner starts reporting itself as stubbed.
+            // `full_scan_emits_routes_and_references` is what catches it.
+            let is_self_source = rel_str.ends_with("corecrux-workspace-scan/src/workspace_scan.rs");
 
             for (line_no, line) in src.lines().enumerate() {
                 if line_no % 256 == 0 {
@@ -1971,7 +1997,7 @@ pub async fn load_latest(
         top_k: 8,
         token_budget: None,
     });
-    let latest = crate::fact_helpers::dedup_latest(result.facts);
+    let latest = corecrux_memory::fact_store::dedup_latest(result.facts);
     let fact = latest
         .into_iter()
         .find(|f| f.entity == LATEST_SCAN_ENTITY && f.key == SCAN_KEY)?;
@@ -2425,11 +2451,11 @@ fn collect_chain_ids(node: &StorylineNode, id_by_path: &HashMap<String, usize>, 
 /// Contained directory walker. Skips `target/`, `node_modules/`, and dot-dirs;
 /// never follows symlinks; rejects repeated canonical directories; and charges
 /// the active scan's shared depth/entry/byte/deadline budget.
-pub(crate) fn walk_dir<F: FnMut(&Path, &Path)>(root: &Path, base: &Path, visit: &mut F) -> Result<(), ScanError> {
+pub fn walk_dir<F: FnMut(&Path, &Path)>(root: &Path, base: &Path, visit: &mut F) -> Result<(), ScanError> {
     walk_dir_filtered(root, base, None, |_| false, visit)
 }
 
-pub(crate) fn walk_dir_filtered<F, S>(
+pub fn walk_dir_filtered<F, S>(
     root: &Path,
     base: &Path,
     max_depth: Option<usize>,
@@ -2602,7 +2628,7 @@ where
 
 /// Bounded, no-follow-aware scanner read. The opened file is identity-checked,
 /// and the read never consumes more than the remaining cumulative byte budget.
-pub(crate) fn read_scan_bytes(path: &Path) -> Result<Vec<u8>, ScanError> {
+pub fn read_scan_bytes(path: &Path) -> Result<Vec<u8>, ScanError> {
     #[cfg(unix)]
     {
         if let Some(file) = crate::repo_scan_policy::open_active_scan_file(path)? {
@@ -2719,12 +2745,12 @@ fn verify_opened_file(
     Err(crate::repo_scan_policy::reject_unsupported_secure_open(path))
 }
 
-pub(crate) fn read_scan_to_string(path: &Path) -> Result<String, ScanError> {
+pub fn read_scan_to_string(path: &Path) -> Result<String, ScanError> {
     String::from_utf8(read_scan_bytes(path)?)
         .map_err(|error| ScanError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error)))
 }
 
-pub(crate) fn read_optional_scan_to_string(path: &Path) -> Result<Option<String>, ScanError> {
+pub fn read_optional_scan_to_string(path: &Path) -> Result<Option<String>, ScanError> {
     if crate::repo_scan_policy::scan_file_metadata(path)?.is_some() {
         read_scan_to_string(path).map(Some)
     } else {
@@ -2732,7 +2758,7 @@ pub(crate) fn read_optional_scan_to_string(path: &Path) -> Result<Option<String>
     }
 }
 
-pub(crate) fn parse_crate_name(toml: &str) -> Option<String> {
+pub fn parse_crate_name(toml: &str) -> Option<String> {
     // Find the `[package]` section then `name = "..."`.
     let mut in_package = false;
     for raw in toml.lines() {
@@ -2758,7 +2784,7 @@ pub(crate) fn parse_crate_name(toml: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn parse_internal_path_deps(toml: &str) -> Result<Vec<String>, ScanError> {
+pub fn parse_internal_path_deps(toml: &str) -> Result<Vec<String>, ScanError> {
     // Find lines like `crux-mcp = { path = "../crux-mcp" }` or
     // `crux-mcp = { workspace = true }` — both indicate workspace deps.
     let mut out = Vec::new();
@@ -2783,7 +2809,7 @@ pub(crate) fn parse_internal_path_deps(toml: &str) -> Result<Vec<String>, ScanEr
 }
 
 /// Infer a module path like `corecruxd::http::admin` from a file path.
-pub(crate) fn infer_module_path(crate_name: &str, crate_root: &Path, file: &Path) -> String {
+pub fn infer_module_path(crate_name: &str, crate_root: &Path, file: &Path) -> String {
     let src = crate_root.join("src");
     let rel = match file.strip_prefix(&src) {
         Ok(r) => r,
@@ -2858,7 +2884,7 @@ fn parse_symbol_line(line: &str) -> Option<(&'static str, String, bool)> {
 ///   `src/integrationTest` source set,
 /// - filename ends with `_tests.rs` or is exactly `tests.rs`,
 /// - first non-blank, non-comment line is `#![cfg(test)]` (rare, but legal).
-pub(crate) fn looks_like_test_file(rel_path: &str, src: &str) -> bool {
+pub fn looks_like_test_file(rel_path: &str, src: &str) -> bool {
     let normalized = rel_path.replace('\\', "/");
     let path_match = normalized.contains("/tests/")
         || normalized.ends_with("/tests.rs")
@@ -2891,7 +2917,7 @@ pub(crate) fn looks_like_test_file(rel_path: &str, src: &str) -> bool {
 /// `(full, summary)` where `summary` is the first sentence (≤80 chars).
 /// Skips a leading copyright `//` block and blank lines so the doc starts
 /// where the developer actually wrote `//!`.
-pub(crate) fn parse_file_doc_header(src: &str) -> (Option<String>, Option<String>) {
+pub fn parse_file_doc_header(src: &str) -> (Option<String>, Option<String>) {
     let mut full = String::new();
     let mut started = false;
     for line in src.lines() {
@@ -2947,12 +2973,12 @@ pub(crate) fn parse_file_doc_header(src: &str) -> (Option<String>, Option<String
 /// Parsed representation of a `.route("/path", METHOD(handler))` line. The
 /// caller resolves `handler_fn` to a definition file via the symbol index.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ParsedRoute {
-    pub(crate) method: String,
-    pub(crate) path: String,
-    pub(crate) handler_fn: String,
-    pub(crate) source_file: String,
-    pub(crate) source_line: usize,
+pub struct ParsedRoute {
+    pub method: String,
+    pub path: String,
+    pub handler_fn: String,
+    pub source_file: String,
+    pub source_line: usize,
 }
 
 /// Parse one route declaration (which may span multiple lines after `.route(`).
@@ -2999,7 +3025,7 @@ fn parse_route_chunk(chunk: &str, source_file: &str, source_line: usize) -> Opti
 
 /// Walk a whole source file looking for `.route(...)` declarations, including
 /// multi-line ones. Returns every route found in source order.
-pub(crate) fn parse_routes_in_source(src: &str, source_file: &str) -> Result<Vec<ParsedRoute>, ScanError> {
+pub fn parse_routes_in_source(src: &str, source_file: &str) -> Result<Vec<ParsedRoute>, ScanError> {
     let mut out = Vec::new();
     let bytes = src.as_bytes();
     let mut i = 0usize;
@@ -3222,7 +3248,7 @@ fn unique_matching_index(candidates: &[usize], predicate: impl Fn(usize) -> bool
     Ok(found)
 }
 
-pub(crate) fn parse_stub_line(line: &str) -> Option<(&'static str, String)> {
+pub fn parse_stub_line(line: &str) -> Option<(&'static str, String)> {
     let trimmed = line.trim();
     if trimmed.starts_with("//") {
         return None;
@@ -3243,7 +3269,7 @@ pub(crate) fn parse_stub_line(line: &str) -> Option<(&'static str, String)> {
     None
 }
 
-pub(crate) fn parse_use_target(line: &str, from_crate: &str, known_crates: &BTreeSet<String>) -> Option<String> {
+pub fn parse_use_target(line: &str, from_crate: &str, known_crates: &BTreeSet<String>) -> Option<String> {
     let trimmed = line.trim();
     if trimmed.starts_with("//") {
         return None;
@@ -3307,6 +3333,60 @@ fn count_substring(haystack: &str, needle: &str) -> Result<usize, ScanError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D-5: `walk_dir` pushed any `path.is_dir()`, which *follows* symlinks,
+    /// so `a/b/loop -> <root>` recursed without bound. It is the walker behind
+    /// both the AST and the polyglot scanners on the live repo-watch path;
+    /// `discover_manifests` already guarded the same shape.
+    ///
+    /// The walk is run on a worker thread with a hard join deadline: before
+    /// the fix this test does not fail, it *hangs*, and an unbounded repro
+    /// would wedge CI.
+    #[cfg(unix)]
+    #[test]
+    fn walk_dir_does_not_follow_symlinks_into_a_loop() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        let nested = root.join("a/b");
+        std::fs::create_dir_all(&nested).expect("nested dirs");
+        std::fs::write(root.join("top.rs"), "fn main() {}").expect("top file");
+        std::fs::write(nested.join("deep.rs"), "fn deep() {}").expect("deep file");
+        // Points back at the root: following it recurses for ever.
+        std::os::unix::fs::symlink(&root, nested.join("loop")).expect("dir symlink");
+        // A symlink to a *file* is still visited — callers record why they
+        // skip it, and dropping it here would hide it entirely.
+        std::os::unix::fs::symlink(root.join("top.rs"), root.join("alias.rs")).expect("file symlink");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let walker = std::thread::spawn(move || {
+            let mut seen: Vec<String> = Vec::new();
+            let mut visits = 0usize;
+            let outcome = walk_dir(&root, &root, &mut |rel, _abs| {
+                visits += 1;
+                // Belt and braces: cap the work even if the walk is unbounded,
+                // so a regression fails the deadline rather than filling disk
+                // or spinning for ever.
+                if visits <= 10_000 {
+                    seen.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            });
+            let _ = tx.send((outcome.is_ok(), visits, seen));
+        });
+
+        let (ok, visits, mut seen) = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("walk_dir must terminate on a symlink loop");
+        walker.join().expect("walker thread");
+
+        assert!(ok, "the walk completes cleanly");
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec!["a/b/deep.rs".to_string(), "alias.rs".to_string(), "top.rs".to_string()],
+            "the directory loop is not descended; the file alias is still surfaced"
+        );
+        assert_eq!(visits, 3, "no path is visited twice via the loop");
+    }
 
     #[test]
     fn rust_complexity_guard_bounds_generics_and_ignores_literals_and_comments() {
@@ -4123,7 +4203,7 @@ fn build() {
         let me = scan
             .files
             .iter()
-            .find(|f| f.rel_path.ends_with("corecruxd/src/workspace_scan.rs"));
+            .find(|f| f.rel_path.ends_with("corecrux-workspace-scan/src/workspace_scan.rs"));
         assert!(me.is_some(), "scan should include workspace_scan.rs");
         assert!(me.unwrap().doc_summary.is_some(), "workspace_scan.rs has a //! header");
     }
@@ -4147,7 +4227,10 @@ fn build() {
         let self_stubs: Vec<&StubHit> = scan
             .stubs
             .iter()
-            .filter(|s| s.file_rel_path.ends_with("corecruxd/src/workspace_scan.rs"))
+            .filter(|s| {
+                s.file_rel_path
+                    .ends_with("corecrux-workspace-scan/src/workspace_scan.rs")
+            })
             .collect();
         assert!(
             self_stubs.is_empty(),

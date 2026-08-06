@@ -108,7 +108,7 @@ To understand what makes this tamper-evident, read these symbols in order:
 
 ## Build / test
 
-- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.53
+- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.55
   (`[workspace.package]` in `Cargo.toml` is authoritative, and
   `scripts/check-agent-docs.sh` fails the build when this line disagrees with it).
 - `cargo build --workspace --locked`
@@ -156,7 +156,7 @@ commands actually run. Editing any doc linked from `llms.txt` requires regenerat
 > Anchored by **symbol name** (greppable), not line number (rots). Verified against
 > the tree by `scripts/check-agent-docs.sh` in CI.
 
-The workspace has **28 cargo crates** under `crates/`. (`crux-console-ui` is a built
+The workspace has **34 cargo crates** under `crates/`. (`crux-console-ui` is a built
 SPA — `dist/` only, not a cargo member — and is excluded below.)
 
 ## Trust core (read these first)
@@ -168,6 +168,8 @@ SPA — `dist/` only, not a cargo member — and is excluded below.)
 | `corecrux-receipts` | Receipt formats, Ed25519 signing, strict verification, witness anchoring, export bundles | `verify_receipt_v1`, `build_c2pa_manifest_v1`/`verify_c2pa_manifest_v1`, `build_bundle_v1`/`verify_bundle_v1`, `build_external_anchor_body_v1`/`verify_rfc6962_inclusion_proof_v1`, `sign_stream_v1` | crux-integrations, crux-mcp, corecruxctl, corecruxd | 12.0k |
 | `corecrux-frame` | Canonical v1 frame encoding + hash helpers (header / payload / stream) | `canonical_header_bytes_v1`, `compute_header_hash`, `compute_payload_hash`, `decode_canonical_header_bytes_v1` | corecrux-{index,projections,storage,segment}, corecruxctl, corecruxd | 0.3k |
 | `rcx-capability-token` | RCX capability token v1.0 (schema-lock, CBOR/JSON mirror, validation) | `RcxCapabilityToken`, `verify_token`, `validate_basic`, `RcxTier`, `ReceiptClass` | crux-enterprise-shim, crux-mcp, crux-router | 1.1k |
+| `rcx-revocation` | CRL feed behind `Revocation.crl_url`; tri-state freshness so callers fail closed | `RevocationSnapshot`, `authorize_when_known`, `RevocationFeed`, `CrlTransport`, `CrlDocument` | (relay accept path — M5) | 0.5k |
+| `crux-escrow` | Vault key recovery: recovery-code wrapped DEKs, Shamir 2-of-3 escrow, delayed cancellable share release | `RecoveryCode`, `WrappedDek`, `wrap_dek`/`unwrap_dek`, `VaultSetup::acknowledge`, `split_escrow`/`combine_shares`, `release::ReleaseRequest` | corecruxd | 0.7k |
 
 ## Memory & retrieval
 
@@ -379,11 +381,68 @@ field fails the check.
   `tampered_component_fails_verification`, `tampered_signed_field_fails_signature`.
   The export → offline-verify → tamper-rejection cycle is a release-blocking CI gate.
 
+## I7 — an absent signal is never a pass
+
+```
+value(check could not run)  ≠  value(check ran and passed)
+```
+
+A check that **could not be evaluated** must never return the value of a check that ran
+and succeeded. This is the single most-repeated defect in this codebase: a two-round
+coverage sweep in July 2026 found 28 pre-existing defects, and **19 of them were this one
+bug** (ExecPlan `crux-pinned-defect-remediation-2026-07-31`). It reappears because the
+lossy form is always the shorter one to write — `.unwrap_or(true)`, `is_none_or(...)`,
+`.ok()`, an early `return Ok(())`, or simply not emitting the check at all.
+
+Three sanctioned shapes, in order of preference:
+
+1. **Add an explicit skipped state** — `checks_skipped: Vec<String>` on the report,
+   listing checks that were *requested but not evaluable*. `ok` keeps its meaning, so an
+   operator who deliberately verifies without an input is not broken; a caller that needs
+   every requested check to have actually run gates on `ok && checks_skipped.is_empty()`.
+   This is the house idiom. Use it wherever an operator could reasonably have omitted the
+   input.
+2. **Fail closed** — return an error. Correct only when the absent signal has *no*
+   legitimate cause (a truncated log, an empty sample where the neighbouring call already
+   hard-errors, a pagination field the protocol requires).
+3. **Reconcile sent against acknowledged** — where a count exists on both sides, compare
+   them rather than copying one across.
+
+Two rules keep the mechanism honest:
+
+- **Absent ≠ skipped.** An input class that is *wholly absent* means the caller never
+  asked for that check; it must NOT be listed. A `checks_skipped` that is non-empty on
+  every ordinary run is useless as a gate. Every fix in the ExecPlan above ships with a
+  control test asserting the absent-input case is not flagged.
+- **Only what the operator configured.** Tightening a check must not start requiring an
+  input the operator never opted into — see `verify_jwt_hs256`, where `iss`/`aud` become
+  required *only* when they are pinned.
+
+- **established:** `checks_skipped` on `EvidenceVerifyReportV1`, `ControlVerifyReportV1`
+  and `SnapshotVerifyReport` (`corecruxctl/src/evidence.rs`, `snapshot.rs`);
+  `X509VerifyReport::checks_skipped` (`corecruxctl/src/c2pa_x509.rs`, the originating
+  precedent — commit `5dd75fc`, `incident:2026-07-28`);
+  `ScanDiagnostics::parse_failures` (`corecruxd/src/workspace_scan.rs`) for the scanner
+  form; `AuthMode::parse` and `required_spec_claims` (`corecruxd/src/auth.rs`) for the
+  fail-closed form.
+- **checked:** the pin-inversion tests named in the ExecPlan's milestones, each paired
+  with an absent-input control.
+
+**Review checklist item.** On any verification, scan, or auth path, treat these as
+requiring a written justification in review: `unwrap_or(true)`, `is_none_or(...)`,
+`.ok()` discarding an error, `.filter(|_| …exists())`, an early `return Ok(())` on
+missing input, and a check that is simply not pushed when its input is absent. A clippy
+lint was considered and **rejected** as too blunt: every one of these is correct in the
+majority of its uses (`is_none_or` on an optional filter bound, `.ok()` on a
+best-effort log write), so a lint would train reviewers to `#[allow]` it rather than
+read it. The signal is the *path*, not the combinator.
+
 ---
 
 *The I1–I4 formulas are quoted from current source (the audit's guessed forms for I1 and I3
 matched the implementation verbatim; I2/I4 field names confirmed exact). I5–I6 statements are
-derived from the named builders/verifiers and their proving tests, not quoted formulas.*
+derived from the named builders/verifiers and their proving tests, not quoted formulas. I7 is
+a codified defect class, not a code-derived formula.*
 
 # ============================================================
 # BEGIN docs/agent/GLOSSARY.md
@@ -450,7 +509,7 @@ schema: crux-agent-manifest/v1
 summary: Local-first, tamper-evident retrieval + memory engine with signed, replayable receipts.
 msrv: "1.88.0"
 edition: "2021"
-workspace_version: "0.5.53"
+workspace_version: "0.5.55"
 
 verify_commands:
   - cargo test --workspace
@@ -892,6 +951,75 @@ for the Crux Daemon.
   token was checked against a CRL or revocation timestamp. Mitigation today:
   keep token lifetimes short. Revocation IO (CRL/timestamp consult) is a planned
   later phase.
+
+## Key Escrow and Recovery
+
+Scope: the `crux-escrow` crate. A vault's data encryption key (DEK) never leaves the
+customer's control in plaintext. This section is the M0 artefact of the key escrow and
+recovery plan and is the contract the crate's tests assert against.
+
+### Recovery modes
+
+| Mode | What the server holds | Reconstructs the DEK | Customer artefacts |
+|---|---|---|---|
+| **Layer 0 — recovery code** (default) | wrapped DEK ciphertext only | the recovery code alone | one 256-bit code, shown once |
+| **Layer 1 — Shamir 2-of-3** (opt-in) | wrapped DEK ciphertext + **share C** | any **two** of A/B/C | device share A, printed share B |
+
+Layer 0 is not escrow: we hold ciphertext and no key-derivation input. Layer 1 adds one
+share, deliberately one short of a threshold.
+
+### Adversaries
+
+| Adversary | Capability assumed | Defeated by | Residual |
+|---|---|---|---|
+| **Us (honest)** | full read of every server-side store | share C is 1 of 3 in a 2-of-3 scheme; Layer 0 stores no key input at all | none — insufficiency is arithmetic, not policy |
+| **A breached us** | offline copy of everything at rest, including share C | same threshold argument; share C is stored non-exportable and its release is an operation, not a read | an attacker who *also* phishes share A or B reconstructs. Two independent compromises required |
+| **An account thief** (valid passport, no device) | authenticated as the account holder | release of share C is delayed (default 72h), notified to every registered device, and cancellable by any of them | a thief who holds the account **and** all registered devices **and** waits out the window succeeds. This is the account-recovery floor for any online system |
+| **A network observer** | full transcript of client↔server traffic | only wrapped ciphertext and share-C *release decisions* cross the wire; unwrapping is client-side | traffic analysis reveals *that* a recovery occurred, not the key. Metadata is receipted anyway |
+| **A coerced operator** (court order, insider under duress) | can compel production of everything we hold | share C alone reconstructs nothing; there is no server-holds-the-key mode to compel | we can be compelled to hand over a useless share, and to say so. Published in the M5 transparency statement |
+| **A malicious client** | crafted shares, replayed or forged release requests | shares are integrity-tagged (corruption is detected, not silently mis-reconstructed); release requests are passport-bound and receipted | a client that already holds 2 valid shares is the legitimate owner by construction |
+
+### Constraint mapping
+
+Each constraint from the plan maps to a named defence, or is an accepted risk:
+
+1. **Boring** — CSPRNG (`rand`), BLAKE3 in KDF mode (`derive_key`) to turn the recovery
+   code into a wrapping key, XChaCha20-Poly1305 AEAD to wrap the DEK, and a published
+   Shamir implementation over GF(2^8). All four are existing workspace dependencies or a
+   vetted addition; no novel construction.
+
+   A password KDF (Argon2id, scrypt) is deliberately **not** used. The recovery code is 256
+   bits of CSPRNG output, not a user-chosen password: there is no low-entropy input for a
+   memory-hard function to defend, and it would only add a dependency and a tuning
+   parameter. This is the same reasoning recorded for the relay device-credential secret.
+2. **Insufficient by construction** — enforced by the threshold, and asserted by the
+   `one_share_yields_nothing` and `server_dump_yields_nothing` tests. Neither test can
+   pass if the server's holdings ever become sufficient.
+3. **Redundant without weakening** — share C may be replicated freely (Vault + sealed
+   offline backup) *because* it is insufficient alone. Replication count does not appear
+   in any security argument, so operational care is not load-bearing.
+4. **Receipted** — every wrap, escrow opt-in, release request, notification, cancellation
+   and completion emits a CROWN receipt into the customer's own timeline.
+
+### Unrecoverable by design
+
+**Losing both user shares (A and B, or the Layer 0 recovery code) is unrecoverable.**
+This is not a gap to close later. The only way to make it recoverable is for our holdings
+alone to reconstruct the DEK — which is Constraint 2 inverted, and would mean a breach of
+us is a breach of every customer's data. We accept permanent loss in the rare case in
+order to make catastrophic loss impossible in the common one.
+
+Product consequence: the customer must be told this *before* opting in, in the UI, not in
+a help article afterwards. That is the M6 launch gate.
+
+### Not defended against
+
+- **A compromised client device at wrap time.** If the endpoint that generates the DEK is
+  owned, escrow is irrelevant — the plaintext is already there.
+- **A user who photographs their recovery code into cloud storage.** Out of scope; the
+  code is rendered for transcription, with print/download offered once.
+- **Rubber-hose against the *customer*.** They hold 2-of-3 by design; they can be compelled
+  to use it. No key-holder scheme defends against this.
 
 ## Error Response Policy
 
@@ -3347,15 +3475,16 @@ also disables submission — the gate requires all three.
 How the Crux Daemon is tested, how coverage is measured and gated, and an honest
 account of why the gated number sits where it does.
 
-> **Snapshot (2026-06-18, `main`):** **4,489** test functions; **86.97%** gated
-> region coverage. CI is the source of truth — the live numbers are printed in
+> **Snapshot (2026-07-30, `main`):** **6,671** test functions; **90.11%** gated
+> region coverage (ungated, whole tree: **88.81%**).
+> CI is the source of truth — the live numbers are printed in
 > the [Coverage job](../.github/workflows/ci.yml) of every run and attested by
 > [`coverage-attestation.yml`](../.github/workflows/coverage-attestation.yml).
 
 ## Running the tests
 
 ```bash
-cargo test --workspace            # the full suite (4,489 tests)
+cargo test --workspace            # the full suite (6,671 test functions)
 cargo test -p corecruxd           # one crate (corecruxd is a binary crate — no lib target)
 cargo fmt --check                 # formatting gate
 cargo clippy --workspace -- -D warnings   # lint gate (lib + bins; not #[cfg(test)] code)
@@ -3381,13 +3510,13 @@ The [`Coverage` job in `ci.yml`](../.github/workflows/ci.yml) enforces:
 
 | Scope | Floor | Actual (snapshot) | Notes |
 |---|---|---|---|
-| **Workspace total** | **86%** | 86.97% | the headline gate |
+| **Workspace total** | **89%** | 90.11% | the headline gate; ratchet target **90** |
 | `corecrux-memory` | 93% | 93.5% | ratchet target **95** (see below) |
-| `crux-sync` | 98% | 99.0% | |
+| `crux-sync` | 98% | 98.4% | |
 | `crux-contrib` | 99% | 100% | |
-| `corecrux-receipts` | 88% | 88.6% | trust core (CROWN receipts) |
-| `corecrux-segment` | 85% | 86.2% | trust core (sealed `.ccxseg`) |
-| `corecrux-storage` | 79% | 80.2% | trust core (append-only store) |
+| `corecrux-receipts` | 88% | 91.2% | trust core (CROWN receipts); ratchet available |
+| `corecrux-segment` | 85% | 93.8% | trust core (sealed `.ccxseg`); ratchet available |
+| `corecrux-storage` | 79% | 89.9% | trust core (append-only store); ratchet available |
 
 Floors are set **at current-rounded-down** ("ratchet from reality"): they prevent
 regression today and are raised as coverage improves. The job also prints the
@@ -3428,20 +3557,21 @@ admin HTTP surfaces — is gated.
 
 | Crate | Tests | | Crate | Tests |
 |---|---:|---|---|---:|
-| `corecruxd` | 1537 | | `corecrux-receipts` | 170 |
-| `corecruxctl` | 933 | | `corecrux-storage` | 143 |
-| `crux-mcp` | 622 | | `crux-claude-hooks` | 108 |
-| `corecrux-projections` | 269 | | `crux-session` | 76 |
-| `corecrux-memory` | 176 | | `corecrux-segment` | 54 |
+| `corecruxd` | 2671 | | `corecrux-receipts` | 275 |
+| `corecruxctl` | 1174 | | `corecrux-storage` | 223 |
+| `crux-mcp` | 798 | | `crux-claude-hooks` | 222 |
+| `corecrux-memory` | 288 | | `crux-session` | 89 |
+| `corecrux-projections` | 276 | | `corecrux-segment` | 62 |
 
-## Why the gated number is ~87%, not higher
+## Why the gated number is ~90%, not higher
 
-This is the honest part. 86.97% is what an *accurate* gate over the
+This is the honest part. 90.11% is what an *accurate* gate over the
 *meaningfully-testable* tree reports — it is not a target someone padded up to.
 
-1. **The trust-core crates pull the average down on purpose.**
-   `corecrux-storage` (80%), `corecrux-segment` (86%), and `corecrux-receipts`
-   (89%) are large and full of deep I/O and error branches. The
+1. **The trust-core crates used to pull the average down, and no longer do.**
+   `corecrux-storage` (89.9%), `corecrux-segment` (93.8%) and
+   `corecrux-receipts` (91.2%) are large and full of deep I/O and error
+   branches; they sat at 80/86/89% as recently as 2026-06-18. The
    **security-critical** paths in them *are* covered — tamper-rejection in
    [`corecrux-segment/tests/corruption_matrix.rs`](../crates/corecrux-segment/tests/corruption_matrix.rs)
    (magic / version / CRC / record-hash / TOC corruption all rejected) and
@@ -3451,10 +3581,35 @@ This is the honest part. 86.97% is what an *accurate* gate over the
    exhaustive error/IO-branch fan-out, not the invariants (see
    [`docs/agent/INVARIANTS.md`](agent/INVARIANTS.md)).
 
-2. **`corecruxd` is an ~87k-LOC surface.** Most handlers are covered, but a few
-   newer ones (`http/events.rs`, `http/infra.rs`, `http/policy.rs`) are still at
-   0% — they are *gated* (not excluded), so they are visible debt and natural
-   next targets, not hidden.
+2. **`corecruxd` is an ~87k-LOC surface.** Most handlers are covered. The three
+   that this doc previously recorded at 0% — `http/events.rs`, `http/infra.rs`,
+   `http/policy.rs` — were closed on 2026-07-30 and now sit at **95.4%**,
+   **98.8%** and **98.7%** region coverage respectively. They were *gated* (not
+   excluded) throughout, which is why they showed up as debt rather than
+   staying hidden. Remaining `corecruxd` debt is tracked per-file in the
+   Coverage job log.
+
+   A second sweep on 2026-07-30 took the nine largest remaining concentrations
+   across `corecruxd` and `corecruxctl` — `http/replay.rs` (1032 missed regions
+   → 66), `corecruxctl/audit_pack.rs` (1164 → 228), `corecruxctl/login.rs`
+   (1035 → 159), `repo_watch.rs` (456 → 125), `storybook.rs` (411 → 35),
+   `context_graph.rs` (296 → 19) and `http/incidents.rs` (379 → 211).
+
+   **What is left is mostly not testable without a production change.** The
+   clearest example is `integrations_github_sync.rs` (532 → 421) and
+   `integrations_github.rs` (253 → 215): every fetch builds a `ureq::Agent`
+   inline against a hard-coded `https://api.github.com/...` URL, with no
+   base-URL or transport injection seam, so the pagination and status-code
+   branches cannot be reached without hitting the real network. Adding a seam
+   is the prerequisite for covering them — not more test effort.
+
+   A related trap worth knowing: **no CI job runs `cargo test -- --ignored`**, so
+   an `#[ignore]`d test contributes nothing to the gate. Two exist today —
+   `sse_session_survives_30s_idle` (>35s wall clock) and `witness_submit`'s live
+   Rekor probe. Both are ignored for good reasons, but the SSE endpoint's
+   *only* test was one of them, which is how a whole handler sat at 0% while
+   looking tested. Prefer a fast handler-level test alongside any long-running
+   or network-dependent one.
 
 3. **The denominator includes the test code itself.** `#[cfg(test)]` regions
    count toward the total, so each new test batch raises coverage by less than
@@ -3486,8 +3641,17 @@ This is the honest part. 86.97% is what an *accurate* gate over the
 
 - **To raise a floor:** add tests for the crate, confirm the new per-crate number
   in the Coverage job log, then bump the `pair` floor in
-  [`ci.yml`](../.github/workflows/ci.yml) (keep it ≤ actual). Raising
-  `corecrux-memory` to its 95 target is the first such opportunity.
+  [`ci.yml`](../.github/workflows/ci.yml) (keep it ≤ actual). Three per-crate
+  floors are currently well below reality and are the standing opportunities:
+  `corecrux-storage` (79 → 89), `corecrux-segment` (85 → 93) and
+  `corecrux-receipts` (88 → 91). They were left alone on 2026-07-30 because
+  part of that headroom comes from `corecruxctl` tests exercising those crates
+  *transitively*, so the numbers should be confirmed stable across a couple of
+  main runs before being locked in. `corecrux-memory` remains at 93.5% against
+  its 95 target.
+- **Leave headroom when ratcheting the workspace floor.** It is set one point
+  below the measured total, not at it: a floor equal to reality turns main red
+  on the first feature PR that adds uncovered code.
 - **Keep the regex in lock-step:** the `COVERAGE_IGNORE_REGEX` is duplicated in
   `ci.yml` and `coverage-attestation.yml` — change both together.
 - **Adding an exclusion is a reviewed decision:** justify it inline (the only
@@ -3846,7 +4010,7 @@ Report it privately per the [security policy](SECURITY.md).
 <sub><b>receipts as a literal chain</b> — click any block in the console, inspect the proof</sub>
 </div>
 
-**Testing & coverage:** 6,000+ tests and **~87%** CI-gated region coverage, with per-crate floors
+**Testing & coverage:** 6,000+ tests and **~90%** CI-gated region coverage, with per-crate floors
 on the trust core (`corecrux-receipts` / `-segment` / `-storage`) and the ungated total reported
 alongside so exclusions can't hide low-coverage code. How it's measured and exactly what's
 excluded: [docs/testing-and-coverage.md](docs/testing-and-coverage.md).
@@ -4241,6 +4405,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.55] - 2026-08-02
+
+### Added
+
+- **Account entitlement is now a verified property of a signed token, not an
+  environment variable.** Three milestones of
+  `crux-pro-capabilities-rcx-entitled-2026-07-27` land together, all **dark** —
+  nothing enforces on them yet, `OperatingMode` still comes from
+  `CORECRUXD_OPERATING_MODE`, and the cutover is a later milestone.
+  - `corecruxd::entitlement` — an on-disk entitlement store on the reserved
+    `__entitlement__::rcx` entity (born private, no freshness horizon), plus
+    `resolve_entitlement`: revocation → presence → parse → tenant scope →
+    signature → expiry → tier. Forgery and revocation always resolve
+    `FreeLocal`; an expired token follows its own `FallbackPolicy`, so a paying
+    user who is merely offline keeps working.
+  - `corecruxd::pairing` — the daemon half of account pairing, reusing the
+    RFC 8628 device grant already shipped at `/v1/auth/device/*`. No licence key
+    and no typed secret: the `user_code` is a short-lived, single-use public
+    correlator, useless without an authenticated browser session, and never
+    written to configuration.
+  - `OperatingMode::GovernanceHosted`. `MaxPrivate` remains a composite —
+    Governance entitlement plus a private deployment shape — so no issuer can
+    hand it out.
+
+### Changed
+
+- **`RcxTier` cut over to the published ladder: `Free | Pro | Governance`.**
+  The previous `Free | Pro | Team | Enterprise` matched no product CueCrux
+  sells. `Team` is retired outright and `Enterprise` becomes `Governance`;
+  `crux-enterprise-shim` re-gates accordingly (`not_enterprise_tier` →
+  `not_governance_tier`). Retired values now fail *deserialisation*, which is
+  what makes a stale token fail closed to `FreeLocal` rather than resolve to
+  some default. `team_scope` and `enterprise_scope` stay on the token: removing
+  either would change the signed bytes for every tier, not just the retired one.
+- **New spec version `rcx-ct/1.2`, accepted alongside `rcx-ct/1.1` rather than
+  replacing it.** The spec-version check is not a version ladder but a match
+  with a rejecting catch-all, so repointing the 1.1 constant would have failed
+  every delegation token already minted. `1.2` is a *tier-vocabulary* version and
+  is orthogonal to delegation: 1.0 forbids a delegation policy, 1.1 requires
+  one, 1.2 makes it optional — a plain entitlement token carries none. A
+  cross-language byte-parity vector pins the Rust and TypeScript encoders
+  together on a `1.2` token with `tier: governance`.
+- **`corecruxd` split into sibling crates** — `corecrux-workspace-scan`,
+  `corecrux-billing`, `corecrux-providers` and `corecrux-secrets` — with the
+  unwrap ratchet re-baselined across the new boundary and `AGENTS.md` added for
+  the extracted crates.
+- Desktop shell gains isolated Registry and WikiCrux tabs.
+- Workspace test coverage raised from 88.49% to 90.11% across the nine
+  highest-debt files.
+
+### Fixed
+
+- **Seat identity is taken from the credential, not the request body**, closing
+  a bypass of the M8 per-seat rate ceiling on enriched verdicts.
+- **`dossier` and `storybook` now authorise against the tenant they answer for**
+  (code-intel M3b).
+- `ledger:history` is no longer advertised as a Pro claim. The route is fully
+  implemented but nothing produces a record, and selling a capability with no
+  producer is a truth-in-selling problem; the route and its handlers stay.
+- `run_git` gained a real wall-clock deadline. `GIT_TIMEOUT_SECS` fed only
+  `GIT_HTTP_LOW_SPEED_TIME`, an HTTP-transport setting that neither a local
+  `git blame` nor an SSH remote ever consults, so the call could block
+  unbounded on a stale `index.lock`.
+- `corecruxctl --version` now exists. It had no version surface at all, unlike
+  `crux-hook` and `corecruxd`.
+- The console `.mcpb` is rebuilt so it ships Apache-2.0 rather than the retired
+  CCL-1.0.
+- The config wizard parses profile frontmatter on a CRLF checkout.
+- The release path and a hang guard that was failing tests are unbroken.
+
+### Security
+
+- **wasmtime 47.0.2 → 47.0.3**, clearing [RUSTSEC-2026-0222] (stores can mix up
+  type indices between engines) and [RUSTSEC-2026-0223] (preemption and traps
+  during bulk operations break internal VM state). Lockfile only; `wasmtime` is
+  optional behind the default-off `wasm-extensions` feature, so default builds
+  never compiled it.
+
+[RUSTSEC-2026-0222]: https://rustsec.org/advisories/RUSTSEC-2026-0222
+[RUSTSEC-2026-0223]: https://rustsec.org/advisories/RUSTSEC-2026-0223
+
+## [0.5.54] - 2026-07-30
+
 ### Changed
 
 - Repository scans now use descriptor-pinned roots, unified parser/generated
@@ -4288,38 +4535,135 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The token-burn cost lens gains a model/effort axis.** `crux-cost` already
+  opened every transcript line by line and discarded what it found: `gitBranch`
+  was parsed but used only as an internal ranking tie-breaker, and `model`,
+  `effort` and `cwd` were not parsed at all. All four are now parsed onto the
+  event, promoted onto `CostReport`, and rolled up into a per-model burn
+  breakdown with per-effort burn *within* each model, rendered by both
+  `corecruxctl session cost` and the console `cx-cost` page.
+  - **It reconciles.** Per-model context, plus the `<synthetic>` pseudo-model,
+    plus records carrying usage but no model id, sum exactly to
+    `headline.measured_context_total`.
+  - **Coverage travels with every effort number.** `effort` is absent from 61%
+    of the measured corpus and its absence correlates with model — 100% / 100% /
+    22.5% / 9.4% across 46,239 assistant records — so a cross-model effort
+    comparison is confounded at source and no sample size fixes it.
+    `effort_coverage_pct` lives on the type, so no surface can render an effort
+    figure without the denominator that qualifies it.
+  - `<synthetic>` is reported separately, never ranked as a model and never
+    dropped. Model-id normalisation folds only stable presentation variants
+    (`[1m]` context suffix, `us.anthropic.`/`bedrock/`/`vertex/` route prefixes,
+    `-v1:0`); floating aliases such as `opus` and `sonnet` are deliberately left
+    unresolved, since resolving them would silently merge two models the day the
+    alias moves.
+  - The five new `CostReport` fields are additive, serde-default and omitted
+    when absent, so an older daemon ignores a newer report and a legacy report
+    is unchanged on the wire. A daemon must be upgraded before the console can
+    render the axis.
+  - Adds the cost lane's first integration coverage: a post-then-get test
+    through both `/v1/cost/report` handlers.
+
 - **`CITATION.cff`.** Machine-readable citation metadata (GitHub "Cite this
   repository" button). Under Apache-2.0 citation is appreciated but not a
   licence condition.
 
+- **A Windows GUI smoke lane for the desktop shell.** `desktop-shell.yml` gains
+  `desktop GUI smoke (windows, interactive session)`, running on a self-hosted
+  runner that executes inside a real logged-on desktop
+  (`[self-hosted, windows-gui]`). It bundles the MSI, installs it per-machine,
+  launches the installed app, and asserts what only a desktop can show: a window
+  appears, an `msedgewebview2` host actually starts, the bundled `corecruxd`
+  sidecar is spawned from the `externalBin` slot, and a graceful close reaps that
+  sidecar. A desktop screenshot uploads on every run, including failures.
+  Non-blocking — it depends on a single operator-owned box, so an offline runner
+  must not gate the merge queue.
+
+  This closes the gap the native-Windows build fix left open: that change noted
+  there was "no Windows job to catch the next one" of ~49 `#[cfg(unix)]` sites.
+  Compiling was never the hard part — a Tauri/WebView2 window cannot be created
+  in a headless or Session 0 context at all, so app launch was unobservable on
+  every existing runner. `scripts/provision-windows-gui-runner.ps1` provisions
+  such a box and refuses to run where a GUI cannot exist; `docs/self-hosted-runner.md`
+  records why Server Core and Session 0 are each disqualifying, and what the lane
+  deliberately does not cover (reboot re-attach, the Defender first-bind prompt,
+  WSL2 parity with a developer box).
+
 ### Fixed
 
-- **Repository scans are contained, bounded, and stale-safe.** Local
-  `root_path` registrations require cross-tenant operator authority and a
-  canonical descendant of the explicit
-  `CORECRUXD_REPO_SCAN_ALLOWED_ROOTS`; MCP binds target tenants to authenticated
-  tenant authority and defaults local scans to async. The operator
-  `CORECRUXD_WORKSPACE_PATH` remains separate and never expands tenant scan
-  authority. Starting and reading the self-scan require cross-tenant operator
-  authority; the persisted result redacts the absolute host root. An empty
-  allowlist disables local repo scans. Inline scans, queued jobs, and bounded
-  polling watchers revalidate at execution time, reject symlinks, hard links,
-  non-regular files and cycles, and share configurable depth, entry, byte,
-  per-file, output and cooperative elapsed-work limits. One process-wide permit
-  is held through encoding/persistence; queues are capped globally and per
-  tenant. Async/watch completions are registration-generation-bound so stale
-  results cannot land after delete/recreate. Watchers use secure content
-  digests, full replacement scans, retry-safe snapshots, and fixed global and
-  tenant caps. Secure reads are Unix-only and native non-Unix daemons fail
-  closed before opening; Windows operators should use WSL2.
+- **The SessionEnd cost hook now records whether it worked.** The generated
+  `cost)` launcher branch failed silently on three paths — `corecruxctl` absent,
+  no configured endpoint, post rejected — each swallowed by `|| true`. Quiet is
+  the correct posture for a SessionEnd hook, which must never block session end;
+  undiagnosable is not. There was no way to distinguish "no sessions ran" from
+  "every session silently failed to post", and the branch had no test coverage
+  of any kind, which is why it survived.
+  - Every attempt writes a one-line outcome record (result, reason, endpoint,
+    endpoint source, launcher version) to `~/.claude/hooks/crux-cost.state.json`;
+    failures additionally append to `crux-cost.errors.log`. `exit 0` remains
+    unconditional on every path.
+  - `CRUX_HTTP_URL` can never actually be empty — `${CRUX_HTTP_URL:-…}`
+    substitutes for empty as well as unset — so the real misconfiguration is the
+    *unconfigured loopback default*, which fails with a connection refused the
+    operator cannot place. The launcher now records whether the endpoint came
+    from config or from the built-in default, and names the remedy.
+  - `corecruxctl hooks status` reports the last outcome and flags a stale
+    launcher by version marker. The boot self-check warns when the installed
+    launcher predates the running build, or when capture last failed or was
+    never attempted — nothing warns when no outcome has been recorded yet, since
+    a fresh install has simply not ended a session.
+  - Six shell-level tests run the *embedded* launcher template under `bash`, so
+    they cannot drift from what `hooks install` writes.
 
-- **Standalone self-update now authenticates its manifest before trusting it.**
-  `crux self update` resolves an immutable release tag, bounds the manifest and
-  Sigstore bundle, and requires `cosign verify-blob` with the exact CueCrux
-  release-workflow identity and GitHub Actions issuer before JSON parsing.
-  Schema, tag/version, artifact mapping, and SHA-256 fields then receive strict
-  validation. Releases publish and self-verify a standard bundle with patched
-  Cosign 2.6.2; missing tooling or proof fails closed.
+  **This takes effect only after `corecruxctl hooks install` is re-run.** An
+  un-re-run wizard keeps the old silent script, and that is the most likely way
+  this fix appears not to work.
+
+- **Three tests that asserted things the machine does not guarantee.** Each
+  failed CI on an unrelated PR and passed on a re-run of the identical commit;
+  two of them gate required checks, so they cost merges rather than just noise.
+  - `envelope_build_latency_under_2ms_for_10_facts` (`crux-mcp`) asserted a
+    wall-clock bound — the only one in the workspace. On a shared runner that
+    measures how busy the machine is, not how fast the code is. The figure is
+    still measured and printed; the assertion is gone, and the test is renamed
+    `envelope_build_covers_all_ten_facts` after the check that carries content
+    (`memories_used.len() == 10`). Raising the constant was rejected: it trades a
+    frequent flake for a rarer one and keeps a load-dependent test.
+  - `allowed_origins_reads_the_env_var` (`corecruxd`) round-tripped through
+    `set_var`/`getenv` and read back the built-in defaults instead of the value
+    it had just set — *while holding the module's `env_lock()`*. The mutex was
+    never the problem: `setenv` can reallocate the environment block, and a
+    concurrent `getenv` anywhere in this 2000-plus-test binary may then read a
+    stale pointer, which no Rust-level lock can fence (hence `set_var` being
+    `unsafe` from the 2024 edition). It now parses via `resolve_allowed_origins`
+    directly, matching its five neighbours, and removes the last `set_var` in
+    the file.
+  - `pick_free_port_is_bindable` (`crux-shell-lifecycle`) asserted that a port
+    picked by binding `:0` and dropping the listener is immediately re-bindable.
+    Nothing promises that — sibling tests binding `:0` in parallel can take it
+    in the gap. It now retries a bounded number of times, so only a genuinely
+    broken helper fails.
+
+- **The desktop shell no longer opens stray console windows on Windows.** Two
+  spawn sites, both console-subsystem binaries launched from a GUI-subsystem app
+  (`windows_subsystem = "windows"`) that has no console to inherit — so Windows
+  allocated a fresh console *window* for each:
+  - `spawn_sidecar` (`crux-shell-lifecycle`) launched the bundled `corecruxd`
+    with a visible console that sat beside the app for its entire lifetime.
+    Redirecting stdout/stderr into the sidecar log did not suppress it: the
+    streams and the window are independent.
+  - the Windows credential lookup (`crux-shell-connection`) shells out to
+    `powershell.exe` for the `PasswordVault` read, flashing a console on *every*
+    attach-profile activation and retry. `-NonInteractive` governs the prompt,
+    not the window.
+
+  Both now set `CREATE_NO_WINDOW` (`0x08000000`) via `CommandExt::creation_flags`.
+  `rundll32.exe`, used to open external links, is GUI-subsystem (verified from
+  its PE header) and needed no change.
+
+  Found by the new Windows GUI smoke lane on its first green run — the
+  assertions passed while the uploaded screenshot showed the console box. That
+  lane now fails if either window returns.
 
 - **A cold `cargo build` now completes on native Windows.** Three unrelated
   stops, none of which CI can see (every runner is Linux, and the release matrix
@@ -4802,7 +5146,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-deny` supply chain and licence audit in CI
 - `cargo-audit` CVE scanning in CI
 
-[unreleased]: https://github.com/CueCrux/Crux/compare/v0.4.6...HEAD
+[unreleased]: https://github.com/CueCrux/Crux/compare/v0.5.54...HEAD
+[0.5.55]: https://github.com/CueCrux/Crux/compare/v0.5.54...v0.5.55
+[0.5.54]: https://github.com/CueCrux/Crux/compare/v0.5.53...v0.5.54
 [0.4.6]: https://github.com/CueCrux/Crux/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/CueCrux/Crux/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/CueCrux/Crux/compare/v0.4.3...v0.4.4

@@ -179,3 +179,18 @@ Every finding below was verified against the code before acting.
 - Step conclusions: `gh api repos/CueCrux/Crux/actions/runs/<id>/jobs --jq '.jobs[0].steps[]'`
 - Artifacts (only 2 exist): `gh api "repos/CueCrux/Crux/actions/artifacts?name=mutants-report"`
 - Analyzed artifact extracted at scratchpad `mutants-0713/` (session-ephemeral).
+
+## runner-hel1 memory-crunch mitigation (2026-07-22, ExecPlan crux-storage-mutation-burndown-2026-07-22 M2)
+
+Daily OOMs continued through 07-22 (~09:15–09:30 UTC; window load = 6 concurrent
+eval/build jobs across the slots, all units previously MemoryHigh=infinity,
+8G swap). Applied on the host, both reversible:
+
+- 16G overflow swapfile at `/srv/data/swapfile` (pri -3, below md1's -2), in
+  fstab (backup: `/etc/fstab.bak-2026-07-22`). Revert: `swapoff`, `rm`, restore fstab.
+- `MemoryHigh=14G` set live+persistent on `actions.runner.CueCrux.runner-hel1-*`
+  via `systemctl set-property` (no restarts). Revert: set back to `infinity`.
+
+Cross-repo cron staggering of the eval workflows remains the operator-level fix;
+watch the next few mornings' journals — if throttling visibly slows the window's
+jobs, tune MemoryHigh up before reverting.

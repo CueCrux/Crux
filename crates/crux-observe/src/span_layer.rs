@@ -59,6 +59,121 @@ pub const TRACE_SAMPLE_ENV: &str = "CORECRUXD_TRACE_SAMPLE_RATE";
 const DEFAULT_CAPACITY: usize = 16_384;
 const DEFAULT_SAMPLE_RATE: u64 = 1;
 
+/// The span field a site records its outcome on.
+///
+/// Matched by name in [`CruxSpanLayer::on_record`]. A span that never declares
+/// this field never reaches that path, which is what keeps the cost of the
+/// outcome dimension off every span that does not opt in.
+pub const OUTCOME_FIELD: &str = "crux.outcome";
+
+/// Did this span's work come back empty?
+///
+/// `had_error` already makes a panic or an `Err` visible. This is the other
+/// silent failure: a function that runs normally and returns `None`, an empty
+/// collection, or a zero count is otherwise indistinguishable from one that
+/// returned a full result — `executed: true` is true, and useless.
+///
+/// # Three states, not a `bool`
+///
+/// [`Unrecorded`](Self::Unrecorded) must stay distinguishable from
+/// [`NonEmpty`](Self::NonEmpty). Collapsing them would make an absent signal
+/// read as a healthy one — the exact defect this dimension exists to catch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SpanOutcome {
+    /// The site never declared an outcome. What every pre-existing span and
+    /// every uninstrumented site reads as. Not a claim that work was produced.
+    #[default]
+    Unrecorded,
+    /// Ran and produced nothing: `None`, an empty collection, a zero count.
+    Empty,
+    /// Ran and produced something.
+    NonEmpty,
+}
+
+impl SpanOutcome {
+    /// `true` only for [`Empty`](Self::Empty) — `Unrecorded` is not emptiness.
+    pub fn is_empty_result(self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    /// `true` when a site actually spoke, whatever it said.
+    pub fn is_recorded(self) -> bool {
+        !matches!(self, Self::Unrecorded)
+    }
+
+    fn from_bool(is_empty: bool) -> Self {
+        if is_empty {
+            Self::Empty
+        } else {
+            Self::NonEmpty
+        }
+    }
+}
+
+/// Declare whether the current span's work came back empty.
+///
+/// Call this at a site where returning nothing is *suspicious* — where an
+/// always-empty result would mean a bug. The enclosing span must declare the
+/// field, or `tracing` discards the value:
+///
+/// ```ignore
+/// #[tracing::instrument(fields(crux.outcome = tracing::field::Empty))]
+/// fn load_latest_workspace_blocking(...) -> Option<WorkspaceScan> {
+///     let scan = lookup();
+///     crux_observe::span_layer::record_outcome(scan.is_none());
+///     scan
+/// }
+/// ```
+///
+/// A no-op when no span is active or capture is off.
+pub fn record_outcome(is_empty: bool) {
+    tracing::Span::current().record(OUTCOME_FIELD, if is_empty { "empty" } else { "non_empty" });
+}
+
+/// Record an outcome by passing the value through, so instrumenting a site does
+/// not mean restructuring its returns.
+///
+/// ```ignore
+/// fn list_dossiers(&self) -> Vec<Dossier> {
+///     self.scan_prefix("dossier:").record_outcome_through()
+/// }
+/// ```
+pub trait OutcomeExt: Sized {
+    /// Is this value the empty case?
+    fn is_empty_result(&self) -> bool;
+
+    /// Record the outcome on the current span and return `self` unchanged.
+    fn record_outcome_through(self) -> Self {
+        record_outcome(self.is_empty_result());
+        self
+    }
+}
+
+impl<T> OutcomeExt for Option<T> {
+    fn is_empty_result(&self) -> bool {
+        self.is_none()
+    }
+}
+
+impl<T> OutcomeExt for Vec<T> {
+    fn is_empty_result(&self) -> bool {
+        self.is_empty()
+    }
+}
+
+impl<T, E> OutcomeExt for Result<T, E>
+where
+    T: OutcomeExt,
+{
+    /// An `Err` is **not** empty — `had_error` already covers failure, and
+    /// conflating the two would let a loud failure masquerade as a silent one.
+    /// Only the `Ok` payload is judged.
+    fn is_empty_result(&self) -> bool {
+        self.as_ref().is_ok_and(OutcomeExt::is_empty_result)
+    }
+}
+
 /// One completed span: a node in the runtime call tree.
 ///
 /// `file` + `line` + `name` are the join key into the static code graph. `name`
@@ -83,6 +198,13 @@ pub struct SpanRecord {
     pub depth: u32,
     /// Whether the span closed with an error recorded on it.
     pub had_error: bool,
+    /// Whether the span's work came back empty, when the site said so.
+    ///
+    /// `#[serde(default)]` so a `spans.jsonl` written before this field existed
+    /// still loads, reading as [`SpanOutcome::Unrecorded`] — which is the honest
+    /// answer for a record captured before anything could declare an outcome.
+    #[serde(default)]
+    pub outcome: SpanOutcome,
 }
 
 /// A completed span as captured on the hot path: **allocation-free**.
@@ -105,6 +227,9 @@ pub struct RawSpan {
     pub duration_ns: u64,
     pub depth: u32,
     pub had_error: bool,
+    /// One `Copy` byte. Keeps [`RawSpan`] allocation-free, so the outcome
+    /// dimension costs the capture path nothing it did not already pay.
+    pub outcome: SpanOutcome,
 }
 
 impl RawSpan {
@@ -122,6 +247,7 @@ impl RawSpan {
             duration_ns: self.duration_ns,
             depth: self.depth,
             had_error: self.had_error,
+            outcome: self.outcome,
         }
     }
 }
@@ -213,6 +339,35 @@ struct SpanState {
     elapsed_ns: u64,
     sampled: bool,
     had_error: bool,
+    outcome: SpanOutcome,
+}
+
+/// Reads `crux.outcome` off a `record` call and ignores every other field.
+struct OutcomeVisitor(Option<SpanOutcome>);
+
+impl tracing::field::Visit for OutcomeVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == OUTCOME_FIELD {
+            self.0 = match value {
+                "empty" => Some(SpanOutcome::Empty),
+                "non_empty" => Some(SpanOutcome::NonEmpty),
+                _ => None,
+            };
+        }
+    }
+
+    /// Also accept `record(OUTCOME_FIELD, true)` for callers who prefer a bool.
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        if field.name() == OUTCOME_FIELD {
+            self.0 = Some(SpanOutcome::from_bool(value));
+        }
+    }
+
+    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {
+        // Every other field type is irrelevant here. Deliberately empty rather
+        // than absent: `Visit` requires it, and doing anything would mean
+        // paying for fields this layer does not care about.
+    }
 }
 
 /// The capture layer. Clone-cheap; the ring is shared.
@@ -292,7 +447,19 @@ where
             elapsed_ns: 0,
             sampled,
             had_error: false,
+            outcome: SpanOutcome::Unrecorded,
         });
+    }
+
+    fn on_record(&self, id: &Id, values: &tracing::span::Record<'_>, ctx: Context<'_, S>) {
+        let mut visitor = OutcomeVisitor(None);
+        values.record(&mut visitor);
+        let Some(outcome) = visitor.0 else { return };
+        let Some(span) = ctx.span(id) else { return };
+        let mut ext = span.extensions_mut();
+        if let Some(state) = ext.get_mut::<SpanState>() {
+            state.outcome = outcome;
+        }
     }
 
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
@@ -359,6 +526,7 @@ where
             duration_ns,
             depth: state.depth,
             had_error: state.had_error,
+            outcome: state.outcome,
         });
     }
 }
@@ -385,6 +553,7 @@ mod tests {
             duration_ns: 0,
             depth: 0,
             had_error: false,
+            outcome: Default::default(),
         }
     }
 
@@ -546,8 +715,107 @@ mod tests {
             duration_ns: 1234,
             depth: 1,
             had_error: false,
+            outcome: Default::default(),
         };
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<SpanRecord>(&json).unwrap(), r);
+    }
+
+    // ── outcome dimension (ExecPlan crux-code-intel-silent-empty-outcomes, M0) ──
+
+    /// The non-negotiable one: `trace_store` loads real `spans.jsonl` files
+    /// written before this field existed. They must still parse, and must read
+    /// as `Unrecorded` — never as `NonEmpty`, which would be a silent claim
+    /// that work was produced.
+    #[test]
+    fn a_span_record_written_before_the_outcome_field_still_loads() {
+        let legacy = r#"{"trace_id":1,"span_id":2,"parent_span_id":null,"name":"old",
+            "target":"t","file":null,"line":null,"module_path":null,
+            "duration_ns":5,"depth":0,"had_error":false}"#;
+        let parsed: SpanRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.outcome, SpanOutcome::Unrecorded);
+        assert!(!parsed.outcome.is_recorded());
+        assert!(!parsed.outcome.is_empty_result(), "unrecorded is not emptiness");
+    }
+
+    #[test]
+    fn outcome_serialises_as_snake_case() {
+        assert_eq!(serde_json::to_string(&SpanOutcome::NonEmpty).unwrap(), "\"non_empty\"");
+        assert_eq!(serde_json::to_string(&SpanOutcome::Empty).unwrap(), "\"empty\"");
+        assert_eq!(
+            serde_json::to_string(&SpanOutcome::Unrecorded).unwrap(),
+            "\"unrecorded\""
+        );
+    }
+
+    #[test]
+    fn record_outcome_marks_the_enclosing_span() {
+        let ring = ring_of(16);
+        let layer = CruxSpanLayer::new(Arc::clone(&ring), 1);
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            tracing::info_span!("empty_one", crux.outcome = tracing::field::Empty).in_scope(|| {
+                record_outcome(true);
+            });
+            tracing::info_span!("full_one", crux.outcome = tracing::field::Empty).in_scope(|| {
+                record_outcome(false);
+            });
+            tracing::info_span!("silent_one").in_scope(|| {});
+        });
+        let spans = ring.snapshot();
+        let by = |n: &str| spans.iter().find(|s| s.name == n).unwrap().outcome;
+        assert_eq!(by("empty_one"), SpanOutcome::Empty);
+        assert_eq!(by("full_one"), SpanOutcome::NonEmpty);
+        // Never opted in, so it never reached `on_record`.
+        assert_eq!(by("silent_one"), SpanOutcome::Unrecorded);
+    }
+
+    /// `on_record` must ignore every field that is not `crux.outcome`, or an
+    /// unrelated `Span::record` elsewhere in the daemon would corrupt this one.
+    #[test]
+    fn on_record_ignores_unrelated_fields() {
+        let ring = ring_of(8);
+        let layer = CruxSpanLayer::new(Arc::clone(&ring), 1);
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            tracing::info_span!(
+                "noisy",
+                other = tracing::field::Empty,
+                crux.outcome = tracing::field::Empty
+            )
+            .in_scope(|| {
+                tracing::Span::current().record("other", "empty");
+            });
+        });
+        assert_eq!(ring.snapshot()[0].outcome, SpanOutcome::Unrecorded);
+    }
+
+    #[test]
+    fn outcome_ext_passes_the_value_through() {
+        let ring = ring_of(8);
+        let layer = CruxSpanLayer::new(Arc::clone(&ring), 1);
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            tracing::info_span!("opt", crux.outcome = tracing::field::Empty).in_scope(|| {
+                let v: Option<u8> = None;
+                assert!(v.record_outcome_through().is_none());
+            });
+            tracing::info_span!("vec", crux.outcome = tracing::field::Empty).in_scope(|| {
+                assert_eq!(vec![1u8, 2].record_outcome_through().len(), 2);
+            });
+        });
+        let spans = ring.snapshot();
+        let by = |n: &str| spans.iter().find(|s| s.name == n).unwrap().outcome;
+        assert_eq!(by("opt"), SpanOutcome::Empty);
+        assert_eq!(by("vec"), SpanOutcome::NonEmpty);
+    }
+
+    /// An `Err` is a failure, not an empty result — `had_error` covers it.
+    /// Conflating them would let a loud failure read as a silent one.
+    #[test]
+    fn an_err_is_not_an_empty_result() {
+        let ok_empty: Result<Vec<u8>, ()> = Ok(vec![]);
+        let ok_full: Result<Vec<u8>, ()> = Ok(vec![1]);
+        let failed: Result<Vec<u8>, ()> = Err(());
+        assert!(ok_empty.is_empty_result());
+        assert!(!ok_full.is_empty_result());
+        assert!(!failed.is_empty_result(), "Err must not read as empty");
     }
 }

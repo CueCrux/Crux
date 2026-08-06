@@ -11,8 +11,8 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    problem_response, require_http_scopes, require_http_scopes_for_tenant, AppState, HeaderMap, IntoResponse, Json,
-    Path, Query, State, StatusCode,
+    problem_response, require_http_any_scope, require_http_scopes, require_http_scopes_for_tenant, AppState, HeaderMap,
+    IntoResponse, Json, Path, Query, State, StatusCode,
 };
 
 type BoostOverlay = BTreeMap<String, String>;
@@ -2965,6 +2965,13 @@ pub(super) async fn get_console_facts(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     let top_k = query.top_k.unwrap_or(50).clamp(1, 200);
+    if query.as_of_unix_ms.is_some_and(|as_of| as_of < 0) {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "as_of_unix_ms must not be negative; a cutoff that cannot be applied is refused, not ignored",
+        )
+        .into_response();
+    }
 
     let store = state.fact_store.read().await;
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
@@ -2980,7 +2987,14 @@ pub(super) async fn get_console_facts(
 
     // #6 — server-side as-of filter. We compare against `stored_at` (DateTime<Utc>)
     // converted to ms; facts created strictly after the cutoff are dropped.
-    if let Some(as_of) = query.as_of_unix_ms.filter(|t| *t > 0) {
+    //
+    // D-26: this was `.filter(|t| *t > 0)`, so `as_of_unix_ms=0` silently
+    // disabled the cutoff and returned ALL current facts while the response
+    // still echoed the parameter back — a client computing 0 was told it had
+    // time-travelled and had not. Zero is a valid epoch cutoff (nothing had
+    // been stored yet); a negative one is a broken client and is refused
+    // above, so the cutoff either applies or the request fails.
+    if let Some(as_of) = query.as_of_unix_ms {
         visible_facts.retain(|fact| fact.stored_at.timestamp_millis() <= as_of);
     }
 
@@ -3217,6 +3231,19 @@ pub(super) async fn get_console_chunk_preview(
     Path(chunk_digest): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    // D-27: the lookup used to run BEFORE any scope check, so an
+    // unauthorized caller got 404 for an absent digest and 401 for a present
+    // one — an existence oracle over every chunk digest. Require the scope
+    // tenant-agnostically first; the tenant-bound check still follows once the
+    // owning tenant is known.
+    // Gate 1 is the SCOPE rail, checked before the lookup: a caller without
+    // `tenant:content:preview` at all is refused 403 without the digest ever
+    // being resolved, so it learns nothing about existence. `admin:read` does
+    // not buy this rail.
+    if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["tenant:content:preview"]) {
+        return problem.into_response();
+    }
+
     let Some(chunk) = (match crate::console_index::find_chunk(&state.data_dir, &chunk_digest) {
         Ok(chunk) => chunk,
         Err(err) => return problem_response(StatusCode::BAD_REQUEST, err.to_string()),
@@ -3224,10 +3251,13 @@ pub(super) async fn get_console_chunk_preview(
         return problem_response(StatusCode::NOT_FOUND, "chunk metadata not found");
     };
 
-    if let Err(problem) =
-        require_http_scopes_for_tenant(&state.auth, &headers, &["tenant:content:preview"], &chunk.tenant_id)
-    {
-        return problem.into_response();
+    // Gate 2 is the TENANT rail, checked after the lookup because it needs the
+    // owner. D-27, second half: a caller holding the preview scope for one
+    // tenant could still tell another tenant's existing digest (403) from an
+    // absent one (404). Past gate 1 the caller does hold the rail, so the only
+    // thing left to hide is the chunk itself — report it absent.
+    if require_http_scopes_for_tenant(&state.auth, &headers, &["tenant:content:preview"], &chunk.tenant_id).is_err() {
+        return problem_response(StatusCode::NOT_FOUND, "chunk metadata not found");
     }
 
     (
@@ -4353,5 +4383,1744 @@ mod session_detail_tests {
         assert_eq!(body["linked_plans_heuristic"].as_array().unwrap().len(), 0);
         // State is still exposed even with no linkage.
         assert_eq!(body["state"], json!({ "k": "v" }));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn st() -> AppState {
+        crate::http::tests::test_app_state(16)
+    }
+
+    /// `DevScopes` state — the only mode in which 401 (no credential) and 403
+    /// (credential without the scope) are distinguishable.
+    fn st_dev() -> AppState {
+        crate::http::tests::test_app_state_with_auth(16, crate::auth::AuthMode::DevScopes)
+    }
+
+    fn scoped(scopes: &str) -> HeaderMap {
+        crate::http::tests::dev_scope_headers(scopes)
+    }
+
+    async fn body_json(resp: axum::response::Response) -> Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 22)
+            .await
+            .expect("read response body");
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    }
+
+    fn seed(store: &mut corecrux_memory::FactStore, entity: &str, key: &str, value: &str, private: bool) {
+        seed_conf(store, entity, key, value, private, 1.0);
+    }
+
+    fn seed_conf(
+        store: &mut corecrux_memory::FactStore,
+        entity: &str,
+        key: &str,
+        value: &str,
+        private: bool,
+        confidence: f32,
+    ) -> String {
+        store
+            .try_store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: corecrux_memory::fact_store::default_tenant_hash(),
+                entity: entity.to_string(),
+                key: key.to_string(),
+                value: value.to_string(),
+                source_receipt: None,
+                confidence,
+                private,
+                horizon_class: None,
+                actor: None,
+            })
+            .expect("seed fact")
+            .fact_id
+    }
+
+    // ── Small pure helpers ───────────────────────────────────────────────
+
+    #[test]
+    fn console_actor_from_headers_defaults_trims_and_ignores_blank() {
+        assert_eq!(console_actor_from_headers(&HeaderMap::new()), "console");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-passport-id", "  claude-work ".parse().unwrap());
+        assert_eq!(console_actor_from_headers(&headers), "claude-work");
+        let mut blank = HeaderMap::new();
+        blank.insert("x-corecrux-passport-id", "   ".parse().unwrap());
+        assert_eq!(
+            console_actor_from_headers(&blank),
+            "console",
+            "a blank header must not become a blank actor"
+        );
+    }
+
+    /// The fingerprint is what the connections route publishes in place of the
+    /// credential. It must be a digest prefix, never a slice of the token.
+    #[test]
+    fn token_fingerprint_is_a_short_digest_not_the_token() {
+        let fp = token_fingerprint("super-secret-agent-token");
+        assert_eq!(fp.len(), 8);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(!"super-secret-agent-token".contains(&fp));
+        assert_eq!(fp, token_fingerprint("super-secret-agent-token"), "deterministic");
+        assert_ne!(fp, token_fingerprint("super-secret-agent-tokem"));
+    }
+
+    #[test]
+    fn clip_preview_collapses_whitespace_and_clips_with_an_ellipsis() {
+        assert_eq!(clip_preview("  a\n\t b  ", 140).as_deref(), Some("a b"));
+        assert_eq!(clip_preview("   ", 140), None);
+        let clipped = clip_preview(&"x".repeat(500), 10).unwrap();
+        assert_eq!(clipped.chars().count(), 10);
+        assert!(clipped.ends_with('…'));
+    }
+
+    #[test]
+    fn session_state_str_reads_only_conventional_string_fields() {
+        let state = json!({ "title": "  M4 gate  ", "summary": 7, "token": "leak-me" });
+        assert_eq!(session_state_str(&state, "title").as_deref(), Some("M4 gate"));
+        assert_eq!(session_state_str(&state, "summary"), None, "non-strings are skipped");
+        assert_eq!(session_state_str(&state, "missing"), None);
+        assert_eq!(session_state_str(&json!("not-an-object"), "title"), None);
+    }
+
+    #[test]
+    fn consolidation_problem_maps_every_error_variant() {
+        use corecrux_memory::fact_store::ConsolidationErrorV1 as E;
+        let cases: Vec<(E, StatusCode)> = vec![
+            (E::NoTargets, StatusCode::BAD_REQUEST),
+            (E::TargetOutsideEntityKey("f".into()), StatusCode::BAD_REQUEST),
+            (E::TargetNotFound("f".into()), StatusCode::NOT_FOUND),
+            (E::TargetDeleted("f".into()), StatusCode::CONFLICT),
+            (E::TargetPinned("f".into()), StatusCode::CONFLICT),
+            (E::TargetPrivate("f".into()), StatusCode::CONFLICT),
+            (E::TargetReceiptLinked("f".into()), StatusCode::CONFLICT),
+            (
+                E::TargetHighConfidence {
+                    fact_id: "f".into(),
+                    confidence: "0.99".into(),
+                },
+                StatusCode::CONFLICT,
+            ),
+            (E::Journal("disk".into()), StatusCode::INTERNAL_SERVER_ERROR),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(consolidation_problem(err).status(), expected);
+        }
+    }
+
+    #[test]
+    fn tenant_category_response_separates_derived_from_override() {
+        // No override → derived == effective.
+        let plain = tenant_category_response("acme", None);
+        assert_eq!(plain["derived"], "work");
+        assert_eq!(plain["effective"], "work");
+        assert!(plain["override"].is_null());
+        // An override changes `effective` while `derived` still reports the
+        // prefix-based classification.
+        let overridden = tenant_category_response("acme", Some(crux_mcp::tenant_category::TenantCategory::Personal));
+        assert_eq!(overridden["derived"], "work");
+        assert_eq!(overridden["override"], "personal");
+        assert_eq!(overridden["effective"], "personal");
+    }
+
+    #[test]
+    fn resolve_install_manifest_rejects_mismatched_or_unknown_packs() {
+        let builtin = crux_integrations::builtin_manifests()
+            .into_iter()
+            .next()
+            .expect("at least one builtin manifest");
+
+        // Inline manifest whose id disagrees with the path → 400.
+        let (status, _) = resolve_install_manifest(
+            "other.pack",
+            InstallIntegrationBody {
+                manifest: Some(builtin.clone()),
+                pack_id: None,
+                version: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Inline manifest matching the path → accepted verbatim.
+        let resolved = resolve_install_manifest(
+            &builtin.id,
+            InstallIntegrationBody {
+                manifest: Some(builtin.clone()),
+                pack_id: None,
+                version: None,
+            },
+        )
+        .expect("matching manifest");
+        assert_eq!(resolved.id, builtin.id);
+
+        // Builtin lookup by id+version.
+        let resolved = resolve_install_manifest(
+            &builtin.id,
+            InstallIntegrationBody {
+                manifest: None,
+                pack_id: Some(builtin.id.clone()),
+                version: Some(builtin.version.clone()),
+            },
+        )
+        .expect("builtin lookup");
+        assert_eq!(resolved.version, builtin.version);
+
+        // Body pack_id contradicting the path → 400, not a silent install of the
+        // path pack.
+        let (status, _) = resolve_install_manifest(
+            &builtin.id,
+            InstallIntegrationBody {
+                manifest: None,
+                pack_id: Some("someone-elses-pack".to_string()),
+                version: Some(builtin.version.clone()),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Unknown pack → 404.
+        let (status, _) = resolve_install_manifest(
+            "does.not.exist",
+            InstallIntegrationBody {
+                manifest: None,
+                pack_id: None,
+                version: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn manifest_trust_tier_requires_first_party_publisher_or_a_signature() {
+        let mut manifest = crux_integrations::builtin_manifests()
+            .into_iter()
+            .next()
+            .expect("builtin manifest");
+        manifest.publisher_passport_fpr = crux_integrations::FIRST_PARTY_PASSPORT.to_string();
+        assert_eq!(manifest_trust_tier(&manifest), crux_integrations::TrustTier::FirstParty);
+        manifest.publisher_passport_fpr = "p_someone_else".to_string();
+        manifest.signature = None;
+        assert_eq!(manifest_trust_tier(&manifest), crux_integrations::TrustTier::Unknown);
+    }
+
+    #[test]
+    fn apply_safe_mode_blocks_only_enabled_non_first_party_packs() {
+        let mut packs = crux_integrations::builtin_packs().expect("builtin packs");
+        assert!(!packs.is_empty());
+        for pack in &mut packs {
+            pack.trust_tier = crux_integrations::TrustTier::Unknown;
+            pack.install_state = crux_integrations::InstallState::Enabled;
+        }
+        let unchanged = apply_safe_mode(packs.clone(), false);
+        assert!(unchanged
+            .iter()
+            .all(|p| p.install_state == crux_integrations::InstallState::Enabled));
+
+        let blocked = apply_safe_mode(packs.clone(), true);
+        assert!(blocked
+            .iter()
+            .all(|p| p.install_state == crux_integrations::InstallState::Blocked));
+
+        // A first-party pack keeps its state even in safe mode.
+        for pack in &mut packs {
+            pack.trust_tier = crux_integrations::TrustTier::FirstParty;
+        }
+        let first_party = apply_safe_mode(packs, true);
+        assert!(first_party
+            .iter()
+            .all(|p| p.install_state == crux_integrations::InstallState::Enabled));
+    }
+
+    #[test]
+    fn integration_problem_maps_status_by_error_class() {
+        assert_eq!(
+            integration_problem(crux_integrations::IntegrationError::PackNotInstalled {
+                pack_id: "p".to_string(),
+                version: "0.1.0".to_string(),
+            })
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            integration_problem(crux_integrations::IntegrationError::ExternalHelperDisabled).status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            integration_problem(crux_integrations::IntegrationError::Io(std::io::Error::other("boom"))).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn now_unix_ms_is_a_plausible_wall_clock() {
+        assert!(now_unix_ms() > 1_700_000_000_000, "after 2023");
+    }
+
+    // ── Auth: 401 vs 403 across the console surface ──────────────────────
+
+    /// Every console READ route is `admin:read`. A missing credential must be
+    /// 401 and a wrong-scope credential 403 — collapsing them hides which of the
+    /// two rails broke.
+    #[tokio::test]
+    async fn console_read_routes_401_without_credential_and_403_with_wrong_scope() {
+        let state = st_dev();
+        let none = HeaderMap::new();
+        let wrong = scoped("facts:read");
+
+        for (label, status_none, status_wrong) in [
+            (
+                "summary",
+                get_console_summary(State(state.clone()), none.clone())
+                    .await
+                    .into_response()
+                    .status(),
+                get_console_summary(State(state.clone()), wrong.clone())
+                    .await
+                    .into_response()
+                    .status(),
+            ),
+            (
+                "settings",
+                get_console_settings(State(state.clone()), none.clone())
+                    .await
+                    .into_response()
+                    .status(),
+                get_console_settings(State(state.clone()), wrong.clone())
+                    .await
+                    .into_response()
+                    .status(),
+            ),
+            (
+                "passports",
+                get_console_passports(State(state.clone()), none.clone())
+                    .await
+                    .into_response()
+                    .status(),
+                get_console_passports(State(state.clone()), wrong.clone())
+                    .await
+                    .into_response()
+                    .status(),
+            ),
+            (
+                "connections",
+                get_console_connections(State(state.clone()), none.clone())
+                    .await
+                    .into_response()
+                    .status(),
+                get_console_connections(State(state.clone()), wrong.clone())
+                    .await
+                    .into_response()
+                    .status(),
+            ),
+            (
+                "storage_breakdown",
+                get_console_storage_breakdown(State(state.clone()), none.clone())
+                    .await
+                    .into_response()
+                    .status(),
+                get_console_storage_breakdown(State(state.clone()), wrong.clone())
+                    .await
+                    .into_response()
+                    .status(),
+            ),
+            (
+                "integrations",
+                get_console_integrations(State(state.clone()), none.clone())
+                    .await
+                    .into_response()
+                    .status(),
+                get_console_integrations(State(state.clone()), wrong.clone())
+                    .await
+                    .into_response()
+                    .status(),
+            ),
+        ] {
+            assert_eq!(status_none, StatusCode::UNAUTHORIZED, "{label} without a credential");
+            assert_eq!(status_wrong, StatusCode::FORBIDDEN, "{label} with the wrong scope");
+        }
+    }
+
+    #[tokio::test]
+    async fn console_query_read_routes_also_enforce_admin_read() {
+        let state = st_dev();
+        let facts_query = || {
+            Query(ConsoleFactsQuery {
+                q: None,
+                top_k: None,
+                as_of_unix_ms: None,
+            })
+        };
+        assert_eq!(
+            get_console_facts(State(state.clone()), facts_query(), HeaderMap::new())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_console_facts(State(state.clone()), facts_query(), scoped("facts:read"))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get_console_facts(State(state.clone()), facts_query(), scoped("admin:read"))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::OK
+        );
+
+        let tenants_query = || Query(ConsoleTenantsQuery { category: None });
+        assert_eq!(
+            get_console_tenants(State(state.clone()), tenants_query(), HeaderMap::new())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_console_tenants(State(state.clone()), tenants_query(), scoped("admin:read"))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_console_review_queue(
+                State(state.clone()),
+                HeaderMap::new(),
+                Query(ConsoleReviewQuery { limit: None })
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_console_tenant_category(State(state), Path("acme".to_string()), scoped("facts:read"))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// Console WRITE routes are `admin:write`; an `admin:read` credential is a
+    /// 403, not a pass.
+    #[tokio::test]
+    async fn console_write_routes_reject_a_read_only_credential() {
+        let state = st_dev();
+        let read_only = scoped("admin:read");
+
+        assert_eq!(
+            put_console_settings(
+                State(state.clone()),
+                read_only.clone(),
+                Json(UpdateSettingsBody {
+                    auth_mode: None,
+                    embedding_enabled: None,
+                    embedding_url: None,
+                    embedding_model: None,
+                })
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_console_onboarding_restart(State(state.clone()), read_only.clone())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_console_onboarding_restart(State(state.clone()), HeaderMap::new())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_console_review_expiries(
+                State(state.clone()),
+                read_only.clone(),
+                Json(ConsoleExpiryApplyRequest {
+                    fact_ids: vec!["f1".to_string()]
+                })
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_console_review_consolidation_undo(
+                State(state.clone()),
+                read_only.clone(),
+                Json(ConsolidationUndoRequest {
+                    canonical_fact_id: "f1".to_string(),
+                    source_fact_ids: Vec::new(),
+                    entity: None,
+                    key: None,
+                })
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            patch_console_tenant_category(
+                State(state.clone()),
+                Path("acme".to_string()),
+                read_only.clone(),
+                Json(crate::tenant_metadata::PatchTenantCategoryBody {
+                    category: "personal".to_string()
+                })
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_console_embedding_probe(
+                State(state.clone()),
+                read_only.clone(),
+                Json(ProbeEmbeddingBody {
+                    url: "http://example.com".to_string()
+                })
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // Integration mutations ride their OWN scopes — `admin:write` alone is
+        // not enough, which is the point of splitting them out.
+        assert_eq!(
+            post_console_integration_install(
+                State(state.clone()),
+                Path("mcp.claude-desktop".to_string()),
+                scoped("admin:write"),
+                Json(InstallIntegrationBody {
+                    manifest: None,
+                    pack_id: None,
+                    version: None,
+                })
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_console_integration_grant(
+                State(state.clone()),
+                Path("mcp.claude-desktop".to_string()),
+                scoped("admin:write"),
+                Json(GrantIntegrationBody {
+                    version: "0.1.0".to_string(),
+                    capabilities: vec!["memory.read".to_string()],
+                    reason: None,
+                })
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_console_integration_disable(
+                State(state),
+                Path("mcp.claude-desktop".to_string()),
+                HeaderMap::new(),
+                Json(DisableIntegrationBody { reason: None })
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    // ── Onboarding ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn onboarding_get_reports_running_mode_and_supported_modes() {
+        let state = st();
+        let body = body_json(get_console_onboarding(State(state)).await.into_response()).await;
+        assert!(body["completed_at_unix_ms"].is_null());
+        assert_eq!(body["running_auth_mode"], "off");
+        assert_eq!(body["bind_is_loopback"], true);
+        assert_eq!(body["supported_auth_modes"].as_array().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn onboarding_complete_rejects_unknown_mode() {
+        let state = st();
+        let resp = post_console_onboarding_complete(
+            State(state),
+            HeaderMap::new(),
+            Json(CompleteOnboardingBody {
+                auth_mode: "  MAGIC ".to_string(),
+                hide_onboarding: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// `auth_mode=off` on a bind that is reachable off-host is the one
+    /// combination that leaves the daemon open; it must be refused unless the
+    /// operator armed the insecure-dev escape hatch.
+    #[tokio::test]
+    async fn onboarding_complete_refuses_auth_off_on_a_public_bind() {
+        let mut state = st();
+        state.http_bind_loopback = false;
+        let resp = post_console_onboarding_complete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(CompleteOnboardingBody {
+                auth_mode: "off".to_string(),
+                hide_onboarding: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // With the escape hatch armed it is allowed again.
+        state.allow_insecure_dev_auth_bind = true;
+        let resp = post_console_onboarding_complete(
+            State(state),
+            HeaderMap::new(),
+            Json(CompleteOnboardingBody {
+                auth_mode: "off".to_string(),
+                hide_onboarding: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "non-loopback still needs auth");
+    }
+
+    #[tokio::test]
+    async fn onboarding_complete_persists_choice_and_reports_restart() {
+        let state = st();
+        let resp = post_console_onboarding_complete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(CompleteOnboardingBody {
+                auth_mode: "dev_scopes".to_string(),
+                hide_onboarding: true,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["chosen_auth_mode"], "dev_scopes");
+        assert_eq!(body["running_auth_mode"], "off");
+        assert_eq!(body["restart_required"], true);
+        assert!(body["completed_at_unix_ms"].as_u64().unwrap() > 0);
+        // Persisted, not just echoed.
+        assert_eq!(
+            crate::onboarding::read_state(&state.data_dir)
+                .unwrap()
+                .chosen_auth_mode
+                .as_deref(),
+            Some("dev_scopes")
+        );
+
+        // Restart clears the completion stamp but keeps the chosen mode.
+        let resp = post_console_onboarding_restart(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert!(body["completed_at_unix_ms"].is_null());
+        assert_eq!(body["chosen_auth_mode"], "dev_scopes");
+    }
+
+    /// After first run, completing onboarding again is an authenticated
+    /// `admin:write` operation — the anonymous first-run allowance is one-shot.
+    #[tokio::test]
+    async fn onboarding_complete_after_first_run_requires_write_scope() {
+        let state = st_dev();
+        state.onboarding.write().await.completed_at_unix_ms = Some(1);
+        let resp = post_console_onboarding_complete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(CompleteOnboardingBody {
+                auth_mode: "dev_scopes".to_string(),
+                hide_onboarding: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = post_console_onboarding_complete(
+            State(state),
+            scoped("admin:write"),
+            Json(CompleteOnboardingBody {
+                auth_mode: "dev_scopes".to_string(),
+                hide_onboarding: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── Settings ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn put_settings_validates_mode_and_tracks_restart_required() {
+        let state = st();
+        let put = |state: AppState, body: UpdateSettingsBody| async move {
+            put_console_settings(State(state), HeaderMap::new(), Json(body))
+                .await
+                .into_response()
+        };
+
+        // Unknown mode → 400.
+        let resp = put(
+            state.clone(),
+            UpdateSettingsBody {
+                auth_mode: Some("magic".to_string()),
+                embedding_enabled: None,
+                embedding_url: None,
+                embedding_model: None,
+            },
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Same mode as the running one + new embedding intent → restart needed
+        // for the embedding change only.
+        let resp = put(
+            state.clone(),
+            UpdateSettingsBody {
+                auth_mode: Some("off".to_string()),
+                embedding_enabled: Some(true),
+                embedding_url: Some("  http://ollama:11434  ".to_string()),
+                embedding_model: Some("bge-m3".to_string()),
+            },
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["restart_required"], true);
+        assert_eq!(body["saved"]["chosen_embedding_url"], "http://ollama:11434");
+        assert_eq!(body["saved"]["chosen_auth_mode"], "off");
+
+        // Replaying the identical settings is a no-op — no phantom restart.
+        let resp = put(
+            state.clone(),
+            UpdateSettingsBody {
+                auth_mode: Some("off".to_string()),
+                embedding_enabled: Some(true),
+                embedding_url: Some("http://ollama:11434".to_string()),
+                embedding_model: Some("bge-m3".to_string()),
+            },
+        )
+        .await;
+        assert_eq!(body_json(resp).await["restart_required"], false);
+
+        // A blank URL clears the override rather than storing an empty string.
+        let resp = put(
+            state.clone(),
+            UpdateSettingsBody {
+                auth_mode: None,
+                embedding_enabled: None,
+                embedding_url: Some("   ".to_string()),
+                embedding_model: None,
+            },
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert!(body["saved"]["chosen_embedding_url"].is_null());
+        assert_eq!(body["restart_required"], true);
+
+        let settings = body_json(
+            get_console_settings(State(state), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(settings["auth"]["chosen_mode"], "off");
+        assert_eq!(settings["embedding"]["enabled_intent"], true);
+        assert_eq!(settings["embedding"]["chosen_model"], "bge-m3");
+    }
+
+    #[tokio::test]
+    async fn put_settings_refuses_auth_off_on_a_public_bind() {
+        let mut state = st();
+        state.http_bind_loopback = false;
+        let resp = put_console_settings(
+            State(state),
+            HeaderMap::new(),
+            Json(UpdateSettingsBody {
+                auth_mode: Some("off".to_string()),
+                embedding_enabled: None,
+                embedding_url: None,
+                embedding_model: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// SSRF guard: the probe route validates the target BEFORE any network work,
+    /// so private / link-local / malformed targets never reach the transport.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn embedding_probe_rejects_private_and_malformed_targets() {
+        std::env::remove_var("CORECRUXD_EMBEDDING_URL");
+        std::env::remove_var("CORECRUXD_EMBEDDING_PROBE_ALLOW_LOCAL");
+        let state = st();
+        for url in [
+            "not a url",
+            "ftp://example.com",
+            "http://169.254.169.254/latest",
+            "http://10.1.2.3:11434",
+            "http://127.0.0.1:11434",
+        ] {
+            let resp = post_console_embedding_probe(
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(ProbeEmbeddingBody { url: url.to_string() }),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{url} must be refused");
+        }
+    }
+
+    // ── Facts ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn console_facts_hide_private_rows_and_honour_the_as_of_cutoff() {
+        let state = st();
+        {
+            let mut store = state.fact_store.write().await;
+            seed(&mut store, "person:alice", "city", "NYC", false);
+            seed(&mut store, "person:bob", "ssn", "secret-value", true);
+        }
+        let fetch = |state: AppState, as_of: Option<i64>| async move {
+            body_json(
+                get_console_facts(
+                    State(state),
+                    Query(ConsoleFactsQuery {
+                        q: None,
+                        top_k: Some(10),
+                        as_of_unix_ms: as_of,
+                    }),
+                    HeaderMap::new(),
+                )
+                .await
+                .into_response(),
+            )
+            .await
+        };
+
+        let body = fetch(state.clone(), None).await;
+        assert_eq!(body["count"], 2, "count is the whole store");
+        assert_eq!(body["visible_count"], 1, "the private row is withheld");
+        assert_eq!(body["private_facts_hidden"], true);
+        assert!(
+            !serde_json::to_string(&body["facts"]).unwrap().contains("secret-value"),
+            "private fact text must not transit the console facts route"
+        );
+
+        // A cutoff before every write hides everything.
+        assert_eq!(fetch(state.clone(), Some(1)).await["visible_count"], 0);
+        // D-26 (inverted pin): `as_of_unix_ms = 0` used to be treated as "no
+        // cutoff" rather than "the epoch", so a client computing 0 silently got
+        // ALL current facts while the response echoed the parameter back. Zero
+        // is a valid epoch cutoff: nothing had been stored yet. Fixed in M7 of
+        // `crux-pinned-defect-remediation-2026-07-31`.
+        assert_eq!(fetch(state, Some(0)).await["visible_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn console_fact_add_validates_input_and_applies_the_privacy_policy() {
+        let state = st();
+        let add = |state: AppState, entity: &str, key: &str, value: &str, confidence: f32| {
+            let (entity, key, value) = (entity.to_string(), key.to_string(), value.to_string());
+            async move {
+                post_console_fact_add(
+                    State(state),
+                    HeaderMap::new(),
+                    Json(ConsoleAddFactBody {
+                        entity,
+                        key,
+                        value,
+                        confidence,
+                    }),
+                )
+                .await
+                .into_response()
+            }
+        };
+
+        for (entity, key, value) in [("", "k", "v"), ("e", "  ", "v"), ("e", "k", "")] {
+            assert_eq!(
+                add(state.clone(), entity, key, value, 1.0).await.status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        for confidence in [-0.1_f32, 1.1_f32] {
+            assert_eq!(
+                add(state.clone(), "e", "k", "v", confidence).await.status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        let resp = add(state.clone(), " person:alice ", " city ", " NYC ", 0.8).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let stored = body_json(resp).await;
+        assert_eq!(stored["entity"], "person:alice", "fields are trimmed before store");
+        assert_eq!(stored["value"], "NYC");
+        assert_eq!(stored["private"], false);
+
+        // A prefix on the always-private list is promoted regardless of what the
+        // caller asked for — the console cannot publish a private-class entity.
+        let resp = add(state, "github::CueCrux/Crux", "commit", "abc123", 1.0).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(
+            body_json(resp).await["private"],
+            true,
+            "github:: is force-promoted to private"
+        );
+    }
+
+    // ── Tenants + category ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn console_tenants_validates_the_category_filter() {
+        let state = st();
+        {
+            let mut store = state.fact_store.write().await;
+            seed(&mut store, "personal::notes", "k", "v", false);
+        }
+        let list = |state: AppState, category: Option<&str>| {
+            let category = category.map(str::to_string);
+            async move {
+                get_console_tenants(State(state), Query(ConsoleTenantsQuery { category }), HeaderMap::new())
+                    .await
+                    .into_response()
+            }
+        };
+
+        let resp = list(state.clone(), Some("nonsense")).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = body_json(list(state.clone(), None).await).await;
+        assert!(body["category_filter"].is_null());
+        let ids: Vec<&str> = body["tenants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["tenant_id"].as_str())
+            .collect();
+        assert!(ids.contains(&"local"), "the implicit local tenant is always listed");
+        assert!(ids.contains(&"personal"));
+
+        // "all" and "" are aliases for "no filter".
+        for alias in ["all", ""] {
+            let body = body_json(list(state.clone(), Some(alias)).await).await;
+            assert!(body["category_filter"].is_null());
+        }
+
+        let body = body_json(list(state, Some("personal")).await).await;
+        assert_eq!(body["category_filter"], "personal");
+        assert!(body["tenants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["category"] == "personal"));
+    }
+
+    #[tokio::test]
+    async fn tenant_category_patch_rejects_system_and_persists_the_override() {
+        let state = st();
+        let patch = |state: AppState, tenant: &str, category: &str| {
+            let (tenant, category) = (tenant.to_string(), category.to_string());
+            async move {
+                patch_console_tenant_category(
+                    State(state),
+                    Path(tenant),
+                    HeaderMap::new(),
+                    Json(crate::tenant_metadata::PatchTenantCategoryBody { category }),
+                )
+                .await
+                .into_response()
+            }
+        };
+
+        // `system` is runtime-derived and must not be settable through the API.
+        assert_eq!(
+            patch(state.clone(), "acme", "system").await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            patch(state.clone(), "acme", "nonsense").await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            patch(state.clone(), "", "personal").await.status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let resp = patch(state.clone(), "acme", "PERSONAL").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["override"], "personal");
+        assert_eq!(body["effective"], "personal");
+
+        // The GET reflects what is actually stored.
+        let resp = get_console_tenant_category(State(state.clone()), Path("acme".to_string()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(body_json(resp).await["effective"], "personal");
+
+        let resp = get_console_tenant_category(State(state), Path(String::new()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── Connections: credential disclosure ───────────────────────────────
+
+    /// `GET /v1/console/connections` is the one console route that can hand back
+    /// a live credential. Default posture must publish a fingerprint only; the
+    /// raw token appears only when the reveal env flag is deliberately armed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn console_connections_never_reveals_the_token_unless_armed() {
+        let restore: Vec<(&str, Option<String>)> =
+            ["CRUX_AGENT_TOKEN", "CRUX_AGENT_TOKENS", CONSOLE_REVEAL_AGENT_TOKEN_ENV]
+                .into_iter()
+                .map(|key| (key, std::env::var(key).ok()))
+                .collect();
+        for (key, _) in &restore {
+            std::env::remove_var(key);
+        }
+        let state = st();
+        let fetch = |state: AppState| async move {
+            body_json(
+                get_console_connections(State(state), HeaderMap::new())
+                    .await
+                    .into_response(),
+            )
+            .await
+        };
+
+        // No token configured → honest "configured: false", no fingerprint.
+        let body = fetch(state.clone()).await;
+        assert_eq!(body["agent_token"]["configured"], false);
+        assert!(body["agent_token"]["fingerprint"].is_null());
+        assert_eq!(body["mcp"]["path"], "/mcp");
+
+        // Single token, reveal OFF → fingerprint + length, never the token.
+        std::env::set_var("CRUX_AGENT_TOKEN", "super-secret-agent-token");
+        let body = fetch(state.clone()).await;
+        let token = &body["agent_token"];
+        assert_eq!(token["configured"], true);
+        assert_eq!(token["source_env"], "CRUX_AGENT_TOKEN");
+        assert_eq!(token["reveal_enabled"], false);
+        assert_eq!(token["length"], "super-secret-agent-token".len());
+        assert_eq!(token["fingerprint"], token_fingerprint("super-secret-agent-token"));
+        assert!(token["token"].is_null());
+        assert!(!serde_json::to_string(&body)
+            .unwrap()
+            .contains("super-secret-agent-token"));
+
+        // Reveal armed → the token is returned deliberately.
+        std::env::set_var(CONSOLE_REVEAL_AGENT_TOKEN_ENV, "1");
+        let body = fetch(state.clone()).await;
+        assert_eq!(body["agent_token"]["reveal_enabled"], true);
+        assert_eq!(body["agent_token"]["token"], "super-secret-agent-token");
+
+        // Multi-agent map wins and NEVER reveals, even with the flag armed.
+        std::env::set_var("CRUX_AGENT_TOKENS", "claude:tok-a,codex:tok-b");
+        let body = fetch(state).await;
+        let token = &body["agent_token"];
+        assert_eq!(token["source_env"], "CRUX_AGENT_TOKENS");
+        assert_eq!(token["agent_names"], "claude, codex");
+        assert!(token["token"].is_null(), "per-agent tokens are never revealed");
+        assert!(!serde_json::to_string(&body).unwrap().contains("tok-a"));
+
+        for (key, value) in restore {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    // ── Chunks ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn chunk_routes_404_when_the_metadata_index_is_empty() {
+        let state = st();
+        let resp = get_console_chunk(State(state.clone()), Path("deadbeef".to_string()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // D-27 (inverted pin): the preview route used to resolve the chunk
+        // BEFORE the scope check, so an unauthenticated caller could tell an
+        // unknown digest (404) from a known one — an existence oracle over
+        // every chunk digest. The scope is now required tenant-agnostically
+        // first. Fixed in M7 of
+        // `crux-pinned-defect-remediation-2026-07-31`.
+        let mut unauthenticated = st_dev();
+        unauthenticated.data_dir = state.data_dir.clone();
+        let resp = get_console_chunk_preview(State(unauthenticated), Path("deadbeef".to_string()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "presence must not be distinguishable without a credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_chunks_page_is_empty_and_reports_its_visibility_posture() {
+        let state = st();
+        let resp = get_console_tenant_chunks(
+            State(state),
+            Path("acme".to_string()),
+            Query(ConsoleChunksQuery {
+                limit: Some(5000),
+                cursor: None,
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["tenant_id"], "acme");
+        assert_eq!(body["page"]["limit"], 200, "limit clamps to the 200 ceiling");
+        assert_eq!(body["visibility"], "metadata_only");
+        assert!(body["chunks"].as_array().unwrap().is_empty());
+    }
+
+    // ── Review queue / expiries / consolidation undo ─────────────────────
+
+    #[tokio::test]
+    async fn review_queue_distinguishes_scheduler_off_from_genuinely_empty() {
+        let state = st();
+        {
+            let mut store = state.fact_store.write().await;
+            // Two live, opposite-polarity rows on the same (entity, key) — the
+            // shape `contradiction_candidates_v1` reports.
+            let first = seed_conf(&mut store, "service:api", "enabled", "enabled", false, 0.7);
+            seed_conf(&mut store, "service:api", "enabled", "disabled", false, 0.7);
+            assert!(store.clear_superseded(&first), "simulate an unresolved conflict");
+        }
+        let resp = get_console_review_queue(
+            State(state),
+            HeaderMap::new(),
+            Query(ConsoleReviewQuery { limit: Some(1000) }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["schema"], "crux.console.review.queue.v1");
+        assert_eq!(body["limit"], 250, "limit clamps to the 250 ceiling");
+        assert_eq!(
+            body["scheduler_enabled"], false,
+            "the page can say 'scheduler off' instead of implying a clean queue"
+        );
+        assert_eq!(body["count"], 0, "nothing surfaced by the scheduler");
+        // The live pass still runs, so contradictions are not hidden by the
+        // scheduler being off.
+        assert!(body["live_count"].as_u64().unwrap() >= 1);
+    }
+
+    /// The apply route recomputes the live candidate set under the write lock
+    /// and refuses anything that is not currently a candidate. A regression here
+    /// would turn an operator's stale selection into a mass delete.
+    #[tokio::test]
+    async fn review_expiries_refuse_ids_that_are_not_live_candidates() {
+        let state = st();
+        let fact_id = {
+            let mut store = state.fact_store.write().await;
+            seed(&mut store, "person:alice", "city", "NYC", false);
+            let id = store.all_facts().next().map(|f| f.fact_id.clone()).unwrap();
+            id
+        };
+
+        // Empty list → 400 (never "expire everything").
+        let resp = post_console_review_expiries(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(ConsoleExpiryApplyRequest { fact_ids: Vec::new() }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Over the per-request cap → 400.
+        let resp = post_console_review_expiries(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(ConsoleExpiryApplyRequest {
+                fact_ids: (0..=MAX_EXPIRY_BATCH).map(|n| format!("f{n}")).collect(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // A fresh, high-confidence fact is NOT a candidate — requesting it (twice,
+        // to exercise de-dup) is skipped, not deleted.
+        let resp = post_console_review_expiries(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(ConsoleExpiryApplyRequest {
+                fact_ids: vec![fact_id.clone(), fact_id.clone(), "does-not-exist".to_string()],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["expired_count"], 0);
+        assert_eq!(body["skipped_count"], 2, "the repeated id is counted once");
+        assert_eq!(body["skipped"][0]["reason"], "not_a_current_expiry_candidate");
+        assert_eq!(body["actor"], "console");
+        assert_eq!(state.fact_store.read().await.count(), 1, "nothing was deleted");
+    }
+
+    #[tokio::test]
+    async fn consolidation_undo_maps_an_unknown_canonical_to_404() {
+        let state = st();
+        let resp = post_console_review_consolidation_undo(
+            State(state),
+            HeaderMap::new(),
+            Json(ConsolidationUndoRequest {
+                canonical_fact_id: "no-such-fact".to_string(),
+                source_fact_ids: Vec::new(),
+                entity: None,
+                key: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn consolidation_merges_and_then_undoes_with_signed_receipts() {
+        let state = st();
+        // Confidence stays under the 0.99 protection floor; a 1.0 fact is
+        // deliberately un-consolidatable.
+        let (first, second) = {
+            let mut store = state.fact_store.write().await;
+            let first = seed_conf(&mut store, "person:alice", "city", "NYC", false, 0.6);
+            let second = seed_conf(&mut store, "person:alice", "city", "New York", false, 0.6);
+            (first, second)
+        };
+        let request: corecrux_memory::fact_store::ConsolidationRequestV1 = serde_json::from_value(json!({
+            "consolidation_id": "",
+            "entity": "person:alice",
+            "key": "city",
+            "canonical_value": "New York City",
+            "target_fact_ids": [first, second],
+        }))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-passport-id", "claude-work".parse().unwrap());
+        let resp = post_console_review_consolidation(State(state.clone()), headers, Json(request))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["schema"], "crux.console.review.consolidation.v1");
+        let canonical = body["receipt"]["canonical_fact_id"].as_str().unwrap().to_string();
+
+        let resp = post_console_review_consolidation_undo(
+            State(state),
+            HeaderMap::new(),
+            Json(ConsolidationUndoRequest {
+                canonical_fact_id: canonical.clone(),
+                source_fact_ids: Vec::new(),
+                entity: Some("person:alice".to_string()),
+                key: Some("city".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["schema"], "crux.console.review.consolidation_undo.v1");
+        assert_eq!(body["canonical_fact_id"], canonical);
+    }
+
+    // ── Aggregate read surfaces ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn storage_breakdown_reports_four_kinds_and_no_phantom_availability() {
+        let state = st();
+        let body = body_json(
+            get_console_storage_breakdown(State(state), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        let kinds: Vec<&str> = body["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|k| k["kind"].as_str())
+            .collect();
+        assert_eq!(kinds, vec!["text_search", "projections", "embedding", "graph"]);
+        // An empty daemon must report every kind as unavailable rather than
+        // reporting "available" with a zero count.
+        assert!(body["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|k| k["available"] == false && k["chunks"] == 0));
+    }
+
+    #[tokio::test]
+    async fn summary_reports_daemon_console_and_store_posture() {
+        let state = st();
+        {
+            let mut store = state.fact_store.write().await;
+            seed(&mut store, "person:alice", "city", "NYC", false);
+        }
+        state.session_store.write().await.put("s1", json!({ "k": 1 }), None);
+        let body = body_json(
+            get_console_summary(State(state), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(body["console"]["enabled"], true);
+        assert_eq!(
+            body["console"]["external_network_dependencies"], 0,
+            "the console promises a zero-egress posture"
+        );
+        assert_eq!(body["daemon"]["auth_mode"], "off");
+        assert_eq!(body["daemon"]["node_id"], "node-a");
+        assert_eq!(body["stores"]["facts"], 1);
+        assert_eq!(body["stores"]["sessions"], 1);
+        assert_eq!(body["routing"]["shard_count"].as_u64().unwrap() > 0, true);
+        assert_eq!(body["integrations"]["enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn passports_route_publishes_no_key_material() {
+        let state = st();
+        let body = body_json(
+            get_console_passports(State(state), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(body["passport"]["fingerprint"], "p_test");
+        assert_eq!(body["passport"]["private_key_exported"], false);
+        assert_eq!(body["agents"]["raw_tokens_exposed"], false);
+        assert_eq!(body["session_defaults"]["mcp_path"], "/mcp");
+    }
+
+    #[tokio::test]
+    async fn integrations_listing_reports_the_disabled_posture_honestly() {
+        let mut state = st();
+        state.integrations_enabled = false;
+        let body = body_json(
+            get_console_integrations(State(state.clone()), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(body["enabled"], false);
+        assert!(body["packs"].as_array().unwrap().is_empty());
+        assert!(!body["allowed_capabilities"].as_array().unwrap().is_empty());
+
+        // Mutations are refused with 403 while the subsystem is off.
+        let install = post_console_integration_install(
+            State(state.clone()),
+            Path("mcp.claude-desktop".to_string()),
+            HeaderMap::new(),
+            Json(InstallIntegrationBody {
+                manifest: None,
+                pack_id: None,
+                version: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(install.status(), StatusCode::FORBIDDEN);
+
+        // Safe mode blocks installs and grants even when integrations are on.
+        state.integrations_enabled = true;
+        state.integrations_safe_mode = true;
+        let install = post_console_integration_install(
+            State(state.clone()),
+            Path("mcp.claude-desktop".to_string()),
+            HeaderMap::new(),
+            Json(InstallIntegrationBody {
+                manifest: None,
+                pack_id: None,
+                version: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(install.status(), StatusCode::FORBIDDEN);
+        let grant = post_console_integration_grant(
+            State(state.clone()),
+            Path("mcp.claude-desktop".to_string()),
+            HeaderMap::new(),
+            Json(GrantIntegrationBody {
+                version: "0.1.0".to_string(),
+                capabilities: vec!["memory.read".to_string()],
+                reason: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(grant.status(), StatusCode::FORBIDDEN);
+
+        // An empty capability list is a 400 — a grant of nothing is a bug, not a
+        // silent success.
+        state.integrations_safe_mode = false;
+        let grant = post_console_integration_grant(
+            State(state.clone()),
+            Path("mcp.claude-desktop".to_string()),
+            HeaderMap::new(),
+            Json(GrantIntegrationBody {
+                version: "0.1.0".to_string(),
+                capabilities: Vec::new(),
+                reason: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(grant.status(), StatusCode::BAD_REQUEST);
+
+        // Disabling a pack that was never installed is a 404, not a no-op 200.
+        let disable = post_console_integration_disable(
+            State(state),
+            Path("never.installed".to_string()),
+            HeaderMap::new(),
+            Json(DisableIntegrationBody {
+                reason: Some("cleanup".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(disable.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn integrations_listing_enumerates_builtin_packs_when_enabled() {
+        let state = st();
+        let body = body_json(
+            get_console_integrations(State(state), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["safe_mode"], false);
+        assert!(!body["packs"].as_array().unwrap().is_empty());
+        assert!(body["grants"].is_array());
+        assert!(body["audit_tail"].is_array());
+    }
+
+    // ── Sessions listing ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sessions_list_separates_archived_rows_and_marks_live_state() {
+        let state = st();
+        {
+            let mut store = state.session_store.write().await;
+            store.put("live-one", json!({ "note": "working" }), None);
+            store.put("gone", json!({ "note": "done" }), None);
+            store.set_archived("gone", true, Some("superseded".to_string()));
+        }
+        let list = |state: AppState, include_archived: bool| async move {
+            body_json(
+                get_console_sessions(
+                    State(state),
+                    HeaderMap::new(),
+                    Query(ConsoleSessionsQuery { include_archived }),
+                )
+                .await
+                .into_response(),
+            )
+            .await
+        };
+
+        let body = list(state.clone(), false).await;
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["total_count"], 2);
+        assert_eq!(body["archived_count"], 1);
+        assert_eq!(body["raw_state_exposed"], false);
+        let row = &body["session_rows"][0];
+        assert_eq!(row["session_id"], "live-one");
+        assert_eq!(row["state"], "active", "a just-written session is live, not idle");
+        assert!(row["agent"].is_null(), "an unscoped key carries no agent");
+
+        let body = list(state, true).await;
+        assert_eq!(body["count"], 2);
+        let archived = body["session_rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["session_id"] == "gone")
+            .unwrap();
+        assert_eq!(archived["state"], "archived");
+        assert_eq!(archived["archive_reason"], "superseded");
+        assert!(archived["archived_at"].is_string());
+    }
+
+    // ── Chunk index: metadata + redacted preview ─────────────────────────
+
+    /// Seed one indexed chunk whose payload contains a secret-looking field, so
+    /// the preview route's redaction can be asserted rather than assumed.
+    fn index_one_chunk(state: &AppState, tenant_id: &str) -> String {
+        let events = vec![corecrux_proto::dataplane_v1::AppendEvent {
+            event_id: "evt-1".to_string(),
+            occurred_at: "2026-05-01T12:00:00Z".to_string(),
+            event_type: "test.event".to_string(),
+            content_type: "application/json".to_string(),
+            payload: br#"{"token":"top-secret-value","value":1}"#.to_vec(),
+        }];
+        crate::console_index::record_appended_events(&state.data_dir, tenant_id, "artifact", "s1", 10, &events, 1_000)
+            .expect("record chunk");
+        crate::console_index::list_chunks(&state.data_dir, tenant_id, 10, None)
+            .expect("list chunks")
+            .chunks
+            .first()
+            .expect("one chunk")
+            .chunk_digest
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn indexed_chunks_surface_as_metadata_and_a_redacted_preview() {
+        let state = st();
+        let digest = index_one_chunk(&state, "tenant-a");
+
+        // The tenant listing picks the tenant up from the chunk index.
+        let body = body_json(
+            get_console_tenants(
+                State(state.clone()),
+                Query(ConsoleTenantsQuery { category: None }),
+                HeaderMap::new(),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert!(body["tenants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["tenant_id"] == "tenant-a"));
+
+        // Page of one, no further cursor.
+        let body = body_json(
+            get_console_tenant_chunks(
+                State(state.clone()),
+                Path("tenant-a".to_string()),
+                Query(ConsoleChunksQuery {
+                    limit: Some(10),
+                    cursor: None,
+                }),
+                HeaderMap::new(),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(body["chunks"].as_array().unwrap().len(), 1);
+        assert!(body["page"]["next_cursor"].is_null());
+
+        // A malformed cursor is a 400, not a silent page-one.
+        let resp = get_console_tenant_chunks(
+            State(state.clone()),
+            Path("tenant-a".to_string()),
+            Query(ConsoleChunksQuery {
+                limit: Some(10),
+                cursor: Some("not-a-number".to_string()),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Metadata route: present, metadata-only, no payload bytes.
+        let resp = get_console_chunk(State(state.clone()), Path(digest.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["present"], true);
+        assert_eq!(body["visibility"], "metadata_only");
+        assert!(!serde_json::to_string(&body).unwrap().contains("top-secret-value"));
+
+        // Preview route: redacted, and the raw payload never appears.
+        let resp = get_console_chunk_preview(State(state.clone()), Path(digest.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["redacted"], true);
+        assert_eq!(body["tenant_id"], "tenant-a");
+        assert!(
+            !serde_json::to_string(&body).unwrap().contains("top-secret-value"),
+            "the console preview must never carry raw secret-like payload bytes"
+        );
+
+        // The preview scope is its own rail: `admin:read` does not buy it.
+        let mut dev = st_dev();
+        dev.data_dir = state.data_dir.clone();
+        let resp = get_console_chunk_preview(State(dev), Path(digest), scoped("admin:read"))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ── Live contradiction pass ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn review_contradictions_reports_live_opposite_polarity_rows() {
+        let state = st();
+        {
+            let mut store = state.fact_store.write().await;
+            let first = seed_conf(&mut store, "service:api", "enabled", "enabled", false, 0.7);
+            seed_conf(&mut store, "service:api", "enabled", "disabled", false, 0.7);
+            assert!(store.clear_superseded(&first));
+        }
+        let resp = get_console_review_contradictions(
+            State(state),
+            HeaderMap::new(),
+            Query(ConsoleReviewQuery { limit: Some(1000) }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["schema"], "crux.console.review.contradictions.v1");
+        assert_eq!(body["limit"], 250, "limit clamps to the 250 ceiling");
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["candidates"][0]["reason"], "opposite_polarity_same_entity_key");
+    }
+
+    // ── CoreCrux proxy plumbing (no network) ─────────────────────────────
+
+    #[test]
+    fn encode_query_component_percent_encodes_everything_unreserved() {
+        assert_eq!(encode_query_component("a-b_c.d~e"), "a-b_c.d~e");
+        assert_eq!(encode_query_component("work::team one"), "work%3A%3Ateam%20one");
+        assert_eq!(encode_query_component("&=?#"), "%26%3D%3F%23");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn corecrux_credentials_come_from_env_with_a_documented_precedence() {
+        for key in [
+            "CORECRUXD_CORECRUX_ADMIN_TOKEN",
+            "CORECRUX_ADMIN_TOKEN",
+            "CORECRUXD_CORECRUX_PASSPORT_ID",
+            "CORECRUX_PASSPORT_ID",
+            "CORECRUXD_CORECRUX_GRAPH_TOKEN",
+            "CORECRUX_GRAPH_TOKEN",
+        ] {
+            std::env::remove_var(key);
+        }
+        assert_eq!(bearer_token_from_env(), None);
+        assert_eq!(passport_id_from_env(), None);
+        assert_eq!(corecrux_graph_token_from_env(), None);
+
+        // A whitespace-only value is NOT a credential.
+        std::env::set_var("CORECRUX_ADMIN_TOKEN", "   ");
+        assert_eq!(bearer_token_from_env(), None, "blank env must not read as configured");
+        std::env::set_var("CORECRUX_ADMIN_TOKEN", "  tok-fallback ");
+        assert_eq!(bearer_token_from_env().as_deref(), Some("tok-fallback"));
+        // The CORECRUXD_-prefixed var wins over the bare one.
+        std::env::set_var("CORECRUXD_CORECRUX_ADMIN_TOKEN", "tok-primary");
+        assert_eq!(bearer_token_from_env().as_deref(), Some("tok-primary"));
+
+        std::env::set_var("CORECRUX_PASSPORT_ID", "p_fallback");
+        assert_eq!(passport_id_from_env().as_deref(), Some("p_fallback"));
+        std::env::set_var("CORECRUXD_CORECRUX_PASSPORT_ID", "p_primary");
+        assert_eq!(passport_id_from_env().as_deref(), Some("p_primary"));
+
+        for key in [
+            "CORECRUXD_CORECRUX_ADMIN_TOKEN",
+            "CORECRUX_ADMIN_TOKEN",
+            "CORECRUXD_CORECRUX_PASSPORT_ID",
+            "CORECRUX_PASSPORT_ID",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn finish_graph_proxy_maps_both_error_arms_to_the_carried_status() {
+        assert_eq!(
+            finish_graph_proxy(Ok(Ok(serde_json::json!({ "ok": true })))).status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            finish_graph_proxy(Ok(Err(CoreCruxProxyError::new(StatusCode::BAD_GATEWAY, "upstream")))).status(),
+            StatusCode::BAD_GATEWAY
+        );
+        // A panicking/cancelled blocking task surfaces as 500, not as a 200 with
+        // an empty body.
+        assert_eq!(
+            finish_graph_proxy(Err(CoreCruxProxyError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "join failed"
+            )))
+            .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_join_error_reports_an_internal_error() {
+        let handle = tokio::task::spawn_blocking(|| panic!("boom"));
+        let err = graph_join_error(handle.await.expect_err("join error"));
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.detail.contains("CoreCrux graph proxy join failed"));
+    }
+
+    #[test]
+    fn parse_graph_u32_rejects_non_numeric_ids() {
+        assert_eq!(parse_graph_u32(" 42 ", "src").unwrap(), 42);
+        assert!(parse_graph_u32("-1", "src").unwrap_err().contains("src"));
+        assert!(parse_graph_u32("", "dst").is_err());
     }
 }

@@ -4848,6 +4848,18 @@
   // Badges never claim a cryptographic property the client did not verify.
   function shortHash(h) { return String(h || '').replace(/^blake3:/, '').slice(0, 12); }
 
+  var RCX_REGISTRY_RECEIPT_BASE = 'https://registry.rcxprotocol.org/v0/receipts/';
+
+  // Pure, fixed-origin URL construction for the RCX Registry receipt lookup.
+  // Only the opaque path component is derived from daemon data. A conservative
+  // receipt/hash alphabet avoids turning control characters or path syntax into
+  // a navigation target; encodeURIComponent provides the final path boundary.
+  function registryVerifyUrl(receiptId) {
+    var id = String(receiptId || '').trim();
+    if (!id || id.length > 256 || !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(id)) { return null; }
+    return RCX_REGISTRY_RECEIPT_BASE + encodeURIComponent(id);
+  }
+
   // A non-ok read (unreachable / HTTP error) → degraded. Reachable-but-empty is
   // NOT this — the caller renders that as an absent-state after confirming status.ok.
   function evidenceDegraded(status, what) {
@@ -4872,7 +4884,11 @@
       // Ed25519 signature in the browser, so nothing here asserts "signed"/"valid".
       return { observation_id: o.observation_id || null, provider: o.provider || null, kind: o.kind || null,
         ts: o.ts || null, seq: (o.seq == null ? null : o.seq),
-        alg: r.alg || null, body_hash: r.body_hash || null };
+        alg: r.alg || null, body_hash: r.body_hash || null,
+        // Current session observations expose a receipt body hash rather than a
+        // Registry-native id. The Registry lookup contract is keyed by hash; a
+        // future explicit receipt_id wins without changing this view model.
+        registry_ref: r.receipt_id || r.body_hash || null };
     });
     return { present: true, items: items, chain: chain, absent: null };
   }
@@ -4983,6 +4999,14 @@
       item.appendChild(el('span', { 'class': 'session-detail-k', text: (r.provider || 'obs') + (r.kind ? (' · ' + r.kind) : '') }));
       if (r.body_hash) { item.appendChild(el('span', { 'class': 'session-detail-hash', text: shortHash(r.body_hash) })); }
       item.appendChild(el('span', { 'class': 'session-detail-badge', title: 'a signed receipt envelope is attached (signature not verified in the browser)', text: 'receipt envelope' }));
+      var registryUrl = registryVerifyUrl(r.registry_ref);
+      if (registryUrl) {
+        item.appendChild(el('a', {
+          'class': 'session-detail-verify', href: registryUrl, target: '_blank', rel: 'noopener noreferrer',
+          'data-shell-tab': 'registry', title: 'Open the external RCX Registry receipt lookup',
+          text: 'registry lookup ↗'
+        }));
+      }
       if (r.ts) { item.appendChild(el('span', { 'class': 'session-detail-k', text: r.ts })); }
       return item;
     }, function (sec) {
@@ -15862,6 +15886,8 @@
     // M4c (console half) — pure stale-plan mismatch badge (daemon_hash, local_hash|null).
     planHashBadge: planHashBadge,
     // M4b — session-detail / evidence contract (pure builder + its live renderer).
+    // M9 — fixed-origin receipt lookup used by the isolated Registry shell tab.
+    registryVerifyUrl: registryVerifyUrl,
     buildSessionDetail: buildSessionDetail,
     paintSessionDetail: paintSessionDetail,
     renderSessionDetail: renderSessionDetail,

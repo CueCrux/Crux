@@ -1,0 +1,25 @@
+[package]
+name = "corecrux-providers"
+publish.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# GitHub commit/PR/issue sync writes its records straight into the fact store.
+corecrux-memory = { path = "../corecrux-memory" }
+# Provider credentials (GitHub PAT, OpenAI API key) are held as sealed
+# envelopes at rest; this crate never stores a plaintext secret on disk.
+corecrux-secrets = { path = "../corecrux-secrets" }
+chrono = { workspace = true, default-features = false, features = ["clock"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# An unreadable selected_repos.json degrades to "nothing selected" so the
+# console still renders, but the operator must be told rather than left to
+# discover it when the next write refuses. See github::list_selected_repos.
+tracing = { workspace = true }
+ureq = { workspace = true, features = ["json"] }
+
+[lints]
+workspace = true

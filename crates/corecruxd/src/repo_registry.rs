@@ -259,6 +259,30 @@ pub fn fail_incomplete_scans(
     Ok(updated)
 }
 
+/// Read back the latest persisted scan JSON for a registered repo — the
+/// mirror of [`store_scan_json`]. `None` when the repo was registered by
+/// `clone_url` only (scan deferred) or has never been scanned.
+/// Takes a [`TenantScope`](crate::auth::TenantScope) rather than a tenant
+/// string: the caller must have *obtained* the right to read this tenant, not
+/// merely be able to spell it. Background callers with no request behind them
+/// mint one through `TenantScope::background`, which records why.
+pub fn load_scan_json(store: &FactStore, scope: &crate::auth::TenantScope, repo_id: &str) -> Option<String> {
+    let tenant_id = scope.as_str();
+    let entity = scan_entity(tenant_id, repo_id);
+    let result = store.query(&FactQuery {
+        min_effective_confidence: None,
+        tenant_hash: None,
+        query: None,
+        entity: Some(entity),
+        entity_prefix: None,
+        top_k: 10,
+        token_budget: None,
+    });
+    crate::fact_helpers::dedup_latest(result.facts)
+        .into_iter()
+        .find(|fact| fact.key == REPO_FACT_KEY)
+        .map(|fact| fact.value)
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ScanPointer {
     schema_version: u8,

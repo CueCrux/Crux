@@ -211,6 +211,21 @@ pub struct X509VerifyReport {
     /// material is `Some(false)`, never a success-producing `None`. `None` is
     /// reserved for non-X.509/unsupported envelopes.
     pub chain_valid: Option<bool>,
+    /// Checks that were REQUESTED but could not be evaluated, e.g.
+    /// `x509_chain` when the root anchor is unreadable or empty.
+    ///
+    /// This is deliberately narrower than "every `None` field". A `None` that
+    /// means *the caller never asked for this check* (`content_hash_match`
+    /// without `--content`) is not a skip and is not listed here — if it were,
+    /// the field would be non-empty on every ordinary run and useless as a
+    /// gate signal.
+    ///
+    /// `ok` does NOT account for skipped checks: a manifest whose signature
+    /// verifies but whose chain could not be walked still reports `ok: true`,
+    /// so an operator deliberately verifying without an anchor is not broken.
+    /// A caller that requires every requested check to have actually run must
+    /// gate on `ok && checks_skipped.is_empty()`.
+    pub checks_skipped: Vec<String>,
     pub ok: bool,
     pub notes: Vec<String>,
 }
@@ -300,26 +315,35 @@ pub fn c2pa_verify(opts: &X509VerifyOptions) -> Result<X509VerifyReport, Box<dyn
         signature_valid,
         content_hash_match,
         chain_valid,
+        checks_skipped,
         ok,
         notes,
     })
 }
 
-#[allow(clippy::type_complexity)]
+/// Identifier recorded in [`X509VerifyReport::checks_skipped`] when the X.509
+/// chain was requested but could not be walked (anchor unreadable or empty).
+pub const SKIPPED_X509_CHAIN: &str = "x509_chain";
+
+/// Identifier recorded in [`X509VerifyReport::checks_skipped`] when an Ed25519
+/// envelope reaches the X.509 verifier, which has no ed25519 verifying key.
+pub const SKIPPED_ED25519_SIGNATURE: &str = "ed25519_signature";
+
+/// What the per-algorithm envelope verifiers hand back to [`c2pa_verify`].
+struct EnvelopeVerdict {
+    envelope_kind: String,
+    chain_depth: usize,
+    chain_valid: Option<bool>,
+    anchor_sha256: Option<String>,
+    signature_valid: bool,
+    checks_skipped: Vec<String>,
+    notes: Vec<String>,
+}
+
 fn verify_x509_envelope(
     parsed: &C2paSignedManifestV1,
     anchor_path: Option<&Path>,
-) -> Result<
-    (
-        String,         // envelope_kind
-        usize,          // chain_depth
-        Option<bool>,   // chain_valid
-        Option<String>, // anchor_sha256
-        bool,           // signature_valid
-        Vec<String>,    // notes
-    ),
-    Box<dyn std::error::Error + Send + Sync>,
-> {
+) -> Result<EnvelopeVerdict, Box<dyn std::error::Error + Send + Sync>> {
     use p256::ecdsa::signature::Verifier as _;
     use p256::ecdsa::{Signature as P256Sig, VerifyingKey as P256VerifyingKey};
 
@@ -357,14 +381,15 @@ fn verify_x509_envelope(
     let (chain_valid, anchor_sha256) =
         validate_chain_from_anchor_path(&chain_der, &anchor_path_buf, UnixTime::now(), &mut notes);
 
-    Ok((
-        "x509-p256".to_string(),
-        chain_pems.len(),
+    Ok(EnvelopeVerdict {
+        envelope_kind: "x509-p256".to_string(),
+        chain_depth: chain_pems.len(),
         chain_valid,
         anchor_sha256,
         signature_valid,
+        checks_skipped,
         notes,
-    ))
+    })
 }
 
 fn validate_chain_from_anchor_path(

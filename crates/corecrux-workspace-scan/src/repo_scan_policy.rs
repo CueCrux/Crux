@@ -16,15 +16,15 @@ use std::time::{Duration, Instant};
 
 use crate::workspace_scan::ScanError;
 
-pub(crate) const ALLOWED_ROOTS_ENV: &str = "CORECRUXD_REPO_SCAN_ALLOWED_ROOTS";
-pub(crate) const MAX_DEPTH_ENV: &str = "CORECRUXD_REPO_SCAN_MAX_DEPTH";
-pub(crate) const MAX_FILES_ENV: &str = "CORECRUXD_REPO_SCAN_MAX_FILES";
-pub(crate) const MAX_BYTES_ENV: &str = "CORECRUXD_REPO_SCAN_MAX_BYTES";
-pub(crate) const MAX_FILE_BYTES_ENV: &str = "CORECRUXD_REPO_SCAN_MAX_FILE_BYTES";
-pub(crate) const TIMEOUT_SECS_ENV: &str = "CORECRUXD_REPO_SCAN_TIMEOUT_SECS";
-pub(crate) const MAX_PARSER_ITEMS_ENV: &str = "CORECRUXD_REPO_SCAN_MAX_PARSER_ITEMS";
-pub(crate) const MAX_GENERATED_ITEMS_ENV: &str = "CORECRUXD_REPO_SCAN_MAX_GENERATED_ITEMS";
-pub(crate) const MAX_DURABLE_SCAN_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
+pub const ALLOWED_ROOTS_ENV: &str = "CORECRUXD_REPO_SCAN_ALLOWED_ROOTS";
+pub const MAX_DEPTH_ENV: &str = "CORECRUXD_REPO_SCAN_MAX_DEPTH";
+pub const MAX_FILES_ENV: &str = "CORECRUXD_REPO_SCAN_MAX_FILES";
+pub const MAX_BYTES_ENV: &str = "CORECRUXD_REPO_SCAN_MAX_BYTES";
+pub const MAX_FILE_BYTES_ENV: &str = "CORECRUXD_REPO_SCAN_MAX_FILE_BYTES";
+pub const TIMEOUT_SECS_ENV: &str = "CORECRUXD_REPO_SCAN_TIMEOUT_SECS";
+pub const MAX_PARSER_ITEMS_ENV: &str = "CORECRUXD_REPO_SCAN_MAX_PARSER_ITEMS";
+pub const MAX_GENERATED_ITEMS_ENV: &str = "CORECRUXD_REPO_SCAN_MAX_GENERATED_ITEMS";
+pub const MAX_DURABLE_SCAN_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 
 const DEFAULT_MAX_DEPTH: usize = 64;
 const DEFAULT_MAX_FILES: usize = 100_000;
@@ -36,10 +36,10 @@ const DEFAULT_MAX_GENERATED_ITEMS: usize = 2_000_000;
 const MAX_CONFIGURED_PARSER_ITEMS: usize = 20_000_000;
 const MAX_CONFIGURED_GENERATED_ITEMS: usize = 10_000_000;
 const MAX_CONFIGURED_FILES: usize = 1_000_000;
-pub(crate) const MAX_CONFIGURED_DEPTH: usize = 256;
+pub const MAX_CONFIGURED_DEPTH: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RepoScanLimits {
+pub struct RepoScanLimits {
     pub max_depth: usize,
     pub max_files: usize,
     pub max_bytes: u64,
@@ -64,7 +64,7 @@ impl Default for RepoScanLimits {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct RepoScanPolicy {
+pub struct RepoScanPolicy {
     allowed_roots: Vec<RootAnchor>,
     workspace_root: Option<RootAnchor>,
     limits: RepoScanLimits,
@@ -78,7 +78,7 @@ struct RootAnchor {
 }
 
 impl RepoScanPolicy {
-    pub(crate) fn from_env() -> Result<Self, std::io::Error> {
+    pub fn from_env() -> Result<Self, std::io::Error> {
         let mut allowed_roots = match std::env::var_os(ALLOWED_ROOTS_ENV) {
             None => Vec::new(),
             Some(raw) if raw.is_empty() => Vec::new(),
@@ -137,7 +137,7 @@ impl RepoScanPolicy {
     /// Direct/operator-owned scans still receive all traversal and work caps,
     /// but their exact root is the allowlist. Tenant HTTP paths never use this
     /// constructor; they receive the startup-frozen `AppState` policy.
-    pub(crate) fn for_exact_root(root: &Path) -> Result<Self, ScanError> {
+    pub fn for_exact_root(root: &Path) -> Result<Self, ScanError> {
         let anchor = root_anchor(root).map_err(ScanError::Io)?;
         Ok(Self {
             allowed_roots: vec![anchor],
@@ -148,7 +148,7 @@ impl RepoScanPolicy {
     }
 
     #[cfg(test)]
-    pub(crate) fn allow_any_for_tests() -> Self {
+    pub fn allow_any_for_tests() -> Self {
         Self {
             allowed_roots: Vec::new(),
             workspace_root: None,
@@ -158,7 +158,7 @@ impl RepoScanPolicy {
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test_roots(allowed_roots: Vec<PathBuf>, limits: RepoScanLimits) -> Self {
+    pub fn for_test_roots(allowed_roots: Vec<PathBuf>, limits: RepoScanLimits) -> Self {
         Self {
             allowed_roots: allowed_roots
                 .into_iter()
@@ -170,15 +170,15 @@ impl RepoScanPolicy {
         }
     }
 
-    pub(crate) fn limits(&self) -> RepoScanLimits {
+    pub fn limits(&self) -> RepoScanLimits {
         self.limits
     }
 
-    pub(crate) fn allowed_root_count(&self) -> usize {
+    pub fn allowed_root_count(&self) -> usize {
         self.allowed_roots.len()
     }
 
-    pub(crate) fn resolve_root(&self, root: &Path) -> Result<PathBuf, ScanError> {
+    pub fn resolve_root(&self, root: &Path) -> Result<PathBuf, ScanError> {
         if !self.allow_any_root && self.allowed_roots.is_empty() {
             return Err(ScanError::Policy(format!(
                 "repository scanning is disabled until {ALLOWED_ROOTS_ENV} is configured"
@@ -207,7 +207,7 @@ impl RepoScanPolicy {
 
     /// Re-resolve the root and install one shared work budget for the complete
     /// scan. Every walker and scanner read on this thread charges this budget.
-    pub(crate) fn execute<T>(
+    pub fn execute<T>(
         &self,
         root: &Path,
         scan: impl FnOnce(&Path) -> Result<T, ScanError>,
@@ -224,7 +224,7 @@ impl RepoScanPolicy {
         self.execute_canonical(canonical, directory, started, scan)
     }
 
-    pub(crate) fn execute_workspace<T>(
+    pub fn execute_workspace<T>(
         &self,
         scan: impl FnOnce(&Path) -> Result<T, ScanError>,
     ) -> Result<T, ScanError> {
@@ -839,13 +839,13 @@ fn with_active_budget<T>(
     })
 }
 
-pub(crate) fn active_root() -> Option<PathBuf> {
+pub fn active_root() -> Option<PathBuf> {
     ACTIVE_SCAN_BUDGET.with(|slot| slot.borrow().as_ref().map(|budget| budget.borrow().root.clone()))
 }
 
-pub(crate) struct OpenedScanEntry {
-    pub(crate) metadata: std::fs::Metadata,
-    pub(crate) directory: Option<File>,
+pub struct OpenedScanEntry {
+    pub metadata: std::fs::Metadata,
+    pub directory: Option<File>,
 }
 
 /// Open a directory relative to the execution's startup-anchored root.
@@ -854,7 +854,7 @@ pub(crate) struct OpenedScanEntry {
 /// walker) keeps every later enumeration attached to the object that was
 /// authorized, even if an attacker renames or replaces an ancestor.
 #[cfg(target_os = "linux")]
-pub(crate) fn open_active_scan_directory(path: &Path) -> Result<Option<File>, ScanError> {
+pub fn open_active_scan_directory(path: &Path) -> Result<Option<File>, ScanError> {
     let active = ACTIVE_SCAN_BUDGET.with(|slot| {
         slot.borrow().as_ref().map(|budget| {
             let budget = budget.borrow();
@@ -879,7 +879,7 @@ pub(crate) fn open_active_scan_directory(path: &Path) -> Result<Option<File>, Sc
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn open_active_scan_directory(path: &Path) -> Result<Option<File>, ScanError> {
+pub fn open_active_scan_directory(path: &Path) -> Result<Option<File>, ScanError> {
     if active_root().is_some() {
         Err(reject_unsupported_secure_open(path))
     } else {
@@ -891,7 +891,7 @@ pub(crate) fn open_active_scan_directory(path: &Path) -> Result<Option<File>, Sc
 /// enter the temporary sort buffer, so a wide directory cannot allocate past
 /// the configured entry cap.
 #[cfg(target_os = "linux")]
-pub(crate) fn read_opened_scan_directory_names(directory: &File, parent: &Path) -> Result<Vec<OsString>, ScanError> {
+pub fn read_opened_scan_directory_names(directory: &File, parent: &Path) -> Result<Vec<OsString>, ScanError> {
     use std::os::unix::ffi::OsStrExt as _;
 
     let mut stream = rustix::fs::Dir::read_from(directory)
@@ -921,7 +921,7 @@ pub(crate) fn read_opened_scan_directory_names(directory: &File, parent: &Path) 
 /// `openat2(RESOLVE_BENEATH|NO_SYMLINKS)` rejects a symlink in any component;
 /// O_PATH lets us inspect special files without activating them.
 #[cfg(target_os = "linux")]
-pub(crate) fn open_scan_entry(
+pub fn open_scan_entry(
     directory: &File,
     parent: &Path,
     name: &std::ffi::OsStr,
@@ -966,12 +966,12 @@ pub(crate) fn open_scan_entry(
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn read_opened_scan_directory_names(_directory: &File, parent: &Path) -> Result<Vec<OsString>, ScanError> {
+pub fn read_opened_scan_directory_names(_directory: &File, parent: &Path) -> Result<Vec<OsString>, ScanError> {
     Err(reject_unsupported_secure_open(parent))
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn open_scan_entry(
+pub fn open_scan_entry(
     _directory: &File,
     parent: &Path,
     _name: &std::ffi::OsStr,
@@ -984,7 +984,7 @@ pub(crate) fn open_scan_entry(
 /// descriptor and rejects symlinks, closing ancestor-swap races that
 /// `O_NOFOLLOW` on the final component alone cannot prevent.
 #[cfg(target_os = "linux")]
-pub(crate) fn open_active_scan_file(path: &Path) -> Result<Option<File>, ScanError> {
+pub fn open_active_scan_file(path: &Path) -> Result<Option<File>, ScanError> {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -1063,7 +1063,7 @@ fn probe_scan_path(path: &Path) -> Result<Option<std::fs::Metadata>, ScanError> 
     Err(reject_unsupported_secure_open(path))
 }
 
-pub(crate) fn scan_path_is_file(path: &Path) -> Result<bool, ScanError> {
+pub fn scan_path_is_file(path: &Path) -> Result<bool, ScanError> {
     Ok(probe_scan_path(path)?.is_some_and(|metadata| metadata.is_file()))
 }
 
@@ -1073,7 +1073,7 @@ pub(crate) fn scan_path_is_file(path: &Path) -> Result<bool, ScanError> {
 /// before the global per-file read ceiling is consulted. The descriptor-rooted
 /// probe and discovery charge still reject links, special files, root escapes,
 /// identity changes, and corpus-budget overflow.
-pub(crate) fn scan_file_metadata_for_admission(path: &Path) -> Result<Option<std::fs::Metadata>, ScanError> {
+pub fn scan_file_metadata_for_admission(path: &Path) -> Result<Option<std::fs::Metadata>, ScanError> {
     let Some(metadata) = probe_scan_path(path)? else {
         return Ok(None);
     };
@@ -1084,7 +1084,7 @@ pub(crate) fn scan_file_metadata_for_admission(path: &Path) -> Result<Option<std
     Ok(Some(metadata))
 }
 
-pub(crate) fn scan_file_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, ScanError> {
+pub fn scan_file_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, ScanError> {
     let Some(metadata) = scan_file_metadata_for_admission(path)? else {
         return Ok(None);
     };
@@ -1092,16 +1092,16 @@ pub(crate) fn scan_file_metadata(path: &Path) -> Result<Option<std::fs::Metadata
     Ok(Some(metadata))
 }
 
-pub(crate) fn scan_path_is_directory(path: &Path) -> Result<bool, ScanError> {
+pub fn scan_path_is_directory(path: &Path) -> Result<bool, ScanError> {
     Ok(probe_scan_path(path)?.is_some_and(|metadata| metadata.is_dir()))
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-pub(crate) fn open_active_scan_file(path: &Path) -> Result<Option<File>, ScanError> {
+pub fn open_active_scan_file(path: &Path) -> Result<Option<File>, ScanError> {
     Err(reject_unsupported_secure_open(path))
 }
 
-pub(crate) fn check_depth(depth: usize) -> Result<(), ScanError> {
+pub fn check_depth(depth: usize) -> Result<(), ScanError> {
     with_active_budget(|budget| {
         budget.check_deadline()?;
         if depth > budget.limits.max_depth {
@@ -1115,17 +1115,17 @@ pub(crate) fn check_depth(depth: usize) -> Result<(), ScanError> {
     Ok(())
 }
 
-pub(crate) fn check_deadline() -> Result<(), ScanError> {
+pub fn check_deadline() -> Result<(), ScanError> {
     with_active_budget(ExecutionBudget::check_deadline)?;
     Ok(())
 }
 
-pub(crate) fn discover_entry(path: &Path) -> Result<(), ScanError> {
+pub fn discover_entry(path: &Path) -> Result<(), ScanError> {
     with_active_budget(|budget| budget.discover_path_entry(path))?;
     Ok(())
 }
 
-pub(crate) fn authorize_directory(path: &Path, metadata: &std::fs::Metadata) -> Result<PathBuf, ScanError> {
+pub fn authorize_directory(path: &Path, metadata: &std::fs::Metadata) -> Result<PathBuf, ScanError> {
     if let Some(result) = with_active_budget(|budget| budget.discover_directory(path, metadata))? {
         return Ok(result);
     }
@@ -1138,7 +1138,7 @@ pub(crate) fn authorize_directory(path: &Path, metadata: &std::fs::Metadata) -> 
     Ok(std::fs::canonicalize(path)?)
 }
 
-pub(crate) fn discover_file(path: &Path, metadata: &std::fs::Metadata) -> Result<(), ScanError> {
+pub fn discover_file(path: &Path, metadata: &std::fs::Metadata) -> Result<(), ScanError> {
     let charged = with_active_budget(|budget| budget.discover_file(path, metadata))?;
     if charged.is_none() && metadata.file_type().is_symlink() {
         return Err(ScanError::Policy(format!(
@@ -1149,7 +1149,7 @@ pub(crate) fn discover_file(path: &Path, metadata: &std::fs::Metadata) -> Result
     Ok(())
 }
 
-pub(crate) fn charge_read(path: &Path, metadata: &std::fs::Metadata) -> Result<(), ScanError> {
+pub fn charge_read(path: &Path, metadata: &std::fs::Metadata) -> Result<(), ScanError> {
     let charged = with_active_budget(|budget| budget.authorize_read(path, metadata))?;
     if charged.is_none() && metadata.file_type().is_symlink() {
         return Err(ScanError::Policy(format!(
@@ -1160,12 +1160,12 @@ pub(crate) fn charge_read(path: &Path, metadata: &std::fs::Metadata) -> Result<(
     Ok(())
 }
 
-pub(crate) fn charge_opened_read(path: &Path, metadata: &std::fs::Metadata) -> Result<(), ScanError> {
+pub fn charge_opened_read(path: &Path, metadata: &std::fs::Metadata) -> Result<(), ScanError> {
     with_active_budget(|budget| budget.authorize_opened_read(path, metadata))?;
     Ok(())
 }
 
-pub(crate) fn max_file_bytes() -> u64 {
+pub fn max_file_bytes() -> u64 {
     ACTIVE_SCAN_BUDGET.with(|slot| {
         slot.borrow()
             .as_ref()
@@ -1173,21 +1173,21 @@ pub(crate) fn max_file_bytes() -> u64 {
     })
 }
 
-pub(crate) fn remaining_read_bytes() -> Result<u64, ScanError> {
+pub fn remaining_read_bytes() -> Result<u64, ScanError> {
     Ok(with_active_budget(ExecutionBudget::remaining_read_bytes)?.unwrap_or(DEFAULT_MAX_FILE_BYTES))
 }
 
-pub(crate) fn charge_read_bytes(bytes: usize) -> Result<(), ScanError> {
+pub fn charge_read_bytes(bytes: usize) -> Result<(), ScanError> {
     with_active_budget(|budget| budget.charge_read_bytes(bytes as u64))?;
     Ok(())
 }
 
-pub(crate) fn charge_generated_work(items: usize, bytes: usize, label: &str) -> Result<(), ScanError> {
+pub fn charge_generated_work(items: usize, bytes: usize, label: &str) -> Result<(), ScanError> {
     with_active_budget(|budget| budget.charge_generated_work(items, bytes as u64, label))?;
     Ok(())
 }
 
-pub(crate) fn charge_parser_work(items: usize, bytes: usize, label: &str) -> Result<(), ScanError> {
+pub fn charge_parser_work(items: usize, bytes: usize, label: &str) -> Result<(), ScanError> {
     with_active_budget(|budget| budget.charge_parser_work(items, bytes as u64, label))?;
     Ok(())
 }
@@ -1196,7 +1196,7 @@ pub(crate) fn charge_parser_work(items: usize, bytes: usize, label: &str) -> Res
 /// count once and each non-whitespace delimiter/operator counts once. The
 /// per-token byte estimate covers parser nodes and small secondary vectors;
 /// durable outputs and cloned indexes are charged again at their own sites.
-pub(crate) fn charge_source_parse_work(source: &str, label: &str) -> Result<(), ScanError> {
+pub fn charge_source_parse_work(source: &str, label: &str) -> Result<(), ScanError> {
     let mut items = 0usize;
     let mut in_word = false;
     for byte in source.bytes() {
@@ -1217,7 +1217,7 @@ pub(crate) fn charge_source_parse_work(source: &str, label: &str) -> Result<(), 
     Ok(())
 }
 
-pub(crate) fn reject_file_growth(path: &Path) -> ScanError {
+pub fn reject_file_growth(path: &Path) -> ScanError {
     reject_violation(format!(
         "repository scan file exceeded {} bytes while reading: {}",
         max_file_bytes(),
@@ -1225,7 +1225,7 @@ pub(crate) fn reject_file_growth(path: &Path) -> ScanError {
     ))
 }
 
-pub(crate) fn reject_file_change(path: &Path) -> ScanError {
+pub fn reject_file_change(path: &Path) -> ScanError {
     reject_violation(format!(
         "repository scan file changed during secure open: {}",
         path.display()
@@ -1233,21 +1233,21 @@ pub(crate) fn reject_file_change(path: &Path) -> ScanError {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn reject_unsupported_secure_open(path: &Path) -> ScanError {
+pub fn reject_unsupported_secure_open(path: &Path) -> ScanError {
     reject_violation(format!(
         "repository scan secure-open verification is unavailable on this platform: {}",
         path.display()
     ))
 }
 
-pub(crate) fn reject_read_budget(path: &Path) -> ScanError {
+pub fn reject_read_budget(path: &Path) -> ScanError {
     reject_violation(format!(
         "repository scan read work exceeded its cumulative byte budget before reading: {}",
         path.display()
     ))
 }
 
-pub(crate) fn reject_read_io(path: &Path, operation: &str, error: &std::io::Error) -> ScanError {
+pub fn reject_read_io(path: &Path, operation: &str, error: &std::io::Error) -> ScanError {
     reject_violation(format!(
         "repository scan secure read failed during {operation} for {}: {error}",
         path.display()
@@ -1322,14 +1322,14 @@ mod tests {
             .execute(root.path(), |_| {
                 charge_generated_work(
                     1,
-                    crate::repo_registry::MAX_SCAN_SNAPSHOT_BYTES as usize + 1,
+                    MAX_DURABLE_SCAN_OUTPUT_BYTES as usize + 1,
                     "fixture output",
                 )
             })
             .expect_err("generated output larger than its durable sidecar must be rejected");
         assert!(error
             .to_string()
-            .contains(&crate::repo_registry::MAX_SCAN_SNAPSHOT_BYTES.to_string()));
+            .contains(&MAX_DURABLE_SCAN_OUTPUT_BYTES.to_string()));
     }
 
     #[test]

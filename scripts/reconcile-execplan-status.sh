@@ -57,7 +57,7 @@ classify_status() {
   local v="${1,,}"
   v="$(sed -E 's/^[[:space:]]*(>[[:space:]]*)*([-*][[:space:]]+)?(\*+)?([[:space:]]*status:[[:space:]]*)?//' <<<"$v")"
   case "$v" in
-    complete*|completed*|code-complete*|superseded*|archived*|parked*|done*|deployed*|shipped*|landed*|merged*)
+    complete*|completed*|code-complete*|closed*|superseded*|archived*|parked*|done*|deployed*|shipped*|landed*|merged*)
       echo terminal ;;
     *)
       echo nonterminal ;;
@@ -68,8 +68,24 @@ classify_status() {
 # First `Status:` line (bare or `> **Status:**`) in the first ~30 lines.
 leading_status() {
   local f="$1" line
-  line="$(head -30 "$f" 2>/dev/null | grep -iEm1 '^[[:space:]]*(>[[:space:]]*\*\*status:\*\*|>?[[:space:]]*\*{0,2}status:)' || true)"
-  sed -E 's/^[[:space:]]*(>[[:space:]]*)*([-*][[:space:]]+)?(\*+)?[[:space:]]*[Ss][Tt][Aa][Tt][Uu][Ss]:[[:space:]]*(\*+)?[[:space:]]*//; s/[[:space:]]+$//' <<<"$line"
+  # CASE-SENSITIVE `Status:`, matching the daemon's parser
+  # (work_execplans.rs `parse_plan`). The `-i` this used to carry made the sweep
+  # disagree with the board: a lowercase `status: draft` in YAML frontmatter
+  # matched first and shadowed the real declaration below it, so three plans
+  # (corecrux-kv-compression, corecrux-kv-offload, llm-gate-completion) were
+  # reported as "Status reads: draft" and counted as needing a flip while
+  # actually declaring `Status: Parked` / `Status: Archived` correctly. A sweep
+  # that reports drift the board does not see is worse than no sweep.
+  #
+  # The DETECTOR and the value-stripper below must accept the same markup set.
+  # They did not: the stripper handled list markers and bold, the detector did
+  # not, so a `- **Status:** Complete` line read as "no Status line" and the
+  # sweep's inverse-drift check missed 2 of the 3 plans that needed a flip.
+  # Same class of bug as the daemon's (work_execplans.rs `status_declaration`).
+  # Markup accepted: blockquote arrows, `- `/`* `/`1. ` list markers, bold.
+  local markup='^[[:space:]]*(>[[:space:]]*)*([-*][[:space:]]+|[0-9]+\.[[:space:]]+)?\**'
+  line="$(head -30 "$f" 2>/dev/null | grep -Em1 "${markup}Status:" || true)"
+  sed -E "s/${markup}Status:[[:space:]]*(\*+)?[[:space:]]*//; s/[[:space:]]+\$//" <<<"$line"
 }
 
 # fetch_work → echoes the /v1/work?source=all JSON to stdout, or returns 2 if the
@@ -252,6 +268,24 @@ EOF
   # Unit: leading_status extraction skips trailer + reads blockquote form.
   check "leading trailer"    "$(leading_status "$tmp/drift-trailer.md")"     "In progress (design complete; deploy gated)"
   check "leading blockquote" "$(leading_status "$tmp/aligned-superseded.md")" "Superseded by [[next]]"
+
+  # Unit: the DETECTOR must accept every markup form the stripper does. It did
+  # not, and the resulting "no Status line" reading made the inverse-drift check
+  # miss 2 of the 3 plans that needed a flip in the 2026-08-04 sweep.
+  printf '# Fix widget\n\n**Status:** Complete\n'      >"$tmp/markup-bold.md"
+  printf '# Fix widget\n\n- **Status:** Complete\n'    >"$tmp/markup-list.md"
+  printf '# Fix widget\n\n1. **Status:** Complete\n'   >"$tmp/markup-ordered.md"
+  check "leading bold"     "$(leading_status "$tmp/markup-bold.md")"    "Complete"
+  check "leading list"     "$(leading_status "$tmp/markup-list.md")"    "Complete"
+  check "leading ordered"  "$(leading_status "$tmp/markup-ordered.md")" "Complete"
+
+  # Unit: case-sensitivity survives the widened markup — lowercase frontmatter
+  # `status:` is metadata and must not shadow the declaration below it.
+  printf -- '---\nstatus: draft\n---\n\n# Fix widget\n\nStatus: Parked — see follow-up\n' >"$tmp/markup-frontmatter.md"
+  check "frontmatter not shadowing" "$(leading_status "$tmp/markup-frontmatter.md")" "Parked — see follow-up"
+
+  # Unit: `Closed` is terminal, matching the daemon's declared_status vocabulary.
+  check "classify Closed"  "$(classify_status 'Closed 2026-08-03 — all merged')" terminal
 
   # Integration: full sweep against canned JSON (no live daemon).
   # fallback-inprog resolves via ${root}/<slug>.md despite a dead plan_path.

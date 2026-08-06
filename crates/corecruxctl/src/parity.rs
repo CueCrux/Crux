@@ -248,6 +248,13 @@ pub fn parity_living_v1(
     corecrux_base: &str,
 ) -> Result<ParityLivingReportV1, Box<dyn std::error::Error + Send + Sync>> {
     let artifacts = fetch_engine_sample(engine_base, engine_api_key, tenant_id, seed, sample_n)?;
+    // D-18: an empty engine sample compared nothing and reported parity —
+    // indistinguishable from every artifact matching. `generate_parity_pack`
+    // already hard-errors on the identical input (see `sampled_artifacts`
+    // below); this is the same call with the same meaning.
+    if artifacts.is_empty() {
+        return Err("engine sample is empty: no artifacts were compared, so parity is unverified".into());
+    }
 
     let mut mismatches: Vec<ParityMismatchV1> = Vec::new();
     let mut summary = ParitySummaryV1::default();
@@ -1015,7 +1022,7 @@ fn get_corecrux_json<T: for<'de> Deserialize<'de>>(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
         build_parity_pack_report, deterministic_artifact_score, hash_hex_bytes, hash_hex_json, hash_prefix, hash_u64,
@@ -2407,5 +2414,685 @@ mod tests {
         };
         let dbg = format!("{:?}", report);
         assert!(dbg.contains("tenant_id"));
+    }
+
+    // ══ HTTP drivers against the loopback stub ═══════════════════════
+    //
+    // `parity_living_v1` and `generate_parity_pack` are the two comparison
+    // drivers. Both talk to a *pair* of bases (engine + corecrux), so each
+    // test spins up two independent `serve_responses` stubs and hands each a
+    // response script in exact call order. The engine script always begins
+    // with the `/internal/living/sample` reply; the corecrux script starts at
+    // the first per-artifact probe.
+    //
+    // Call order per artifact (engine / corecrux interleaved):
+    //   state, relations(out), relations(in), dependents, pressure-events.
+    // A `missing_state` FAIL short-circuits the rest for that artifact, so
+    // those tests script exactly two engine and one corecrux response.
+
+    use super::{fetch_engine_sample, generate_parity_pack, get_corecrux_json, get_engine_json, parity_living_v1};
+    use crate::test_support::serve_responses;
+    use serde_json::{json, Value};
+
+    fn base_url(port: u16) -> String {
+        format!("http://127.0.0.1:{port}")
+    }
+
+    fn ok(value: Value) -> (u16, String) {
+        (200, value.to_string())
+    }
+
+    fn eng_state(present: bool, status: &str, trunk_tier: i32, pressure_level: i32, confidence: f64) -> Value {
+        json!({
+            "tenant_id": "t1",
+            "artifact_id": 7,
+            "present": present,
+            "living_status": status,
+            "confidence": confidence,
+            "pressure_level": pressure_level,
+            "trunk_tier": trunk_tier,
+            "counts": { "relations_out": 1, "relations_in": 0, "dependents": 1 }
+        })
+    }
+
+    fn ccx_state(present: bool, status: &str, trunk_tier: i32, pressure_level: i32, confidence: f64) -> Value {
+        json!({
+            "tenant_id": "t1",
+            "artifact_id": 7,
+            "present": present,
+            "living_status": status,
+            "confidence": confidence,
+            "pressure_level": pressure_level,
+            "trunk_tier": trunk_tier,
+            "counts": { "relations_out": 1, "relations_in": 0, "dependents": 1 }
+        })
+    }
+
+    fn relations(rows: &[(u32, u32, &str)]) -> Value {
+        json!({
+            "relations": rows
+                .iter()
+                .map(|(src, dst, kind)| json!({
+                    "src_artifact_id": src,
+                    "dst_artifact_id": dst,
+                    "relation_type": kind,
+                }))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    fn eng_dependents(rows: &[(&str, &str, &str)]) -> Value {
+        json!({
+            "dependents": rows
+                .iter()
+                .map(|(kind, id, seen)| json!({
+                    "dependent_type": kind,
+                    "dependent_id": id,
+                    "last_seen_at": seen,
+                }))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    fn ccx_dependents(rows: &[(&str, &str, i64)]) -> Value {
+        json!({
+            "dependents": rows
+                .iter()
+                .map(|(kind, id, micros)| json!({
+                    "dependent_type": kind,
+                    "dependent_id": id,
+                    "last_seen_at_micros": micros,
+                }))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    fn eng_pressure(rows: &[(&str, Option<&str>)]) -> Value {
+        json!({
+            "events": rows
+                .iter()
+                .map(|(id, resolved_at)| json!({
+                    "event_id": id,
+                    "pressure_code": "code",
+                    "severity": 1,
+                    "observed_at": "2026-01-01T00:00:00Z",
+                    "resolved_at": resolved_at,
+                }))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    fn ccx_pressure(rows: &[(&str, i64)]) -> Value {
+        json!({
+            "events": rows
+                .iter()
+                .map(|(id, resolved_at_micros)| json!({
+                    "event_id": id,
+                    "pressure_code_id": 1,
+                    "severity": 1,
+                    "observed_at_micros": 0,
+                    "acknowledged_at_micros": 0,
+                    "resolved_at_micros": resolved_at_micros,
+                }))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    /// `2026-01-01T00:00:00Z` expressed in microseconds — the corecrux-side
+    /// encoding of the engine's RFC3339 `last_seen_at`.
+    const TS_MICROS: i64 = 1_767_225_600_000_000;
+
+    // ── get_engine_json / get_corecrux_json ──────────────────────────
+
+    #[test]
+    fn get_engine_json_sends_api_key_and_path() {
+        let (port, handle) = serve_responses(vec![ok(json!({ "tenant_id": "t1", "artifacts": [1, 2] }))]);
+        let parsed: super::EngineSampleResp =
+            get_engine_json(&base_url(port), "secret-key", "/internal/living/sample?tenant_id=t1").unwrap();
+        assert_eq!(parsed.artifacts, vec![1, 2]);
+
+        let captured = handle.join().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].contains("/internal/living/sample?tenant_id=t1"));
+        assert!(
+            captured[0].to_lowercase().contains("x-api-key: secret-key"),
+            "api key header missing: {}",
+            captured[0]
+        );
+    }
+
+    /// Regression: a trailing slash on `--engine-base` must not produce a
+    /// double-slash path that the daemon 404s on.
+    #[test]
+    fn get_engine_json_trims_trailing_slash_on_base() {
+        let (port, handle) = serve_responses(vec![ok(json!({ "tenant_id": "t1", "artifacts": [] }))]);
+        let base = format!("{}/", base_url(port));
+        let _parsed: super::EngineSampleResp = get_engine_json(&base, "k", "/internal/living/sample").unwrap();
+
+        let captured = handle.join().unwrap();
+        assert!(captured[0].contains("GET /internal/living/sample "), "{}", captured[0]);
+        assert!(!captured[0].contains("//internal"));
+    }
+
+    #[test]
+    fn get_engine_json_error_status_is_reported_with_url() {
+        let (port, handle) = serve_responses(vec![(500, "boom".to_string())]);
+        let err =
+            get_engine_json::<super::EngineSampleResp>(&base_url(port), "k", "/internal/living/sample").unwrap_err();
+        assert!(err.to_string().starts_with("engine GET http://127.0.0.1:"), "{err}");
+        assert!(err.to_string().contains("failed"), "{err}");
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn get_corecrux_json_error_status_is_reported_with_url() {
+        let (port, handle) = serve_responses(vec![(404, "nope".to_string())]);
+        let err = get_corecrux_json::<super::CoreCruxStateResp>(&base_url(port), "/v1/admin/projections").unwrap_err();
+        assert!(err.to_string().starts_with("corecrux GET http://127.0.0.1:"), "{err}");
+        let _ = handle.join();
+    }
+
+    /// A 200 whose body is not the expected shape must fail the read rather
+    /// than deserialise into a default-looking record that compares equal.
+    #[test]
+    fn get_corecrux_json_rejects_malformed_body() {
+        let (port, handle) = serve_responses(vec![(200, "{ this is not json".to_string())]);
+        let err = get_corecrux_json::<super::CoreCruxStateResp>(&base_url(port), "/v1/admin/projections").unwrap_err();
+        assert!(!err.to_string().is_empty());
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn get_engine_json_rejects_body_missing_required_field() {
+        // `artifacts` is required; a body without it must not decode as empty.
+        let (port, handle) = serve_responses(vec![ok(json!({ "tenant_id": "t1" }))]);
+        let err =
+            get_engine_json::<super::EngineSampleResp>(&base_url(port), "k", "/internal/living/sample").unwrap_err();
+        assert!(!err.to_string().is_empty());
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn fetch_engine_sample_returns_artifact_ids() {
+        let (port, handle) = serve_responses(vec![ok(json!({ "tenant_id": "t1", "artifacts": [9, 4, 4] }))]);
+        let ids = fetch_engine_sample(&base_url(port), "k", "t1", "seed", 3).unwrap();
+        assert_eq!(ids, vec![9, 4, 4]);
+
+        let captured = handle.join().unwrap();
+        assert!(captured[0].contains("seed=seed"));
+        assert!(captured[0].contains("n=3"));
+    }
+
+    // ── parity_living_v1 ─────────────────────────────────────────────
+
+    #[test]
+    fn parity_living_v1_reports_parity_when_both_sides_agree() {
+        let (eng_port, eng) = serve_responses(vec![
+            ok(json!({ "tenant_id": "t1", "artifacts": [7] })),
+            ok(eng_state(true, "active", 2, 3, 0.9)),
+            ok(relations(&[(7, 8, "cites")])),
+            ok(relations(&[])),
+            ok(eng_dependents(&[("query", "q1", "2026-01-01T00:00:00Z")])),
+            ok(eng_pressure(&[("e1", None)])),
+        ]);
+        let (ccx_port, ccx) = serve_responses(vec![
+            ok(ccx_state(true, "active", 2, 3, 0.9)),
+            ok(relations(&[(7, 8, "cites")])),
+            ok(relations(&[])),
+            ok(ccx_dependents(&[("query", "q1", TS_MICROS)])),
+            ok(ccx_pressure(&[("e1", 0)])),
+        ]);
+
+        let report = parity_living_v1("t1", "seed", 1, &base_url(eng_port), "k", &base_url(ccx_port)).unwrap();
+        assert_eq!(report.artifacts, vec![7]);
+        assert_eq!(report.summary.artifacts_checked, 1);
+        assert_eq!(report.summary.fail, 0);
+        assert_eq!(report.summary.warn, 0);
+        assert!(report.mismatches.is_empty());
+
+        assert_eq!(eng.join().unwrap().len(), 6);
+        assert_eq!(ccx.join().unwrap().len(), 5);
+    }
+
+    /// An artifact the engine has and corecrux does not is the headline
+    /// divergence: it must be a FAIL, and it must short-circuit the remaining
+    /// probes for that artifact (five fewer round-trips).
+    #[test]
+    fn parity_living_v1_flags_missing_state_and_skips_remaining_probes() {
+        let (eng_port, eng) = serve_responses(vec![
+            ok(json!({ "tenant_id": "t1", "artifacts": [7] })),
+            ok(eng_state(true, "active", 2, 3, 0.9)),
+        ]);
+        let (ccx_port, ccx) = serve_responses(vec![ok(ccx_state(false, "active", 2, 3, 0.9))]);
+
+        let report = parity_living_v1("t1", "seed", 1, &base_url(eng_port), "k", &base_url(ccx_port)).unwrap();
+        assert_eq!(report.summary.fail, 1);
+        assert_eq!(report.mismatches.len(), 1);
+        assert_eq!(report.mismatches[0].kind, "missing_state");
+        assert_eq!(report.mismatches[0].artifact_id, 7);
+        assert!(report.mismatches[0].engine.is_some());
+        assert!(report.mismatches[0].corecrux.is_some());
+
+        assert_eq!(eng.join().unwrap().len(), 2);
+        assert_eq!(ccx.join().unwrap().len(), 1);
+    }
+
+    /// Every scalar state field that can diverge does, in one artifact: four
+    /// FAILs (living_status, trunk_tier, pressure_level, counts) plus the
+    /// confidence WARN.
+    #[test]
+    fn parity_living_v1_flags_every_state_field_divergence() {
+        let mut ccx = ccx_state(true, "stale", 5, 1, 0.5);
+        ccx["counts"] = json!({ "relations_out": 9, "relations_in": 9, "dependents": 9 });
+
+        let (eng_port, eng_handle) = serve_responses(vec![
+            ok(json!({ "tenant_id": "t1", "artifacts": [7] })),
+            ok(eng_state(true, "active", 2, 3, 0.9)),
+            ok(relations(&[])),
+            ok(relations(&[])),
+            ok(eng_dependents(&[])),
+            ok(eng_pressure(&[])),
+        ]);
+        let (ccx_port, ccx_handle) = serve_responses(vec![
+            ok(ccx),
+            ok(relations(&[])),
+            ok(relations(&[])),
+            ok(ccx_dependents(&[])),
+            ok(ccx_pressure(&[])),
+        ]);
+
+        let report = parity_living_v1("t1", "seed", 1, &base_url(eng_port), "k", &base_url(ccx_port)).unwrap();
+        assert_eq!(report.summary.fail, 4);
+        assert_eq!(report.summary.warn, 1);
+        let kinds: Vec<&str> = report.mismatches.iter().map(|m| m.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["living_status", "trunk_tier", "pressure_level", "counts", "confidence"]
+        );
+        assert!(
+            report.mismatches[4].message.contains("(>0.02)"),
+            "{:?}",
+            report.mismatches[4]
+        );
+
+        assert_eq!(eng_handle.join().unwrap().len(), 6);
+        assert_eq!(ccx_handle.join().unwrap().len(), 5);
+    }
+
+    /// The confidence check is a tolerance, not an equality: a 0.01 gap must
+    /// not be reported, or every run would be noise.
+    #[test]
+    fn parity_living_v1_confidence_within_tolerance_is_not_reported() {
+        let (eng_port, eng) = serve_responses(vec![
+            ok(json!({ "tenant_id": "t1", "artifacts": [7] })),
+            ok(eng_state(true, "active", 2, 3, 0.90)),
+            ok(relations(&[])),
+            ok(relations(&[])),
+            ok(eng_dependents(&[])),
+            ok(eng_pressure(&[])),
+        ]);
+        let (ccx_port, ccx) = serve_responses(vec![
+            ok(ccx_state(true, "active", 2, 3, 0.91)),
+            ok(relations(&[])),
+            ok(relations(&[])),
+            ok(ccx_dependents(&[])),
+            ok(ccx_pressure(&[])),
+        ]);
+
+        let report = parity_living_v1("t1", "seed", 1, &base_url(eng_port), "k", &base_url(ccx_port)).unwrap();
+        assert_eq!(report.summary.fail, 0);
+        assert_eq!(report.summary.warn, 0);
+        let _ = (eng.join(), ccx.join());
+    }
+
+    /// Divergence in each of the four list-shaped probes: an extra edge out, a
+    /// missing edge in, a dependent present only on the engine, and an open
+    /// pressure event that corecrux has already resolved.
+    #[test]
+    fn parity_living_v1_flags_relation_dependent_and_pressure_divergence() {
+        let (eng_port, eng) = serve_responses(vec![
+            ok(json!({ "tenant_id": "t1", "artifacts": [7] })),
+            ok(eng_state(true, "active", 2, 3, 0.9)),
+            ok(relations(&[(7, 8, "cites"), (7, 9, "cites")])),
+            ok(relations(&[])),
+            ok(eng_dependents(&[("query", "q1", "2026-01-01T00:00:00Z")])),
+            ok(eng_pressure(&[("e1", None)])),
+        ]);
+        let (ccx_port, ccx) = serve_responses(vec![
+            ok(ccx_state(true, "active", 2, 3, 0.9)),
+            ok(relations(&[(7, 8, "cites")])),
+            ok(relations(&[(6, 7, "cites")])),
+            ok(ccx_dependents(&[])),
+            ok(ccx_pressure(&[("e1", 12_345)])),
+        ]);
+
+        let report = parity_living_v1("t1", "seed", 1, &base_url(eng_port), "k", &base_url(ccx_port)).unwrap();
+        assert_eq!(report.summary.fail, 4);
+        let kinds: Vec<&str> = report.mismatches.iter().map(|m| m.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["relations_out", "relations_in", "dependents", "pressure_open_count"]
+        );
+        assert!(
+            report.mismatches[3].message.contains("engine=1 corecrux=0"),
+            "{:?}",
+            report.mismatches[3]
+        );
+        let _ = (eng.join(), ccx.join());
+    }
+
+    /// Matching dependent keys whose `last_seen_at` has drifted is a WARN, not
+    /// a FAIL — timestamps lag, key sets must not.
+    #[test]
+    fn parity_living_v1_warns_on_dependent_timestamp_drift_only() {
+        let (eng_port, eng) = serve_responses(vec![
+            ok(json!({ "tenant_id": "t1", "artifacts": [7] })),
+            ok(eng_state(true, "active", 2, 3, 0.9)),
+            ok(relations(&[])),
+            ok(relations(&[])),
+            ok(eng_dependents(&[("query", "q1", "2026-01-01T00:00:00Z")])),
+            ok(eng_pressure(&[])),
+        ]);
+        let (ccx_port, ccx) = serve_responses(vec![
+            ok(ccx_state(true, "active", 2, 3, 0.9)),
+            ok(relations(&[])),
+            ok(relations(&[])),
+            ok(ccx_dependents(&[("query", "q1", 1)])),
+            ok(ccx_pressure(&[])),
+        ]);
+
+        let report = parity_living_v1("t1", "seed", 1, &base_url(eng_port), "k", &base_url(ccx_port)).unwrap();
+        assert_eq!(report.summary.fail, 0);
+        assert_eq!(report.summary.warn, 1);
+        assert_eq!(report.mismatches[0].kind, "dependents_last_seen_at");
+        let _ = (eng.join(), ccx.join());
+    }
+
+    /// DEFECT PIN (absent signal reads as pass): when the engine returns an
+    /// empty sample, `parity_living_v1` used to return a clean report —
+    /// `artifacts_checked: 0`, no mismatches, `Ok` — which a caller read as
+    /// "the two systems agree". `generate_parity_pack` already treated the
+    /// same input as a hard error ("engine sample candidate set is empty");
+    /// the living driver now agrees. D-18, fixed in M5 of
+    /// `crux-pinned-defect-remediation-2026-07-31`.
+    #[test]
+    fn parity_living_v1_empty_sample_is_an_error_not_clean_parity() {
+        let (eng_port, eng) = serve_responses(vec![ok(json!({ "tenant_id": "t1", "artifacts": [] }))]);
+        let (ccx_port, ccx) = serve_responses(vec![]);
+
+        let err = parity_living_v1("t1", "seed", 5, &base_url(eng_port), "k", &base_url(ccx_port))
+            .expect_err("comparing nothing is not parity");
+        assert!(err.to_string().contains("engine sample is empty"), "{err}");
+        let _ = (eng.join(), ccx.join());
+    }
+
+    #[test]
+    fn parity_living_v1_propagates_engine_sample_failure() {
+        let (eng_port, eng) = serve_responses(vec![(503, "unavailable".to_string())]);
+        let (ccx_port, ccx) = serve_responses(vec![]);
+        let err = parity_living_v1("t1", "seed", 1, &base_url(eng_port), "k", &base_url(ccx_port)).unwrap_err();
+        assert!(err.to_string().starts_with("engine GET"), "{err}");
+        let _ = (eng.join(), ccx.join());
+    }
+
+    /// A corecrux-side outage must not be silently absorbed as "no state".
+    #[test]
+    fn parity_living_v1_propagates_corecrux_failure() {
+        let (eng_port, eng) = serve_responses(vec![
+            ok(json!({ "tenant_id": "t1", "artifacts": [7] })),
+            ok(eng_state(true, "active", 2, 3, 0.9)),
+        ]);
+        let (ccx_port, ccx) = serve_responses(vec![(503, "unavailable".to_string())]);
+        let err = parity_living_v1("t1", "seed", 1, &base_url(eng_port), "k", &base_url(ccx_port)).unwrap_err();
+        assert!(err.to_string().starts_with("corecrux GET"), "{err}");
+        let _ = (eng.join(), ccx.join());
+    }
+
+    // ── generate_parity_pack ─────────────────────────────────────────
+
+    fn pack_options(
+        out_dir: &std::path::Path,
+        engine_port: u16,
+        corecrux_port: u16,
+        sample_size: u32,
+    ) -> ParityPackOptions {
+        ParityPackOptions {
+            out_dir: out_dir.to_path_buf(),
+            tenant_id: "t1".to_string(),
+            seed: "seed".to_string(),
+            sample_size,
+            window_hours: 24,
+            projections: "v1".to_string(),
+            engine_base: base_url(engine_port),
+            engine_api_key: "k".to_string(),
+            corecrux_base: base_url(corecrux_port),
+        }
+    }
+
+    use super::ParityPackOptions;
+
+    #[test]
+    fn generate_parity_pack_rejects_zero_sample_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let opts = pack_options(tmp.path(), 1, 1, 0);
+        let err = generate_parity_pack(&opts).unwrap_err();
+        assert!(err.to_string().contains("--sample-size must be >= 1"), "{err}");
+        // No directories should have been created by the rejected run.
+        assert!(!tmp.path().join("expected").exists());
+    }
+
+    #[test]
+    fn generate_parity_pack_errors_when_candidate_set_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (eng_port, eng) = serve_responses(vec![ok(json!({ "tenant_id": "t1", "artifacts": [] }))]);
+        let (ccx_port, ccx) = serve_responses(vec![]);
+
+        let err = generate_parity_pack(&pack_options(tmp.path(), eng_port, ccx_port, 1)).unwrap_err();
+        assert!(
+            err.to_string().contains("engine sample candidate set is empty"),
+            "{err}"
+        );
+        let _ = (eng.join(), ccx.join());
+    }
+
+    /// Engine responses for one artifact, in call order.
+    fn engine_artifact_script(
+        state: Value,
+        rel_out: Value,
+        rel_in: Value,
+        deps: Value,
+        pressure: Value,
+    ) -> Vec<(u16, String)> {
+        vec![ok(state), ok(rel_out), ok(rel_in), ok(deps), ok(pressure)]
+    }
+
+    #[test]
+    fn generate_parity_pack_writes_full_pack_when_sides_agree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = vec![ok(json!({ "tenant_id": "t1", "artifacts": [7] }))];
+        engine.extend(engine_artifact_script(
+            eng_state(true, "active", 2, 3, 0.9),
+            relations(&[(7, 8, "cites")]),
+            relations(&[]),
+            eng_dependents(&[("query", "q1", "2026-01-01T00:00:00Z")]),
+            eng_pressure(&[("e1", None)]),
+        ));
+        let (eng_port, eng) = serve_responses(engine);
+        let (ccx_port, ccx) = serve_responses(engine_artifact_script(
+            ccx_state(true, "active", 2, 3, 0.9),
+            relations(&[(7, 8, "cites")]),
+            relations(&[]),
+            ccx_dependents(&[("query", "q1", TS_MICROS)]),
+            ccx_pressure(&[("e1", 0)]),
+        ));
+
+        let result = generate_parity_pack(&pack_options(tmp.path(), eng_port, ccx_port, 1)).unwrap();
+        assert!(result.report.ok);
+        assert_eq!(result.report.checked, 1);
+        assert_eq!(result.report.mismatches, 0);
+        assert_eq!(result.report.critical_fails, 0);
+
+        assert!(std::path::Path::new(&result.manifest_path).exists());
+        assert!(std::path::Path::new(&result.report_path).exists());
+        // Compatibility alias consumed by the migration stage-gate scripts.
+        assert!(tmp.path().join("parity-pack-report.json").exists());
+        assert!(tmp.path().join("expected").join("s000001.json").exists());
+        assert!(tmp.path().join("actual").join("s000001.json").exists());
+
+        let samples = std::fs::read_to_string(&result.samples_path).unwrap();
+        let record: Value = serde_json::from_str(samples.lines().next().unwrap()).unwrap();
+        assert_eq!(record["sample_id"], "s000001");
+        assert_eq!(record["object_key"], "artifact:7");
+
+        let manifest: Value = serde_json::from_slice(&std::fs::read(&result.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["pack_type"], "parity_pack_v1");
+        assert_eq!(manifest["sample_size"], 1);
+        assert_eq!(manifest["window_hours"], 24);
+        assert_eq!(manifest["projection_versions"]["artifact_living_state"], "v1");
+
+        assert_eq!(eng.join().unwrap().len(), 6);
+        assert_eq!(ccx.join().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn generate_parity_pack_records_hash_mismatch_when_state_diverges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = vec![ok(json!({ "tenant_id": "t1", "artifacts": [7] }))];
+        engine.extend(engine_artifact_script(
+            eng_state(true, "active", 2, 3, 0.9),
+            relations(&[]),
+            relations(&[]),
+            eng_dependents(&[]),
+            eng_pressure(&[]),
+        ));
+        let (eng_port, eng) = serve_responses(engine);
+        let (ccx_port, ccx) = serve_responses(engine_artifact_script(
+            ccx_state(true, "stale", 2, 3, 0.9),
+            relations(&[]),
+            relations(&[]),
+            ccx_dependents(&[]),
+            ccx_pressure(&[]),
+        ));
+
+        let result = generate_parity_pack(&pack_options(tmp.path(), eng_port, ccx_port, 1)).unwrap();
+        assert!(!result.report.ok);
+        assert_eq!(result.report.mismatches, 1);
+        assert_eq!(result.report.critical_fails, 1);
+        let example = &result.report.mismatch_examples[0];
+        assert_eq!(example.sample_id, "s000001");
+        assert_eq!(example.projection_key, "artifact_living_state");
+        assert_eq!(example.drift_class, DRIFT_SOURCE_CHANGE);
+        assert_ne!(example.expected_hash, example.actual_hash);
+        assert!(example.detail.contains("artifact:7"), "{}", example.detail);
+        let _ = (eng.join(), ccx.join());
+    }
+
+    /// The two sides encode "open pressure event" differently (engine:
+    /// `resolved_at: null`; corecrux: `resolved_at_micros: 0`). Canonicalising
+    /// both to `pressure_open_count` is what makes them comparable — a real
+    /// divergence there must still change the hash.
+    #[test]
+    fn generate_parity_pack_detects_pressure_open_count_divergence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = vec![ok(json!({ "tenant_id": "t1", "artifacts": [7] }))];
+        engine.extend(engine_artifact_script(
+            eng_state(true, "active", 2, 3, 0.9),
+            relations(&[]),
+            relations(&[]),
+            eng_dependents(&[]),
+            eng_pressure(&[("e1", None), ("e2", Some("2026-02-01T00:00:00Z"))]),
+        ));
+        let (eng_port, eng) = serve_responses(engine);
+        let (ccx_port, ccx) = serve_responses(engine_artifact_script(
+            ccx_state(true, "active", 2, 3, 0.9),
+            relations(&[]),
+            relations(&[]),
+            ccx_dependents(&[]),
+            // Both resolved on the corecrux side => 0 open vs the engine's 1.
+            ccx_pressure(&[("e1", 5), ("e2", 6)]),
+        ));
+
+        let result = generate_parity_pack(&pack_options(tmp.path(), eng_port, ccx_port, 1)).unwrap();
+        assert!(!result.report.ok);
+        assert_eq!(result.report.mismatches, 1);
+
+        let expected: Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("expected/s000001.json")).unwrap()).unwrap();
+        let actual: Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("actual/s000001.json")).unwrap()).unwrap();
+        assert_eq!(expected["pressure_open_count"], 1);
+        assert_eq!(actual["pressure_open_count"], 0);
+        let _ = (eng.join(), ccx.join());
+    }
+
+    /// Guard against false positives: the canonical form sorts relations and
+    /// dependents, so a pure ordering difference between the two daemons must
+    /// NOT be reported as drift.
+    #[test]
+    fn generate_parity_pack_ignores_pure_ordering_differences() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = vec![ok(json!({ "tenant_id": "t1", "artifacts": [7] }))];
+        engine.extend(engine_artifact_script(
+            eng_state(true, "active", 2, 3, 0.9),
+            relations(&[(7, 8, "cites"), (7, 9, "cites")]),
+            relations(&[]),
+            eng_dependents(&[
+                ("query", "q1", "2026-01-01T00:00:00Z"),
+                ("query", "q2", "2026-01-01T00:00:00Z"),
+            ]),
+            eng_pressure(&[]),
+        ));
+        let (eng_port, eng) = serve_responses(engine);
+        let (ccx_port, ccx) = serve_responses(engine_artifact_script(
+            ccx_state(true, "active", 2, 3, 0.9),
+            relations(&[(7, 9, "cites"), (7, 8, "cites")]),
+            relations(&[]),
+            ccx_dependents(&[("query", "q2", TS_MICROS), ("query", "q1", TS_MICROS)]),
+            ccx_pressure(&[]),
+        ));
+
+        let result = generate_parity_pack(&pack_options(tmp.path(), eng_port, ccx_port, 1)).unwrap();
+        assert!(result.report.ok, "ordering-only difference reported as drift");
+        assert!(result.report.mismatch_examples.is_empty());
+        let _ = (eng.join(), ccx.join());
+    }
+
+    /// `--sample-size` larger than the candidate set must not fabricate
+    /// samples: the manifest records the *actual* sampled count.
+    #[test]
+    fn generate_parity_pack_manifest_records_actual_sample_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = vec![ok(json!({ "tenant_id": "t1", "artifacts": [7] }))];
+        engine.extend(engine_artifact_script(
+            eng_state(true, "active", 2, 3, 0.9),
+            relations(&[]),
+            relations(&[]),
+            eng_dependents(&[]),
+            eng_pressure(&[]),
+        ));
+        let (eng_port, eng) = serve_responses(engine);
+        let (ccx_port, ccx) = serve_responses(engine_artifact_script(
+            ccx_state(true, "active", 2, 3, 0.9),
+            relations(&[]),
+            relations(&[]),
+            ccx_dependents(&[]),
+            ccx_pressure(&[]),
+        ));
+
+        let result = generate_parity_pack(&pack_options(tmp.path(), eng_port, ccx_port, 8)).unwrap();
+        assert_eq!(result.report.checked, 1);
+        let manifest: Value = serde_json::from_slice(&std::fs::read(&result.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["sample_size"], 1);
+        let _ = (eng.join(), ccx.join());
+    }
+
+    #[test]
+    fn generate_parity_pack_propagates_engine_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (eng_port, eng) = serve_responses(vec![(500, "boom".to_string())]);
+        let (ccx_port, ccx) = serve_responses(vec![]);
+        let err = generate_parity_pack(&pack_options(tmp.path(), eng_port, ccx_port, 1)).unwrap_err();
+        assert!(err.to_string().starts_with("engine GET"), "{err}");
+        let _ = (eng.join(), ccx.join());
     }
 }

@@ -11,9 +11,8 @@
 //!    interval, expires_in}`. The client shows `user_code` + `verification_uri`
 //!    to the human and begins polling.
 //! 2. The human opens `/activate` (served by `console.rs`), authenticates as a
-//!    console admin, enters the `user_code`, and approves — choosing one tenant
-//!    plus a scope subset already held by that admin.
-//!    `POST /v1/auth/device/approve` records the attenuated choice.
+//!    console admin, enters the `user_code`, and approves — choosing the tenant +
+//!    scopes. `POST /v1/auth/device/approve` records the approver's choice.
 //! 3. `POST /v1/auth/device/token` (poll) → `authorization_pending` /
 //!    `slow_down` / `expired_token` / `access_denied`, or, once approved,
 //!    `{access_token, refresh_token, expires_in, scopes}`. The `device_code` is
@@ -24,29 +23,25 @@
 //! Security posture (see ExecPlan Risks):
 //! - **Phishing:** short `user_code` TTL; `/activate` shows the requesting client
 //!   name; approval is bound to an authenticated console admin (`admin:write`).
-//! - **Tenant leakage (T.1):** the issued `tenant_id` + scopes are a concrete
-//!   subset of the authenticated approver's verified grants, never authority
-//!   supplied by the polling client or approval form.
-//! - **Availability:** every device-auth request has a route-local body cap;
-//!   client labels and the process-local grant/refresh registries are bounded.
+//! - **Tenant leakage (T.1):** the issued `tenant_id` + scopes come from the
+//!   *approver*, never from the polling client.
 //! - Gated behind `CORECRUXD_DEVICE_GRANT_ENABLED` (default off) ⇒ 404 disabled.
 //!
-//! Known limitation (M3): pending grants and refresh credentials live in a
-//! process-local registry — a daemon restart invalidates them. Persisting +
-//! externalising revocation is tracked for M5 hardening.
+//! Durability (ExecPlan `crux-hosted-relay-gateway-2026-07-30`, M1): refresh
+//! credentials — and their revocations — persist across restarts as private
+//! facts; see the durable-credentials section below. Pending `device_code`
+//! grants remain process-local by design: they live 600s, and losing an
+//! in-flight pairing to a restart is benign because the operator simply re-runs
+//! the command.
 
-use std::collections::{BTreeSet, HashMap};
-use std::net::{IpAddr, SocketAddr};
+use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::ConnectInfo;
 use base64::Engine as _;
 use rand::Rng as _; // brings `fill_bytes` into scope (matches repo idiom)
-use subtle::ConstantTimeEq as _;
 
 use super::auth_rails::{env_flag_enabled, ISSUED_TOKEN_TTL_SECS};
-use crate::auth::HttpScopeContext;
 use crux_mcp::tools::loopback_auth::{mint_scoped_jwt_from_env, ScopedClaims};
 
 use super::*;
@@ -57,20 +52,6 @@ const DEVICE_ENABLED_ENV: &str = "CORECRUXD_DEVICE_GRANT_ENABLED";
 const DEVICE_CODE_TTL_SECS: u64 = 600;
 /// Minimum seconds a client must wait between polls (RFC 8628 `interval`).
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
-/// Route-local body cap for every public device-auth request.
-pub(super) const DEVICE_AUTH_MAX_REQUEST_BYTES: usize = 16 * 1024;
-/// Maximum UTF-8 byte length of the client label rendered on `/activate`.
-const MAX_CLIENT_NAME_BYTES: usize = 256;
-/// Hard cap on pending grants from one ingress-resolved effective client IP.
-const MAX_PENDING_DEVICE_GRANTS_PER_IP: usize = 16;
-/// Hard cap on pending grants across all effective client IPs.
-const MAX_PENDING_DEVICE_GRANTS: usize = 1_024;
-/// Hard cap on all live device-code rows. Expired rows are pruned before admission.
-const MAX_DEVICE_GRANTS_TOTAL: usize = 4_096;
-/// Hard cap on active refresh credentials. Revoked rows are pruned before admission.
-const MAX_REFRESH_CREDENTIALS: usize = 4_096;
-/// Absolute lifetime of a device refresh credential (90 days).
-const REFRESH_CREDENTIAL_TTL_SECS: u64 = 90 * 24 * 60 * 60;
 /// Unambiguous user-code alphabet (no 0/O/1/I).
 const USER_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
@@ -88,26 +69,43 @@ enum GrantState {
     Pending,
     Approved { tenant_id: String, scopes: Vec<String> },
     Denied,
+    Consumed,
 }
 
 #[derive(Debug, Clone)]
 struct DeviceGrant {
     user_code: String,
     client_name: String,
-    request_ip: IpAddr,
     expires_at: u64,
     last_poll: u64,
     interval: u64,
     state: GrantState,
 }
 
+/// A long-lived refresh credential.
+///
+/// The secret is held **hashed**, never in clear. Two reasons, and the second is
+/// why this changed: BLAKE3 `Hash` compares in constant time (byte arrays and
+/// slices do not — blake3 documents exactly this hazard), and durable storage
+/// means the value now reaches disk. Writing a bearer secret to the fact store
+/// in clear would turn a process-local exposure into a persistent one.
+///
+/// A plain hash rather than a slow KDF is correct here: the secret is 32 bytes
+/// of CSPRNG output, not a user-chosen password, so there is nothing to
+/// brute-force and no salt to add.
 #[derive(Debug, Clone)]
 struct RefreshCred {
     tenant_id: String,
     scopes: Vec<String>,
-    secret: String,
-    expires_at: u64,
+    secret_hash: blake3::Hash,
     revoked: bool,
+}
+
+impl RefreshCred {
+    /// Constant-time check of a presented secret.
+    fn secret_matches(&self, presented: &str) -> bool {
+        self.secret_hash == blake3::hash(presented.as_bytes())
+    }
 }
 
 #[derive(Default)]
@@ -119,15 +117,219 @@ struct DeviceRegistry {
 
 static REGISTRY: LazyLock<Mutex<DeviceRegistry>> = LazyLock::new(|| Mutex::new(DeviceRegistry::default()));
 
+// ── durable refresh credentials (ExecPlan crux-hosted-relay-gateway M1) ─────
+//
+// Pending `device_code` grants stay process-local on purpose: they live 600s and
+// losing an in-flight pairing to a restart is benign — the operator re-runs the
+// command. Refresh credentials are the opposite: they ARE the paired device, and
+// losing them silently unpaired every device on every restart.
+//
+// These persist as *private* facts (never pushed to a remote by sync) under a
+// reserved entity prefix, reusing the existing fact-store path rather than
+// introducing a new on-disk artifact type — which would require the three-place
+// wiring (storage allowlist, projection registry, load-at-startup) and give a
+// quarantine-on-restart bug class for no benefit.
+
+/// Reserved entity prefix for persisted refresh credentials.
+const DEVICE_CRED_ENTITY_PREFIX: &str = "__device_creds__";
+const DEVICE_CRED_KEY: &str = "cred";
+
+fn cred_entity(cred_id: &str) -> String {
+    format!("{DEVICE_CRED_ENTITY_PREFIX}::{cred_id}")
+}
+
+/// On-disk shape. `secret_hash` is hex of the BLAKE3 hash — the clear secret is
+/// never serialised.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedCred {
+    cred_id: String,
+    tenant_id: String,
+    scopes: Vec<String>,
+    secret_hash: String,
+    revoked: bool,
+}
+
+impl PersistedCred {
+    fn from_cred(cred_id: &str, cred: &RefreshCred) -> Self {
+        Self {
+            cred_id: cred_id.to_string(),
+            tenant_id: cred.tenant_id.clone(),
+            scopes: cred.scopes.clone(),
+            secret_hash: cred.secret_hash.to_hex().to_string(),
+            revoked: cred.revoked,
+        }
+    }
+
+    fn into_cred(self) -> Option<(String, RefreshCred)> {
+        let mut raw = [0u8; blake3::OUT_LEN];
+        hex::decode_to_slice(&self.secret_hash, &mut raw).ok()?;
+        Some((
+            self.cred_id,
+            RefreshCred {
+                tenant_id: self.tenant_id,
+                scopes: self.scopes,
+                secret_hash: blake3::Hash::from(raw),
+                revoked: self.revoked,
+            },
+        ))
+    }
+}
+
+/// Write one credential through to the fact store.
+///
+/// Persistence failure is **not** silent: issuing a credential the daemon cannot
+/// remember would hand the caller a token that dies at the next restart, so the
+/// caller treats `false` as a failed issuance rather than logging and continuing.
+async fn persist_cred(state: &AppState, cred_id: &str, cred: &RefreshCred) -> bool {
+    let mut store = state.fact_store.write().await;
+    persist_cred_in(&mut store, cred_id, cred)
+}
+
+/// Store-facing half of [`persist_cred`], split out so the durability
+/// behaviour is unit-testable against a bare `FactStore` without standing up an
+/// `AppState`.
+fn persist_cred_in(store: &mut corecrux_memory::FactStore, cred_id: &str, cred: &RefreshCred) -> bool {
+    let record = PersistedCred::from_cred(cred_id, cred);
+    let Ok(value) = serde_json::to_string(&record) else {
+        return false;
+    };
+    store.store(corecrux_memory::fact_store::StoreFact {
+        tenant_hash: cred.tenant_id.clone(),
+        entity: cred_entity(cred_id),
+        key: DEVICE_CRED_KEY.to_string(),
+        value,
+        source_receipt: None,
+        confidence: 1.0,
+        // Never leaves this machine, and never decays: a credential that
+        // "grew stale" and dropped out of recall would silently unpair a device.
+        private: true,
+        horizon_class: Some(corecrux_memory::fact_store::HorizonClass::None),
+        actor: None,
+    });
+    true
+}
+
+/// Rehydrate the in-memory registry from the fact store.
+///
+/// Called once at daemon startup — this is the load-at-startup leg that makes a
+/// paired device survive a restart.
+pub(crate) async fn hydrate_refresh_credentials(state: &AppState) -> usize {
+    // Credentials are not a ranked recall surface: take the whole set, so a
+    // large fleet is never silently truncated into a partial unpair.
+    let query = cred_query();
+    let facts = {
+        let store = state.fact_store.read().await;
+        store.query(&query).facts
+    };
+    let creds = decode_creds(facts);
+    let Ok(mut reg) = REGISTRY.lock() else {
+        tracing::warn!("device registry unavailable; refresh credentials not hydrated");
+        return 0;
+    };
+    let loaded = creds.len();
+    for (cred_id, cred) in creds {
+        reg.refresh.insert(cred_id, cred);
+    }
+    if loaded > 0 {
+        tracing::info!(count = loaded, "hydrated device refresh credentials");
+    }
+    loaded
+}
+
+/// Decode persisted credential facts, skipping (and logging) any that are
+/// unreadable. Split out so round-tripping is unit-testable; an unreadable row
+/// must never abort the whole hydration, or one corrupt record would unpair the
+/// entire fleet.
+fn decode_creds(facts: Vec<corecrux_memory::Fact>) -> Vec<(String, RefreshCred)> {
+    // The fact store is versioned: re-storing an (entity, key) appends a new
+    // version rather than replacing, so a revoked credential is still present
+    // in the query result *alongside* its pre-revocation version. Taking them
+    // in arbitrary order would let a restart resurrect a revoked credential.
+    //
+    // Two defences, deliberately belt-and-braces because the failure direction
+    // is "revoked device works again":
+    //   1. keep only the highest `version` per credential, ignoring tombstones;
+    //   2. make revocation STICKY — if any version says revoked, the credential
+    //      is revoked, whatever the newest one claims. Revocation can then never
+    //      be undone by an ordering quirk, a clock skew, or a replayed record.
+    let mut newest: HashMap<String, (u32, RefreshCred)> = HashMap::new();
+    let mut revoked_ever: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for fact in facts
+        .into_iter()
+        .filter(|fact| fact.key == DEVICE_CRED_KEY && !fact.deleted)
+    {
+        let Ok(Some((cred_id, cred))) =
+            serde_json::from_str::<PersistedCred>(&fact.value).map(PersistedCred::into_cred)
+        else {
+            tracing::warn!(entity = %fact.entity, "skipping unreadable device credential");
+            continue;
+        };
+        if cred.revoked {
+            revoked_ever.insert(cred_id.clone());
+        }
+        match newest.get(&cred_id) {
+            Some((seen, _)) if *seen >= fact.version => {}
+            _ => {
+                newest.insert(cred_id, (fact.version, cred));
+            }
+        }
+    }
+
+    newest
+        .into_iter()
+        .map(|(cred_id, (_, mut cred))| {
+            if revoked_ever.contains(&cred_id) {
+                cred.revoked = true;
+            }
+            (cred_id, cred)
+        })
+        .collect()
+}
+
+/// Device ids currently paired with this daemon for `tenant`, revoked ones
+/// excluded, in a stable order.
+///
+/// This is "every registered device" for a daemon the customer runs themselves —
+/// escrow release notifications go here (ExecPlan
+/// `crux-key-escrow-and-recovery-2026-07-31`, M3b). Deliberately local: reaching
+/// for a hosted registry would make key recovery depend on a network the
+/// customer may have just lost access to.
+///
+/// A poisoned registry lock yields an empty list rather than a panic. The
+/// consequence is visible in the receipt chain — a release with no `Notified`
+/// events shows plainly that nobody could have cancelled it.
+pub(super) fn paired_device_ids(tenant: &str) -> Vec<String> {
+    let Ok(reg) = REGISTRY.lock() else {
+        tracing::warn!("device registry unavailable; escrow release will notify nobody");
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = reg
+        .refresh
+        .iter()
+        .filter(|(_, cred)| !cred.revoked && cred.tenant_id == tenant)
+        .map(|(cred_id, _)| cred_id.clone())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// Query used by both the live hydrate path and its tests.
+fn cred_query() -> corecrux_memory::fact_store::FactQuery {
+    corecrux_memory::fact_store::FactQuery {
+        entity_prefix: Some(DEVICE_CRED_ENTITY_PREFIX.to_string()),
+        top_k: usize::MAX,
+        ..Default::default()
+    }
+}
+
 impl DeviceRegistry {
-    /// Drop every expired grant (and its user-code index entry). Successfully
-    /// issued grants are removed immediately, so replay and expiry share the
-    /// same non-enumerating `expired_token` response.
+    /// Drop expired pending grants (and their user-code index entries).
     fn prune(&mut self, now: u64) {
         let expired: Vec<String> = self
             .grants
             .iter()
-            .filter(|(_, g)| now > g.expires_at)
+            .filter(|(_, g)| now > g.expires_at && g.state != GrantState::Consumed)
             .map(|(k, _)| k.clone())
             .collect();
         for device_code in expired {
@@ -136,55 +338,7 @@ impl DeviceRegistry {
             }
         }
     }
-
-    fn insert_grant(&mut self, device_code: String, grant: DeviceGrant, now: u64) -> Result<(), RegistryCapacityError> {
-        self.prune(now);
-        if self.grants.len() >= MAX_DEVICE_GRANTS_TOTAL {
-            return Err(RegistryCapacityError);
-        }
-        let pending_total = self
-            .grants
-            .values()
-            .filter(|existing| matches!(existing.state, GrantState::Pending))
-            .count();
-        if pending_total >= MAX_PENDING_DEVICE_GRANTS {
-            return Err(RegistryCapacityError);
-        }
-        let pending_for_ip = self
-            .grants
-            .values()
-            .filter(|existing| existing.request_ip == grant.request_ip && matches!(existing.state, GrantState::Pending))
-            .count();
-        if pending_for_ip >= MAX_PENDING_DEVICE_GRANTS_PER_IP {
-            return Err(RegistryCapacityError);
-        }
-        self.by_user_code.insert(grant.user_code.clone(), device_code.clone());
-        self.grants.insert(device_code, grant);
-        Ok(())
-    }
-
-    fn insert_refresh_credential(
-        &mut self,
-        cred_id: String,
-        credential: RefreshCred,
-        now: u64,
-    ) -> Result<(), RegistryCapacityError> {
-        self.prune_refresh_credentials(now);
-        if self.refresh.len() >= MAX_REFRESH_CREDENTIALS || self.refresh.contains_key(&cred_id) {
-            return Err(RegistryCapacityError);
-        }
-        self.refresh.insert(cred_id, credential);
-        Ok(())
-    }
-
-    fn prune_refresh_credentials(&mut self, now: u64) {
-        self.refresh
-            .retain(|_, credential| !credential.revoked && now < credential.expires_at);
-    }
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RegistryCapacityError;
 
 // ── code generation ────────────────────────────────────────────────────────
 
@@ -219,9 +373,9 @@ enum PollDecision {
     Issue { tenant_id: String, scopes: Vec<String> },
 }
 
-/// Advance the poll state machine for one `device/token` call. This mutates
-/// only `last_poll`; an approved grant is retired atomically with refresh
-/// credential insertion by [`issue_approved_grant`].
+/// Advance the poll state machine for one `device/token` call. Mutates the
+/// grant's `last_poll` and (on issue) marks it `Consumed` so the `device_code`
+/// is one-time. Pure w.r.t. the clock for deterministic tests.
 fn decide_poll(grant: &mut DeviceGrant, now: u64) -> PollDecision {
     if now > grant.expires_at {
         return PollDecision::Expired;
@@ -235,10 +389,15 @@ fn decide_poll(grant: &mut DeviceGrant, now: u64) -> PollDecision {
     match &grant.state {
         GrantState::Pending => PollDecision::Pending,
         GrantState::Denied => PollDecision::Denied,
-        GrantState::Approved { tenant_id, scopes } => PollDecision::Issue {
-            tenant_id: tenant_id.clone(),
-            scopes: scopes.clone(),
-        },
+        GrantState::Consumed => PollDecision::Expired, // one-time: replay rejected
+        GrantState::Approved { tenant_id, scopes } => {
+            let decision = PollDecision::Issue {
+                tenant_id: tenant_id.clone(),
+                scopes: scopes.clone(),
+            };
+            grant.state = GrantState::Consumed;
+            decision
+        }
     }
 }
 
@@ -257,37 +416,6 @@ fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
         .into_response()
 }
 
-fn oauth_retryable_error(status: StatusCode, error: &str, description: &str, retry_after_secs: u64) -> Response {
-    let mut response = oauth_error(status, error, description);
-    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
-        response.headers_mut().insert(header::RETRY_AFTER, value);
-    }
-    response
-}
-
-fn normalize_client_name(client_name: Option<String>) -> Result<String, &'static str> {
-    let normalized = client_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .unwrap_or("unknown client");
-    if normalized.len() > MAX_CLIENT_NAME_BYTES || normalized.chars().any(char::is_control) {
-        return Err("client_name must be at most 256 UTF-8 bytes and contain no control characters");
-    }
-    Ok(normalized.to_string())
-}
-
-fn device_request_ip(state: &AppState, headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
-    let trusted_proxy_cidrs = state
-        .session
-        .as_ref()
-        .map(|services| super::ingress::parse_trusted_proxy_cidrs(&services.policy.trusted_proxy_cidrs))
-        .unwrap_or_default();
-    super::ingress::effective_client_ip(headers, Some(peer.ip()), &trusted_proxy_cidrs)
-        .key_ip
-        .unwrap_or_else(|| peer.ip())
-}
-
 // ── handlers ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -302,8 +430,7 @@ pub(super) struct DeviceStartReq {
 
 #[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_device_start(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(_state): State<AppState>,
     headers: HeaderMap,
     body: Option<Json<DeviceStartReq>>,
 ) -> Response {
@@ -314,11 +441,11 @@ pub(super) async fn post_device_start(
     let now = now_secs();
     let device_code = random_token_b64(32);
     let user_code = random_user_code();
-    let request_ip = device_request_ip(&state, &headers, peer);
-    let client_name = match normalize_client_name(req.client_name) {
-        Ok(client_name) => client_name,
-        Err(description) => return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", description),
-    };
+    let client_name = req
+        .client_name
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown client".to_string());
 
     let verification_uri = activate_uri(&headers);
     let verification_uri_complete = format!("{verification_uri}?user_code={user_code}");
@@ -326,7 +453,6 @@ pub(super) async fn post_device_start(
     let grant = DeviceGrant {
         user_code: user_code.clone(),
         client_name,
-        request_ip,
         expires_at: now + DEVICE_CODE_TTL_SECS,
         last_poll: 0,
         interval: DEFAULT_POLL_INTERVAL_SECS,
@@ -336,14 +462,9 @@ pub(super) async fn post_device_start(
         let Ok(mut reg) = REGISTRY.lock() else {
             return problem_response(StatusCode::INTERNAL_SERVER_ERROR, "device registry unavailable");
         };
-        if reg.insert_grant(device_code.clone(), grant, now).is_err() {
-            return oauth_retryable_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "temporarily_unavailable",
-                "device authorization capacity reached; retry after existing codes expire",
-                DEFAULT_POLL_INTERVAL_SECS,
-            );
-        }
+        reg.prune(now);
+        reg.by_user_code.insert(user_code.clone(), device_code.clone());
+        reg.grants.insert(device_code.clone(), grant);
     }
     (
         StatusCode::OK,
@@ -378,112 +499,13 @@ fn activate_uri(headers: &HeaderMap) -> String {
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct DeviceApproveReq {
     pub user_code: String,
-    /// Desired tenant. The server requires it to be inside the approver's
-    /// verified tenant grant.
+    /// Tenant the issued token will be bound to (approver-chosen — T.1).
     pub tenant_id: String,
-    /// Desired scopes. The server rejects any scope the approver does not hold.
+    /// Scopes the approver grants.
     pub scopes: Vec<String>,
     /// Set true to deny instead of approve.
     #[serde(default)]
     pub deny: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AttenuatedDeviceGrant {
-    tenant_id: String,
-    scopes: Vec<String>,
-}
-
-#[allow(clippy::result_large_err)]
-fn require_device_approver(context: &HttpScopeContext) -> Result<(), ProblemResponse> {
-    if !context.auth_enforced() {
-        return Err(ProblemResponse(
-            corecrux_types::ProblemDetails::forbidden("device approval requires enforced HTTP authentication")
-                .with_extensions(serde_json::json!({
-                    "code": "DEVICE_APPROVER_AUTH_REQUIRED",
-                })),
-        ));
-    }
-    if !context.has_scope("admin:write") {
-        return Err(ProblemResponse(
-            corecrux_types::ProblemDetails::forbidden("insufficient scopes").with_extensions(serde_json::json!({
-                "code": "MISSING_SCOPE",
-                "missingScopes": ["admin:write"],
-            })),
-        ));
-    }
-    // DevScopes is an explicit local-development rail. In production JWT
-    // modes, device approval is a human delegation boundary: an automation
-    // token, a device token (no canonical passport), a sub-only JWT, or an
-    // admin passport-header override must not mint a fresh credential chain.
-    if !context.local_unverified_identity()
-        && (context.credential_is_agent_token()
-            || context.passport_override_used()
-            || !context.canonical_passport_claim_verified())
-    {
-        return Err(ProblemResponse(
-            corecrux_types::ProblemDetails::forbidden(
-                "device approval requires the bearer token's canonical human passport",
-            )
-            .with_extensions(serde_json::json!({
-                "code": "DEVICE_APPROVER_HUMAN_REQUIRED",
-            })),
-        ));
-    }
-    Ok(())
-}
-
-/// Resolve one concrete tenant and a canonical scope subset from the verified
-/// approver context. Approval is delegation, not a fresh authority source:
-/// `admin:write` permits the decision but does not widen tenant or scope.
-#[allow(clippy::result_large_err)]
-fn attenuate_device_grant(
-    context: &HttpScopeContext,
-    requested_tenant: &str,
-    requested_scopes: &[String],
-) -> Result<AttenuatedDeviceGrant, ProblemResponse> {
-    require_device_approver(context)?;
-
-    let requested_tenant = requested_tenant.trim();
-    if requested_tenant.is_empty() || requested_tenant == "*" {
-        return Err(ProblemResponse(corecrux_types::ProblemDetails::bad_request(
-            "one concrete tenant_id is required to approve a device grant",
-        )));
-    }
-    let tenant_id = context.resolve_authorized_tenant(Some(requested_tenant))?;
-
-    let scopes: BTreeSet<String> = requested_scopes
-        .iter()
-        .map(|scope| scope.trim())
-        .filter(|scope| !scope.is_empty())
-        .map(str::to_string)
-        .collect();
-    if scopes.is_empty() {
-        return Err(ProblemResponse(corecrux_types::ProblemDetails::bad_request(
-            "at least one scope is required to approve",
-        )));
-    }
-
-    let unauthorized_scopes: Vec<String> = scopes
-        .iter()
-        .filter(|scope| !context.has_scope(scope))
-        .cloned()
-        .collect();
-    if !unauthorized_scopes.is_empty() {
-        return Err(ProblemResponse(
-            corecrux_types::ProblemDetails::forbidden("device grant scopes exceed approver authority").with_extensions(
-                serde_json::json!({
-                    "code": "DEVICE_GRANT_SCOPE_WIDENING",
-                    "unauthorizedScopes": unauthorized_scopes,
-                }),
-            ),
-        ));
-    }
-
-    Ok(AttenuatedDeviceGrant {
-        tenant_id,
-        scopes: scopes.into_iter().collect(),
-    })
 }
 
 #[tracing::instrument(level = "info", skip_all)]
@@ -495,24 +517,27 @@ pub(super) async fn post_device_approve(
     if !env_flag_enabled(DEVICE_ENABLED_ENV) {
         return device_disabled_response();
     }
-    // Approval is delegation by an authenticated admin, not authority supplied
-    // by this request body.
-    let context = match http_scope_context(&state.auth, &headers) {
-        Ok(context) => context,
-        Err(problem) => return problem.into_response(),
-    };
-    if let Err(problem) = require_device_approver(&context) {
+    // Approval is an admin action — bind to an authenticated console admin.
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let user_code = req.user_code.trim().to_ascii_uppercase();
-    let approved = if req.deny {
-        None
-    } else {
-        match attenuate_device_grant(&context, &req.tenant_id, &req.scopes) {
-            Ok(grant) => Some(grant),
-            Err(problem) => return problem.into_response(),
-        }
-    };
+    let tenant_id = req.tenant_id.trim().to_string();
+    if tenant_id.is_empty() {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "tenant_id is required to approve a device grant",
+        );
+    }
+    let scopes: Vec<String> = req
+        .scopes
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !req.deny && scopes.is_empty() {
+        return problem_response(StatusCode::BAD_REQUEST, "at least one scope is required to approve");
+    }
 
     let now = now_secs();
     let Ok(mut reg) = REGISTRY.lock() else {
@@ -529,9 +554,13 @@ pub(super) async fn post_device_approve(
         return problem_response(StatusCode::CONFLICT, "device grant is no longer pending");
     }
     let client_name = grant.client_name.clone();
-    grant.state = match approved {
-        None => GrantState::Denied,
-        Some(AttenuatedDeviceGrant { tenant_id, scopes }) => GrantState::Approved { tenant_id, scopes },
+    grant.state = if req.deny {
+        GrantState::Denied
+    } else {
+        GrantState::Approved {
+            tenant_id: tenant_id.clone(),
+            scopes: scopes.clone(),
+        }
     };
     (
         StatusCode::OK,
@@ -551,27 +580,28 @@ pub(super) struct DeviceTokenReq {
 }
 
 #[tracing::instrument(level = "info", skip_all)]
-pub(super) async fn post_device_token(State(_state): State<AppState>, Json(req): Json<DeviceTokenReq>) -> Response {
+pub(super) async fn post_device_token(State(state): State<AppState>, Json(req): Json<DeviceTokenReq>) -> Response {
     if !env_flag_enabled(DEVICE_ENABLED_ENV) {
         return device_disabled_response();
     }
     let now = now_secs();
-    // The local JWT mint, refresh insertion, and grant retirement share one
-    // registry critical section. Any failure leaves Approved retryable instead
-    // of burning the one-time code.
-    let Ok(mut reg) = REGISTRY.lock() else {
-        return problem_response(StatusCode::INTERNAL_SERVER_ERROR, "device registry unavailable");
+    // Decide under the lock, then mint outside it.
+    let decision = {
+        let Ok(mut reg) = REGISTRY.lock() else {
+            return problem_response(StatusCode::INTERNAL_SERVER_ERROR, "device registry unavailable");
+        };
+        reg.prune(now);
+        let Some(grant) = reg.grants.get_mut(&req.device_code) else {
+            // Unknown device_code: treat as expired (also covers pruned codes).
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "expired_token",
+                "unknown or expired device_code",
+            );
+        };
+        decide_poll(grant, now)
     };
-    reg.prune(now);
-    let Some(grant) = reg.grants.get_mut(&req.device_code) else {
-        // Unknown device_code: treat as expired (also covers pruned/consumed codes).
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "expired_token",
-            "unknown or expired device_code",
-        );
-    };
-    let decision = decide_poll(grant, now);
+
     match decision {
         PollDecision::SlowDown => oauth_error(StatusCode::BAD_REQUEST, "slow_down", "poll interval not yet elapsed"),
         PollDecision::Pending => oauth_error(
@@ -585,124 +615,60 @@ pub(super) async fn post_device_token(State(_state): State<AppState>, Json(req):
             "expired_token",
             "the device_code has expired or was already used",
         ),
-        PollDecision::Issue { .. } => {
-            let issued = issue_approved_grant(&mut reg, &req.device_code, now, |cred_id, tenant_id, scopes| {
-                let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
-                let sub = format!("device:{cred_id}");
-                mint_scoped_jwt_from_env(&ScopedClaims {
-                    sub: &sub,
-                    passport_id: None,
-                    scopes: &scope_refs,
-                    tenant_id,
-                    ttl_secs: ISSUED_TOKEN_TTL_SECS,
-                })
-            });
-            match issued {
-                Ok(issued) => issued_device_tokens_response(issued),
-                Err(DeviceIssueError::MintUnavailable) => problem_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "token issuance requires CORECRUXD_JWT_HS256_SECRET (run the daemon in jwt_hs256 mode)",
-                ),
-                Err(DeviceIssueError::RefreshCapacity) => oauth_retryable_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "temporarily_unavailable",
-                    "device refresh credential capacity reached; revoke an existing login and retry",
-                    DEFAULT_POLL_INTERVAL_SECS,
-                ),
-                Err(DeviceIssueError::GrantUnavailable) => problem_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "approved device grant disappeared during token issuance",
-                ),
-            }
-        }
+        PollDecision::Issue { tenant_id, scopes } => issue_device_tokens(&state, &tenant_id, &scopes).await,
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct IssuedDeviceTokens {
-    access_token: String,
-    refresh_token: String,
-    tenant_id: String,
-    scopes: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeviceIssueError {
-    GrantUnavailable,
-    MintUnavailable,
-    RefreshCapacity,
-}
-
-/// Mint and commit one approved grant while the caller holds the registry
-/// lock. T.1: tenant/scopes were attenuated against the approver before they
-/// reached the registry. The grant remains Approved on every error.
-fn issue_approved_grant<F>(
-    reg: &mut DeviceRegistry,
-    device_code: &str,
-    now: u64,
-    mint: F,
-) -> Result<IssuedDeviceTokens, DeviceIssueError>
-where
-    F: FnOnce(&str, &str, &[String]) -> Option<String>,
-{
-    let (user_code, tenant_id, scopes) = match reg.grants.get(device_code) {
-        Some(DeviceGrant {
-            user_code,
-            state: GrantState::Approved { tenant_id, scopes },
-            ..
-        }) => (user_code.clone(), tenant_id.clone(), scopes.clone()),
-        _ => return Err(DeviceIssueError::GrantUnavailable),
-    };
-    reg.prune_refresh_credentials(now);
-    if reg.refresh.len() >= MAX_REFRESH_CREDENTIALS {
-        return Err(DeviceIssueError::RefreshCapacity);
-    }
+/// Mint an access token + create a revocable refresh credential for an approved
+/// grant. T.1: `tenant_id`/`scopes` are the approver's, passed in here.
+async fn issue_device_tokens(state: &AppState, tenant_id: &str, scopes: &[String]) -> Response {
+    let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
     let cred_id = uuid::Uuid::new_v4().simple().to_string();
-    if reg.refresh.contains_key(&cred_id) {
-        return Err(DeviceIssueError::RefreshCapacity);
-    }
-    let Some(access_token) = mint(&cred_id, &tenant_id, &scopes) else {
-        return Err(DeviceIssueError::MintUnavailable);
+    let sub = format!("device:{cred_id}");
+    let claims = ScopedClaims {
+        sub: &sub,
+        scopes: &scope_refs,
+        tenant_id,
+        ttl_secs: ISSUED_TOKEN_TTL_SECS,
+    };
+    let Some(access_token) = mint_scoped_jwt_from_env(&claims) else {
+        return problem_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "token issuance requires CORECRUXD_JWT_HS256_SECRET (run the daemon in jwt_hs256 mode)",
+        );
     };
     let secret = random_token_b64(32);
     let refresh_token = format!("{cred_id}.{secret}");
-    reg.insert_refresh_credential(
-        cred_id.clone(),
-        RefreshCred {
-            tenant_id: tenant_id.clone(),
-            scopes: scopes.clone(),
-            secret,
-            expires_at: now.saturating_add(REFRESH_CREDENTIAL_TTL_SECS),
-            revoked: false,
-        },
-        now,
-    )
-    .map_err(|_| DeviceIssueError::RefreshCapacity)?;
-    let removed = reg.grants.remove(device_code);
-    if removed.is_none() {
-        reg.refresh.remove(&cred_id);
-        return Err(DeviceIssueError::GrantUnavailable);
+    let cred = RefreshCred {
+        tenant_id: tenant_id.to_string(),
+        scopes: scopes.to_vec(),
+        secret_hash: blake3::hash(secret.as_bytes()),
+        revoked: false,
+    };
+    // Persist BEFORE publishing the credential to the caller. Issuing first and
+    // persisting after would hand out a token that silently stops working at the
+    // next restart — the exact failure this milestone exists to remove.
+    if !persist_cred(state, &cred_id, &cred).await {
+        return problem_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not persist the refresh credential; no token issued",
+        );
     }
-    reg.by_user_code.remove(&user_code);
-    Ok(IssuedDeviceTokens {
-        access_token,
-        refresh_token,
-        tenant_id,
-        scopes,
-    })
-}
-
-fn issued_device_tokens_response(issued: IssuedDeviceTokens) -> Response {
+    {
+        let Ok(mut reg) = REGISTRY.lock() else {
+            return problem_response(StatusCode::INTERNAL_SERVER_ERROR, "device registry unavailable");
+        };
+        reg.refresh.insert(cred_id, cred);
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "access_token": issued.access_token,
+            "access_token": access_token,
             "token_type": "Bearer",
             "expires_in": ISSUED_TOKEN_TTL_SECS,
-            "refresh_token": issued.refresh_token,
-            "refresh_expires_in": REFRESH_CREDENTIAL_TTL_SECS,
-            "scopes": issued.scopes,
-            "tenant_id": issued.tenant_id,
+            "refresh_token": refresh_token,
+            "scopes": scopes,
+            "tenant_id": tenant_id,
             "rail": "device",
         })),
     )
@@ -714,98 +680,11 @@ pub(super) struct RefreshReq {
     pub refresh_token: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RefreshedDeviceAccess {
-    access_token: String,
-    tenant_id: String,
-    scopes: Vec<String>,
-    refresh_expires_in: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RefreshAccessError {
-    RegistryUnavailable,
-    Unknown,
-    Revoked,
-    Expired,
-    IssuanceUnavailable,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RegistryUnavailable;
-
 /// Split a `cred_id.secret` refresh token into its parts.
 fn split_refresh(token: &str) -> Option<(&str, &str)> {
     token
         .split_once('.')
         .filter(|(id, secret)| !id.is_empty() && !secret.is_empty())
-}
-
-fn refresh_secrets_match(stored: &str, presented: &str) -> bool {
-    bool::from(stored.as_bytes().ct_eq(presented.as_bytes()))
-}
-
-/// Validate and mint while holding the credential registry lock. This gives
-/// refresh and revoke one ordering boundary: when revoke returns, no refresh
-/// that validated before it can still enter token issuance afterwards.
-fn refresh_device_credential<F>(
-    registry: &Mutex<DeviceRegistry>,
-    cred_id: &str,
-    secret: &str,
-    now: u64,
-    mint: F,
-) -> Result<RefreshedDeviceAccess, RefreshAccessError>
-where
-    F: FnOnce(&str, &[String]) -> Option<String>,
-{
-    let mut reg = registry.lock().map_err(|_| RefreshAccessError::RegistryUnavailable)?;
-    let Some(credential) = reg.refresh.get(cred_id) else {
-        return Err(RefreshAccessError::Unknown);
-    };
-    // Check the bearer secret before exposing whether a known credential has
-    // been revoked. The access-token subject discloses only `cred_id`.
-    if !refresh_secrets_match(&credential.secret, secret) {
-        return Err(RefreshAccessError::Unknown);
-    }
-    if credential.revoked {
-        return Err(RefreshAccessError::Revoked);
-    }
-    let tenant_id = credential.tenant_id.clone();
-    let scopes = credential.scopes.clone();
-    let expires_at = credential.expires_at;
-    if now >= expires_at {
-        reg.refresh.remove(cred_id);
-        return Err(RefreshAccessError::Expired);
-    }
-    let access_token = mint(&tenant_id, &scopes).ok_or(RefreshAccessError::IssuanceUnavailable)?;
-    let refreshed = RefreshedDeviceAccess {
-        access_token,
-        tenant_id,
-        scopes,
-        refresh_expires_in: expires_at.saturating_sub(now),
-    };
-    drop(reg);
-    Ok(refreshed)
-}
-
-/// RFC 7009-style idempotent revocation: unknown and incorrectly authenticated
-/// credentials both report `false`, and neither changes registry state.
-fn revoke_refresh_credential(
-    registry: &Mutex<DeviceRegistry>,
-    cred_id: &str,
-    secret: &str,
-) -> Result<bool, RegistryUnavailable> {
-    let mut reg = registry.lock().map_err(|_| RegistryUnavailable)?;
-    let authenticated = reg
-        .refresh
-        .get(cred_id)
-        .is_some_and(|credential| refresh_secrets_match(&credential.secret, secret));
-    if authenticated {
-        reg.refresh.remove(cred_id);
-        Ok(true)
-    } else {
-        Ok(false)
-    }
 }
 
 #[tracing::instrument(level = "info", skip_all)]
@@ -816,54 +695,46 @@ pub(super) async fn post_device_refresh(State(_state): State<AppState>, Json(req
     let Some((cred_id, secret)) = split_refresh(req.refresh_token.trim()) else {
         return oauth_error(StatusCode::UNAUTHORIZED, "invalid_grant", "malformed refresh_token");
     };
-    let now = now_secs();
-    let refreshed = refresh_device_credential(&REGISTRY, cred_id, secret, now, |tenant_id, scopes| {
-        let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
-        let sub = format!("device:{cred_id}");
-        mint_scoped_jwt_from_env(&ScopedClaims {
-            sub: &sub,
-            passport_id: None,
-            scopes: &scope_refs,
-            tenant_id,
-            ttl_secs: ISSUED_TOKEN_TTL_SECS,
-        })
-    });
-    match refreshed {
-        Ok(RefreshedDeviceAccess {
-            access_token,
-            tenant_id,
-            scopes,
-            refresh_expires_in,
-        }) => (
+    // Validate under the lock; clone the principal, then mint outside it.
+    let principal = {
+        let Ok(reg) = REGISTRY.lock() else {
+            return problem_response(StatusCode::INTERNAL_SERVER_ERROR, "device registry unavailable");
+        };
+        match reg.refresh.get(cred_id) {
+            Some(cred) if !cred.revoked && cred.secret_matches(secret) => (cred.tenant_id.clone(), cred.scopes.clone()),
+            Some(cred) if cred.revoked => {
+                return oauth_error(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_grant",
+                    "refresh credential was revoked",
+                );
+            }
+            _ => return oauth_error(StatusCode::UNAUTHORIZED, "invalid_grant", "unknown refresh credential"),
+        }
+    };
+    let (tenant_id, scopes) = principal;
+    let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
+    let sub = format!("device:{cred_id}");
+    let claims = ScopedClaims {
+        sub: &sub,
+        scopes: &scope_refs,
+        tenant_id: &tenant_id,
+        ttl_secs: ISSUED_TOKEN_TTL_SECS,
+    };
+    match mint_scoped_jwt_from_env(&claims) {
+        Some(access_token) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "access_token": access_token,
                 "token_type": "Bearer",
                 "expires_in": ISSUED_TOKEN_TTL_SECS,
-                "refresh_expires_in": refresh_expires_in,
                 "scopes": scopes,
                 "tenant_id": tenant_id,
                 "rail": "device",
             })),
         )
             .into_response(),
-        Err(RefreshAccessError::RegistryUnavailable) => {
-            problem_response(StatusCode::INTERNAL_SERVER_ERROR, "device registry unavailable")
-        }
-        Err(RefreshAccessError::Revoked) => oauth_error(
-            StatusCode::UNAUTHORIZED,
-            "invalid_grant",
-            "refresh credential was revoked",
-        ),
-        Err(RefreshAccessError::Expired) => oauth_error(
-            StatusCode::UNAUTHORIZED,
-            "invalid_grant",
-            "refresh credential expired; run device login again",
-        ),
-        Err(RefreshAccessError::Unknown) => {
-            oauth_error(StatusCode::UNAUTHORIZED, "invalid_grant", "unknown refresh credential")
-        }
-        Err(RefreshAccessError::IssuanceUnavailable) => problem_response(
+        None => problem_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "token issuance requires CORECRUXD_JWT_HS256_SECRET (run the daemon in jwt_hs256 mode)",
         ),
@@ -871,20 +742,38 @@ pub(super) async fn post_device_refresh(State(_state): State<AppState>, Json(req
 }
 
 #[tracing::instrument(level = "info", skip_all)]
-pub(super) async fn post_device_revoke(State(_state): State<AppState>, Json(req): Json<RefreshReq>) -> Response {
+pub(super) async fn post_device_revoke(State(state): State<AppState>, Json(req): Json<RefreshReq>) -> Response {
     if !env_flag_enabled(DEVICE_ENABLED_ENV) {
         return device_disabled_response();
     }
-    let Some((cred_id, secret)) = split_refresh(req.refresh_token.trim()) else {
+    let Some((cred_id, _secret)) = split_refresh(req.refresh_token.trim()) else {
         // Idempotent: a malformed/absent token is already "not active".
         return (StatusCode::OK, Json(serde_json::json!({ "revoked": false }))).into_response();
     };
-    let revoked = match revoke_refresh_credential(&REGISTRY, cred_id, secret) {
-        Ok(revoked) => revoked,
-        Err(RegistryUnavailable) => {
+    let (revoked, updated) = {
+        let Ok(mut reg) = REGISTRY.lock() else {
             return problem_response(StatusCode::INTERNAL_SERVER_ERROR, "device registry unavailable");
+        };
+        match reg.refresh.get_mut(cred_id) {
+            Some(cred) => {
+                let was_active = !cred.revoked;
+                cred.revoked = true;
+                (was_active, Some(cred.clone()))
+            }
+            None => (false, None),
         }
     };
+    // Persist the revocation. Without this, durable credentials would make revoke
+    // *worse* than the in-memory version: the credential would come back alive on
+    // the next restart. Revocation must be at least as durable as the credential.
+    if let Some(cred) = updated {
+        if !persist_cred(&state, cred_id, &cred).await {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "revocation could not be persisted; the credential may still be active after a restart",
+            );
+        }
+    }
     (StatusCode::OK, Json(serde_json::json!({ "revoked": revoked }))).into_response()
 }
 
@@ -893,73 +782,10 @@ pub(super) async fn post_device_revoke(State(_state): State<AppState>, Json(req)
 mod tests {
     use super::*;
 
-    const APPROVAL_TEST_SECRET: &[u8] = b"device-approval-test-secret-32-bytes";
-    const APPROVAL_TEST_ISSUER: &str = "corecrux-device-approval-test";
-    const APPROVAL_TEST_AUDIENCE: &str = "corecrux";
-
-    fn approval_context(claims: serde_json::Value, tenant_header: Option<&str>) -> HttpScopeContext {
-        approval_context_with_passport_header(claims, tenant_header, None)
-    }
-
-    fn approval_context_with_passport_header(
-        mut claims: serde_json::Value,
-        tenant_header: Option<&str>,
-        passport_header: Option<&str>,
-    ) -> HttpScopeContext {
-        let object = claims.as_object_mut().expect("claims object");
-        object.insert(
-            "exp".to_string(),
-            serde_json::json!(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("system time after epoch")
-                    .as_secs()
-                    + 3_600
-            ),
-        );
-        object.insert("iss".to_string(), serde_json::json!(APPROVAL_TEST_ISSUER));
-        object.insert("aud".to_string(), serde_json::json!(APPROVAL_TEST_AUDIENCE));
-        let token = jsonwebtoken::encode(
-            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
-            &claims,
-            &jsonwebtoken::EncodingKey::from_secret(APPROVAL_TEST_SECRET),
-        )
-        .expect("approval test JWT");
-        let auth = crate::auth::Authz::test_hs256(APPROVAL_TEST_SECRET, APPROVAL_TEST_ISSUER, APPROVAL_TEST_AUDIENCE);
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer header"),
-        );
-        if let Some(tenant) = tenant_header {
-            headers.insert(
-                "x-corecrux-tenant-id",
-                HeaderValue::from_str(tenant).expect("tenant header"),
-            );
-        }
-        if let Some(passport) = passport_header {
-            headers.insert(
-                "x-corecrux-passport-id",
-                HeaderValue::from_str(passport).expect("passport header"),
-            );
-        }
-        http_scope_context(&auth, &headers).expect("verified approval context")
-    }
-
-    fn problem_code(problem: &ProblemResponse) -> Option<&str> {
-        problem
-            .0
-            .extensions
-            .as_ref()
-            .and_then(|extensions| extensions.get("code"))
-            .and_then(serde_json::Value::as_str)
-    }
-
     fn pending_grant(now: u64) -> DeviceGrant {
         DeviceGrant {
             user_code: "ABCD-2345".to_string(),
             client_name: "test".to_string(),
-            request_ip: "192.0.2.1".parse().expect("test IP"),
             expires_at: now + 600,
             last_poll: 0,
             interval: 5,
@@ -1005,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_approved_remains_retryable_until_committed() {
+    fn poll_approved_issues_once_then_expired() {
         let now = 1_000_000;
         let mut g = pending_grant(now);
         g.state = GrantState::Approved {
@@ -1019,8 +845,9 @@ mod tests {
             }
             other => panic!("expected Issue, got {other:?}"),
         }
-        assert!(matches!(g.state, GrantState::Approved { .. }));
-        assert!(matches!(decide_poll(&mut g, now + 10), PollDecision::Issue { .. }));
+        assert_eq!(g.state, GrantState::Consumed);
+        // Replay of the same device_code → expired_token (one-time use).
+        assert_eq!(decide_poll(&mut g, now + 10), PollDecision::Expired);
     }
 
     #[test]
@@ -1029,110 +856,6 @@ mod tests {
         assert!(split_refresh("nodot").is_none());
         assert!(split_refresh(".secret").is_none());
         assert!(split_refresh("id.").is_none());
-    }
-
-    fn registry_with_refresh_credential() -> Mutex<DeviceRegistry> {
-        let mut registry = DeviceRegistry::default();
-        registry.refresh.insert(
-            "credential-id".to_string(),
-            RefreshCred {
-                tenant_id: "tenant-a".to_string(),
-                scopes: vec!["query:read".to_string()],
-                secret: "legitimate-secret".to_string(),
-                expires_at: 2_000_000,
-                revoked: false,
-            },
-        );
-        Mutex::new(registry)
-    }
-
-    #[test]
-    fn refresh_revoke_requires_the_complete_secret_and_is_idempotent() {
-        let registry = registry_with_refresh_credential();
-
-        assert_eq!(
-            revoke_refresh_credential(&registry, "credential-id", "attacker-secret"),
-            Ok(false)
-        );
-        let refreshed = refresh_device_credential(
-            &registry,
-            "credential-id",
-            "legitimate-secret",
-            1_000_000,
-            |tenant_id, scopes| {
-                assert_eq!(tenant_id, "tenant-a");
-                assert_eq!(scopes, ["query:read"]);
-                Some("fresh-access-token".to_string())
-            },
-        )
-        .expect("wrong-secret revocation must leave the credential active");
-        assert_eq!(refreshed.access_token, "fresh-access-token");
-
-        assert_eq!(
-            revoke_refresh_credential(&registry, "credential-id", "legitimate-secret"),
-            Ok(true)
-        );
-        assert_eq!(
-            revoke_refresh_credential(&registry, "credential-id", "legitimate-secret"),
-            Ok(false)
-        );
-        assert_eq!(
-            revoke_refresh_credential(&registry, "credential-id", "attacker-secret"),
-            Ok(false)
-        );
-        assert_eq!(
-            refresh_device_credential(&registry, "credential-id", "attacker-secret", 1_000_000, |_, _| {
-                Some("must-not-mint".to_string())
-            },),
-            Err(RefreshAccessError::Unknown)
-        );
-        assert_eq!(
-            refresh_device_credential(&registry, "credential-id", "legitimate-secret", 1_000_000, |_, _| {
-                Some("must-not-mint".to_string())
-            },),
-            Err(RefreshAccessError::Unknown)
-        );
-    }
-
-    #[test]
-    fn revoke_waits_for_an_inflight_refresh_to_finish_minting() {
-        use std::sync::{mpsc, Arc, TryLockError};
-
-        let registry = Arc::new(registry_with_refresh_credential());
-        let refresh_registry = Arc::clone(&registry);
-        let (mint_started_tx, mint_started_rx) = mpsc::channel();
-        let (allow_mint_tx, allow_mint_rx) = mpsc::channel();
-        let refresh = std::thread::spawn(move || {
-            refresh_device_credential(
-                &refresh_registry,
-                "credential-id",
-                "legitimate-secret",
-                1_000_000,
-                |_, _| {
-                    mint_started_tx.send(()).expect("signal mint start");
-                    allow_mint_rx.recv().expect("release mint");
-                    Some("ordered-access-token".to_string())
-                },
-            )
-        });
-        mint_started_rx.recv().expect("refresh reached mint boundary");
-        assert!(
-            matches!(registry.try_lock(), Err(TryLockError::WouldBlock)),
-            "refresh must retain the registry ordering lock throughout token issuance"
-        );
-
-        let revoke_registry = Arc::clone(&registry);
-        let (revoke_started_tx, revoke_started_rx) = mpsc::channel();
-        let revoke = std::thread::spawn(move || {
-            revoke_started_tx.send(()).expect("signal revoke attempt");
-            revoke_refresh_credential(&revoke_registry, "credential-id", "legitimate-secret")
-        });
-        revoke_started_rx.recv().expect("revoke thread started");
-
-        allow_mint_tx.send(()).expect("finish refresh mint");
-        let refreshed = refresh.join().expect("refresh thread").expect("refresh succeeds");
-        assert_eq!(refreshed.access_token, "ordered-access-token");
-        assert_eq!(revoke.join().expect("revoke thread"), Ok(true));
     }
 
     #[test]
@@ -1148,529 +871,153 @@ mod tests {
         assert_eq!(activate_uri(&HeaderMap::new()), "http://127.0.0.1:14800/activate");
     }
 
-    #[test]
-    fn registry_prune_drops_every_expired_state_and_keeps_active_rows() {
-        let now = 1_000_000;
-        let mut reg = DeviceRegistry::default();
-        for (index, state) in [
-            GrantState::Pending,
-            GrantState::Approved {
-                tenant_id: "tenant-a".to_string(),
-                scopes: vec!["query:read".to_string()],
-            },
-            GrantState::Denied,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let mut grant = pending_grant(now);
-            grant.user_code = format!("EXPIRED-{index}");
-            grant.expires_at = now - 1;
-            grant.state = state;
-            let device_code = format!("expired-device-{index}");
-            reg.by_user_code.insert(grant.user_code.clone(), device_code.clone());
-            reg.grants.insert(device_code, grant);
-        }
-        let active = pending_grant(now);
-        reg.by_user_code
-            .insert(active.user_code.clone(), "active-device".to_string());
-        reg.grants.insert("active-device".to_string(), active);
+    // ── durable refresh credentials (relay ExecPlan M1) ────────────────────
+    //
+    // These drive a real `FactStore` and simulate a restart by discarding every
+    // in-memory copy and reloading from the store — the whole point of the
+    // milestone is that a restart no longer unpairs devices.
 
-        reg.prune(now);
-
-        assert_eq!(reg.grants.len(), 1);
-        assert_eq!(reg.by_user_code.len(), 1);
-        assert!(reg.grants.contains_key("active-device"));
-    }
-
-    #[test]
-    fn client_name_is_trimmed_and_byte_bounded() {
-        assert_eq!(
-            normalize_client_name(Some("  trusted client  ".to_string())),
-            Ok("trusted client".to_string())
-        );
-        assert_eq!(normalize_client_name(None), Ok("unknown client".to_string()));
-        assert_eq!(
-            normalize_client_name(Some("   ".to_string())),
-            Ok("unknown client".to_string())
-        );
-        assert!(normalize_client_name(Some("a".repeat(MAX_CLIENT_NAME_BYTES))).is_ok());
-        assert!(normalize_client_name(Some("a".repeat(MAX_CLIENT_NAME_BYTES + 1))).is_err());
-        assert!(normalize_client_name(Some("line\nbreak".to_string())).is_err());
-        assert!(normalize_client_name(Some("é".repeat((MAX_CLIENT_NAME_BYTES / 2) + 1))).is_err());
-    }
-
-    #[test]
-    fn device_grant_registry_limits_pending_per_effective_ip() {
-        let now = 1_000_000;
-        let mut reg = DeviceRegistry::default();
-        for index in 0..MAX_PENDING_DEVICE_GRANTS_PER_IP {
-            let mut grant = pending_grant(now);
-            grant.user_code = format!("USER-{index}");
-            reg.insert_grant(format!("device-{index}"), grant, now)
-                .expect("per-IP capacity admits configured number of grants");
-        }
-
-        let mut rejected = pending_grant(now);
-        rejected.user_code = "REJECTED".to_string();
-        assert_eq!(
-            reg.insert_grant("rejected-device".to_string(), rejected, now),
-            Err(RegistryCapacityError)
-        );
-        assert!(!reg.by_user_code.contains_key("REJECTED"));
-
-        let mut other_ip = pending_grant(now);
-        other_ip.user_code = "OTHER-IP".to_string();
-        other_ip.request_ip = "192.0.2.2".parse().expect("test IP");
-        reg.insert_grant("other-ip-device".to_string(), other_ip, now)
-            .expect("one saturated IP must not starve another");
-    }
-
-    #[test]
-    fn device_grant_registry_limits_pending_and_total_rows() {
-        let now = 1_000_000;
-        let mut pending = DeviceRegistry::default();
-        for index in 0..MAX_PENDING_DEVICE_GRANTS {
-            let mut grant = pending_grant(now);
-            grant.user_code = format!("PENDING-{index}");
-            grant.request_ip = IpAddr::V6((index as u128 + 1).into());
-            pending
-                .insert_grant(format!("pending-device-{index}"), grant, now)
-                .expect("global pending capacity admits configured number");
-        }
-        let mut pending_rejected = pending_grant(now);
-        pending_rejected.user_code = "PENDING-REJECTED".to_string();
-        pending_rejected.request_ip = "2001:db8::ffff".parse().expect("test IP");
-        assert_eq!(
-            pending.insert_grant("pending-rejected".to_string(), pending_rejected, now),
-            Err(RegistryCapacityError)
-        );
-
-        let mut total = DeviceRegistry::default();
-        for index in 0..MAX_DEVICE_GRANTS_TOTAL {
-            let mut grant = pending_grant(now);
-            grant.user_code = format!("TOTAL-{index}");
-            grant.state = GrantState::Denied;
-            total
-                .insert_grant(format!("total-device-{index}"), grant, now)
-                .expect("total capacity admits configured number");
-        }
-        let mut total_rejected = pending_grant(now);
-        total_rejected.user_code = "TOTAL-REJECTED".to_string();
-        assert_eq!(
-            total.insert_grant("total-rejected".to_string(), total_rejected, now),
-            Err(RegistryCapacityError)
-        );
-        assert_eq!(total.grants.len(), MAX_DEVICE_GRANTS_TOTAL);
-        assert!(!total.by_user_code.contains_key("TOTAL-REJECTED"));
-    }
-
-    #[test]
-    fn expired_grant_frees_admission_and_preserves_indexes() {
-        let now = 1_000_000;
-        let mut reg = DeviceRegistry::default();
-        for index in 0..MAX_PENDING_DEVICE_GRANTS_PER_IP {
-            let mut grant = pending_grant(now);
-            grant.user_code = format!("EXPIRED-{index}");
-            grant.expires_at = now - 1;
-            let device_code = format!("expired-{index}");
-            reg.by_user_code.insert(grant.user_code.clone(), device_code.clone());
-            reg.grants.insert(device_code, grant);
-        }
-        let mut admitted = pending_grant(now);
-        admitted.user_code = "ADMITTED".to_string();
-        reg.insert_grant("admitted".to_string(), admitted, now)
-            .expect("expired rows are pruned before admission");
-        assert_eq!(reg.grants.len(), 1);
-        assert_eq!(reg.by_user_code.len(), 1);
-        assert_eq!(reg.by_user_code.get("ADMITTED").map(String::as_str), Some("admitted"));
-    }
-
-    #[test]
-    fn refresh_registry_is_bounded_and_reclaims_revoked_rows() {
-        let now = 1_000_000;
-        let mut reg = DeviceRegistry::default();
-        for index in 0..MAX_REFRESH_CREDENTIALS {
-            reg.insert_refresh_credential(
-                format!("credential-{index}"),
-                RefreshCred {
-                    tenant_id: "tenant-a".to_string(),
-                    scopes: vec!["query:read".to_string()],
-                    secret: format!("secret-{index}"),
-                    expires_at: now + REFRESH_CREDENTIAL_TTL_SECS,
-                    revoked: false,
-                },
-                now,
-            )
-            .expect("capacity admits configured number of refresh credentials");
-        }
-
-        let credential = RefreshCred {
-            tenant_id: "tenant-a".to_string(),
+    fn cred_for(secret: &str, revoked: bool) -> RefreshCred {
+        RefreshCred {
+            tenant_id: "acme".to_string(),
             scopes: vec!["query:read".to_string()],
-            secret: "replacement-secret".to_string(),
-            expires_at: now + REFRESH_CREDENTIAL_TTL_SECS,
+            secret_hash: blake3::hash(secret.as_bytes()),
+            revoked,
+        }
+    }
+
+    /// Round-trip everything in the store, exactly as startup hydration does.
+    fn reload(store: &corecrux_memory::FactStore) -> Vec<(String, RefreshCred)> {
+        decode_creds(store.query(&cred_query()).facts)
+    }
+
+    #[test]
+    fn credential_survives_a_restart_and_still_matches_its_secret() {
+        let mut store = corecrux_memory::FactStore::new();
+        assert!(persist_cred_in(&mut store, "cred-1", &cred_for("s3cret", false)));
+
+        // Restart: nothing in memory, everything from the store.
+        let loaded = reload(&store);
+
+        assert_eq!(loaded.len(), 1, "the credential must survive a restart");
+        let (cred_id, cred) = &loaded[0];
+        assert_eq!(cred_id, "cred-1");
+        assert_eq!(cred.tenant_id, "acme");
+        assert_eq!(cred.scopes, vec!["query:read".to_string()]);
+        assert!(cred.secret_matches("s3cret"), "the rehydrated secret must still verify");
+        assert!(!cred.secret_matches("wrong"), "a wrong secret must not verify");
+        assert!(!cred.revoked);
+    }
+
+    #[test]
+    fn revocation_survives_a_restart() {
+        // The regression that durability itself introduces: if a revocation were
+        // held only in memory, a restart would bring a revoked credential back
+        // to life — strictly worse than the previous volatile behaviour.
+        let mut store = corecrux_memory::FactStore::new();
+        assert!(persist_cred_in(&mut store, "cred-1", &cred_for("s3cret", false)));
+        assert!(persist_cred_in(&mut store, "cred-1", &cred_for("s3cret", true)));
+
+        let loaded = reload(&store);
+
+        assert_eq!(loaded.len(), 1, "revoking must not duplicate the credential");
+        assert!(
+            loaded[0].1.revoked,
+            "a revoked credential must stay revoked across a restart"
+        );
+    }
+
+    #[test]
+    fn revocation_is_sticky_even_if_an_older_active_version_sorts_last() {
+        // Defence in depth: a revoked credential must not come back to life just
+        // because a pre-revocation version is replayed, or arrives later, or
+        // wins an ordering tie. The failure direction here is a revoked device
+        // that works again, so this is asserted directly rather than assumed
+        // from version ordering.
+        let mut store = corecrux_memory::FactStore::new();
+        assert!(persist_cred_in(&mut store, "cred-1", &cred_for("s3cret", false)));
+        assert!(persist_cred_in(&mut store, "cred-1", &cred_for("s3cret", true)));
+        // A stale, still-active record shows up again after the revocation.
+        assert!(persist_cred_in(&mut store, "cred-1", &cred_for("s3cret", false)));
+
+        let loaded = reload(&store);
+
+        assert_eq!(loaded.len(), 1);
+        assert!(
+            loaded[0].1.revoked,
+            "revocation must be sticky — a replayed active record must not un-revoke a device"
+        );
+    }
+
+    #[test]
+    fn the_clear_secret_never_reaches_storage() {
+        let mut store = corecrux_memory::FactStore::new();
+        let secret = "super-secret-value";
+        assert!(persist_cred_in(&mut store, "cred-1", &cred_for(secret, false)));
+
+        let serialised = store
+            .query(&cred_query())
+            .facts
+            .iter()
+            .map(|fact| fact.value.clone())
+            .collect::<String>();
+
+        assert!(
+            !serialised.contains(secret),
+            "the clear secret must never be written to the fact store"
+        );
+        assert!(
+            serialised.contains(&blake3::hash(secret.as_bytes()).to_hex().to_string()),
+            "the stored record must carry the hash instead"
+        );
+    }
+
+    #[test]
+    fn one_unreadable_record_does_not_unpair_the_whole_fleet() {
+        let mut store = corecrux_memory::FactStore::new();
+        assert!(persist_cred_in(&mut store, "good-1", &cred_for("a", false)));
+        store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "acme".to_string(),
+            entity: cred_entity("corrupt"),
+            key: DEVICE_CRED_KEY.to_string(),
+            value: "{not valid json".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+            horizon_class: Some(corecrux_memory::fact_store::HorizonClass::None),
+            actor: None,
+        });
+        assert!(persist_cred_in(&mut store, "good-2", &cred_for("b", false)));
+
+        let loaded = reload(&store);
+
+        assert_eq!(loaded.len(), 2, "readable credentials must survive a corrupt neighbour");
+    }
+
+    #[test]
+    fn a_tampered_hash_fails_closed_rather_than_matching() {
+        // Truncated/garbage hex must drop the record, never decode to a hash
+        // that some secret could accidentally match.
+        let bad = PersistedCred {
+            cred_id: "cred-1".to_string(),
+            tenant_id: "acme".to_string(),
+            scopes: vec![],
+            secret_hash: "not-hex".to_string(),
             revoked: false,
         };
-        assert_eq!(
-            reg.insert_refresh_credential("rejected".to_string(), credential.clone(), now),
-            Err(RegistryCapacityError)
-        );
-        reg.refresh.get_mut("credential-0").expect("seeded credential").revoked = true;
-        reg.insert_refresh_credential("replacement".to_string(), credential, now)
-            .expect("revoked row is reclaimed before capacity check");
-        assert_eq!(reg.refresh.len(), MAX_REFRESH_CREDENTIALS);
-        assert!(!reg.refresh.contains_key("credential-0"));
-        assert!(reg.refresh.contains_key("replacement"));
+        assert!(bad.into_cred().is_none());
     }
 
-    fn approved_registry(now: u64) -> DeviceRegistry {
+    #[test]
+    fn registry_prune_drops_expired_pending() {
+        let now = 1_000_000;
         let mut reg = DeviceRegistry::default();
-        let mut grant = pending_grant(now);
-        grant.state = GrantState::Approved {
-            tenant_id: "tenant-a".to_string(),
-            scopes: vec!["query:read".to_string()],
-        };
-        reg.insert_grant("approved-device".to_string(), grant, now)
-            .expect("approved fixture admission");
-        reg
-    }
-
-    #[test]
-    fn failed_device_token_mint_leaves_approved_grant_retryable() {
-        let now = 1_000_000;
-        let mut reg = approved_registry(now);
-
-        assert_eq!(
-            issue_approved_grant(&mut reg, "approved-device", now, |_, _, _| None),
-            Err(DeviceIssueError::MintUnavailable)
-        );
-        assert!(matches!(
-            reg.grants.get("approved-device").map(|grant| &grant.state),
-            Some(GrantState::Approved { .. })
-        ));
-        assert_eq!(
-            reg.by_user_code.get("ABCD-2345").map(String::as_str),
-            Some("approved-device")
-        );
-        assert!(reg.refresh.is_empty());
-    }
-
-    #[test]
-    fn refresh_capacity_failure_does_not_mint_or_consume_and_retry_commits_once() {
-        use std::cell::Cell;
-
-        let now = 1_000_000;
-        let mut reg = approved_registry(now);
-        for index in 0..MAX_REFRESH_CREDENTIALS {
-            reg.refresh.insert(
-                format!("existing-{index}"),
-                RefreshCred {
-                    tenant_id: "tenant-a".to_string(),
-                    scopes: vec!["query:read".to_string()],
-                    secret: format!("secret-{index}"),
-                    expires_at: now + REFRESH_CREDENTIAL_TTL_SECS,
-                    revoked: false,
-                },
-            );
-        }
-        let mint_called = Cell::new(false);
-        assert_eq!(
-            issue_approved_grant(&mut reg, "approved-device", now, |_, _, _| {
-                mint_called.set(true);
-                Some("must-not-mint".to_string())
-            }),
-            Err(DeviceIssueError::RefreshCapacity)
-        );
-        assert!(!mint_called.get());
-        assert!(matches!(
-            reg.grants.get("approved-device").map(|grant| &grant.state),
-            Some(GrantState::Approved { .. })
-        ));
-
-        reg.refresh.remove("existing-0");
-        let issued = issue_approved_grant(&mut reg, "approved-device", now, |_, tenant_id, scopes| {
-            assert_eq!(tenant_id, "tenant-a");
-            assert_eq!(scopes, ["query:read"]);
-            Some("issued-access-token".to_string())
-        })
-        .expect("free capacity permits atomic retry");
-        assert_eq!(issued.access_token, "issued-access-token");
-        assert_eq!(reg.refresh.len(), MAX_REFRESH_CREDENTIALS);
-        assert!(!reg.grants.contains_key("approved-device"));
-        assert!(!reg.by_user_code.contains_key("ABCD-2345"));
-        assert_eq!(
-            issue_approved_grant(&mut reg, "approved-device", now, |_, _, _| {
-                Some("must-not-replay".to_string())
-            }),
-            Err(DeviceIssueError::GrantUnavailable)
-        );
-    }
-
-    #[test]
-    fn refresh_expiry_is_terminal_before_mint_and_prunes_the_row() {
-        use std::cell::Cell;
-
-        let now = 1_000_000;
-        let registry = registry_with_refresh_credential();
-        registry
-            .lock()
-            .expect("registry lock")
-            .refresh
-            .get_mut("credential-id")
-            .expect("seeded credential")
-            .expires_at = now;
-        let mint_called = Cell::new(false);
-        assert_eq!(
-            refresh_device_credential(&registry, "credential-id", "legitimate-secret", now, |_, _| {
-                mint_called.set(true);
-                Some("must-not-mint".to_string())
-            }),
-            Err(RefreshAccessError::Expired)
-        );
-        assert!(!mint_called.get());
-        assert!(!registry
-            .lock()
-            .expect("registry lock")
-            .refresh
-            .contains_key("credential-id"));
-    }
-
-    #[test]
-    fn refresh_prune_removes_expired_and_revoked_but_retains_active() {
-        let now = 1_000_000;
-        let credential = |expires_at, revoked| RefreshCred {
-            tenant_id: "tenant-a".to_string(),
-            scopes: vec!["query:read".to_string()],
-            secret: "secret".to_string(),
-            expires_at,
-            revoked,
-        };
-        let mut reg = DeviceRegistry::default();
-        reg.refresh.insert("active".to_string(), credential(now + 1, false));
-        reg.refresh.insert("expired".to_string(), credential(now, false));
-        reg.refresh.insert("revoked".to_string(), credential(now + 1, true));
-
-        reg.prune_refresh_credentials(now);
-
-        assert_eq!(reg.refresh.len(), 1);
-        assert!(reg.refresh.contains_key("active"));
-    }
-
-    #[test]
-    fn device_approval_accepts_only_an_admins_tenant_and_scope_subset() {
-        let context = approval_context(
-            serde_json::json!({
-                "scope": "admin:write query:read facts:write",
-                "tenant_id": "tenant-a",
-                "passport_id": "approver-1",
-            }),
-            None,
-        );
-        let grant = attenuate_device_grant(
-            &context,
-            " tenant-a ",
-            &[
-                "facts:write".to_string(),
-                " query:read ".to_string(),
-                "facts:write".to_string(),
-            ],
-        )
-        .expect("authorized subset");
-        assert_eq!(grant.tenant_id, "tenant-a");
-        assert_eq!(grant.scopes, vec!["facts:write", "query:read"]);
-    }
-
-    #[test]
-    fn device_approval_rejects_scope_widening() {
-        let context = approval_context(
-            serde_json::json!({
-                "scope": "admin:write query:read",
-                "tenant_id": "tenant-a",
-                "passport_id": "approver-1",
-            }),
-            None,
-        );
-        let error = attenuate_device_grant(
-            &context,
-            "tenant-a",
-            &["query:read".to_string(), "facts:write".to_string()],
-        )
-        .expect_err("facts:write exceeds approver authority");
-        assert_eq!(error.0.status, 403);
-        assert_eq!(problem_code(&error), Some("DEVICE_GRANT_SCOPE_WIDENING"));
-        assert_eq!(
-            error
-                .0
-                .extensions
-                .as_ref()
-                .and_then(|extensions| extensions.get("unauthorizedScopes")),
-            Some(&serde_json::json!(["facts:write"]))
-        );
-    }
-
-    #[test]
-    fn device_approval_rejects_tenant_widening_and_missing_tenant_claim() {
-        let context = approval_context(
-            serde_json::json!({
-                "scope": "admin:write query:read",
-                "tenant_id": "tenant-a",
-                "passport_id": "approver-1",
-            }),
-            None,
-        );
-        let wrong_tenant = attenuate_device_grant(&context, "tenant-b", &["query:read".to_string()])
-            .expect_err("tenant-b exceeds approver authority");
-        assert_eq!(wrong_tenant.0.status, 403);
-        assert_eq!(problem_code(&wrong_tenant), Some("TENANT_FORBIDDEN"));
-
-        let missing_tenant = approval_context(
-            serde_json::json!({
-                "scope": "admin:write query:read",
-                "passport_id": "approver-1",
-            }),
-            None,
-        );
-        let error = attenuate_device_grant(&missing_tenant, "default", &["query:read".to_string()])
-            .expect_err("authenticated device approval requires tenant authority");
-        assert_eq!(error.0.status, 403);
-        assert_eq!(problem_code(&error), Some("TENANT_CLAIM_MISSING"));
-    }
-
-    #[test]
-    fn device_approval_requires_unambiguous_multi_tenant_selection() {
-        let context = approval_context(
-            serde_json::json!({
-                "scope": "admin:write query:read",
-                "tenants": ["tenant-a", "tenant-b"],
-                "passport_id": "approver-1",
-            }),
-            None,
-        );
-        let ambiguous = attenuate_device_grant(&context, "", &["query:read".to_string()])
-            .expect_err("approval must choose one tenant");
-        assert_eq!(ambiguous.0.status, 400);
-
-        let grant =
-            attenuate_device_grant(&context, "tenant-b", &["query:read".to_string()]).expect("explicit allowed tenant");
-        assert_eq!(grant.tenant_id, "tenant-b");
-
-        let header_bound = approval_context(
-            serde_json::json!({
-                "scope": "admin:write query:read",
-                "tenants": ["tenant-a", "tenant-b"],
-                "passport_id": "approver-1",
-            }),
-            Some("tenant-a"),
-        );
-        let mismatch = attenuate_device_grant(&header_bound, "tenant-b", &["query:read".to_string()])
-            .expect_err("body and verified selector must agree");
-        assert_eq!(mismatch.0.status, 403);
-        assert_eq!(problem_code(&mismatch), Some("TENANT_SELECTOR_MISMATCH"));
-    }
-
-    #[test]
-    fn device_approval_allows_global_admin_only_for_an_explicit_tenant() {
-        let context = approval_context(
-            serde_json::json!({
-                "scope": "admin:write query:read",
-                "tenant_id": "*",
-                "passport_id": "approver-1",
-            }),
-            None,
-        );
-        let grant = attenuate_device_grant(&context, "tenant-new", &["query:read".to_string()])
-            .expect("global tenant authority with explicit tenant");
-        assert_eq!(grant.tenant_id, "tenant-new");
-
-        let ambiguous = attenuate_device_grant(&context, " ", &["query:read".to_string()])
-            .expect_err("global admin must still choose a tenant");
-        assert_eq!(ambiguous.0.status, 400);
-
-        let wildcard = attenuate_device_grant(&context, "*", &["query:read".to_string()])
-            .expect_err("issued token must bind one concrete tenant");
-        assert_eq!(wildcard.0.status, 400);
-    }
-
-    #[test]
-    fn device_approval_rejects_non_human_production_credentials() {
-        let device_context = approval_context(
-            serde_json::json!({
-                "scope": "admin:write query:read",
-                "tenant_id": "tenant-a",
-                "sub": "device:credential-id",
-            }),
-            None,
-        );
-        let error = attenuate_device_grant(&device_context, "tenant-a", &["query:read".to_string()])
-            .expect_err("device credentials cannot recursively approve");
-        assert_eq!(error.0.status, 403);
-        assert_eq!(problem_code(&error), Some("DEVICE_APPROVER_HUMAN_REQUIRED"));
-
-        let sub_only_context = approval_context(
-            serde_json::json!({
-                "scope": "admin:write query:read",
-                "tenant_id": "tenant-a",
-                "sub": "operator@example.test",
-            }),
-            None,
-        );
-        let error = attenuate_device_grant(&sub_only_context, "tenant-a", &["query:read".to_string()])
-            .expect_err("sub-only identity is not a canonical human passport");
-        assert_eq!(problem_code(&error), Some("DEVICE_APPROVER_HUMAN_REQUIRED"));
-
-        let override_context = approval_context_with_passport_header(
-            serde_json::json!({
-                "scope": "admin:write query:read",
-                "tenant_id": "tenant-a",
-                "passport_id": "approver-1",
-            }),
-            None,
-            Some("impersonated-approver"),
-        );
-        let error = attenuate_device_grant(&override_context, "tenant-a", &["query:read".to_string()])
-            .expect_err("passport override cannot satisfy the approval boundary");
-        assert_eq!(problem_code(&error), Some("DEVICE_APPROVER_HUMAN_REQUIRED"));
-    }
-
-    #[test]
-    fn device_approval_requires_admin_write_without_scope_implication() {
-        let context = approval_context(
-            serde_json::json!({
-                "scope": "query:read facts:write",
-                "tenant_id": "tenant-a",
-                "passport_id": "approver-1",
-            }),
-            None,
-        );
-        let error = attenuate_device_grant(&context, "tenant-a", &["query:read".to_string()])
-            .expect_err("delegation requires admin:write");
-        assert_eq!(error.0.status, 403);
-        assert_eq!(problem_code(&error), Some("MISSING_SCOPE"));
-    }
-
-    #[test]
-    fn device_approval_retains_explicit_dev_scopes_local_flow() {
-        let auth = crate::auth::Authz::from_env(crate::auth::AuthMode::DevScopes).expect("dev scopes auth");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-corecrux-scopes",
-            "admin:write query:read".parse().expect("scope header"),
-        );
-        let context = http_scope_context(&auth, &headers).expect("dev approval context");
-        let grant = attenuate_device_grant(&context, "local-dev", &["query:read".to_string()])
-            .expect("explicit dev-scopes flow");
-        assert_eq!(grant.tenant_id, "local-dev");
-        assert_eq!(grant.scopes, vec!["query:read"]);
-    }
-
-    #[test]
-    fn device_approval_rejects_auth_off_even_with_scope_bypass() {
-        let auth = crate::auth::Authz::from_env(crate::auth::AuthMode::Off).expect("off auth");
-        let context = http_scope_context(&auth, &HeaderMap::new()).expect("local auth-off context");
-        let error = attenuate_device_grant(&context, "default", &["admin:write".to_string()])
-            .expect_err("auth-off cannot approve durable bearer credentials");
-        assert_eq!(error.0.status, 403);
-        assert_eq!(problem_code(&error), Some("DEVICE_APPROVER_AUTH_REQUIRED"));
+        let mut g = pending_grant(now);
+        g.expires_at = now - 1;
+        reg.by_user_code.insert(g.user_code.clone(), "D".to_string());
+        reg.grants.insert("D".to_string(), g);
+        reg.prune(now);
+        assert!(reg.grants.is_empty());
+        assert!(reg.by_user_code.is_empty());
     }
 }

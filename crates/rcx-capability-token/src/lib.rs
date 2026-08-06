@@ -24,11 +24,33 @@ use serde::Deserialize;
 
 pub const RCX_CT_SPEC_VERSION: &str = "rcx-ct/1.0";
 pub const RCX_CT_DELEGATION_SPEC_VERSION: &str = "rcx-ct/1.1";
+/// Corrected tier vocabulary (`free | pro | governance`). Accepted *alongside*
+/// `rcx-ct/1.1`, never in place of it: the CruxEngine↔Rust byte-for-byte
+/// agreement (CruxEngine #103 / Crux #502) is pinned on 1.1 and replacing the
+/// constant would invalidate every delegation token already minted against it.
+pub const RCX_CT_GOVERNANCE_SPEC_VERSION: &str = "rcx-ct/1.2";
+/// Whether a spec version carries the delegation contract. Both `rcx-ct/1.1` and
+/// `rcx-ct/1.2` do; they differ only in the `tier` value set, which is validated
+/// by `RcxTier`'s own deserialiser and not by the delegation gate.
+pub fn is_delegation_spec_version(spec_version: &str) -> bool {
+    spec_version == RCX_CT_DELEGATION_SPEC_VERSION || spec_version == RCX_CT_GOVERNANCE_SPEC_VERSION
+}
+
 pub const RCX_CT_SIGNATURE_LEN: usize = 64;
 pub const RCX_CT_HASH_LEN: usize = 32;
 pub const RCX_CT_PUBLIC_KEY_LEN: usize = 32;
 pub const RCX_DELEGATION_ENVELOPE_VERSION: u8 = 1;
 pub const RCX_SYNC_DELEGATION_AUDIENCE: &str = "crux-sync";
+/// Delegation audience a hosted-relay device envelope carries, and the
+/// `AttenuationContext.audience` the relay presents at session attach
+/// (ExecPlan `crux-hosted-relay-gateway-2026-07-30`, contract v1 §6).
+pub const RCX_RELAY_DELEGATION_AUDIENCE: &str = "crux-relay";
+/// Backend id the hosted relay carries in `backends[]`, and the
+/// `AttenuationContext.backend_id` the relay presents. Must not begin with
+/// `customer:` — that prefix reclassifies the router mode.
+pub const RCX_RELAY_BACKEND_ID: &str = "hosted.relay.cuecrux.com";
+/// Capability for attaching one relay session.
+pub const RCX_RELAY_SESSION_CAPABILITY: &str = "crux.relay.session";
 /// Backend id a CruxEngine-issued sync-delegation token carries, and the
 /// `AttenuationContext.backend_id` the sync boundary presents (macaroon M3′).
 /// Distinct from `"local"` (the router's signature short-circuit) and from the
@@ -126,8 +148,7 @@ pub fn corecrux_premium_lane_capabilities(per_call_cost: u64) -> Vec<PermittedCa
 pub enum RcxTier {
     Free,
     Pro,
-    Team,
-    Enterprise,
+    Governance,
 }
 
 impl RcxTier {
@@ -135,8 +156,7 @@ impl RcxTier {
         match self {
             Self::Free => "free",
             Self::Pro => "pro",
-            Self::Team => "team",
-            Self::Enterprise => "enterprise",
+            Self::Governance => "governance",
         }
     }
 }
@@ -449,12 +469,22 @@ impl DelegationPresentation {
 #[serde(rename_all = "kebab-case")]
 pub enum DelegationAudience {
     CruxSync,
+    /// Hosted relay gateway (ExecPlan `crux-hosted-relay-gateway-2026-07-30`, M0).
+    ///
+    /// A separate audience is a security boundary, not a label: reusing
+    /// `CruxSync` would make a relay envelope byte-identical to a sync envelope
+    /// for the same device, so a relay-paired daemon could present its envelope
+    /// at the sync handshake (which supplies `audience: CruxSync`). The audience
+    /// equality checks in [`verify_token_attenuated`] then separate the two
+    /// boundaries structurally rather than relying on a `ScopeSubset` caveat.
+    CruxRelay,
 }
 
 impl DelegationAudience {
     fn as_str(self) -> &'static str {
         match self {
             Self::CruxSync => RCX_SYNC_DELEGATION_AUDIENCE,
+            Self::CruxRelay => RCX_RELAY_DELEGATION_AUDIENCE,
         }
     }
 }
@@ -726,7 +756,7 @@ where
     let Some(policy) = token.delegation_policy.as_ref() else {
         return AttenuatedOutcome::DelegationNotPermitted;
     };
-    if token.spec_version != RCX_CT_DELEGATION_SPEC_VERSION
+    if !is_delegation_spec_version(&token.spec_version)
         || policy.presentation != DelegationPresentation::ProofOfPossession
         || policy.max_depth != 1
     {
@@ -1076,6 +1106,12 @@ impl RcxCapabilityToken {
         hex::encode(self.token_hash())
     }
 
+    /// Whether presentation-time proof of possession is required.
+    ///
+    /// Keyed on `rcx-ct/1.1` and on the delegation fields themselves — NOT on
+    /// `is_delegation_spec_version`. A `1.2` entitlement token carries no
+    /// delegation policy and must verify through the generic issuer path; a
+    /// `1.2` token that *does* carry one is caught by the field checks below.
     pub fn requires_contextual_verification(&self) -> bool {
         self.spec_version == RCX_CT_DELEGATION_SPEC_VERSION
             || self.delegation_policy.is_some()
@@ -1096,7 +1132,7 @@ impl RcxCapabilityToken {
         let Some(policy) = self.delegation_policy.as_ref() else {
             return Err(AttenuateError::DelegationNotPermitted);
         };
-        if self.spec_version != RCX_CT_DELEGATION_SPEC_VERSION
+        if !is_delegation_spec_version(&self.spec_version)
             || policy.presentation != DelegationPresentation::ProofOfPossession
             || policy.max_depth != 1
         {
@@ -1218,19 +1254,31 @@ impl RcxCapabilityToken {
         let mut issues = Vec::new();
         match (&*self.spec_version, &self.delegation_policy) {
             (RCX_CT_SPEC_VERSION, None) if self.delegation_envelope.is_none() => {}
-            (RCX_CT_DELEGATION_SPEC_VERSION, Some(policy)) => {
+            // `rcx-ct/1.2` is a TIER-VOCABULARY version, orthogonal to delegation:
+            // a plain entitlement token (the pairing flow's output) carries no
+            // delegation policy and must still be valid at 1.2.
+            (RCX_CT_GOVERNANCE_SPEC_VERSION, None) if self.delegation_envelope.is_none() => {}
+            (RCX_CT_DELEGATION_SPEC_VERSION | RCX_CT_GOVERNANCE_SPEC_VERSION, Some(policy)) => {
                 let delegates_valid = !policy.allowed_delegate_fprs.is_empty()
                     && policy.allowed_delegate_fprs.len() <= RCX_MAX_DELEGATION_PRINCIPALS
                     && policy.allowed_delegate_fprs.iter().all(|fpr| valid_passport_fpr(fpr))
                     && policy.allowed_delegate_fprs.windows(2).all(|pair| pair[0] < pair[1]);
+                // The audience is deliberately NOT pinned here. It is a closed
+                // enum, so deserialization already rejects unknown audiences,
+                // and the boundary separation that matters is enforced
+                // contextually at verify time: `verify_token_attenuated`
+                // requires `policy.audience == context.audience ==
+                // envelope.audience`, so a relay envelope cannot be presented at
+                // the sync handshake (which supplies `CruxSync`) and vice versa.
+                // Pinning it structurally here would instead make every
+                // non-sync audience an invalid *token*, which is wrong.
                 if policy.presentation != DelegationPresentation::ProofOfPossession
                     || policy.max_depth != 1
-                    || policy.audience != DelegationAudience::CruxSync
                     || !delegates_valid
                 {
                     issues.push(TokenValidationIssue::new(
                         "invalid_delegation_policy",
-                        "delegation policy must be canonical PoP-only, one-hop, crux-sync policy",
+                        "delegation policy must be canonical PoP-only, one-hop policy with a valid delegate set",
                     ));
                 }
             }
@@ -1275,16 +1323,13 @@ impl RcxCapabilityToken {
                 "at least one backend is required",
             ));
         }
-        if self.tier == RcxTier::Team && self.team_scope.is_none() {
-            issues.push(TokenValidationIssue::new(
-                "missing_team_scope",
-                "team tier tokens require team_scope",
-            ));
-        }
-        if self.tier == RcxTier::Enterprise && self.enterprise_scope.is_none() {
+        // `Team` had no product behind it, so its scope invariant is dropped rather
+        // than re-pointed. `team_scope` stays on the struct: removing the field would
+        // change the token's shape for every tier, not just the retired one.
+        if self.tier == RcxTier::Governance && self.enterprise_scope.is_none() {
             issues.push(TokenValidationIssue::new(
                 "missing_enterprise_scope",
-                "enterprise tier tokens require enterprise_scope",
+                "governance tier tokens require enterprise_scope",
             ));
         }
         if let Some(team_scope) = &self.team_scope {
@@ -1417,6 +1462,32 @@ pub enum VerifyOutcome {
     StructuralFailure(Vec<String>),
     BadSignature,
     BadTrustRoot,
+}
+
+/// Establish that a token was really issued by the trust root — and **nothing
+/// more**.
+///
+/// **This is NOT an authorization check.** It answers exactly one question: did
+/// this issuer sign these bytes, and is the base envelope structurally valid and
+/// unexpired. It deliberately does *not* apply the contextual gate, so a
+/// delegation-capable `rcx-ct/1.1` token passes here even though it must still
+/// be presented through [`verify_token_attenuated`] before it authorizes
+/// anything.
+///
+/// It exists because a daemon has to *load* a hosted token at startup — to
+/// discover which backends it was granted and where they live — long before any
+/// session presents it. [`verify_token`] cannot serve that purpose: it fails
+/// every delegation-bearing token closed by design
+/// (ExecPlan `crux-hosted-relay-gateway-2026-07-30`, contract v1 §8).
+///
+/// If you are deciding whether a caller may *do* something, you want
+/// [`verify_token_attenuated`], not this.
+pub fn verify_issuer_provenance(
+    token: &RcxCapabilityToken,
+    trust_root_pubkey: &[u8],
+    now_unix_seconds: u64,
+) -> VerifyOutcome {
+    verify_issuer_signed_token(token, trust_root_pubkey, now_unix_seconds)
 }
 
 pub fn verify_token(token: &RcxCapabilityToken, trust_root_pubkey: &[u8], now_unix_seconds: u64) -> VerifyOutcome {
@@ -1794,6 +1865,71 @@ mod tests {
     const SYNC_DELEGATION_VECTOR_CBOR_HEX: &str = "b06474696572646672656566697373756572a26a6973737565725f6f7267656c6f63616c6c70617373706f72745f6b69647822705f30313233343536373839616263646566303132333435363738396162636465666763726564697473a466726566696c6ca266616d6f756e74f666706572696f64646e6f6e656762616c616e6365f6696f766572647261667466666f726269646f6f76657264726166745f6c696d6974f6677375626a656374a26c70617373706f72745f6670727822705f3031323334353637383961626364656630313233343536373839616263646566726461656d6f6e5f696e7374616e63655f696478216461656d6f6e5f3031485630303030303030303030303030303030303030303030686261636b656e647381a46a6261636b656e645f696469637275782d73796e636c656e64706f696e745f75726cf66e74727573745f726f6f745f6b69647822705f3031323334353637383961626364656630313233343536373839616263646566767065726d69747465645f6361706162696c697469657382a46a6361706162696c69747972636f7265637275782e73796e632e70756c6c6b6372656469745f636f7374f673646174615f6567726573735f636c617373657381646e6f6e657572657175697265645f6174746573746174696f6e73816e70617373706f72745f626f756e64a46a6361706162696c69747972636f7265637275782e73796e632e707573686b6372656469745f636f7374f673646174615f6567726573735f636c617373657381646e6f6e657572657175697265645f6174746573746174696f6e73816e70617373706f72745f626f756e646866616c6c6261636ba4696f6e5f657870697279667265667573657171756575655f74746c5f7365636f6e6473f6746f6e5f637265646974735f65786861757374656466726566757365766f6e5f6261636b656e645f756e726561636861626c656672656675736568746f6b656e5f6964782672637863745f73796e6364656c5f303132333435363738396162636465665f64656661756c74696973737565645f61741a69eab5a0697369676e6174757265a363616c676765643235353139636b69647822705f3031323334353637383961626364656630313233343536373839616263646566637369675840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111116a657870697265735f61741a6a1ad4606a7265766f636174696f6ea26763726c5f75726cf66c707573685f6368616e6e656cf66c737065635f76657273696f6e6a7263782d63742f312e316c74656e616e745f73636f7065a26974656e616e745f69646764656661756c746c646973706c61795f6e616d65654c6f63616c6d726563656970745f636c6173736876657269666965646f726566726573685f68696e745f61741a6a1ac6507164656c65676174696f6e5f706f6c696379a46861756469656e636569637275782d73796e63696d61785f6465707468016c70726573656e746174696f6e7370726f6f665f6f665f706f7373657373696f6e75616c6c6f7765645f64656c65676174655f66707273827822705f30303030303030303030303030303030303030303030303030303030303030317822705f3030303030303030303030303030303030303030303030303030303030303032";
     const SYNC_DELEGATION_VECTOR_TOKEN_HASH: &str = "1ca9e0d2f4e74af7314a80d6f376b73a52e30df04a10d8cb435d11766a73b0c7";
     const SYNC_DELEGATION_VECTOR_ISSUER_SIG: &str = "6441eb1f1678566b7d0e81b52b331c77e3a500ae210cdbdeda67dbbe71ed1dc78ee1be37434735b19ac61362afb64c3f962fb3a3b5659cd96b4012f344ee3801";
+
+    // --- rcx-ct/1.2 governance-tier cross-language byte-parity vector ---------
+    // ExecPlan crux-pro-capabilities-rcx-entitled-2026-07-27 M1 exit criterion:
+    // "Rust and TS agree byte-for-byte on a 1.2 token with tier: governance".
+    // The TS mirror is `governanceTierVectorFixture` in
+    // packages/shared/packages/contracts/src/rcx-capability-token.ts; the shared
+    // hex constants below lock the two encoders together, exactly as the 1.1
+    // sync-delegation vector does.
+    const GOVERNANCE_VECTOR_CBOR_HEX: &str = "b064746965726a676f7665726e616e636566697373756572a26a6973737565725f6f7267656c6f63616c6c70617373706f72745f6b69647822705f30313233343536373839616263646566303132333435363738396162636465666763726564697473a466726566696c6ca266616d6f756e74f666706572696f64646e6f6e656762616c616e6365f6696f766572647261667466666f726269646f6f76657264726166745f6c696d6974f6677375626a656374a26c70617373706f72745f6670727822705f3031323334353637383961626364656630313233343536373839616263646566726461656d6f6e5f696e7374616e63655f696478216461656d6f6e5f3031485630303030303030303030303030303030303030303030686261636b656e647381a46a6261636b656e645f696472637573746f6d65723a636c75737465722d616c656e64706f696e745f75726c782668747470733a2f2f636c75737465722d612e637573746f6d65722e6578616d706c652f7263786e74727573745f726f6f745f6b69646f637573746f6d65722d726f6f742d61767065726d69747465645f6361706162696c697469657381a46a6361706162696c69747974636f7265637275782e71756572792e6c6f63616c6b6372656469745f636f7374f673646174615f6567726573735f636c617373657381646e6f6e657572657175697265645f6174746573746174696f6e73806866616c6c6261636ba4696f6e5f657870697279667265667573657171756575655f74746c5f7365636f6e6473f6746f6e5f637265646974735f65786861757374656466726566757365766f6e5f6261636b656e645f756e726561636861626c656672656675736568746f6b656e5f6964782972637863745f676f7665726e616e63655f303132333435363738396162636465665f64656661756c74696973737565645f61741a69eab5a0697369676e6174757265a363616c676765643235353139636b69647822705f3031323334353637383961626364656630313233343536373839616263646566637369675840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111116a657870697265735f61741a6a1ad4606a7265766f636174696f6ea26763726c5f75726cf66c707573685f6368616e6e656cf66c737065635f76657273696f6e6a7263782d63742f312e326c74656e616e745f73636f7065a26974656e616e745f69646764656661756c746c646973706c61795f6e616d65654c6f63616c6d726563656970745f636c6173736876657269666965646f726566726573685f68696e745f61741a6a1ac65070656e74657270726973655f73636f7065a766616972676170f56a6261636b656e645f696472637573746f6d65723a636c75737465722d616b636f6e74726163745f6964f66b637573746f6d65725f69646a637573746f6d65722d616c656e64706f696e745f75726c782668747470733a2f2f636c75737465722d612e637573746f6d65722e6578616d706c652f7263786e74727573745f726f6f745f6b69646f637573746f6d65722d726f6f742d61781963726f73735f7369676e65645f62795f7661756c7463727578f5";
+    const GOVERNANCE_VECTOR_TOKEN_HASH: &str = "5f9641d7020b4b191999ff32256ef21c624fb4e2e95b55238b7a94cc5f258c92";
+
+    fn governance_tier_vector_fixture() -> RcxCapabilityToken {
+        let mut token = free_local_verified_fixture();
+        token.spec_version = RCX_CT_GOVERNANCE_SPEC_VERSION.to_string();
+        token.token_id = "rcxct_governance_0123456789abcdef_default".to_string();
+        token.tier = RcxTier::Governance;
+        token.enterprise_scope = Some(EnterpriseScope {
+            customer_id: "customer-a".to_string(),
+            contract_id: None,
+            backend_id: "customer:cluster-a".to_string(),
+            endpoint_url: "https://cluster-a.customer.example/rcx".to_string(),
+            trust_root_kid: "customer-root-a".to_string(),
+            airgap: true,
+            cross_signed_by_vaultcrux: true,
+        });
+        // enterprise_scope names a backend that must exist in `backends`.
+        token.backends[0].backend_id = "customer:cluster-a".to_string();
+        token.backends[0].trust_root_kid = "customer-root-a".to_string();
+        token.backends[0].endpoint_url = Some("https://cluster-a.customer.example/rcx".to_string());
+        token
+    }
+
+    #[test]
+    fn governance_vector_has_stable_bytes_across_languages() {
+        let token = governance_tier_vector_fixture();
+        assert_eq!(token.tier, RcxTier::Governance);
+        assert_eq!(token.spec_version, "rcx-ct/1.2");
+        assert_eq!(hex::encode(token.to_canonical_cbor()), GOVERNANCE_VECTOR_CBOR_HEX);
+        assert_eq!(token.token_hash_hex(), GOVERNANCE_VECTOR_TOKEN_HASH);
+
+        // A plain entitlement token carries NO delegation policy. It must still
+        // be structurally valid at 1.2.
+        let issues: Vec<_> = token
+            .validate_basic(token.issued_at + 1)
+            .issues
+            .into_iter()
+            .map(|i| i.code)
+            .collect();
+        assert!(issues.is_empty(), "1.2 entitlement token must validate, got {issues:?}");
+
+        // And it must verify through the GENERIC issuer path — no proof-of-possession
+        // context. This is the shape the pairing flow (M3) mints, so if 1.2 demanded
+        // contextual verification the entire entitlement path would be unreachable.
+        assert!(
+            !token.requires_contextual_verification(),
+            "a 1.2 entitlement token carries no delegation and must not require PoP context"
+        );
+        let issuer = SigningKey::from_bytes(&[11u8; 32]);
+        let mut signed = governance_tier_vector_fixture();
+        signed.signature.sig = issuer.sign(&signed.token_hash()).to_bytes();
+        assert_eq!(
+            verify_token(&signed, &issuer.verifying_key().to_bytes(), signed.issued_at + 1),
+            VerifyOutcome::Verified
+        );
+    }
 
     fn sync_delegation_vector_fixture() -> RcxCapabilityToken {
         let mut token = free_local_verified_fixture();
@@ -2543,7 +2679,7 @@ mod tests {
         let delegate = SigningKey::from_bytes(&[3; 32]);
         let outsider = SigningKey::from_bytes(&[4; 32]);
         let mut base = delegation_enabled_fixture(&issuer, &subject, &delegate);
-        base.tier = RcxTier::Team;
+        base.tier = RcxTier::Pro;
         base.team_scope = Some(TeamScope {
             team_id: "team-1".to_string(),
             seat_id: None,
@@ -2649,6 +2785,162 @@ mod tests {
                 AttenuatedOutcome::ContextDenied | AttenuatedOutcome::CaveatDenied
             ));
         }
+    }
+
+    // ── crux-relay audience separation (ExecPlan crux-hosted-relay-gateway M0) ──
+    //
+    // The relay reuses the sync boundary's machinery, so the ONLY thing keeping a
+    // relay-paired device out of the sync boundary is the audience triple-equality
+    // in `verify_token_attenuated`. These four tests pin that property in both
+    // directions; if they ever pass vacuously the boundary has collapsed.
+
+    /// Build a relay-audience delegation: policy audience, envelope audience and
+    /// the presented context all say `crux-relay`.
+    fn relay_delegation(issuer: &SigningKey, subject: &SigningKey, delegate: &SigningKey) -> RcxCapabilityToken {
+        let mut base = delegation_enabled_fixture(issuer, subject, delegate);
+        base.backends[0].permitted_capabilities.push(PermittedCapability {
+            capability: RCX_RELAY_SESSION_CAPABILITY.to_string(),
+            data_egress_classes: vec![DataEgressClass::Text],
+            required_attestations: vec![RCX_SYNC_PASSPORT_ATTESTATION.to_string()],
+            credit_cost: None,
+        });
+        let policy = base
+            .delegation_policy
+            .as_mut()
+            .unwrap_or_else(|| panic!("fixture must carry a delegation policy"));
+        policy.audience = DelegationAudience::CruxRelay;
+        base.signature.sig = issuer.sign(&base.token_hash()).to_bytes();
+        base.attenuate_for(
+            vec![
+                Caveat::TenantIdEq {
+                    tenant_id: "default".to_string(),
+                },
+                Caveat::ExpiresAtLe {
+                    expires_at: 1_780_143_100,
+                },
+            ],
+            delegate.verifying_key().to_bytes(),
+            "relay-delegation-1",
+            subject,
+        )
+        .unwrap_or_else(|error| panic!("relay delegation fixture failed: {error:?}"))
+    }
+
+    fn relay_context<'a>(tenant_id: &'a str, attestations: &'a [&'a str]) -> AttenuationContext<'a> {
+        AttenuationContext {
+            audience: DelegationAudience::CruxRelay,
+            tenant_id,
+            backend_id: "local",
+            capability: RCX_RELAY_SESSION_CAPABILITY,
+            data_egress_classes: &[DataEgressClass::Text],
+            present_attestations: attestations,
+        }
+    }
+
+    #[test]
+    fn relay_audience_delegation_verifies_at_a_relay_context() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let token = relay_delegation(&issuer, &subject, &delegate);
+        let context = relay_context("default", &[RCX_SYNC_PASSPORT_ATTESTATION]);
+
+        let outcome = verify_as(&token, &issuer, &delegate, context, M2_NONCE, M2_NONCE);
+
+        assert!(
+            matches!(outcome, AttenuatedOutcome::Verified(_)),
+            "a canonical relay delegation must verify at a relay context, got {outcome:?}"
+        );
+    }
+
+    // Both cross-boundary tests are DIFFERENTIAL: they assert the baseline
+    // context verifies, then flip *only* `audience` and assert denial. The
+    // capability/egress check at the top of `verify_token_attenuated` also
+    // returns `ContextDenied`, so asserting the variant alone would pass
+    // vacuously if the fixture happened to lack the capability. Proving the
+    // baseline first is what makes the audience the sole variable.
+
+    #[test]
+    fn relay_delegation_is_refused_at_the_sync_boundary() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let token = relay_delegation(&issuer, &subject, &delegate);
+
+        let baseline = relay_context("default", &[RCX_SYNC_PASSPORT_ATTESTATION]);
+        assert!(
+            matches!(
+                verify_as(&token, &issuer, &delegate, baseline, M2_NONCE, M2_NONCE),
+                AttenuatedOutcome::Verified(_)
+            ),
+            "baseline relay context must verify, else the flip below proves nothing"
+        );
+
+        // Flip ONLY the audience — this is what the sync handshake presents.
+        let mut crossed = baseline;
+        crossed.audience = DelegationAudience::CruxSync;
+
+        assert_eq!(
+            verify_as(&token, &issuer, &delegate, crossed, M2_NONCE, M2_NONCE),
+            AttenuatedOutcome::ContextDenied,
+            "a relay-audience envelope must not be presentable at the sync boundary"
+        );
+    }
+
+    #[test]
+    fn sync_delegation_is_refused_at_the_relay_boundary() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let token = valid_delegation(&issuer, &subject, &delegate);
+
+        let baseline = query_context("corecrux.query.explain", "default", &[RCX_SYNC_PASSPORT_ATTESTATION]);
+        assert!(
+            matches!(
+                verify_as(&token, &issuer, &delegate, baseline, M2_NONCE, M2_NONCE),
+                AttenuatedOutcome::Verified(_)
+            ),
+            "baseline sync context must verify, else the flip below proves nothing"
+        );
+
+        // Flip ONLY the audience — this is what the relay attach presents.
+        let mut crossed = baseline;
+        crossed.audience = DelegationAudience::CruxRelay;
+
+        assert_eq!(
+            verify_as(&token, &issuer, &delegate, crossed, M2_NONCE, M2_NONCE),
+            AttenuatedOutcome::ContextDenied,
+            "a sync-audience envelope must not be presentable at the relay boundary"
+        );
+    }
+
+    #[test]
+    fn relay_audience_round_trips_through_canonical_cbor() {
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let token = relay_delegation(&issuer, &subject, &delegate);
+
+        let encoded = hex::encode(token.to_canonical_cbor());
+        assert!(
+            encoded.contains(&hex::encode(RCX_RELAY_DELEGATION_AUDIENCE)),
+            "the relay audience must appear in the canonical encoding"
+        );
+        // The wire form must decode back to the same audience — this is what the
+        // TS minter has to reproduce byte-for-byte.
+        let policy = token
+            .delegation_policy
+            .as_ref()
+            .unwrap_or_else(|| panic!("relay fixture must carry a policy"));
+        assert_eq!(policy.audience, DelegationAudience::CruxRelay);
+        assert_eq!(
+            token
+                .delegation_envelope
+                .as_ref()
+                .unwrap_or_else(|| panic!("relay fixture must carry an envelope"))
+                .audience,
+            DelegationAudience::CruxRelay,
+        );
     }
 
     #[test]
@@ -2872,7 +3164,7 @@ mod tests {
         let signing = SigningKey::from_bytes(&[7u8; 32]);
         let mut token = free_local_verified_fixture();
         token.token_id = "rcxct_team_0123456789abcdef".to_string();
-        token.tier = RcxTier::Team;
+        token.tier = RcxTier::Pro;
         token.team_scope = Some(TeamScope {
             team_id: "team-a".to_string(),
             seat_id: Some("seat-a".to_string()),
@@ -2914,7 +3206,7 @@ mod tests {
         let signing = SigningKey::from_bytes(&[7u8; 32]);
         let mut token = free_local_verified_fixture();
         token.token_id = "rcxct_enterprise_0123456789abcdef".to_string();
-        token.tier = RcxTier::Enterprise;
+        token.tier = RcxTier::Governance;
         token.enterprise_scope = Some(EnterpriseScope {
             customer_id: "customer-a".to_string(),
             contract_id: Some("contract-a".to_string()),
@@ -2954,6 +3246,91 @@ mod tests {
         let json = token.to_canonical_json();
         assert!(json.contains("\"enterprise_scope\""));
         assert!(json.contains("\"airgap\":true"));
+    }
+
+    // --- M1 tier taxonomy cutover (rcx-ct/1.2) -------------------------------
+    // ExecPlan crux-pro-capabilities-rcx-entitled-2026-07-27 M1. Exit criterion:
+    // no `team`/`enterprise` value survives, and `governance` is carried instead.
+
+    #[test]
+    fn retired_tier_values_do_not_deserialise_and_published_ladder_does() {
+        // The retired values must fail *parsing*, not merely compare unequal —
+        // that is what makes a stale token fail closed to FreeLocal rather than
+        // silently resolving to some default tier.
+        for retired in ["team", "enterprise"] {
+            let parsed = serde_json::from_str::<RcxTier>(&format!("\"{retired}\""));
+            assert!(parsed.is_err(), "retired tier `{retired}` must not deserialise");
+        }
+        for (wire, tier) in [
+            ("free", RcxTier::Free),
+            ("pro", RcxTier::Pro),
+            ("governance", RcxTier::Governance),
+        ] {
+            let parsed = serde_json::from_str::<RcxTier>(&format!("\"{wire}\""))
+                .unwrap_or_else(|e| panic!("published tier `{wire}` must deserialise: {e}"));
+            assert_eq!(parsed, tier);
+            assert_eq!(tier.as_str(), wire, "as_str must round-trip the wire value");
+        }
+    }
+
+    #[test]
+    fn governance_tier_requires_enterprise_scope_and_team_scope_is_unconstrained() {
+        let mut token = free_local_verified_fixture();
+        token.tier = RcxTier::Governance;
+        token.enterprise_scope = None;
+        let issues: Vec<_> = token
+            .validate_basic(1_776_989_601)
+            .issues
+            .into_iter()
+            .map(|i| i.code)
+            .collect();
+        assert!(
+            issues.iter().any(|c| c == "missing_enterprise_scope"),
+            "governance without enterprise_scope must be rejected, got {issues:?}"
+        );
+
+        // `Team` is gone, so no tier constrains `team_scope` any more. The field
+        // stays on the struct (removing it would change the shape for every tier),
+        // but a Pro token carrying one is structurally valid.
+        let mut pro = free_local_verified_fixture();
+        pro.tier = RcxTier::Pro;
+        assert!(
+            !pro.validate_basic(1_776_989_601)
+                .issues
+                .iter()
+                .any(|i| i.code == "missing_team_scope"),
+            "no missing_team_scope invariant should survive the cutover"
+        );
+    }
+
+    #[test]
+    fn spec_1_2_is_accepted_alongside_1_1_not_in_place_of_it() {
+        // Both delegation spec versions must satisfy the same gate. If 1.2 had
+        // replaced 1.1 rather than joining it, every delegation token already
+        // minted against 1.1 would fail closed — an entitlement outage.
+        assert!(is_delegation_spec_version(RCX_CT_DELEGATION_SPEC_VERSION));
+        assert!(is_delegation_spec_version(RCX_CT_GOVERNANCE_SPEC_VERSION));
+        assert!(!is_delegation_spec_version(RCX_CT_SPEC_VERSION));
+        assert!(!is_delegation_spec_version("rcx-ct/9.9"));
+
+        let issuer = SigningKey::from_bytes(&[1; 32]);
+        let subject = SigningKey::from_bytes(&[2; 32]);
+        let delegate = SigningKey::from_bytes(&[3; 32]);
+        let mut token = delegation_enabled_fixture(&issuer, &subject, &delegate);
+        token.spec_version = RCX_CT_GOVERNANCE_SPEC_VERSION.to_string();
+        token.signature.sig = issuer.sign(&token.token_hash()).to_bytes();
+
+        let issues: Vec<_> = token
+            .validate_basic(1_776_989_601)
+            .issues
+            .into_iter()
+            .map(|i| i.code)
+            .collect();
+        assert!(
+            !issues.iter().any(|c| c == "invalid_spec_version"),
+            "rcx-ct/1.2 must clear the delegation spec gate, got {issues:?}"
+        );
+        assert!(token.requires_contextual_verification());
     }
 }
 

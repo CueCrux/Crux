@@ -11,6 +11,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.55] - 2026-08-02
+
+### Added
+
+- **Account entitlement is now a verified property of a signed token, not an
+  environment variable.** Three milestones of
+  `crux-pro-capabilities-rcx-entitled-2026-07-27` land together, all **dark** —
+  nothing enforces on them yet, `OperatingMode` still comes from
+  `CORECRUXD_OPERATING_MODE`, and the cutover is a later milestone.
+  - `corecruxd::entitlement` — an on-disk entitlement store on the reserved
+    `__entitlement__::rcx` entity (born private, no freshness horizon), plus
+    `resolve_entitlement`: revocation → presence → parse → tenant scope →
+    signature → expiry → tier. Forgery and revocation always resolve
+    `FreeLocal`; an expired token follows its own `FallbackPolicy`, so a paying
+    user who is merely offline keeps working.
+  - `corecruxd::pairing` — the daemon half of account pairing, reusing the
+    RFC 8628 device grant already shipped at `/v1/auth/device/*`. No licence key
+    and no typed secret: the `user_code` is a short-lived, single-use public
+    correlator, useless without an authenticated browser session, and never
+    written to configuration.
+  - `OperatingMode::GovernanceHosted`. `MaxPrivate` remains a composite —
+    Governance entitlement plus a private deployment shape — so no issuer can
+    hand it out.
+
+### Changed
+
+- **`RcxTier` cut over to the published ladder: `Free | Pro | Governance`.**
+  The previous `Free | Pro | Team | Enterprise` matched no product CueCrux
+  sells. `Team` is retired outright and `Enterprise` becomes `Governance`;
+  `crux-enterprise-shim` re-gates accordingly (`not_enterprise_tier` →
+  `not_governance_tier`). Retired values now fail *deserialisation*, which is
+  what makes a stale token fail closed to `FreeLocal` rather than resolve to
+  some default. `team_scope` and `enterprise_scope` stay on the token: removing
+  either would change the signed bytes for every tier, not just the retired one.
+- **New spec version `rcx-ct/1.2`, accepted alongside `rcx-ct/1.1` rather than
+  replacing it.** The spec-version check is not a version ladder but a match
+  with a rejecting catch-all, so repointing the 1.1 constant would have failed
+  every delegation token already minted. `1.2` is a *tier-vocabulary* version and
+  is orthogonal to delegation: 1.0 forbids a delegation policy, 1.1 requires
+  one, 1.2 makes it optional — a plain entitlement token carries none. A
+  cross-language byte-parity vector pins the Rust and TypeScript encoders
+  together on a `1.2` token with `tier: governance`.
+- **`corecruxd` split into sibling crates** — `corecrux-workspace-scan`,
+  `corecrux-billing`, `corecrux-providers` and `corecrux-secrets` — with the
+  unwrap ratchet re-baselined across the new boundary and `AGENTS.md` added for
+  the extracted crates.
+- Desktop shell gains isolated Registry and WikiCrux tabs.
+- Workspace test coverage raised from 88.49% to 90.11% across the nine
+  highest-debt files.
+
+### Fixed
+
+- **Seat identity is taken from the credential, not the request body**, closing
+  a bypass of the M8 per-seat rate ceiling on enriched verdicts.
+- **`dossier` and `storybook` now authorise against the tenant they answer for**
+  (code-intel M3b).
+- `ledger:history` is no longer advertised as a Pro claim. The route is fully
+  implemented but nothing produces a record, and selling a capability with no
+  producer is a truth-in-selling problem; the route and its handlers stay.
+- `run_git` gained a real wall-clock deadline. `GIT_TIMEOUT_SECS` fed only
+  `GIT_HTTP_LOW_SPEED_TIME`, an HTTP-transport setting that neither a local
+  `git blame` nor an SSH remote ever consults, so the call could block
+  unbounded on a stale `index.lock`.
+- `corecruxctl --version` now exists. It had no version surface at all, unlike
+  `crux-hook` and `corecruxd`.
+- The console `.mcpb` is rebuilt so it ships Apache-2.0 rather than the retired
+  CCL-1.0.
+- The config wizard parses profile frontmatter on a CRLF checkout.
+- The release path and a hang guard that was failing tests are unbroken.
+
+### Security
+
+- **wasmtime 47.0.2 → 47.0.3**, clearing [RUSTSEC-2026-0222] (stores can mix up
+  type indices between engines) and [RUSTSEC-2026-0223] (preemption and traps
+  during bulk operations break internal VM state). Lockfile only; `wasmtime` is
+  optional behind the default-off `wasm-extensions` feature, so default builds
+  never compiled it.
+
+[RUSTSEC-2026-0222]: https://rustsec.org/advisories/RUSTSEC-2026-0222
+[RUSTSEC-2026-0223]: https://rustsec.org/advisories/RUSTSEC-2026-0223
+
+## [0.5.54] - 2026-07-30
+
 ### Changed
 
 - Repository scans now use descriptor-pinned roots, unified parser/generated
@@ -58,38 +141,135 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The token-burn cost lens gains a model/effort axis.** `crux-cost` already
+  opened every transcript line by line and discarded what it found: `gitBranch`
+  was parsed but used only as an internal ranking tie-breaker, and `model`,
+  `effort` and `cwd` were not parsed at all. All four are now parsed onto the
+  event, promoted onto `CostReport`, and rolled up into a per-model burn
+  breakdown with per-effort burn *within* each model, rendered by both
+  `corecruxctl session cost` and the console `cx-cost` page.
+  - **It reconciles.** Per-model context, plus the `<synthetic>` pseudo-model,
+    plus records carrying usage but no model id, sum exactly to
+    `headline.measured_context_total`.
+  - **Coverage travels with every effort number.** `effort` is absent from 61%
+    of the measured corpus and its absence correlates with model — 100% / 100% /
+    22.5% / 9.4% across 46,239 assistant records — so a cross-model effort
+    comparison is confounded at source and no sample size fixes it.
+    `effort_coverage_pct` lives on the type, so no surface can render an effort
+    figure without the denominator that qualifies it.
+  - `<synthetic>` is reported separately, never ranked as a model and never
+    dropped. Model-id normalisation folds only stable presentation variants
+    (`[1m]` context suffix, `us.anthropic.`/`bedrock/`/`vertex/` route prefixes,
+    `-v1:0`); floating aliases such as `opus` and `sonnet` are deliberately left
+    unresolved, since resolving them would silently merge two models the day the
+    alias moves.
+  - The five new `CostReport` fields are additive, serde-default and omitted
+    when absent, so an older daemon ignores a newer report and a legacy report
+    is unchanged on the wire. A daemon must be upgraded before the console can
+    render the axis.
+  - Adds the cost lane's first integration coverage: a post-then-get test
+    through both `/v1/cost/report` handlers.
+
 - **`CITATION.cff`.** Machine-readable citation metadata (GitHub "Cite this
   repository" button). Under Apache-2.0 citation is appreciated but not a
   licence condition.
 
+- **A Windows GUI smoke lane for the desktop shell.** `desktop-shell.yml` gains
+  `desktop GUI smoke (windows, interactive session)`, running on a self-hosted
+  runner that executes inside a real logged-on desktop
+  (`[self-hosted, windows-gui]`). It bundles the MSI, installs it per-machine,
+  launches the installed app, and asserts what only a desktop can show: a window
+  appears, an `msedgewebview2` host actually starts, the bundled `corecruxd`
+  sidecar is spawned from the `externalBin` slot, and a graceful close reaps that
+  sidecar. A desktop screenshot uploads on every run, including failures.
+  Non-blocking — it depends on a single operator-owned box, so an offline runner
+  must not gate the merge queue.
+
+  This closes the gap the native-Windows build fix left open: that change noted
+  there was "no Windows job to catch the next one" of ~49 `#[cfg(unix)]` sites.
+  Compiling was never the hard part — a Tauri/WebView2 window cannot be created
+  in a headless or Session 0 context at all, so app launch was unobservable on
+  every existing runner. `scripts/provision-windows-gui-runner.ps1` provisions
+  such a box and refuses to run where a GUI cannot exist; `docs/self-hosted-runner.md`
+  records why Server Core and Session 0 are each disqualifying, and what the lane
+  deliberately does not cover (reboot re-attach, the Defender first-bind prompt,
+  WSL2 parity with a developer box).
+
 ### Fixed
 
-- **Repository scans are contained, bounded, and stale-safe.** Local
-  `root_path` registrations require cross-tenant operator authority and a
-  canonical descendant of the explicit
-  `CORECRUXD_REPO_SCAN_ALLOWED_ROOTS`; MCP binds target tenants to authenticated
-  tenant authority and defaults local scans to async. The operator
-  `CORECRUXD_WORKSPACE_PATH` remains separate and never expands tenant scan
-  authority. Starting and reading the self-scan require cross-tenant operator
-  authority; the persisted result redacts the absolute host root. An empty
-  allowlist disables local repo scans. Inline scans, queued jobs, and bounded
-  polling watchers revalidate at execution time, reject symlinks, hard links,
-  non-regular files and cycles, and share configurable depth, entry, byte,
-  per-file, output and cooperative elapsed-work limits. One process-wide permit
-  is held through encoding/persistence; queues are capped globally and per
-  tenant. Async/watch completions are registration-generation-bound so stale
-  results cannot land after delete/recreate. Watchers use secure content
-  digests, full replacement scans, retry-safe snapshots, and fixed global and
-  tenant caps. Secure reads are Unix-only and native non-Unix daemons fail
-  closed before opening; Windows operators should use WSL2.
+- **The SessionEnd cost hook now records whether it worked.** The generated
+  `cost)` launcher branch failed silently on three paths — `corecruxctl` absent,
+  no configured endpoint, post rejected — each swallowed by `|| true`. Quiet is
+  the correct posture for a SessionEnd hook, which must never block session end;
+  undiagnosable is not. There was no way to distinguish "no sessions ran" from
+  "every session silently failed to post", and the branch had no test coverage
+  of any kind, which is why it survived.
+  - Every attempt writes a one-line outcome record (result, reason, endpoint,
+    endpoint source, launcher version) to `~/.claude/hooks/crux-cost.state.json`;
+    failures additionally append to `crux-cost.errors.log`. `exit 0` remains
+    unconditional on every path.
+  - `CRUX_HTTP_URL` can never actually be empty — `${CRUX_HTTP_URL:-…}`
+    substitutes for empty as well as unset — so the real misconfiguration is the
+    *unconfigured loopback default*, which fails with a connection refused the
+    operator cannot place. The launcher now records whether the endpoint came
+    from config or from the built-in default, and names the remedy.
+  - `corecruxctl hooks status` reports the last outcome and flags a stale
+    launcher by version marker. The boot self-check warns when the installed
+    launcher predates the running build, or when capture last failed or was
+    never attempted — nothing warns when no outcome has been recorded yet, since
+    a fresh install has simply not ended a session.
+  - Six shell-level tests run the *embedded* launcher template under `bash`, so
+    they cannot drift from what `hooks install` writes.
 
-- **Standalone self-update now authenticates its manifest before trusting it.**
-  `crux self update` resolves an immutable release tag, bounds the manifest and
-  Sigstore bundle, and requires `cosign verify-blob` with the exact CueCrux
-  release-workflow identity and GitHub Actions issuer before JSON parsing.
-  Schema, tag/version, artifact mapping, and SHA-256 fields then receive strict
-  validation. Releases publish and self-verify a standard bundle with patched
-  Cosign 2.6.2; missing tooling or proof fails closed.
+  **This takes effect only after `corecruxctl hooks install` is re-run.** An
+  un-re-run wizard keeps the old silent script, and that is the most likely way
+  this fix appears not to work.
+
+- **Three tests that asserted things the machine does not guarantee.** Each
+  failed CI on an unrelated PR and passed on a re-run of the identical commit;
+  two of them gate required checks, so they cost merges rather than just noise.
+  - `envelope_build_latency_under_2ms_for_10_facts` (`crux-mcp`) asserted a
+    wall-clock bound — the only one in the workspace. On a shared runner that
+    measures how busy the machine is, not how fast the code is. The figure is
+    still measured and printed; the assertion is gone, and the test is renamed
+    `envelope_build_covers_all_ten_facts` after the check that carries content
+    (`memories_used.len() == 10`). Raising the constant was rejected: it trades a
+    frequent flake for a rarer one and keeps a load-dependent test.
+  - `allowed_origins_reads_the_env_var` (`corecruxd`) round-tripped through
+    `set_var`/`getenv` and read back the built-in defaults instead of the value
+    it had just set — *while holding the module's `env_lock()`*. The mutex was
+    never the problem: `setenv` can reallocate the environment block, and a
+    concurrent `getenv` anywhere in this 2000-plus-test binary may then read a
+    stale pointer, which no Rust-level lock can fence (hence `set_var` being
+    `unsafe` from the 2024 edition). It now parses via `resolve_allowed_origins`
+    directly, matching its five neighbours, and removes the last `set_var` in
+    the file.
+  - `pick_free_port_is_bindable` (`crux-shell-lifecycle`) asserted that a port
+    picked by binding `:0` and dropping the listener is immediately re-bindable.
+    Nothing promises that — sibling tests binding `:0` in parallel can take it
+    in the gap. It now retries a bounded number of times, so only a genuinely
+    broken helper fails.
+
+- **The desktop shell no longer opens stray console windows on Windows.** Two
+  spawn sites, both console-subsystem binaries launched from a GUI-subsystem app
+  (`windows_subsystem = "windows"`) that has no console to inherit — so Windows
+  allocated a fresh console *window* for each:
+  - `spawn_sidecar` (`crux-shell-lifecycle`) launched the bundled `corecruxd`
+    with a visible console that sat beside the app for its entire lifetime.
+    Redirecting stdout/stderr into the sidecar log did not suppress it: the
+    streams and the window are independent.
+  - the Windows credential lookup (`crux-shell-connection`) shells out to
+    `powershell.exe` for the `PasswordVault` read, flashing a console on *every*
+    attach-profile activation and retry. `-NonInteractive` governs the prompt,
+    not the window.
+
+  Both now set `CREATE_NO_WINDOW` (`0x08000000`) via `CommandExt::creation_flags`.
+  `rundll32.exe`, used to open external links, is GUI-subsystem (verified from
+  its PE header) and needed no change.
+
+  Found by the new Windows GUI smoke lane on its first green run — the
+  assertions passed while the uploaded screenshot showed the console box. That
+  lane now fails if either window returns.
 
 - **A cold `cargo build` now completes on native Windows.** Three unrelated
   stops, none of which CI can see (every runner is Linux, and the release matrix
@@ -572,7 +752,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-deny` supply chain and licence audit in CI
 - `cargo-audit` CVE scanning in CI
 
-[unreleased]: https://github.com/CueCrux/Crux/compare/v0.4.6...HEAD
+[unreleased]: https://github.com/CueCrux/Crux/compare/v0.5.54...HEAD
+[0.5.55]: https://github.com/CueCrux/Crux/compare/v0.5.54...v0.5.55
+[0.5.54]: https://github.com/CueCrux/Crux/compare/v0.5.53...v0.5.54
 [0.4.6]: https://github.com/CueCrux/Crux/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/CueCrux/Crux/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/CueCrux/Crux/compare/v0.4.3...v0.4.4

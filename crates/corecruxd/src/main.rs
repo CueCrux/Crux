@@ -26,6 +26,7 @@
 
 mod activity;
 mod agentgraph_kinds;
+mod attention;
 mod auth;
 mod code_intel;
 mod codegraph_fusion;
@@ -39,16 +40,25 @@ mod cost_attribution;
 // Default-off, append-only comped-wallet meter shared by the explicit spend
 // rail and metered capability paths.
 #[allow(dead_code)]
-mod credit_meter;
+// Extracted to the `corecrux-billing` crate; aliased so existing
+// `crate::credit_meter::…` call sites compile unchanged. The fail-closed
+// response to a poisoned meter lock stays in `http/credit_meter.rs` — the
+// ledger crate holds state, the handler owns the policy.
+use corecrux_billing::credit_meter;
+mod enrich_budget;
 // Dataplane store stubs: proprietary edition provides the real implementation.
 #[allow(dead_code)]
 mod dataplane_store;
+mod entitlement;
+mod pairing;
 // gRPC service stubs: dataplane-enabled distributions implement full RPCs;
 // Crux Daemon keeps the server skeleton. Suppress dead_code for stub internals.
 #[allow(dead_code)]
 mod grpc;
+mod hosted_token;
 mod http;
 mod local_ingest;
+mod relay_device;
 // Candidate proposers are staged behind the identity-candidates rollout path; tests
 // exercise creation/proposal before daemon startup wires automatic proposer runs.
 #[allow(dead_code)]
@@ -56,7 +66,10 @@ mod candidate_links;
 mod candidate_store;
 mod context_graph;
 mod dossier;
-mod encrypted_secrets;
+// Extracted to the `corecrux-secrets` leaf crate; aliased so existing
+// `crate::encrypted_secrets::…` call sites (7 of them, incl. wasm_host and
+// http/extensions) compile unchanged.
+use corecrux_secrets as encrypted_secrets;
 mod ephemeral_gc;
 // Git-backed ExecPlan projection root: clone + fast-forward only, so the
 // replica can never hold state git does not already have.
@@ -67,9 +80,12 @@ mod extension_registry;
 mod fact_helpers;
 mod fact_privacy;
 mod identity_links;
-mod integrations_github;
-mod integrations_github_sync;
-mod integrations_openai;
+// Extracted to the `corecrux-providers` crate (provider credentials + GitHub
+// sync); aliased so existing `crate::integrations_*::…` call sites in
+// http/integrations_{github,openai}.rs compile unchanged.
+use corecrux_providers::github as integrations_github;
+use corecrux_providers::github_sync as integrations_github_sync;
+use corecrux_providers::openai as integrations_openai;
 mod mcp_stdio;
 mod memory_extract;
 pub mod mint_requests;
@@ -94,10 +110,17 @@ mod projects;
 mod protocol_posture;
 mod redaction;
 mod relations;
+mod repo_aggregate;
 mod repo_allowance;
 mod repo_codegraph;
 mod repo_registry;
-mod repo_scan_policy;
+// Moved into `corecrux-workspace-scan` alongside the scanners it contains: the
+// two are mutually recursive (the scanners charge work and check deadlines on
+// nearly every iteration; the policy calls back into `walk_dir` /
+// `read_scan_bytes`), so a crate boundary between them is not expressible.
+// Aliased so corecruxd's own `crate::repo_scan_policy::…` call sites are
+// unchanged.
+use corecrux_workspace_scan::repo_scan_policy;
 mod repo_watch;
 mod self_update;
 mod session_bindings;
@@ -123,10 +146,15 @@ mod witness_proofs;
 mod witness_submit;
 mod work;
 mod work_execplans;
-mod workspace_scan;
-mod workspace_scan_ast;
-mod workspace_scan_manifests;
-mod workspace_scan_polyglot;
+// Extracted to the `corecrux-workspace-scan` crate; aliased so the 16 consumer
+// modules here (http/repos, http/workspace, code_intel, repo_codegraph,
+// symbol_resolve, dossier, …) keep their existing `crate::workspace_scan*::`
+// paths. Module names kept their prefix inside the new crate so the ~15k lines
+// of intra-group paths needed no rewriting.
+use corecrux_workspace_scan::workspace_scan;
+use corecrux_workspace_scan::workspace_scan_ast;
+use corecrux_workspace_scan::workspace_scan_manifests;
+use corecrux_workspace_scan::workspace_scan_polyglot;
 
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
@@ -140,7 +168,7 @@ use fs2::{available_space, total_space, FileExt};
 use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use corecrux_types::{
     BuildInfo, CapacityThresholdBreachedV1, CompatContract, ControlCheckpointMaterializedV1, ControlStateMutationV1,
@@ -837,6 +865,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         quota_hosted_surfaces: Arc::new(config.quota_hosted_surfaces.clone()),
         quota_ledger: Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
         credit_meter,
+        enrich_budgets: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
         openai_shim_enabled: config.openai_shim_enabled,
         memory_import_enabled: config.memory_import_enabled,
         identity_links_enabled: config.identity_links_enabled,
@@ -979,6 +1008,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Wire the shared event bus into both stores so mutations emit SSE events.
     state.fact_store.write().await.set_event_bus(state.event_bus.clone());
     state.session_store.write().await.set_event_bus(state.event_bus.clone());
+
+    // Load-at-startup: rehydrate paired-device refresh credentials, so a daemon
+    // restart no longer silently unpairs every device (ExecPlan
+    // crux-hosted-relay-gateway-2026-07-30, M1).
+    crate::http::auth_device::hydrate_refresh_credentials(&state).await;
+
+    // Load-at-startup: the externally-minted hosted token, if the operator
+    // configured one (M4a). Held to one side and NOT given to `rcx_router` — a
+    // delegation-bearing token makes `requires_contextual_verification()` true,
+    // and the router then refuses every capability on it. M4b's relay client is
+    // the consumer.
+    // The verified grant is intentionally not retained yet: M4b's relay client
+    // is the first consumer and will own the storage. Loading here still earns
+    // its keep — an operator sees at boot whether the grant is usable, rather
+    // than discovering it at the first connect attempt.
+    //
+    // M1 extends that: the device identity is surfaced (the operator needs the
+    // fingerprint to register the device) and, when a relay grant is present,
+    // the delegation envelope is minted once as a **boot-time rehearsal**. It is
+    // dropped rather than kept — M4b owns the storage — but minting it here
+    // means a daemon that cannot produce a valid envelope says so at boot,
+    // beside the grant it belongs to, instead of failing at the first connect.
+    {
+        let now_seconds = now_unix_ms() / 1000;
+        let hosted = crate::hosted_token::load_from_env(now_seconds);
+        let device = crate::relay_device::DeviceIdentity::derive(&rcx_passport_key);
+        info!(
+            device_fpr = %device.fpr(),
+            "relay device identity derived; register this fingerprint to pair this daemon"
+        );
+        if let Some(hosted) = hosted.as_ref() {
+            if hosted.relay.is_some() {
+                match crate::relay_device::attenuate_for_relay(
+                    hosted,
+                    &rcx_passport_key,
+                    &device,
+                    "boot-rehearsal",
+                    now_seconds,
+                    crate::relay_device::DEFAULT_ENVELOPE_TTL_SECONDS,
+                ) {
+                    Ok(_) => info!(
+                        device_fpr = %device.fpr(),
+                        "relay delegation envelope mints cleanly"
+                    ),
+                    // Not fatal: the daemon serves local capability with or
+                    // without a relay. Warn loudly and carry on, rather than
+                    // refusing to boot over a hosted feature.
+                    Err(error) => warn!(
+                        device_fpr = %device.fpr(),
+                        %error,
+                        "relay grant present but the delegation envelope cannot be minted; \
+                         the relay session will not establish until this is resolved"
+                    ),
+                }
+            }
+        }
+    }
     {
         let mut store = state.fact_store.write().await;
         let count = crate::repo_registry::fail_incomplete_scans(
@@ -1226,6 +1312,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 _ = interval.tick() => {
                                     let spans = ring.drain();
                                     if spans.is_empty() { continue; }
+                                    // Both sides changed this block: red-steel put the
+                                    // resolver rebuild behind scan admission control, and
+                                    // main added M6 retention pruning. Keep both — taking
+                                    // either alone silently drops the other.
                                     let resolver = cache
                                         .get(
                                             &fact_store,
@@ -1235,6 +1325,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                             &repo_id,
                                         )
                                         .await;
+                                    // M6: enforce the retention window on every flush.
+                                    // A window nothing applies is not retention — it is a
+                                    // documented intention, and the store grows anyway.
+                                    match store.prune_expired(
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+                                    ) {
+                                        Ok(0) => {}
+                                        Ok(n) => info!(pruned = n, "trace-retention-pruned"),
+                                        Err(err) => tracing::warn!(?err, "trace-retention-prune-failed"),
+                                    }
                                     match store.append_resolved(spans, resolver.as_deref(), &tenant_id) {
                                         Ok(r) => info!(
                                             drained = r.spans_drained, resolved = r.resolved,
@@ -4819,6 +4921,7 @@ mod tests {
             quota_hosted_surfaces: std::sync::Arc::new(Vec::new()),
             quota_ledger: std::sync::Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
             credit_meter: None,
+            enrich_budgets: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
             openai_shim_enabled: false,
             memory_import_enabled: false,
             identity_links_enabled: false,

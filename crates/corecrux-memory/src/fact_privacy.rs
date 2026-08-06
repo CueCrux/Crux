@@ -111,6 +111,11 @@ pub const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
     "__coord__::",
     "__dossier__::",
     "__engram__::",
+    // Vault key escrow (ExecPlan crux-key-escrow-and-recovery M3b): wrapped
+    // DEK ciphertext and the pointer to a vault's latest release request.
+    // Born private — a wrapped DEK pushed to a remote would put ciphertext
+    // somewhere the customer did not choose to put it.
+    "__escrow__::",
     "__extension__::",
     "__extension_grant__::",
     "__gpu1_receipt__::",

@@ -1413,15 +1413,27 @@ mod tests {
         assert_eq!(mixed, vec!["https://ok.example.com".to_string()]);
     }
 
+    // Parses the configured list directly instead of round-tripping through the
+    // process environment.
+    //
+    // This test used to `set_var` the allowlist and read it back through
+    // `console_allowed_origins()`, and flaked: it observed the built-in defaults
+    // instead of the value it had just set, *while holding `env_lock()`*. The
+    // mutex is not the problem. `setenv` may reallocate the environment block, and
+    // a concurrent `getenv` anywhere in this 2000-plus-test binary can then read a
+    // stale pointer — a hazard no Rust-level lock can fence, and precisely why
+    // `std::env::set_var` is `unsafe` from the 2024 edition. Serialising the
+    // handful of tests that opt into `env_lock()` never covered the other
+    // thousands that merely read env vars of their own.
+    //
+    // `console_allowed_origins()` is a one-line wrapper — `std::env::var(..)
+    // .unwrap_or_default()` feeding this parser — so the parsing contract is fully
+    // covered here, and the wrapper carries no logic worth a flaky test.
     #[test]
-    fn allowed_origins_reads_the_env_var() {
-        let _guard = env_lock();
-        std::env::set_var(
-            super::CONSOLE_ALLOWED_ORIGINS_ENV,
+    fn allowed_origins_parses_a_configured_list() {
+        let origins = origin_strings(&super::resolve_allowed_origins(
             "https://console.example.test, http://localhost:3000",
-        );
-        let origins = origin_strings(&super::console_allowed_origins());
-        std::env::remove_var(super::CONSOLE_ALLOWED_ORIGINS_ENV);
+        ));
         assert_eq!(
             origins,
             vec![

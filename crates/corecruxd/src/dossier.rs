@@ -1110,10 +1110,12 @@ mod tests {
                 duration_ns: 10,
                 depth: 0,
                 had_error: false,
+                outcome: Default::default(),
             },
             symbol_id: None,
             join: "extracted".into(),
             tenant_id: String::new(),
+            release: String::new(),
             stored_at_unix_ms: 1_000,
         }
     }

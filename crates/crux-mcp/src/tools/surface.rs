@@ -219,7 +219,29 @@ pub fn tool_affinity(tool: &str) -> &'static str {
         | "memory_acknowledge_use"
         | "artefact_put"
         | "artefact_get"
-        | "artefact_list" => "memory",
+        | "artefact_list"
+        // Substrate CRUD: entities, edges and the kind registry. The whole
+        // family had no entry, so every one scored 0 and was reachable only by
+        // an agent that already knew the name — `tools/list` advertises the
+        // floor, and none of them are in it. That is not theoretical: a session
+        // reconciling the Feature Registry's capability graph read `tools/list`,
+        // concluded the daemon had no `edge_delete`, and recorded a stale edge
+        // as permanently unfixable. It had been there the whole time.
+        //
+        // "memory" because that is exactly what they are — `corecrux-memory`
+        // owns entities, edges and the kind registry alongside the fact store,
+        // and `list_entities` was already tagged this way.
+        | "entity_upsert"
+        | "entity_get"
+        | "entity_list"
+        | "entity_delete"
+        | "entity_history"
+        | "edge_upsert"
+        | "edge_get"
+        | "edge_list"
+        | "edge_delete"
+        | "kind_get"
+        | "kind_list" => "memory",
         "save_session"
         | "get_session"
         | "list_sessions"
@@ -505,6 +527,36 @@ mod tests {
             assert_eq!(
                 tool_affinity(tool),
                 "session",
+                "{tool} must carry an affinity or it can never be surfaced beyond the floor"
+            );
+        }
+    }
+
+    /// Same reasoning as the context-graph family, learned the hard way. The
+    /// substrate CRUD tools carried no affinity at all, so they scored 0 in
+    /// every intent and never appeared beyond the 16-tool floor. An agent
+    /// reconciling the Feature Registry's capability graph read `tools/list`,
+    /// saw no `edge_delete`, and concluded a stale edge could never be
+    /// retracted — the tool existed and worked. Asserted by name so the next
+    /// tool added to this family cannot be silently forgotten.
+    #[test]
+    fn every_substrate_tool_has_an_affinity() {
+        for tool in [
+            "entity_upsert",
+            "entity_get",
+            "entity_list",
+            "entity_delete",
+            "entity_history",
+            "edge_upsert",
+            "edge_get",
+            "edge_list",
+            "edge_delete",
+            "kind_get",
+            "kind_list",
+        ] {
+            assert_eq!(
+                tool_affinity(tool),
+                "memory",
                 "{tool} must carry an affinity or it can never be surfaced beyond the floor"
             );
         }

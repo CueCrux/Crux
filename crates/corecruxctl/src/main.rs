@@ -27,6 +27,12 @@ use corecruxctl::{
 #[derive(Debug, Parser)]
 #[command(name = "corecruxctl")]
 #[command(about = "CoreCrux v3 control tool (Phase 0)")]
+// A packaged install has no checkout to compare against, so `--version` is the
+// only way a user can tell which `corecruxctl` they are running. `crux-hook`
+// and `corecruxd` both expose one; this crate did not, which left the M5
+// clean-install version check unable to cover the binary that carries the
+// `compaction-sync` activation surface.
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -99,6 +105,11 @@ enum Command {
         /// Skip the post-login tools/list + fact round-trip verification.
         #[arg(long, default_value_t = false)]
         no_verify: bool,
+        /// Exit non-zero if a post-login self-check RAN and FAILED. A check
+        /// that could not run at all (daemon unreachable) is still tolerated —
+        /// `corecruxctl login` is expected to work offline.
+        #[arg(long, default_value_t = false)]
+        strict_verify: bool,
         /// Skip installing the Claude Code hooks (banner + observe capture).
         #[arg(long, default_value_t = false)]
         no_hooks: bool,
@@ -2620,6 +2631,7 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             token,
             device,
             no_verify,
+            strict_verify,
             no_hooks,
             no_register,
         } => login::run(login::LoginArgs {
@@ -2627,6 +2639,7 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             token,
             device,
             no_verify,
+            strict_verify,
             no_hooks,
             no_register,
         }),
@@ -5038,6 +5051,28 @@ mod tests {
     }
 
     // ── CLI parsing: top-level subcommands ──────────────────────────────
+
+    /// `corecruxctl --version` / `-V` must report the crate version.
+    ///
+    /// Regression for the M5 clean-install gap found on 2026-07-30: a fresh
+    /// signed-release install put `corecruxctl` on the box with no way to ask
+    /// which build it was, even though it carries `compaction-sync enable`.
+    /// clap surfaces `--version` as a `DisplayVersion` parse "error".
+    #[test]
+    fn version_flag_reports_the_crate_version() {
+        for flag in ["--version", "-V"] {
+            let err = Cli::try_parse_from(["corecruxctl", flag]).expect_err("--version short-circuits parsing");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayVersion,
+                "{flag} must be a version request, not an unknown-argument error"
+            );
+            assert!(
+                err.to_string().contains(env!("CARGO_PKG_VERSION")),
+                "{flag} must print the crate version, got: {err}"
+            );
+        }
+    }
 
     #[test]
     fn parse_verify_store_defaults() {

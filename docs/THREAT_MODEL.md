@@ -213,6 +213,75 @@ for the Crux Daemon.
   keep token lifetimes short. Revocation IO (CRL/timestamp consult) is a planned
   later phase.
 
+## Key Escrow and Recovery
+
+Scope: the `crux-escrow` crate. A vault's data encryption key (DEK) never leaves the
+customer's control in plaintext. This section is the M0 artefact of the key escrow and
+recovery plan and is the contract the crate's tests assert against.
+
+### Recovery modes
+
+| Mode | What the server holds | Reconstructs the DEK | Customer artefacts |
+|---|---|---|---|
+| **Layer 0 — recovery code** (default) | wrapped DEK ciphertext only | the recovery code alone | one 256-bit code, shown once |
+| **Layer 1 — Shamir 2-of-3** (opt-in) | wrapped DEK ciphertext + **share C** | any **two** of A/B/C | device share A, printed share B |
+
+Layer 0 is not escrow: we hold ciphertext and no key-derivation input. Layer 1 adds one
+share, deliberately one short of a threshold.
+
+### Adversaries
+
+| Adversary | Capability assumed | Defeated by | Residual |
+|---|---|---|---|
+| **Us (honest)** | full read of every server-side store | share C is 1 of 3 in a 2-of-3 scheme; Layer 0 stores no key input at all | none — insufficiency is arithmetic, not policy |
+| **A breached us** | offline copy of everything at rest, including share C | same threshold argument; share C is stored non-exportable and its release is an operation, not a read | an attacker who *also* phishes share A or B reconstructs. Two independent compromises required |
+| **An account thief** (valid passport, no device) | authenticated as the account holder | release of share C is delayed (default 72h), notified to every registered device, and cancellable by any of them | a thief who holds the account **and** all registered devices **and** waits out the window succeeds. This is the account-recovery floor for any online system |
+| **A network observer** | full transcript of client↔server traffic | only wrapped ciphertext and share-C *release decisions* cross the wire; unwrapping is client-side | traffic analysis reveals *that* a recovery occurred, not the key. Metadata is receipted anyway |
+| **A coerced operator** (court order, insider under duress) | can compel production of everything we hold | share C alone reconstructs nothing; there is no server-holds-the-key mode to compel | we can be compelled to hand over a useless share, and to say so. Published in the M5 transparency statement |
+| **A malicious client** | crafted shares, replayed or forged release requests | shares are integrity-tagged (corruption is detected, not silently mis-reconstructed); release requests are passport-bound and receipted | a client that already holds 2 valid shares is the legitimate owner by construction |
+
+### Constraint mapping
+
+Each constraint from the plan maps to a named defence, or is an accepted risk:
+
+1. **Boring** — CSPRNG (`rand`), BLAKE3 in KDF mode (`derive_key`) to turn the recovery
+   code into a wrapping key, XChaCha20-Poly1305 AEAD to wrap the DEK, and a published
+   Shamir implementation over GF(2^8). All four are existing workspace dependencies or a
+   vetted addition; no novel construction.
+
+   A password KDF (Argon2id, scrypt) is deliberately **not** used. The recovery code is 256
+   bits of CSPRNG output, not a user-chosen password: there is no low-entropy input for a
+   memory-hard function to defend, and it would only add a dependency and a tuning
+   parameter. This is the same reasoning recorded for the relay device-credential secret.
+2. **Insufficient by construction** — enforced by the threshold, and asserted by the
+   `one_share_yields_nothing` and `server_dump_yields_nothing` tests. Neither test can
+   pass if the server's holdings ever become sufficient.
+3. **Redundant without weakening** — share C may be replicated freely (Vault + sealed
+   offline backup) *because* it is insufficient alone. Replication count does not appear
+   in any security argument, so operational care is not load-bearing.
+4. **Receipted** — every wrap, escrow opt-in, release request, notification, cancellation
+   and completion emits a CROWN receipt into the customer's own timeline.
+
+### Unrecoverable by design
+
+**Losing both user shares (A and B, or the Layer 0 recovery code) is unrecoverable.**
+This is not a gap to close later. The only way to make it recoverable is for our holdings
+alone to reconstruct the DEK — which is Constraint 2 inverted, and would mean a breach of
+us is a breach of every customer's data. We accept permanent loss in the rare case in
+order to make catastrophic loss impossible in the common one.
+
+Product consequence: the customer must be told this *before* opting in, in the UI, not in
+a help article afterwards. That is the M6 launch gate.
+
+### Not defended against
+
+- **A compromised client device at wrap time.** If the endpoint that generates the DEK is
+  owned, escrow is irrelevant — the plaintext is already there.
+- **A user who photographs their recovery code into cloud storage.** Out of scope; the
+  code is rendered for transcription, with print/download offered once.
+- **Rubber-hose against the *customer*.** They hold 2-of-3 by design; they can be compelled
+  to use it. No key-holder scheme defends against this.
+
 ## Error Response Policy
 
 Error responses for shard routing errors (`SHARD_UNAVAILABLE`, `WRONG_SHARD`,

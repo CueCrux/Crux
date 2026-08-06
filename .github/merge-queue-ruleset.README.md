@@ -69,14 +69,14 @@ gh api -X DELETE repos/CueCrux/Crux/rulesets/<id>
 | Parameter | Value | Why |
 |---|---|---|
 | `merge_method` | `MERGE` | Preserve merge history — `main`'s commit shape is unchanged from today (OD-MQ-1, operator decision 2026-06-26). |
-| `max_entries_to_build` | `2` | **The runner-safety knob.** Caps how many speculative combinations build at once — see "Runner load". |
+| `max_entries_to_build` | `1` | **The runner-safety knob.** Caps how many speculative combinations build at once — see "Runner load". Lowered from 2 on 2026-08-03 after measured ejections. |
 | `max_entries_to_merge` | `3` | Batch up to 3 PRs into one CI run; fewer total runs. |
 | `min_entries_to_merge` | `1` | A lone PR is never blocked waiting for a batch to fill. |
 | `min_entries_to_merge_wait_minutes` | `5` | Brief window to let a batch coalesce before merging a single entry. |
 | `grouping_strategy` | `ALLGREEN` | A batch only merges if the whole group passes; GitHub bisects on failure. |
 | `check_response_timeout_minutes` | `60` | A required check that never reports fails the entry after 60 min instead of wedging the queue forever (backstop). |
 
-## Runner load (why `max_entries_to_build: 2`)
+## Runner load (why `max_entries_to_build: 1`)
 
 All PR and merge-queue required checks now run on disposable GitHub-hosted
 workers. A single **code-change** queue build fans out to about 10 non-trivial
@@ -87,9 +87,26 @@ jobs:
 - `audit.yml` — Cargo deny policy, Cargo audit, Licence check (3)
 - `semver.yml` — Semver Compatibility (1)
 
-With `max_entries_to_build: 2`, the queue requests at most about 20 hosted jobs
-concurrently, on top of in-flight PR/push CI. Keep the cap at 2 until duration,
-hosted concurrency, and cost data justify raising it.
+With `max_entries_to_build: 1`, the queue demands **at most ~9 self-hosted jobs
+concurrently** — on top of any in-flight PR/push CI.
+
+**Lowered from 2 to 1 on 2026-08-03, on measured evidence.** The reasoning above
+was right about the mechanism and wrong about the headroom: `runner-hel1`
+provides **5 concurrent slots**, so at 2 the queue alone could demand ~18 jobs —
+3.6× the pool — while ordinary PR CI competes for the same five. What that
+produces is not a slow queue but *ejections*, because the queue gives up on an
+entry whose checks have not **responded** within `check_response_timeout_minutes`
+(60), and a merge-group job that never starts never responds.
+
+Observed 2026-08-02: PR #577 and PR #586 were each ejected from the queue while
+green. Their merge-group `CI` runs sat in `queued` — never started — for over an
+hour against 5 busy slots; at the 60-minute mark the queue dropped them. Both
+merged later, unchanged, once the backlog drained. This reads as flakiness and
+is arithmetic.
+
+At 1 the queue still over-subscribes a 5-slot pool, so this is a mitigation, not
+a fix. The real fix is capacity. Raise this only alongside runner headroom data,
+one step at a time, watching concurrent-run counts *and* queue-ejection events.
 
 ## Required checks the queue waits on
 

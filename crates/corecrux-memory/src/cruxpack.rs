@@ -70,6 +70,9 @@ pub const CRUXPACK_RESERVED_PREFIXES: &[&str] = &[
     "__coord__::",
     "__dossier__::",
     "__engram__::",
+    // Vault key escrow: wrapped DEK ciphertext. Exporting it into a .cruxpack
+    // would put a customer's key material somewhere they did not choose.
+    "__escrow__::",
     "__extension__::",
     "__extension_grant__::",
     "__gpu1_receipt__::",
@@ -104,6 +107,7 @@ pub const CRUXPACK_RESERVED_PREFIXES: &[&str] = &[
     "__work__::",
     "__work_comment__::",
     "__work_gate__::",
+    "__workbench::",
     "__work_transition__::",
     "__workbench__::",
     "__workspace__::",
