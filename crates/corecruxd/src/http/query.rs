@@ -1133,17 +1133,21 @@ mod query_tests {
         let results = json["results"].as_array().expect("results");
         assert_eq!(results.len(), 2, "both sealed chunks retrieved");
 
+        let mut seen = std::collections::HashSet::new();
         for hit in results {
             let seq = hit["segment_seq"].as_u64().expect("segment_seq present on every hit");
             assert!(
                 sealed_seqs.contains(&seq),
                 "segment_seq {seq} must be a value an ingest receipt returned (receipts: {sealed_seqs:?})"
             );
-            // The relationship holds on a contiguously-sealed store, which is
-            // what makes the undocumented off-by-one so easy to hardcode — the
-            // join key above is what a consumer should actually use.
-            let index = hit["segment_index"].as_u64().expect("segment_index");
-            assert_eq!(seq, index + 1);
+            assert!(seen.insert(seq), "each hit's segment must resolve distinctly");
+            // Deliberately NOT asserting `seq == segment_index + 1`. It happens
+            // to hold on this fixture — one tenant, two segments, nothing else
+            // loaded — and asserting it would enshrine an offset that is a
+            // position in the daemon-wide reader list: measured at 1, then 18,
+            // then 17 on one host within hours as unrelated segments came and
+            // went. The join key is the contract; the offset is not.
+            assert!(hit["segment_index"].is_u64(), "segment_index still reported");
         }
     }
 
