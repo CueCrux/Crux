@@ -78,4 +78,18 @@ jobs:
           name: typescript-sdk-${{ github.sha }}
           path: package
       - name: Publish exact package with provenance
-        run: npm publish package/*.tgz --access public --provenance
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tarballs=(package/*.tgz)
+          if [[ ${#tarballs[@]} -ne 1 ]]; then
+            echo "::error::expected exactly one tarball in package/, found ${#tarballs[@]}"
+            exit 1
+          fi
+          # The leading ./ is load-bearing. Without it npm reads `package/foo.tgz`
+          # as a GitHub `owner/repo` shorthand and tries to git-clone it:
+          #   npm error command git ls-remote ssh://git@github.com/package/....tgz.git
+          #   npm error git@github.com: Permission denied (publickey).
+          # Publishing has never succeeded on this workflow, which is why 0.2.0
+          # (tagged July) never reached npm either.
+          npm publish "./${tarballs[0]}" --access public --provenance
