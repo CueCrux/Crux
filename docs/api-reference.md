@@ -28,6 +28,24 @@ Crux Daemon exposes three network surfaces by default:
 
 \* Requires a dataplane-enabled deployment. Returns 501 in Crux Daemon.
 
+#### Segment coordinates on a result
+
+Each `/v1/query/text-search` result (and each `/expand` chunk) carries two
+segment coordinates, which are **not the same number**:
+
+| Field | Meaning |
+|---|---|
+| `segment_index` | Position in the loaded-reader list, ascending by sequence. **0-based.** Pairs with `doc_id` to form `result_id`, and is the value `/expand` takes back. |
+| `segment_seq` | The sealed segment's own sequence — the `segment_seq` the `/v1/local/ingest` receipt returned. **1-based.** |
+
+To join a query result back to the ingest that produced it, **join on
+`segment_seq`**. On a store whose segments are all loaded and contiguously
+numbered from 1, `segment_index == segment_seq - 1` — but that is an
+observation, not a contract: erase a segment, or load a subset, and the
+positional index shifts while the sequence does not. Code that hardcodes the
+`-1` scores a plausible, uniform **0%** rather than erroring, which is how the
+mapping was wrong on BEAM-100K for a full run before anyone noticed.
+
 ### Local prose ingest
 
 | Method | Path | Description | Auth Scope |
