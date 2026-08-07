@@ -177,6 +177,7 @@ pub fn fused_retrieve(
         bm25_pool_size,
         Some(tenant_hash),
         &bm25_params,
+        index_mgr.forgotten_watermark(tenant_hash),
     );
 
     // Keep a defensive exact filter here in case older in-memory indexes are ever wired in.
@@ -397,6 +398,50 @@ mod tests {
         assert_eq!(
             resp2.results[0].doc_id, 1,
             "collider tenant should see only its own doc"
+        );
+    }
+
+    #[test]
+    fn forgotten_tenant_gets_no_candidates() {
+        let (mut mgr, _) = build_test_index_manager();
+        let tenant_hash = xxhash_rust::xxh64::xxh64(b"test-tenant", 0);
+        let req = FusedRetrieveRequest {
+            tenant_id: "test-tenant".to_string(),
+            query: "terraform drift detection".to_string(),
+            query_embedding: None,
+            top_k: 5,
+            weights: FusionWeights {
+                bm25: 1.0,
+                graph: 0.0,
+                dense: 0.0,
+                sparse: 0.0,
+            },
+            graph_hops: 0,
+            min_confidence: 0.0,
+            include_state: false,
+            graph_node_count: 0,
+            graph_cold_start_threshold: 100,
+        };
+
+        assert!(!fused_retrieve(&mgr, &req, None, None).unwrap().results.is_empty());
+
+        let watermark = mgr.max_segment_seq().expect("a loaded segment");
+        mgr.forget_tenant(crate::index_manager::ForgottenTenant {
+            tenant_id: "test-tenant".to_string(),
+            tenant_hash,
+            watermark_segment_seq: watermark,
+            forgotten_at: "2026-08-06T00:00:00Z".to_string(),
+            segments_reclaimed: 0,
+        });
+        assert!(
+            fused_retrieve(&mgr, &req, None, None).unwrap().results.is_empty(),
+            "a masked tenant retrieves nothing"
+        );
+
+        mgr.unforget_tenant(tenant_hash);
+        assert!(
+            !fused_retrieve(&mgr, &req, None, None).unwrap().results.is_empty(),
+            "unmasking restores the corpus — Layer 1 is reversible"
         );
     }
 

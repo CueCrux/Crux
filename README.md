@@ -107,7 +107,23 @@ corecruxctl start
 
 `start` is the canonical on-ramp: it detects the daemon, authenticates on the lowest-friction
 secure rail, wires the MCP endpoint + Claude Code hooks, round-trips a first fact, and prints a
-single "you're live" summary. Longer install path: [docs/getting-started.md](docs/getting-started.md) ·
+single "you're live" summary.
+
+**Using Codex or Cursor?** One command each — `--agent` wires that client's own config too:
+
+| Agent | Command | What it writes |
+|---|---|---|
+| Claude Code | `corecruxctl start --agent claude` | `~/.claude/settings.json` (hooks + statusline) |
+| Codex CLI | `corecruxctl start --agent codex` | `~/.codex/config.toml` + the stdio bridge |
+| Cursor | `corecruxctl start --agent cursor` | `~/.cursor/mcp.json` |
+
+Every write is a **merge, not an overwrite** — your other MCP servers and settings survive — and
+re-running is safe. No bearer token is ever written into an agent config; it stays in
+`~/.config/cuecrux/env` (0600) and is resolved at runtime. Codex gets the stdio bridge rather
+than the HTTP endpoint because Codex CLI fails the daemon's streamable-HTTP handshake
+([details](integrations/codex-cli/README.md#in-session-mcp-tools)).
+
+Longer install path: [docs/getting-started.md](docs/getting-started.md) ·
 guided rails: `corecruxctl login`, `corecruxctl quickstart` · ready-made MCP connector configs
 for Claude Code, Claude Desktop and Cursor: [`examples/mcp-configs/`](examples/mcp-configs/).
 

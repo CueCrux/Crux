@@ -46,20 +46,36 @@ is_placeholder() {
 }
 
 # ── Fact lookup ────────────────────────────────────────────────────────────
-# Returns 0 if the fact exists (non-empty facts[]), 1 if dangling, 2 if the
-# daemon is unreachable or auth-rejected.
+# 0 fact exists · 1 dangling · 2 transport failure · 3 credential rejected ·
+# 4 other HTTP error.
+#
+# These used to be one status. `curl -f` exits non-zero for a 401 exactly as it
+# does for a refused connection, so the caller reported an auth failure as
+# "daemon unreachable" and, in the default non-strict mode, exited 0 having
+# verified nothing — a green run that checked no references at all. Splitting
+# them is the whole point: unreachable is a legitimate "cannot run here" skip,
+# a rejected credential is a misconfiguration that must never pass, and a lone
+# 5xx should cost one reference rather than the entire sweep.
 fact_exists() {
   local entity="$1" key="$2"
   local url="${CRUX_HTTP_URL}/v1/facts?entity=$(url_encode "${entity}")&key=$(url_encode "${key}")&token_budget=500"
-  local resp
-  if ! resp="$(curl -fsS \
-      --max-time 5 \
+  local out code body curl_rc=0
+  # Deliberately no -f: we need the status code, not a collapsed exit status.
+  out="$(curl -sS --max-time 5 -w '\n%{http_code}' \
       -H "Authorization: Bearer ${CORECRUXD_ADMIN_TOKEN:-}" \
-      "${url}" 2>/dev/null)"; then
-    return 2
+      "${url}" 2>/dev/null)" || curl_rc=$?
+  if [ "${curl_rc}" -ne 0 ]; then
+    return 2                       # no connection / DNS / timeout
   fi
+  code="${out##*$'\n'}"
+  body="${out%$'\n'*}"
+  case "${code}" in
+    200) ;;
+    401|403) return 3 ;;           # credential problem, not a reachability problem
+    *) return 4 ;;                 # transient or unexpected: costs one ref, not the run
+  esac
   # Empty facts array → dangling.
-  if [ "$(echo "${resp}" | jq -r '.facts | length' 2>/dev/null || echo 0)" = "0" ]; then
+  if [ "$(printf '%s' "${body}" | jq -r '.facts | length' 2>/dev/null || echo 0)" = "0" ]; then
     return 1
   fi
   return 0
@@ -131,10 +147,11 @@ check_plan_refs() {
 # ── Plan walker ────────────────────────────────────────────────────────────
 walk_plans() {
   local plans_dir="$1"
-  local dangling_count=0 checked_count=0 placeholder_count=0
-  local dangling_log
+  local dangling_count=0 checked_count=0 placeholder_count=0 unchecked_count=0
+  local dangling_log unchecked_log
   dangling_log="$(mktemp)"
-  trap "rm -f '${dangling_log}'" RETURN
+  unchecked_log="$(mktemp)"
+  trap "rm -f '${dangling_log}' '${unchecked_log}'" RETURN
 
   shopt -s nullglob
   local plan_files=("${plans_dir}"/*.md)
@@ -166,30 +183,60 @@ walk_plans() {
         :
       else
         local rc=$?
-        if [ "${rc}" -eq 2 ]; then
-          if [ "${STRICT}" = "1" ]; then
-            echo "ERROR: daemon unreachable at ${CRUX_HTTP_URL} (strict mode)" >&2
+        case "${rc}" in
+          2)
+            # Genuinely unreachable: a global condition, so stopping is right.
+            if [ "${STRICT}" = "1" ]; then
+              echo "ERROR: daemon unreachable at ${CRUX_HTTP_URL} (strict mode)" >&2
+              return 2
+            fi
+            echo "WARN: daemon unreachable at ${CRUX_HTTP_URL}; skipping live checks" >&2
+            return 0
+            ;;
+          3)
+            # Always fatal, strict or not. A missing or mis-scoped token would
+            # otherwise skip every check and report success, which is worse than
+            # a red run because nobody learns the references were never verified.
+            echo "ERROR: daemon rejected the credential (HTTP 401/403) at ${CRUX_HTTP_URL}" >&2
+            echo "       CORECRUXD_ADMIN_TOKEN is unset, expired, or wrongly scoped." >&2
+            echo "       Refusing to report success on unverified references." >&2
             return 2
-          fi
-          echo "WARN: daemon unreachable at ${CRUX_HTTP_URL}; skipping live checks" >&2
-          return 0
-        fi
+            ;;
+          4)
+            # One bad response costs one reference, not the whole sweep.
+            printf '%s\t%s\n' "${slug}" "${ref}" >> "${unchecked_log}"
+            unchecked_count=$((unchecked_count + 1))
+            continue
+            ;;
+        esac
         printf '%s\t%s\n' "${slug}" "${ref}" >> "${dangling_log}"
         dangling_count=$((dangling_count + 1))
       fi
     done <<< "${refs}"
   done
 
-  echo "checked: ${checked_count} refs, skipped: ${placeholder_count} placeholders, dangling: ${dangling_count}"
+  echo "checked: ${checked_count} refs, skipped: ${placeholder_count} placeholders, dangling: ${dangling_count}, unchecked: ${unchecked_count}"
+  local walk_rc=0
   if [ "${dangling_count}" -gt 0 ]; then
     echo "" >&2
     echo "Dangling references (cited in ExecPlans but no matching fact):" >&2
     while IFS=$'\t' read -r slug ref; do
       echo "  ${slug}: ${ref}" >&2
     done < "${dangling_log}"
-    return 1
+    walk_rc=1
   fi
-  return 0
+  if [ "${unchecked_count}" -gt 0 ]; then
+    # Reported separately from dangling: "we could not look" is a different
+    # claim from "we looked and it was not there", and silently merging the two
+    # is how a partial run reads as a clean one.
+    echo "" >&2
+    echo "Could not check ${unchecked_count} reference(s) — HTTP error, NOT a missing fact:" >&2
+    while IFS=$'\t' read -r slug ref; do
+      echo "  ${slug}: ${ref}" >&2
+    done < "${unchecked_log}"
+    walk_rc=1
+  fi
+  return "${walk_rc}"
 }
 
 # ── Self-test ──────────────────────────────────────────────────────────────
@@ -269,6 +316,70 @@ EOF
     return 1
   fi
   rm -f "${tmp}/refok-2026-05-20.md"
+
+  # ── fact_exists status separation ──
+  # The defect this guards: `curl -f` gave a 401 and a refused connection the
+  # same exit status, so an auth failure was reported as "daemon unreachable"
+  # and non-strict mode exited 0 having checked nothing. Nothing tested it,
+  # which is why it survived. Each status is now pinned against a real socket.
+  local port stub_pid stub_rc
+  port=""
+  for p in 24971 24972 24973 24974; do
+    if ! (exec 3<>"/dev/tcp/127.0.0.1/${p}") 2>/dev/null; then port="${p}"; break; fi
+  done
+  if [ -z "${port}" ] || ! command -v python3 >/dev/null 2>&1; then
+    echo "self-test: SKIP fact_exists status cases (no free port or no python3)" >&2
+  else
+    # A stub that answers by path: /401 → rejected, /500 → other, /ok → a fact.
+    python3 - "${port}" <<'PYSTUB' &
+import sys, http.server
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        code = 401 if "%3A401" in self.path or "key=401" in self.path else \
+               500 if "key=500" in self.path else 200
+        body = b'{"facts":[{"key":"x"}]}' if code == 200 else b'{}'
+        self.send_response(code); self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PYSTUB
+    stub_pid=$!
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null && break
+      sleep 0.2
+    done
+
+    local saved_url="${CRUX_HTTP_URL}"
+    CRUX_HTTP_URL="http://127.0.0.1:${port}"
+
+    stub_rc=0; fact_exists "execplan:t" "ok" || stub_rc=$?
+    if [ "${stub_rc}" -ne 0 ]; then
+      echo "FAIL: fact_exists must return 0 on a 200 with a non-empty facts[] (got ${stub_rc})" >&2
+      kill "${stub_pid}" 2>/dev/null; CRUX_HTTP_URL="${saved_url}"; return 1
+    fi
+
+    stub_rc=0; fact_exists "execplan:t" "401" || stub_rc=$?
+    if [ "${stub_rc}" -ne 3 ]; then
+      echo "FAIL: a 401 must return 3 (credential), not ${stub_rc} — this is the original defect" >&2
+      kill "${stub_pid}" 2>/dev/null; CRUX_HTTP_URL="${saved_url}"; return 1
+    fi
+
+    stub_rc=0; fact_exists "execplan:t" "500" || stub_rc=$?
+    if [ "${stub_rc}" -ne 4 ]; then
+      echo "FAIL: a 500 must return 4 (per-call), not ${stub_rc}" >&2
+      kill "${stub_pid}" 2>/dev/null; CRUX_HTTP_URL="${saved_url}"; return 1
+    fi
+
+    kill "${stub_pid}" 2>/dev/null; wait "${stub_pid}" 2>/dev/null || true
+
+    # Nothing listening now → transport failure, which must stay distinct from 3.
+    stub_rc=0; fact_exists "execplan:t" "ok" || stub_rc=$?
+    if [ "${stub_rc}" -ne 2 ]; then
+      echo "FAIL: a refused connection must return 2 (unreachable), not ${stub_rc}" >&2
+      CRUX_HTTP_URL="${saved_url}"; return 1
+    fi
+    CRUX_HTTP_URL="${saved_url}"
+  fi
 
   echo "self-test: PASS"
   return 0
