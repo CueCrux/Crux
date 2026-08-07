@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling==1.31.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cuecrux-adapters"
+version = "0.1.0"
+description = "Framework adapters for the Crux Daemon context surface (LangChain, LlamaIndex, CrewAI)"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+# The adapters are thin wrappers over GET /v1/context and reuse the Python SDK
+# for auth, timeouts and error types rather than re-implementing them.
+dependencies = ["corecrux-client>=0.2"]
+
+[project.optional-dependencies]
+# One extra per framework: installing the LangChain adapter must not drag in
+# LlamaIndex or CrewAI. The conformance suite runs whatever is present.
+langchain = ["langchain-core>=0.3"]
+llamaindex = ["llama-index-core>=0.11"]
+crewai = ["crewai>=0.80"]
+
+[project.urls]
+Homepage = "https://github.com/CueCrux/Crux"
+Documentation = "https://github.com/CueCrux/Crux/tree/main/integrations/adapters"
+Repository = "https://github.com/CueCrux/Crux"
+
+[tool.hatch.build.targets.wheel]
+packages = ["crux_adapters"]

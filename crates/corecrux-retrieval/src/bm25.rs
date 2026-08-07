@@ -30,6 +30,16 @@ fn doc_matches_tenant(reader: &CcxiReader, did: usize, tenant_filter: Option<u64
     doc.tenant_hash_lo16 == (tf64 & 0xFFFF) as u16 && doc.tenant_hash_full == tf64
 }
 
+/// True when the segment predates the querying tenant's erasure watermark, so
+/// every document it holds for that tenant is erased.
+///
+/// The check is per segment rather than per document: a mixed-tenant segment
+/// disappears for the erased tenant while every other tenant (which passes its
+/// own watermark, or none) keeps seeing it.
+fn is_forgotten(reader: &CcxiReader, forgotten_up_to_seq: Option<u64>) -> bool {
+    forgotten_up_to_seq.is_some_and(|w| reader.header.segment_seq <= w)
+}
+
 /// A scored document from BM25 retrieval.
 #[derive(Debug, Clone)]
 pub struct Bm25Hit {
@@ -43,15 +53,21 @@ pub struct Bm25Hit {
 ///
 /// Returns hits sorted by score descending, limited to `top_k`.
 /// If `tenant_filter` is Some, only documents matching the full 64-bit tenant hash are scored.
+///
+/// `forgotten_up_to_seq` is the querying tenant's erasure watermark (see
+/// [`crate::IndexManager::forgotten_watermark`]): segments sealed at or below
+/// it hold documents this tenant has erased and are skipped entirely. Pass
+/// `None` when the caller is not scoped to a single tenant.
 pub fn bm25_score(
     reader: &CcxiReader,
     query: &str,
     top_k: usize,
     tenant_filter: Option<u64>,
     params: &Bm25Params,
+    forgotten_up_to_seq: Option<u64>,
 ) -> Vec<Bm25Hit> {
     let query_tokens = tokenize(query);
-    if query_tokens.is_empty() || reader.docs.is_empty() {
+    if query_tokens.is_empty() || reader.docs.is_empty() || is_forgotten(reader, forgotten_up_to_seq) {
         return Vec::new();
     }
 
@@ -118,6 +134,7 @@ pub fn bm25_score_multi(
     top_k: usize,
     tenant_filter: Option<u64>,
     params: &Bm25Params,
+    forgotten_up_to_seq: Option<u64>,
 ) -> Vec<MergedBm25Hit> {
     let query_tokens = tokenize(query);
     if query_tokens.is_empty() {
@@ -141,6 +158,11 @@ pub fn bm25_score_multi(
     let mut all_hits: Vec<MergedBm25Hit> = Vec::new();
 
     for (seg_idx, reader) in readers.iter().enumerate() {
+        // `seg_idx` still advances for skipped segments: callers key their dense
+        // companions off the position in the reader slice they passed in.
+        if is_forgotten(reader, forgotten_up_to_seq) {
+            continue;
+        }
         let mut scores = vec![0.0f32; reader.docs.len()];
 
         for qt in &query_tokens {
@@ -237,6 +259,7 @@ pub fn bm25_search(
     tenant_filter: Option<u64>,
     params: &Bm25Params,
     min_score: Option<f32>,
+    forgotten_up_to_seq: Option<u64>,
 ) -> Bm25SearchResult {
     let query_tokens = tokenize(query);
     if query_tokens.is_empty() {
@@ -271,6 +294,11 @@ pub fn bm25_search(
     let mut all_hits: Vec<MergedBm25Hit> = Vec::new();
 
     for (seg_idx, reader) in readers.iter().enumerate() {
+        // `seg_idx` still advances for skipped segments: callers key their dense
+        // companions off the position in the reader slice they passed in.
+        if is_forgotten(reader, forgotten_up_to_seq) {
+            continue;
+        }
         let mut scores = vec![0.0f32; reader.docs.len()];
 
         for (qt_idx, qt) in query_tokens.iter().enumerate() {
@@ -389,7 +417,7 @@ mod tests {
         let bytes = build_test_index();
         let reader = CcxiReader::from_bytes(&bytes).unwrap();
 
-        let hits = bm25_score(&reader, "terraform drift", 5, None, &Bm25Params::default());
+        let hits = bm25_score(&reader, "terraform drift", 5, None, &Bm25Params::default(), None);
 
         assert!(!hits.is_empty());
         // Doc 0 ("terraform module drift detection") should rank highest
@@ -404,7 +432,7 @@ mod tests {
         let bytes = builder.build();
         let reader = CcxiReader::from_bytes(&bytes).unwrap();
 
-        let hits = bm25_score(&reader, "terraform", 5, Some(0xAAAA), &Bm25Params::default());
+        let hits = bm25_score(&reader, "terraform", 5, Some(0xAAAA), &Bm25Params::default(), None);
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, 0);
@@ -422,7 +450,7 @@ mod tests {
         let bytes = builder.build();
         let reader = CcxiReader::from_bytes(&bytes).unwrap();
 
-        let hits = bm25_score(&reader, "terraform", 5, Some(tenant_a), &Bm25Params::default());
+        let hits = bm25_score(&reader, "terraform", 5, Some(tenant_a), &Bm25Params::default(), None);
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, 0);
@@ -434,7 +462,89 @@ mod tests {
         let bytes = build_test_index();
         let reader = CcxiReader::from_bytes(&bytes).unwrap();
 
-        let hits = bm25_score(&reader, "quantum entanglement photon", 5, None, &Bm25Params::default());
+        let hits = bm25_score(
+            &reader,
+            "quantum entanglement photon",
+            5,
+            None,
+            &Bm25Params::default(),
+            None,
+        );
         assert!(hits.is_empty());
+    }
+
+    // ── erasure watermark ────────────────────────────────────────────
+
+    /// Two tenants sharing one segment; `seg_seq` is the segment's sequence.
+    fn shared_segment(seg_seq: u64) -> Vec<u8> {
+        let mut builder = CcxiBuilder::new(0, seg_seq, 100);
+        builder.add_document(0, "terraform module drift", 0, 0xAAAA);
+        builder.add_document(1, "terraform module drift", 100, 0xBBBB);
+        builder.build()
+    }
+
+    #[test]
+    fn watermark_hides_segments_at_or_below_it() {
+        let bytes = shared_segment(5);
+        let reader = CcxiReader::from_bytes(&bytes).unwrap();
+        let p = Bm25Params::default();
+
+        assert_eq!(bm25_score(&reader, "terraform", 5, Some(0xAAAA), &p, Some(4)).len(), 1);
+        assert!(
+            bm25_score(&reader, "terraform", 5, Some(0xAAAA), &p, Some(5)).is_empty(),
+            "the watermark is inclusive — seq 5 is erased at watermark 5"
+        );
+        assert!(bm25_score(&reader, "terraform", 5, Some(0xAAAA), &p, Some(9)).is_empty());
+    }
+
+    #[test]
+    fn watermark_leaves_a_sibling_tenant_intact() {
+        let bytes = shared_segment(5);
+        let reader = CcxiReader::from_bytes(&bytes).unwrap();
+        let readers = vec![&reader];
+        let p = Bm25Params::default();
+
+        // 0xAAAA is erased; 0xBBBB passes no watermark and still sees its doc
+        // in the very same segment.
+        assert!(bm25_search(&readers, "terraform", 5, Some(0xAAAA), &p, None, Some(5))
+            .hits
+            .is_empty());
+        let sibling = bm25_search(&readers, "terraform", 5, Some(0xBBBB), &p, None, None);
+        assert_eq!(sibling.hits.len(), 1);
+        assert_eq!(sibling.hits[0].tenant_hash_full, 0xBBBB);
+    }
+
+    #[test]
+    fn re_ingested_segments_above_the_watermark_are_served() {
+        // The erase-then-re-pave case: seg 5 erased, seg 6 ingested after.
+        let old = CcxiReader::from_bytes(&shared_segment(5)).unwrap();
+        let fresh = CcxiReader::from_bytes(&shared_segment(6)).unwrap();
+        let readers = vec![&old, &fresh];
+
+        let hits = bm25_search(
+            &readers,
+            "terraform",
+            5,
+            Some(0xAAAA),
+            &Bm25Params::default(),
+            None,
+            Some(5),
+        )
+        .hits;
+        assert_eq!(hits.len(), 1, "only the post-erasure segment answers");
+        assert_eq!(hits[0].segment_index, 1);
+    }
+
+    #[test]
+    fn skipped_segments_do_not_shift_segment_index() {
+        // Callers key dense companions off the position in the slice they
+        // passed in, so a skipped segment must not renumber later ones.
+        let erased = CcxiReader::from_bytes(&shared_segment(1)).unwrap();
+        let kept = CcxiReader::from_bytes(&shared_segment(2)).unwrap();
+        let readers = vec![&erased, &kept];
+
+        let hits = bm25_score_multi(&readers, "terraform", 5, Some(0xAAAA), &Bm25Params::default(), Some(1));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].segment_index, 1, "index 1 is still index 1");
     }
 }

@@ -11,14 +11,25 @@ blake3 = { workspace = true }
 ciborium = { workspace = true }
 ciborium-ll = "0.2.2"
 chacha20poly1305 = { workspace = true }
-chrono = { workspace = true, default-features = false }
+chrono = { workspace = true, default-features = false, features = ["serde"] }
 cms = { version = "0.3.0-pre.2", features = ["std"] }
 const-oid = "0.10.2"
 ed25519-dalek = { workspace = true, features = ["std"] }
 half = "2.7.1"
+hex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_bytes = "0.11.14"
-serde_json = { workspace = true }
+# `preserve_order` is LOAD-BEARING, not a preference. `canonical_body_bytes`
+# in observation_envelope.rs signs `serde_json::to_value(record)`, so the map
+# ordering IS the wire format: with the feature on, fields keep struct
+# declaration order; with it off, serde_json sorts them alphabetically and
+# every observation receipt ever minted fails to verify.
+#
+# Until this crate owned that canonicalisation the dependency was accidental —
+# corecruxd only got the feature because `crux-session` happens to enable it
+# and Cargo unifies features across the graph. Declared here so the crate that
+# defines the format also declares what the format depends on.
+serde_json = { workspace = true, features = ["preserve_order"] }
 sha2 = { workspace = true }
 tar = { workspace = true }
 thiserror = { workspace = true }

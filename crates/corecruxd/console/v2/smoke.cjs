@@ -1671,6 +1671,401 @@ function extractThemeVars(theme) {
 //  module (zero new vendored files, T.5). Reduced-motion: render-on-demand only.
 // =========================================================================
 (function checkLinkGraphDestination() {
+  // ---- Patchbay (console-execplan-patchbay M3) --------------------------
+  // A registry-driven destination is silently absent if any one of its four
+  // wiring points is missed, and the rest of the smoke passes regardless — so
+  // assert all four, plus the two invariants the operator asked for: that it
+  // sits directly under Rings, and that adding it moved nobody's shortcut.
+  const destList = pages.DESTS || [];
+  const pb = destList.filter(function (d) { return d.id === 'patchbay'; })[0];
+  check(!!pb, '[patchbay] pages.DESTS must register the patchbay destination');
+  if (pb) {
+    check(pb.icon === 'patchbay', '[patchbay] the patchbay destination must use the patchbay icon');
+    check(pb.key === '6', '[patchbay] the patchbay destination must claim shortcut 6 (the free slot — taking a used one would renumber an existing destination)');
+    check(!pb.capability, '[patchbay] the patchbay destination must NOT be capability-gated: the route is always mounted and self-degrades to an empty graph');
+    check(!pb.railHidden, '[patchbay] the patchbay destination must be visible in the Command rail');
+  }
+  // Rail order is array position: patchbay sits immediately after rings.
+  const idxRings = destList.findIndex(function (d) { return d.id === 'rings'; });
+  const idxPb = destList.findIndex(function (d) { return d.id === 'patchbay'; });
+  check(idxRings === 0, '[patchbay] rings must remain the first destination (the console index)');
+  check(idxPb === idxRings + 1, '[patchbay] patchbay must sit directly under rings in the rail');
+  // No incumbent shortcut moved.
+  const EXPECTED_KEYS = { rings: '1', work: '2', memory: '3', trust: '4', meters: '5', sitemap: '7' };
+  Object.keys(EXPECTED_KEYS).forEach(function (id) {
+    const d = destList.filter(function (x) { return x.id === id; })[0];
+    check(!!d && d.key === EXPECTED_KEYS[id],
+      '[patchbay] adding patchbay must not renumber the ' + id + ' shortcut (expected ' + EXPECTED_KEYS[id] + ')');
+  });
+  // No two destinations may claim the same shortcut.
+  const seenKeys = {};
+  destList.forEach(function (d) {
+    if (!d.key) { return; }
+    check(!seenKeys[d.key], '[patchbay] duplicate keyboard shortcut ' + d.key + ' claimed by ' + d.id);
+    seenKeys[d.key] = d.id;
+  });
+  // Shell + render wiring.
+  check(/patchbay:\s*'<svg/.test(shellHtml), '[patchbay] shell.html must define the "patchbay" icon glyph');
+  check(/destId === 'patchbay'/.test(shellHtml) && /renderPatchbay/.test(shellHtml),
+    '[patchbay] shell.html must route the patchbay destination to render.renderPatchbay');
+  check(typeof render.renderPatchbay === 'function', '[patchbay] render.js must export renderPatchbay');
+  // The page reads ONLY through the generated client — no raw fetch in render.js.
+  check(renderSrc.indexOf('api.workGraph') >= 0,
+    '[patchbay] renderPatchbay must read through the generated CruxApi.workGraph client method');
+  {
+    const apiSrcPb = fs.readFileSync(path.join(DIR, 'api.js'), 'utf8');
+    check(apiSrcPb.indexOf("'/v1/work/graph': true") >= 0,
+      '[patchbay] api.js LITERAL_GET_PATHS must allowlist /v1/work/graph (regenerate from the ROUTES manifest)');
+    check(/workGraph\(query\)/.test(apiSrcPb),
+      '[patchbay] api.js must expose the generated workGraph client method');
+  }
+
+  // Mock-DOM paint: registration alone proves nothing about what the route
+  // draws. Drive the renderer over a fixture and over each failure shape, and
+  // assert the three states stay DISTINCT — an aggregator that is switched off
+  // must not read as "the board is empty", and a failed read must not read as
+  // either. This is the console's own verification idiom (model + mock paint).
+  if (typeof render.renderPatchbay === 'function') {
+    function pbRes(ok, status, data) {
+      return Promise.resolve({ ok: ok, status: status, json: function () { return Promise.resolve(data); } });
+    }
+    const pbFixture = {
+      plans: [
+        { id: 'execplan:a-2026-01-01', slug: 'a-2026-01-01', title: 'Alpha', state: 'in_progress',
+          plane: 'Crux daemon', services: ['Postgres'], links: ['b-2026-01-01'],
+          blurb: 'Does a thing.', milestones_done: 1, milestones_total: 4, updated_at_unix_ms: 1 },
+        { id: 'execplan:b-2026-01-01', slug: 'b-2026-01-01', title: 'Bravo', state: 'blocked',
+          plane: 'Commerce', services: [], links: [], milestones_done: 0, milestones_total: 2,
+          updated_at_unix_ms: 2 }
+      ],
+      planes: [{ key: 'Crux daemon', n: 1 }, { key: 'Commerce', n: 1 }],
+      services: [{ key: 'Postgres', side: 'bottom', n: 1 }],
+      link_count: 1,
+      generated_at_unix_ms: 3
+    };
+    const pbMock = newMockDom();
+    const mkNode = pbMock.mkNode, mockDoc = pbMock.doc, collectNodes = pbMock.collect;
+    const pbSavedDoc = global.document, pbSavedWin = global.window;
+    const textOf = function (host) {
+      return collectNodes(host, [host]).map(function (n) { return n.textContent || ''; }).join(' | ');
+    };
+    global.document = mockDoc;
+
+    // 1. healthy read paints the counts and every system
+    global.window = { CruxApi: { workGraph: function () { return pbRes(true, 200, pbFixture); } } };
+    const pbHost = mkNode('div');
+    asyncChecks.push(Promise.resolve(render.renderPatchbay(pbHost, {})).then(function () {
+      const t = textOf(pbHost);
+      check(t.indexOf('open plans') >= 0, '[patchbay] renderPatchbay must paint the summary strip');
+      // The canvas is the surface, so assert against its nodes, not prose. It
+      // uppercases the system label, which is exactly the kind of drift a text
+      // assertion hides.
+      const nodes = collectNodes(pbHost, [pbHost]);
+      const byClass = function (c) {
+        return nodes.filter(function (n) { return String(n.className || '').split(/\s+/).indexOf(c) >= 0; });
+      };
+      check(byClass('pb-chip').length === pbFixture.plans.length,
+        '[patchbay] the canvas must draw one card per open plan');
+      check(byClass('pb-centre').length === pbFixture.planes.length,
+        '[patchbay] the canvas must draw one label block per system');
+      check(byClass('pb-plate').length === pbFixture.planes.length,
+        '[patchbay] the canvas must draw one raised plate per system');
+      check(byClass('pb-rail').length === pbFixture.services.length,
+        '[patchbay] the canvas must draw one rail per touched service');
+      check(byClass('pb-wire').length === pbFixture.link_count,
+        '[patchbay] the canvas must draw one wire per declared edge');
+      check(t.indexOf('CRUX DAEMON') >= 0 && t.indexOf('COMMERCE') >= 0,
+        '[patchbay] the canvas must label every system it draws');
+      check(t.indexOf('declared edges') >= 0,
+        '[patchbay] renderPatchbay must surface the declared-edge count');
+      check(t.indexOf('Postgres') >= 0,
+        '[patchbay] the canvas must name the services it wires to');
+      check(t.indexOf('not mentions') >= 0,
+        '[patchbay] the legend must state that wires are declared dependencies, not mentions');
+      check(t.indexOf('Reading the board') < 0,
+        '[patchbay] the loading line must be cleared once the read resolves');
+    }).catch(function (e) {
+      check(false, '[patchbay] renderPatchbay drive threw: ' + (e && e.stack || e));
+    }));
+
+    // 1b. M5 interaction: freshness, selection, isolation and keyboard reach.
+    // Driven through the CAPTURED handlers, so a control that exists only as a
+    // painted node with no behaviour fails here.
+    const nowMs = Date.now();
+    const pbLiveFixture = {
+      plans: [
+        { id: 'execplan:f1', slug: 'f1', title: 'Fresh one', state: 'in_progress', plane: 'Crux daemon',
+          services: [], links: ['f2'], milestones_done: 1, milestones_total: 3,
+          updated_at_unix_ms: nowMs - 2 * 3600000 },                       // 2h — fresh
+        { id: 'execplan:f2', slug: 'f2', title: 'Fresh two', state: 'planned', plane: 'Crux daemon',
+          services: [], links: [], milestones_done: 0, milestones_total: 3,
+          updated_at_unix_ms: nowMs - 5 * 3600000 },                       // 5h — fresh
+        { id: 'execplan:s1', slug: 's1', title: 'Stale one', state: 'blocked', plane: 'Commerce',
+          services: [], links: [], milestones_done: 2, milestones_total: 4,
+          updated_at_unix_ms: nowMs - 40 * 24 * 3600000 }                  // 40d — stale
+      ],
+      planes: [{ key: 'Crux daemon', n: 2 }, { key: 'Commerce', n: 1 }],
+      services: [], link_count: 1
+    };
+    const pbLiveHost = mkNode('div');
+    global.window = { CruxApi: { workGraph: function () { return pbRes(true, 200, pbLiveFixture); } } };
+    asyncChecks.push(Promise.resolve(render.renderPatchbay(pbLiveHost, {})).then(function () {
+      const nodes = function () { return collectNodes(pbLiveHost, [pbLiveHost]); };
+      const byClass = function (c) {
+        return nodes().filter(function (n) { return String(n.className || '').split(/\s+/).indexOf(c) >= 0; });
+      };
+      // Freshness: only the two recent cards glow, and the wire between them
+      // greens because BOTH ends are inside the window.
+      check(byClass('pb-fresh').length === 3,
+        '[patchbay] at 24h exactly the two recent cards and the wire joining them must read as fresh (got ' + byClass('pb-fresh').length + ')');
+      const chips = byClass('pb-chip');
+      check(chips.length === 3, '[patchbay] all three cards must paint');
+      // Keyboard reach: every card and every plate is focusable and activatable.
+      check(chips.every(function (n) { return n.getAttribute('tabindex') === '0'; }),
+        '[patchbay] every card must be keyboard focusable');
+      check(chips.every(function (n) { return (n.getAttribute('aria-label') || '').length > 0; }),
+        '[patchbay] every card must carry an aria-label naming its plan and state');
+      check(byClass('pb-plate-g').every(function (n) { return n.getAttribute('tabindex') === '0'; }),
+        '[patchbay] every system plate must be keyboard focusable');
+      const canvasNode = byClass('pb-canvas')[0];
+      check(!!canvasNode && canvasNode.getAttribute('tabindex') === '0',
+        '[patchbay] the canvas itself must be focusable so pan/zoom is not mouse-only');
+
+      // Selecting a card isolates it plus what it declares; the third card dims.
+      const f1 = chips.filter(function (n) { return n.getAttribute('data-slug') === 'f1'; })[0];
+      check(!!f1, '[patchbay] cards must carry data-slug');
+      f1.click();
+      check(String(f1.className).indexOf('pb-sel') >= 0,
+        '[patchbay] activating a card must select it (the lift is the feedback)');
+      const dimmed = byClass('pb-dim').map(function (n) { return n.getAttribute('data-slug'); });
+      check(dimmed.indexOf('s1') >= 0 && dimmed.indexOf('f2') < 0,
+        '[patchbay] selecting a card must isolate it and what it declares, dimming the rest (dimmed: ' + dimmed.join(',') + ')');
+      check(byClass('pb-fresh').length === 0,
+        '[patchbay] freshness must go quiet while something is selected — two highlights at once say two things');
+      check(byClass('pb-hot').length === 1,
+        '[patchbay] the selected card\'s wire must light up');
+
+      // Selecting the same card again clears it.
+      f1.click();
+      check(byClass('pb-sel').length === 0, '[patchbay] activating a selected card again must clear the selection');
+      check(byClass('pb-dim').length === 0, '[patchbay] clearing the selection must restore the whole board');
+
+      // Clicking a system isolates its members.
+      const plate = byClass('pb-plate-g')[0];
+      plate.click();
+      const dimmed2 = byClass('pb-dim').map(function (n) { return n.getAttribute('data-slug'); });
+      check(dimmed2.length > 0, '[patchbay] activating a system must isolate it');
+      // Keyboard activation must do the same thing as a click.
+      plate.click();
+      const kchips = byClass('pb-chip');
+      const target = kchips.filter(function (n) { return n.getAttribute('data-slug') === 's1'; })[0];
+      (target._handlers.keydown || []).forEach(function (fn) { fn({ key: 'Enter', preventDefault: function () {} }); });
+      check(String(target.className).indexOf('pb-sel') >= 0,
+        '[patchbay] Enter on a focused card must select it, exactly as a click does');
+
+      // The recency window is a control, not a constant: widening it must make
+      // the stale card read as fresh once nothing is selected.
+      const winBtns = byClass('pb-win');
+      check(winBtns.length >= 3, '[patchbay] the recency window must be switchable (24h is often a thin signal)');
+      byClass('pb-clear')[0].click();
+      const wide = winBtns.filter(function (b) { return b.getAttribute('data-h') === '720'; })[0];
+      check(!!wide, '[patchbay] a 30d window must be offered');
+      wide.click();
+      check(byClass('pb-fresh').length >= 3,
+        '[patchbay] widening the window must light the older card too');
+      check(String(wide.className).indexOf('pb-on') >= 0 && wide.getAttribute('aria-pressed') === 'true',
+        '[patchbay] the active window button must be marked pressed');
+    }).catch(function (e) {
+      check(false, '[patchbay] renderPatchbay interaction drive threw: ' + (e && e.stack || e));
+    }));
+
+    // 2. aggregator off (200 + zero plans) is a CONFIGURATION statement
+    const pbEmptyHost = mkNode('div');
+    global.window = { CruxApi: { workGraph: function () { return pbRes(true, 200, { plans: [], planes: [], services: [], link_count: 0 }); } } };
+    asyncChecks.push(Promise.resolve(render.renderPatchbay(pbEmptyHost, {})).then(function () {
+      const t = textOf(pbEmptyHost);
+      check(/CRUX_EXECPLANS_ROOT/.test(t),
+        '[patchbay] an empty graph must name the missing ExecPlan root, not read as a healthy empty board');
+      check(t.indexOf('open plans') < 0,
+        '[patchbay] an empty graph must not paint a summary strip of zeroes');
+    }).catch(function (e) {
+      check(false, '[patchbay] renderPatchbay empty-state drive threw: ' + (e && e.stack || e));
+    }));
+
+    // 3. failed read states the status verbatim and never fabricates a board
+    const pbFailHost = mkNode('div');
+    global.window = { CruxApi: { workGraph: function () { return pbRes(false, 503, null); } } };
+    asyncChecks.push(Promise.resolve(render.renderPatchbay(pbFailHost, {})).then(function () {
+      const t = textOf(pbFailHost);
+      check(/503/.test(t), '[patchbay] a failed read must state the HTTP status verbatim');
+      check(t.indexOf('open plans') < 0 && !/CRUX_EXECPLANS_ROOT/.test(t),
+        '[patchbay] a failed read must be distinct from both a healthy board and a switched-off aggregator');
+    }).catch(function (e) {
+      check(false, '[patchbay] renderPatchbay failure drive threw: ' + (e && e.stack || e));
+    }).then(function () {
+      if (pbSavedDoc === undefined) { delete global.document; } else { global.document = pbSavedDoc; }
+      if (pbSavedWin === undefined) { delete global.window; } else { global.window = pbSavedWin; }
+    }));
+  }
+
+  // Geometry gates (M4). Layout and routing are pure, so the invariants that
+  // make the picture readable are assertable here — no DOM, no daemon, no
+  // screenshot (which headless cannot take of this SPA anyway, see D11).
+  if (typeof render.patchbayLayout === 'function' && typeof render.patchbayRoutes === 'function') {
+    // A board-sized synthetic fixture: 63 plans over 10 systems with 30 declared
+    // edges, matching the real projection's shape.
+    const PLANE_NAMES = ['Crux daemon', 'CoreCrux/Engine', 'Commerce', 'Surfaces/Web', 'Benchmarks',
+      'WikiCrux', 'RCX protocol', 'Agents/Harness', 'VaultCrux', 'ChainCrux'];
+    const PLANE_N = [14, 11, 10, 6, 6, 5, 5, 3, 2, 1];
+    const gPlans = [];
+    let gi = 0;
+    PLANE_NAMES.forEach(function (pn, pi) {
+      for (let k = 0; k < PLANE_N[pi]; k++) {
+        gPlans.push({
+          id: 'execplan:p' + gi, slug: 'p' + gi, title: 'Plan number ' + gi + ' with a longish title',
+          state: ['in_progress', 'blocked', 'planned', 'drafting'][gi % 4],
+          plane: pn, services: [], links: [], milestones_done: gi % 5, milestones_total: 5,
+          updated_at_unix_ms: gi
+        });
+        gi++;
+      }
+    });
+    // 30 edges, deliberately including long cross-system ones.
+    for (let e = 0; e < 30; e++) {
+      const a = gPlans[(e * 7) % gPlans.length], b = gPlans[(e * 13 + 5) % gPlans.length];
+      if (a.slug !== b.slug && a.links.indexOf(b.slug) < 0) { a.links.push(b.slug); }
+    }
+    const gGraph = {
+      plans: gPlans,
+      planes: PLANE_NAMES.map(function (pn, pi) { return { key: pn, n: PLANE_N[pi] }; }),
+      services: [
+        { key: 'Anthropic API', side: 'top', n: 9 }, { key: 'GitHub / CI', side: 'top', n: 14 },
+        { key: 'Postgres', side: 'bottom', n: 12 }, { key: 'GPU-1 / embedders', side: 'bottom', n: 18 },
+        { key: 'Crux HTTP :14800', side: 'left', n: 7 }, { key: 'Paddle', side: 'right', n: 5 }
+      ],
+      link_count: 30
+    };
+    const L = render.patchbayLayout(gGraph);
+    const cw = L.cw, chh = L.ch;
+    check(L.chips.length === gPlans.length,
+      '[patchbay] every open plan must get a card (got ' + L.chips.length + ' of ' + gPlans.length + ')');
+    check(L.chips.length >= 60, '[patchbay] the board-sized fixture must render >= 60 cards');
+    check(L.sections.length === PLANE_NAMES.length, '[patchbay] every system must get a plate');
+
+    function rectsOverlap(a, b) {
+      return !(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y);
+    }
+    const chipRects = L.chips.map(function (c) { return { x: c.x, y: c.y, w: cw, h: chh, slug: c.plan.slug }; });
+    let chipOverlaps = 0, centreOverlaps = 0, landlocked = 0;
+    for (let a = 0; a < chipRects.length; a++) {
+      if (!L.chips[a].out || !L.chips[a].out.length) { landlocked++; }
+      for (let b = a + 1; b < chipRects.length; b++) {
+        if (rectsOverlap(chipRects[a], chipRects[b])) { chipOverlaps++; }
+      }
+      for (let c2 = 0; c2 < L.centres.length; c2++) {
+        if (rectsOverlap(chipRects[a], L.centres[c2])) { centreOverlaps++; }
+      }
+    }
+    check(chipOverlaps === 0, '[patchbay] no two cards may overlap (got ' + chipOverlaps + ')');
+    check(centreOverlaps === 0, '[patchbay] no card may overlap its system label block (got ' + centreOverlaps + ')');
+    check(landlocked === 0,
+      '[patchbay] every card must sit on the ring perimeter with an outward face — a landlocked card cannot route out (got ' + landlocked + ')');
+
+    const R = render.patchbayRoutes(L, gGraph);
+    let expectedEdges = 0;
+    gPlans.forEach(function (p) { expectedEdges += p.links.length; });
+    check(R.length === expectedEdges,
+      '[patchbay] every declared edge must be routed, none dropped (got ' + R.length + ' of ' + expectedEdges + ')');
+    check(R.length >= 25, '[patchbay] the board-sized fixture must route >= 25 wires');
+
+    // Which plate does a card belong to? A wire legitimately crosses only its
+    // OWN two plates, and only where it emerges from the card.
+    function plateOf(slug) {
+      const chip = L.chips.filter(function (c) { return c.plan.slug === slug; })[0];
+      if (!chip) { return null; }
+      for (let s = 0; s < L.sections.length; s++) {
+        const sec = L.sections[s];
+        if (chip.x >= sec.x - 1 && chip.x + cw <= sec.x + sec.w + 1 &&
+            chip.y >= sec.y - 1 && chip.y + chh <= sec.y + sec.h + 1) { return sec; }
+      }
+      return null;
+    }
+    let diagonals = 0, plateCrossings = 0;
+    R.forEach(function (w) {
+      const own = [plateOf(w.from), plateOf(w.to)];
+      for (let i2 = 0; i2 + 1 < w.pts.length; i2++) {
+        const p1 = w.pts[i2], p2 = w.pts[i2 + 1];
+        const dx = Math.abs(p1.x - p2.x), dy = Math.abs(p1.y - p2.y);
+        if (dx > 0.6 && dy > 0.6) { diagonals++; continue; }
+        for (let s = 0; s < L.sections.length; s++) {
+          const sec = L.sections[s];
+          if (own.indexOf(sec) >= 0) { continue; }           // its own plate: the stub
+          const rx = sec.x + 2, ry = sec.y + 2, rw = sec.w - 4, rh = sec.h - 4;
+          let hit = false;
+          if (dx < 0.6) {
+            hit = rx < p1.x && p1.x < rx + rw &&
+              Math.max(ry, Math.min(p1.y, p2.y)) < Math.min(ry + rh, Math.max(p1.y, p2.y));
+          } else {
+            hit = ry < p1.y && p1.y < ry + rh &&
+              Math.max(rx, Math.min(p1.x, p2.x)) < Math.min(rx + rw, Math.max(p1.x, p2.x));
+          }
+          if (hit) { plateCrossings++; }
+        }
+      }
+    });
+    check(diagonals === 0,
+      '[patchbay] every wire segment must run in X or Y only — no diagonals (got ' + diagonals + ')');
+    check(plateCrossings === 0,
+      '[patchbay] no wire may cross a system plate it does not belong to (got ' + plateCrossings + ')');
+
+    // CAPACITY GATE (incident 2026-08-07). A ring whose perimeter is smaller
+    // than its plane cannot place every card, and the slot allocator span on it
+    // forever — a frozen browser tab, not a wrong picture. Prod had a 61-plan
+    // plane while the sizer topped out at 28 slots.
+    //
+    // Asserted as a PROPERTY of the sizer rather than by running the layout:
+    // on the broken code "does the layout finish" would hang CI instead of
+    // failing it, which is a worse outcome than the bug.
+    if (typeof render.patchbayGridFor === 'function') {
+      let worst = null;
+      for (let n = 1; n <= 400; n++) {
+        const g = render.patchbayGridFor(n);
+        const perim = 2 * (g[0] + g[1]) - 4;
+        if (perim < n && !worst) { worst = { n, g, perim }; }
+        if (g[0] < 3 || g[1] < 3) { worst = worst || { n, g, perim }; }
+      }
+      check(!worst, '[patchbay] every ring must have perimeter >= its plan count and an interior for the label' +
+        (worst ? ' — n=' + worst.n + ' got ' + worst.g.join('x') + ' (' + worst.perim + ' slots)' : ''));
+      // And the interior must stay big enough for the label block.
+      const big = render.patchbayGridFor(228);
+      check((big[0] - 2) >= 1 && (big[1] - 2) >= 1,
+        '[patchbay] a large ring must still leave an interior for its system label');
+    }
+    // A plane larger than the sizer's static table must place every card.
+    {
+      const many = [];
+      for (let i = 0; i < 61; i++) {
+        many.push({ id: 'execplan:b' + i, slug: 'b' + i, title: 'Big plan ' + i, state: 'planned',
+          plane: 'VaultCrux', services: [], links: [], milestones_done: 0, milestones_total: 3,
+          updated_at_unix_ms: 1 });
+      }
+      const LB = render.patchbayLayout({ plans: many, planes: [{ key: 'VaultCrux', n: 61 }],
+        services: [], link_count: 0 });
+      check(LB.chips.length === 61,
+        '[patchbay] a 61-plan system must place all 61 cards (got ' + LB.chips.length + ')');
+      check(LB.chips.every(function (c) { return c.out && c.out.length; }),
+        '[patchbay] every card in a large ring must still have an outward face');
+    }
+
+    // A board with no declared edges must still lay out (the endpoint can
+    // legitimately return zero links) rather than throw.
+    const noEdge = { plans: gPlans.map(function (p) { return Object.assign({}, p, { links: [] }); }),
+      planes: gGraph.planes, services: [], link_count: 0 };
+    const L2 = render.patchbayLayout(noEdge);
+    check(render.patchbayRoutes(L2, noEdge).length === 0,
+      '[patchbay] a board with no declared edges must route nothing and not throw');
+  }
+
   const lg = (pages.DESTS || []).filter(function (d) { return d.id === 'linkgraph'; })[0];
   check(!!lg, '[linkgraph] pages.DESTS must register the linkgraph destination');
   if (lg) {

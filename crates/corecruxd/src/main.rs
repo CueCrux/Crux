@@ -139,6 +139,7 @@ mod witness_proofs;
 mod witness_submit;
 mod work;
 mod work_execplans;
+mod work_graph;
 // Extracted to the `corecrux-workspace-scan` crate; aliased so the 16 consumer
 // modules here (http/repos, http/workspace, code_intel, repo_codegraph,
 // symbol_resolve, dossier, …) keep their existing `crate::workspace_scan*::`
@@ -743,6 +744,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         consolidation_scheduler_enabled: config.consolidation_scheduler_enabled,
         coord_presence_ttl_secs: config.coord_presence_ttl_secs,
         context_surface_enabled: config.context_surface_enabled,
+        tenant_erasure_enabled: config.tenant_erasure_enabled,
         auto_capture_enabled: config.auto_capture_enabled,
         local_ingest_enabled: config.local_ingest_enabled,
         compute_provider_enabled: config.compute_provider_enabled,
@@ -822,6 +824,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }
                 tracing::info!(total, "ccxi-indexes-loaded-at-startup");
+            }
+            // Load-at-startup wiring for the tenant erasure mask: without it a
+            // restart would silently re-serve a corpus the operator erased.
+            // Loaded unconditionally — a mask must outlive the flag that made it.
+            let forgotten_path = config
+                .data_dir
+                .join(corecrux_retrieval::index_manager::FORGOTTEN_TENANTS_FILE);
+            // An unreadable mask fails the boot rather than degrading to
+            // "serve it anyway": the whole point of the mask is that erased
+            // documents stay unreachable.
+            let forgotten = idx.load_forgotten(&forgotten_path).map_err(|err| {
+                std::io::Error::other(format!(
+                    "tenant erasure mask at {} is unreadable ({err}); refusing to serve a corpus that may include erased documents",
+                    forgotten_path.display()
+                ))
+            })?;
+            if forgotten > 0 {
+                tracing::info!(forgotten_tenants = forgotten, "tenant-erasure-mask-loaded");
             }
             Arc::new(RwLock::new(idx))
         },
@@ -4728,6 +4748,7 @@ mod tests {
             consolidation_scheduler_enabled: false,
             coord_presence_ttl_secs: crate::coord::DEFAULT_PRESENCE_TTL_SECS,
             context_surface_enabled: false,
+            tenant_erasure_enabled: false,
             auto_capture_enabled: false,
             local_ingest_enabled: false,
             compute_provider_enabled: false,

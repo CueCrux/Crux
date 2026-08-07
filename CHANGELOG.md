@@ -11,6 +11,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.57] - 2026-08-07
+
+### Fixed
+
+- **A CPU-only daemon can verify the governance receipts it mints.** Erasure,
+  `compact_facts` erasure, `memory_forget` and held hard-erasure overrides all
+  persist their receipt as the observation envelope itself — Ed25519, passport
+  signed, on disk. Until now none of the three documented surfaces could attest
+  to one: `GET /v1/receipts/{id}` is 501 without a dataplane (by design), the
+  verification endpoint's local fallback only understood *stream* receipts, and
+  `corecruxctl inspect-receipt` searches sealed segments, where a governance
+  receipt never appears. The daemon produced an audit artefact nothing could
+  check.
+  - `GET /v1/receipts/{id}/verification` gains a second local fallback for the
+    observation-envelope shape, reporting
+    `crux.governance_receipt_verification.v1`. A caller lacking scope for the
+    receipt's *own* tenant gets **404**, byte for byte identical to a missing
+    receipt, so the endpoint cannot be used as a cross-tenant existence oracle.
+  - `corecruxctl inspect-receipt` resolves and verifies them too, printing kind,
+    signer, body hash and signature status.
+  - Both scans are bounded to `__governance__*` logs. This is a correctness
+    constraint, not a tuning choice: a production node carries tens of thousands
+    of per-session observation logs, and walking them all on an audit lookup
+    would make verification a denial-of-service surface.
+- **`serde_json/preserve_order` is now declared where the wire format is
+  defined.** `canonical_body_bytes` signs `serde_json::to_value(record)`, so map
+  ordering *is* the signed format. `corecruxd` only had the feature because
+  `crux-session` happens to enable it and Cargo unifies features across the
+  graph — an accidental dependency that left the audit trail one dependency
+  change away from every existing receipt failing to verify. The feature is now
+  declared by `corecrux-receipts` and pinned by a golden-vector test.
+
+### Changed
+
+- Observation record types, `canonical_body_bytes` and
+  `verify_observation_envelope` move from `corecruxd` into `corecrux-receipts`.
+  `corecruxd` is a bin-only crate, so `corecruxctl` could not otherwise reach
+  the verifier; sharing beats a second copy of a signature check that can drift.
+
+### Added
+
+- `corecruxctl start --agent <claude|codex|cursor>`.
+- LlamaIndex and CrewAI adapters under the unchanged conformance suite.
+- Console Patchbay no longer freezes the tab when a system has more than 28
+  plans; drift reporting distinguishes a rejected credential from an
+  unreachable daemon.
+
+## [0.5.56] - 2026-08-07
+
+### Added
+
+- **A tenant's retrieval corpus can finally be erased.** Until now a corpus
+  could be created but never retired, so a mis-ingested or superseded tenant was
+  permanent — and there was no GDPR Art.17 story for the daemon. Two layers,
+  deliberately separated by reversibility:
+  - *Layer 1, logical erasure.* A persisted set of forgotten
+    `(tenant_hash, watermark_segment_seq)` pairs, enforced in the BM25 scorers
+    as a **required** parameter rather than an optional wrapper — so the
+    compiler forces every present and future serving path to state its intent
+    instead of one being silently missed. Reversible via
+    `DELETE /v1/admin/forget-tenants/{tenantId}`.
+  - *Layer 2, physical reclaim.* Opt-in per request (`"reclaim": true`), never
+    automatic. Whole-tenant segments are evicted from the `IndexManager` and
+    only then unlinked; mixed-tenant segments are retained, still masked, and
+    reported as `mixed_segments_retained`. Irreversible — recovery is
+    restore-from-backup only.
+  - `POST /v1/admin/forget-tenants` (+ singular alias) requires `admin:write`
+    **per named tenant**, with the whole batch rejected if any tenant fails and
+    nothing masked. Reserved `__`-prefixed namespaces are refused by convention,
+    so a future reserved namespace is protected the day it is introduced.
+  - `GET /v1/admin/tenants/{tenantId}/footprint` reports segments, docs and
+    bytes, so the blast radius is inspectable *before* anything is erased.
+  - The whole surface is gated on `CORECRUXD_TENANT_ERASURE=1` and the routes
+    404 without it. Fact-store erasure remains out of scope: the response key is
+    `corpus_erased`, never `tenant_forgotten`.
+- Key escrow M0–M3b, device-identity and CRL transport auth for the relay, and a
+  span outcome dimension.
+- Console Patchbay — a spatial projection of the open work board
+  (`GET /v1/work/graph`).
+
+### Changed
+
+- Tenant scoping tightened across the stack: derived from the token, applied by
+  type, exact-matched, and pushed down into gRPC and the lower layers.
+- Login verification is strict, and M1 auth fails closed.
+
 ## [0.5.55] - 2026-08-02
 
 ### Added
@@ -698,6 +784,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-audit` CVE scanning in CI
 
 [unreleased]: https://github.com/CueCrux/Crux/compare/v0.5.54...HEAD
+[0.5.57]: https://github.com/CueCrux/Crux/compare/v0.5.56...v0.5.57
+[0.5.56]: https://github.com/CueCrux/Crux/compare/v0.5.55...v0.5.56
 [0.5.55]: https://github.com/CueCrux/Crux/compare/v0.5.54...v0.5.55
 [0.5.54]: https://github.com/CueCrux/Crux/compare/v0.5.53...v0.5.54
 [0.4.6]: https://github.com/CueCrux/Crux/compare/v0.4.5...v0.4.6

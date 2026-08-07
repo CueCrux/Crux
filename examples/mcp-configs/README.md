@@ -1,5 +1,12 @@
 # MCP Client Configuration Examples
 
+
+> **Prefer one command?** `corecruxctl start --agent cursor` writes the `crux`
+> server into `~/.cursor/mcp.json` for you (and `--agent claude` / `--agent codex`
+> do the equivalent for those clients). It merges rather than overwrites, so your
+> other MCP servers survive, and it is safe to re-run. The files here are for
+> wiring it by hand or for clients the flag does not cover.
+
 Example configuration files for connecting MCP clients to a running Crux Daemon instance.
 
 ## How it works
