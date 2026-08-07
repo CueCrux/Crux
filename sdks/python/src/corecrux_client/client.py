@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import httpx
@@ -54,6 +56,68 @@ def _parse_json(resp: httpx.Response) -> dict[str, Any]:
     if not resp.content:
         return {}
     return resp.json()
+
+
+def _params(**kwargs: Any) -> dict[str, Any]:
+    """Drop ``None`` entries so optional query parameters are simply absent.
+
+    Sending ``types=`` explicitly is not the same as omitting it: the daemon
+    reads a blank filter as "match nothing", not "stream everything".
+    """
+    return {k: v for k, v in kwargs.items() if v is not None}
+
+
+def _body(**kwargs: Any) -> dict[str, Any]:
+    """Drop ``None`` entries so the daemon's ``#[serde(default)]`` applies."""
+    return {k: v for k, v in kwargs.items() if v is not None}
+
+
+def _sse_event(block: str) -> dict[str, Any] | None:
+    """Parse one SSE block into its decoded JSON ``data`` payload.
+
+    Returns ``None`` for keep-alive comments and for any block without a
+    ``data:`` field. The daemon sends a comment every 15s to hold the
+    connection open, and those must not surface as events.
+    """
+    data_lines = [
+        line[5:].lstrip() if line.startswith("data:") else line[len("data") :]
+        for line in block.splitlines()
+        if line.startswith("data:") or line == "data"
+    ]
+    if not data_lines:
+        return None
+    try:
+        return json.loads("\n".join(data_lines))
+    except json.JSONDecodeError:
+        return None
+
+
+def _sse_blocks(lines: Any) -> Any:
+    """Group an iterable of SSE lines into ``\\n\\n``-delimited blocks."""
+    buf: list[str] = []
+    for line in lines:
+        if line == "":
+            if buf:
+                yield "\n".join(buf)
+                buf = []
+        else:
+            buf.append(line)
+    if buf:
+        yield "\n".join(buf)
+
+
+async def _sse_blocks_async(lines: Any) -> Any:
+    """:func:`_sse_blocks` over an async line iterator."""
+    buf: list[str] = []
+    async for line in lines:
+        if line == "":
+            if buf:
+                yield "\n".join(buf)
+                buf = []
+        else:
+            buf.append(line)
+    if buf:
+        yield "\n".join(buf)
 
 
 def _to_fact(d: dict[str, Any]) -> Fact:
@@ -387,6 +451,371 @@ class CoreCruxClient:
             body["artifact_ids"] = artifact_ids
         return self._request("POST", "/v1/query/time-range", json=body)
 
+    # -- context --
+
+    def context(
+        self,
+        *,
+        session_id: str | None = None,
+        entity: str | None = None,
+        query: str | None = None,
+        token_budget: int | None = None,
+    ) -> dict[str, Any]:
+        """GET /v1/context -- the provider-neutral injection bundle.
+
+        Requires ``CORECRUXD_CONTEXT_SURFACE=1`` on the daemon; the route 404s
+        when the surface is off, so the capability is invisible rather than
+        half-alive.
+
+        The response is the flattened wire envelope, not the daemon's internal
+        ``ContextBundle`` struct: ``sections`` sits at the top level rather
+        than under a ``stable`` key. ``stable_hash`` covers only the stable
+        region (``bundle_version`` + ordered ``sections``), so it is byte-stable
+        across calls for an unchanged fact-chain head.
+        """
+        return self._request(
+            "GET",
+            "/v1/context",
+            params=_params(
+                session_id=session_id, entity=entity, query=query, token_budget=token_budget
+            ),
+        )
+
+    def post_context(self, **options: Any) -> dict[str, Any]:
+        """POST /v1/context -- same bundle, options in the body.
+
+        Prefer this when ``query`` is long enough to strain a URL.
+        """
+        return self._request("POST", "/v1/context", json=_body(**options))
+
+    def context_markdown(self, **options: Any) -> str:
+        """GET /v1/context?render=markdown -- the boot-banner rendering.
+
+        Returns ``text/markdown``, so this bypasses the JSON parse path.
+        """
+        resp = self._client.request(
+            "GET", "/v1/context", params=_params(render="markdown", **options)
+        )
+        _raise_for_status(resp)
+        return resp.text
+
+    def context_messages(self, **options: Any) -> dict[str, Any]:
+        """GET /v1/context?render=openai_messages -- an OpenAI messages fragment."""
+        return self._request(
+            "GET", "/v1/context", params=_params(render="openai_messages", **options)
+        )
+
+    # -- review: auto-capture candidates --
+
+    def extract_memory(
+        self,
+        text: str,
+        *,
+        session_id: str | None = None,
+        profile: str | None = None,
+        session_date: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /v1/memory/extract -- mine transcript text into review candidates.
+
+        Candidates land in the ``__candidate_fact__::`` review namespace and
+        never appear in ``query_facts`` recall until promoted. Requires
+        ``CORECRUXD_AUTO_CAPTURE=1``.
+        """
+        return self._request(
+            "POST",
+            "/v1/memory/extract",
+            json=_body(
+                text=text, session_id=session_id, profile=profile, session_date=session_date
+            ),
+        )
+
+    def list_candidates(self, *, status: str | None = None) -> dict[str, Any]:
+        """GET /v1/memory/candidates -- list candidates, optionally by status.
+
+        ``status`` is one of ``candidate``, ``promoted``, ``rejected``.
+        """
+        return self._request("GET", "/v1/memory/candidates", params=_params(status=status))
+
+    def promote_candidate(
+        self,
+        candidate_id: str,
+        *,
+        reviewer: str | None = None,
+        auto_threshold: float | None = None,
+    ) -> dict[str, Any]:
+        """POST /v1/memory/candidates/{id}/promote -- promote to a real fact.
+
+        The gate is fail-closed: with ``auto_threshold`` set, an unscored or
+        below-threshold candidate is refused (422) rather than promoted.
+        """
+        return self._request(
+            "POST",
+            f"/v1/memory/candidates/{candidate_id}/promote",
+            json=_body(reviewer=reviewer, auto_threshold=auto_threshold),
+        )
+
+    def reject_candidate(self, candidate_id: str, reason: str) -> dict[str, Any]:
+        """POST /v1/memory/candidates/{id}/reject -- reject with a reason."""
+        return self._request(
+            "POST", f"/v1/memory/candidates/{candidate_id}/reject", json={"reason": reason}
+        )
+
+    # -- review: contradictions, queue, expiries --
+
+    def review_contradictions(self, *, limit: int | None = None) -> dict[str, Any]:
+        """GET /v1/console/review/contradictions -- run a LIVE contradiction pass."""
+        return self._request(
+            "GET", "/v1/console/review/contradictions", params=_params(limit=limit)
+        )
+
+    def review_queue(self, *, limit: int | None = None) -> dict[str, Any]:
+        """GET /v1/console/review/queue -- surfaced scheduler review receipts.
+
+        Distinct from :meth:`review_contradictions`, which runs a live pass.
+        """
+        return self._request("GET", "/v1/console/review/queue", params=_params(limit=limit))
+
+    def apply_expiries(self, fact_ids: list[str]) -> dict[str, Any]:
+        """POST /v1/console/review/expiries -- apply reviewed expiry proposals.
+
+        Every id is re-validated at apply time; ids that became protected, were
+        re-verified fresh, or gained confidence are skipped, never deleted.
+        Capped at 500 ids per request.
+        """
+        return self._request(
+            "POST", "/v1/console/review/expiries", json={"fact_ids": fact_ids}
+        )
+
+    # -- consolidation --
+
+    def consolidate(
+        self,
+        entity: str,
+        key: str,
+        canonical_value: str,
+        target_fact_ids: list[str],
+        **options: Any,
+    ) -> dict[str, Any]:
+        """POST /v1/console/review/consolidations -- merge facts atomically.
+
+        Emits an Ed25519-signed, offline-verifiable diff receipt. Facts at or
+        above ``protected_confidence_floor`` (0.99 by default) are never merged.
+        The scheduler itself stays proposal-only -- this is the explicit commit.
+        """
+        return self._request(
+            "POST",
+            "/v1/console/review/consolidations",
+            # `consolidation_id` has no serde default daemon-side, so omitting
+            # it is a 422 even though the handler generates one for a BLANK
+            # value. Send "" and let the daemon mint `console-<uuid>`.
+            json=_body(
+                consolidation_id=options.pop("consolidation_id", ""),
+                entity=entity,
+                key=key,
+                canonical_value=canonical_value,
+                target_fact_ids=target_fact_ids,
+                **options,
+            ),
+        )
+
+    def undo_consolidation(
+        self, canonical_fact_id: str, **options: Any
+    ) -> dict[str, Any]:
+        """POST /v1/console/review/consolidations/undo -- reverse a consolidation.
+
+        Idempotent: undoing an already-undone consolidation returns
+        ``status = "already_undone"`` rather than failing.
+        """
+        return self._request(
+            "POST",
+            "/v1/console/review/consolidations/undo",
+            json=_body(canonical_fact_id=canonical_fact_id, **options),
+        )
+
+    # -- ingest --
+
+    def local_ingest(
+        self,
+        tenant_id: str,
+        corpus_id: str,
+        documents: list[dict[str, Any]],
+        *,
+        semantic_profile: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """POST /v1/local/ingest -- ingest documents into a local corpus.
+
+        Chunks without a ``dense_vector`` are embedded server-side, so this
+        works offline with no external embedder. Caps: 4096 documents and
+        65536 chunks per request, 4 MiB per chunk.
+        """
+        return self._request(
+            "POST",
+            "/v1/local/ingest",
+            json=_body(
+                tenant_id=tenant_id,
+                corpus_id=corpus_id,
+                documents=documents,
+                semantic_profile=semantic_profile,
+            ),
+        )
+
+    def import_memory_pack(
+        self,
+        tenant_id: str,
+        pack: dict[str, Any],
+        *,
+        dry_run: bool = False,
+        principal_map: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """POST /v1/memory/import -- import a signed ``CruxPack``.
+
+        Requires ``CRUX_MEMORY_IMPORT=1``. ``tenant_id`` must equal the pack
+        manifest's tenant -- there is no override.
+        """
+        return self._request(
+            "POST",
+            "/v1/memory/import",
+            json=_body(
+                tenant_id=tenant_id,
+                pack=pack,
+                dry_run=dry_run,
+                principal_map=principal_map,
+            ),
+        )
+
+    # -- extensions --
+
+    def list_extensions(self) -> dict[str, Any]:
+        """GET /v1/extensions -- list installed extensions."""
+        return self._request("GET", "/v1/extensions")
+
+    def get_extension(self, extension_id: str) -> dict[str, Any] | None:
+        """GET /v1/extensions/{id} -- one extension, or None if absent."""
+        try:
+            return self._request("GET", f"/v1/extensions/{extension_id}")
+        except CoreCruxError as err:
+            if err.status_code == 404:
+                return None
+            raise
+
+    def register_extension(self, manifest: dict[str, Any]) -> dict[str, Any]:
+        """POST /v1/extensions/register -- register a signed manifest."""
+        return self._request("POST", "/v1/extensions/register", json={"manifest": manifest})
+
+    def delete_extension(self, extension_id: str) -> bool:
+        """DELETE /v1/extensions/{id} -- uninstall. False if not installed."""
+        try:
+            self._request("DELETE", f"/v1/extensions/{extension_id}")
+            return True
+        except CoreCruxError as err:
+            if err.status_code == 404:
+                return False
+            raise
+
+    def list_registry_entries(self) -> dict[str, Any]:
+        """GET /v1/extensions/registry -- the curator-signed community index."""
+        return self._request("GET", "/v1/extensions/registry")
+
+    def install_from_registry(
+        self, extension_id: str, *, index_path: str | None = None
+    ) -> dict[str, Any]:
+        """POST /v1/extensions/install-from-registry -- install from the cached index."""
+        return self._request(
+            "POST",
+            "/v1/extensions/install-from-registry",
+            json=_body(id=extension_id, index_path=index_path),
+        )
+
+    def list_trusted_keys(self) -> dict[str, Any]:
+        """GET /v1/extensions/keys -- trusted signing keys."""
+        return self._request("GET", "/v1/extensions/keys")
+
+    def add_trusted_key(
+        self,
+        passport_fpr: str,
+        public_key_hex: str,
+        trust_tier: str,
+        *,
+        added_by: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /v1/extensions/keys -- trust a signing key at a tier."""
+        return self._request(
+            "POST",
+            "/v1/extensions/keys",
+            json=_body(
+                passport_fpr=passport_fpr,
+                public_key_hex=public_key_hex,
+                trust_tier=trust_tier,
+                added_by=added_by,
+            ),
+        )
+
+    def delete_trusted_key(self, passport_fpr: str) -> dict[str, Any]:
+        """DELETE /v1/extensions/keys/{passport_fpr} -- untrust a signing key."""
+        return self._request("DELETE", f"/v1/extensions/keys/{passport_fpr}")
+
+    def list_grants(self, extension_id: str) -> dict[str, Any]:
+        """GET /v1/extensions/{id}/grants -- grants issued for an extension."""
+        return self._request("GET", f"/v1/extensions/{extension_id}/grants")
+
+    def issue_grant(self, extension_id: str, passport_fpr: str, **options: Any) -> dict[str, Any]:
+        """POST /v1/extensions/{id}/grants -- issue a per-passport capability grant."""
+        return self._request(
+            "POST",
+            f"/v1/extensions/{extension_id}/grants",
+            json=_body(passport_fpr=passport_fpr, **options),
+        )
+
+    def revoke_grant(self, extension_id: str, passport_fpr: str) -> dict[str, Any]:
+        """DELETE /v1/extensions/{id}/grants/{passport_fpr} -- revoke a grant."""
+        return self._request(
+            "DELETE", f"/v1/extensions/{extension_id}/grants/{passport_fpr}"
+        )
+
+    def invoke_extension_tool(
+        self,
+        extension_id: str,
+        tool_name: str,
+        *,
+        args: dict[str, Any] | None = None,
+        passport_fpr: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /v1/extensions/{id}/tools/{tool}/invoke -- dispatch one tool.
+
+        The caller's passport must hold a grant naming this tool.
+        """
+        return self._request(
+            "POST",
+            f"/v1/extensions/{extension_id}/tools/{tool_name}/invoke",
+            json=_body(args=args if args is not None else {}, passport_fpr=passport_fpr),
+        )
+
+    # -- events (SSE) --
+
+    def subscribe_events(
+        self, *, types: list[str] | None = None
+    ) -> Iterator[dict[str, Any]]:
+        """GET /v1/events/stream -- yield mutation events as they arrive.
+
+        The stream is infinite; break out of the loop (or close the client) to
+        disconnect. Keep-alive comments are skipped.
+
+        Usage::
+
+            for event in client.subscribe_events(types=["fact.stored"]):
+                print(event["type"], event["fact_id"])
+                break
+        """
+        params = _params(types=",".join(types) if types else None)
+        with self._client.stream("GET", "/v1/events/stream", params=params) as resp:
+            if resp.status_code >= 400:
+                resp.read()  # a streamed error body is not loaded until read
+            _raise_for_status(resp)
+            for block in _sse_blocks(resp.iter_lines()):
+                event = _sse_event(block)
+                if event is not None:
+                    yield event
+
 
 # ---------------------------------------------------------------------------
 # Asynchronous client
@@ -630,3 +1059,368 @@ class AsyncCoreCruxClient:
         if artifact_ids is not None:
             body["artifact_ids"] = artifact_ids
         return await self._request("POST", "/v1/query/time-range", json=body)
+
+    # -- context --
+
+    async def context(
+        self,
+        *,
+        session_id: str | None = None,
+        entity: str | None = None,
+        query: str | None = None,
+        token_budget: int | None = None,
+    ) -> dict[str, Any]:
+        """GET /v1/context -- the provider-neutral injection bundle.
+
+        Requires ``CORECRUXD_CONTEXT_SURFACE=1`` on the daemon; the route 404s
+        when the surface is off, so the capability is invisible rather than
+        half-alive.
+
+        The response is the flattened wire envelope, not the daemon's internal
+        ``ContextBundle`` struct: ``sections`` sits at the top level rather
+        than under a ``stable`` key. ``stable_hash`` covers only the stable
+        region (``bundle_version`` + ordered ``sections``), so it is byte-stable
+        across calls for an unchanged fact-chain head.
+        """
+        return await self._request(
+            "GET",
+            "/v1/context",
+            params=_params(
+                session_id=session_id, entity=entity, query=query, token_budget=token_budget
+            ),
+        )
+
+    async def post_context(self, **options: Any) -> dict[str, Any]:
+        """POST /v1/context -- same bundle, options in the body.
+
+        Prefer this when ``query`` is long enough to strain a URL.
+        """
+        return await self._request("POST", "/v1/context", json=_body(**options))
+
+    async def context_markdown(self, **options: Any) -> str:
+        """GET /v1/context?render=markdown -- the boot-banner rendering.
+
+        Returns ``text/markdown``, so this bypasses the JSON parse path.
+        """
+        resp = await self._client.request(
+            "GET", "/v1/context", params=_params(render="markdown", **options)
+        )
+        _raise_for_status(resp)
+        return resp.text
+
+    async def context_messages(self, **options: Any) -> dict[str, Any]:
+        """GET /v1/context?render=openai_messages -- an OpenAI messages fragment."""
+        return await self._request(
+            "GET", "/v1/context", params=_params(render="openai_messages", **options)
+        )
+
+    # -- review: auto-capture candidates --
+
+    async def extract_memory(
+        self,
+        text: str,
+        *,
+        session_id: str | None = None,
+        profile: str | None = None,
+        session_date: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /v1/memory/extract -- mine transcript text into review candidates.
+
+        Candidates land in the ``__candidate_fact__::`` review namespace and
+        never appear in ``query_facts`` recall until promoted. Requires
+        ``CORECRUXD_AUTO_CAPTURE=1``.
+        """
+        return await self._request(
+            "POST",
+            "/v1/memory/extract",
+            json=_body(
+                text=text, session_id=session_id, profile=profile, session_date=session_date
+            ),
+        )
+
+    async def list_candidates(self, *, status: str | None = None) -> dict[str, Any]:
+        """GET /v1/memory/candidates -- list candidates, optionally by status.
+
+        ``status`` is one of ``candidate``, ``promoted``, ``rejected``.
+        """
+        return await self._request("GET", "/v1/memory/candidates", params=_params(status=status))
+
+    async def promote_candidate(
+        self,
+        candidate_id: str,
+        *,
+        reviewer: str | None = None,
+        auto_threshold: float | None = None,
+    ) -> dict[str, Any]:
+        """POST /v1/memory/candidates/{id}/promote -- promote to a real fact.
+
+        The gate is fail-closed: with ``auto_threshold`` set, an unscored or
+        below-threshold candidate is refused (422) rather than promoted.
+        """
+        return await self._request(
+            "POST",
+            f"/v1/memory/candidates/{candidate_id}/promote",
+            json=_body(reviewer=reviewer, auto_threshold=auto_threshold),
+        )
+
+    async def reject_candidate(self, candidate_id: str, reason: str) -> dict[str, Any]:
+        """POST /v1/memory/candidates/{id}/reject -- reject with a reason."""
+        return await self._request(
+            "POST", f"/v1/memory/candidates/{candidate_id}/reject", json={"reason": reason}
+        )
+
+    # -- review: contradictions, queue, expiries --
+
+    async def review_contradictions(self, *, limit: int | None = None) -> dict[str, Any]:
+        """GET /v1/console/review/contradictions -- run a LIVE contradiction pass."""
+        return await self._request(
+            "GET", "/v1/console/review/contradictions", params=_params(limit=limit)
+        )
+
+    async def review_queue(self, *, limit: int | None = None) -> dict[str, Any]:
+        """GET /v1/console/review/queue -- surfaced scheduler review receipts.
+
+        Distinct from :meth:`review_contradictions`, which runs a live pass.
+        """
+        return await self._request("GET", "/v1/console/review/queue", params=_params(limit=limit))
+
+    async def apply_expiries(self, fact_ids: list[str]) -> dict[str, Any]:
+        """POST /v1/console/review/expiries -- apply reviewed expiry proposals.
+
+        Every id is re-validated at apply time; ids that became protected, were
+        re-verified fresh, or gained confidence are skipped, never deleted.
+        Capped at 500 ids per request.
+        """
+        return await self._request(
+            "POST", "/v1/console/review/expiries", json={"fact_ids": fact_ids}
+        )
+
+    # -- consolidation --
+
+    async def consolidate(
+        self,
+        entity: str,
+        key: str,
+        canonical_value: str,
+        target_fact_ids: list[str],
+        **options: Any,
+    ) -> dict[str, Any]:
+        """POST /v1/console/review/consolidations -- merge facts atomically.
+
+        Emits an Ed25519-signed, offline-verifiable diff receipt. Facts at or
+        above ``protected_confidence_floor`` (0.99 by default) are never merged.
+        The scheduler itself stays proposal-only -- this is the explicit commit.
+        """
+        return await self._request(
+            "POST",
+            "/v1/console/review/consolidations",
+            # `consolidation_id` has no serde default daemon-side, so omitting
+            # it is a 422 even though the handler generates one for a BLANK
+            # value. Send "" and let the daemon mint `console-<uuid>`.
+            json=_body(
+                consolidation_id=options.pop("consolidation_id", ""),
+                entity=entity,
+                key=key,
+                canonical_value=canonical_value,
+                target_fact_ids=target_fact_ids,
+                **options,
+            ),
+        )
+
+    async def undo_consolidation(
+        self, canonical_fact_id: str, **options: Any
+    ) -> dict[str, Any]:
+        """POST /v1/console/review/consolidations/undo -- reverse a consolidation.
+
+        Idempotent: undoing an already-undone consolidation returns
+        ``status = "already_undone"`` rather than failing.
+        """
+        return await self._request(
+            "POST",
+            "/v1/console/review/consolidations/undo",
+            json=_body(canonical_fact_id=canonical_fact_id, **options),
+        )
+
+    # -- ingest --
+
+    async def local_ingest(
+        self,
+        tenant_id: str,
+        corpus_id: str,
+        documents: list[dict[str, Any]],
+        *,
+        semantic_profile: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """POST /v1/local/ingest -- ingest documents into a local corpus.
+
+        Chunks without a ``dense_vector`` are embedded server-side, so this
+        works offline with no external embedder. Caps: 4096 documents and
+        65536 chunks per request, 4 MiB per chunk.
+        """
+        return await self._request(
+            "POST",
+            "/v1/local/ingest",
+            json=_body(
+                tenant_id=tenant_id,
+                corpus_id=corpus_id,
+                documents=documents,
+                semantic_profile=semantic_profile,
+            ),
+        )
+
+    async def import_memory_pack(
+        self,
+        tenant_id: str,
+        pack: dict[str, Any],
+        *,
+        dry_run: bool = False,
+        principal_map: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """POST /v1/memory/import -- import a signed ``CruxPack``.
+
+        Requires ``CRUX_MEMORY_IMPORT=1``. ``tenant_id`` must equal the pack
+        manifest's tenant -- there is no override.
+        """
+        return await self._request(
+            "POST",
+            "/v1/memory/import",
+            json=_body(
+                tenant_id=tenant_id,
+                pack=pack,
+                dry_run=dry_run,
+                principal_map=principal_map,
+            ),
+        )
+
+    # -- extensions --
+
+    async def list_extensions(self) -> dict[str, Any]:
+        """GET /v1/extensions -- list installed extensions."""
+        return await self._request("GET", "/v1/extensions")
+
+    async def get_extension(self, extension_id: str) -> dict[str, Any] | None:
+        """GET /v1/extensions/{id} -- one extension, or None if absent."""
+        try:
+            return await self._request("GET", f"/v1/extensions/{extension_id}")
+        except CoreCruxError as err:
+            if err.status_code == 404:
+                return None
+            raise
+
+    async def register_extension(self, manifest: dict[str, Any]) -> dict[str, Any]:
+        """POST /v1/extensions/register -- register a signed manifest."""
+        return await self._request("POST", "/v1/extensions/register", json={"manifest": manifest})
+
+    async def delete_extension(self, extension_id: str) -> bool:
+        """DELETE /v1/extensions/{id} -- uninstall. False if not installed."""
+        try:
+            await self._request("DELETE", f"/v1/extensions/{extension_id}")
+            return True
+        except CoreCruxError as err:
+            if err.status_code == 404:
+                return False
+            raise
+
+    async def list_registry_entries(self) -> dict[str, Any]:
+        """GET /v1/extensions/registry -- the curator-signed community index."""
+        return await self._request("GET", "/v1/extensions/registry")
+
+    async def install_from_registry(
+        self, extension_id: str, *, index_path: str | None = None
+    ) -> dict[str, Any]:
+        """POST /v1/extensions/install-from-registry -- install from the cached index."""
+        return await self._request(
+            "POST",
+            "/v1/extensions/install-from-registry",
+            json=_body(id=extension_id, index_path=index_path),
+        )
+
+    async def list_trusted_keys(self) -> dict[str, Any]:
+        """GET /v1/extensions/keys -- trusted signing keys."""
+        return await self._request("GET", "/v1/extensions/keys")
+
+    async def add_trusted_key(
+        self,
+        passport_fpr: str,
+        public_key_hex: str,
+        trust_tier: str,
+        *,
+        added_by: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /v1/extensions/keys -- trust a signing key at a tier."""
+        return await self._request(
+            "POST",
+            "/v1/extensions/keys",
+            json=_body(
+                passport_fpr=passport_fpr,
+                public_key_hex=public_key_hex,
+                trust_tier=trust_tier,
+                added_by=added_by,
+            ),
+        )
+
+    async def delete_trusted_key(self, passport_fpr: str) -> dict[str, Any]:
+        """DELETE /v1/extensions/keys/{passport_fpr} -- untrust a signing key."""
+        return await self._request("DELETE", f"/v1/extensions/keys/{passport_fpr}")
+
+    async def list_grants(self, extension_id: str) -> dict[str, Any]:
+        """GET /v1/extensions/{id}/grants -- grants issued for an extension."""
+        return await self._request("GET", f"/v1/extensions/{extension_id}/grants")
+
+    async def issue_grant(self, extension_id: str, passport_fpr: str, **options: Any) -> dict[str, Any]:
+        """POST /v1/extensions/{id}/grants -- issue a per-passport capability grant."""
+        return await self._request(
+            "POST",
+            f"/v1/extensions/{extension_id}/grants",
+            json=_body(passport_fpr=passport_fpr, **options),
+        )
+
+    async def revoke_grant(self, extension_id: str, passport_fpr: str) -> dict[str, Any]:
+        """DELETE /v1/extensions/{id}/grants/{passport_fpr} -- revoke a grant."""
+        return await self._request(
+            "DELETE", f"/v1/extensions/{extension_id}/grants/{passport_fpr}"
+        )
+
+    async def invoke_extension_tool(
+        self,
+        extension_id: str,
+        tool_name: str,
+        *,
+        args: dict[str, Any] | None = None,
+        passport_fpr: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /v1/extensions/{id}/tools/{tool}/invoke -- dispatch one tool.
+
+        The caller's passport must hold a grant naming this tool.
+        """
+        return await self._request(
+            "POST",
+            f"/v1/extensions/{extension_id}/tools/{tool_name}/invoke",
+            json=_body(args=args if args is not None else {}, passport_fpr=passport_fpr),
+        )
+
+    # -- events (SSE) --
+
+    async def subscribe_events(
+        self, *, types: list[str] | None = None
+    ) -> AsyncIterator[dict[str, Any]]:
+        """GET /v1/events/stream -- yield mutation events as they arrive.
+
+        The stream is infinite; break out of the loop (or close the client) to
+        disconnect. Keep-alive comments are skipped.
+
+        Usage::
+
+            async for event in client.subscribe_events(types=["fact.stored"]):
+                print(event["type"], event["fact_id"])
+                break
+        """
+        params = _params(types=",".join(types) if types else None)
+        async with self._client.stream("GET", "/v1/events/stream", params=params) as resp:
+            if resp.status_code >= 400:
+                await resp.aread()  # a streamed error body is not loaded until read
+            _raise_for_status(resp)
+            async for block in _sse_blocks_async(resp.aiter_lines()):
+                event = _sse_event(block)
+                if event is not None:
+                    yield event

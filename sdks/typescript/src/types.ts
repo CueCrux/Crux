@@ -287,8 +287,6 @@ export interface TimeRangeResult {
 
 // ── Events (SSE) ────────────────────────────────────────────────────
 
-export type CruxEventType = "fact.stored" | "fact.deleted" | "session.stored" | "session.deleted";
-
 export interface CruxEventFactStored {
   type: "fact.stored";
   fact_id: string;
@@ -311,11 +309,62 @@ export interface CruxEventSessionDeleted {
   session_id: string;
 }
 
+export interface CruxEventSessionArchived {
+  type: "session.archived";
+  session_id: string;
+}
+
+export interface CruxEventAuditStep {
+  type: "observe.audit_step";
+  [key: string]: unknown;
+}
+
+export interface CruxEventOrchestratorChanged {
+  type: "orchestrator.changed";
+  [key: string]: unknown;
+}
+
+export interface CruxEventPunchcardChanged {
+  type: "punchcard.changed";
+  [key: string]: unknown;
+}
+
+export interface CruxEventActivityAppended {
+  type: "activity.appended";
+  [key: string]: unknown;
+}
+
 export type CruxEvent =
   | CruxEventFactStored
   | CruxEventFactDeleted
   | CruxEventSessionStored
-  | CruxEventSessionDeleted;
+  | CruxEventSessionDeleted
+  | CruxEventSessionArchived
+  | CruxEventAuditStep
+  | CruxEventOrchestratorChanged
+  | CruxEventPunchcardChanged
+  | CruxEventActivityAppended;
+
+/**
+ * Every event type the daemon emits on `GET /v1/events/stream`.
+ *
+ * These strings travel twice on the wire — once as the SSE `event:` name and
+ * once as the JSON `type` field — and the daemon pins the two together in
+ * `events::tests::sse_names_match_the_serde_tags`.
+ */
+export const CRUX_EVENT_TYPES = [
+  "fact.stored",
+  "fact.deleted",
+  "session.stored",
+  "session.deleted",
+  "session.archived",
+  "observe.audit_step",
+  "orchestrator.changed",
+  "punchcard.changed",
+  "activity.appended",
+] as const;
+
+export type CruxEventType = (typeof CRUX_EVENT_TYPES)[number];
 
 // ── Error ───────────────────────────────────────────────────────────
 
@@ -327,4 +376,276 @@ export interface ProblemDetails {
   detail?: string;
   instance?: string;
   extensions?: Record<string, unknown>;
+}
+
+// ── Context bundle (`context_bundle/v1`) ────────────────────────────
+
+export type SectionKind = "facts" | "dossier" | "session_state" | "work_table" | "coord";
+export type Freshness = "fresh" | "stale" | "unknown";
+export type HorizonClass = "volatile" | "medium" | "stable" | "none";
+export type ContextRender = "json" | "markdown" | "openai_messages";
+
+export interface ContextOptions {
+  /** Include the saved state for this consumer session as a `session_state` section. */
+  session_id?: string;
+  /** Typed address resolved first (`execplan:<slug>`, `bench:<id>`, …). */
+  entity?: string;
+  /** Keyword recall over fact values/keys/entities. */
+  query?: string;
+  /** `budget.requested`. Defaults to 2000, hard-capped by the tier ceiling (8000 free/local). */
+  token_budget?: number;
+}
+
+/** One fact inside the byte-stable region. Stale items are annotated, never dropped. */
+export interface StableFactItem {
+  fact_id: string;
+  entity: string;
+  key: string;
+  value: string;
+  confidence: number;
+  horizon_class: HorizonClass;
+  freshness: Freshness;
+  est_tokens: number;
+}
+
+export interface AuxItem {
+  id: string;
+  text: string;
+  est_tokens?: number | null;
+}
+
+export interface StableSection {
+  kind: SectionKind;
+  /** Present on the `facts` section; ordered by (entity, key, fact_id). */
+  facts?: StableFactItem[];
+  /** Present on non-fact sections; ordered by id. */
+  items?: AuxItem[];
+  est_tokens: number;
+}
+
+/** Items that did not fit the budget. Truncation is explicit, never silent. */
+export interface DroppedReport {
+  kind: SectionKind;
+  count: number;
+  reason: string;
+}
+
+export interface BudgetReport {
+  requested: number;
+  ceiling: number;
+  spent_est: number;
+  dropped?: DroppedReport[];
+}
+
+/**
+ * The `GET/POST /v1/context` JSON body.
+ *
+ * Note this is the flattened wire envelope, not the daemon's internal
+ * `ContextBundle` struct: `sections` sits at the top level rather than under
+ * a `stable` key. `stable_hash` covers the stable region only — the
+ * `bundle_version` + ordered `sections` — so it is byte-stable across calls
+ * for an unchanged fact-chain head. Everything else here is volatile.
+ */
+export interface ContextBundle {
+  bundle_version: string;
+  passport: string | null;
+  session_id: string | null;
+  assembled_at: string;
+  budget: BudgetReport;
+  sections: StableSection[];
+  stable_hash: string;
+  receipt_ref: string | null;
+  /** Present only when receipt minting failed; the bundle is still served. */
+  receipt_error?: string;
+}
+
+/** The `render=openai_messages` fragment — drop `messages` into an OpenAI-SDK call. */
+export interface ContextMessages {
+  bundle_version: string;
+  messages: Array<{ role: "system"; content: string }>;
+  metadata: {
+    stable_hash: string;
+    assembled_at: string;
+    receipt_ref: string | null;
+    budget: BudgetReport;
+  };
+}
+
+// ── Review: auto-capture candidates + contradictions + expiries ─────
+
+export type CandidateStatus = "candidate" | "promoted" | "rejected";
+
+export interface ExtractOptions {
+  /** Raw session/transcript text to mine. */
+  text: string;
+  /** Recorded as candidate provenance. */
+  session_id?: string;
+  /** `comprehensive` | `money` | `counts` | `dates` | `version_chains`. */
+  profile?: string;
+  /** ISO date used to fill the year on month-day dates. */
+  session_date?: string;
+}
+
+export interface ExtractResult {
+  schema: string;
+  extracted: number;
+  written: number;
+  skipped_existing: number;
+  candidates: Array<Record<string, unknown>>;
+}
+
+export interface CandidateListResult {
+  schema: string;
+  count: number;
+  candidates: Array<Record<string, unknown>>;
+}
+
+export interface PromoteOptions {
+  /** Reviewer identity recorded on the promoted fact. */
+  reviewer?: string;
+  /**
+   * Score-gated automatic promotion at this threshold instead of an explicit
+   * review. The daemon refuses unscored or below-threshold candidates (422) —
+   * the fail-closed gate. Omit for an explicit operator promotion.
+   */
+  auto_threshold?: number;
+}
+
+export interface ReviewQueueOptions {
+  /** Defaults to 50 daemon-side, capped at 250. */
+  limit?: number;
+}
+
+export interface ExpiryApplyResult {
+  schema: string;
+  expired_count: number;
+  skipped_count: number;
+  expired: unknown[];
+  skipped: unknown[];
+  actor: string;
+}
+
+// ── Consolidation ───────────────────────────────────────────────────
+
+export interface ConsolidationRequest {
+  /**
+   * Omit to let the daemon mint `console-<uuid>`. The SDK sends an empty
+   * string on your behalf: the field has no serde default daemon-side, so a
+   * genuinely absent key is rejected (422) even though a blank one is filled in.
+   */
+  consolidation_id?: string;
+  entity: string;
+  key: string;
+  canonical_value: string;
+  target_fact_ids: string[];
+  protected_fact_ids?: string[];
+  confidence?: number;
+  source_receipt?: string;
+  /** Defaults daemon-side to the caller's console actor. */
+  actor?: string;
+  horizon_class?: HorizonClass;
+  /** Facts at or above this confidence are never merged. Defaults to 0.99. */
+  protected_confidence_floor?: number;
+}
+
+export interface ConsolidationResult {
+  schema: string;
+  status: string;
+  receipt: Record<string, unknown>;
+  /** Ed25519-signed, offline-verifiable diff receipt. */
+  signed_receipt: Record<string, unknown> | null;
+}
+
+export interface ConsolidationUndoRequest {
+  canonical_fact_id: string;
+  source_fact_ids?: string[];
+  entity?: string;
+  key?: string;
+}
+
+// ── Ingest ──────────────────────────────────────────────────────────
+
+export interface LocalIngestChunk {
+  chunk_id: string;
+  text: string;
+  chunk_index?: number;
+  /**
+   * Precomputed dense vector. Omit to let the daemon embed server-side.
+   * A batch whose declared `semantic_profile` fingerprint differs from the
+   * node's is refused with 422 rather than stored unqueryable.
+   */
+  dense_vector?: number[];
+  metadata?: Record<string, unknown>;
+}
+
+export interface LocalIngestDocument {
+  doc_id: string;
+  title?: string;
+  url?: string;
+  source_timestamp?: string;
+  chunks: LocalIngestChunk[];
+}
+
+export interface LocalIngestRequest {
+  tenant_id: string;
+  corpus_id: string;
+  documents: LocalIngestDocument[];
+  /** Declared profile for caller-supplied `dense_vector`s. */
+  semantic_profile?: Record<string, unknown>;
+}
+
+export interface MemoryImportRequest {
+  /** Must equal the pack manifest's `tenant_id` — there is no override. */
+  tenant_id: string;
+  /** Verify and plan only; write nothing. */
+  dry_run?: boolean;
+  /** Principal remap table (`src` actor → `dst` actor). */
+  principal_map?: Record<string, string>;
+  /** A `CruxPack` as produced by `corecruxctl memory pack`. */
+  pack: Record<string, unknown>;
+}
+
+export interface MemoryImportResult {
+  ok: boolean;
+  dry_run: boolean;
+  pack_hash: string;
+  pack_passport_fpr: string;
+  imported_facts: number;
+  collisions_superseded: number;
+  skipped_duplicate_facts: number;
+  imported_sessions: number;
+  skipped_sessions: number;
+  private_facts: number;
+}
+
+// ── Extensions ──────────────────────────────────────────────────────
+
+export type TrustTier = "official" | "verified" | "community";
+
+export interface IssueGrantRequest {
+  passport_fpr: string;
+  allowed_tool_names?: string[];
+  allowed_prefixes_read?: string[];
+  allowed_prefixes_write?: string[];
+  rate_limit_per_min?: number;
+}
+
+export interface AddTrustedKeyRequest {
+  passport_fpr: string;
+  public_key_hex: string;
+  trust_tier: TrustTier;
+  added_by?: string;
+}
+
+export interface InstallFromRegistryRequest {
+  id: string;
+  /** Alternate cached index path; relative paths resolve under `data_dir`. */
+  index_path?: string;
+}
+
+export interface InvokeToolOptions {
+  /** Defaults to the `X-Corecrux-Passport-Id` header when omitted. */
+  passport_fpr?: string;
+  /** Forwarded to the extension endpoint as-is. */
+  args?: Record<string, unknown>;
 }
