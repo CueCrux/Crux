@@ -1793,16 +1793,28 @@ segment coordinates, which are **not the same number**:
 
 | Field | Meaning |
 |---|---|
-| `segment_index` | Position in the loaded-reader list, ascending by sequence. **0-based.** Pairs with `doc_id` to form `result_id`, and is the value `/expand` takes back. |
-| `segment_seq` | The sealed segment's own sequence — the `segment_seq` the `/v1/local/ingest` receipt returned. **1-based.** |
+| `segment_index` | Position in the loaded-reader list, ascending by sequence. **0-based, global, and mutable** — see the warning below. Pairs with `doc_id` to form `result_id`, and is the value `/expand` takes back. |
+| `segment_seq` | The sealed segment's own sequence — the `segment_seq` the `/v1/local/ingest` receipt returned. **1-based and stable for the life of the segment.** |
 
 To join a query result back to the ingest that produced it, **join on
-`segment_seq`**. On a store whose segments are all loaded and contiguously
-numbered from 1, `segment_index == segment_seq - 1` — but that is an
-observation, not a contract: erase a segment, or load a subset, and the
-positional index shifts while the sequence does not. Code that hardcodes the
-`-1` scores a plausible, uniform **0%** rather than erroring, which is how the
-mapping was wrong on BEAM-100K for a full run before anyone noticed.
+`segment_seq`**.
+
+**Never derive one from the other.** `segment_index` is a position in the
+daemon's loaded-reader list, so it moves when *any* segment is loaded, sealed or
+erased — including segments belonging to other tenants, written by someone else,
+while your query runs. Measured on one host on 2026-08-07: `segment_seq -
+segment_index` was **1** in the morning, **18** that afternoon and **17** minutes
+later, uniformly across every tenant. There is no offset to store, not even a
+freshly measured one.
+
+A consumer that translates between them scores a plausible, uniform **0%**
+instead of erroring, because every hit unmaps at once and nothing raises. That is
+how the BEAM-100K mapping was wrong for a full run before anyone noticed. If you
+are on a daemon old enough not to return `segment_seq`, do not guess the offset:
+discover the tenant's live segment ids through the same query path you score
+with, and pair them in ascending order with your ingest batches — segment
+sequences are allocated monotonically, so ascending live order matches ingest
+order whatever the absolute numbers have become.
 
 ### Local prose ingest
 
