@@ -11,6 +11,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.56] - 2026-08-07
+
+### Added
+
+- **A tenant's retrieval corpus can finally be erased.** Until now a corpus
+  could be created but never retired, so a mis-ingested or superseded tenant was
+  permanent — and there was no GDPR Art.17 story for the daemon. Two layers,
+  deliberately separated by reversibility:
+  - *Layer 1, logical erasure.* A persisted set of forgotten
+    `(tenant_hash, watermark_segment_seq)` pairs, enforced in the BM25 scorers
+    as a **required** parameter rather than an optional wrapper — so the
+    compiler forces every present and future serving path to state its intent
+    instead of one being silently missed. Reversible via
+    `DELETE /v1/admin/forget-tenants/{tenantId}`.
+  - *Layer 2, physical reclaim.* Opt-in per request (`"reclaim": true`), never
+    automatic. Whole-tenant segments are evicted from the `IndexManager` and
+    only then unlinked; mixed-tenant segments are retained, still masked, and
+    reported as `mixed_segments_retained`. Irreversible — recovery is
+    restore-from-backup only.
+  - `POST /v1/admin/forget-tenants` (+ singular alias) requires `admin:write`
+    **per named tenant**, with the whole batch rejected if any tenant fails and
+    nothing masked. Reserved `__`-prefixed namespaces are refused by convention,
+    so a future reserved namespace is protected the day it is introduced.
+  - `GET /v1/admin/tenants/{tenantId}/footprint` reports segments, docs and
+    bytes, so the blast radius is inspectable *before* anything is erased.
+  - The whole surface is gated on `CORECRUXD_TENANT_ERASURE=1` and the routes
+    404 without it. Fact-store erasure remains out of scope: the response key is
+    `corpus_erased`, never `tenant_forgotten`.
+- Key escrow M0–M3b, device-identity and CRL transport auth for the relay, and a
+  span outcome dimension.
+- Console Patchbay — a spatial projection of the open work board
+  (`GET /v1/work/graph`).
+
+### Changed
+
+- Tenant scoping tightened across the stack: derived from the token, applied by
+  type, exact-matched, and pushed down into gRPC and the lower layers.
+- Login verification is strict, and M1 auth fails closed.
+
 ## [0.5.55] - 2026-08-02
 
 ### Added
@@ -698,6 +737,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-audit` CVE scanning in CI
 
 [unreleased]: https://github.com/CueCrux/Crux/compare/v0.5.54...HEAD
+[0.5.56]: https://github.com/CueCrux/Crux/compare/v0.5.55...v0.5.56
 [0.5.55]: https://github.com/CueCrux/Crux/compare/v0.5.54...v0.5.55
 [0.5.54]: https://github.com/CueCrux/Crux/compare/v0.5.53...v0.5.54
 [0.4.6]: https://github.com/CueCrux/Crux/compare/v0.4.5...v0.4.6

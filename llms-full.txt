@@ -108,7 +108,7 @@ To understand what makes this tamper-evident, read these symbols in order:
 
 ## Build / test
 
-- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.55
+- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.56
   (`[workspace.package]` in `Cargo.toml` is authoritative, and
   `scripts/check-agent-docs.sh` fails the build when this line disagrees with it).
 - `cargo build --workspace --locked`
@@ -509,7 +509,7 @@ schema: crux-agent-manifest/v1
 summary: Local-first, tamper-evident retrieval + memory engine with signed, replayable receipts.
 msrv: "1.88.0"
 edition: "2021"
-workspace_version: "0.5.55"
+workspace_version: "0.5.56"
 
 verify_commands:
   - cargo test --workspace
