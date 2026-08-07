@@ -10504,6 +10504,854 @@
     return hit || 'sitemap';
   }
 
+  // ---- Patchbay (console-execplan-patchbay M3/M4) ------------------------
+  // The open board laid out in SPACE: every open ExecPlan is a card, cards are
+  // packed into a hollow RING per system with the system name in the middle,
+  // and declared dependencies are drawn as orthogonal wires between them.
+  //
+  // Geometry and routing are PURE functions over the projection (no DOM, no
+  // network), exported so the smoke can assert the invariants that make the
+  // picture readable — every card reachable from outside its ring, no wire
+  // through a plate, no diagonal segment — without needing a browser.
+  //
+  // The ring is not decoration. Because no card is landlocked, every card has
+  // an outward face, so a wire can always leave without crossing its own group.
+
+  var PB_CW = 168, PB_CH = 78, PB_GAP = 10;      // card box + gap between cards
+  var PB_ROWGAP = 178, PB_COLGAP = 134;          // gutters — also the wire channels
+  var PB_X0 = 340, PB_Y0 = 250;
+  var PB_ASPECT = 1.7;                           // canvas shape the packer aims for
+  var PB_PLATE = 12;                             // plate inset around a ring
+  var PB_G = 11;                                 // routing grid pitch
+  var PB_STUB = 36, PB_TURN = 48, PB_USED = 95, PB_NEAR = 26;
+  var PB_INFL = 150, PB_OUTW = 0.5, PB_BOUNDPAD = 64, PB_RADIUS = 8;
+  var PB_RAIL_W = 200, PB_RAIL_H = 52, PB_RAIL_GAP = 168;
+
+  // Open work only ever has four states, so the palette maps onto the console's
+  // own tokens rather than inventing a second vocabulary.
+  var PB_STATE_COLOR = {
+    in_progress: 'var(--ok)',
+    blocked: 'var(--warn)',
+    planned: 'var(--ink3)',
+    drafting: 'var(--acc)'
+  };
+  function pbStateColor(s) { return PB_STATE_COLOR[s] || 'var(--ink3)'; }
+
+  // Ring grid whose perimeter holds n cards and whose interior fits the label.
+  function pbGridFor(n) {
+    var opts = [[3, 3], [4, 3], [5, 3], [5, 4], [6, 4], [7, 4], [7, 5], [8, 5], [9, 6]];
+    for (var i = 0; i < opts.length; i++) {
+      if (2 * opts[i][0] + 2 * opts[i][1] - 4 >= n) { return opts[i]; }
+    }
+    return [10, 6];
+  }
+  // Perimeter cells, clockwise from top-left.
+  function pbRingSlots(c, r) {
+    var out = [], i, j;
+    for (i = 0; i < c; i++) { out.push([i, 0]); }
+    for (j = 1; j < r; j++) { out.push([c - 1, j]); }
+    for (i = c - 2; i >= 0; i--) { out.push([i, r - 1]); }
+    for (j = r - 2; j > 0; j--) { out.push([0, j]); }
+    return out;
+  }
+  function pbOutward(c, r, col, row) {
+    var o = [];
+    if (row === 0) { o.push('N'); }
+    if (row === r - 1) { o.push('S'); }
+    if (col === 0) { o.push('W'); }
+    if (col === c - 1) { o.push('E'); }
+    return o;
+  }
+
+  // Pure layout. Returns plates, centre labels, positioned cards, service rails
+  // and the canvas box. Plane order comes from the projection (largest first),
+  // so the picture is stable between loads.
+  function patchbayLayout(graph) {
+    var planes = (graph && graph.planes) || [];
+    var plans = (graph && graph.plans) || [];
+    var byPlane = {}, i, j, p;
+    for (i = 0; i < plans.length; i++) {
+      p = plans[i];
+      if (!Object.prototype.hasOwnProperty.call(byPlane, p.plane)) { byPlane[p.plane] = []; }
+      byPlane[p.plane].push(p);
+    }
+    // Blocks: <=4 plans is a strip (label then a row of cards); more is a ring.
+    var blocks = [];
+    for (i = 0; i < planes.length; i++) {
+      var key = planes[i].key;
+      var members = byPlane[key] || [];
+      var n = members.length;
+      if (!n) { continue; }
+      if (n <= 4) {
+        blocks.push({ key: key, n: n, kind: 'strip', c: n + 1, r: 1, members: members,
+          w: (n + 1) * PB_CW + n * PB_GAP, h: PB_CH });
+      } else {
+        var g = pbGridFor(n);
+        blocks.push({ key: key, n: n, kind: 'ring', c: g[0], r: g[1], members: members,
+          w: g[0] * PB_CW + (g[0] - 1) * PB_GAP, h: g[1] * PB_CH + (g[1] - 1) * PB_GAP });
+      }
+    }
+    // Row packing. The plane set is LIVE — a board of 20 plans and a board of
+    // 200 want different shapes — so instead of a tuned target width, pack at a
+    // spread of candidate widths and keep the one whose canvas comes out
+    // closest to landscape. Packing is pure arithmetic over ~a dozen blocks, so
+    // trying a handful costs nothing and removes a constant that would silently
+    // rot as the board grows.
+    function pbPack(targetW) {
+      var rws = [], c2 = [], cw2 = 0, q;
+      for (q = 0; q < blocks.length; q++) {
+        var add = (c2.length ? PB_COLGAP : 0) + blocks[q].w;
+        if (c2.length && cw2 + add > targetW) { rws.push(c2); c2 = []; cw2 = 0; add = blocks[q].w; }
+        c2.push(blocks[q]); cw2 += add;
+      }
+      if (c2.length) { rws.push(c2); }
+      var w = 0, h = 0;
+      for (q = 0; q < rws.length; q++) {
+        var rowW = 0, rowH = 0;
+        for (var z = 0; z < rws[q].length; z++) {
+          rowW += rws[q][z].w + (z ? PB_COLGAP : 0);
+          if (rws[q][z].h > rowH) { rowH = rws[q][z].h; }
+        }
+        if (rowW > w) { w = rowW; }
+        h += rowH + (q ? PB_ROWGAP : 0);
+      }
+      return { rows: rws, w: w, h: h };
+    }
+    var widest = 0, totalW = 0;
+    for (i = 0; i < blocks.length; i++) {
+      if (blocks[i].w > widest) { widest = blocks[i].w; }
+      totalW += blocks[i].w + PB_COLGAP;
+    }
+    var best = null;
+    for (i = 0; i <= 14; i++) {
+      var cand = widest + (totalW - widest) * (i / 14);
+      var packed = pbPack(cand);
+      // Compare the CANVAS aspect (interior plus the rail margins), not the
+      // interior alone — the rails are what the pane actually has to fit.
+      var aspect = (packed.w + 2 * PB_RAIL_GAP) / (packed.h + 2 * (PB_RAIL_GAP - 20));
+      var cost = Math.abs(Math.log(aspect / PB_ASPECT));
+      if (!best || cost < best.cost) { best = { cost: cost, packed: packed }; }
+    }
+    var rows = best.packed.rows;
+    var intW = best.packed.w;
+
+    var sections = [], centres = [], chips = [];
+    var y = PB_Y0;
+    for (i = 0; i < rows.length; i++) {
+      var row = rows[i], tw = 0, rh = 0;
+      for (j = 0; j < row.length; j++) { tw += row[j].w + (j ? PB_COLGAP : 0); if (row[j].h > rh) { rh = row[j].h; } }
+      var x = PB_X0 + (intW - tw) / 2;
+      for (j = 0; j < row.length; j++) {
+        var b = row[j], yy = y + (rh - b.h) / 2, k;
+        sections.push({ key: b.key, n: b.n, x: x, y: yy, w: b.w, h: b.h });
+        if (b.kind === 'strip') {
+          centres.push({ key: b.key, n: b.n, x: x, y: yy, w: PB_CW, h: PB_CH });
+          for (k = 0; k < b.members.length; k++) {
+            chips.push({ plan: b.members[k], x: x + (k + 1) * (PB_CW + PB_GAP), y: yy,
+              out: ['N', 'S'].concat(k === b.n - 1 ? ['E'] : []) });
+          }
+        } else {
+          centres.push({ key: b.key, n: b.n,
+            x: x + (PB_CW + PB_GAP), y: yy + (PB_CH + PB_GAP),
+            w: (b.c - 2) * PB_CW + (b.c - 3) * PB_GAP,
+            h: (b.r - 2) * PB_CH + (b.r - 3) * PB_GAP });
+          var slots = pbRingSlots(b.c, b.r), P = slots.length;
+          // Spread the cards evenly around the ring so gaps read as breathing
+          // room rather than a truncated side.
+          var chosen = [], seen = {};
+          for (k = 0; k < b.n; k++) {
+            var si = Math.round(k * P / b.n) % P;
+            while (Object.prototype.hasOwnProperty.call(seen, si)) { si = (si + 1) % P; }
+            seen[si] = true; chosen.push(si);
+          }
+          chosen.sort(function (a2, b2) { return a2 - b2; });
+          for (k = 0; k < b.members.length; k++) {
+            var slot = slots[chosen[k]], col = slot[0], rw2 = slot[1];
+            chips.push({ plan: b.members[k],
+              x: x + col * (PB_CW + PB_GAP), y: yy + rw2 * (PB_CH + PB_GAP),
+              out: pbOutward(b.c, b.r, col, rw2) });
+          }
+        }
+        x += b.w + PB_COLGAP;
+      }
+      y += rh + PB_ROWGAP;
+    }
+    var intY1 = y - PB_ROWGAP;
+
+    // Service rails on the perimeter, grouped by the side the endpoint assigned.
+    var svcIn = (graph && graph.services) || [];
+    var bySide = { top: [], bottom: [], left: [], right: [] };
+    for (i = 0; i < svcIn.length; i++) {
+      var s = svcIn[i];
+      if (bySide[s.side]) { bySide[s.side].push(s); }
+    }
+    var railTop = 92, railBot = intY1 + 84;
+    var leftX = PB_RAIL_GAP, rightX = PB_X0 + intW + PB_RAIL_GAP;
+    var services = [];
+    function placeH(list, yy, side) {
+      for (var q = 0; q < list.length; q++) {
+        services.push({ key: list[q].key, n: list[q].n, side: side, w: PB_RAIL_W,
+          x: PB_X0 + intW * (q + 0.5) / list.length, y: yy });
+      }
+    }
+    function placeV(list, xx, side) {
+      for (var q = 0; q < list.length; q++) {
+        services.push({ key: list[q].key, n: list[q].n, side: side, w: PB_RAIL_W + 6,
+          x: xx, y: PB_Y0 + (intY1 - PB_Y0) * (q + 0.5) / list.length });
+      }
+    }
+    placeH(bySide.top, railTop, 'top');
+    placeH(bySide.bottom, railBot, 'bottom');
+    placeV(bySide.left, leftX, 'left');
+    placeV(bySide.right, rightX, 'right');
+
+    var minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
+    for (i = 0; i < sections.length; i++) {
+      if (sections[i].x < minX) { minX = sections[i].x; }
+      if (sections[i].x + sections[i].w > maxX) { maxX = sections[i].x + sections[i].w; }
+      if (sections[i].y < minY) { minY = sections[i].y; }
+      if (sections[i].y + sections[i].h > maxY) { maxY = sections[i].y + sections[i].h; }
+    }
+    if (!sections.length) { minX = PB_X0; maxX = PB_X0; minY = PB_Y0; maxY = PB_Y0; }
+
+    return {
+      sections: sections, centres: centres, chips: chips, services: services,
+      cw: PB_CW, ch: PB_CH,
+      W: Math.round(rightX + PB_RAIL_GAP), H: Math.round(railBot + 82),
+      bound: { x0: minX - PB_BOUNDPAD, x1: maxX + PB_BOUNDPAD,
+               y0: minY - PB_BOUNDPAD, y1: maxY + PB_BOUNDPAD }
+    };
+  }
+
+  // ---- orthogonal router -------------------------------------------------
+  // X/Y only, small rounded corners, obstacle-aware (whole plates are solid),
+  // with a congestion cost + two rip-up passes so paths that must share a
+  // gutter fan onto parallel tracks instead of stacking on one line.
+  function pbRoundPath(pts, r) {
+    var q = [], i, a, l, pt;
+    for (i = 0; i < pts.length; i++) {
+      pt = pts[i]; l = q[q.length - 1];
+      if (l && Math.abs(l.x - pt.x) < 0.5 && Math.abs(l.y - pt.y) < 0.5) { continue; }
+      if (q.length >= 2) {
+        a = q[q.length - 2];
+        if ((Math.abs(a.x - l.x) < 0.5 && Math.abs(l.x - pt.x) < 0.5) ||
+            (Math.abs(a.y - l.y) < 0.5 && Math.abs(l.y - pt.y) < 0.5)) { q.pop(); }
+      }
+      q.push(pt);
+    }
+    if (q.length < 2) { return ''; }
+    var d = 'M' + q[0].x.toFixed(1) + ',' + q[0].y.toFixed(1);
+    for (i = 1; i < q.length - 1; i++) {
+      var b = q[i], c = q[i + 1]; a = q[i - 1];
+      var d1 = Math.abs(b.x - a.x) + Math.abs(b.y - a.y);
+      var d2 = Math.abs(c.x - b.x) + Math.abs(c.y - b.y);
+      var rr = Math.min(r, d1 / 2, d2 / 2);
+      if (rr < 1.2) { d += ' L' + b.x.toFixed(1) + ',' + b.y.toFixed(1); continue; }
+      d += ' L' + (b.x + (a.x - b.x) / d1 * rr).toFixed(1) + ',' + (b.y + (a.y - b.y) / d1 * rr).toFixed(1) +
+           ' Q' + b.x.toFixed(1) + ',' + b.y.toFixed(1) +
+           ' ' + (b.x + (c.x - b.x) / d2 * rr).toFixed(1) + ',' + (b.y + (c.y - b.y) / d2 * rr).toFixed(1);
+    }
+    var e = q[q.length - 1];
+    return d + ' L' + e.x.toFixed(1) + ',' + e.y.toFixed(1);
+  }
+
+  function pbSideToward(chip, tx, ty) {
+    var cx = chip.x + PB_CW / 2, cy = chip.y + PB_CH / 2;
+    var score = { N: cy - ty, S: ty - cy, W: cx - tx, E: tx - cx };
+    var faces = (chip.out && chip.out.length) ? chip.out.slice() : ['N', 'S', 'E', 'W'];
+    faces.sort(function (a, b) { return score[b] - score[a]; });
+    return faces[0];
+  }
+  // Connector at fraction t along a face, snapped to the grid so the stub and
+  // the routed path share a centreline (no 5px jog where they meet).
+  function pbFaceConn(chip, side, t) {
+    function mid(v) { return (Math.floor(v / PB_G) + 0.5) * PB_G; }
+    var x, y;
+    if (side === 'N' || side === 'S') {
+      x = mid(Math.min(chip.x + PB_CW - 10, Math.max(chip.x + 10, chip.x + PB_CW * t)));
+      y = side === 'N' ? chip.y : chip.y + PB_CH;
+      return { port: { x: x, y: y }, A: { x: x, y: mid(side === 'N' ? y - PB_STUB : y + PB_STUB) },
+        dir: side === 'N' ? 3 : 2 };
+    }
+    y = mid(Math.min(chip.y + PB_CH - 10, Math.max(chip.y + 10, chip.y + PB_CH * t)));
+    x = side === 'W' ? chip.x : chip.x + PB_CW;
+    return { port: { x: x, y: y }, A: { y: y, x: mid(side === 'W' ? x - PB_STUB : x + PB_STUB) },
+      dir: side === 'W' ? 1 : 0 };
+  }
+
+  function patchbayRoutes(layout, graph) {
+    var DX = [1, -1, 0, 0], DY = [0, 0, 1, -1];   // 0=E 1=W 2=S 3=N
+    var GC = Math.ceil(layout.W / PB_G), GR = Math.ceil(layout.H / PB_G);
+    var blocked = new Uint8Array(GC * GR);
+    function blockRect(x, y, w, h, pad) {
+      var c0 = Math.max(0, Math.floor((x - pad) / PB_G)), c1 = Math.min(GC - 1, Math.floor((x + w + pad) / PB_G));
+      var r0 = Math.max(0, Math.floor((y - pad) / PB_G)), r1 = Math.min(GR - 1, Math.floor((y + h + pad) / PB_G));
+      for (var r = r0; r <= r1; r++) { for (var c = c0; c <= c1; c++) { blocked[r * GC + c] = 1; } }
+    }
+    var i;
+    // Whole plates are obstacles, not individual cards: a wire slipping through
+    // an empty ring slot would visibly cross the raised plate.
+    for (i = 0; i < layout.sections.length; i++) {
+      blockRect(layout.sections[i].x, layout.sections[i].y, layout.sections[i].w, layout.sections[i].h, PB_PLATE + 3);
+    }
+    for (i = 0; i < layout.services.length; i++) {
+      blockRect(layout.services[i].x - layout.services[i].w / 2, layout.services[i].y - PB_RAIL_H / 2,
+        layout.services[i].w, PB_RAIL_H, 4);
+    }
+
+    function astar(start, goal, dir0, usage, bb, bound) {
+      var N = GC * GR, S = N * 4;
+      var dist = new Float64Array(S), prev = new Int32Array(S), k;
+      for (k = 0; k < S; k++) { dist[k] = Infinity; prev[k] = -1; }
+      var heap = [];
+      function push(f, s) {
+        heap.push([f, s]);
+        var idx = heap.length - 1;
+        while (idx > 0) {
+          var par = (idx - 1) >> 1;
+          if (heap[par][0] <= heap[idx][0]) { break; }
+          var t = heap[par]; heap[par] = heap[idx]; heap[idx] = t; idx = par;
+        }
+      }
+      function pop() {
+        var top = heap[0], last = heap.pop();
+        if (heap.length) {
+          heap[0] = last;
+          var idx = 0;
+          for (;;) {
+            var l = 2 * idx + 1, r = l + 1, m = idx;
+            if (l < heap.length && heap[l][0] < heap[m][0]) { m = l; }
+            if (r < heap.length && heap[r][0] < heap[m][0]) { m = r; }
+            if (m === idx) { break; }
+            var t2 = heap[m]; heap[m] = heap[idx]; heap[idx] = t2; idx = m;
+          }
+        }
+        return top;
+      }
+      function h(c, r) { return (Math.abs(c - goal.c) + Math.abs(r - goal.r)) * PB_G; }
+      var s0 = (start.r * GC + start.c) * 4 + dir0;
+      dist[s0] = 0; push(h(start.c, start.r), s0);
+      var end = -1;
+      while (heap.length) {
+        var curTop = pop(), f = curTop[0], s = curTop[1];
+        var cell = s >> 2, d = s & 3, c = cell % GC, r = (cell - c) / GC;
+        if (f > dist[s] + h(c, r) + 1e-9) { continue; }
+        if (c === goal.c && r === goal.r) { end = s; break; }
+        for (var nd = 0; nd < 4; nd++) {
+          var nc = c + DX[nd], nr = r + DY[nd];
+          if (nc < 0 || nr < 0 || nc >= GC || nr >= GR) { continue; }
+          var ni = nr * GC + nc;
+          if (blocked[ni] && !(nc === goal.c && nr === goal.r)) { continue; }
+          var px = (nc + 0.5) * PB_G, py = (nr + 0.5) * PB_G;
+          if (bound && (px < bound.x0 || px > bound.x1 || py < bound.y0 || py > bound.y1)) { continue; }
+          var stray = 0;
+          if (bb) {
+            stray = (Math.max(bb.x0 - px, 0, px - bb.x1) + Math.max(bb.y0 - py, 0, py - bb.y1)) * PB_OUTW;
+          }
+          var ns = ni * 4 + nd;
+          var nDist = dist[s] + PB_G + (nd === d ? 0 : PB_TURN) + usage[ni] + stray;
+          if (nDist < dist[ns]) { dist[ns] = nDist; prev[ns] = s; push(nDist + h(nc, nr), ns); }
+        }
+      }
+      if (end < 0) { return null; }
+      var out = [], sp = end;
+      while (sp >= 0) { var cl = sp >> 2, cc = cl % GC; out.push({ c: cc, r: (cl - cc) / GC }); sp = prev[sp]; }
+      return out.reverse();
+    }
+    function markUsed(cells, usage, sign) {
+      for (var k = 0; k < cells.length; k++) {
+        var idx = cells[k].r * GC + cells[k].c;
+        usage[idx] += sign * PB_USED;
+        if (cells[k].c > 0) { usage[idx - 1] += sign * PB_NEAR; }
+        if (cells[k].c < GC - 1) { usage[idx + 1] += sign * PB_NEAR; }
+        if (cells[k].r > 0) { usage[idx - GC] += sign * PB_NEAR; }
+        if (cells[k].r < GR - 1) { usage[idx + GC] += sign * PB_NEAR; }
+      }
+    }
+
+    // Requests: one per declared edge whose target is also on the canvas.
+    var bySlug = {}, reqs = [], j;
+    for (i = 0; i < layout.chips.length; i++) { bySlug[layout.chips[i].plan.slug] = layout.chips[i]; }
+    for (i = 0; i < layout.chips.length; i++) {
+      var chip = layout.chips[i], links = chip.plan.links || [];
+      for (j = 0; j < links.length; j++) {
+        var target = bySlug[links[j]];
+        if (target) { reqs.push({ a: chip, b: target, from: chip.plan.slug, to: links[j] }); }
+      }
+    }
+    if (!reqs.length) { return []; }
+
+    // Spread connectors along each face so a hub does not fire every wire out
+    // of one point — the single biggest source of overlapping runs.
+    var faces = {};
+    function faceKey(chip, side) { return chip.plan.slug + '|' + side; }
+    for (i = 0; i < reqs.length; i++) {
+      var q = reqs[i];
+      q.sa = pbSideToward(q.a, q.b.x + PB_CW / 2, q.b.y + PB_CH / 2);
+      q.sb = pbSideToward(q.b, q.a.x + PB_CW / 2, q.a.y + PB_CH / 2);
+      var ka = faceKey(q.a, q.sa), kb = faceKey(q.b, q.sb);
+      if (!faces[ka]) { faces[ka] = []; }
+      if (!faces[kb]) { faces[kb] = []; }
+      faces[ka].push({ q: q, end: 'a' });
+      faces[kb].push({ q: q, end: 'b' });
+    }
+    Object.keys(faces).forEach(function (key) {
+      var list = faces[key];
+      list.sort(function (m, n) {
+        var mo = m.end === 'a' ? m.q.b : m.q.a, no = n.end === 'a' ? n.q.b : n.q.a;
+        var side = m.end === 'a' ? m.q.sa : m.q.sb;
+        return (side === 'N' || side === 'S') ? (mo.x - no.x) : (mo.y - no.y);
+      });
+      for (var k = 0; k < list.length; k++) {
+        var e = list[k];
+        var own = e.end === 'a' ? e.q.a : e.q.b;
+        var side2 = e.end === 'a' ? e.q.sa : e.q.sb;
+        var conn = pbFaceConn(own, side2, (k + 1) / (list.length + 1));
+        if (e.end === 'a') { e.q.ca = conn; } else { e.q.cb = conn; }
+      }
+    });
+
+    var usage = new Float32Array(GC * GR);
+    for (i = 0; i < reqs.length; i++) {
+      reqs[i].bb = {
+        x0: Math.min(reqs[i].ca.A.x, reqs[i].cb.A.x) - PB_INFL,
+        x1: Math.max(reqs[i].ca.A.x, reqs[i].cb.A.x) + PB_INFL,
+        y0: Math.min(reqs[i].ca.A.y, reqs[i].cb.A.y) - PB_INFL,
+        y1: Math.max(reqs[i].ca.A.y, reqs[i].cb.A.y) + PB_INFL
+      };
+      reqs[i].len = Math.abs(reqs[i].ca.A.x - reqs[i].cb.A.x) + Math.abs(reqs[i].ca.A.y - reqs[i].cb.A.y);
+    }
+    var order = reqs.slice().sort(function (m, n) { return m.len - n.len; });
+    function cellOf(pt) { return { c: Math.floor(pt.x / PB_G), r: Math.floor(pt.y / PB_G) }; }
+    function ptOf(k) { return { x: (k.c + 0.5) * PB_G, y: (k.r + 0.5) * PB_G }; }
+    function run(q) {
+      var cells = astar(cellOf(q.ca.A), cellOf(q.cb.A), q.ca.dir, usage, q.bb, layout.bound);
+      if (cells) {
+        q.cells = cells; markUsed(cells, usage, 1);
+        q.pts = [q.ca.port].concat(cells.map(ptOf)).concat([q.cb.port]);
+      } else {
+        // Never drop an edge: fall back to an L through the stub points.
+        q.cells = null;
+        q.pts = [q.ca.port, q.ca.A, { x: q.ca.A.x, y: q.cb.A.y }, q.cb.A, q.cb.port];
+      }
+    }
+    order.forEach(run);
+    // Rip-up and reroute: with every other wire already on the grid, each one
+    // gets a second chance at a track of its own.
+    var pass;
+    for (pass = 0; pass < 2; pass++) {
+      order.forEach(function (q) { if (q.cells) { markUsed(q.cells, usage, -1); } run(q); });
+    }
+    return reqs.map(function (q) { return { from: q.from, to: q.to, pts: q.pts }; });
+  }
+
+  // ---- paint + interaction (M4 canvas, M5 polish) ------------------------
+  // M3 landed the destination + the live read and summary; M4 drew the canvas;
+  // M5 makes it operable: pan/zoom, a recency window, click a system to isolate
+  // it, click a card to raise it, all reachable from the keyboard.
+  //
+  // One read, through the GENERATED client (CruxApi.workGraph → GET
+  // /v1/work/graph), so render.js keeps zero raw network calls.
+  //
+  // Three honest states, kept distinct rather than collapsed into "no data":
+  //   · read failed        — the daemon said no (status shown verbatim)
+  //   · aggregator off     — 200 with zero plans: CRUX_EXECPLANS_ROOT is unset,
+  //                          which is a configuration fact, not an error
+  //   · verified empty     — plans exist but none are open
+
+  // Recency windows. 24h is the default because that is the question people
+  // ask, but on a real board it is often a thin signal (two plans, and no wire
+  // with BOTH ends inside it), so the wider windows are one click away rather
+  // than a code change.
+  var PB_WINDOWS = [
+    { h: 24, label: '24h' }, { h: 72, label: '3d' }, { h: 168, label: '7d' }, { h: 720, label: '30d' }
+  ];
+
+  function pbNow() { return Date.now(); }
+  function pbAgeHours(plan, now) {
+    var t = plan && plan.updated_at_unix_ms;
+    if (!t) { return Infinity; }
+    return Math.max(0, (now - t) / 3600000);
+  }
+
+  function renderPatchbay(host, ctx) {
+    host.textContent = '';
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    if (!api || typeof api.workGraph !== 'function') {
+      host.appendChild(el('p', { 'class': 'v2card-sub', text: 'Patchbay client method unavailable — regenerate console/v2/api.js from the route manifest.' }));
+      return Promise.resolve();
+    }
+    host.appendChild(el('p', { 'class': 'v2card-sub', text: 'Reading the board…' }));
+
+    return api.workGraph()
+      .then(function (r) {
+        return r.json().then(
+          function (d) { return { ok: r.ok, status: r.status, data: d }; },
+          function () { return { ok: r.ok, status: r.status, data: null }; }
+        );
+      })
+      .catch(function () { return { ok: false, status: 0, data: null }; })
+      .then(function (res) {
+        host.textContent = '';
+        if (!res.ok || !res.data) {
+          host.appendChild(el('p', { 'class': 'v2card-sub', text: 'Could not read the work graph (HTTP ' + String(res.status) + ').' }));
+          return;
+        }
+        var d = res.data;
+        var plans = (d && d.plans) || [];
+        var planes = (d && d.planes) || [];
+        var services = (d && d.services) || [];
+
+        if (!plans.length) {
+          host.appendChild(el('p', {
+            'class': 'v2card-sub',
+            text: 'No open ExecPlans are projected. This daemon has no ExecPlan root configured (CRUX_EXECPLANS_ROOT), or every plan is closed.'
+          }));
+          return;
+        }
+
+        var now = pbNow(), i;
+        var state = { plan: null, plane: null, live: PB_WINDOWS[0].h };
+
+        // Summary strip.
+        var blurbs = 0;
+        for (i = 0; i < plans.length; i++) { if (plans[i].blurb) { blurbs++; } }
+        var strip = el('div', { 'class': 'v2card' });
+        var row = el('div', { 'class': 'ow-stat-row' });
+        var liveStat = null;
+        [
+          { n: plans.length, l: 'open plans' },
+          { n: planes.length, l: 'systems' },
+          { n: (d.link_count || 0), l: 'declared edges' },
+          { n: services.length, l: 'services touched' },
+          { n: blurbs, l: 'with a blurb' },
+          { n: 0, l: 'touched recently', live: true }
+        ].forEach(function (s) {
+          var b = el('b', { text: String(s.n) });
+          var cell = el('div', { 'class': 'ow-stat' }, [b, el('span', { text: s.l })]);
+          if (s.live) { liveStat = b; }
+          row.appendChild(cell);
+        });
+        strip.appendChild(row);
+        host.appendChild(strip);
+
+        // Controls: the recency window, and a reset that clears any selection.
+        var bar = el('div', { 'class': 'pb-bar' });
+        bar.appendChild(el('span', { 'class': 'v2card-sub', text: 'Recently touched:' }));
+        var winBtns = [];
+        PB_WINDOWS.forEach(function (w) {
+          var btn = el('button', { type: 'button', 'class': 'pb-win', 'data-h': String(w.h), text: w.label });
+          btn.addEventListener('click', function () { state.live = w.h; applyAll(); });
+          winBtns.push(btn); bar.appendChild(btn);
+        });
+        var clearBtn = el('button', { type: 'button', 'class': 'pb-clear', text: 'Clear selection' });
+        clearBtn.addEventListener('click', function () { state.plan = null; state.plane = null; applyAll(); });
+        bar.appendChild(clearBtn);
+        host.appendChild(bar);
+
+        var layout = patchbayLayout(d);
+        var wires = patchbayRoutes(layout, d);
+        var canvas = pbCanvas(layout, wires, state, function () { applyAll(); });
+        host.appendChild(canvas.svg);
+
+        // Detail line — a selection that changes nothing but a highlight is a
+        // dead end, so name what is selected and why it matters.
+        var detail = el('p', { 'class': 'v2card-sub pb-detail' });
+        host.appendChild(detail);
+
+        // Legend.
+        var legend = el('div', { 'class': 'v2card-sub pb-legend' });
+        ['in_progress', 'blocked', 'planned', 'drafting'].forEach(function (st) {
+          legend.appendChild(el('span', { 'class': 'pb-legend-item' }, [
+            el('i', { 'class': 'pb-swatch', style: 'background:' + pbStateColor(st) }),
+            el('span', { text: st.replace('_', ' ') })
+          ]));
+        });
+        legend.appendChild(el('span', { 'class': 'pb-legend-item', text: 'wires are declared dependencies (Depends on / Extended by), not mentions' }));
+        legend.appendChild(el('span', { 'class': 'pb-legend-item', text: 'drag to pan · scroll to zoom · click a system to isolate it' }));
+        host.appendChild(legend);
+
+        function applyAll() {
+          var fresh = {}, freshN = 0, p;
+          for (var k = 0; k < plans.length; k++) {
+            p = plans[k];
+            if (pbAgeHours(p, now) < state.live) { fresh[p.slug] = true; freshN++; }
+          }
+          if (liveStat) { liveStat.textContent = String(freshN); }
+          winBtns.forEach(function (b) {
+            var on = String(state.live) === b.getAttribute('data-h');
+            b.setAttribute('aria-pressed', on ? 'true' : 'false');
+            if (on) { b.classList.add('pb-on'); } else { b.classList.remove('pb-on'); }
+          });
+
+          // Focus set: a selected plan pulls in what it declares and what
+          // declares it; a selected system pulls in its members.
+          var focus = null;
+          if (state.plan) {
+            focus = {};
+            focus[state.plan] = true;
+            var sel = null;
+            for (k = 0; k < plans.length; k++) { if (plans[k].slug === state.plan) { sel = plans[k]; } }
+            if (sel) { (sel.links || []).forEach(function (l) { focus[l] = true; }); }
+            for (k = 0; k < plans.length; k++) {
+              if ((plans[k].links || []).indexOf(state.plan) >= 0) { focus[plans[k].slug] = true; }
+            }
+          } else if (state.plane) {
+            focus = {};
+            for (k = 0; k < plans.length; k++) { if (plans[k].plane === state.plane) { focus[plans[k].slug] = true; } }
+          }
+
+          canvas.chips.forEach(function (entry) {
+            var slug = entry.plan.slug;
+            var on = !focus || focus[slug];
+            if (on) { entry.node.classList.remove('pb-dim'); } else { entry.node.classList.add('pb-dim'); }
+            if (state.plan === slug) { entry.node.classList.add('pb-sel'); } else { entry.node.classList.remove('pb-sel'); }
+            // Freshness only reads while nothing is selected — a glow competing
+            // with a selection highlight says two things at once.
+            if (!focus && fresh[slug]) { entry.node.classList.add('pb-fresh'); } else { entry.node.classList.remove('pb-fresh'); }
+          });
+          canvas.wires.forEach(function (w) {
+            var hot = (state.plan && (w.from === state.plan || w.to === state.plan)) ||
+              (state.plane && focus && (focus[w.from] || focus[w.to]));
+            if (hot) { w.node.classList.add('pb-hot'); } else { w.node.classList.remove('pb-hot'); }
+            var bothFresh = !focus && fresh[w.from] && fresh[w.to];
+            if (bothFresh) { w.node.classList.add('pb-fresh'); } else { w.node.classList.remove('pb-fresh'); }
+          });
+          canvas.plates.forEach(function (pl) {
+            if (state.plane === pl.key) { pl.node.classList.add('pb-sel'); } else { pl.node.classList.remove('pb-sel'); }
+          });
+
+          // Detail text.
+          if (state.plan) {
+            var sp = null;
+            for (k = 0; k < plans.length; k++) { if (plans[k].slug === state.plan) { sp = plans[k]; } }
+            if (sp) {
+              var bits = [sp.title || sp.slug, sp.state,
+                (sp.milestones_total ? (sp.milestones_done || 0) + '/' + sp.milestones_total + ' milestones' : 'no milestones declared')];
+              if (sp.risk) { bits.push(sp.risk + ' risk'); }
+              if ((sp.links || []).length) { bits.push('depends on ' + sp.links.length); }
+              if ((sp.services || []).length) { bits.push('touches ' + sp.services.join(', ')); }
+              detail.textContent = bits.join(' · ') + (sp.blurb ? ' — ' + sp.blurb : '');
+            }
+          } else if (state.plane) {
+            var n = 0;
+            for (k = 0; k < plans.length; k++) { if (plans[k].plane === state.plane) { n++; } }
+            detail.textContent = state.plane + ' — ' + n + (n === 1 ? ' open plan' : ' open plans') + '. Click it again, or Clear selection, to show the whole board.';
+          } else {
+            detail.textContent = freshN
+              ? freshN + ' plan' + (freshN === 1 ? '' : 's') + ' touched in the last ' + state.live + 'h are lit; select a card or a system to isolate it.'
+              : 'Nothing touched in the last ' + state.live + 'h — widen the window, or select a card or a system to isolate it.';
+          }
+        }
+        applyAll();
+      });
+  }
+
+  // Build the SVG and wire interaction. Returns the node plus the handles the
+  // caller needs to restyle on selection, so selection logic stays out of here.
+  function pbCanvas(layout, wires, state, onChange) {
+    var NS = 'http://www.w3.org/2000/svg';
+    var doc0 = doc();
+    function sv(tag, attrs) {
+      var n = doc0.createElementNS ? doc0.createElementNS(NS, tag) : doc0.createElement(tag);
+      if (attrs) {
+        for (var k in attrs) {
+          if (attrs[k] == null) { continue; }
+          if (n.setAttribute) { n.setAttribute(k, String(attrs[k])); }
+        }
+      }
+      return n;
+    }
+    var svg = sv('svg', {
+      'class': 'pb-canvas',
+      viewBox: '0 0 ' + layout.W + ' ' + layout.H,
+      preserveAspectRatio: 'xMidYMid meet',
+      role: 'group',
+      tabindex: '0',
+      'aria-label': layout.chips.length + ' open plans grouped by system, wired to the services they touch. Arrow keys pan, plus and minus zoom.'
+    });
+    var root = sv('g', { 'class': 'pb-root' });
+    svg.appendChild(root);
+    var gPlate = sv('g'), gWire = sv('g'), gLabel = sv('g'), gSvc = sv('g'), gChip = sv('g');
+    root.appendChild(gPlate); root.appendChild(gWire); root.appendChild(gLabel);
+    root.appendChild(gSvc); root.appendChild(gChip);
+
+    var plates = [], chipsOut = [], wiresOut = [], i;
+
+    function selectPlane(key) {
+      state.plane = (state.plane === key) ? null : key;
+      state.plan = null;
+      if (onChange) { onChange(); }
+    }
+    function selectPlan(slug) {
+      state.plan = (state.plan === slug) ? null : slug;
+      state.plane = null;
+      if (onChange) { onChange(); }
+    }
+    function keyActivate(fn) {
+      return function (ev) {
+        var k = ev && ev.key;
+        if (k === 'Enter' || k === ' ' || k === 'Spacebar') {
+          if (ev.preventDefault) { ev.preventDefault(); }
+          fn();
+        }
+      };
+    }
+
+    for (i = 0; i < layout.sections.length; i++) {
+      (function (s) {
+        var g = sv('g', { 'class': 'pb-plate-g', tabindex: '0', role: 'button',
+          'aria-label': 'System ' + s.key + ', ' + s.n + ' open plans. Activate to isolate it.' });
+        var rect = sv('rect', { 'class': 'pb-plate',
+          x: s.x - PB_PLATE, y: s.y - PB_PLATE, width: s.w + 2 * PB_PLATE, height: s.h + 2 * PB_PLATE, rx: 14 });
+        g.appendChild(rect);
+        if (g.addEventListener) {
+          g.addEventListener('click', function () { selectPlane(s.key); });
+          g.addEventListener('keydown', keyActivate(function () { selectPlane(s.key); }));
+        }
+        gPlate.appendChild(g);
+        plates.push({ key: s.key, node: g });
+      }(layout.sections[i]));
+    }
+    for (i = 0; i < wires.length; i++) {
+      var wnode = sv('path', { 'class': 'pb-wire', d: pbRoundPath(wires[i].pts, PB_RADIUS) });
+      gWire.appendChild(wnode);
+      wiresOut.push({ from: wires[i].from, to: wires[i].to, node: wnode });
+    }
+    for (i = 0; i < layout.centres.length; i++) {
+      (function (c) {
+        var g = sv('g', { 'class': 'pb-centre-g' });
+        g.appendChild(sv('rect', { 'class': 'pb-centre', x: c.x, y: c.y, width: c.w, height: c.h, rx: 12 }));
+        var t = sv('text', { 'class': 'pb-centre-t', x: c.x + c.w / 2, y: c.y + c.h / 2 - 2, 'text-anchor': 'middle' });
+        t.textContent = c.key.toUpperCase();
+        g.appendChild(t);
+        var t2 = sv('text', { 'class': 'pb-centre-n', x: c.x + c.w / 2, y: c.y + c.h / 2 + 14, 'text-anchor': 'middle' });
+        t2.textContent = c.n + (c.n === 1 ? ' plan' : ' plans');
+        g.appendChild(t2);
+        if (g.addEventListener) { g.addEventListener('click', function () { selectPlane(c.key); }); }
+        gLabel.appendChild(g);
+      }(layout.centres[i]));
+    }
+    for (i = 0; i < layout.services.length; i++) {
+      var s2 = layout.services[i];
+      gSvc.appendChild(sv('rect', { 'class': 'pb-rail',
+        x: s2.x - s2.w / 2, y: s2.y - PB_RAIL_H / 2, width: s2.w, height: PB_RAIL_H, rx: 10 }));
+      var rt = sv('text', { 'class': 'pb-rail-t', x: s2.x, y: s2.y - 2, 'text-anchor': 'middle' });
+      rt.textContent = s2.key; gSvc.appendChild(rt);
+      var rn = sv('text', { 'class': 'pb-rail-n', x: s2.x, y: s2.y + 13, 'text-anchor': 'middle' });
+      rn.textContent = s2.n + (s2.n === 1 ? ' plan' : ' plans'); gSvc.appendChild(rn);
+    }
+    for (i = 0; i < layout.chips.length; i++) {
+      (function (ch) {
+        var p = ch.plan;
+        var g = sv('g', { 'class': 'pb-chip', 'data-slug': p.slug, 'data-state': p.state,
+          tabindex: '0', role: 'button',
+          'aria-label': (p.title || p.slug) + '. ' + p.state + '. ' +
+            (p.milestones_total ? (p.milestones_done || 0) + ' of ' + p.milestones_total + ' milestones.' : 'No milestones declared.') });
+        g.appendChild(sv('rect', { 'class': 'pb-chip-bg', x: ch.x, y: ch.y, width: PB_CW, height: PB_CH, rx: 10 }));
+        g.appendChild(sv('rect', { x: ch.x, y: ch.y + 8, width: 3.5, height: PB_CH - 16, fill: pbStateColor(p.state) }));
+        var lines = pbWrap(p.title || p.slug, 21, 3), li;
+        for (li = 0; li < lines.length; li++) {
+          var ln = sv('text', { 'class': 'pb-chip-t', x: ch.x + 11, y: ch.y + 17 + li * 13 });
+          ln.textContent = lines[li];
+          g.appendChild(ln);
+        }
+        var done = p.milestones_done || 0, total = p.milestones_total || 0;
+        var bx = ch.x + 12, by = ch.y + PB_CH - 27, bw = PB_CW - 24;
+        g.appendChild(sv('rect', { 'class': 'pb-meter', x: bx, y: by, width: bw, height: 6, rx: 3 }));
+        if (total > 0) {
+          g.appendChild(sv('rect', { x: bx, y: by, width: Math.max(4, bw * done / total), height: 6, rx: 3,
+            fill: pbStateColor(p.state) }));
+        }
+        var meta = sv('text', { 'class': 'pb-chip-m', x: bx, y: by + 16 });
+        meta.textContent = (total ? done + '/' + total : '—') + (p.current_milestone ? ' · ' + p.current_milestone : '');
+        g.appendChild(meta);
+        var title = sv('title');
+        title.textContent = (p.title || p.slug) + ' — ' + p.state + (p.blurb ? '\n' + p.blurb : '');
+        g.appendChild(title);
+        if (g.addEventListener) {
+          g.addEventListener('click', function () { selectPlan(p.slug); });
+          g.addEventListener('keydown', keyActivate(function () { selectPlan(p.slug); }));
+        }
+        gChip.appendChild(g);
+        chipsOut.push({ plan: p, node: g });
+      }(layout.chips[i]));
+    }
+
+    // Pan + zoom. Kept to a transform on one group so nothing re-lays out, and
+    // mirrored onto the keyboard so the canvas is not mouse-only.
+    var view = { x: 0, y: 0, k: 1 };
+    function paint() {
+      if (root.setAttribute) {
+        root.setAttribute('transform', 'translate(' + view.x.toFixed(1) + ',' + view.y.toFixed(1) + ') scale(' + view.k.toFixed(3) + ')');
+      }
+    }
+    function zoomBy(f) {
+      var k2 = Math.min(6, Math.max(0.4, view.k * f));
+      // Zoom about the canvas centre — without a real layout box (the console
+      // scales the SVG by viewBox) the centre is the honest anchor.
+      var cx = layout.W / 2, cy = layout.H / 2;
+      view.x = cx - (cx - view.x) * (k2 / view.k);
+      view.y = cy - (cy - view.y) * (k2 / view.k);
+      view.k = k2; paint();
+    }
+    if (svg.addEventListener) {
+      var drag = null;
+      svg.addEventListener('wheel', function (ev) {
+        if (ev.preventDefault) { ev.preventDefault(); }
+        zoomBy((ev.deltaY || 0) < 0 ? 1.12 : 1 / 1.12);
+      });
+      svg.addEventListener('pointerdown', function (ev) {
+        drag = { x: ev.clientX || 0, y: ev.clientY || 0, vx: view.x, vy: view.y };
+        if (svg.setPointerCapture && ev.pointerId != null) { svg.setPointerCapture(ev.pointerId); }
+      });
+      svg.addEventListener('pointermove', function (ev) {
+        if (!drag) { return; }
+        var scale = layout.W / 1000;                    // viewBox units per screen px, approx
+        view.x = drag.vx + ((ev.clientX || 0) - drag.x) * scale;
+        view.y = drag.vy + ((ev.clientY || 0) - drag.y) * scale;
+        paint();
+      });
+      svg.addEventListener('pointerup', function () { drag = null; });
+      svg.addEventListener('pointercancel', function () { drag = null; });
+      svg.addEventListener('keydown', function (ev) {
+        var k = ev && ev.key, step = 90;
+        if (k === 'ArrowLeft') { view.x += step; } else if (k === 'ArrowRight') { view.x -= step; }
+        else if (k === 'ArrowUp') { view.y += step; } else if (k === 'ArrowDown') { view.y -= step; }
+        else if (k === '+' || k === '=') { zoomBy(1.2); return; }
+        else if (k === '-' || k === '_') { zoomBy(1 / 1.2); return; }
+        else if (k === '0') { view.x = 0; view.y = 0; view.k = 1; }
+        else if (k === 'Escape') { state.plan = null; state.plane = null; if (onChange) { onChange(); } return; }
+        else { return; }
+        if (ev.preventDefault) { ev.preventDefault(); }
+        paint();
+      });
+    }
+    paint();
+
+    return { svg: svg, chips: chipsOut, wires: wiresOut, plates: plates, view: view, zoomBy: zoomBy };
+  }
+
+  // Wrap a label into at most `max` lines of ~`width` chars, on word bounds.
+  function pbWrap(text, width, max) {
+    var words = String(text).split(/\s+/), lines = [], cur = '';
+    for (var i = 0; i < words.length; i++) {
+      var cand = cur ? cur + ' ' + words[i] : words[i];
+      if (cand.length > width && cur) {
+        lines.push(cur); cur = words[i];
+        if (lines.length === max) { break; }
+      } else { cur = cand; }
+    }
+    if (cur && lines.length < max) { lines.push(cur); }
+    if (lines.length === max) {
+      var joined = lines.join(' ');
+      if (joined.length < String(text).length) {
+        lines[max - 1] = lines[max - 1].slice(0, Math.max(0, width - 1)) + '…';
+      }
+    }
+    return lines;
+  }
+
   function renderSiteMap(host) {
     host.textContent = '';
     var isOp = (typeof window !== 'undefined' && window.CRUX_POSTURE === 'operator');
@@ -15846,6 +16694,13 @@
     // capabilityAvailable gates the DEST on the daemon's runtime capability plan.
     renderLinkGraph: renderLinkGraph,
     capabilityAvailable: capabilityAvailable,
+    // Patchbay — the open board in space (GET /v1/work/graph).
+    renderPatchbay: renderPatchbay,
+    // Pure geometry + routing, exported so the smoke can assert the invariants
+    // (every card outward-facing, no wire through a plate, no diagonal) with no
+    // DOM and no daemon.
+    patchbayLayout: patchbayLayout,
+    patchbayRoutes: patchbayRoutes,
     // Site map — static reference destination (rail → destinations map).
     renderSiteMap: renderSiteMap,
     // M2 (console-surfaces-remediation) — the paged, searchable facts browser.
