@@ -3141,7 +3141,60 @@
   .act-livedot { width: 8px; height: 8px; border-radius: 999px; background: var(--ink3); flex: none; }
   .act-livedot.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
   .act-list { display: flex; flex-direction: column; gap: 8px; }
-  .act-row { border: 1px solid var(--edge); border-left: 4px solid var(--ink3); border-radius: 10px; padding: 10px 13px; background: var(--surface); cursor: pointer; }
+  /* ---- Patchbay canvas (console-execplan-patchbay M4) -------------------
+     The open board in space. Plates are ground-coloured and read by their
+     shadow; cards use the same --surface/--edge material as every other card
+     in the console; wires are declared dependencies drawn X/Y only. */
+  .pb-canvas { display: block; width: 100%; height: auto; max-height: 78vh; margin: 4px 0 2px; }
+  .pb-plate { fill: var(--bg, var(--surface2)); stroke: none; filter: drop-shadow(0 6px 10px rgba(0,0,0,.30)); }
+  .pb-centre { fill: var(--surface); stroke: var(--edge); stroke-width: 1; }
+  .pb-centre-t { fill: var(--acc); font-size: 12px; font-weight: 700; letter-spacing: .12em; }
+  .pb-centre-n { fill: var(--ink3); font-size: 9.5px; }
+  .pb-chip-bg { fill: var(--surface); stroke: var(--edge); stroke-width: 1; }
+  .pb-chip-t { fill: var(--ink); font-size: 10.5px; }
+  .pb-chip-m { fill: var(--ink3); font-size: 9px; font-variant-numeric: tabular-nums; }
+  .pb-meter { fill: var(--surface2); stroke: var(--edge); stroke-width: 1; }
+  .pb-rail { fill: var(--surface2); stroke: var(--edge); stroke-width: 1; }
+  .pb-rail-t { fill: var(--ink2); font-size: 10.5px; }
+  .pb-rail-n { fill: var(--ink3); font-size: 9px; }
+  .pb-wire { fill: none; stroke: var(--acc); stroke-width: 1.8; opacity: .32;
+             stroke-linejoin: round; stroke-linecap: round; }
+  .pb-chip:hover .pb-chip-bg { stroke: var(--acc); }
+  .pb-legend { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin-top: 6px; }
+  .pb-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+  .pb-swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+
+  /* M5 — interaction. A card lifts when selected; everything outside the focus
+     recedes rather than disappearing, so the board keeps its shape. */
+  .pb-chip, .pb-plate-g { cursor: pointer; }
+  .pb-chip { transform-box: fill-box; transform-origin: center;
+             transition: transform .18s cubic-bezier(.34,1.4,.5,1), opacity .16s ease; }
+  .pb-chip:hover { transform: scale(1.025); }
+  .pb-chip.pb-sel { transform: scale(1.07); }
+  .pb-chip.pb-sel .pb-chip-bg { stroke: var(--acc); stroke-width: 2;
+                                filter: drop-shadow(0 6px 8px rgba(0,0,0,.42)); }
+  .pb-chip.pb-dim, .pb-wire.pb-dim { opacity: .13; }
+  .pb-plate-g.pb-sel .pb-plate { stroke: var(--acc); stroke-width: 1.5; }
+  .pb-wire { transition: opacity .16s ease; }
+  .pb-wire.pb-hot { opacity: 1; stroke-width: 2.8; }
+  /* Recently touched, and only while nothing is selected — a glow competing
+     with a selection highlight says two things at once. */
+  .pb-chip.pb-fresh .pb-chip-bg { stroke: var(--ok); filter: drop-shadow(0 0 5px var(--ok)); }
+  .pb-wire.pb-fresh { stroke: var(--ok); opacity: .95; stroke-width: 2.4; }
+  .pb-canvas:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+  .pb-chip:focus-visible .pb-chip-bg, .pb-plate-g:focus-visible .pb-plate {
+    stroke: var(--acc); stroke-width: 2; }
+  .pb-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 6px 0 2px; }
+  .pb-win, .pb-clear { font: inherit; font-size: 11px; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--edge); background: var(--surface); color: var(--ink2); cursor: pointer; }
+  .pb-win.pb-on { background: var(--acc); border-color: var(--acc); color: var(--bg); font-weight: 600; }
+  .pb-detail { margin-top: 4px; min-height: 1.4em; }
+  @media (prefers-reduced-motion: reduce) {
+    .pb-chip, .pb-wire { transition: none; }
+    .pb-chip:hover, .pb-chip.pb-sel { transform: none; }
+  }
+
+  .act-row { border: 1px solid var(--edge); border-left: 4px solid var(--ink3); border-radius:10px; padding: 10px 13px; background: var(--surface); cursor: pointer; }
   .act-row:hover { border-color: var(--edge-strong); }
   .act-meta { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-family: var(--font-mono); font-size: 10.5px; color: var(--ink3); }
   .act-kind { font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--ink2); }
@@ -3616,6 +3669,9 @@
     map: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="5" rx="1.4"/><rect x="3" y="16" width="6" height="5" rx="1.4"/><rect x="15" y="16" width="6" height="5" rx="1.4"/><path d="M12 8v4M6 16v-2.5h12V16"/></svg>',
     rings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5.5"/><circle cx="12" cy="12" r="2"/><path d="M12 3v3"/></svg>',
     linkgraph: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="6" r="2.4"/><circle cx="19" cy="6" r="2.4"/><circle cx="12" cy="18" r="2.4"/><path d="M7 7l3 9M17 7l-3 9M7 6h10"/></svg>',
+    // Patchbay: a centre block (the system label) with four cards ringed around
+    // it, wired orthogonally — the page's own layout, drawn small.
+    patchbay: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="9.25" y="9.25" width="5.5" height="5.5" rx="1.2"/><rect x="2.5" y="2.5" width="4" height="4" rx="1"/><rect x="17.5" y="2.5" width="4" height="4" rx="1"/><rect x="2.5" y="17.5" width="4" height="4" rx="1"/><rect x="17.5" y="17.5" width="4" height="4" rx="1"/><path d="M6.5 4.5h3.5v4.75M17.5 4.5H14v4.75M6.5 19.5h3.5v-4.75M17.5 19.5H14v-4.75"/></svg>',
     lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>',
     palette: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 0 18c1 0 1.6-.8 1.6-1.7 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.1 0-.9.8-1.7 1.7-1.7H16a5 5 0 0 0 5-5c0-4.1-4-7.3-9-7.3z"/><circle cx="7.5" cy="11.5" r="1"/><circle cx="12" cy="8" r="1"/><circle cx="16.5" cy="11.5" r="1"/></svg>',
     globe: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.6 2.5 4 5.6 4 9s-1.4 6.5-4 9c-2.6-2.5-4-5.6-4-9s1.4-6.5 4-9z"/></svg>',
@@ -5264,6 +5320,26 @@
     // renderLinkGraph (custom three.js r165, dynamically imported). Capability-gated
     // (console_link_graph): render.renderLinkGraph itself fails to an honest empty
     // state when the proxy is unconfigured, so a deep-link here is always safe.
+    // Patchbay — no sub-pills: it IS the canvas. Every open ExecPlan as a card,
+    // ringed per system, wired to the shared services it touches. Reads only
+    // (GET /v1/work/graph through the generated client), so it shows in every
+    // posture; the renderer states an honest empty when the daemon has no
+    // ExecPlan root configured. Delegates to render.js renderPatchbay.
+    if (destId === 'patchbay') {
+      document.getElementById('destTitle').textContent = dest.label;
+      document.getElementById('destSub').textContent = dest.sub || '';
+      var pbHost = el('div', { 'class': 'patchbay-region-host', id: 'patchbayHost' });
+      content.appendChild(pbHost);
+      if (window.CruxRender && window.CruxRender.renderPatchbay) {
+        window.CruxRender.renderPatchbay(pbHost, { summary: BOOT.summary });
+      } else {
+        pbHost.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' }));
+      }
+      applyPosture(content);
+      if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
+      return;
+    }
+
     if (destId === 'linkgraph') {
       document.getElementById('destTitle').textContent = dest.label;
       document.getElementById('destSub').textContent = dest.sub || '';

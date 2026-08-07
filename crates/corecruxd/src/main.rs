@@ -139,6 +139,7 @@ mod witness_proofs;
 mod witness_submit;
 mod work;
 mod work_execplans;
+mod work_graph;
 // Extracted to the `corecrux-workspace-scan` crate; aliased so the 16 consumer
 // modules here (http/repos, http/workspace, code_intel, repo_codegraph,
 // symbol_resolve, dossier, …) keep their existing `crate::workspace_scan*::`

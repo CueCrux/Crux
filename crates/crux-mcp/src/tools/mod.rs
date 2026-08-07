@@ -3265,6 +3265,7 @@ mod tests {
     use crate::dispatch::McpContext;
     use crate::tools::test_support::{clear_sync_env, sync_env_lock};
     use crux_router::{mint_free_local_token, RcxRouter};
+    use crux_session::intent::default_intent_table;
     use ed25519_dalek::{Signer, SigningKey};
     use rcx_capability_token::{
         Backend, CreditCost, CreditCostUnit, CreditRefill, Credits, FallbackAction, FallbackPolicy, OverdraftPolicy,
@@ -4136,5 +4137,51 @@ mod tests {
         let result = call_tool("update_status", &json!({}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"state\": \"disabled\""));
+    }
+
+    /// The substrate edge tools are callable but **not advertised**, and an
+    /// affinity alone does not change that.
+    ///
+    /// `edge_delete`/`edge_list` were given a `"memory"` affinity in b98ebec8
+    /// after a Feature Registry session read `tools/list`, saw no `edge_delete`
+    /// and recorded a stale dependency edge as permanently unretractable. The
+    /// affinity is necessary but not sufficient: every intent that weights
+    /// `"memory"` scores all ~27 non-floor memory tools identically, the tie
+    /// breaks on catalogue order, and the substrate family sits last — so the
+    /// twelve `DYNAMIC_TOP_N` slots are exhausted by `delete_fact` through
+    /// `memory_set_horizon` before the edge tools are reached.
+    ///
+    /// Pinned as a test because the gap is invisible by construction: nothing
+    /// else fails when a tool is merely undiscoverable. Callers must therefore
+    /// invoke these by name, which is what the out-of-repo Feature Registry
+    /// capability-graph reconciler does, and documents.
+    ///
+    /// Closing the gap means changing the ranking in
+    /// [`surface`] — a distinct affinity for the substrate family plus an intent
+    /// that weights it, or a `CORE_FLOOR` entry. When that lands this test fails
+    /// on the second assertion; update it, and update the reconciler's note.
+    #[test]
+    fn substrate_edge_tools_are_callable_but_never_advertised_when_shaped() {
+        let full: Vec<String> = list_tools().into_iter().map(|t| t.name).collect();
+        for name in ["edge_list", "edge_delete"] {
+            assert!(
+                full.iter().any(|n| n == name),
+                "`{name}` left the full surface — the loader calls it by name and would break"
+            );
+        }
+
+        // Every intent in the shaping table, not just the memory-weighted ones:
+        // absence must not depend on which intent an agent happens to declare.
+        for intent in default_intent_table().keys() {
+            let shaped = surface::shape_dynamic(list_tools(), Some(intent), surface::DYNAMIC_TOP_N);
+            let names: Vec<&str> = shaped.iter().map(|t| t.name.as_str()).collect();
+            for name in ["edge_list", "edge_delete"] {
+                assert!(
+                    !names.contains(&name),
+                    "`{name}` now surfaces under intent `{intent}` — the discovery gap is closed. \
+                     Update this test and drop the by-name-only note in the Feature Registry loader."
+                );
+            }
+        }
     }
 }

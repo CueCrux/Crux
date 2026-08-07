@@ -807,6 +807,41 @@ mod tests {
         assert_eq!(by("vec"), SpanOutcome::NonEmpty);
     }
 
+    /// The M1 gate, as a deterministic test rather than a benchmark.
+    ///
+    /// The overhead claim for the outcome dimension is *structural*: a span
+    /// that does not declare `crux.outcome` never reaches [`Layer::on_record`],
+    /// because `tracing` only dispatches a record for a field present in the
+    /// span's metadata. So an uninstrumented span cannot pay for this feature.
+    ///
+    /// A benchmark cannot show that at the precision required — run-to-run
+    /// drift on a shared machine is larger than the effect. This asserts the
+    /// mechanism directly: `record_outcome` inside an undeclared span is inert,
+    /// and the span still closes as `Unrecorded`.
+    ///
+    /// It doubles as the contract for M2: a site that forgets `fields(crux
+    /// .outcome = tracing::field::Empty)` records nothing, silently. That is
+    /// the one sharp edge of this design, and this test is where it is written
+    /// down.
+    #[test]
+    fn record_outcome_is_inert_when_the_span_never_declared_the_field() {
+        let ring = ring_of(8);
+        let layer = CruxSpanLayer::new(Arc::clone(&ring), 1);
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            // No `fields(crux.outcome = ...)` on this span.
+            tracing::info_span!("undeclared").in_scope(|| {
+                record_outcome(true);
+            });
+        });
+        let spans = ring.snapshot();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            spans[0].outcome,
+            SpanOutcome::Unrecorded,
+            "an undeclared span must not be markable, or the no-cost claim is false"
+        );
+    }
+
     /// An `Err` is a failure, not an empty result — `had_error` covers it.
     /// Conflating them would let a loud failure read as a silent one.
     #[test]
