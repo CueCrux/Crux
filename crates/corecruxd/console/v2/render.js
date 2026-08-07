@@ -10998,11 +10998,25 @@
   ];
 
   function pbNow() { return Date.now(); }
+  // Recency comes from FACT activity, never from the file's mtime.
+  //
+  // `updated_at_unix_ms` is the plan file's mtime, and on a daemon whose plan
+  // root is an rsync or git target every plan shares it to the millisecond — on
+  // prod that made all 228 plans read as "touched in the last 24h", which lit
+  // every card, turned every wire green, and left the window buttons with
+  // nothing to change. `last_activity_unix_ms` is the newest fact written
+  // against the plan, which is what "recently worked on" actually means.
+  //
+  // A plan with no facts has no activity to report: it stays cold rather than
+  // borrowing the sync timestamp.
   function pbAgeHours(plan, now) {
-    var t = plan && plan.updated_at_unix_ms;
+    var t = plan && plan.last_activity_unix_ms;
     if (!t) { return Infinity; }
     return Math.max(0, (now - t) / 3600000);
   }
+
+  // Open work states, in the order the rail reads them.
+  var PB_STATES = ['in_progress', 'blocked', 'planned', 'drafting'];
 
   function renderPatchbay(host, ctx) {
     host.textContent = '';
@@ -11041,41 +11055,74 @@
         }
 
         var now = pbNow(), i;
-        var state = { plan: null, plane: null, live: PB_WINDOWS[0].h };
+        var state = { plan: null, plane: null, live: 0, states: {}, planeFilter: '' };
 
-        // Summary strip.
-        var blurbs = 0;
-        for (i = 0; i < plans.length; i++) { if (plans[i].blurb) { blurbs++; } }
-        var strip = el('div', { 'class': 'v2card' });
-        var row = el('div', { 'class': 'ow-stat-row' });
-        var liveStat = null;
-        [
-          { n: plans.length, l: 'open plans' },
-          { n: planes.length, l: 'systems' },
-          { n: (d.link_count || 0), l: 'declared edges' },
-          { n: services.length, l: 'services touched' },
-          { n: blurbs, l: 'with a blurb' },
-          { n: 0, l: 'touched recently', live: true }
-        ].forEach(function (s) {
-          var b = el('b', { text: String(s.n) });
-          var cell = el('div', { 'class': 'ow-stat' }, [b, el('span', { text: s.l })]);
-          if (s.live) { liveStat = b; }
-          row.appendChild(cell);
-        });
-        strip.appendChild(row);
-        host.appendChild(strip);
-
-        // Controls: the recency window, and a reset that clears any selection.
+        // ---- controls -------------------------------------------------------
+        // One compact bar, not a wall of stat tiles: the counts people wanted to
+        // read were mostly filters in disguise ("50 in progress" is only useful
+        // if you can click it), so every number here is actionable.
         var bar = el('div', { 'class': 'pb-bar' });
-        bar.appendChild(el('span', { 'class': 'v2card-sub', text: 'Recently touched:' }));
-        var winBtns = [];
-        PB_WINDOWS.forEach(function (w) {
-          var btn = el('button', { type: 'button', 'class': 'pb-win', 'data-h': String(w.h), text: w.label });
-          btn.addEventListener('click', function () { state.live = w.h; applyAll(); });
-          winBtns.push(btn); bar.appendChild(btn);
+
+        // Summary that is genuinely just a summary.
+        var sum = el('span', { 'class': 'pb-sum' });
+        bar.appendChild(sum);
+
+        // State filters, with live counts.
+        var stateCounts = {};
+        for (i = 0; i < plans.length; i++) {
+          stateCounts[plans[i].state] = (stateCounts[plans[i].state] || 0) + 1;
+        }
+        var stateBtns = [];
+        bar.appendChild(el('span', { 'class': 'pb-lbl', text: 'State' }));
+        PB_STATES.forEach(function (st) {
+          if (!stateCounts[st]) { return; }
+          var b = el('button', { type: 'button', 'class': 'pb-chip-btn', 'data-state': st,
+            'aria-pressed': 'false',
+            title: 'Show only ' + st.replace('_', ' ') + ' plans' });
+          b.appendChild(el('i', { 'class': 'pb-swatch', style: 'background:' + pbStateColor(st) }));
+          b.appendChild(el('span', { text: st.replace('_', ' ') + ' ' + stateCounts[st] }));
+          b.addEventListener('click', function () {
+            if (state.states[st]) { delete state.states[st]; } else { state.states[st] = true; }
+            applyAll();
+          });
+          stateBtns.push(b); bar.appendChild(b);
         });
-        var clearBtn = el('button', { type: 'button', 'class': 'pb-clear', text: 'Clear selection' });
-        clearBtn.addEventListener('click', function () { state.plan = null; state.plane = null; applyAll(); });
+
+        // System filter — 10 rings is more than a rail of buttons should carry.
+        bar.appendChild(el('span', { 'class': 'pb-lbl', text: 'System' }));
+        var planeSel = el('select', { 'class': 'pb-select', 'aria-label': 'Filter by system' });
+        planeSel.appendChild(el('option', { value: '', text: 'all ' + planes.length + ' systems' }));
+        planes.forEach(function (pl) {
+          planeSel.appendChild(el('option', { value: pl.key, text: pl.key + ' (' + pl.n + ')' }));
+        });
+        planeSel.addEventListener('change', function (ev) {
+          state.planeFilter = (ev && ev.target && ev.target.value) || '';
+          state.plane = null; applyAll();
+        });
+        bar.appendChild(planeSel);
+
+        // Recency. "any" is the default because on a daemon whose plan root is
+        // synced in bulk most plans have no fact activity at all, and defaulting
+        // to a window would hide most of the board behind a dimmed state.
+        bar.appendChild(el('span', { 'class': 'pb-lbl', text: 'Worked on' }));
+        var winSel = el('select', { 'class': 'pb-select', 'aria-label': 'Highlight plans worked on within' });
+        winSel.appendChild(el('option', { value: '0', text: 'any time' }));
+        PB_WINDOWS.forEach(function (w) {
+          var n = 0;
+          for (var q = 0; q < plans.length; q++) { if (pbAgeHours(plans[q], now) < w.h) { n++; } }
+          winSel.appendChild(el('option', { value: String(w.h), text: 'last ' + w.label + ' (' + n + ')' }));
+        });
+        winSel.addEventListener('change', function (ev) {
+          state.live = parseInt((ev && ev.target && ev.target.value) || '0', 10) || 0;
+          applyAll();
+        });
+        bar.appendChild(winSel);
+
+        var clearBtn = el('button', { type: 'button', 'class': 'pb-clear', text: 'Reset' });
+        clearBtn.addEventListener('click', function () {
+          state.plan = null; state.plane = null; state.states = {}; state.planeFilter = '';
+          state.live = 0; planeSel.value = ''; winSel.value = '0'; applyAll();
+        });
         bar.appendChild(clearBtn);
         host.appendChild(bar);
 
@@ -11102,17 +11149,32 @@
         host.appendChild(legend);
 
         function applyAll() {
-          var fresh = {}, freshN = 0, p;
-          for (var k = 0; k < plans.length; k++) {
-            p = plans[k];
-            if (pbAgeHours(p, now) < state.live) { fresh[p.slug] = true; freshN++; }
+          var fresh = {}, freshN = 0, p, k;
+          if (state.live > 0) {
+            for (k = 0; k < plans.length; k++) {
+              p = plans[k];
+              if (pbAgeHours(p, now) < state.live) { fresh[p.slug] = true; freshN++; }
+            }
           }
-          if (liveStat) { liveStat.textContent = String(freshN); }
-          winBtns.forEach(function (b) {
-            var on = String(state.live) === b.getAttribute('data-h');
+          stateBtns.forEach(function (b) {
+            var on = !!state.states[b.getAttribute('data-state')];
             b.setAttribute('aria-pressed', on ? 'true' : 'false');
             if (on) { b.classList.add('pb-on'); } else { b.classList.remove('pb-on'); }
           });
+
+          // Filters narrow WHAT IS SHOWN. Anything filtered out is dimmed, not
+          // removed, so the board keeps its shape and you can see where the
+          // matching work sits in the estate.
+          var anyState = false, sk;
+          for (sk in state.states) { if (state.states[sk]) { anyState = true; } }
+          var shown = {}, shownN = 0;
+          for (k = 0; k < plans.length; k++) {
+            p = plans[k];
+            var ok = (!anyState || state.states[p.state]) &&
+                     (!state.planeFilter || p.plane === state.planeFilter) &&
+                     (state.live <= 0 || fresh[p.slug]);
+            if (ok) { shown[p.slug] = true; shownN++; }
+          }
 
           // Focus set: a selected plan pulls in what it declares and what
           // declares it; a selected system pulls in its members.
@@ -11133,7 +11195,7 @@
 
           canvas.chips.forEach(function (entry) {
             var slug = entry.plan.slug;
-            var on = !focus || focus[slug];
+            var on = shown[slug] && (!focus || focus[slug]);
             if (on) { entry.node.classList.remove('pb-dim'); } else { entry.node.classList.add('pb-dim'); }
             if (state.plan === slug) { entry.node.classList.add('pb-sel'); } else { entry.node.classList.remove('pb-sel'); }
             // Freshness only reads while nothing is selected — a glow competing
@@ -11141,6 +11203,8 @@
             if (!focus && fresh[slug]) { entry.node.classList.add('pb-fresh'); } else { entry.node.classList.remove('pb-fresh'); }
           });
           canvas.wires.forEach(function (w) {
+            var visible = shown[w.from] && shown[w.to];
+            if (visible) { w.node.classList.remove('pb-dim'); } else { w.node.classList.add('pb-dim'); }
             var hot = (state.plan && (w.from === state.plan || w.to === state.plan)) ||
               (state.plane && focus && (focus[w.from] || focus[w.to]));
             if (hot) { w.node.classList.add('pb-hot'); } else { w.node.classList.remove('pb-hot'); }
@@ -11150,6 +11214,12 @@
           canvas.plates.forEach(function (pl) {
             if (state.plane === pl.key) { pl.node.classList.add('pb-sel'); } else { pl.node.classList.remove('pb-sel'); }
           });
+
+          sum.textContent = (shownN === plans.length
+            ? plans.length + ' open plans'
+            : shownN + ' of ' + plans.length + ' plans') +
+            ' · ' + planes.length + ' systems · ' + (d.link_count || 0) + ' edges · ' +
+            services.length + ' services';
 
           // Detail text.
           if (state.plan) {
@@ -11168,9 +11238,13 @@
             for (k = 0; k < plans.length; k++) { if (plans[k].plane === state.plane) { n++; } }
             detail.textContent = state.plane + ' — ' + n + (n === 1 ? ' open plan' : ' open plans') + '. Click it again, or Clear selection, to show the whole board.';
           } else {
-            detail.textContent = freshN
-              ? freshN + ' plan' + (freshN === 1 ? '' : 's') + ' touched in the last ' + state.live + 'h are lit; select a card or a system to isolate it.'
-              : 'Nothing touched in the last ' + state.live + 'h — widen the window, or select a card or a system to isolate it.';
+            if (state.live > 0) {
+              detail.textContent = freshN
+                ? freshN + ' plan' + (freshN === 1 ? '' : 's') + ' worked on in the last ' + state.live + 'h. Recency comes from the newest fact on a plan, not its file timestamp.'
+                : 'No plan has a recorded fact in the last ' + state.live + 'h — widen the window. (Recency is fact activity, not file mtime.)';
+            } else {
+              detail.textContent = 'Click a card or a system to isolate it. Wires are declared dependencies.';
+            }
           }
         }
         applyAll();

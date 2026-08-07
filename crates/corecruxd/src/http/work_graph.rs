@@ -59,7 +59,16 @@ pub(super) struct GraphPlan {
     current_milestone: Option<String>,
     milestones_done: u32,
     milestones_total: u32,
+    /// When the plan FILE last changed. On a host whose plan root is an rsync or
+    /// git target this is the sync time, not an edit time — on prod every plan
+    /// shares it to the millisecond — so it is NOT a recency signal.
     updated_at_unix_ms: u64,
+    /// When the plan was last actually worked on: the newest fact written
+    /// against it (gate / milestone / decision). This is the honest recency
+    /// signal. Absent when a plan has no facts yet — an unworked plan should
+    /// read as unworked, not as freshly touched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_activity_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -217,6 +226,11 @@ pub(super) async fn get_work_graph(State(state): State<AppState>, headers: Heade
             milestones_done: w.milestones_done.unwrap_or(0),
             milestones_total: w.milestones_total.unwrap_or(0),
             updated_at_unix_ms: w.updated_at_unix_ms,
+            last_activity_unix_ms: w
+                .provenance
+                .as_ref()
+                .map(|p| p.last_activity_unix_ms)
+                .filter(|t| *t > 0),
         });
     }
 
