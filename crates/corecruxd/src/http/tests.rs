@@ -1121,7 +1121,7 @@ pub(super) fn test_app_state(action_max_pending: usize) -> AppState {
 }
 
 /// Fresh in-memory case store for `router(state, …)` test calls (M3).
-fn test_case_store() -> std::sync::Arc<tokio::sync::RwLock<corecrux_memory::CaseStore>> {
+pub(super) fn test_case_store() -> std::sync::Arc<tokio::sync::RwLock<corecrux_memory::CaseStore>> {
     std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::CaseStore::new()))
 }
 

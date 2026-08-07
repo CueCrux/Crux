@@ -81,6 +81,15 @@ pub(super) fn dense_status(sealed: bool, expected: usize, written: usize) -> Den
     }
 }
 
+/// Request-body ceiling for this route, matching the daemon-wide
+/// `CORECRUXD_MAX_REQUEST_BODY_BYTES` default that the 413 problem response
+/// names ([`crate::http::ingress`]).
+///
+/// Without this the route inherits axum's 2 MiB `DefaultBodyLimit`, so an ingest
+/// of ~2 MiB was refused with a 413 whose detail claimed a 16 MiB limit — the
+/// numbers a harness author reads to size their batches were wrong by 8×.
+pub(super) const LOCAL_INGEST_MAX_REQUEST_BYTES: usize = crate::config::DEFAULT_MAX_REQUEST_BODY_BYTES;
+
 /// Max documents accepted in a single request.
 const MAX_DOCUMENTS_PER_REQUEST: usize = 4096;
 /// Max chunks accepted across a single request.
@@ -738,6 +747,57 @@ mod tests {
             }],
             semantic_profile: None,
         }
+    }
+
+    /// The route must accept a body up to the daemon-wide limit its own 413
+    /// message advertises. Without the explicit `DefaultBodyLimit` the route
+    /// inherited axum's 2 MiB default and refused a 3 MiB ingest while claiming
+    /// a 16 MiB ceiling — mis-sizing every harness that reads that number.
+    #[tokio::test]
+    async fn ingest_route_accepts_a_body_over_the_axum_default_limit() {
+        use tower::ServiceExt as _;
+
+        let mut state = super::super::tests::test_app_state(16);
+        state.local_ingest_enabled = true;
+        let app = super::super::router(state, super::super::tests::test_case_store());
+
+        // ~3 MiB of payload: over axum's 2 MiB default, under the 16 MiB
+        // daemon limit.
+        let filler = "lorem ipsum dolor sit amet ".repeat(4_000);
+        let body = serde_json::json!({
+            "tenant_id": "tenant-bodylimit",
+            "corpus_id": "docs",
+            "documents": [{
+                "doc_id": "big",
+                "chunks": (0..30)
+                    .map(|i| serde_json::json!({
+                        "chunk_id": format!("big::{i}"),
+                        "text": format!("{i} {filler}"),
+                    }))
+                    .collect::<Vec<_>>(),
+            }],
+        })
+        .to_string();
+        assert!(
+            body.len() > 2 * 1024 * 1024 && body.len() < LOCAL_INGEST_MAX_REQUEST_BYTES,
+            "fixture must straddle the two limits (was {} bytes)",
+            body.len()
+        );
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::post("/v1/local/ingest")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::ACCEPTED,
+            "a 3 MiB ingest must not be refused as payload-too-large"
+        );
     }
 
     // ── B1: dense outcome reporting ──────────────────────────────────────
