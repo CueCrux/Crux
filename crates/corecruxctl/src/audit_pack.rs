@@ -2373,6 +2373,7 @@ fn build_integrity_scan_report(opts: &AuditPackOptionsV1) -> IntegrityScanReport
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
     use tempfile::tempdir;
 
     fn h(seq: u64, event_id: &str) -> StreamHeaderLineV1 {
@@ -2384,6 +2385,25 @@ mod tests {
             header_hash: format!("{:064x}", seq + 11),
             payload_hash: format!("{:064x}", seq + 29),
         }
+    }
+
+    #[test]
+    fn deflated_receipt_export_entry_round_trips() {
+        let expected = b"{\"schema\":\"corecrux.receipt_export.v1\"}\n";
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            writer
+                .start_file("manifest.json", options)
+                .expect("start deflated manifest entry");
+            writer.write_all(expected).expect("write deflated manifest");
+            writer.finish().expect("finish deflated receipt export");
+        }
+
+        let mut archive = zip::ZipArchive::new(Cursor::new(cursor.into_inner())).expect("open deflated receipt export");
+        let actual = read_zip_entry(&mut archive, "manifest.json").expect("read deflated receipt export entry");
+        assert_eq!(actual, expected);
     }
 
     #[test]

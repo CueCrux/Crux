@@ -44,7 +44,7 @@ SPA — `dist/` only, not a cargo member — and is excluded below.)
 |---|---|---|---|---|
 | `corecruxd` | The Crux Daemon binary (HTTP / gRPC / MCP host, signing, auth) | *(binary)* — owns `build_segment_seal_receipt`, `sign_segment_seal_material` (`src/grpc.rs`) | — | 83.8k |
 | `corecruxctl` | CoreCrux CLI: `verify-store`, `replay`, `gaps` | *(binary)* — `verify_store`, `replay`, `gaps` modules (`src/`) | — | 33.1k |
-| `crux-mcp` | Agent-facing MCP server (JSON-RPC 2.0 + axum Streamable-HTTP); ~42 tool modules | `dispatch`, `router`/`with_rcx_router`/`with_agent_passports`, `crc_v1` | corecruxd | 33.1k |
+| `crux-mcp` | Agent-facing MCP server (JSON-RPC 2.0 + axum Streamable-HTTP); static-bearer/OAuth fail-closed auth; ~42 tool modules | `dispatch`, `router`/`with_rcx_router`/`with_agent_passports`, `mcp_authentication_configured`, `crc_v1` | corecruxd | 33.1k |
 | `crux-observe` | Self-observation layer: ops events + bootstrap docs → memory facts | `Redactor`/`redact_line`, `bootstrap_entity`/`ops_entity`, `self_observe_enabled` | crux-mcp, corecruxd | 2.7k |
 | `crux-observe-api` | Wire types for the agent audit-chain data contract | `NodeKind`, `RiskClass`, `StepStatus`, `ReasoningRef` | corecruxd | 0.8k |
 | `crux-integrations` | Declarative manifest contract for daemon integration packs | `IntegrationManifest`, `IntegrationEntry`, `EntryKind`, `SafetyPolicy` | corecruxctl, crux-mcp, corecruxd | 2.5k |

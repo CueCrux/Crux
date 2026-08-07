@@ -23,8 +23,10 @@
 //!
 //! ## Authentication
 //!
-//! Agents authenticate via `CRUX_AGENT_TOKEN` (Bearer token). The token is
-//! validated in the [`agent`] module before any tool dispatch.
+//! Agents authenticate with registered bearer tokens (`CRUX_AGENT_TOKEN` /
+//! `CRUX_AGENT_TOKENS`) or hosted-client OAuth bearer introspection. When
+//! either rail is configured, missing and unknown credentials fail closed
+//! before any tool dispatch.
 
 #![deny(clippy::unwrap_used)]
 

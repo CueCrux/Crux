@@ -8,8 +8,9 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
-use axum::extract::Path as AxumPath;
-use axum::http::{header, HeaderValue, Method};
+use axum::extract::{Path as AxumPath, Request};
+use axum::http::{header, HeaderName, HeaderValue, Method};
+use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::Router;
@@ -53,6 +54,25 @@ const CONSOLE_DEV_PATH_ENV: &str = "CORECRUXD_CONSOLE_DEV_PATH";
 // `CORECRUXD_CONSOLE_ALLOWED_ORIGINS` (comma-separated); when unset (or empty
 // after trimming) the production defaults below apply.
 const CONSOLE_ALLOWED_ORIGINS_ENV: &str = "CORECRUXD_CONSOLE_ALLOWED_ORIGINS";
+
+// Browser hardening for every document and static asset served by the daemon.
+// The console intentionally uses same-origin frames for its 3D view and Studio
+// web tiles, so frame-src/frame-ancestors and X-Frame-Options permit only that
+// same origin rather than denying framing outright. Inline script/style remain
+// necessary for the embedded, no-build shell and `/activate`; eval is not.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-src 'self'; frame-ancestors 'self'; form-action 'self'; connect-src 'self'; img-src 'self' data: blob:; font-src 'self' data:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; worker-src 'self'; manifest-src 'self'";
+const BROWSER_SECURITY_HEADERS: [(&str, &str); 7] = [
+    ("content-security-policy", CONTENT_SECURITY_POLICY),
+    ("x-content-type-options", "nosniff"),
+    ("x-frame-options", "SAMEORIGIN"),
+    ("referrer-policy", "no-referrer"),
+    (
+        "permissions-policy",
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=()",
+    ),
+    ("cross-origin-opener-policy", "same-origin"),
+    ("cross-origin-resource-policy", "same-origin"),
+];
 
 // Default allowlist when `CORECRUXD_CONSOLE_ALLOWED_ORIGINS` is unset: the
 // public console origin plus the two Tailnet-facing origins the daemon is
@@ -315,6 +335,19 @@ fn console_cors_layer() -> CorsLayer {
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT])
 }
 
+/// Replace any route-local browser policy with the daemon's canonical policy.
+/// This layer sits outside CORS so its headers also cover CORS-generated
+/// preflight responses.
+async fn add_browser_security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    for (name, value) in BROWSER_SECURITY_HEADERS {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static(name), HeaderValue::from_static(value));
+    }
+    response
+}
+
 pub fn routes(enabled: bool) -> Router {
     if !enabled {
         return Router::new();
@@ -329,6 +362,7 @@ pub fn routes(enabled: bool) -> Router {
         // Device-grant approval page (ExecPlan crux-unified-login-rails, M3).
         .route("/activate", get(serve_activate))
         .layer(console_cors_layer())
+        .layer(axum::middleware::from_fn(add_browser_security_headers))
 }
 
 /// `/activate` — operator approval page for the device-authorization grant.
@@ -585,10 +619,13 @@ fn resolve_dev_html_path(base: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_console_body, CONSOLE_DEV_PATH_ENV, CONSOLE_V2_API_JS, CONSOLE_V2_HTML, CONSOLE_V2_ICON_SVG,
-        CONSOLE_V2_LINKGRAPH_MJS, CONSOLE_V2_MANIFEST, CONSOLE_V2_PAGES_JS, CONSOLE_V2_RENDER_JS, CONSOLE_V2_SW_JS,
+        resolve_console_body, BROWSER_SECURITY_HEADERS, CONSOLE_DEV_PATH_ENV, CONSOLE_V2_API_JS, CONSOLE_V2_HTML,
+        CONSOLE_V2_ICON_SVG, CONSOLE_V2_LINKGRAPH_MJS, CONSOLE_V2_MANIFEST, CONSOLE_V2_PAGES_JS, CONSOLE_V2_RENDER_JS,
+        CONSOLE_V2_SW_JS, CONTENT_SECURITY_POLICY,
     };
     use std::sync::Mutex;
+
+    const DESKTOP_PROXY_SOURCE: &str = include_str!("../../../shells/desktop/connection/src/proxy.rs");
 
     // The dev-path / v2 flag env vars are process-global; serialise tests that
     // mutate either of them. Recover a poisoned lock so one failing env test
@@ -596,6 +633,148 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn assert_browser_security_headers(headers: &axum::http::HeaderMap) {
+        for (name, expected) in BROWSER_SECURITY_HEADERS {
+            assert_eq!(
+                headers.get_all(name).iter().count(),
+                1,
+                "{name} must occur exactly once"
+            );
+            assert_eq!(
+                headers.get(name).and_then(|value| value.to_str().ok()),
+                Some(expected),
+                "{name} must match the canonical browser policy"
+            );
+        }
+        assert!(CONTENT_SECURITY_POLICY.contains("frame-src 'self'"));
+        assert!(CONTENT_SECURITY_POLICY.contains("frame-ancestors 'self'"));
+        assert!(!CONTENT_SECURITY_POLICY.contains("'unsafe-eval'"));
+        assert!(!CONTENT_SECURITY_POLICY.contains("'wasm-unsafe-eval'"));
+    }
+
+    #[tokio::test]
+    async fn browser_security_headers_cover_all_console_responses() {
+        use tower::ServiceExt;
+
+        let _guard = env_lock();
+        std::env::remove_var(CONSOLE_DEV_PATH_ENV);
+        std::env::remove_var(super::CONSOLE_ALLOWED_ORIGINS_ENV);
+
+        for (method, uri, expected_status) in [
+            (axum::http::Method::GET, "/", axum::http::StatusCode::SEE_OTHER),
+            (axum::http::Method::GET, "/console", axum::http::StatusCode::OK),
+            (axum::http::Method::HEAD, "/console", axum::http::StatusCode::OK),
+            (
+                axum::http::Method::GET,
+                "/console-assets/CueCrux-Arc-Loop.png",
+                axum::http::StatusCode::OK,
+            ),
+            (
+                axum::http::Method::GET,
+                "/console-assets/missing.png",
+                axum::http::StatusCode::NOT_FOUND,
+            ),
+            (axum::http::Method::GET, "/console-v2/sw.js", axum::http::StatusCode::OK),
+            (
+                axum::http::Method::GET,
+                "/console-v2/missing.js",
+                axum::http::StatusCode::NOT_FOUND,
+            ),
+            (
+                axum::http::Method::GET,
+                "/console-v2/%2E%2E",
+                axum::http::StatusCode::BAD_REQUEST,
+            ),
+            (
+                axum::http::Method::GET,
+                "/console-3d/index.html",
+                axum::http::StatusCode::OK,
+            ),
+            (
+                axum::http::Method::GET,
+                "/console-3d/missing.js",
+                axum::http::StatusCode::NOT_FOUND,
+            ),
+            (axum::http::Method::GET, "/activate", axum::http::StatusCode::OK),
+        ] {
+            let response = super::routes(true)
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .expect("build request"),
+                )
+                .await
+                .expect("router response");
+            assert_eq!(response.status(), expected_status, "unexpected status for {uri}");
+            assert_browser_security_headers(response.headers());
+        }
+
+        let preflight = super::routes(true)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("OPTIONS")
+                    .uri("/console")
+                    .header(axum::http::header::ORIGIN, "https://crux.cuecrux.com")
+                    .header(axum::http::header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .header(axum::http::header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+                    .body(axum::body::Body::empty())
+                    .expect("build preflight request"),
+            )
+            .await
+            .expect("preflight response");
+        assert_eq!(preflight.status(), axum::http::StatusCode::OK);
+        assert_browser_security_headers(preflight.headers());
+        assert_eq!(
+            preflight
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("https://crux.cuecrux.com"),
+            "security middleware must preserve CORS preflight headers"
+        );
+    }
+
+    #[test]
+    fn desktop_proxy_browser_security_policy_matches_daemon() {
+        let normalized_desktop = DESKTOP_PROXY_SOURCE
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let normalized_csp = CONTENT_SECURITY_POLICY
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        assert!(
+            normalized_desktop.contains(&format!("constcontent_security_policy:&str=\"{normalized_csp}\";")),
+            "desktop proxy CSP must match the daemon policy byte-for-byte"
+        );
+        assert!(
+            normalized_desktop.contains("constbrowser_security_headers:[(&str,&str);7]"),
+            "desktop proxy must expose the same seven canonical headers"
+        );
+        assert!(
+            normalized_desktop.contains("(\"content-security-policy\",content_security_policy)"),
+            "desktop proxy must source CSP from its parity-checked constant"
+        );
+        for (name, value) in BROWSER_SECURITY_HEADERS.into_iter().skip(1) {
+            let normalized_value = value
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            let compact = format!("(\"{name}\",\"{normalized_value}\")");
+            let compact_with_trailing_comma = format!("(\"{name}\",\"{normalized_value}\",)");
+            assert!(
+                normalized_desktop.contains(&compact) || normalized_desktop.contains(&compact_with_trailing_comma),
+                "desktop proxy header {name} must match the daemon value"
+            );
+        }
     }
 
     #[test]
