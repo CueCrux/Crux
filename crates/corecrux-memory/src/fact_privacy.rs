@@ -140,6 +140,26 @@ pub const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
     "github::",
 ];
 
+/// The marker that makes an entity a daemon-internal namespace: a leading
+/// `__`, as in `__bootstrap__::`, `__coord__::`, `__work__::`.
+///
+/// 37 of the 39 [`DEFAULT_PRIVATE_PREFIXES`] use it; the two that do not
+/// (`decisions::`, `github::`) are private *user* content rather than daemon
+/// bookkeeping, which is exactly the distinction this predicate draws.
+pub const INTERNAL_NAMESPACE_MARKER: &str = "__";
+
+/// Whether an entity lives in a daemon-internal namespace.
+///
+/// Callers that assemble memory *for a human or a model* — recall surfaces,
+/// injection bundles — should exclude these unless the caller named the
+/// entity explicitly. They are the daemon's own bookkeeping and
+/// documentation: real records, but not the user's memory, and on a fresh
+/// node they outnumber it. Storage, export and audit paths must NOT use this;
+/// they need the complete set.
+pub fn is_internal_namespace(entity: &str) -> bool {
+    entity.starts_with(INTERNAL_NAMESPACE_MARKER)
+}
+
 /// Reserved entity namespaces owned exclusively by daemon governance flows.
 ///
 /// Client-facing fact-write handlers must reject these prefixes before they
@@ -258,6 +278,28 @@ mod tests {
             horizon_class: None,
             actor: None,
         }
+    }
+
+    #[test]
+    fn internal_namespace_matches_the_reserved_prefixes() {
+        // Every `__`-prefixed default must be recognised, so a recall surface
+        // filtering on this predicate cannot miss one.
+        for prefix in DEFAULT_PRIVATE_PREFIXES.iter().filter(|p| p.starts_with("__")) {
+            assert!(is_internal_namespace(prefix), "{prefix} not detected as internal");
+        }
+        assert!(is_internal_namespace("__bootstrap__::doc:api-append"));
+        assert!(is_internal_namespace("__coord__::session"));
+    }
+
+    #[test]
+    fn internal_namespace_excludes_user_content() {
+        // These are private-by-default but they are the USER's records, not
+        // daemon bookkeeping — a recall surface must still return them.
+        assert!(!is_internal_namespace("decisions::pick-postgres"));
+        assert!(!is_internal_namespace("github::CueCrux/Crux"));
+        assert!(!is_internal_namespace("project:atlas"));
+        assert!(!is_internal_namespace("execplan:demo"));
+        assert!(!is_internal_namespace("_single_underscore::x"));
     }
 
     #[test]
