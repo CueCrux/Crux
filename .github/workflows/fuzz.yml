@@ -77,7 +77,10 @@ env:
 jobs:
   fuzz:
     name: Fuzz (${{ matrix.target }})
-    runs-on: [self-hosted, ci, Linux]
+    # Pinned, not widened — see the `test` job in ci.yml, plus: libFuzzer's
+    # sanitizers need a glibc host, and the vukgpu02 containers report a
+    # musl rust host triple, so ASan cannot link against their static libc.
+    runs-on: [self-hosted, hel1]
     timeout-minutes: 30
     strategy:
       fail-fast: false

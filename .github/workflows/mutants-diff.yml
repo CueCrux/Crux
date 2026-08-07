@@ -35,7 +35,9 @@ concurrency:
 jobs:
   in-diff:
     name: cargo-mutants --in-diff
-    runs-on: [self-hosted, ci, Linux]
+    # Pinned, not widened — see the `test` job in ci.yml. This job runs the
+    # workspace test suite, which fails on the vukgpu02 container pool.
+    runs-on: [self-hosted, hel1]
     timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: "4"

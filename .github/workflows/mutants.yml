@@ -53,7 +53,9 @@ env:
 jobs:
   mutants:
     name: shard ${{ matrix.shard }}
-    runs-on: [self-hosted, ci, Linux]
+    # Pinned, not widened — see the `test` job in ci.yml. This job runs the
+    # workspace test suite, which fails on the vukgpu02 container pool.
+    runs-on: [self-hosted, hel1]
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -129,7 +131,9 @@ jobs:
     name: merge + ratchet
     needs: mutants
     if: always()
-    runs-on: [self-hosted, ci, Linux]
+    # Pinned, not widened — see the `test` job in ci.yml. This job runs the
+    # workspace test suite, which fails on the vukgpu02 container pool.
+    runs-on: [self-hosted, hel1]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
