@@ -77,6 +77,9 @@ env:
 jobs:
   fuzz:
     name: Fuzz (${{ matrix.target }})
+    # Pinned, not widened — see the `test` job in ci.yml, plus: libFuzzer's
+    # sanitizers need a glibc host, and the vukgpu02 containers report a
+    # musl rust host triple, so ASan cannot link against their static libc.
     runs-on: [self-hosted, hel1]
     timeout-minutes: 30
     strategy:
@@ -93,15 +96,29 @@ jobs:
     env:
       # Per-run, per-target CARGO_HOME on the runner data disk; reclaimed at
       # the end (see the `lint` job in ci.yml for the disk-leak rationale).
-      CARGO_HOME: /home/gha-runner/.cargo-fuzz-${{ matrix.target }}-${{ github.run_id }}
       # cargo-fuzz + libFuzzer require nightly; override the repo's pinned
       # stable rust-toolchain.toml for every cargo call in this job.
       RUSTUP_TOOLCHAIN: nightly
     steps:
-      - name: Seed per-job CARGO_HOME from shared toolchain
+      - name: Resolve CARGO_HOME (shared toolchain when the runner has one)
         run: |
+          # $RUNNER_TEMP is writable on EVERY runner pool, unlike the
+          # /home/gha-runner path this used to hardcode — which is what made
+          # these jobs a scheduling coin flip (pass on hel1, die in 13s on
+          # vukgpu02 with "mkdir: cannot create directory ... Permission denied").
+          #
+          # Set HERE and not in the job-level `env:` because the `runner` context
+          # is not available there; only `github`/`needs`/`matrix` etc. are.
+          # Using it at job level makes the whole workflow file invalid.
+          #
+          # The symlink loop is the FAST PATH, not a requirement: where a shared
+          # toolchain exists it is linked in and the toolchain action becomes a
+          # no-op; where it does not, the glob stays literal, `-e` fails, and the
+          # action installs into this writable home. Same workflow, both pools.
+          CARGO_HOME="${RUNNER_TEMP}/cargo-fuzz-${{ matrix.target }}-${{ github.run_id }}"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
           mkdir -p "$CARGO_HOME/bin"
-          for tool in /home/gha-runner/.cargo/bin/*; do
+          for tool in "${CRUX_SHARED_CARGO_HOME:-/home/gha-runner/.cargo}"/bin/*; do
             [ -e "$tool" ] || continue
             ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
           done
