@@ -4481,6 +4481,121 @@ mod tests {
         assert_eq!(records[0].principal, "operator");
     }
 
+    // ── Governance receipt verification (CE, no dataplane) ───────────────
+
+    /// Mint a real governance receipt and resolve it back through the
+    /// verifier a CPU-only deployment actually uses.
+    #[test]
+    fn governance_receipt_resolves_and_verifies_without_a_dataplane() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        let receipt_id = mint_governance_receipt(
+            &state,
+            "__governance__::erasure",
+            "operator",
+            "erasure.forget_tenant_corpus",
+            &serde_json::json!({ "tenant_id": "MarketResearch", "docs_masked": 7075 }),
+        )
+        .expect("governance receipt must mint");
+
+        let found = super::super::receipts::local_governance_receipt_verification(&state, &receipt_id)
+            .expect("resolver must not error")
+            .expect("the receipt it just minted must resolve");
+
+        assert!(
+            found.verification.signature_valid,
+            "{:?}",
+            found.verification.failure_reason
+        );
+        assert!(found.verification.chain_valid);
+        assert_eq!(found.tenant_id, "MarketResearch");
+        assert_eq!(found.verification.kind, "erasure.forget_tenant_corpus");
+        assert_eq!(found.verification.receipt_id, receipt_id);
+        assert_eq!(found.verification.signed_by, state.passport_fpr);
+    }
+
+    /// A tampered body must come back as an unverified *report*, not an
+    /// error and never a silent pass — this is the whole point of the
+    /// receipt.
+    #[test]
+    fn governance_receipt_with_a_tampered_body_fails_verification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        let receipt_id = mint_governance_receipt(
+            &state,
+            "__governance__::erasure",
+            "operator",
+            "erasure.forget_tenant_corpus",
+            &serde_json::json!({ "tenant_id": "MarketResearch", "docs_masked": 7075 }),
+        )
+        .expect("governance receipt must mint");
+
+        // Rewrite the docs count, leaving the signature untouched.
+        let path = observation_file_path(&state.data_dir, "__governance__::erasure");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, raw.replace("7075", "1")).unwrap();
+
+        let found = super::super::receipts::local_governance_receipt_verification(&state, &receipt_id)
+            .expect("resolver must not error")
+            .expect("the record is still present");
+        assert!(!found.verification.signature_valid);
+        assert!(found.verification.failure_reason.is_some());
+    }
+
+    #[test]
+    fn governance_receipt_lookup_of_an_unknown_id_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+        mint_governance_receipt(
+            &state,
+            "__governance__::erasure",
+            "operator",
+            "erasure.forget_tenant_corpus",
+            &serde_json::json!({ "tenant_id": "t" }),
+        )
+        .expect("governance receipt must mint");
+
+        assert!(
+            super::super::receipts::local_governance_receipt_verification(&state, "no-such-receipt")
+                .expect("resolver must not error")
+                .is_none()
+        );
+    }
+
+    /// The scan is bounded to `__governance__*` on purpose: a production
+    /// node carries tens of thousands of per-session observation logs
+    /// (59,022 against 5 mediation logs on host crux), so walking them all
+    /// on an audit lookup would be a denial-of-service surface.
+    ///
+    /// Asserted by planting a corrupt session log that `read_observations_strict`
+    /// would error on. If the resolver ever widens its filter, this stops
+    /// returning `None` and starts returning `Err`.
+    #[test]
+    fn governance_receipt_scan_never_opens_a_non_governance_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        let obs_dir = state.data_dir.join("observations");
+        std::fs::create_dir_all(&obs_dir).unwrap();
+        std::fs::write(
+            obs_dir.join("__agent_session__agent_anthropic__decoy.jsonl"),
+            "{ this is not a valid observation record\n",
+        )
+        .unwrap();
+
+        assert!(
+            super::super::receipts::local_governance_receipt_verification(&state, "anything")
+                .expect("a corrupt NON-governance log must never be read, so this must not error")
+                .is_none()
+        );
+    }
+
     /// The durable append distinguishes "nothing was written" from "the line
     /// landed but fsync failed". Collapsing the two would let a caller retry a
     /// receipt-bound mutation that is in fact already on disk.

@@ -4855,6 +4855,52 @@ async fn get_receipt_verification_resolves_locally_without_dataplane() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// A governance receipt (tenant corpus erasure and friends) must verify
+/// through the same route on a CPU-only build. Before this fallback the
+/// daemon minted an Ed25519-signed audit artefact it had no supported way
+/// to attest to: this route 404'd, `GET /v1/receipts/{id}` 501s by design,
+/// and `corecruxctl inspect-receipt` searches sealed segments only.
+#[tokio::test]
+async fn get_receipt_verification_resolves_a_governance_receipt_without_a_dataplane() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).expect("passport key");
+    let mut state = test_app_state(16);
+    state.data_dir = tmp.path().to_path_buf();
+    state.passport_key_path = tmp.path().join("passport.key");
+    state.passport_fpr = key.passport_fpr().to_string();
+    state.passport_public_key_hex = key.public_key_hex().to_string();
+
+    let receipt_id = super::observations::mint_governance_receipt(
+        &state,
+        "__governance__::erasure",
+        "operator",
+        "erasure.forget_tenant_corpus",
+        &serde_json::json!({ "tenant_id": "MarketResearch", "segments_reclaimed": 17 }),
+    )
+    .expect("governance receipt must mint");
+
+    let resp = receipts::get_receipt_verification_v1(
+        State(state),
+        Path(receipt_id.clone()),
+        Query(TenantQuery {
+            tenant_id: "MarketResearch".to_string(),
+        }),
+        HeaderMap::new(),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json["schema"], "crux.governance_receipt_verification.v1");
+    assert_eq!(json["receipt_id"], receipt_id);
+    assert_eq!(json["tenant_id"], "MarketResearch");
+    assert_eq!(json["kind"], "erasure.forget_tenant_corpus");
+    assert_eq!(json["signature_valid"], true);
+    assert_eq!(json["chain_valid"], true);
+}
+
 #[tokio::test]
 async fn get_receipt_verification_uses_http_dataplane_fake() {
     let fake = Arc::new(FakeHttpDataplane {

@@ -346,6 +346,137 @@ fn verify_observation_envelope(
         .map_err(|err| format!("verify local stream receipt observation signature: {err}"))
 }
 
+/// Filename prefix of the governance observation logs. Governance receipts
+/// are minted under session ids like `__governance__::erasure`, which the
+/// observation writer encodes as `__governance____erasure.jsonl`.
+const GOVERNANCE_LOG_PREFIX: &str = "__governance__";
+
+/// A governance receipt resolved from the local observation logs, carrying
+/// the receipt's OWN tenant so the caller can re-gate authorization against
+/// it rather than the query tenant.
+#[derive(Debug)]
+pub(super) struct LocalGovernanceReceipt {
+    pub(super) tenant_id: String,
+    pub(super) verification: GovernanceReceiptVerificationV1,
+}
+
+/// Verification report for an observation-envelope (governance) receipt.
+///
+/// Deliberately **not** [`corecrux_receipts::VerificationReportV1`]: that
+/// report describes a CBOR receipt body checked against a `ReceiptSigV1`
+/// envelope, and carries trace-check and candidate-digest fields that have
+/// no analogue here. Emitting it would imply checks this path never
+/// performs. The distinct `schema` makes the difference legible to clients
+/// instead of hiding it behind a familiar shape.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(super) struct GovernanceReceiptVerificationV1 {
+    pub schema: String,
+    pub receipt_id: String,
+    pub tenant_id: String,
+    /// Observation `kind`, e.g. `erasure.forget_tenant_corpus`.
+    pub kind: String,
+    /// Passport fingerprint the envelope is signed by.
+    pub signed_by: String,
+    pub body_hash: String,
+    /// Ed25519 signature over the canonical record body verified against
+    /// this node's passport key.
+    pub signature_valid: bool,
+    /// The whole log's hash chain validated (tamper-evidence for the file,
+    /// not just the record).
+    pub chain_valid: bool,
+    pub recorded_at: String,
+    pub verified_at: String,
+    pub verifier_build: corecrux_types::BuildInfo,
+    /// Present only when `signature_valid` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+}
+
+/// Locate and verify a governance receipt in the local observation logs.
+///
+/// Sibling of [`local_stream_receipt_verification`], for the *other* receipt
+/// shape. Governance surfaces (tenant corpus erasure, `compact_facts`
+/// erasure, `memory_forget`, held hard-erasure overrides) persist their
+/// receipt as the observation envelope itself — the receipt id **is** the
+/// `observation_id`, the body is the canonical record bytes, and the
+/// signature lives in the top-level `receipt{}`. They carry no
+/// `body_cbor_hex`/`sig` payload, so the stream resolver cannot match them
+/// no matter which files it reads.
+///
+/// Without this, a CPU-only deployment mints governance receipts it has no
+/// supported way to verify: `GET /v1/receipts/{id}` is 501 by design and
+/// `corecruxctl inspect-receipt` searches sealed segments only.
+///
+/// A failed signature returns a `signature_valid: false` report rather than
+/// an error, mirroring the stream and dataplane branches.
+///
+/// The scan is restricted to [`GOVERNANCE_LOG_PREFIX`] files. That is a
+/// correctness constraint, not an optimisation: a production node carries
+/// tens of thousands of per-session observation logs (59,022 on host crux
+/// against 5 mediation logs), and walking them all on an audit lookup would
+/// make verification a denial-of-service surface.
+pub(super) fn local_governance_receipt_verification(
+    state: &AppState,
+    receipt_id: &str,
+) -> Result<Option<LocalGovernanceReceipt>, String> {
+    let obs_dir = state.data_dir.join("observations");
+    let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(&obs_dir) {
+        Ok(entries) => entries
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                let is_jsonl = std::path::Path::new(&name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"));
+                is_jsonl && name.starts_with(GOVERNANCE_LOG_PREFIX)
+            })
+            .map(|e| e.path())
+            .collect(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(format!("list governance observation logs: {err}")),
+    };
+    files.sort();
+
+    for path in files {
+        let records = super::observations::read_observations_strict(&path)
+            .map_err(|err| format!("read governance observations {}: {err}", path.display()))?;
+        let Some(record) = records.iter().find(|r| r.observation_id == receipt_id) else {
+            continue;
+        };
+
+        let chain_valid = matches!(
+            super::observations::validate_chain(&records),
+            super::observations::ChainStatus::Ok { .. }
+        );
+        let failure_reason = verify_observation_envelope(state, record).err();
+        let tenant_id = record
+            .payload
+            .get("tenant_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("local")
+            .to_string();
+
+        return Ok(Some(LocalGovernanceReceipt {
+            tenant_id: tenant_id.clone(),
+            verification: GovernanceReceiptVerificationV1 {
+                schema: "crux.governance_receipt_verification.v1".to_string(),
+                receipt_id: receipt_id.to_string(),
+                tenant_id,
+                kind: record.kind.clone(),
+                signed_by: record.receipt.signed_by.clone(),
+                body_hash: record.receipt.body_hash.clone(),
+                signature_valid: failure_reason.is_none(),
+                chain_valid,
+                recorded_at: record.ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                verified_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                verifier_build: state.build.clone(),
+                failure_reason,
+            },
+        }));
+    }
+    Ok(None)
+}
+
 /// Best-effort top-level `tenant_id` text field from a CBOR receipt body.
 fn cbor_top_level_tenant(body_bytes: &[u8]) -> Option<String> {
     let value: ciborium::Value = ciborium::de::from_reader(std::io::Cursor::new(body_bytes)).ok()?;
@@ -777,7 +908,24 @@ pub(super) async fn get_receipt_verification_v1(
                 }
                 (StatusCode::OK, Json(found.verification)).into_response()
             }
-            Ok(None) => problem_response(StatusCode::NOT_FOUND, "receipt body not found"),
+            // Not a stream receipt — try the governance envelope shape
+            // before giving up, so erasure/forget receipts minted on this
+            // node are verifiable without a dataplane.
+            Ok(None) => match local_governance_receipt_verification(&state, &receipt_id) {
+                Ok(Some(found)) => {
+                    // Same re-gate as the stream path: a caller not
+                    // authorized for the receipt's OWN tenant gets the
+                    // missing-receipt 404, so existence can't be probed.
+                    if require_http_scopes_for_tenant(&state.auth, &headers, &["receipts:read"], &found.tenant_id)
+                        .is_err()
+                    {
+                        return problem_response(StatusCode::NOT_FOUND, "receipt body not found");
+                    }
+                    (StatusCode::OK, Json(found.verification)).into_response()
+                }
+                Ok(None) => problem_response(StatusCode::NOT_FOUND, "receipt body not found"),
+                Err(detail) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, detail),
+            },
             Err(detail) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, detail),
         };
     }
