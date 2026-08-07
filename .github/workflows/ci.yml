@@ -162,7 +162,15 @@ jobs:
     name: Test
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: [self-hosted, ci, Linux]
+    # NOT widened to the whole `ci` pool, unlike every other job here. The
+    # vukgpu02 runners are Docker containers on a Windows host, and the
+    # workspace test run includes crux-claude-hooks' witness-key tests, which
+    # require real POSIX custody: a 0700 parent, a 0600 key, and no
+    # group/world write bit. Those semantics do not survive that mount, so
+    # `WitnessKey::load_or_create` fails and the runtime degrades to an
+    # unsigned witness. Confirmed: Test/Coverage have never passed on
+    # vukgpu02, and pass on every hel1 runner.
+    runs-on: [self-hosted, hel1]
     # See `lint` job above for the per-job CARGO_HOME rationale.
     steps:
       - name: Resolve CARGO_HOME (shared toolchain when the runner has one)
@@ -406,7 +414,8 @@ jobs:
     name: Coverage
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: [self-hosted, ci, Linux]
+    # Same workspace-wide run as `test`, so same pool restriction — see there.
+    runs-on: [self-hosted, hel1]
     env:
       # See `lint` job above for the per-job CARGO_HOME rationale.
       # Coverage scope. The exclusion list is deliberately narrow — only code
