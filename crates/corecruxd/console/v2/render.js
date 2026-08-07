@@ -10538,12 +10538,24 @@
   function pbStateColor(s) { return PB_STATE_COLOR[s] || 'var(--ink3)'; }
 
   // Ring grid whose perimeter holds n cards and whose interior fits the label.
+  //
+  // MUST satisfy perimeter >= n for every n. A table alone cannot: it ran out at
+  // 10x6 (perimeter 28) and silently returned a grid too small for the board,
+  // which the slot allocator below then span on forever. Prod had a 61-plan
+  // plane; the table topped out at 28 slots and froze the tab. So the table is
+  // only a nicety for small n, and anything larger is COMPUTED.
   function pbGridFor(n) {
     var opts = [[3, 3], [4, 3], [5, 3], [5, 4], [6, 4], [7, 4], [7, 5], [8, 5], [9, 6]];
     for (var i = 0; i < opts.length; i++) {
       if (2 * opts[i][0] + 2 * opts[i][1] - 4 >= n) { return opts[i]; }
     }
-    return [10, 6];
+    // perimeter = 2(c + r) - 4 >= n  →  c + r >= (n + 4) / 2.
+    var need = Math.ceil((n + 4) / 2);
+    var r = Math.max(3, Math.round(need * 0.38));   // ~1.6:1, the shape the packer likes
+    var c = Math.max(3, need - r);
+    // Guard the arithmetic rather than trusting it: grow until it genuinely fits.
+    while (2 * (c + r) - 4 < n) { c += 1; }
+    return [c, r];
   }
   // Perimeter cells, clockwise from top-left.
   function pbRingSlots(c, r) {
@@ -10661,11 +10673,29 @@
           var chosen = [], seen = {};
           for (k = 0; k < b.n; k++) {
             var si = Math.round(k * P / b.n) % P;
-            while (Object.prototype.hasOwnProperty.call(seen, si)) { si = (si + 1) % P; }
+            // BOUNDED probe. The old `while (taken) si = (si+1) % P` spun forever
+            // the moment the ring had fewer slots than cards — a browser freeze,
+            // not a wrong picture. Never loop on layout without a bound: at worst
+            // drop a card and say so, because a hung tab tells you nothing.
+            var tries = 0;
+            while (Object.prototype.hasOwnProperty.call(seen, si) && tries < P) { si = (si + 1) % P; tries++; }
+            if (tries >= P) { break; }                 // ring genuinely full
             seen[si] = true; chosen.push(si);
           }
+          if (chosen.length < b.n) {
+            // Should be unreachable now pbGridFor guarantees capacity; if it ever
+            // happens, render what fits and name the loss rather than truncating
+            // silently (a board that quietly hides work is worse than a small one).
+            if (typeof console !== 'undefined' && console.warn) {
+              console.warn('patchbay: ring for "' + b.key + '" holds ' + chosen.length +
+                ' of ' + b.n + ' plans (' + P + ' slots) — some cards are not drawn');
+            }
+          }
           chosen.sort(function (a2, b2) { return a2 - b2; });
-          for (k = 0; k < b.members.length; k++) {
+          // Bound by `chosen`, not by the member count: if the ring ever holds
+          // fewer slots than the plane has plans, place what fits instead of
+          // indexing past the end (the warning above already names the loss).
+          for (k = 0; k < chosen.length && k < b.members.length; k++) {
             var slot = slots[chosen[k]], col = slot[0], rw2 = slot[1];
             chips.push({ plan: b.members[k],
               x: x + col * (PB_CW + PB_GAP), y: yy + rw2 * (PB_CH + PB_GAP),
@@ -16701,6 +16731,10 @@
     // DOM and no daemon.
     patchbayLayout: patchbayLayout,
     patchbayRoutes: patchbayRoutes,
+    // Exported for the capacity gate: a ring that cannot hold its plane is the
+    // freeze that shipped in v0.5.56, and the property is assertable in
+    // microseconds where "does the layout finish" would hang CI instead.
+    patchbayGridFor: pbGridFor,
     // Site map — static reference destination (rail → destinations map).
     renderSiteMap: renderSiteMap,
     // M2 (console-surfaces-remediation) — the paged, searchable facts browser.
