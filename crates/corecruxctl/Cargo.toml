@@ -27,6 +27,7 @@ syn = { workspace = true, features = ["full", "visit"] }
 thiserror = { workspace = true }
 hex = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 serde_yaml = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "time"] }

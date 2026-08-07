@@ -1014,6 +1014,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "toml",
  "tonic",
  "ureq 3.3.0",
  "url",

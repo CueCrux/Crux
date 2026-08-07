@@ -81,6 +81,23 @@ Codex must see Crux tools through an MCP server named `crux` before the model
 can call tools such as `sync_status`, `get_bootstrap`, `store_fact`,
 `query_facts`, and `cuecrux_session` directly.
 
+### One command
+
+```bash
+corecruxctl start --agent codex
+```
+
+Installs the stdio bridge to `~/.codex/crux-mcp-stdio.py` and merges
+`[mcp_servers.crux]` into `~/.codex/config.toml`, on top of everything plain
+`corecruxctl start` already does. It is a merge, not an overwrite — your other
+`mcp_servers` entries and unrelated keys survive — and it is idempotent. No
+bearer material is written to `config.toml`.
+
+Restart Codex afterwards. The manual equivalent is below, if you would rather
+wire it yourself or need a non-default path.
+
+### Manual
+
 Codex streamable HTTP MCP support may work with newer Codex releases, but
 Codex CLI `0.137.0-alpha.4` failed the Crux daemon handshake with native HTTP
 and with `mcp-remote`. The supported compatibility path is the stdio bridge:
