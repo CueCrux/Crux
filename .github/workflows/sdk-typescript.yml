@@ -40,6 +40,8 @@ jobs:
           fi
       - run: npm ci
       - run: npm run build
+      - name: Unit tests (wire shape, against a local stub server)
+        run: node --test test/*.test.mjs
       - name: Pack exact publish artifact
         run: |
           rm -rf package

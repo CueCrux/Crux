@@ -38,6 +38,10 @@ jobs:
             echo "::error::SDK tag version $tag_version does not match pyproject.toml version $package_version"
             exit 1
           fi
+      - name: Install runtime dependency for the test run
+        run: python -m pip install 'httpx>=0.27'
+      - name: Unit tests (wire shape, against a local stub server)
+        run: python -m unittest discover -s tests -v
       - name: Install pinned build toolchain
         run: python -m pip install 'build==1.5.0' 'hatchling==1.31.0'
       - name: Build twice and verify reproducibility

@@ -116,7 +116,7 @@ fn cat12_bm25_recall() {
     let mut theme_hits: HashMap<&str, (usize, usize)> = HashMap::new(); // theme → (hits, total_expected)
 
     for (qi, q) in corpus.queries.iter().enumerate() {
-        let hits = bm25_score(&reader, &q.query, q.top_k, Some(tenant_hash), &params);
+        let hits = bm25_score(&reader, &q.query, q.top_k, Some(tenant_hash), &params, None);
 
         let retrieved_ids: Vec<String> = hits.iter().filter_map(|h| idx_to_id.get(&h.doc_id).cloned()).collect();
 

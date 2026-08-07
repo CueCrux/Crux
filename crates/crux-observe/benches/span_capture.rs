@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use crux_observe::span_layer::{CruxSpanLayer, RawSpan, SpanRing};
+use crux_observe::span_layer::{record_outcome, CruxSpanLayer, RawSpan, SpanRing};
 use tracing_subscriber::prelude::*;
 
 /// Synthetic unit of work: one root span with `children` nested spans beneath
@@ -113,6 +113,65 @@ fn bench_realistic_handler(c: &mut Criterion) {
     group.finish();
 }
 
+/// The same handler, but every child span declares and records an outcome.
+///
+/// ExecPlan `crux-code-intel-silent-empty-outcomes-2026-08-03`, milestone M1.
+fn simulated_request_recording_outcomes(children: usize, work_iters: u64) {
+    let root = tracing::info_span!("http_handler", route = "/v1/query/text-search");
+    let _r = root.enter();
+    for i in 0..children {
+        let child = tracing::info_span!("storage_read", shard = i, crux.outcome = tracing::field::Empty);
+        let _c = child.enter();
+        let mut acc = 0u64;
+        for k in 0..work_iters {
+            acc = acc.wrapping_add(k).wrapping_mul(2_654_435_761);
+        }
+        record_outcome(acc == 0);
+        std::hint::black_box(acc);
+    }
+}
+
+/// M1 gate — what the outcome dimension costs.
+///
+/// ExecPlan `crux-code-intel-silent-empty-outcomes-2026-08-03`, milestone M1.
+///
+/// Two distinct questions, and conflating them is how a cheap feature gets
+/// blamed for an expensive one:
+///
+/// * **`uninstrumented`** — spans that never declare `crux.outcome`, i.e. every
+///   span in the daemon today. This must be indistinguishable from the same
+///   benchmark on `main`, because a span that does not declare the field never
+///   reaches `on_record`. This is the number the gate is about: the predecessor
+///   plan's M2 closed PARTIAL at +2.6% against a <1% target, and nothing here
+///   may add to that bill for code that did not opt in.
+/// * **`recording`** — spans that declare the field and call `record_outcome`.
+///   This cost is *elective*: it is paid only by the curated sites M2 picks, and
+///   it is the price of the signal, not a tax on the daemon.
+///
+/// Run: `cargo bench -p crux-observe --bench span_capture -- outcome_dimension`
+fn bench_outcome_dimension(c: &mut Criterion) {
+    const WORK: u64 = 25_000;
+    let mut group = c.benchmark_group("outcome_dimension");
+
+    group.bench_function("uninstrumented", |b| {
+        let ring = Arc::new(SpanRing::new(16_384));
+        let sub = tracing_subscriber::registry().with(CruxSpanLayer::new(Arc::clone(&ring), 1));
+        tracing::subscriber::with_default(sub, || {
+            b.iter(|| simulated_request_with_work(8, WORK));
+        });
+    });
+
+    group.bench_function("recording", |b| {
+        let ring = Arc::new(SpanRing::new(16_384));
+        let sub = tracing_subscriber::registry().with(CruxSpanLayer::new(Arc::clone(&ring), 1));
+        tracing::subscriber::with_default(sub, || {
+            b.iter(|| simulated_request_recording_outcomes(8, WORK));
+        });
+    });
+
+    group.finish();
+}
+
 fn bench_ring(c: &mut Criterion) {
     let mut group = c.benchmark_group("span_ring");
 
@@ -148,5 +207,11 @@ fn bench_ring(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_layer_overhead, bench_realistic_handler, bench_ring);
+criterion_group!(
+    benches,
+    bench_layer_overhead,
+    bench_realistic_handler,
+    bench_outcome_dimension,
+    bench_ring
+);
 criterion_main!(benches);

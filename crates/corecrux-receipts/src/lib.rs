@@ -27,6 +27,7 @@ mod forget_v1;
 mod identity_v1;
 mod keyring_v1;
 mod memory_use_v1;
+mod observation_envelope;
 mod store_v1;
 mod stream_v1;
 mod subject_index_v1;
@@ -120,6 +121,9 @@ pub use memory_use_v1::{
     assert_memory_use_kind_v1, build_memory_use_body_v1, extract_memory_use_entries_v1, filter_reserved_entries,
     is_reserved_entity_prefix, sign_memory_use_v1, MemoryUseBodyInputV1, MemoryUseEntryV1, MemoryUseIntentV1,
     MEMORY_USE_BODY_SCHEMA_V1, MEMORY_USE_KIND_V1, RESERVED_ENTITY_PREFIXES_V1,
+};
+pub use observation_envelope::{
+    canonical_body_bytes, verify_observation_envelope, ObservationRecordV1, ReceiptEnvelopeV1,
 };
 pub use store_v1::{
     load_verification_report_v1, store_verification_report_v1, verification_report_path_v1, ReceiptStoreError,
