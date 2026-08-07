@@ -338,6 +338,100 @@ pub fn narrow_links(declared: &[String], open: &dyn Fn(&str) -> bool, self_slug:
     out
 }
 
+/// Everything the canvas needs about a plan that depends ONLY on its file
+/// content — never on the fact store.
+///
+/// That split is the whole basis of the cache in the HTTP layer. A plan's
+/// *state* and *milestone counts* come from facts, and a gate fact changes them
+/// without touching the file, so caching a whole response keyed off file mtimes
+/// would silently serve a stale board. Facets cannot go stale that way: if the
+/// file has not changed, none of this has changed either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanFacets {
+    pub plane: &'static str,
+    pub services: Vec<&'static str>,
+    pub blurb: Option<String>,
+    pub risk: Option<String>,
+    /// `depends_on` ∪ `extended_by`, before narrowing to the open set.
+    pub declared: Vec<String>,
+}
+
+/// Compute every file-derived facet in one pass.
+///
+/// Deliberately calls the same public classifiers everything else does, rather
+/// than a private fast path: the per-plan cost only lands on a cache MISS, so a
+/// second code path would buy nothing and could drift from the one under test.
+/// The title is taken from the parsed plan rather than from the caller, so every
+/// inch of this is file-derived and the cache key `(mtime, len)` genuinely
+/// covers it. (Passing the WorkItem title in would leave a scoring input outside
+/// the key — the classification could then go stale without the file changing.)
+pub fn facets_for(slug: &str, body: &str) -> PlanFacets {
+    let parsed = crate::work_execplans::parse_plan(body);
+    let mut declared = parsed.depends_on.clone();
+    declared.extend(parsed.extended_by.iter().cloned());
+    PlanFacets {
+        plane: plane_for(slug, &parsed.title, body),
+        services: services_for(body),
+        blurb: purpose_blurb(body, BLURB_CHARS),
+        risk: parsed.risk_class.clone(),
+        declared,
+    }
+}
+
+/// Longest blurb the console renders on a card before it truncates anyway.
+pub const BLURB_CHARS: usize = 240;
+
+/// One plan file, as seen by a stat — path, slug and the two fields that decide
+/// whether a cached facet set is still valid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanStat {
+    pub slug: String,
+    pub path: std::path::PathBuf,
+    pub mtime_unix_ms: u64,
+    pub len: u64,
+}
+
+/// Enumerate the plan root WITHOUT reading any file.
+///
+/// Mirrors `work_execplans::walk_execplans_root`'s filtering (`.md`, no scratch
+/// prefix) but stops at the metadata, so a request whose facets are all cached
+/// does no file I/O beyond the directory listing.
+pub fn stat_execplans_root(root: &std::path::Path) -> std::io::Result<Vec<PlanStat>> {
+    let mut out = Vec::new();
+    if !root.exists() {
+        return Ok(out);
+    }
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
+            continue;
+        };
+        if crate::work_execplans::is_scratch_slug(&stem) {
+            continue;
+        }
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let mtime_unix_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_millis() as u64);
+        out.push(PlanStat {
+            slug: stem,
+            path,
+            mtime_unix_ms,
+            len: meta.len(),
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 #[path = "work_graph/tests.rs"]
 mod tests;

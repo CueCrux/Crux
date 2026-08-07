@@ -15,12 +15,28 @@
 //! and an edge pointing at one is dropped rather than drawn as a dangling stub.
 
 use super::{problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, State};
-use crate::work_graph;
+use crate::work_graph::{self, PlanFacets};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
-/// Longest blurb the console renders on a card before it truncates anyway.
-const BLURB_CHARS: usize = 240;
+/// Per-plan facet cache, keyed by slug and validated by `(mtime, len)`.
+///
+/// ONLY file-derived facets are cached. A plan's state and milestone counts come
+/// from the fact store, and a `gate:M<n>` write changes them without touching the
+/// file — so a whole-response cache keyed off mtimes would serve a board that
+/// silently lied about progress. Those fields are re-read on every request; what
+/// is cached is the expensive half (classification, blurb, declared edges) that
+/// genuinely cannot change unless the file does.
+///
+/// Process-global because there is one plan root per daemon. Bounded by the
+/// number of plan files, and entries for deleted plans are dropped each pass.
+type FacetCache = HashMap<String, (u64, u64, PlanFacets)>;
+static FACETS: OnceLock<Mutex<FacetCache>> = OnceLock::new();
+
+fn facet_cache() -> &'static Mutex<FacetCache> {
+    FACETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Debug, Serialize)]
 pub(super) struct GraphPlan {
@@ -106,15 +122,50 @@ pub(super) async fn get_work_graph(State(state): State<AppState>, headers: Heade
     };
     drop(store);
 
-    // Plan markdown, keyed by slug. The taggers need the body, which the
-    // WorkItem projection does not carry.
-    let bodies: HashMap<String, String> = match crate::work_execplans::walk_execplans_root(&root) {
-        Ok(files) => files.into_iter().map(|f| (f.slug, f.content)).collect(),
+    // File-derived facets. Stat the directory first and read only the plans
+    // whose `(mtime, len)` no longer matches the cache — a board where nothing
+    // has been edited does no file reads and no classification at all here.
+    let stats = match work_graph::stat_execplans_root(&root) {
+        Ok(s) => s,
         Err(err) => {
-            tracing::warn!(error = %err, root = %root.display(), "execplan-walk-io-error");
-            HashMap::new()
+            tracing::warn!(error = %err, root = %root.display(), "execplan-stat-io-error");
+            Vec::new()
         }
     };
+    let mut facets: HashMap<String, PlanFacets> = HashMap::with_capacity(stats.len());
+    let (mut hits, mut misses) = (0usize, 0usize);
+    {
+        let mut cache = match facet_cache().lock() {
+            Ok(g) => g,
+            // A panic in another request must not wedge this endpoint; the cache
+            // holds only derived data, so continuing on the recovered map is safe.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for st in &stats {
+            if let Some((m, l, f)) = cache.get(&st.slug) {
+                if *m == st.mtime_unix_ms && *l == st.len {
+                    hits += 1;
+                    facets.insert(st.slug.clone(), f.clone());
+                    continue;
+                }
+            }
+            let Ok(body) = std::fs::read_to_string(&st.path) else {
+                tracing::warn!(path = %st.path.display(), "execplan-read-io-error");
+                continue;
+            };
+            let f = work_graph::facets_for(&st.slug, &body);
+            misses += 1;
+            cache.insert(st.slug.clone(), (st.mtime_unix_ms, st.len, f.clone()));
+            facets.insert(st.slug.clone(), f);
+        }
+        // Drop entries for plans that no longer exist so the map cannot grow
+        // without bound across renames.
+        if cache.len() > stats.len() {
+            let live: std::collections::HashSet<&str> = stats.iter().map(|s| s.slug.as_str()).collect();
+            cache.retain(|slug, _| live.contains(slug.as_str()));
+        }
+    }
+    tracing::debug!(hits, misses, plans = stats.len(), "work-graph-facet-cache");
 
     // Open work only, and the open set is what an edge may point at.
     let open: Vec<&crate::work::WorkItem> = items
@@ -128,22 +179,26 @@ pub(super) async fn get_work_graph(State(state): State<AppState>, headers: Heade
     let mut service_counts: HashMap<&'static str, usize> = HashMap::new();
     let mut link_count = 0usize;
 
+    let empty_facets = PlanFacets {
+        plane: work_graph::plane_for("", "", ""),
+        services: Vec::new(),
+        blurb: None,
+        risk: None,
+        declared: Vec::new(),
+    };
     for w in &open {
         let slug = slug_of(&w.id);
-        let body = bodies.get(slug).map_or("", String::as_str);
-        let parsed = crate::work_execplans::parse_plan(body);
+        let f = facets.get(slug).unwrap_or(&empty_facets);
 
-        // Declared edges only — depends_on ∪ extended_by, both of which the
-        // parser sources from declaration lines, not prose.
-        let mut declared = parsed.depends_on.clone();
-        declared.extend(parsed.extended_by.iter().cloned());
-        let links = work_graph::narrow_links(&declared, &|s| open_slugs.contains(s), slug);
+        // Declared edges only — `depends_on` ∪ `extended_by`, both of which the
+        // parser sources from declaration lines, never from prose.
+        let links = work_graph::narrow_links(&f.declared, &|s| open_slugs.contains(s), slug);
         link_count += links.len();
 
-        let plane = work_graph::plane_for(slug, &w.title, body);
+        let plane = f.plane;
         *plane_counts.entry(plane).or_insert(0) += 1;
 
-        let services = work_graph::services_for(body);
+        let services = f.services.clone();
         for s in &services {
             *service_counts.entry(*s).or_insert(0) += 1;
         }
@@ -156,8 +211,8 @@ pub(super) async fn get_work_graph(State(state): State<AppState>, headers: Heade
             plane,
             services,
             links,
-            blurb: work_graph::purpose_blurb(body, BLURB_CHARS),
-            risk: parsed.risk_class.clone(),
+            blurb: f.blurb.clone(),
+            risk: f.risk.clone(),
             current_milestone: w.current_milestone.clone(),
             milestones_done: w.milestones_done.unwrap_or(0),
             milestones_total: w.milestones_total.unwrap_or(0),

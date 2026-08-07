@@ -1180,6 +1180,15 @@ fn mk_item(
 ///
 /// Returns plain `io::Error` for filesystem failures; callers can decide
 /// whether to fall back to an empty list or 500.
+/// Is this slug a scratch plan (leading `_`), excluded from the projection?
+///
+/// Exposed so a second enumerator of the same directory (the Patchbay facet
+/// cache's stat-only walk) filters to the SAME file set rather than duplicating
+/// the rule and silently drifting from it.
+pub fn is_scratch_slug(stem: &str) -> bool {
+    stem.starts_with(SCRATCH_PREFIX)
+}
+
 pub fn walk_execplans_root(root: &Path) -> std::io::Result<Vec<ExecplanFile>> {
     let mut out = Vec::new();
     if !root.exists() {
@@ -1195,7 +1204,7 @@ pub fn walk_execplans_root(root: &Path) -> std::io::Result<Vec<ExecplanFile>> {
             Some(s) => s.to_string(),
             None => continue,
         };
-        if stem.starts_with(SCRATCH_PREFIX) {
+        if is_scratch_slug(&stem) {
             continue;
         }
         let content = std::fs::read_to_string(&path)?;
