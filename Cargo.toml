@@ -48,7 +48,7 @@ edition = "2021"
 # Kept in lock-step with the release tag (v<MAJOR.MINOR.PATCH>). Bump via
 # scripts/cut-release.sh; the version-sync CI gate (.github/workflows/version-sync.yml)
 # fails any v* tag whose workspace version != the tag.
-version = "0.5.55"
+version = "0.5.56"
 license = "Apache-2.0"
 rust-version = "1.88.0"
 # Apache-2.0 licensed but not (yet) published to crates.io: the workspace uses
