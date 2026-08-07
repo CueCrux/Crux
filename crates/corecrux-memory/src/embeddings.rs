@@ -1010,7 +1010,7 @@ struct OllamaEmbedResponse {
 /// read failed — silently, because the caller fell back to a BM25-only seal.
 /// Ingests of 776 / 839 / 872 chunks sealed lexical-only; 707 and 749 did not.
 /// At 128 texts the reply is ~1.6 MB at 1024 dims and ~5 MB even at 4096 dims,
-/// well inside [`EMBED_RESPONSE_BODY_LIMIT`].
+/// well inside the response cap this module now sets (`EMBED_RESPONSE_BODY_LIMIT`).
 pub const EMBED_MAX_TEXTS_PER_CALL: usize = 128;
 
 /// Response-body cap for one embedding call. Raised well above ureq's 10 MiB
