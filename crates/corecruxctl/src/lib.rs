@@ -130,21 +130,67 @@ pub(crate) mod test_support {
         let port = listener.local_addr().expect("addr").port();
         let handle = std::thread::spawn(move || {
             let mut captured = Vec::new();
-            for (status, body) in responses {
+            let mut pending = responses.into_iter();
+            let Some(mut current) = pending.next() else {
+                return captured;
+            };
+            loop {
                 let (mut stream, _) = match listener.accept() {
                     Ok(pair) => pair,
                     Err(_) => break,
                 };
-                captured.push(read_full_request(&mut stream));
+                let request = read_full_request(&mut stream);
+                if request.is_empty() {
+                    // A connection that carried no request: a pooled socket the
+                    // client opened and dropped, or a stray probe. Consuming a
+                    // scripted response for it shifts every later response by
+                    // one and ends the loop early, so the next real request
+                    // finds nothing listening and fails with ConnectionRefused
+                    // -- which reads as an unrelated flake. Don't count it.
+                    continue;
+                }
+                captured.push(request);
+                let (status, body) = (current.0, &current.1);
                 let resp = format!(
                     "HTTP/1.1 {status} S\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = stream.write_all(resp.as_bytes());
                 let _ = stream.flush();
+                match pending.next() {
+                    Some(next) => current = next,
+                    None => break,
+                }
             }
             captured
         });
         (port, handle)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::io::{Read as _, Write as _};
+
+        #[test]
+        fn a_connection_carrying_no_request_does_not_consume_a_response() {
+            let (port, handle) = super::serve_responses(vec![(200, r#"{"ok":true}"#.to_string())]);
+
+            // Phantom connection: connect, send nothing, close.
+            drop(std::net::TcpStream::connect(("127.0.0.1", port)).expect("phantom connect"));
+
+            // The single scripted response must still be waiting for the real
+            // request. Before the guard, the phantom consumed it, the accept
+            // loop ended, and this connect failed with ConnectionRefused.
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("real connect");
+            stream
+                .write_all(b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}")
+                .expect("write request");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).expect("read response");
+            assert!(response.contains("200"), "real request got: {response}");
+
+            let captured = handle.join().expect("join stub");
+            assert_eq!(captured.len(), 1, "only the real request should be captured");
+        }
     }
 }
