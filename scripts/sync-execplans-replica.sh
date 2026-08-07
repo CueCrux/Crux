@@ -41,22 +41,20 @@
 # Usage:
 #   scripts/sync-execplans-replica.sh [--dry-run]
 #
-#   EXECPLANS_SRC   local plans dir   (default: ../PlanCrux/.agent/execplans)
+#   EXECPLANS_SRC   local plans dir   (required: the .agent/execplans dir of your plans repo)
 #   EXECPLANS_DEST  rsync destination (default: root@crux:/srv/plancrux-execplans/)
 #
 # Additive by design: no `--delete`. A plan removed upstream lingers in the
 # replica rather than vanishing from the board mid-session; prune deliberately.
 set -euo pipefail
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-src="${EXECPLANS_SRC:-$root/../PlanCrux/.agent/execplans}"
+src="${EXECPLANS_SRC:?set it to the .agent/execplans directory of your planning repo}"
 dest="${EXECPLANS_DEST:-root@crux:/srv/plancrux-execplans/}"
 dry=""
 [ "${1:-}" = "--dry-run" ] && dry="--dry-run"
 
 if [ ! -d "$src" ]; then
   echo "error: plans dir not found: $src" >&2
-  echo "  set EXECPLANS_SRC to your PlanCrux .agent/execplans directory" >&2
   exit 1
 fi
 
