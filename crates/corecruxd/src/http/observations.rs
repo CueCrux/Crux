@@ -204,50 +204,12 @@ struct CloudWitnessRecordV1 {
     test_upstream: bool,
 }
 
-/// Receipt envelope returned to the caller.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(super) struct ReceiptEnvelopeV1 {
-    pub alg: String,
-    pub signed_by: String,
-    pub body_hash: String,
-    pub signature: String,
-}
-
-/// Persisted record (one JSONL line). Phase 2 M5e: carries `seq` + `prev_hash`
-/// so the JSONL is sequence-level tamper-evident — removing or reordering any
-/// line breaks the chain. `prev_hash` is `None` for the first record of a
-/// chain (`seq == Some(0)`); subsequent records carry the previous record's
-/// `body_hash` (the hex part after the `blake3:` prefix).
-///
-/// **Backwards compatibility**: both fields are `Option`-typed with
-/// `skip_serializing_if = "Option::is_none"`. Pre-M5e records on disk had
-/// neither field; re-reading them yields `seq == None, prev_hash == None`
-/// and re-serialising omits both, so the original signature remains valid.
-/// A session's chain may therefore have a "legacy prefix" of unchained
-/// records followed by a "chained suffix" starting at `seq == Some(0)`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct ObservationRecordV1 {
-    pub observation_id: String,
-    pub session_id: String,
-    pub ts: DateTime<Utc>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_ts: Option<DateTime<Utc>>,
-    pub provider: String,
-    pub principal: String,
-    pub kind: String,
-    pub payload: serde_json::Value,
-    /// Monotonic 0-based index of this record within the chained suffix of
-    /// the session's JSONL. `None` for pre-M5e legacy records. Verifiers
-    /// reject gaps within a chained suffix (`seq` must be contiguous).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seq: Option<u64>,
-    /// `body_hash` of the previous record in this session (hex, no prefix).
-    /// `None` iff this is the first record of a chained suffix, or the
-    /// record is a pre-M5e legacy record.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prev_hash: Option<String>,
-    pub receipt: ReceiptEnvelopeV1,
-}
+/// Receipt envelope and persisted record now live in `corecrux-receipts` so
+/// `corecruxctl` can verify them too — `corecruxd` is a bin-only crate, so a
+/// CLI verifier would otherwise need a second copy of the signature check.
+/// The canonicalisation these depend on is wire format; see
+/// `corecrux_receipts::observation_envelope`.
+pub(super) use corecrux_receipts::{ObservationRecordV1, ReceiptEnvelopeV1};
 
 /// POST response (singleton).
 #[derive(Debug, Clone, Serialize)]
@@ -478,11 +440,7 @@ fn should_stream_observation_to_dataplane(scoped_session_id: &str) -> bool {
 /// only thing that travels through the hash is the bytes produced by this
 /// same operation.
 pub(super) fn canonical_body_bytes(record: &ObservationRecordV1) -> Result<Vec<u8>, String> {
-    let mut value = serde_json::to_value(record).map_err(|err| format!("to_value: {err}"))?;
-    if let serde_json::Value::Object(obj) = &mut value {
-        obj.remove("receipt");
-    }
-    serde_json::to_vec(&value).map_err(|err| format!("canonicalise observation body: {err}"))
+    corecrux_receipts::canonical_body_bytes(record)
 }
 
 fn mint_receipt(state: &AppState, body_bytes: &[u8]) -> Result<ReceiptEnvelopeV1, (StatusCode, String)> {
@@ -2423,6 +2381,19 @@ mod tests {
             },
         };
         let bytes = canonical_body_bytes(&record).unwrap();
+
+        // GOLDEN VECTOR. These bytes are what every observation signature on
+        // disk was computed over, so this hash is a wire-format constant, not
+        // an implementation detail. If a refactor changes it — field order, a
+        // skip_serializing_if, moving the type to another crate — every
+        // receipt ever minted stops verifying. Never "fix" this by updating
+        // the constant.
+        assert_eq!(
+            format!("blake3:{}", hex::encode(blake3::hash(&bytes).as_bytes())),
+            "blake3:13c40869de39a4a8702082024ef6bf01ab3af149edd4966302f69716bbe4f287",
+            "observation canonical body bytes changed — existing signatures would break"
+        );
+
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(parsed.get("receipt").is_none(), "receipt must not be in canonical body");
         assert_eq!(parsed["observation_id"], "obs-1");
@@ -4479,6 +4450,121 @@ mod tests {
         assert_eq!(records[0].observation_id, observation_id);
         assert_eq!(records[0].kind, "gc_swept");
         assert_eq!(records[0].principal, "operator");
+    }
+
+    // ── Governance receipt verification (CE, no dataplane) ───────────────
+
+    /// Mint a real governance receipt and resolve it back through the
+    /// verifier a CPU-only deployment actually uses.
+    #[test]
+    fn governance_receipt_resolves_and_verifies_without_a_dataplane() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        let receipt_id = mint_governance_receipt(
+            &state,
+            "__governance__::erasure",
+            "operator",
+            "erasure.forget_tenant_corpus",
+            &serde_json::json!({ "tenant_id": "MarketResearch", "docs_masked": 7075 }),
+        )
+        .expect("governance receipt must mint");
+
+        let found = super::super::receipts::local_governance_receipt_verification(&state, &receipt_id)
+            .expect("resolver must not error")
+            .expect("the receipt it just minted must resolve");
+
+        assert!(
+            found.verification.signature_valid,
+            "{:?}",
+            found.verification.failure_reason
+        );
+        assert!(found.verification.chain_valid);
+        assert_eq!(found.tenant_id, "MarketResearch");
+        assert_eq!(found.verification.kind, "erasure.forget_tenant_corpus");
+        assert_eq!(found.verification.receipt_id, receipt_id);
+        assert_eq!(found.verification.signed_by, state.passport_fpr);
+    }
+
+    /// A tampered body must come back as an unverified *report*, not an
+    /// error and never a silent pass — this is the whole point of the
+    /// receipt.
+    #[test]
+    fn governance_receipt_with_a_tampered_body_fails_verification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        let receipt_id = mint_governance_receipt(
+            &state,
+            "__governance__::erasure",
+            "operator",
+            "erasure.forget_tenant_corpus",
+            &serde_json::json!({ "tenant_id": "MarketResearch", "docs_masked": 7075 }),
+        )
+        .expect("governance receipt must mint");
+
+        // Rewrite the docs count, leaving the signature untouched.
+        let path = observation_file_path(&state.data_dir, "__governance__::erasure");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, raw.replace("7075", "1")).unwrap();
+
+        let found = super::super::receipts::local_governance_receipt_verification(&state, &receipt_id)
+            .expect("resolver must not error")
+            .expect("the record is still present");
+        assert!(!found.verification.signature_valid);
+        assert!(found.verification.failure_reason.is_some());
+    }
+
+    #[test]
+    fn governance_receipt_lookup_of_an_unknown_id_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+        mint_governance_receipt(
+            &state,
+            "__governance__::erasure",
+            "operator",
+            "erasure.forget_tenant_corpus",
+            &serde_json::json!({ "tenant_id": "t" }),
+        )
+        .expect("governance receipt must mint");
+
+        assert!(
+            super::super::receipts::local_governance_receipt_verification(&state, "no-such-receipt")
+                .expect("resolver must not error")
+                .is_none()
+        );
+    }
+
+    /// The scan is bounded to `__governance__*` on purpose: a production
+    /// node carries tens of thousands of per-session observation logs
+    /// (59,022 against 5 mediation logs on host crux), so walking them all
+    /// on an audit lookup would be a denial-of-service surface.
+    ///
+    /// Asserted by planting a corrupt session log that `read_observations_strict`
+    /// would error on. If the resolver ever widens its filter, this stops
+    /// returning `None` and starts returning `Err`.
+    #[test]
+    fn governance_receipt_scan_never_opens_a_non_governance_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        let obs_dir = state.data_dir.join("observations");
+        std::fs::create_dir_all(&obs_dir).unwrap();
+        std::fs::write(
+            obs_dir.join("__agent_session__agent_anthropic__decoy.jsonl"),
+            "{ this is not a valid observation record\n",
+        )
+        .unwrap();
+
+        assert!(
+            super::super::receipts::local_governance_receipt_verification(&state, "anything")
+                .expect("a corrupt NON-governance log must never be read, so this must not error")
+                .is_none()
+        );
     }
 
     /// The durable append distinguishes "nothing was written" from "the line
