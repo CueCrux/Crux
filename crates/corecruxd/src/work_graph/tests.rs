@@ -247,6 +247,97 @@ fn a_prose_wikilink_is_never_an_edge() {
     assert_eq!(parsed2.depends_on, vec!["other-plan".to_string()]);
 }
 
+// ---- facets + the stat walk the cache keys off --------------------------
+
+#[test]
+fn facets_agree_with_the_direct_classifiers() {
+    // The endpoint serves cached facets; the tests above exercise the direct
+    // functions. If the two paths ever disagree, the cache silently changes what
+    // the board says — so pin them together.
+    let md = "# T\n\n## Purpose\n\nDo the thing with postgres postgres psql postgres.\n\n\
+              Depends on [[other-plan]]\n";
+    let slug = "wikicrux-thing-2026-01-01";
+    let f = facets_for(slug, md);
+    assert_eq!(f.plane, plane_for(slug, "", md));
+    assert_eq!(f.services, services_for(md));
+    assert_eq!(f.blurb, purpose_blurb(md, BLURB_CHARS));
+    assert_eq!(f.declared, vec!["other-plan".to_string()]);
+}
+
+#[test]
+fn facets_keep_the_title_signal_from_the_file() {
+    // The title is a scoring input. It is parsed from the plan, so the facets
+    // must read it from there — dropping it would change classifications, and
+    // taking it from the caller would put a scoring input outside the cache key.
+    let md = "# Paddle billing rails\n\n## Purpose\n\nSomething neutral.\n";
+    assert_eq!(facets_for("m4-followups-2026-01-01", md).plane, "Commerce");
+}
+
+#[test]
+fn the_stat_walk_sees_exactly_what_the_reader_sees() {
+    // Two enumerators over one directory. If they disagree the cache keys off a
+    // different file set than the projection reads, and plans go missing or stale.
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir")
+    };
+    let root = dir.path();
+    for (name, body) in [
+        ("alpha-2026-01-01.md", "# A\n\n## Purpose\n\nA.\n"),
+        ("beta-2026-01-01.md", "# B\n\n## Purpose\n\nB.\n"),
+        ("_scratch-2026-01-01.md", "# S\n\n## Purpose\n\nscratch.\n"),
+        ("notes.txt", "not a plan"),
+    ] {
+        if std::fs::write(root.join(name), body).is_err() {
+            panic!("write {name}");
+        }
+    }
+    let Ok(walked) = crate::work_execplans::walk_execplans_root(root) else {
+        panic!("walk")
+    };
+    let Ok(statted) = stat_execplans_root(root) else {
+        panic!("stat")
+    };
+    let mut a: Vec<String> = walked.into_iter().map(|f| f.slug).collect();
+    let mut b: Vec<String> = statted.iter().map(|s| s.slug.clone()).collect();
+    a.sort();
+    b.sort();
+    assert_eq!(a, b, "the stat walk and the reader must agree on the file set");
+    assert_eq!(a, vec!["alpha-2026-01-01".to_string(), "beta-2026-01-01".to_string()]);
+    // And the stat must carry the two fields the cache validates on.
+    for s in &statted {
+        assert!(s.len > 0, "stat must report a length for {}", s.slug);
+    }
+}
+
+#[test]
+fn editing_a_plan_changes_the_field_the_cache_validates_on() {
+    // The cache trusts (mtime, len). A content edit must move at least one of
+    // them, or a stale facet set would be served forever.
+    let Ok(dir) = tempfile::tempdir() else {
+        panic!("tempdir")
+    };
+    let p = dir.path().join("alpha-2026-01-01.md");
+    if std::fs::write(&p, "# A\n\n## Purpose\n\nShort.\n").is_err() {
+        panic!("write")
+    }
+    let Ok(before) = stat_execplans_root(dir.path()) else {
+        panic!("stat")
+    };
+    if std::fs::write(&p, "# A\n\n## Purpose\n\nA considerably longer purpose line.\n").is_err() {
+        panic!("rewrite")
+    }
+    let Ok(after) = stat_execplans_root(dir.path()) else {
+        panic!("stat")
+    };
+    let (Some(b0), Some(a0)) = (before.first(), after.first()) else {
+        panic!("expected one plan")
+    };
+    assert!(
+        a0.len != b0.len || a0.mtime_unix_ms != b0.mtime_unix_ms,
+        "an edit must move mtime or len, else the cache cannot notice it"
+    );
+}
+
 // ---- distribution guard (plan risk R2) -------------------------------------
 
 #[test]
