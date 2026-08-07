@@ -173,4 +173,61 @@ mod tests {
         let err = verify_observation_envelope(&fixture(), "someone-else", "00").expect_err("must refuse");
         assert!(err.contains("signer binding mismatch"), "{err}");
     }
+
+    /// Sign `fixture()` properly, the way the daemon does: blake3 over the
+    /// canonical body, then ed25519 over that digest.
+    fn signed_fixture() -> (ObservationRecordV1, String, String) {
+        use ed25519_dalek::{Signer as _, SigningKey};
+
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let public_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
+
+        let mut record = fixture();
+        record.receipt.signed_by = "fpr-signer".to_string();
+        record.receipt.alg = "ed25519".to_string();
+        let body = canonical_body_bytes(&record).expect("canonicalise");
+        let hash = blake3::hash(&body);
+        record.receipt.body_hash = format!("blake3:{}", hex::encode(hash.as_bytes()));
+        record.receipt.signature = hex::encode(signing_key.sign(hash.as_bytes()).to_bytes());
+        (record, "fpr-signer".to_string(), public_key_hex)
+    }
+
+    /// The happy path. Worth stating why it is not redundant with the
+    /// negative tests: both guard clauses in `verify_observation_envelope`
+    /// are `!=` comparisons, and inverting either one still rejects bad
+    /// input — it only breaks *good* input. Without a round-trip that
+    /// succeeds, an inverted check passes every negative test while
+    /// rejecting every real receipt. (Both inversions survived mutation
+    /// testing until this test existed.)
+    #[test]
+    fn a_correctly_signed_record_verifies() {
+        let (record, fpr, pubkey) = signed_fixture();
+        verify_observation_envelope(&record, &fpr, &pubkey).expect("a correctly signed record must verify");
+    }
+
+    #[test]
+    fn a_non_ed25519_algorithm_is_refused() {
+        let (mut record, fpr, pubkey) = signed_fixture();
+        record.receipt.alg = "ed448".to_string();
+        let err = verify_observation_envelope(&record, &fpr, &pubkey).expect_err("must refuse");
+        assert!(err.contains("signer binding mismatch"), "{err}");
+    }
+
+    #[test]
+    fn a_body_hash_that_does_not_bind_the_body_is_refused() {
+        let (mut record, fpr, pubkey) = signed_fixture();
+        record.receipt.body_hash = format!("blake3:{}", hex::encode([0u8; 32]));
+        let err = verify_observation_envelope(&record, &fpr, &pubkey).expect_err("must refuse");
+        assert!(err.contains("body hash mismatch"), "{err}");
+    }
+
+    /// A body edited after signing must fail even though the envelope is
+    /// internally consistent in every other respect.
+    #[test]
+    fn a_tampered_payload_is_refused() {
+        let (mut record, fpr, pubkey) = signed_fixture();
+        record.payload = serde_json::json!({"tool": "Write"});
+        let err = verify_observation_envelope(&record, &fpr, &pubkey).expect_err("must refuse");
+        assert!(err.contains("body hash mismatch"), "{err}");
+    }
 }
