@@ -54,3 +54,42 @@ Run `reconcile-execplan-status.sh --quiet` on **SessionStart** in both agents. I
 `scripts/reconcile-execplan-sessions.sh` is a **separate** detector covering a different drift class:
 orphan sessions (a registry entry with no `.md`) and unparseable plans. It also prints without
 mutating. See the `workspace-cuecrux` profile.
+
+## Keeping the daemon's replica current
+
+The drift guard above compares a plan's `Status:` line against derived state. It
+can only compare what the daemon can *see*, and what it sees is its own replica
+of `*.md` — `/v1/work` walks `CRUX_EXECPLANS_ROOT` on every request and
+re-projects. Nothing is pushed to it when you edit a plan.
+
+So there are two distinct failure modes, and they look identical from the board:
+
+| symptom | cause |
+|---|---|
+| plan's state is wrong | its `Status:` line drifted — the guard above catches this |
+| plan is **absent** | the replica never received the file |
+
+The second is the quiet one. A plan can be committed, pushed, and correct, and
+still be invisible because the daemon's copy predates it — no error anywhere.
+
+### If the deployment has git backing
+
+Set `CRUX_EXECPLANS_GIT_REMOTE` (+ `_BRANCH`, `_INTERVAL_SECS`, `_CHECKOUT`) and
+the replica maintains itself; `POST /v1/execplans/refresh` pulls on demand. Note
+`_CHECKOUT` is **the repository**, while the projection root is normally
+`<checkout>/.agent/execplans` — a mismatch is silent, and shows up only as an
+empty board.
+
+### If it does not
+
+`POST /v1/execplans/refresh` returns **409** — "git backing is not configured",
+which is deliberately distinct from a pull that ran and failed. The replica is
+then whatever was last copied there, and it ages silently.
+
+Use `scripts/sync-execplans-replica.sh` (`--dry-run` to preview). Run it after
+merging plan changes; the board re-projects on the next read, no restart.
+
+Measured on host `crux`: the replica went **four days stale and lost nine
+plans**, one of them complete, before anyone noticed — and eighteen hours later
+another ten files had changed. Treat a manual replica as a thing that stops
+happening, and prefer git backing wherever a credential allows it.
