@@ -15,7 +15,7 @@
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
 //
-// 193 read endpoints, generated from the route manifest.
+// 194 read endpoints, generated from the route manifest.
 
 /**
  * Append a plain query object to a path as a URL search string.

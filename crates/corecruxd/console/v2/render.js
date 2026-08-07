@@ -10945,16 +10945,35 @@
     return reqs.map(function (q) { return { from: q.from, to: q.to, pts: q.pts }; });
   }
 
-  // ---- paint -------------------------------------------------------------
-  // M3 landed the destination + the live read and summary; M4 draws the canvas
-  // underneath it. One read, through the GENERATED client (CruxApi.workGraph →
-  // GET /v1/work/graph), so render.js keeps zero raw network calls.
+  // ---- paint + interaction (M4 canvas, M5 polish) ------------------------
+  // M3 landed the destination + the live read and summary; M4 drew the canvas;
+  // M5 makes it operable: pan/zoom, a recency window, click a system to isolate
+  // it, click a card to raise it, all reachable from the keyboard.
+  //
+  // One read, through the GENERATED client (CruxApi.workGraph → GET
+  // /v1/work/graph), so render.js keeps zero raw network calls.
   //
   // Three honest states, kept distinct rather than collapsed into "no data":
   //   · read failed        — the daemon said no (status shown verbatim)
   //   · aggregator off     — 200 with zero plans: CRUX_EXECPLANS_ROOT is unset,
   //                          which is a configuration fact, not an error
   //   · verified empty     — plans exist but none are open
+
+  // Recency windows. 24h is the default because that is the question people
+  // ask, but on a real board it is often a thin signal (two plans, and no wire
+  // with BOTH ends inside it), so the wider windows are one click away rather
+  // than a code change.
+  var PB_WINDOWS = [
+    { h: 24, label: '24h' }, { h: 72, label: '3d' }, { h: 168, label: '7d' }, { h: 720, label: '30d' }
+  ];
+
+  function pbNow() { return Date.now(); }
+  function pbAgeHours(plan, now) {
+    var t = plan && plan.updated_at_unix_ms;
+    if (!t) { return Infinity; }
+    return Math.max(0, (now - t) / 3600000);
+  }
+
   function renderPatchbay(host, ctx) {
     host.textContent = '';
     var api = (typeof window !== 'undefined') ? window.CruxApi : null;
@@ -10991,30 +11010,56 @@
           return;
         }
 
-        var blurbs = 0, i;
+        var now = pbNow(), i;
+        var state = { plan: null, plane: null, live: PB_WINDOWS[0].h };
+
+        // Summary strip.
+        var blurbs = 0;
         for (i = 0; i < plans.length; i++) { if (plans[i].blurb) { blurbs++; } }
-        var stats = [
+        var strip = el('div', { 'class': 'v2card' });
+        var row = el('div', { 'class': 'ow-stat-row' });
+        var liveStat = null;
+        [
           { n: plans.length, l: 'open plans' },
           { n: planes.length, l: 'systems' },
           { n: (d.link_count || 0), l: 'declared edges' },
           { n: services.length, l: 'services touched' },
-          { n: blurbs, l: 'with a blurb' }
-        ];
-        var strip = el('div', { 'class': 'v2card' });
-        var row = el('div', { 'class': 'ow-stat-row' });
-        stats.forEach(function (s) {
-          row.appendChild(el('div', { 'class': 'ow-stat' }, [
-            el('b', { text: String(s.n) }), el('span', { text: s.l })
-          ]));
+          { n: blurbs, l: 'with a blurb' },
+          { n: 0, l: 'touched recently', live: true }
+        ].forEach(function (s) {
+          var b = el('b', { text: String(s.n) });
+          var cell = el('div', { 'class': 'ow-stat' }, [b, el('span', { text: s.l })]);
+          if (s.live) { liveStat = b; }
+          row.appendChild(cell);
         });
         strip.appendChild(row);
         host.appendChild(strip);
 
+        // Controls: the recency window, and a reset that clears any selection.
+        var bar = el('div', { 'class': 'pb-bar' });
+        bar.appendChild(el('span', { 'class': 'v2card-sub', text: 'Recently touched:' }));
+        var winBtns = [];
+        PB_WINDOWS.forEach(function (w) {
+          var btn = el('button', { type: 'button', 'class': 'pb-win', 'data-h': String(w.h), text: w.label });
+          btn.addEventListener('click', function () { state.live = w.h; applyAll(); });
+          winBtns.push(btn); bar.appendChild(btn);
+        });
+        var clearBtn = el('button', { type: 'button', 'class': 'pb-clear', text: 'Clear selection' });
+        clearBtn.addEventListener('click', function () { state.plan = null; state.plane = null; applyAll(); });
+        bar.appendChild(clearBtn);
+        host.appendChild(bar);
+
         var layout = patchbayLayout(d);
         var wires = patchbayRoutes(layout, d);
-        host.appendChild(pbCanvas(layout, wires));
+        var canvas = pbCanvas(layout, wires, state, function () { applyAll(); });
+        host.appendChild(canvas.svg);
 
-        // Legend — the canvas encodes state in colour, so name the encoding.
+        // Detail line — a selection that changes nothing but a highlight is a
+        // dead end, so name what is selected and why it matters.
+        var detail = el('p', { 'class': 'v2card-sub pb-detail' });
+        host.appendChild(detail);
+
+        // Legend.
         var legend = el('div', { 'class': 'v2card-sub pb-legend' });
         ['in_progress', 'blocked', 'planned', 'drafting'].forEach(function (st) {
           legend.appendChild(el('span', { 'class': 'pb-legend-item' }, [
@@ -11023,12 +11068,88 @@
           ]));
         });
         legend.appendChild(el('span', { 'class': 'pb-legend-item', text: 'wires are declared dependencies (Depends on / Extended by), not mentions' }));
+        legend.appendChild(el('span', { 'class': 'pb-legend-item', text: 'drag to pan · scroll to zoom · click a system to isolate it' }));
         host.appendChild(legend);
+
+        function applyAll() {
+          var fresh = {}, freshN = 0, p;
+          for (var k = 0; k < plans.length; k++) {
+            p = plans[k];
+            if (pbAgeHours(p, now) < state.live) { fresh[p.slug] = true; freshN++; }
+          }
+          if (liveStat) { liveStat.textContent = String(freshN); }
+          winBtns.forEach(function (b) {
+            var on = String(state.live) === b.getAttribute('data-h');
+            b.setAttribute('aria-pressed', on ? 'true' : 'false');
+            if (on) { b.classList.add('pb-on'); } else { b.classList.remove('pb-on'); }
+          });
+
+          // Focus set: a selected plan pulls in what it declares and what
+          // declares it; a selected system pulls in its members.
+          var focus = null;
+          if (state.plan) {
+            focus = {};
+            focus[state.plan] = true;
+            var sel = null;
+            for (k = 0; k < plans.length; k++) { if (plans[k].slug === state.plan) { sel = plans[k]; } }
+            if (sel) { (sel.links || []).forEach(function (l) { focus[l] = true; }); }
+            for (k = 0; k < plans.length; k++) {
+              if ((plans[k].links || []).indexOf(state.plan) >= 0) { focus[plans[k].slug] = true; }
+            }
+          } else if (state.plane) {
+            focus = {};
+            for (k = 0; k < plans.length; k++) { if (plans[k].plane === state.plane) { focus[plans[k].slug] = true; } }
+          }
+
+          canvas.chips.forEach(function (entry) {
+            var slug = entry.plan.slug;
+            var on = !focus || focus[slug];
+            if (on) { entry.node.classList.remove('pb-dim'); } else { entry.node.classList.add('pb-dim'); }
+            if (state.plan === slug) { entry.node.classList.add('pb-sel'); } else { entry.node.classList.remove('pb-sel'); }
+            // Freshness only reads while nothing is selected — a glow competing
+            // with a selection highlight says two things at once.
+            if (!focus && fresh[slug]) { entry.node.classList.add('pb-fresh'); } else { entry.node.classList.remove('pb-fresh'); }
+          });
+          canvas.wires.forEach(function (w) {
+            var hot = (state.plan && (w.from === state.plan || w.to === state.plan)) ||
+              (state.plane && focus && (focus[w.from] || focus[w.to]));
+            if (hot) { w.node.classList.add('pb-hot'); } else { w.node.classList.remove('pb-hot'); }
+            var bothFresh = !focus && fresh[w.from] && fresh[w.to];
+            if (bothFresh) { w.node.classList.add('pb-fresh'); } else { w.node.classList.remove('pb-fresh'); }
+          });
+          canvas.plates.forEach(function (pl) {
+            if (state.plane === pl.key) { pl.node.classList.add('pb-sel'); } else { pl.node.classList.remove('pb-sel'); }
+          });
+
+          // Detail text.
+          if (state.plan) {
+            var sp = null;
+            for (k = 0; k < plans.length; k++) { if (plans[k].slug === state.plan) { sp = plans[k]; } }
+            if (sp) {
+              var bits = [sp.title || sp.slug, sp.state,
+                (sp.milestones_total ? (sp.milestones_done || 0) + '/' + sp.milestones_total + ' milestones' : 'no milestones declared')];
+              if (sp.risk) { bits.push(sp.risk + ' risk'); }
+              if ((sp.links || []).length) { bits.push('depends on ' + sp.links.length); }
+              if ((sp.services || []).length) { bits.push('touches ' + sp.services.join(', ')); }
+              detail.textContent = bits.join(' · ') + (sp.blurb ? ' — ' + sp.blurb : '');
+            }
+          } else if (state.plane) {
+            var n = 0;
+            for (k = 0; k < plans.length; k++) { if (plans[k].plane === state.plane) { n++; } }
+            detail.textContent = state.plane + ' — ' + n + (n === 1 ? ' open plan' : ' open plans') + '. Click it again, or Clear selection, to show the whole board.';
+          } else {
+            detail.textContent = freshN
+              ? freshN + ' plan' + (freshN === 1 ? '' : 's') + ' touched in the last ' + state.live + 'h are lit; select a card or a system to isolate it.'
+              : 'Nothing touched in the last ' + state.live + 'h — widen the window, or select a card or a system to isolate it.';
+          }
+        }
+        applyAll();
       });
   }
 
-  // Build the SVG. Scales to the pane via viewBox — M5 adds pan/zoom.
-  function pbCanvas(layout, wires) {
+  // Build the SVG and wire interaction. Returns the node plus the handles the
+  // caller needs to restyle on selection, so selection logic stays out of here.
+  function pbCanvas(layout, wires, state, onChange) {
     var NS = 'http://www.w3.org/2000/svg';
     var doc0 = doc();
     function sv(tag, attrs) {
@@ -11045,71 +11166,170 @@
       'class': 'pb-canvas',
       viewBox: '0 0 ' + layout.W + ' ' + layout.H,
       preserveAspectRatio: 'xMidYMid meet',
-      role: 'img',
-      'aria-label': layout.chips.length + ' open plans grouped by system, wired to the services they touch'
+      role: 'group',
+      tabindex: '0',
+      'aria-label': layout.chips.length + ' open plans grouped by system, wired to the services they touch. Arrow keys pan, plus and minus zoom.'
     });
+    var root = sv('g', { 'class': 'pb-root' });
+    svg.appendChild(root);
     var gPlate = sv('g'), gWire = sv('g'), gLabel = sv('g'), gSvc = sv('g'), gChip = sv('g');
-    svg.appendChild(gPlate); svg.appendChild(gWire); svg.appendChild(gLabel);
-    svg.appendChild(gSvc); svg.appendChild(gChip);
-    var i;
+    root.appendChild(gPlate); root.appendChild(gWire); root.appendChild(gLabel);
+    root.appendChild(gSvc); root.appendChild(gChip);
+
+    var plates = [], chipsOut = [], wiresOut = [], i;
+
+    function selectPlane(key) {
+      state.plane = (state.plane === key) ? null : key;
+      state.plan = null;
+      if (onChange) { onChange(); }
+    }
+    function selectPlan(slug) {
+      state.plan = (state.plan === slug) ? null : slug;
+      state.plane = null;
+      if (onChange) { onChange(); }
+    }
+    function keyActivate(fn) {
+      return function (ev) {
+        var k = ev && ev.key;
+        if (k === 'Enter' || k === ' ' || k === 'Spacebar') {
+          if (ev.preventDefault) { ev.preventDefault(); }
+          fn();
+        }
+      };
+    }
 
     for (i = 0; i < layout.sections.length; i++) {
-      var s = layout.sections[i];
-      gPlate.appendChild(sv('rect', { 'class': 'pb-plate',
-        x: s.x - PB_PLATE, y: s.y - PB_PLATE, width: s.w + 2 * PB_PLATE, height: s.h + 2 * PB_PLATE, rx: 14 }));
+      (function (s) {
+        var g = sv('g', { 'class': 'pb-plate-g', tabindex: '0', role: 'button',
+          'aria-label': 'System ' + s.key + ', ' + s.n + ' open plans. Activate to isolate it.' });
+        var rect = sv('rect', { 'class': 'pb-plate',
+          x: s.x - PB_PLATE, y: s.y - PB_PLATE, width: s.w + 2 * PB_PLATE, height: s.h + 2 * PB_PLATE, rx: 14 });
+        g.appendChild(rect);
+        if (g.addEventListener) {
+          g.addEventListener('click', function () { selectPlane(s.key); });
+          g.addEventListener('keydown', keyActivate(function () { selectPlane(s.key); }));
+        }
+        gPlate.appendChild(g);
+        plates.push({ key: s.key, node: g });
+      }(layout.sections[i]));
     }
     for (i = 0; i < wires.length; i++) {
-      gWire.appendChild(sv('path', { 'class': 'pb-wire', d: pbRoundPath(wires[i].pts, PB_RADIUS) }));
+      var wnode = sv('path', { 'class': 'pb-wire', d: pbRoundPath(wires[i].pts, PB_RADIUS) });
+      gWire.appendChild(wnode);
+      wiresOut.push({ from: wires[i].from, to: wires[i].to, node: wnode });
     }
     for (i = 0; i < layout.centres.length; i++) {
-      var c = layout.centres[i];
-      gLabel.appendChild(sv('rect', { 'class': 'pb-centre', x: c.x, y: c.y, width: c.w, height: c.h, rx: 12 }));
-      var t = sv('text', { 'class': 'pb-centre-t', x: c.x + c.w / 2, y: c.y + c.h / 2 - 2, 'text-anchor': 'middle' });
-      t.textContent = c.key.toUpperCase();
-      gLabel.appendChild(t);
-      var t2 = sv('text', { 'class': 'pb-centre-n', x: c.x + c.w / 2, y: c.y + c.h / 2 + 14, 'text-anchor': 'middle' });
-      t2.textContent = c.n + (c.n === 1 ? ' plan' : ' plans');
-      gLabel.appendChild(t2);
+      (function (c) {
+        var g = sv('g', { 'class': 'pb-centre-g' });
+        g.appendChild(sv('rect', { 'class': 'pb-centre', x: c.x, y: c.y, width: c.w, height: c.h, rx: 12 }));
+        var t = sv('text', { 'class': 'pb-centre-t', x: c.x + c.w / 2, y: c.y + c.h / 2 - 2, 'text-anchor': 'middle' });
+        t.textContent = c.key.toUpperCase();
+        g.appendChild(t);
+        var t2 = sv('text', { 'class': 'pb-centre-n', x: c.x + c.w / 2, y: c.y + c.h / 2 + 14, 'text-anchor': 'middle' });
+        t2.textContent = c.n + (c.n === 1 ? ' plan' : ' plans');
+        g.appendChild(t2);
+        if (g.addEventListener) { g.addEventListener('click', function () { selectPlane(c.key); }); }
+        gLabel.appendChild(g);
+      }(layout.centres[i]));
     }
     for (i = 0; i < layout.services.length; i++) {
-      var sv2 = layout.services[i];
+      var s2 = layout.services[i];
       gSvc.appendChild(sv('rect', { 'class': 'pb-rail',
-        x: sv2.x - sv2.w / 2, y: sv2.y - PB_RAIL_H / 2, width: sv2.w, height: PB_RAIL_H, rx: 10 }));
-      var rt = sv('text', { 'class': 'pb-rail-t', x: sv2.x, y: sv2.y - 2, 'text-anchor': 'middle' });
-      rt.textContent = sv2.key;
-      gSvc.appendChild(rt);
-      var rn = sv('text', { 'class': 'pb-rail-n', x: sv2.x, y: sv2.y + 13, 'text-anchor': 'middle' });
-      rn.textContent = sv2.n + (sv2.n === 1 ? ' plan' : ' plans');
-      gSvc.appendChild(rn);
+        x: s2.x - s2.w / 2, y: s2.y - PB_RAIL_H / 2, width: s2.w, height: PB_RAIL_H, rx: 10 }));
+      var rt = sv('text', { 'class': 'pb-rail-t', x: s2.x, y: s2.y - 2, 'text-anchor': 'middle' });
+      rt.textContent = s2.key; gSvc.appendChild(rt);
+      var rn = sv('text', { 'class': 'pb-rail-n', x: s2.x, y: s2.y + 13, 'text-anchor': 'middle' });
+      rn.textContent = s2.n + (s2.n === 1 ? ' plan' : ' plans'); gSvc.appendChild(rn);
     }
     for (i = 0; i < layout.chips.length; i++) {
-      var ch = layout.chips[i], p = ch.plan;
-      var g = sv('g', { 'class': 'pb-chip', 'data-slug': p.slug, 'data-state': p.state });
-      g.appendChild(sv('rect', { 'class': 'pb-chip-bg', x: ch.x, y: ch.y, width: PB_CW, height: PB_CH, rx: 10 }));
-      g.appendChild(sv('rect', { x: ch.x, y: ch.y + 8, width: 3.5, height: PB_CH - 16,
-        fill: pbStateColor(p.state) }));
-      var lines = pbWrap(p.title || p.slug, 21, 3), li;
-      for (li = 0; li < lines.length; li++) {
-        var ln = sv('text', { 'class': 'pb-chip-t', x: ch.x + 11, y: ch.y + 17 + li * 13 });
-        ln.textContent = lines[li];
-        g.appendChild(ln);
-      }
-      var done = p.milestones_done || 0, total = p.milestones_total || 0;
-      var bx = ch.x + 12, by = ch.y + PB_CH - 27, bw = PB_CW - 24;
-      g.appendChild(sv('rect', { 'class': 'pb-meter', x: bx, y: by, width: bw, height: 6, rx: 3 }));
-      if (total > 0) {
-        g.appendChild(sv('rect', { x: bx, y: by, width: Math.max(4, bw * done / total), height: 6, rx: 3,
-          fill: pbStateColor(p.state) }));
-      }
-      var meta = sv('text', { 'class': 'pb-chip-m', x: bx, y: by + 16 });
-      meta.textContent = (total ? done + '/' + total : '—') + (p.current_milestone ? ' · ' + p.current_milestone : '');
-      g.appendChild(meta);
-      var title = sv('title');
-      title.textContent = (p.title || p.slug) + ' — ' + p.state + (p.blurb ? '\n' + p.blurb : '');
-      g.appendChild(title);
-      gChip.appendChild(g);
+      (function (ch) {
+        var p = ch.plan;
+        var g = sv('g', { 'class': 'pb-chip', 'data-slug': p.slug, 'data-state': p.state,
+          tabindex: '0', role: 'button',
+          'aria-label': (p.title || p.slug) + '. ' + p.state + '. ' +
+            (p.milestones_total ? (p.milestones_done || 0) + ' of ' + p.milestones_total + ' milestones.' : 'No milestones declared.') });
+        g.appendChild(sv('rect', { 'class': 'pb-chip-bg', x: ch.x, y: ch.y, width: PB_CW, height: PB_CH, rx: 10 }));
+        g.appendChild(sv('rect', { x: ch.x, y: ch.y + 8, width: 3.5, height: PB_CH - 16, fill: pbStateColor(p.state) }));
+        var lines = pbWrap(p.title || p.slug, 21, 3), li;
+        for (li = 0; li < lines.length; li++) {
+          var ln = sv('text', { 'class': 'pb-chip-t', x: ch.x + 11, y: ch.y + 17 + li * 13 });
+          ln.textContent = lines[li];
+          g.appendChild(ln);
+        }
+        var done = p.milestones_done || 0, total = p.milestones_total || 0;
+        var bx = ch.x + 12, by = ch.y + PB_CH - 27, bw = PB_CW - 24;
+        g.appendChild(sv('rect', { 'class': 'pb-meter', x: bx, y: by, width: bw, height: 6, rx: 3 }));
+        if (total > 0) {
+          g.appendChild(sv('rect', { x: bx, y: by, width: Math.max(4, bw * done / total), height: 6, rx: 3,
+            fill: pbStateColor(p.state) }));
+        }
+        var meta = sv('text', { 'class': 'pb-chip-m', x: bx, y: by + 16 });
+        meta.textContent = (total ? done + '/' + total : '—') + (p.current_milestone ? ' · ' + p.current_milestone : '');
+        g.appendChild(meta);
+        var title = sv('title');
+        title.textContent = (p.title || p.slug) + ' — ' + p.state + (p.blurb ? '\n' + p.blurb : '');
+        g.appendChild(title);
+        if (g.addEventListener) {
+          g.addEventListener('click', function () { selectPlan(p.slug); });
+          g.addEventListener('keydown', keyActivate(function () { selectPlan(p.slug); }));
+        }
+        gChip.appendChild(g);
+        chipsOut.push({ plan: p, node: g });
+      }(layout.chips[i]));
     }
-    return svg;
+
+    // Pan + zoom. Kept to a transform on one group so nothing re-lays out, and
+    // mirrored onto the keyboard so the canvas is not mouse-only.
+    var view = { x: 0, y: 0, k: 1 };
+    function paint() {
+      if (root.setAttribute) {
+        root.setAttribute('transform', 'translate(' + view.x.toFixed(1) + ',' + view.y.toFixed(1) + ') scale(' + view.k.toFixed(3) + ')');
+      }
+    }
+    function zoomBy(f) {
+      var k2 = Math.min(6, Math.max(0.4, view.k * f));
+      // Zoom about the canvas centre — without a real layout box (the console
+      // scales the SVG by viewBox) the centre is the honest anchor.
+      var cx = layout.W / 2, cy = layout.H / 2;
+      view.x = cx - (cx - view.x) * (k2 / view.k);
+      view.y = cy - (cy - view.y) * (k2 / view.k);
+      view.k = k2; paint();
+    }
+    if (svg.addEventListener) {
+      var drag = null;
+      svg.addEventListener('wheel', function (ev) {
+        if (ev.preventDefault) { ev.preventDefault(); }
+        zoomBy((ev.deltaY || 0) < 0 ? 1.12 : 1 / 1.12);
+      });
+      svg.addEventListener('pointerdown', function (ev) {
+        drag = { x: ev.clientX || 0, y: ev.clientY || 0, vx: view.x, vy: view.y };
+        if (svg.setPointerCapture && ev.pointerId != null) { svg.setPointerCapture(ev.pointerId); }
+      });
+      svg.addEventListener('pointermove', function (ev) {
+        if (!drag) { return; }
+        var scale = layout.W / 1000;                    // viewBox units per screen px, approx
+        view.x = drag.vx + ((ev.clientX || 0) - drag.x) * scale;
+        view.y = drag.vy + ((ev.clientY || 0) - drag.y) * scale;
+        paint();
+      });
+      svg.addEventListener('pointerup', function () { drag = null; });
+      svg.addEventListener('pointercancel', function () { drag = null; });
+      svg.addEventListener('keydown', function (ev) {
+        var k = ev && ev.key, step = 90;
+        if (k === 'ArrowLeft') { view.x += step; } else if (k === 'ArrowRight') { view.x -= step; }
+        else if (k === 'ArrowUp') { view.y += step; } else if (k === 'ArrowDown') { view.y -= step; }
+        else if (k === '+' || k === '=') { zoomBy(1.2); return; }
+        else if (k === '-' || k === '_') { zoomBy(1 / 1.2); return; }
+        else if (k === '0') { view.x = 0; view.y = 0; view.k = 1; }
+        else if (k === 'Escape') { state.plan = null; state.plane = null; if (onChange) { onChange(); } return; }
+        else { return; }
+        if (ev.preventDefault) { ev.preventDefault(); }
+        paint();
+      });
+    }
+    paint();
+
+    return { svg: svg, chips: chipsOut, wires: wiresOut, plates: plates, view: view, zoomBy: zoomBy };
   }
 
   // Wrap a label into at most `max` lines of ~`width` chars, on word bounds.

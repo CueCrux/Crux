@@ -3163,7 +3163,36 @@
   .pb-legend { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin-top: 6px; }
   .pb-legend-item { display: inline-flex; align-items: center; gap: 6px; }
   .pb-swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
-  @media (prefers-reduced-motion: reduce) { .pb-canvas { transition: none; } }
+
+  /* M5 — interaction. A card lifts when selected; everything outside the focus
+     recedes rather than disappearing, so the board keeps its shape. */
+  .pb-chip, .pb-plate-g { cursor: pointer; }
+  .pb-chip { transform-box: fill-box; transform-origin: center;
+             transition: transform .18s cubic-bezier(.34,1.4,.5,1), opacity .16s ease; }
+  .pb-chip:hover { transform: scale(1.025); }
+  .pb-chip.pb-sel { transform: scale(1.07); }
+  .pb-chip.pb-sel .pb-chip-bg { stroke: var(--acc); stroke-width: 2;
+                                filter: drop-shadow(0 6px 8px rgba(0,0,0,.42)); }
+  .pb-chip.pb-dim, .pb-wire.pb-dim { opacity: .13; }
+  .pb-plate-g.pb-sel .pb-plate { stroke: var(--acc); stroke-width: 1.5; }
+  .pb-wire { transition: opacity .16s ease; }
+  .pb-wire.pb-hot { opacity: 1; stroke-width: 2.8; }
+  /* Recently touched, and only while nothing is selected — a glow competing
+     with a selection highlight says two things at once. */
+  .pb-chip.pb-fresh .pb-chip-bg { stroke: var(--ok); filter: drop-shadow(0 0 5px var(--ok)); }
+  .pb-wire.pb-fresh { stroke: var(--ok); opacity: .95; stroke-width: 2.4; }
+  .pb-canvas:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+  .pb-chip:focus-visible .pb-chip-bg, .pb-plate-g:focus-visible .pb-plate {
+    stroke: var(--acc); stroke-width: 2; }
+  .pb-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 6px 0 2px; }
+  .pb-win, .pb-clear { font: inherit; font-size: 11px; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--edge); background: var(--surface); color: var(--ink2); cursor: pointer; }
+  .pb-win.pb-on { background: var(--acc); border-color: var(--acc); color: var(--bg); font-weight: 600; }
+  .pb-detail { margin-top: 4px; min-height: 1.4em; }
+  @media (prefers-reduced-motion: reduce) {
+    .pb-chip, .pb-wire { transition: none; }
+    .pb-chip:hover, .pb-chip.pb-sel { transform: none; }
+  }
 
   .act-row { border: 1px solid var(--edge); border-left: 4px solid var(--ink3); border-radius:10px; padding: 10px 13px; background: var(--surface); cursor: pointer; }
   .act-row:hover { border-color: var(--edge-strong); }

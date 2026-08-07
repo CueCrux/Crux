@@ -1788,6 +1788,97 @@ function extractThemeVars(theme) {
       check(false, '[patchbay] renderPatchbay drive threw: ' + (e && e.stack || e));
     }));
 
+    // 1b. M5 interaction: freshness, selection, isolation and keyboard reach.
+    // Driven through the CAPTURED handlers, so a control that exists only as a
+    // painted node with no behaviour fails here.
+    const nowMs = Date.now();
+    const pbLiveFixture = {
+      plans: [
+        { id: 'execplan:f1', slug: 'f1', title: 'Fresh one', state: 'in_progress', plane: 'Crux daemon',
+          services: [], links: ['f2'], milestones_done: 1, milestones_total: 3,
+          updated_at_unix_ms: nowMs - 2 * 3600000 },                       // 2h — fresh
+        { id: 'execplan:f2', slug: 'f2', title: 'Fresh two', state: 'planned', plane: 'Crux daemon',
+          services: [], links: [], milestones_done: 0, milestones_total: 3,
+          updated_at_unix_ms: nowMs - 5 * 3600000 },                       // 5h — fresh
+        { id: 'execplan:s1', slug: 's1', title: 'Stale one', state: 'blocked', plane: 'Commerce',
+          services: [], links: [], milestones_done: 2, milestones_total: 4,
+          updated_at_unix_ms: nowMs - 40 * 24 * 3600000 }                  // 40d — stale
+      ],
+      planes: [{ key: 'Crux daemon', n: 2 }, { key: 'Commerce', n: 1 }],
+      services: [], link_count: 1
+    };
+    const pbLiveHost = mkNode('div');
+    global.window = { CruxApi: { workGraph: function () { return pbRes(true, 200, pbLiveFixture); } } };
+    asyncChecks.push(Promise.resolve(render.renderPatchbay(pbLiveHost, {})).then(function () {
+      const nodes = function () { return collectNodes(pbLiveHost, [pbLiveHost]); };
+      const byClass = function (c) {
+        return nodes().filter(function (n) { return String(n.className || '').split(/\s+/).indexOf(c) >= 0; });
+      };
+      // Freshness: only the two recent cards glow, and the wire between them
+      // greens because BOTH ends are inside the window.
+      check(byClass('pb-fresh').length === 3,
+        '[patchbay] at 24h exactly the two recent cards and the wire joining them must read as fresh (got ' + byClass('pb-fresh').length + ')');
+      const chips = byClass('pb-chip');
+      check(chips.length === 3, '[patchbay] all three cards must paint');
+      // Keyboard reach: every card and every plate is focusable and activatable.
+      check(chips.every(function (n) { return n.getAttribute('tabindex') === '0'; }),
+        '[patchbay] every card must be keyboard focusable');
+      check(chips.every(function (n) { return (n.getAttribute('aria-label') || '').length > 0; }),
+        '[patchbay] every card must carry an aria-label naming its plan and state');
+      check(byClass('pb-plate-g').every(function (n) { return n.getAttribute('tabindex') === '0'; }),
+        '[patchbay] every system plate must be keyboard focusable');
+      const canvasNode = byClass('pb-canvas')[0];
+      check(!!canvasNode && canvasNode.getAttribute('tabindex') === '0',
+        '[patchbay] the canvas itself must be focusable so pan/zoom is not mouse-only');
+
+      // Selecting a card isolates it plus what it declares; the third card dims.
+      const f1 = chips.filter(function (n) { return n.getAttribute('data-slug') === 'f1'; })[0];
+      check(!!f1, '[patchbay] cards must carry data-slug');
+      f1.click();
+      check(String(f1.className).indexOf('pb-sel') >= 0,
+        '[patchbay] activating a card must select it (the lift is the feedback)');
+      const dimmed = byClass('pb-dim').map(function (n) { return n.getAttribute('data-slug'); });
+      check(dimmed.indexOf('s1') >= 0 && dimmed.indexOf('f2') < 0,
+        '[patchbay] selecting a card must isolate it and what it declares, dimming the rest (dimmed: ' + dimmed.join(',') + ')');
+      check(byClass('pb-fresh').length === 0,
+        '[patchbay] freshness must go quiet while something is selected — two highlights at once say two things');
+      check(byClass('pb-hot').length === 1,
+        '[patchbay] the selected card\'s wire must light up');
+
+      // Selecting the same card again clears it.
+      f1.click();
+      check(byClass('pb-sel').length === 0, '[patchbay] activating a selected card again must clear the selection');
+      check(byClass('pb-dim').length === 0, '[patchbay] clearing the selection must restore the whole board');
+
+      // Clicking a system isolates its members.
+      const plate = byClass('pb-plate-g')[0];
+      plate.click();
+      const dimmed2 = byClass('pb-dim').map(function (n) { return n.getAttribute('data-slug'); });
+      check(dimmed2.length > 0, '[patchbay] activating a system must isolate it');
+      // Keyboard activation must do the same thing as a click.
+      plate.click();
+      const kchips = byClass('pb-chip');
+      const target = kchips.filter(function (n) { return n.getAttribute('data-slug') === 's1'; })[0];
+      (target._handlers.keydown || []).forEach(function (fn) { fn({ key: 'Enter', preventDefault: function () {} }); });
+      check(String(target.className).indexOf('pb-sel') >= 0,
+        '[patchbay] Enter on a focused card must select it, exactly as a click does');
+
+      // The recency window is a control, not a constant: widening it must make
+      // the stale card read as fresh once nothing is selected.
+      const winBtns = byClass('pb-win');
+      check(winBtns.length >= 3, '[patchbay] the recency window must be switchable (24h is often a thin signal)');
+      byClass('pb-clear')[0].click();
+      const wide = winBtns.filter(function (b) { return b.getAttribute('data-h') === '720'; })[0];
+      check(!!wide, '[patchbay] a 30d window must be offered');
+      wide.click();
+      check(byClass('pb-fresh').length >= 3,
+        '[patchbay] widening the window must light the older card too');
+      check(String(wide.className).indexOf('pb-on') >= 0 && wide.getAttribute('aria-pressed') === 'true',
+        '[patchbay] the active window button must be marked pressed');
+    }).catch(function (e) {
+      check(false, '[patchbay] renderPatchbay interaction drive threw: ' + (e && e.stack || e));
+    }));
+
     // 2. aggregator off (200 + zero plans) is a CONFIGURATION statement
     const pbEmptyHost = mkNode('div');
     global.window = { CruxApi: { workGraph: function () { return pbRes(true, 200, { plans: [], planes: [], services: [], link_count: 0 }); } } };
