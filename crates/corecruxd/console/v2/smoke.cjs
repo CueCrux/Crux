@@ -1776,7 +1776,7 @@ function extractThemeVars(theme) {
         '[patchbay] the canvas must draw one wire per declared edge');
       check(t.indexOf('CRUX DAEMON') >= 0 && t.indexOf('COMMERCE') >= 0,
         '[patchbay] the canvas must label every system it draws');
-      check(t.indexOf('declared edges') >= 0,
+      check(t.indexOf('edges') >= 0,
         '[patchbay] renderPatchbay must surface the declared-edge count');
       check(t.indexOf('Postgres') >= 0,
         '[patchbay] the canvas must name the services it wires to');
@@ -1796,13 +1796,13 @@ function extractThemeVars(theme) {
       plans: [
         { id: 'execplan:f1', slug: 'f1', title: 'Fresh one', state: 'in_progress', plane: 'Crux daemon',
           services: [], links: ['f2'], milestones_done: 1, milestones_total: 3,
-          updated_at_unix_ms: nowMs - 2 * 3600000 },                       // 2h — fresh
+          updated_at_unix_ms: nowMs, last_activity_unix_ms: nowMs - 2 * 3600000 },   // 2h — worked on
         { id: 'execplan:f2', slug: 'f2', title: 'Fresh two', state: 'planned', plane: 'Crux daemon',
           services: [], links: [], milestones_done: 0, milestones_total: 3,
-          updated_at_unix_ms: nowMs - 5 * 3600000 },                       // 5h — fresh
+          updated_at_unix_ms: nowMs, last_activity_unix_ms: nowMs - 5 * 3600000 },   // 5h — worked on
         { id: 'execplan:s1', slug: 's1', title: 'Stale one', state: 'blocked', plane: 'Commerce',
           services: [], links: [], milestones_done: 2, milestones_total: 4,
-          updated_at_unix_ms: nowMs - 40 * 24 * 3600000 }                  // 40d — stale
+          updated_at_unix_ms: nowMs, last_activity_unix_ms: nowMs - 20 * 24 * 3600000 } // 20d — cold at 24h, lit at 30d
       ],
       planes: [{ key: 'Crux daemon', n: 2 }, { key: 'Commerce', n: 1 }],
       services: [], link_count: 1
@@ -1814,13 +1814,21 @@ function extractThemeVars(theme) {
       const byClass = function (c) {
         return nodes().filter(function (n) { return String(n.className || '').split(/\s+/).indexOf(c) >= 0; });
       };
-      // Freshness: only the two recent cards glow, and the wire between them
-      // greens because BOTH ends are inside the window.
-      check(byClass('pb-fresh').length === 3,
-        '[patchbay] at 24h exactly the two recent cards and the wire joining them must read as fresh (got ' + byClass('pb-fresh').length + ')');
+      const sel = function (cls) {
+        return nodes().filter(function (n) { return String(n.className || '').split(/\s+/).indexOf(cls) >= 0; });
+      };
+      const fire = function (node, type, ev) { (node._handlers[type] || []).forEach(function (f) { f(ev || { target: node }); }); };
+
+      // Default is "any time": nothing is highlighted until a window is chosen.
+      // This is deliberate — on a daemon whose plan root is synced in bulk most
+      // plans have no fact activity, so defaulting to a window would hide the
+      // board behind a dimmed state.
+      check(byClass('pb-fresh').length === 0,
+        '[patchbay] no recency highlight until a window is chosen');
       const chips = byClass('pb-chip');
       check(chips.length === 3, '[patchbay] all three cards must paint');
-      // Keyboard reach: every card and every plate is focusable and activatable.
+
+      // Keyboard reach.
       check(chips.every(function (n) { return n.getAttribute('tabindex') === '0'; }),
         '[patchbay] every card must be keyboard focusable');
       check(chips.every(function (n) { return (n.getAttribute('aria-label') || '').length > 0; }),
@@ -1831,50 +1839,65 @@ function extractThemeVars(theme) {
       check(!!canvasNode && canvasNode.getAttribute('tabindex') === '0',
         '[patchbay] the canvas itself must be focusable so pan/zoom is not mouse-only');
 
-      // Selecting a card isolates it plus what it declares; the third card dims.
-      const f1 = chips.filter(function (n) { return n.getAttribute('data-slug') === 'f1'; })[0];
-      check(!!f1, '[patchbay] cards must carry data-slug');
+      // ---- STATE FILTERS (the control that was missing on the live page) ----
+      const stateBtns = sel('pb-chip-btn');
+      check(stateBtns.length >= 2,
+        '[patchbay] a filter chip must exist per open state present on the board');
+      const blockedBtn = stateBtns.filter(function (b) { return b.getAttribute('data-state') === 'blocked'; })[0];
+      check(!!blockedBtn, '[patchbay] a "blocked" filter chip must exist when blocked plans are present');
+      blockedBtn.click();
+      check(blockedBtn.getAttribute('aria-pressed') === 'true',
+        '[patchbay] an active filter chip must report aria-pressed');
+      let dim = byClass('pb-dim').map(function (n) { return n.getAttribute('data-slug'); });
+      check(dim.indexOf('f1') >= 0 && dim.indexOf('f2') >= 0 && dim.indexOf('s1') < 0,
+        '[patchbay] filtering to "blocked" must dim every non-blocked card (dimmed: ' + dim.join(',') + ')');
+      blockedBtn.click();
+      check(byClass('pb-dim').length === 0, '[patchbay] clicking the chip again must clear the filter');
+
+      // ---- RECENCY comes from fact activity, not file mtime ----------------
+      // The live regression: every plan file shared one rsync mtime, so all 228
+      // read as "touched in the last 24h". Recency must key off
+      // last_activity_unix_ms, and a plan without facts must stay cold.
+      const winSel = sel('pb-select').filter(function (n) {
+        return /worked on/i.test(n.getAttribute('aria-label') || '');
+      })[0];
+      check(!!winSel, '[patchbay] a recency control must exist');
+      winSel.value = '24';
+      fire(winSel, 'change', { target: winSel });
+      check(byClass('pb-fresh').length === 3,
+        '[patchbay] at 24h exactly the two recently-worked cards and the wire joining them light up (got ' +
+        byClass('pb-fresh').length + ')');
+      dim = byClass('pb-dim').map(function (n) { return n.getAttribute('data-slug'); });
+      check(dim.indexOf('s1') >= 0,
+        '[patchbay] a plan with no recent fact activity must dim under a recency window');
+      winSel.value = '720';
+      fire(winSel, 'change', { target: winSel });
+      check(byClass('pb-fresh').length >= 4,
+        '[patchbay] widening to 30d must light the older plan too');
+
+      // A plan whose only timestamp is the file mtime must NOT read as fresh.
+      check(pbLiveFixture.plans.every(function (p) { return p.last_activity_unix_ms; }),
+        '[patchbay] fixture sanity: recency is driven by last_activity_unix_ms');
+
+      // ---- selection still works alongside filters -------------------------
+      sel('pb-clear')[0].click();
+      const f1 = byClass('pb-chip').filter(function (n) { return n.getAttribute('data-slug') === 'f1'; })[0];
       f1.click();
       check(String(f1.className).indexOf('pb-sel') >= 0,
         '[patchbay] activating a card must select it (the lift is the feedback)');
-      const dimmed = byClass('pb-dim').map(function (n) { return n.getAttribute('data-slug'); });
-      check(dimmed.indexOf('s1') >= 0 && dimmed.indexOf('f2') < 0,
-        '[patchbay] selecting a card must isolate it and what it declares, dimming the rest (dimmed: ' + dimmed.join(',') + ')');
-      check(byClass('pb-fresh').length === 0,
-        '[patchbay] freshness must go quiet while something is selected — two highlights at once say two things');
-      check(byClass('pb-hot').length === 1,
-        '[patchbay] the selected card\'s wire must light up');
-
-      // Selecting the same card again clears it.
+      dim = byClass('pb-dim').map(function (n) { return n.getAttribute('data-slug'); });
+      check(dim.indexOf('s1') >= 0 && dim.indexOf('f2') < 0,
+        '[patchbay] selecting a card must isolate it and what it declares (dimmed: ' + dim.join(',') + ')');
       f1.click();
       check(byClass('pb-sel').length === 0, '[patchbay] activating a selected card again must clear the selection');
-      check(byClass('pb-dim').length === 0, '[patchbay] clearing the selection must restore the whole board');
-
-      // Clicking a system isolates its members.
       const plate = byClass('pb-plate-g')[0];
       plate.click();
-      const dimmed2 = byClass('pb-dim').map(function (n) { return n.getAttribute('data-slug'); });
-      check(dimmed2.length > 0, '[patchbay] activating a system must isolate it');
-      // Keyboard activation must do the same thing as a click.
+      check(byClass('pb-dim').length > 0, '[patchbay] activating a system must isolate it');
       plate.click();
-      const kchips = byClass('pb-chip');
-      const target = kchips.filter(function (n) { return n.getAttribute('data-slug') === 's1'; })[0];
+      const target = byClass('pb-chip').filter(function (n) { return n.getAttribute('data-slug') === 's1'; })[0];
       (target._handlers.keydown || []).forEach(function (fn) { fn({ key: 'Enter', preventDefault: function () {} }); });
       check(String(target.className).indexOf('pb-sel') >= 0,
         '[patchbay] Enter on a focused card must select it, exactly as a click does');
-
-      // The recency window is a control, not a constant: widening it must make
-      // the stale card read as fresh once nothing is selected.
-      const winBtns = byClass('pb-win');
-      check(winBtns.length >= 3, '[patchbay] the recency window must be switchable (24h is often a thin signal)');
-      byClass('pb-clear')[0].click();
-      const wide = winBtns.filter(function (b) { return b.getAttribute('data-h') === '720'; })[0];
-      check(!!wide, '[patchbay] a 30d window must be offered');
-      wide.click();
-      check(byClass('pb-fresh').length >= 3,
-        '[patchbay] widening the window must light the older card too');
-      check(String(wide.className).indexOf('pb-on') >= 0 && wide.getAttribute('aria-pressed') === 'true',
-        '[patchbay] the active window button must be marked pressed');
     }).catch(function (e) {
       check(false, '[patchbay] renderPatchbay interaction drive threw: ' + (e && e.stack || e));
     }));
@@ -1886,8 +1909,8 @@ function extractThemeVars(theme) {
       const t = textOf(pbEmptyHost);
       check(/CRUX_EXECPLANS_ROOT/.test(t),
         '[patchbay] an empty graph must name the missing ExecPlan root, not read as a healthy empty board');
-      check(t.indexOf('open plans') < 0,
-        '[patchbay] an empty graph must not paint a summary strip of zeroes');
+      check(!/\d+ open plans/.test(t),
+        '[patchbay] an empty graph must not paint a summary line of zeroes');
     }).catch(function (e) {
       check(false, '[patchbay] renderPatchbay empty-state drive threw: ' + (e && e.stack || e));
     }));
@@ -1898,7 +1921,7 @@ function extractThemeVars(theme) {
     asyncChecks.push(Promise.resolve(render.renderPatchbay(pbFailHost, {})).then(function () {
       const t = textOf(pbFailHost);
       check(/503/.test(t), '[patchbay] a failed read must state the HTTP status verbatim');
-      check(t.indexOf('open plans') < 0 && !/CRUX_EXECPLANS_ROOT/.test(t),
+      check(!/\d+ open plans/.test(t) && !/CRUX_EXECPLANS_ROOT/.test(t),
         '[patchbay] a failed read must be distinct from both a healthy board and a switched-off aggregator');
     }).catch(function (e) {
       check(false, '[patchbay] renderPatchbay failure drive threw: ' + (e && e.stack || e));

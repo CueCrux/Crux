@@ -3157,7 +3157,7 @@
   .pb-rail { fill: var(--surface2); stroke: var(--edge); stroke-width: 1; }
   .pb-rail-t { fill: var(--ink2); font-size: 10.5px; }
   .pb-rail-n { fill: var(--ink3); font-size: 9px; }
-  .pb-wire { fill: none; stroke: var(--acc); stroke-width: 1.8; opacity: .32;
+  .pb-wire { fill: none; stroke: var(--acc); stroke-width: 2; opacity: .55;
              stroke-linejoin: round; stroke-linecap: round; }
   .pb-chip:hover .pb-chip-bg { stroke: var(--acc); }
   .pb-legend { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin-top: 6px; }
@@ -3184,10 +3184,23 @@
   .pb-canvas:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
   .pb-chip:focus-visible .pb-chip-bg, .pb-plate-g:focus-visible .pb-plate {
     stroke: var(--acc); stroke-width: 2; }
-  .pb-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 6px 0 2px; }
-  .pb-win, .pb-clear { font: inherit; font-size: 11px; padding: 3px 9px; border-radius: 999px;
+  .pb-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 8px 0 4px;
+    padding: 8px 10px; border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface2); }
+  .pb-sum { font-size: 12px; color: var(--ink2); font-variant-numeric: tabular-nums;
+    margin-right: 6px; padding-right: 10px; border-right: 1px solid var(--edge); }
+  .pb-lbl { font-size: 9.5px; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--ink3); margin-left: 4px; }
+  .pb-chip-btn, .pb-clear { font: inherit; font-size: 11px; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--edge); background: var(--surface); color: var(--ink2); cursor: pointer;
+    display: inline-flex; align-items: center; gap: 6px; }
+  .pb-chip-btn:hover, .pb-clear:hover { border-color: var(--acc); color: var(--ink); }
+  .pb-chip-btn.pb-on { background: var(--acc); border-color: var(--acc); color: var(--bg); font-weight: 600; }
+  .pb-chip-btn.pb-on .pb-swatch { outline: 1px solid var(--bg); }
+  .pb-select { font: inherit; font-size: 11px; padding: 3px 6px; border-radius: var(--radius-sm);
     border: 1px solid var(--edge); background: var(--surface); color: var(--ink2); cursor: pointer; }
-  .pb-win.pb-on { background: var(--acc); border-color: var(--acc); color: var(--bg); font-weight: 600; }
+  .pb-chip-btn:focus-visible, .pb-clear:focus-visible, .pb-select:focus-visible {
+    outline: 2px solid var(--acc); outline-offset: 2px; }
   .pb-detail { margin-top: 4px; min-height: 1.4em; }
   @media (prefers-reduced-motion: reduce) {
     .pb-chip, .pb-wire { transition: none; }
