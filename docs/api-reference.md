@@ -158,9 +158,39 @@ understanding back to agents.
 | POST | `/v1/admin/actions` | Submit admin action (seal, scrub, verify, rebalance) | `admin:write` |
 | GET | `/v1/admin/actions/{actionId}` | Get admin action status | `admin:read` |
 | POST | `/v1/admin/stream-meta` | Update stream metadata | `admin:write` * |
+| GET | `/v1/admin/tenants/{tenantId}/footprint` | Segments, docs and bytes a tenant occupies in the retrieval corpus | `admin:read` † |
+| POST | `/v1/admin/forget-tenants` | Erase the named tenants' retrieval corpora (`/v1/admin/forget-tenant` is the singular alias) | `admin:write` † |
+| DELETE | `/v1/admin/forget-tenants/{tenantId}` | Lift a mask-only erasure | `admin:write` † |
 | POST | `/v1/internal/replication/segments` | Receive replicated segments | `replication:write` * |
 
 \* Requires a dataplane-enabled deployment. Returns 501 in Crux Daemon.
+
+† Requires `CORECRUXD_TENANT_ERASURE=1`; the routes 404 while it is unset.
+
+#### Tenant corpus erasure
+
+`POST /v1/admin/forget-tenants` takes `{"tenant_ids": ["…"], "reclaim": false}`.
+Empty ids are dropped and duplicates collapsed in first-seen order; the batch is
+capped at 4096, `__`-prefixed (reserved) tenant ids are refused, and `admin:write`
+is checked for **every** named tenant before anything is mutated — a partially
+authorised batch is `403` and erases nothing.
+
+Two layers:
+
+- **Layer 1 (default).** Segments sealed up to the current `watermark_segment_seq`
+  become invisible to that tenant, and the mask is persisted to
+  `<data_dir>/forgotten-tenants.json` before the response returns. Reversible via
+  the `DELETE` route. Anything ingested afterwards is served normally, so a corpus
+  can be erased and re-paved under the same tenant id.
+- **Layer 2 (`"reclaim": true`).** Additionally deletes the file group of every
+  segment whose documents all belong to that tenant. **Irreversible** — recovery is
+  restore-from-backup only. Segments shared with another tenant are never deleted;
+  they stay masked and are reported as `mixed_segments_retained`.
+
+Scope is the **retrieval corpus only**. A tenant's facts, sessions and activity
+rows are untouched, so the response says `corpus_erased`, not `tenant_forgotten`.
+Each tenant's erasure mints a signed governance receipt carrying counts, the
+watermark and the scope — never document content.
 
 ---
 

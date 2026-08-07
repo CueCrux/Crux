@@ -80,6 +80,7 @@ async fn handle_inner(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcEr
             Some(tenant_hash),
             &Bm25Params::default(),
             min_score,
+            index.forgotten_watermark(tenant_hash),
         );
         result
             .hits
