@@ -17,11 +17,11 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use corecruxctl::{
-    admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, compaction_sync, config_bundle, cost,
-    deploy_audit, evidence, explain, export, extensions, fixture_digest, gaps, hooks, identity_cli, incident, ingest,
-    inspect_receipt, learn, login, machine, memory, memory_pack, observe_ingest, openclaw, output_verify, parity,
-    projections, receipts, reconcile, replay, repo, session_sync, shard, shardmap, smoke, snapshot, stage1_import,
-    start, storage, structured_log, studio, tooling_env, verify_store,
+    admin, agent_wiring, audit_export, audit_pack, c2pa_x509, code_chain, code_health, compaction_sync, config_bundle,
+    cost, deploy_audit, evidence, explain, export, extensions, fixture_digest, gaps, hooks, identity_cli, incident,
+    ingest, inspect_receipt, learn, login, machine, memory, memory_pack, observe_ingest, openclaw, output_verify,
+    parity, projections, receipts, reconcile, replay, repo, session_sync, shard, shardmap, smoke, snapshot,
+    stage1_import, start, storage, structured_log, studio, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -80,6 +80,13 @@ enum Command {
         /// Static named token for CI / headless / air-gapped clients.
         #[arg(long)]
         token: Option<String>,
+        /// Wire one agent's config too: claude | codex | cursor.
+        ///
+        /// Claude Code is wired by `login` already; codex installs the stdio
+        /// bridge and registers it in ~/.codex/config.toml; cursor writes
+        /// ~/.cursor/mcp.json. All merges, never overwrites, and idempotent.
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
     },
 
     /// (advanced) Authenticate to a Crux Daemon, auto-selecting the lowest-friction secure rail.
@@ -2617,7 +2624,10 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             network_exposed,
             json,
         }),
-        Command::Start { url, token } => start::run(start::StartArgs { url, token }),
+        Command::Start { url, token, agent } => {
+            let agent = agent.as_deref().map(agent_wiring::Agent::parse).transpose()?;
+            start::run(start::StartArgs { url, token, agent })
+        }
         Command::Login {
             url,
             token,
