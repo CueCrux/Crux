@@ -28,6 +28,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod release;
+pub mod verify;
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
@@ -46,7 +47,11 @@ const CHECK_SYMBOLS: usize = 2;
 const GROUP: usize = 6;
 
 /// Domain separation for the recovery code -> wrapping key derivation.
-const KDF_CONTEXT: &str = "cuecrux crux-escrow 2026-08-01 recovery-code wrapping key v1";
+///
+/// Published deliberately: [`verify`] derives candidate keys under it to show that
+/// nothing the server holds opens a vault, and a customer can only reproduce that
+/// check if the context string is public.
+pub(crate) const KDF_CONTEXT: &str = "cuecrux crux-escrow 2026-08-01 recovery-code wrapping key v1";
 /// Domain separation for the transcription checksum.
 const CHECKSUM_CONTEXT: &str = "cuecrux crux-escrow 2026-08-01 recovery-code checksum v1";
 /// Domain separation for per-share integrity tags.

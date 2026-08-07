@@ -16,6 +16,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use corecruxctl::verify_escrow;
 use corecruxctl::{
     admin, agent_wiring, audit_export, audit_pack, c2pa_x509, code_chain, code_health, compaction_sync, config_bundle,
     cost, deploy_audit, evidence, explain, export, extensions, fixture_digest, gaps, hooks, identity_cli, incident,
@@ -299,6 +300,31 @@ enum Command {
     Receipts {
         #[command(subcommand)]
         command: ReceiptsCommand,
+    },
+
+    /// Prove that what a daemon stores for a vault cannot open that vault.
+    ///
+    /// Runs the same named checks as `scripts/verify-escrow.py` and
+    /// `docs/verify-key-escrow.md`, so an independent implementation can be
+    /// compared against this one.
+    #[command(name = "verify-escrow")]
+    VerifyEscrow {
+        /// Daemon base URL holding the vault (default http://127.0.0.1:14800).
+        #[arg(long, default_value = "http://127.0.0.1:14800")]
+        daemon: String,
+        /// Vault to verify.
+        #[arg(long)]
+        vault_id: String,
+        /// Bearer token with `admin:read` (or set CORECRUXD_TOKEN).
+        #[arg(long)]
+        token: Option<String>,
+        /// Also prove the blob opens for its owner. Reads the recovery code
+        /// from stdin — never from argv, which `ps` exposes to every process.
+        #[arg(long)]
+        with_recovery_code: bool,
+        /// Emit JSON instead of prose.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Verify on-disk shard store integrity (Phase 5 hardening surface).
@@ -2778,6 +2804,27 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Some("missing --pack/--input"),
             );
             Err("either --pack or --input must be provided".into())
+        }
+        Command::VerifyEscrow {
+            daemon,
+            vault_id,
+            token,
+            with_recovery_code,
+            json,
+        } => {
+            let token = token.or_else(|| std::env::var("CORECRUXD_TOKEN").ok());
+            let report = verify_escrow::verify_escrow(&verify_escrow::VerifyEscrowOptions {
+                daemon,
+                vault_id,
+                token,
+                with_recovery_code,
+                json,
+            })?;
+            let code = verify_escrow::render(&report, json);
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
         }
         Command::VerifyStore {
             data_dir,

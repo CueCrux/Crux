@@ -997,6 +997,7 @@ dependencies = [
  "crc32c",
  "crux-config-wizard",
  "crux-cost",
+ "crux-escrow",
  "crux-integrations",
  "crux-session",
  "ed25519-dalek",

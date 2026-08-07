@@ -47,6 +47,7 @@ p256 = { workspace = true, default-features = false, features = ["std", "ecdsa",
 x509-cert = { workspace = true, default-features = false, features = ["std", "pem"] }
 
 corecrux-frame = { path = "../corecrux-frame" }
+crux-escrow = { path = "../crux-escrow" }
 corecrux-index = { path = "../corecrux-index" }
 corecrux-memory = { path = "../corecrux-memory" }
 corecrux-projections = { path = "../corecrux-projections" }
