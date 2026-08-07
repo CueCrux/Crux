@@ -308,9 +308,7 @@ pub struct DeadSymbol {
     pub note: String,
 }
 
-pub fn run_scan_with_policy(
-    policy: &crate::repo_scan_policy::RepoScanPolicy,
-) -> Result<WorkspaceScan, ScanError> {
+pub fn run_scan_with_policy(policy: &crate::repo_scan_policy::RepoScanPolicy) -> Result<WorkspaceScan, ScanError> {
     policy.execute_workspace(|canonical| {
         let mut scan = run_scan_at_in_context(canonical)?;
         crate::workspace_scan_manifests::attach_external_deps_if_enabled(canonical, &mut scan)?;

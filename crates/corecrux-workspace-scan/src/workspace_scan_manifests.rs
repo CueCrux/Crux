@@ -46,12 +46,13 @@ pub fn attach_external_deps_if_enabled(
     scan: &mut crate::workspace_scan::WorkspaceScan,
 ) -> Result<(), crate::workspace_scan::ScanError> {
     if external_deps_enabled_from_env() {
-        scan.external_deps = if crate::repo_scan_policy::active_root().is_some() {
+        let (deps, failures) = if crate::repo_scan_policy::active_root().is_some() {
             scan_external_deps_in_context(root)?
         } else {
             let policy = crate::repo_scan_policy::RepoScanPolicy::for_exact_root(root)?;
             policy.execute(root, scan_external_deps_in_context)?
         };
+        scan.external_deps = deps;
         scan.stats.external_dep_count = scan.external_deps.len();
         scan.diagnostics.parse_failures.extend(failures);
         scan.diagnostics
@@ -66,7 +67,7 @@ pub fn scan_external_deps(root: &Path) -> Vec<ExternalDep> {
     let result = crate::repo_scan_policy::RepoScanPolicy::for_exact_root(root)
         .and_then(|policy| policy.execute(root, scan_external_deps_in_context));
     match result {
-        Ok(deps) => deps,
+        Ok((deps, _failures)) => deps,
         Err(error) => {
             tracing::warn!(root=%root.display(), ?error, "external dependency scan rejected");
             Vec::new()
@@ -74,7 +75,11 @@ pub fn scan_external_deps(root: &Path) -> Vec<ExternalDep> {
     }
 }
 
-fn scan_external_deps_in_context(root: &Path) -> Result<Vec<ExternalDep>, crate::workspace_scan::ScanError> {
+/// Returns the deps plus the manifests whose lockfile was **present and
+/// unparsable** (D-23), inside the scan policy's deadline/byte budget.
+type ExternalDepScan = (Vec<ExternalDep>, Vec<ParseFailure>);
+
+fn scan_external_deps_in_context(root: &Path) -> Result<ExternalDepScan, crate::workspace_scan::ScanError> {
     let manifests = discover_manifests(root)?;
     let mut deps = Vec::new();
     let mut failures: Vec<ParseFailure> = Vec::new();
@@ -114,7 +119,7 @@ fn scan_external_deps_in_context(root: &Path) -> Result<Vec<ExternalDep>, crate:
     }
     failures.sort_by(|a, b| (&a.rel_path, &a.language).cmp(&(&b.rel_path, &b.language)));
     failures.dedup();
-    (dedup_and_sort(deps), failures)
+    Ok((dedup_and_sort(deps)?, failures))
 }
 
 /// Resolve a lockfile, parse it, and record the failure when it exists but

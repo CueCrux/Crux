@@ -207,11 +207,7 @@ impl RepoScanPolicy {
 
     /// Re-resolve the root and install one shared work budget for the complete
     /// scan. Every walker and scanner read on this thread charges this budget.
-    pub fn execute<T>(
-        &self,
-        root: &Path,
-        scan: impl FnOnce(&Path) -> Result<T, ScanError>,
-    ) -> Result<T, ScanError> {
+    pub fn execute<T>(&self, root: &Path, scan: impl FnOnce(&Path) -> Result<T, ScanError>) -> Result<T, ScanError> {
         let started = Instant::now();
         let canonical = self.resolve_root(root)?;
         if started.elapsed() > self.limits.timeout {
@@ -224,10 +220,7 @@ impl RepoScanPolicy {
         self.execute_canonical(canonical, directory, started, scan)
     }
 
-    pub fn execute_workspace<T>(
-        &self,
-        scan: impl FnOnce(&Path) -> Result<T, ScanError>,
-    ) -> Result<T, ScanError> {
+    pub fn execute_workspace<T>(&self, scan: impl FnOnce(&Path) -> Result<T, ScanError>) -> Result<T, ScanError> {
         let workspace = self.workspace_root.as_ref().ok_or(ScanError::NotConfigured)?;
         let canonical = workspace.path.clone();
         let started = Instant::now();
@@ -921,11 +914,7 @@ pub fn read_opened_scan_directory_names(directory: &File, parent: &Path) -> Resu
 /// `openat2(RESOLVE_BENEATH|NO_SYMLINKS)` rejects a symlink in any component;
 /// O_PATH lets us inspect special files without activating them.
 #[cfg(target_os = "linux")]
-pub fn open_scan_entry(
-    directory: &File,
-    parent: &Path,
-    name: &std::ffi::OsStr,
-) -> Result<OpenedScanEntry, ScanError> {
+pub fn open_scan_entry(directory: &File, parent: &Path, name: &std::ffi::OsStr) -> Result<OpenedScanEntry, ScanError> {
     use std::os::unix::fs::MetadataExt as _;
 
     check_deadline()?;
@@ -1320,16 +1309,10 @@ mod tests {
         let scan_policy = policy(root.path(), RepoScanLimits::default());
         let error = scan_policy
             .execute(root.path(), |_| {
-                charge_generated_work(
-                    1,
-                    MAX_DURABLE_SCAN_OUTPUT_BYTES as usize + 1,
-                    "fixture output",
-                )
+                charge_generated_work(1, MAX_DURABLE_SCAN_OUTPUT_BYTES as usize + 1, "fixture output")
             })
             .expect_err("generated output larger than its durable sidecar must be rejected");
-        assert!(error
-            .to_string()
-            .contains(&MAX_DURABLE_SCAN_OUTPUT_BYTES.to_string()));
+        assert!(error.to_string().contains(&MAX_DURABLE_SCAN_OUTPUT_BYTES.to_string()));
     }
 
     #[test]

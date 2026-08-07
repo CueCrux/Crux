@@ -1179,15 +1179,16 @@ fn parse_file_ast(
     crate::repo_scan_policy::check_deadline()?;
     crate::workspace_scan::validate_rust_syntax_complexity(&src)?;
     crate::repo_scan_policy::charge_source_parse_work(&src, "Rust AST parser work")?;
-    if let Ok(parsed) = syn::parse_file(&src) {
+    let parse_result = syn::parse_file(&src);
+    if let Ok(parsed) = parse_result.as_ref() {
         crate::repo_scan_policy::check_deadline()?;
         let mut ident_refs = HashMap::new();
-        collect_identifier_refs(&parsed, &mut ident_refs)?;
+        collect_identifier_refs(parsed, &mut ident_refs)?;
         // Second pass with test scopes elided. A file that *is* a test file
         // contributes nothing here: every reference in it is a test reference.
         let mut ident_refs_nontest = HashMap::new();
         if !is_test_file {
-            collect_identifier_refs_nontest(&parsed, &mut ident_refs_nontest)?;
+            collect_identifier_refs_nontest(parsed, &mut ident_refs_nontest)?;
         }
         let mut line_lookup = LineLookup::new(&src)?;
         index_items(
