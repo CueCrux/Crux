@@ -204,50 +204,12 @@ struct CloudWitnessRecordV1 {
     test_upstream: bool,
 }
 
-/// Receipt envelope returned to the caller.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(super) struct ReceiptEnvelopeV1 {
-    pub alg: String,
-    pub signed_by: String,
-    pub body_hash: String,
-    pub signature: String,
-}
-
-/// Persisted record (one JSONL line). Phase 2 M5e: carries `seq` + `prev_hash`
-/// so the JSONL is sequence-level tamper-evident — removing or reordering any
-/// line breaks the chain. `prev_hash` is `None` for the first record of a
-/// chain (`seq == Some(0)`); subsequent records carry the previous record's
-/// `body_hash` (the hex part after the `blake3:` prefix).
-///
-/// **Backwards compatibility**: both fields are `Option`-typed with
-/// `skip_serializing_if = "Option::is_none"`. Pre-M5e records on disk had
-/// neither field; re-reading them yields `seq == None, prev_hash == None`
-/// and re-serialising omits both, so the original signature remains valid.
-/// A session's chain may therefore have a "legacy prefix" of unchained
-/// records followed by a "chained suffix" starting at `seq == Some(0)`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct ObservationRecordV1 {
-    pub observation_id: String,
-    pub session_id: String,
-    pub ts: DateTime<Utc>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_ts: Option<DateTime<Utc>>,
-    pub provider: String,
-    pub principal: String,
-    pub kind: String,
-    pub payload: serde_json::Value,
-    /// Monotonic 0-based index of this record within the chained suffix of
-    /// the session's JSONL. `None` for pre-M5e legacy records. Verifiers
-    /// reject gaps within a chained suffix (`seq` must be contiguous).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seq: Option<u64>,
-    /// `body_hash` of the previous record in this session (hex, no prefix).
-    /// `None` iff this is the first record of a chained suffix, or the
-    /// record is a pre-M5e legacy record.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prev_hash: Option<String>,
-    pub receipt: ReceiptEnvelopeV1,
-}
+/// Receipt envelope and persisted record now live in `corecrux-receipts` so
+/// `corecruxctl` can verify them too — `corecruxd` is a bin-only crate, so a
+/// CLI verifier would otherwise need a second copy of the signature check.
+/// The canonicalisation these depend on is wire format; see
+/// `corecrux_receipts::observation_envelope`.
+pub(super) use corecrux_receipts::{ObservationRecordV1, ReceiptEnvelopeV1};
 
 /// POST response (singleton).
 #[derive(Debug, Clone, Serialize)]
@@ -478,11 +440,7 @@ fn should_stream_observation_to_dataplane(scoped_session_id: &str) -> bool {
 /// only thing that travels through the hash is the bytes produced by this
 /// same operation.
 pub(super) fn canonical_body_bytes(record: &ObservationRecordV1) -> Result<Vec<u8>, String> {
-    let mut value = serde_json::to_value(record).map_err(|err| format!("to_value: {err}"))?;
-    if let serde_json::Value::Object(obj) = &mut value {
-        obj.remove("receipt");
-    }
-    serde_json::to_vec(&value).map_err(|err| format!("canonicalise observation body: {err}"))
+    corecrux_receipts::canonical_body_bytes(record)
 }
 
 fn mint_receipt(state: &AppState, body_bytes: &[u8]) -> Result<ReceiptEnvelopeV1, (StatusCode, String)> {
@@ -2423,6 +2381,19 @@ mod tests {
             },
         };
         let bytes = canonical_body_bytes(&record).unwrap();
+
+        // GOLDEN VECTOR. These bytes are what every observation signature on
+        // disk was computed over, so this hash is a wire-format constant, not
+        // an implementation detail. If a refactor changes it — field order, a
+        // skip_serializing_if, moving the type to another crate — every
+        // receipt ever minted stops verifying. Never "fix" this by updating
+        // the constant.
+        assert_eq!(
+            format!("blake3:{}", hex::encode(blake3::hash(&bytes).as_bytes())),
+            "blake3:13c40869de39a4a8702082024ef6bf01ab3af149edd4966302f69716bbe4f287",
+            "observation canonical body bytes changed — existing signatures would break"
+        );
+
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(parsed.get("receipt").is_none(), "receipt must not be in canonical body");
         assert_eq!(parsed["observation_id"], "obs-1");

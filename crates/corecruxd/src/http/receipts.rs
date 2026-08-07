@@ -312,38 +312,14 @@ pub(super) struct LocalStreamReceipt {
 }
 
 /// Verify one observation record's daemon envelope signature against the
-/// node passport key. Generic sibling of
-/// [`verify_local_approval_observation`]: stream-receipt payloads do not
-/// embed `signer_public_key_hex`, so the binding is directly to this
-/// node's passport key.
+/// node passport key. Delegates to the shared implementation in
+/// `corecrux-receipts` so `corecruxctl inspect-receipt` runs the same check
+/// rather than a second copy that can drift.
 fn verify_observation_envelope(
     state: &AppState,
     record: &super::observations::ObservationRecordV1,
 ) -> Result<(), String> {
-    use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
-
-    if record.receipt.signed_by != state.passport_fpr || record.receipt.alg != "ed25519" {
-        return Err("local stream receipt observation signer binding mismatch".to_string());
-    }
-    let public_key: [u8; 32] = hex::decode(&state.passport_public_key_hex)
-        .map_err(|err| format!("decode node passport public key: {err}"))?
-        .try_into()
-        .map_err(|bytes: Vec<u8>| format!("node passport public key is {} bytes", bytes.len()))?;
-    let body_bytes = super::observations::canonical_body_bytes(record)?;
-    let body_hash = blake3::hash(&body_bytes);
-    if record.receipt.body_hash != format!("blake3:{}", hex::encode(body_hash.as_bytes())) {
-        return Err("local stream receipt observation body hash mismatch".to_string());
-    }
-    let signature = Signature::from_slice(
-        &hex::decode(&record.receipt.signature)
-            .map_err(|err| format!("decode local stream receipt observation signature: {err}"))?,
-    )
-    .map_err(|err| format!("parse local stream receipt observation signature: {err}"))?;
-    let verifying_key =
-        VerifyingKey::from_bytes(&public_key).map_err(|err| format!("parse node passport public key: {err}"))?;
-    verifying_key
-        .verify(body_hash.as_bytes(), &signature)
-        .map_err(|err| format!("verify local stream receipt observation signature: {err}"))
+    corecrux_receipts::verify_observation_envelope(record, &state.passport_fpr, &state.passport_public_key_hex)
 }
 
 /// Filename prefix of the governance observation logs. Governance receipts
