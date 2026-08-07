@@ -108,7 +108,7 @@ To understand what makes this tamper-evident, read these symbols in order:
 
 ## Build / test
 
-- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.57
+- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.58
   (`[workspace.package]` in `Cargo.toml` is authoritative, and
   `scripts/check-agent-docs.sh` fails the build when this line disagrees with it).
 - `cargo build --workspace --locked`
@@ -509,7 +509,7 @@ schema: crux-agent-manifest/v1
 summary: Local-first, tamper-evident retrieval + memory engine with signed, replayable receipts.
 msrv: "1.88.0"
 edition: "2021"
-workspace_version: "0.5.57"
+workspace_version: "0.5.58"
 
 verify_commands:
   - cargo test --workspace
@@ -4223,6 +4223,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.58] - 2026-08-07
+
+### Fixed
+
+- **Ingest can no longer seal a corpus with no vectors and call it healthy.**
+  `POST /v1/local/ingest` returned an ordinary `202` with `sealed: true`, a full
+  `frame_count` and `dense_vectors: 0` whenever the embed step failed. BM25 still
+  indexes, so the tenant looked fine while semantic retrieval was simply gone —
+  a corpus that reads as healthy and answers worse, with nothing in the response
+  to check. The cause was **ureq's default 10 MiB response-body cap**, hit while
+  *reading* the embedder's reply: a 1024-dim vector is ~12.6 KB of JSON, so a
+  batch past roughly 830 chunks overflowed it. The ceiling therefore moved with
+  the embedding dimension, not the chunk count, which is why 749 chunks passed
+  and 776 failed.
+  - `EmbeddingClient::embed_batch` now issues sub-batches of at most 128 texts
+    and concatenates in order, so how many chunks a caller sends no longer
+    decides whether embedding succeeds. A failing sub-batch fails the whole call
+    — never a short or partially embedded result.
+  - The `202` carries `dense_status` (`ok` | `partial` | `skipped` |
+    `not_configured` | `not_applicable`) and `dense_expected` beside the existing
+    `dense_vectors`, and the daemon logs `local-ingest-dense-gap-sealed` at WARN
+    with the segment sequence. **Assert `dense_status == "ok"`** after any ingest
+    that expects semantic recall. `crux-ingest` asserts it for you and warns when
+    a batch seals lexical-only.
+  - Both fields are additive: a client that ignores them sees the response shape
+    it saw before.
+  - This matters beyond the response cap — *any* embedder error took the same
+    silent path. An audit of one host found 41 of 641 segments sealed
+    lexical-only, most of them from ordinary `502`s.
+- **`/v1/local/ingest` honours the request-body limit its own error advertises.**
+  The route inherited axum's 2 MiB `DefaultBodyLimit` while its `413` named the
+  16 MiB daemon limit, so every client that sized batches from that number sized
+  them eight times too large.
+
+### Added
+
+- **`segment_seq` on query results.** Each `/v1/query/text-search` result and
+  `/expand` chunk now carries the sealed segment's own sequence — the value the
+  ingest receipt returned — so a consumer can join a result back to the ingest
+  that produced it. `segment_index`, which sits beside it, is a position in the
+  daemon-wide loaded-reader list: it is **not** convertible to `segment_seq`, and
+  the difference between them was measured at 1, then 18, then 17 on one host
+  within hours as unrelated segments came and went. Deriving one from the other
+  unmaps every hit at once and scores a plausible, uniform 0% instead of
+  erroring. `segment_index` is unchanged for existing consumers.
+
 ## [0.5.57] - 2026-08-07
 
 ### Fixed
@@ -4996,6 +5042,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-audit` CVE scanning in CI
 
 [unreleased]: https://github.com/CueCrux/Crux/compare/v0.5.54...HEAD
+[0.5.58]: https://github.com/CueCrux/Crux/compare/v0.5.57...v0.5.58
 [0.5.57]: https://github.com/CueCrux/Crux/compare/v0.5.56...v0.5.57
 [0.5.56]: https://github.com/CueCrux/Crux/compare/v0.5.55...v0.5.56
 [0.5.55]: https://github.com/CueCrux/Crux/compare/v0.5.54...v0.5.55
