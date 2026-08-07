@@ -2018,6 +2018,45 @@ function extractThemeVars(theme) {
     check(plateCrossings === 0,
       '[patchbay] no wire may cross a system plate it does not belong to (got ' + plateCrossings + ')');
 
+    // CAPACITY GATE (incident 2026-08-07). A ring whose perimeter is smaller
+    // than its plane cannot place every card, and the slot allocator span on it
+    // forever — a frozen browser tab, not a wrong picture. Prod had a 61-plan
+    // plane while the sizer topped out at 28 slots.
+    //
+    // Asserted as a PROPERTY of the sizer rather than by running the layout:
+    // on the broken code "does the layout finish" would hang CI instead of
+    // failing it, which is a worse outcome than the bug.
+    if (typeof render.patchbayGridFor === 'function') {
+      let worst = null;
+      for (let n = 1; n <= 400; n++) {
+        const g = render.patchbayGridFor(n);
+        const perim = 2 * (g[0] + g[1]) - 4;
+        if (perim < n && !worst) { worst = { n, g, perim }; }
+        if (g[0] < 3 || g[1] < 3) { worst = worst || { n, g, perim }; }
+      }
+      check(!worst, '[patchbay] every ring must have perimeter >= its plan count and an interior for the label' +
+        (worst ? ' — n=' + worst.n + ' got ' + worst.g.join('x') + ' (' + worst.perim + ' slots)' : ''));
+      // And the interior must stay big enough for the label block.
+      const big = render.patchbayGridFor(228);
+      check((big[0] - 2) >= 1 && (big[1] - 2) >= 1,
+        '[patchbay] a large ring must still leave an interior for its system label');
+    }
+    // A plane larger than the sizer's static table must place every card.
+    {
+      const many = [];
+      for (let i = 0; i < 61; i++) {
+        many.push({ id: 'execplan:b' + i, slug: 'b' + i, title: 'Big plan ' + i, state: 'planned',
+          plane: 'VaultCrux', services: [], links: [], milestones_done: 0, milestones_total: 3,
+          updated_at_unix_ms: 1 });
+      }
+      const LB = render.patchbayLayout({ plans: many, planes: [{ key: 'VaultCrux', n: 61 }],
+        services: [], link_count: 0 });
+      check(LB.chips.length === 61,
+        '[patchbay] a 61-plan system must place all 61 cards (got ' + LB.chips.length + ')');
+      check(LB.chips.every(function (c) { return c.out && c.out.length; }),
+        '[patchbay] every card in a large ring must still have an outward face');
+    }
+
     // A board with no declared edges must still lay out (the endpoint can
     // legitimately return zero links) rather than throw.
     const noEdge = { plans: gPlans.map(function (p) { return Object.assign({}, p, { links: [] }); }),
