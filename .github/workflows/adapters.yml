@@ -28,7 +28,9 @@ jobs:
       # every PR. The live layer needs a built corecruxd and runs locally via
       # `python -m conformance` -- see the README.
       - name: Install the SDK dependency and every adapter framework
-        run: python -m pip install 'httpx>=0.27' 'langchain-core>=0.3'
+        run: |
+          python -m pip install 'httpx>=0.27' \
+            'langchain-core>=0.3' 'llama-index-core>=0.11' 'crewai>=0.80'
 
       - name: Conformance suite + negative controls
         run: python -m unittest discover -s tests -v
@@ -36,11 +38,27 @@ jobs:
       - name: Every discovered adapter, mapping layer
         run: python -m conformance --mapping
 
+      - name: All three bindings are actually discovered
+        # Guards the failure mode where a framework silently fails to import
+        # and the suite passes by checking only the neutral core.
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          from conformance.suite import discover_adapters
+          found = {a.name for a in discover_adapters()}
+          expected = {"core", "langchain", "llamaindex", "crewai"}
+          missing = expected - found
+          if missing:
+              raise SystemExit(f"adapters not discovered: {sorted(missing)} (found {sorted(found)})")
+          print(f"discovered: {sorted(found)}")
+          PY
+
       - name: Suite still runs with no frameworks installed
         # The neutral core adapter must always be exercised, otherwise a
         # machine without LangChain would silently check nothing.
         run: |
-          python -m pip uninstall -y langchain-core
+          python -m pip uninstall -y langchain-core llama-index-core crewai
           python -m conformance --mapping
 
       - name: Package builds

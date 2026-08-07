@@ -82,31 +82,42 @@ class Failure:
 # the whole point is that one suite covers all three.
 
 
+#: ``(adapter name, module, guard callable)``. A binding joins the suite by
+#: appending one row. That is the whole registration cost, and it is the
+#: property M6.3 was meant to demonstrate: LlamaIndex and CrewAI were added
+#: here without changing a single case.
+_BINDINGS = (
+    ("langchain", "crux_adapters.langchain", "_require_langchain"),
+    ("llamaindex", "crux_adapters.llamaindex", "_require_llamaindex"),
+    ("crewai", "crux_adapters.crewai", "_require_crewai"),
+)
+
+
 def discover_adapters() -> list[Adapter]:
     """Every adapter whose framework is importable, plus the neutral core.
 
     The core entry always runs, so the mapping properties are covered even on
     a machine with no frameworks installed.
     """
+    import importlib
+
     from crux_adapters import core
 
     adapters = [
         Adapter(name="core", fetch=core.fetch_bundle, items=lambda b: list(b.items)),
     ]
 
-    try:
-        from crux_adapters import langchain as lc
-    except ModuleNotFoundError:
-        pass
-    else:
+    for name, module_name, guard in _BINDINGS:
         try:
-            lc._require_langchain()
+            module = importlib.import_module(module_name)
+            getattr(module, guard)()
         except ModuleNotFoundError:
-            pass
-        else:
-            adapters.append(
-                Adapter(name="langchain", fetch=lc.adapter_entrypoint, items=lc.adapter_items)
-            )
+            # Framework not installed: skip, so the suite runs anywhere. CI
+            # installs all three, and asserts the full set is discovered.
+            continue
+        adapters.append(
+            Adapter(name=name, fetch=module.adapter_entrypoint, items=module.adapter_items)
+        )
 
     return adapters
 

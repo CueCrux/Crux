@@ -17,6 +17,8 @@ dependencies = ["corecrux-client>=0.2"]
 # One extra per framework: installing the LangChain adapter must not drag in
 # LlamaIndex or CrewAI. The conformance suite runs whatever is present.
 langchain = ["langchain-core>=0.3"]
+llamaindex = ["llama-index-core>=0.11"]
+crewai = ["crewai>=0.80"]
 
 [project.urls]
 Homepage = "https://github.com/CueCrux/Crux"

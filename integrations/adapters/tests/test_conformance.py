@@ -49,6 +49,39 @@ class MappingConformance(unittest.TestCase):
         # otherwise CI silently checks nothing.
         self.assertIn("core", {a.name for a in discover_adapters()})
 
+    def test_every_registered_binding_exposes_both_conformance_hooks(self) -> None:
+        # A binding registered without its hooks would be skipped silently by
+        # discover_adapters() and never conform to anything.
+        import importlib
+
+        from conformance.suite import _BINDINGS
+
+        self.assertEqual(
+            [name for name, _, _ in _BINDINGS],
+            ["langchain", "llamaindex", "crewai"],
+            "the three shipped bindings must all be registered",
+        )
+        for name, module_name, guard in _BINDINGS:
+            with self.subTest(binding=name):
+                module = importlib.import_module(module_name)
+                # Importing must never require the framework -- the guard is
+                # what raises, and only when the adapter is actually used.
+                self.assertTrue(callable(getattr(module, guard)))
+                self.assertTrue(callable(getattr(module, "adapter_entrypoint", None)))
+                self.assertTrue(callable(getattr(module, "adapter_items", None)))
+
+    def test_every_binding_module_imports_without_its_framework(self) -> None:
+        # `import crux_adapters.crewai` on a machine with no CrewAI must work;
+        # only calling into it may fail. Otherwise discover_adapters() would
+        # blow up instead of skipping.
+        import importlib
+
+        from conformance.suite import _BINDINGS
+
+        for _, module_name, _ in _BINDINGS:
+            with self.subTest(module=module_name):
+                self.assertIsNotNone(importlib.import_module(module_name))
+
 
 class NegativeControls(unittest.TestCase):
     """Each case must reject an adapter that violates exactly that property."""
