@@ -100,6 +100,11 @@ tempfile = "3.16.0"
 thiserror = "2.0.12"
 tokio = "1.52.3"
 tokio-stream = "0.1.17"
+# Client-only WebSocket for the relay dial (relay contract v1 §3). Pinned to
+# 0.30 and default-features = false so rustls resolves with a SINGLE crypto
+# provider (ring, no aws-lc-rs) — a dual-provider rustls has no default and
+# ClientConfig::builder() then fails at RUNTIME, not at compile time.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 toml = "1.1"
 tonic = "0.14.6"
 tower = "0.5"
