@@ -15,7 +15,7 @@
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
 //
-// 192 read endpoints, generated from the route manifest.
+// 194 read endpoints, generated from the route manifest.
 
 /**
  * Append a plain query object to a path as a URL search string.
@@ -153,6 +153,7 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/witness/smoke': true,
   '/v1/work': true,
   '/v1/work/gate/pending': true,
+  '/v1/work/graph': true,
   '/v1/workbench/api-drift': true,
   '/v1/workbench/audit-triage': true,
   '/v1/workbench/brief': true,
@@ -235,6 +236,9 @@ const CruxApi = Object.freeze({
   },
   adminSharingPosture(query) {
     return fetch(withQuery(`/v1/admin/sharing/posture`, query), { credentials: 'same-origin' });
+  },
+  adminTenantsByTenantIdFootprint(tenantId, query) {
+    return fetch(withQuery(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/footprint`, query), { credentials: 'same-origin' });
   },
   adminVersion(query) {
     return fetch(withQuery(`/v1/admin/version`, query), { credentials: 'same-origin' });
@@ -724,6 +728,9 @@ const CruxApi = Object.freeze({
   },
   workGatePending(query) {
     return fetch(withQuery(`/v1/work/gate/pending`, query), { credentials: 'same-origin' });
+  },
+  workGraph(query) {
+    return fetch(withQuery(`/v1/work/graph`, query), { credentials: 'same-origin' });
   },
   workById(id, query) {
     return fetch(withQuery(`/v1/work/${encodeURIComponent(id)}`, query), { credentials: 'same-origin' });

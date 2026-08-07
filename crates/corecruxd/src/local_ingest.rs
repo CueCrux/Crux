@@ -888,6 +888,7 @@ mod tests {
             Some(tenant_hash(tenant)),
             &Bm25Params::default(),
             None,
+            None,
         );
         assert_eq!(result.hits.len(), 1, "the sealed chunk must be retrievable");
 
@@ -898,6 +899,7 @@ mod tests {
             10,
             Some(tenant_hash("someone-else")),
             &Bm25Params::default(),
+            None,
             None,
         );
         assert_eq!(other.hits.len(), 0, "cross-tenant query must not match");
@@ -958,12 +960,14 @@ mod tests {
         let th = Some(tenant_hash(tenant));
         let p = Bm25Params::default();
         assert_eq!(
-            bm25_search(&readers, "alpha centauri", 10, th, &p, None).hits.len(),
+            bm25_search(&readers, "alpha centauri", 10, th, &p, None, None)
+                .hits
+                .len(),
             1,
             "first ingest must survive the second ingest's shard reopen"
         );
         assert_eq!(
-            bm25_search(&readers, "betelgeuse", 10, th, &p, None).hits.len(),
+            bm25_search(&readers, "betelgeuse", 10, th, &p, None, None).hits.len(),
             1,
             "second ingest must be retrievable"
         );
@@ -1370,6 +1374,7 @@ mod tests {
             Some(tenant_hash(tenant)),
             &Bm25Params::default(),
             None,
+            None,
         );
         assert_eq!(hits.hits.len(), 1, "exactly one copy served");
     }
@@ -1422,13 +1427,37 @@ mod tests {
         let p = Bm25Params::default();
 
         // Tenant A sees only its own doc for the shared term.
-        let a = bm25_search(&readers, "common secret", 10, Some(tenant_hash("tenant-a")), &p, None);
+        let a = bm25_search(
+            &readers,
+            "common secret",
+            10,
+            Some(tenant_hash("tenant-a")),
+            &p,
+            None,
+            None,
+        );
         assert_eq!(a.hits.len(), 1, "tenant-a sees exactly its own doc");
         // Tenant B likewise.
-        let b = bm25_search(&readers, "common secret", 10, Some(tenant_hash("tenant-b")), &p, None);
+        let b = bm25_search(
+            &readers,
+            "common secret",
+            10,
+            Some(tenant_hash("tenant-b")),
+            &p,
+            None,
+            None,
+        );
         assert_eq!(b.hits.len(), 1, "tenant-b sees exactly its own doc");
         // A third tenant sees nothing.
-        let c = bm25_search(&readers, "common secret", 10, Some(tenant_hash("tenant-c")), &p, None);
+        let c = bm25_search(
+            &readers,
+            "common secret",
+            10,
+            Some(tenant_hash("tenant-c")),
+            &p,
+            None,
+            None,
+        );
         assert_eq!(c.hits.len(), 0, "unrelated tenant sees nothing");
     }
 }

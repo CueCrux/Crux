@@ -962,8 +962,16 @@ mod tests {
         assert_eq!(guard.total_docs(), 2);
         let th = Some(tenant_hash("tenant-m2h"));
         let p = Bm25Params::default();
-        assert_eq!(bm25_search(&readers, "aurora borealis", 10, th, &p, None).hits.len(), 1);
-        assert_eq!(bm25_search(&readers, "anglerfish", 10, th, &p, None).hits.len(), 1);
+        assert_eq!(
+            bm25_search(&readers, "aurora borealis", 10, th, &p, None, None)
+                .hits
+                .len(),
+            1
+        );
+        assert_eq!(
+            bm25_search(&readers, "anglerfish", 10, th, &p, None, None).hits.len(),
+            1
+        );
 
         // The .ccxi landed exactly where the daemon startup scan looks.
         let seg_dir = data_dir.join("shards").join("shard-0000").join("segments");
@@ -1008,8 +1016,11 @@ mod tests {
         let readers = cold.readers();
         let th = Some(tenant_hash("tenant-restart"));
         let p = Bm25Params::default();
-        assert_eq!(bm25_search(&readers, "quartz", 10, th, &p, None).hits.len(), 1);
-        assert_eq!(bm25_search(&readers, "arctic terns", 10, th, &p, None).hits.len(), 1);
+        assert_eq!(bm25_search(&readers, "quartz", 10, th, &p, None, None).hits.len(), 1);
+        assert_eq!(
+            bm25_search(&readers, "arctic terns", 10, th, &p, None, None).hits.len(),
+            1
+        );
     }
 
     /// M4 (daemon side): a MediaCrux-scale backfill — 357 prose documents in one
@@ -1055,7 +1066,7 @@ mod tests {
         let p = Bm25Params::default();
         // Spot-check a few individual articles are retrievable by their token.
         for i in [0usize, 42, 200, 356] {
-            let hits = bm25_search(&readers, &format!("articletoken{i}"), 10, th, &p, None).hits;
+            let hits = bm25_search(&readers, &format!("articletoken{i}"), 10, th, &p, None, None).hits;
             assert_eq!(hits.len(), 1, "article {i} must be BM25-served");
         }
     }

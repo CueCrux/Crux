@@ -1597,3 +1597,131 @@ fn code_liveness_never_reports_an_unseen_symbol_as_dead() {
         "an empty observation window must not yield a `dead` verdict, got {verdict:?}"
     );
 }
+
+// ── Tenant corpus erasure (ExecPlan crux-forget-tenant-corpus-erasure) ──────
+//
+// Its own daemon: the surface is flag-gated off by default, and the test
+// restarts the process to prove the mask is durable.
+
+fn ingest(daemon: &TestDaemon, tenant: &str, doc: &str, text: &str) {
+    let resp = daemon
+        .post_json(
+            "/v1/local/ingest",
+            json!({
+                "tenant_id": tenant,
+                "corpus_id": "erasure-it",
+                "documents": [{
+                    "doc_id": doc,
+                    "chunks": [{ "chunk_id": format!("{doc}-c0"), "text": text }]
+                }]
+            }),
+        )
+        .expect("local ingest");
+    assert_eq!(resp.status().as_u16(), 202, "ingest accepted");
+}
+
+fn search_hits(daemon: &TestDaemon, tenant: &str, query: &str) -> usize {
+    let body: serde_json::Value = daemon
+        .post_json(
+            "/v1/query/text-search",
+            json!({ "tenant_id": tenant, "query": query, "limit": 10 }),
+        )
+        .expect("text-search")
+        .into_body()
+        .read_json()
+        .expect("json");
+    body["results"].as_array().map(Vec::len).unwrap_or(0)
+}
+
+fn footprint(daemon: &TestDaemon, tenant: &str) -> serde_json::Value {
+    daemon
+        .get(&format!("/v1/admin/tenants/{tenant}/footprint"))
+        .expect("footprint")
+        .into_body()
+        .read_json()
+        .expect("json")
+}
+
+#[test]
+fn tenant_corpus_erasure_masks_survives_restart_and_reclaims() {
+    let mut daemon = TestDaemon::start_with_env(&[("CORECRUXD_TENANT_ERASURE", "1")]);
+
+    ingest(&daemon, "erasure-a", "a1", "peregrine falcon stoop velocity");
+    ingest(&daemon, "erasure-b", "b1", "peregrine falcon stoop velocity");
+
+    assert_eq!(search_hits(&daemon, "erasure-a", "peregrine falcon"), 1);
+    assert_eq!(search_hits(&daemon, "erasure-b", "peregrine falcon"), 1);
+
+    // The blast radius is inspectable before anything is erased.
+    let before = footprint(&daemon, "erasure-a");
+    assert_eq!(before["segment_count"], 1);
+    assert_eq!(before["docs"], 1);
+    assert!(before["bytes"].as_u64().unwrap() > 0, "on-disk group has size");
+
+    // Layer 1 — mask only.
+    let erased: serde_json::Value = daemon
+        .post_json("/v1/admin/forget-tenants", json!({ "tenant_ids": ["erasure-a"] }))
+        .expect("forget-tenants")
+        .into_body()
+        .read_json()
+        .expect("json");
+    assert_eq!(erased["per_tenant"][0]["corpus_erased"], true);
+    assert_eq!(erased["per_tenant"][0]["segments_reclaimed"], 0);
+
+    assert_eq!(search_hits(&daemon, "erasure-a", "peregrine falcon"), 0, "masked");
+    assert_eq!(
+        search_hits(&daemon, "erasure-b", "peregrine falcon"),
+        1,
+        "sibling tenant is untouched"
+    );
+
+    // Crash window: the mask is persisted, the files are not yet reclaimed.
+    daemon.restart();
+    assert_eq!(
+        search_hits(&daemon, "erasure-a", "peregrine falcon"),
+        0,
+        "the mask outlives the process"
+    );
+    assert_eq!(search_hits(&daemon, "erasure-b", "peregrine falcon"), 1);
+
+    // Layer 2 — physical reclaim, then another restart to prove nothing dangles.
+    let reclaimed: serde_json::Value = daemon
+        .post_json(
+            "/v1/admin/forget-tenants",
+            json!({ "tenant_ids": ["erasure-a"], "reclaim": true }),
+        )
+        .expect("reclaim")
+        .into_body()
+        .read_json()
+        .expect("json");
+    let row = &reclaimed["per_tenant"][0];
+    assert_eq!(row["segments_reclaimed"], 1);
+    assert_eq!(
+        row["bytes_reclaimed"].as_u64().unwrap(),
+        before["bytes"].as_u64().unwrap(),
+        "bytes freed match the footprint reported before the erase"
+    );
+
+    daemon.restart();
+    assert_eq!(footprint(&daemon, "erasure-a")["segment_count"], 0);
+    assert_eq!(search_hits(&daemon, "erasure-a", "peregrine falcon"), 0);
+    assert_eq!(
+        search_hits(&daemon, "erasure-b", "peregrine falcon"),
+        1,
+        "the co-tenant corpus is still served after a reclaim + restart"
+    );
+    assert_eq!(daemon.get("/readyz").unwrap().status().as_u16(), 200);
+}
+
+#[test]
+fn tenant_corpus_erasure_routes_404_when_the_flag_is_off() {
+    // The shared daemon runs without CORECRUXD_TENANT_ERASURE.
+    match daemon().get("/v1/admin/tenants/anyone/footprint") {
+        Err(ureq::Error::StatusCode(404)) => {}
+        other => panic!("expected 404 with the flag off: {other:?}"),
+    }
+    match daemon().post_json("/v1/admin/forget-tenants", json!({ "tenant_ids": ["anyone"] })) {
+        Err(ureq::Error::StatusCode(404)) => {}
+        other => panic!("expected 404 with the flag off: {other:?}"),
+    }
+}

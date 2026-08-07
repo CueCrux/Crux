@@ -1673,6 +1673,19 @@
     // store, replayed as an animated ring, live-wired through the console's CruxApi
     // client with snapshot fallbacks. Reads only, so it shows in every posture.
     { id: 'rings', label: 'Rings', icon: 'rings', key: '1', sub: 'The clock of work — the live work board, facts and glance as an animated ring.' },
+    // Patchbay — the board laid out in SPACE rather than in a list. Every open
+    // ExecPlan is a card, grouped into a ring per system with the system name in
+    // the middle, wired to the shared services it touches. Sits directly under
+    // Rings because it answers the same question ("what is in flight?") from the
+    // other direction: Rings orders work in time, Patchbay places it in the
+    // estate. Rail position is this array index; `key` is only the keyboard
+    // shortcut, and '6' was the free slot — so no existing shortcut moves.
+    // Reads through the generated CruxApi.workGraph() (GET /v1/work/graph), so
+    // it shows in every posture. Deliberately NOT capability-gated: the route is
+    // always mounted and returns an empty graph when the ExecPlan root is unset,
+    // so the page degrades honestly on its own. Delegates to render.js
+    // renderPatchbay.
+    { id: 'patchbay', label: 'Patchbay', icon: 'patchbay', key: '6', sub: 'The board in space — every open plan as a card, grouped by system, wired to the services it touches.' },
     { id: 'work', label: 'Work', icon: 'work', key: '2', sub: 'ExecPlans, projects, and sessions.' },
     { id: 'memory', label: 'Memory', icon: 'memory', key: '3', sub: 'Facts, tenants, documents, and retrieval tuning.' },
     { id: 'trust', label: 'Trust', icon: 'trust', key: '4', sub: 'Receipts, gates, identity, and posture.' },

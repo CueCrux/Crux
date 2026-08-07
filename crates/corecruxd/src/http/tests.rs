@@ -1027,6 +1027,7 @@ pub(crate) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         coord_presence_ttl_secs: crate::coord::DEFAULT_PRESENCE_TTL_SECS,
         consolidation_scheduler_enabled: false,
         context_surface_enabled: true,
+        tenant_erasure_enabled: true,
         compute_provider_enabled: false,
         auto_capture_enabled: true,
         local_ingest_enabled: false,
@@ -4852,6 +4853,112 @@ async fn get_receipt_verification_resolves_locally_without_dataplane() {
     .await
     .into_response();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// A governance receipt (tenant corpus erasure and friends) must verify
+/// through the same route on a CPU-only build. Before this fallback the
+/// daemon minted an Ed25519-signed audit artefact it had no supported way
+/// to attest to: this route 404'd, `GET /v1/receipts/{id}` 501s by design,
+/// and `corecruxctl inspect-receipt` searches sealed segments only.
+#[tokio::test]
+async fn get_receipt_verification_resolves_a_governance_receipt_without_a_dataplane() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).expect("passport key");
+    let mut state = test_app_state(16);
+    state.data_dir = tmp.path().to_path_buf();
+    state.passport_key_path = tmp.path().join("passport.key");
+    state.passport_fpr = key.passport_fpr().to_string();
+    state.passport_public_key_hex = key.public_key_hex().to_string();
+
+    let receipt_id = super::observations::mint_governance_receipt(
+        &state,
+        "__governance__::erasure",
+        "operator",
+        "erasure.forget_tenant_corpus",
+        &serde_json::json!({ "tenant_id": "MarketResearch", "segments_reclaimed": 17 }),
+    )
+    .expect("governance receipt must mint");
+
+    let resp = receipts::get_receipt_verification_v1(
+        State(state),
+        Path(receipt_id.clone()),
+        Query(TenantQuery {
+            tenant_id: "MarketResearch".to_string(),
+        }),
+        HeaderMap::new(),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json["schema"], "crux.governance_receipt_verification.v1");
+    assert_eq!(json["receipt_id"], receipt_id);
+    assert_eq!(json["tenant_id"], "MarketResearch");
+    assert_eq!(json["kind"], "erasure.forget_tenant_corpus");
+    assert_eq!(json["signature_valid"], true);
+    assert_eq!(json["chain_valid"], true);
+}
+
+/// A caller authorised for one tenant must not be able to confirm that a
+/// receipt belonging to *another* tenant exists. The re-gate happens after
+/// resolution — the receipt was found — so this must answer **404**, byte
+/// for byte the same as a receipt that does not exist. A 403 here would
+/// turn the endpoint into an existence oracle across tenants.
+#[tokio::test]
+async fn governance_receipt_for_another_tenant_is_404_not_403() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).expect("passport key");
+    let mut state = mint_test_verified_app_state(16);
+    state.data_dir = tmp.path().to_path_buf();
+    state.passport_key_path = tmp.path().join("passport.key");
+    state.passport_fpr = key.passport_fpr().to_string();
+    state.passport_public_key_hex = key.public_key_hex().to_string();
+
+    // The receipt belongs to MarketResearch.
+    let receipt_id = super::observations::mint_governance_receipt(
+        &state,
+        "__governance__::erasure",
+        "operator",
+        "erasure.forget_tenant_corpus",
+        &serde_json::json!({ "tenant_id": "MarketResearch", "segments_reclaimed": 17 }),
+    )
+    .expect("governance receipt must mint");
+
+    // The caller holds receipts:read, but only for a different tenant —
+    // and asks under that tenant, so the route's first gate passes.
+    let headers = mint_test_jwt_headers_for_tenant("receipts:read", "other-tenant");
+    let resp = receipts::get_receipt_verification_v1(
+        State(state.clone()),
+        Path(receipt_id.clone()),
+        Query(TenantQuery {
+            tenant_id: "other-tenant".to_string(),
+        }),
+        headers,
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a cross-tenant hit must be indistinguishable from a miss"
+    );
+
+    // Control: the same request from the receipt's own tenant succeeds, so
+    // the 404 above is the tenant re-gate and not a broken lookup.
+    let owner_headers = mint_test_jwt_headers_for_tenant("receipts:read", "MarketResearch");
+    let ok = receipts::get_receipt_verification_v1(
+        State(state),
+        Path(receipt_id),
+        Query(TenantQuery {
+            tenant_id: "MarketResearch".to_string(),
+        }),
+        owner_headers,
+    )
+    .await
+    .into_response();
+    assert_eq!(ok.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -11647,6 +11754,37 @@ fn mint_test_jwt_headers(scopes: &str, identity_claim: (&str, &str)) -> HeaderMa
 
 fn mint_test_verified_headers(scopes: &str, passport_id: &str) -> HeaderMap {
     mint_test_jwt_headers(scopes, ("passport_id", passport_id))
+}
+
+/// Like [`mint_test_jwt_headers`] but binds the token to a named tenant, so
+/// a test can exercise `TenantAllow::Only` — the cross-tenant path. Neither
+/// `AuthMode::Off` nor `AuthMode::DevScopes` can: both resolve to
+/// `TenantAllow::Any`, so every tenant check trivially passes.
+fn mint_test_jwt_headers_for_tenant(scopes: &str, tenant_id: &str) -> HeaderMap {
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs()
+        .saturating_add(3_600) as usize;
+    let claims = serde_json::json!({
+        "exp": exp,
+        "iss": MINT_TEST_ISSUER,
+        "aud": MINT_TEST_AUDIENCE,
+        "scope": scopes,
+        "tenant_id": tenant_id,
+    });
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(MINT_TEST_HS256_SECRET.as_bytes()),
+    )
+    .expect("mint tenant-scoped test JWT");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer header"),
+    );
+    headers
 }
 
 fn mint_test_sub_only_headers(scopes: &str, subject: &str) -> HeaderMap {
