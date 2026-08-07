@@ -651,6 +651,12 @@ pub(super) async fn post_query_text_search(
         result_id: String,
         rank: usize,
         segment_index: usize,
+        /// The sealed segment's own sequence — the value `/v1/local/ingest`
+        /// returned as `segment_seq` in its receipt. `segment_index` is a
+        /// position in the loaded-reader list and is NOT the same number, so a
+        /// consumer joining a receipt to a result joins on this
+        /// (ExecPlan `corecrux-ingest-dense-silent-failure-2026-08-07`, B2).
+        segment_seq: Option<u64>,
         doc_id: u32,
         score: f32,
         source_label: &'static str,
@@ -668,6 +674,7 @@ pub(super) async fn post_query_text_search(
             result_id: format!("{}:{}", h.segment_index, h.doc_id),
             rank: idx + 1,
             segment_index: h.segment_index,
+            segment_seq: readers.get(h.segment_index).map(|r| r.header.segment_seq),
             doc_id: h.doc_id,
             score: h.score,
             source_label: "local_tenant_index",
@@ -881,6 +888,9 @@ pub(super) async fn post_query_text_search_expand(
 
         chunks.push(serde_json::json!({
             "segment_index": rid.segment_index,
+            // B2: the ingest receipt's `segment_seq`, so an expand result joins
+            // back to the ingest that produced it without a positional guess.
+            "segment_seq": reader.header.segment_seq,
             "doc_id": rid.doc_id,
             "source_label": "local_tenant_index",
             "score_space": SCORE_SPACE_BM25_LEXICAL,
@@ -1061,6 +1071,80 @@ mod query_tests {
             .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
         std::env::remove_var("CORECRUXD_QUERY_TIME_RANGE");
+    }
+
+    /// B2: every result carries the `segment_seq` its ingest receipt returned,
+    /// so a consumer joins on that value instead of guessing at the positional
+    /// `segment_index`. Two separate ingests → seqs 1 and 2 at indices 0 and 1.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn text_search_results_carry_the_ingest_segment_seq() {
+        std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
+        let state = enabled();
+
+        let mut sealed_seqs = Vec::new();
+        for (doc, text) in [("d1", "peregrine falcon dives"), ("d2", "peregrine falcon nests")] {
+            let documents = vec![crate::local_ingest::ProseDocument {
+                doc_id: doc.to_string(),
+                chunks: vec![crate::local_ingest::ProseChunk {
+                    chunk_id: format!("{doc}::0"),
+                    text: text.to_string(),
+                    dense_vector: None,
+                }],
+            }];
+            let summary = crate::local_ingest::seal_prose_documents(
+                &state.data_dir,
+                0,
+                1,
+                "t1",
+                "corpus",
+                "2026-08-07T00:00:00Z",
+                &documents,
+                None,
+            )
+            .unwrap();
+            sealed_seqs.push(summary.segment_seq);
+        }
+        state
+            .retrieval_index
+            .write()
+            .await
+            .scan_and_load(&state.data_dir.join("shards").join("shard-0000").join("segments"))
+            .unwrap();
+
+        let response = post_query_text_search(
+            State(state),
+            HeaderMap::new(),
+            Json(TextSearchBody {
+                tenant_id: "t1".to_string(),
+                query: "peregrine falcon".to_string(),
+                limit: 10,
+                token_budget: None,
+                min_score: None,
+                mode: None,
+                include_receipt: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let results = json["results"].as_array().expect("results");
+        assert_eq!(results.len(), 2, "both sealed chunks retrieved");
+
+        for hit in results {
+            let seq = hit["segment_seq"].as_u64().expect("segment_seq present on every hit");
+            assert!(
+                sealed_seqs.contains(&seq),
+                "segment_seq {seq} must be a value an ingest receipt returned (receipts: {sealed_seqs:?})"
+            );
+            // The relationship holds on a contiguously-sealed store, which is
+            // what makes the undocumented off-by-one so easy to hardcode — the
+            // join key above is what a consumer should actually use.
+            let index = hit["segment_index"].as_u64().expect("segment_index");
+            assert_eq!(seq, index + 1);
+        }
     }
 
     #[tokio::test]

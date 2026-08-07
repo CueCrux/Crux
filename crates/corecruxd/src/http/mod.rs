@@ -703,7 +703,10 @@ pub(crate) fn router_with_route_auth(
         )
         .route(
             "/v1/local/ingest",
-            axum::routing::post(self::local_ingest::post_local_ingest),
+            axum::routing::post(self::local_ingest::post_local_ingest)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    self::local_ingest::LOCAL_INGEST_MAX_REQUEST_BYTES,
+                )),
         )
         .route(
             "/v1/query/text-search",

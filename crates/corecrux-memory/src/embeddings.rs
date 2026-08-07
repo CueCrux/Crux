@@ -1000,6 +1000,25 @@ struct OllamaEmbedResponse {
     embeddings: Vec<Vec<f32>>,
 }
 
+/// Texts per outbound `/api/embed` call. [`EmbeddingClient::embed_batch`] splits
+/// a larger batch across several calls, so how many chunks a caller sends in one
+/// request no longer decides whether embedding succeeds.
+///
+/// ExecPlan `corecrux-ingest-dense-silent-failure-2026-08-07` (B1): an unsplit
+/// batch made the *response* the limit. A 1024-dim vector serialises to ~12.6 KB
+/// of JSON, so ~830 vectors overflowed ureq's 10 MiB default body cap and the
+/// read failed — silently, because the caller fell back to a BM25-only seal.
+/// Ingests of 776 / 839 / 872 chunks sealed lexical-only; 707 and 749 did not.
+/// At 128 texts the reply is ~1.6 MB at 1024 dims and ~5 MB even at 4096 dims,
+/// well inside the response cap this module now sets (`EMBED_RESPONSE_BODY_LIMIT`).
+pub const EMBED_MAX_TEXTS_PER_CALL: usize = 128;
+
+/// Response-body cap for one embedding call. Raised well above ureq's 10 MiB
+/// default so the cap is a runaway guard, not a working limit — sub-batching is
+/// what keeps replies small, and this is the backstop if a provider returns
+/// something far larger than the requested batch implies.
+const EMBED_RESPONSE_BODY_LIMIT: u64 = 256 * 1024 * 1024;
+
 /// Lightweight embedding client that talks to Ollama's `/api/embed` endpoint.
 ///
 /// Thread-safe via interior mutability for dimension auto-detection.
@@ -1033,11 +1052,27 @@ impl EmbeddingClient {
     }
 
     /// Embed a batch of text strings. Returns one vector per input.
+    ///
+    /// The batch is split into sub-batches of at most
+    /// [`EMBED_MAX_TEXTS_PER_CALL`] and issued as several HTTP calls, so the
+    /// caller's batch size no longer decides whether embedding succeeds. Vectors
+    /// are concatenated in input order; a failure in any sub-batch fails the
+    /// whole call (never a partial result).
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
 
+        let mut out = Vec::with_capacity(texts.len());
+        for sub_batch in texts.chunks(EMBED_MAX_TEXTS_PER_CALL) {
+            out.extend(self.embed_one_call(sub_batch)?);
+        }
+        Ok(out)
+    }
+
+    /// One outbound `/api/embed` call. Callers go through [`Self::embed_batch`],
+    /// which bounds the size of what reaches here.
+    fn embed_one_call(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         let url = format!("{}/api/embed", self.config.base_url.trim_end_matches('/'));
         let body = OllamaEmbedRequest {
             model: &self.config.model,
@@ -1051,6 +1086,8 @@ impl EmbeddingClient {
 
         let parsed: OllamaEmbedResponse = resp
             .body_mut()
+            .with_config()
+            .limit(EMBED_RESPONSE_BODY_LIMIT)
             .read_json()
             .map_err(|e| EmbeddingError::Deserialize(e.to_string()))?;
 
@@ -1218,6 +1255,118 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::Arc;
+
+    // ── B1: `/api/embed` sub-batching ────────────────────────────────────
+    //
+    // A stub Ollama-shaped embedding service that answers `calls` requests,
+    // echoing one 2-dim vector per input text, and reports the input count it
+    // saw on each call.
+
+    fn spawn_embed_stub(calls: usize) -> (String, std::sync::mpsc::Receiver<usize>) {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind embed stub");
+        let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..calls {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut bytes = Vec::new();
+                let mut buf = [0u8; 8192];
+                let header_end = loop {
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break bytes.len(),
+                        Ok(n) => bytes.extend_from_slice(&buf[..n]),
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end.min(bytes.len())]).to_string();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while bytes.len() < header_end + content_length {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => bytes.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[header_end.min(bytes.len())..]).unwrap_or(serde_json::Value::Null);
+                let count = body["input"].as_array().map(|a| a.len()).unwrap_or(0);
+                let _ = tx.send(count);
+
+                let reply = serde_json::json!({ "embeddings": vec![vec![0.5_f32, 0.5]; count] }).to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    reply.len()
+                );
+                let _ = stream.write_all(reply.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (base_url, rx)
+    }
+
+    /// B1: a batch larger than [`EMBED_MAX_TEXTS_PER_CALL`] is split across
+    /// several calls — the caller's batch size no longer decides whether the
+    /// embedder's reply fits. Every input still gets exactly one vector, in
+    /// order.
+    #[test]
+    fn embed_batch_splits_into_bounded_calls() {
+        let count = EMBED_MAX_TEXTS_PER_CALL * 2 + 7;
+        let expected_calls = 3;
+        let (base_url, seen) = spawn_embed_stub(expected_calls);
+        let client = EmbeddingClient::new(EmbeddingConfig {
+            base_url,
+            model: "stub-model".to_string(),
+            dimensions: 2,
+        });
+
+        let owned: Vec<String> = (0..count).map(|i| format!("text {i}")).collect();
+        let texts: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let vectors = client.embed_batch(&texts).expect("sub-batched embed");
+
+        assert_eq!(vectors.len(), count, "one vector per input, across sub-batches");
+        let sizes: Vec<usize> = seen.iter().take(expected_calls).collect();
+        assert_eq!(
+            sizes,
+            vec![EMBED_MAX_TEXTS_PER_CALL, EMBED_MAX_TEXTS_PER_CALL, 7],
+            "no single call exceeds the per-call bound"
+        );
+    }
+
+    /// A single sub-batch failure fails the whole call: never a short or
+    /// partially embedded result that a caller could mistake for success.
+    #[test]
+    fn embed_batch_failure_in_a_later_call_is_not_partial() {
+        // The stub answers ONE call, then drops the listener — the second
+        // sub-batch cannot connect.
+        let (base_url, _seen) = spawn_embed_stub(1);
+        let client = EmbeddingClient::new(EmbeddingConfig {
+            base_url,
+            model: "stub-model".to_string(),
+            dimensions: 2,
+        });
+
+        let owned: Vec<String> = (0..EMBED_MAX_TEXTS_PER_CALL * 2).map(|i| format!("text {i}")).collect();
+        let texts: Vec<&str> = owned.iter().map(String::as_str).collect();
+        assert!(
+            client.embed_batch(&texts).is_err(),
+            "a failed sub-batch must fail the batch, not return a short result"
+        );
+    }
 
     #[derive(Clone)]
     struct MockDelegationRequest {

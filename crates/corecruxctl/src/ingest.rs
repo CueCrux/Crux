@@ -85,6 +85,13 @@ struct IngestResponse {
     receipt_id: Option<String>,
     dense_vectors: usize,
     dense_dim: Option<usize>,
+    /// B1 (`corecrux-ingest-dense-silent-failure-2026-08-07`): `ok` | `partial` |
+    /// `skipped` | `not_configured` | `not_applicable`. Defaulted so this CLI
+    /// still talks to a daemon that predates the field.
+    #[serde(default)]
+    dense_status: Option<String>,
+    #[serde(default)]
+    dense_expected: Option<usize>,
 }
 
 /// Receipt and sealed-segment identifiers returned for one HTTP batch.
@@ -99,6 +106,9 @@ pub struct BatchSeal {
     pub sealed: bool,
     pub dense_vectors: usize,
     pub dense_dim: Option<usize>,
+    /// `None` when the daemon predates `dense_status` (B1).
+    pub dense_status: Option<String>,
+    pub dense_expected: Option<usize>,
 }
 
 /// Aggregate result for a completed or dry-run ingest.
@@ -209,6 +219,8 @@ pub fn execute(options: &IngestOptions) -> Result<IngestReport, DynErr> {
             sealed: response.sealed,
             dense_vectors: response.dense_vectors,
             dense_dim: response.dense_dim,
+            dense_status: response.dense_status,
+            dense_expected: response.dense_expected,
         });
     }
     Ok(report)
@@ -240,6 +252,20 @@ pub fn run(options: &IngestOptions) -> Result<(), DynErr> {
                 seal.chunks,
                 seal.sealed
             );
+            // B1: a dense gap is not visible in chunks/sealed — those look
+            // healthy while retrieval has degraded to lexical-only. Say it.
+            if let Some(status) = seal.dense_status.as_deref() {
+                if matches!(status, "skipped" | "partial") {
+                    eprintln!(
+                        "  warning: batch {} sealed with dense_status={status} \
+                         ({} of {} chunks embedded) — this corpus is lexical-only \
+                         and semantic recall will be degraded",
+                        seal.batch,
+                        seal.dense_vectors,
+                        seal.dense_expected.unwrap_or(seal.chunks),
+                    );
+                }
+            }
         }
     }
     println!("query next:");
@@ -898,6 +924,32 @@ mod tests {
         }
     }
 
+    /// B1: a daemon that reports a dense gap has that gap carried into the
+    /// `BatchSeal`, so the caller-facing warning has something to fire on.
+    #[test]
+    fn dense_gap_reply_is_carried_into_the_seal() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.md"), "# Alpha\n\nbody text").unwrap();
+        let reply = serde_json::json!({
+            "ingested": 1,
+            "documents": 1,
+            "frame_count": 7u64,
+            "sealed": true,
+            "segment_seq": 42u64,
+            "receipt_id": "rcpt-1",
+            "dense_vectors": 0,
+            "dense_dim": serde_json::Value::Null,
+            "dense_status": "skipped",
+            "dense_expected": 1,
+        })
+        .to_string();
+        let (port, _handle) = crate::test_support::serve_responses(vec![(202, reply)]);
+
+        let report = execute(&options(temp.path(), &format!("http://127.0.0.1:{port}"))).unwrap();
+        assert_eq!(report.seals[0].dense_status.as_deref(), Some("skipped"));
+        assert_eq!(report.seals[0].dense_expected, Some(1));
+    }
+
     /// A well-formed `/v1/local/ingest` reply body.
     fn ingest_reply(ingested: usize, documents: usize) -> String {
         serde_json::json!({
@@ -1194,6 +1246,10 @@ mod tests {
                 sealed: true,
                 dense_vectors: 0,
                 dense_dim: None,
+                // The fixture reply predates `dense_status`, as a daemon older
+                // than B1 would — the field must decode as absent, not fail.
+                dense_status: None,
+                dense_expected: None,
             }]
         );
 
