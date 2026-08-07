@@ -3,11 +3,11 @@
 Thin bindings that inject Crux memory into agent frameworks, over the daemon's
 provider-neutral `GET /v1/context` surface.
 
-| Framework | Status | Extra |
+| Framework | Native shape | Extra |
 |---|---|---|
-| LangChain | shipped | `pip install 'cuecrux-adapters[langchain]'` |
-| LlamaIndex | planned (M6.3) | — |
-| CrewAI | planned (M6.3) | — |
+| LangChain | `Document`, `SystemMessage`, `BaseRetriever` | `pip install 'cuecrux-adapters[langchain]'` |
+| LlamaIndex | `NodeWithScore`, `BaseRetriever` | `pip install 'cuecrux-adapters[llamaindex]'` |
+| CrewAI | `BaseTool`, context string | `pip install 'cuecrux-adapters[crewai]'` |
 
 ## The rule these adapters follow
 
@@ -45,23 +45,55 @@ docs = retriever.invoke("what database do we use")
 message = to_system_message(fetch_bundle(client, entity="project:atlas"))
 ```
 
-Runnable version, which boots its own daemon:
+LlamaIndex and CrewAI, same bundle, native shapes:
+
+```python
+from crux_adapters.llamaindex import CruxContextRetriever as LlamaRetriever
+from crux_adapters.crewai import CruxMemoryTool
+
+nodes = LlamaRetriever(client, entity="project:atlas").retrieve("what database")
+tool = CruxMemoryTool(client=client, entity="project:atlas")   # attach to any Agent
+```
+
+Runnable versions, which boot their own daemon:
 
 ```bash
 python examples/langchain_example.py --boot
+python examples/crewai_example.py --boot
 ```
 
-**Scope your retrieval.** An unscoped bundle also carries the daemon's own
-`__bootstrap__::` documentation facts, seeded on first boot and visible
-whenever the caller is the operator. On a fresh daemon they outnumber your own
-memory. Pass `entity=` or a `query`.
+### Scoping: `entity` filters, `query` does not
+
+Measured against a fresh daemon holding exactly one user fact
+(`project:atlas · database`), plus the `__bootstrap__::` documentation facts
+the daemon seeds on first boot:
+
+| Call | Facts returned | Of them, yours |
+|---|---|---|
+| no arguments | 20 | 1 |
+| `entity="project:atlas"` | 1 | 1 |
+| `query="what database does atlas use"` | 31 | 0 |
+| both | 32 | 1 |
+
+Two things follow, and both are easy to get wrong:
+
+- **`entity=` is the only true scope.** It resolves that entity first *and*
+  restricts to it.
+- **`query=` is a union, not a filter.** It *adds* keyword recall on top, so
+  `entity=` plus `query=` returns more than `entity=` alone, not less.
+
+The bootstrap facts are visible whenever the caller is the operator (auth off,
+or an operator passport), and on a fresh daemon they dominate keyword recall —
+in the probe above a natural-language query returned 31 facts, none of them the
+user's own. Pass `entity=` when you want scoped recall. This is daemon-side
+ranking behaviour, not something the adapters filter: an adapter that dropped
+results here would be re-deciding, which is exactly what the suite forbids.
 
 ## Conformance
 
-One suite, every adapter. Adding LlamaIndex and CrewAI in M6.3 means appending
-two entries to `discover_adapters()` — if either needs a *new* case, that is a
-signal worth recording in the ExecPlan, because the point is that one suite
-covers all three.
+One suite, every adapter. Adding LlamaIndex and CrewAI took **one row each in
+`_BINDINGS`** and changed no case — which was the point of writing the suite
+before the second and third adapters existed.
 
 ```bash
 python -m conformance                    # mapping + live (boots two daemons)
@@ -123,12 +155,32 @@ catches each one. Loosen a case and one of those breaks.
 ```
 crux_adapters/core.py        framework-free mapping; the shared behaviour
 crux_adapters/langchain.py   LangChain binding (Document, SystemMessage, BaseRetriever)
+crux_adapters/llamaindex.py  LlamaIndex binding (NodeWithScore, BaseRetriever)
+crux_adapters/crewai.py      CrewAI binding (BaseTool, context string)
 conformance/suite.py         the cases, and adapter discovery
 conformance/daemon.py        throwaway corecruxd for the live layer
 conformance/__main__.py      the runner; this is the gate
 tests/test_conformance.py    mapping layer + negative controls (CI)
 examples/langchain_example.py
+examples/crewai_example.py
 ```
+
+## Two framework-shape decisions worth knowing
+
+**LlamaIndex nodes carry `score=None`.** Bundle order is the daemon's
+*presentation* order, not a relevance ranking. Filling in a synthetic
+descending score would let downstream LlamaIndex components re-sort or
+threshold on a number this adapter invented — the re-deciding the suite
+forbids.
+
+**CrewAI gets a tool, not a `BaseKnowledgeSource`.** The knowledge-source
+extension point looks like the obvious fit and is the wrong one: it hands raw
+content to CrewAI, which chunks it, embeds it into its own vector store, and
+retrieves against that store with its own ranking. Crux has already done the
+selection, the budget enforcement and the ordering, and `stable_hash` covers
+exactly that ordering. Routing the bundle through a second retrieval layer
+would discard all of it. A tool keeps Crux as the retriever and CrewAI as the
+caller.
 
 ## Licence
 

@@ -45,17 +45,17 @@ def run(base_url: str) -> int:
         retriever = CruxContextRetriever(
             client=client, entity="project:atlas", token_budget=2000
         )
-        docs = retriever.invoke("what database does atlas use")
+        # No query text: scoped strictly to the entity.
+        docs = retriever.invoke("")
         print(f"scoped retriever returned {len(docs)} documents")
         for doc in docs:
             freshness = doc.metadata.get("freshness", "?")
             print(f"  [{doc.metadata['crux_kind']}/{freshness}] {doc.page_content}")
 
-        # Worth knowing: an UNSCOPED retriever also returns the daemon's own
-        # `__bootstrap__::` documentation facts, which are seeded on first boot
-        # and are visible whenever the caller is the operator (auth off, or an
-        # operator passport). On a fresh daemon they outnumber your own memory.
-        # Pass `entity=` -- or a `query` -- unless you really want everything.
+        # Worth knowing: `entity=` is the only true scope. A `query` UNIONS
+        # keyword recall on top rather than filtering, and on a fresh daemon
+        # the seeded `__bootstrap__::` documentation facts dominate that pass.
+        # See the README table for the measured numbers.
         unscoped = CruxContextRetriever(client=client, token_budget=2000).invoke("")
         bootstrap = sum(1 for d in unscoped if d.metadata.get("entity", "").startswith("__"))
         print(f"\nunscoped: {len(unscoped)} documents, {bootstrap} of them daemon bootstrap docs")
