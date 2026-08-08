@@ -60,7 +60,19 @@ impl CloudWitnessRuntime {
             Some(url) => (super::allowlist::validate_insecure_test_upstream(url)?, true),
             None => (config.provider.base_url().to_string(), false),
         };
-        let witness_key = WitnessKey::load_or_create(&config.witness_key).ok();
+        let witness_key = match WitnessKey::load_or_create(&config.witness_key) {
+            Ok(key) => Some(key),
+            // Fail-soft is deliberate (records degrade to `witness_key_unavailable`), but the
+            // reason must not be swallowed: `{error:#}` prints the whole anyhow context chain,
+            // which already names the exact custody step that refused.
+            Err(error) => {
+                eprintln!(
+                    "crux-llm-shim: cloud witness key unavailable at {}; records will be degraded: {error:#}",
+                    config.witness_key.display()
+                );
+                None
+            }
+        };
         let dispatcher = ReceiptDispatcher::new(config.daemon_receipts, config.receipts_spool.clone());
         Ok(Self {
             config,
@@ -801,16 +813,24 @@ mod tests {
         }
     }
 
-    fn test_runtime() -> CloudWitnessRuntime {
+    /// The `TempDir` is returned, not dropped: the runtime outlives this call and its key
+    /// directory must outlive the runtime.
+    fn test_runtime() -> (CloudWitnessRuntime, tempfile::TempDir) {
         let directory = tempfile::tempdir().expect("cloud witness test directory");
+        let key_path = directory.path().join("witness.key");
+        // Establish the key through the runtime's own path but keep the `Result`, so a custody
+        // failure panics with the real context chain rather than surfacing later as a bare
+        // `expect("test witness key")` on a `None`.
+        WitnessKey::load_or_create(&key_path).expect("cloud witness test key");
         let config = CloudWitnessConfig::new(
             CloudUpstream::Anthropic,
             "127.0.0.1:0".to_string(),
-            directory.path().join("witness.key"),
+            key_path,
             directory.path().join("receipts.jsonl"),
             false,
         );
-        CloudWitnessRuntime::new(config).expect("cloud witness test runtime")
+        let runtime = CloudWitnessRuntime::new(config).expect("cloud witness test runtime");
+        (runtime, directory)
     }
 
     fn test_request(headers: &[(&str, &str)]) -> Request {
@@ -829,7 +849,7 @@ mod tests {
     fn session_hint_is_withheld_without_matching_listener_auth() {
         let _env_guard = crate::test_support::env_guard();
         let unset_token = SessionTokenEnvGuard::set(None);
-        let runtime = test_runtime();
+        let (runtime, _witness_dir) = test_runtime();
         let unauthenticated = test_request(&[
             (SESSION_ID_HEADER, "session-unproven"),
             (SESSION_AUTH_HEADER, "caller-chosen"),
@@ -840,7 +860,7 @@ mod tests {
         drop(unset_token);
 
         let _configured_token = SessionTokenEnvGuard::set(Some("listener-secret"));
-        let runtime = test_runtime();
+        let (runtime, _witness_dir) = test_runtime();
         let missing_auth = test_request(&[(SESSION_ID_HEADER, "session-unproven")]);
         let record = cloud_request_record(&runtime, &missing_auth, "/v1/messages", "request-2");
         assert!(record["session_hint"].is_null());
@@ -856,7 +876,7 @@ mod tests {
     fn session_hint_is_stamped_with_matching_listener_auth() {
         let _env_guard = crate::test_support::env_guard();
         let _configured_token = SessionTokenEnvGuard::set(Some("listener-secret"));
-        let runtime = test_runtime();
+        let (runtime, _witness_dir) = test_runtime();
         let authenticated = test_request(&[
             (SESSION_ID_HEADER, "session-proven"),
             (SESSION_AUTH_HEADER, "listener-secret"),
@@ -867,7 +887,7 @@ mod tests {
 
     #[test]
     fn witnessed_records_have_signed_distinct_nonces() {
-        let runtime = test_runtime();
+        let (runtime, _witness_dir) = test_runtime();
         let request = test_request(&[]);
         let request_record = cloud_request_record(&runtime, &request, "/v1/messages", "request-1");
         let response_record = cloud_response_record(
@@ -898,6 +918,25 @@ mod tests {
             crate::llm_shim::witness::verify_witness_envelope(&envelope, &identity)
                 .expect("nonce-bearing witness envelope verifies");
         }
+    }
+
+    #[test]
+    fn unusable_witness_key_degrades_instead_of_failing_construction() {
+        let directory = tempfile::tempdir().expect("cloud witness test directory");
+        let key_path = directory.path().join("witness.key");
+        std::fs::write(&key_path, "not-a-hex-seed\n").expect("write unusable witness key");
+        let config = CloudWitnessConfig::new(
+            CloudUpstream::Anthropic,
+            "127.0.0.1:0".to_string(),
+            key_path,
+            directory.path().join("receipts.jsonl"),
+            false,
+        );
+
+        // Fail-soft: the listener still starts, and records degrade to `witness_key_unavailable`
+        // rather than the shim refusing provider traffic.
+        let runtime = CloudWitnessRuntime::new(config).expect("runtime constructs without a key");
+        assert!(runtime.witness_key.is_none());
     }
 
     #[test]
