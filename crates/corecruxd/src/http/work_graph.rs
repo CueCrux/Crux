@@ -49,8 +49,14 @@ pub(super) struct GraphPlan {
     plane: &'static str,
     /// Shared services the plan touches, most-referenced first.
     services: Vec<&'static str>,
-    /// Declared dependency edges, narrowed to plans that are still open.
+    /// Declared dependency edges (`Depends on` / `Extended by`), narrowed to
+    /// plans that are still open. These mean "blocked by".
     links: Vec<String>,
+    /// Bare `[[slug]]` prose references, narrowed the same way and with the
+    /// declared set removed. These mean "talks about" — a weaker claim, kept on
+    /// its own axis so a typo can never masquerade as a dependency.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    mentions: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     blurb: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,6 +102,8 @@ pub(super) struct WorkGraph {
     /// Total declared edges between open plans — lets a caller sanity-check a
     /// render without walking every plan.
     link_count: usize,
+    /// Total prose-mention edges between open plans.
+    mention_count: usize,
     generated_at_unix_ms: u64,
 }
 
@@ -112,6 +120,7 @@ pub(super) async fn get_work_graph(State(state): State<AppState>, headers: Heade
             planes: Vec::new(),
             services: Vec::new(),
             link_count: 0,
+            mention_count: 0,
             generated_at_unix_ms: now_unix_ms(),
         })
         .into_response();
@@ -187,6 +196,7 @@ pub(super) async fn get_work_graph(State(state): State<AppState>, headers: Heade
     let mut plane_counts: HashMap<&'static str, usize> = HashMap::new();
     let mut service_counts: HashMap<&'static str, usize> = HashMap::new();
     let mut link_count = 0usize;
+    let mut mention_count = 0usize;
 
     let empty_facets = PlanFacets {
         plane: work_graph::plane_for("", "", ""),
@@ -194,6 +204,7 @@ pub(super) async fn get_work_graph(State(state): State<AppState>, headers: Heade
         blurb: None,
         risk: None,
         declared: Vec::new(),
+        mentions: Vec::new(),
     };
     for w in &open {
         let slug = slug_of(&w.id);
@@ -203,6 +214,8 @@ pub(super) async fn get_work_graph(State(state): State<AppState>, headers: Heade
         // parser sources from declaration lines, never from prose.
         let links = work_graph::narrow_links(&f.declared, &|s| open_slugs.contains(s), slug);
         link_count += links.len();
+        let mentions = work_graph::narrow_links(&f.mentions, &|s| open_slugs.contains(s), slug);
+        mention_count += mentions.len();
 
         let plane = f.plane;
         *plane_counts.entry(plane).or_insert(0) += 1;
@@ -220,6 +233,7 @@ pub(super) async fn get_work_graph(State(state): State<AppState>, headers: Heade
             plane,
             services,
             links,
+            mentions,
             blurb: f.blurb.clone(),
             risk: f.risk.clone(),
             current_milestone: w.current_milestone.clone(),
@@ -252,6 +266,7 @@ pub(super) async fn get_work_graph(State(state): State<AppState>, headers: Heade
         planes,
         services,
         link_count,
+        mention_count,
         generated_at_unix_ms: now,
     })
     .into_response()

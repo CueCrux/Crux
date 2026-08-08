@@ -325,6 +325,40 @@ fn truncate_on_word(s: &str, max_chars: usize) -> String {
 ///
 /// `declared` is `depends_on` ∪ `extended_by` from the parser. An edge to a
 /// closed or unknown plan is dropped rather than drawn as a dangling stub.
+/// Every `[[slug]]`-shaped reference in the prose, deduped, minus anything the
+/// plan already declares.
+///
+/// These are NOT dependencies. A mention is "this plan talks about that one",
+/// which is a different claim from "this plan is blocked by that one" — so they
+/// travel on their own axis and the console draws them differently. The reason
+/// the layer exists at all: only 21 of 228 open plans declare an edge, so a
+/// declared-only board is honest but nearly empty, and the relationships people
+/// actually wrote down live in the prose.
+///
+/// Deliberately permissive — a typo lands here and nowhere else, which is
+/// exactly why it must never be merged into `depends_on`.
+pub fn prose_mentions(body: &str, declared: &[String], self_slug: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = body;
+    while let Some(open) = rest.find("[[") {
+        rest = &rest[open + 2..];
+        let Some(close) = rest.find("]]") else { break };
+        let inner = &rest[..close];
+        rest = &rest[close + 2..];
+        // `[[slug|label]]` and `[[slug#anchor]]` both key off the slug.
+        let slug = inner.split(['|', '#']).next().unwrap_or("").trim();
+        if slug.is_empty() || slug.len() > 160 || slug == self_slug {
+            continue;
+        }
+        if declared.iter().any(|d| d == slug) || out.iter().any(|d| d == slug) {
+            continue;
+        }
+        out.push(slug.to_string());
+    }
+    out.sort();
+    out
+}
+
 pub fn narrow_links(declared: &[String], open: &dyn Fn(&str) -> bool, self_slug: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for slug in declared {
@@ -354,6 +388,9 @@ pub struct PlanFacets {
     pub risk: Option<String>,
     /// `depends_on` ∪ `extended_by`, before narrowing to the open set.
     pub declared: Vec<String>,
+    /// Prose `[[slug]]` references minus the declared set. File-derived like
+    /// everything else here, so it caches on the same `(mtime, len)` key.
+    pub mentions: Vec<String>,
 }
 
 /// Compute every file-derived facet in one pass.
@@ -374,6 +411,7 @@ pub fn facets_for(slug: &str, body: &str) -> PlanFacets {
         services: services_for(body),
         blurb: purpose_blurb(body, BLURB_CHARS),
         risk: parsed.risk_class.clone(),
+        mentions: prose_mentions(body, &declared, slug),
         declared,
     }
 }

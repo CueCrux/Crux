@@ -3145,7 +3145,14 @@
      The open board in space. Plates are ground-coloured and read by their
      shadow; cards use the same --surface/--edge material as every other card
      in the console; wires are declared dependencies drawn X/Y only. */
-  .pb-canvas { display: block; width: 100%; height: auto; max-height: 78vh; margin: 4px 0 2px; }
+  /* Full-bleed: the canvas IS the page here, so it escapes the content column
+     rather than sitting in a letterboxed panel inside it. */
+  .pb-canvas { display: block; width: 100%; height: auto; margin: 4px 0 2px; }
+  .patchbay-region-host { display: flex; flex-direction: column; }
+  .patchbay-region-host .pb-canvas {
+    width: 100vw; max-width: 100vw; margin-left: 50%; transform: translateX(-50%);
+    height: calc(100vh - 210px); min-height: 420px; }
+  .patchbay-region-host .pb-canvas svg, .patchbay-region-host svg.pb-canvas { height: 100%; }
   .pb-plate { fill: var(--bg, var(--surface2)); stroke: none; filter: drop-shadow(0 6px 10px rgba(0,0,0,.30)); }
   .pb-centre { fill: var(--surface); stroke: var(--edge); stroke-width: 1; }
   .pb-centre-t { fill: var(--acc); font-size: 12px; font-weight: 700; letter-spacing: .12em; }
@@ -3159,6 +3166,17 @@
   .pb-rail-n { fill: var(--ink3); font-size: 9px; }
   .pb-wire { fill: none; stroke: var(--acc); stroke-width: 2; opacity: .55;
              stroke-linejoin: round; stroke-linecap: round; }
+  /* A mention is a weaker claim than a dependency, so it is drawn as one:
+     thinner, dashed, and in the neutral ink rather than the accent. */
+  .pb-wire-mention { stroke: var(--ink3); stroke-width: 1.4; opacity: .38; stroke-dasharray: 5 5; }
+  .pb-cable { fill: none; stroke: var(--ok); stroke-width: 2; opacity: .8;
+              stroke-linejoin: round; stroke-linecap: round; }
+  .pb-rail-g { cursor: pointer; }
+  .pb-rail-g:hover .pb-rail, .pb-rail-g.pb-sel .pb-rail { stroke: var(--acc); stroke-width: 2; }
+  .pb-rail-g:focus-visible .pb-rail { stroke: var(--acc); stroke-width: 2; }
+  /* Removed from the picture entirely, not faded: a selection answers a
+     question, and the plans that are not part of the answer are noise. */
+  .pb-gone { display: none; }
   .pb-chip:hover .pb-chip-bg { stroke: var(--acc); }
   .pb-legend { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin-top: 6px; }
   .pb-legend-item { display: inline-flex; align-items: center; gap: 6px; }

@@ -1685,7 +1685,7 @@
     // always mounted and returns an empty graph when the ExecPlan root is unset,
     // so the page degrades honestly on its own. Delegates to render.js
     // renderPatchbay.
-    { id: 'patchbay', label: 'Patchbay', icon: 'patchbay', key: '6', sub: 'The board in space — every open plan as a card, grouped by system, wired to the services it touches.' },
+    { id: 'patchbay', label: 'Patchbay', icon: 'patchbay', key: '6', sub: 'The board in space — every open plan as a card, grouped by system. Solid wires are declared dependencies (Depends on / Extended by); dashed are prose mentions. Click a system or a service to isolate it.' },
     { id: 'work', label: 'Work', icon: 'work', key: '2', sub: 'ExecPlans, projects, and sessions.' },
     { id: 'memory', label: 'Memory', icon: 'memory', key: '3', sub: 'Facts, tenants, documents, and retrieval tuning.' },
     { id: 'trust', label: 'Trust', icon: 'trust', key: '4', sub: 'Receipts, gates, identity, and posture.' },
