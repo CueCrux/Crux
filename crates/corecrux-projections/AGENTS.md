@@ -3,21 +3,21 @@
 > Root `AGENTS.md` and `CLAUDE.md` still apply; this file adds crate-local context.
 
 Living-objects projections: derived read-model state materialised from projection events
-on the event spine, plus `.ccxs` snapshots and parity-harness plumbing. All projection
+on the event spine, plus `.ccxsnap` snapshots and parity-harness plumbing. All projection
 logic is deterministic by construction — sorted key orders (BTreeMap/BTreeSet),
 integer-only state (quantized confidence, unix micros), stable snapshot/meta encodings.
 
 ## Key symbols
 - `ProjectionEventV1` / `parse_projection_event` (`events.rs`) — the event vocabulary (`EVT_*_V1` constants) that feeds every projection.
 - `ProjectionState::apply` (`state.rs`) — folds one event into derived state, returning `ProjectionApplyStats`.
-- `CcxsSnapshot` / `CcxsProjectionId` (`ccxs.rs`) — snapshot format; blake3-hashed, deterministic.
+- `CcxsnapSnapshot` / `CcxsnapProjectionId` (`ccxsnap.rs`) — snapshot format; blake3-hashed, deterministic.
 - `ProjectionStoreV1` / `ProjectionsTickResultV1` (`runner.rs`) — the tick loop; on module-version change the next tick replays from genesis.
 - `decay::apply_at` — pure freshness function `(HorizonClass, written_ms, now_ms) → Freshness`; no I/O, no clock, no randomness.
 - `quantize_confidence_q16` / `dequantize_confidence_f32` — the integer-only confidence rule.
 
 ## Test & verify
 - `cargo test -p corecrux-projections`
-- Determinism tests: `snapshot_blake3_hex_is_deterministic` (`ccxs.rs`),
+- Determinism tests: `snapshot_blake3_hex_is_deterministic` (`ccxsnap.rs`),
   `cold_block_path_v1_deterministic` / `cold_segment_path_v1_deterministic` (`runner.rs` tests).
 - The cross-daemon parity harness (`corecruxctl/src/parity.rs`, `ParityLivingReportV1`)
   compares two daemons for byte-equivalent reads — it only works because state here is deterministic.

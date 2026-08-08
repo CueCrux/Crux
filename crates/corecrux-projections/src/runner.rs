@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0.
 // See LICENSE in the repository root.
 
-//! Projection materialiser: replays sealed-segment frames through Phase 7 event handlers and writes `.ccxs` snapshots.
+//! Projection materialiser: replays sealed-segment frames through Phase 7 event handlers and writes `.ccxsnap` snapshots.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
@@ -14,9 +14,10 @@ use corecrux_frame::decode_canonical_header_bytes_v1;
 use corecrux_segment::decode_frame_v1;
 use corecrux_storage::{ReplayCursor, ReplayFrames, ShardStorage};
 
-use crate::ccxs::{
-    CcxsProjectionId, CcxsSnapshot, CcxsSnapshotHeaderV1, CCXS_BLOCK_COLD_SEGMENT_DIR_V1, CCXS_BLOCK_EDGES_V1,
-    CCXS_BLOCK_EVENTS_V1, CCXS_BLOCK_HOT_PTRS_V1, CCXS_BLOCK_ROWS_V1, CCXS_CODEC_NONE,
+use crate::ccxsnap::{
+    CcxsnapProjectionId, CcxsnapSnapshot, CcxsnapSnapshotHeaderV1, CCXSNAP_BLOCK_COLD_SEGMENT_DIR_V1,
+    CCXSNAP_BLOCK_EDGES_V1, CCXSNAP_BLOCK_EVENTS_V1, CCXSNAP_BLOCK_HOT_PTRS_V1, CCXSNAP_BLOCK_ROWS_V1,
+    CCXSNAP_CODEC_NONE,
 };
 use crate::codec_v1::{
     decode_dependents_edges_v1, decode_hot_ptrs_v1, decode_living_rows_v1, decode_pressure_rows_v1,
@@ -60,10 +61,10 @@ impl ProjectionFilesV1 {
         let cold_dependents_segments_dir = cold_dependents_dir.join("segments");
         Self {
             meta_path: projections_dir.join("projections.meta.json"),
-            living_snapshot_path: projections_dir.join("artifact_living_state.snapshot.ccxs"),
-            relations_snapshot_path: projections_dir.join("artifact_relations.snapshot.ccxs"),
-            pressure_snapshot_path: projections_dir.join("pressure_events.snapshot.ccxs"),
-            dependents_snapshot_path: projections_dir.join("artifact_dependents.snapshot.ccxs"),
+            living_snapshot_path: projections_dir.join("artifact_living_state.snapshot.ccxsnap"),
+            relations_snapshot_path: projections_dir.join("artifact_relations.snapshot.ccxsnap"),
+            pressure_snapshot_path: projections_dir.join("pressure_events.snapshot.ccxsnap"),
+            dependents_snapshot_path: projections_dir.join("artifact_dependents.snapshot.ccxsnap"),
             cold_relations_dir,
             cold_relations_segments_dir,
             cold_dependents_dir,
@@ -206,10 +207,11 @@ impl ProjectionStoreV1 {
         {
             match std::fs::read(&files.living_snapshot_path) {
                 Ok(bytes) => {
-                    if CcxsSnapshot::snapshot_blake3_hex(&bytes) == h {
-                        match CcxsSnapshot::decode(&bytes) {
+                    if CcxsnapSnapshot::snapshot_blake3_hex(&bytes) == h {
+                        match CcxsnapSnapshot::decode(&bytes) {
                             Ok(snap) => {
-                                if let Some((_, block)) = snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_ROWS_V1) {
+                                if let Some((_, block)) = snap.blocks.iter().find(|(t, _)| *t == CCXSNAP_BLOCK_ROWS_V1)
+                                {
                                     if let Ok(rows) = decode_living_rows_v1(block) {
                                         state.living = rows;
                                     } else {
@@ -236,12 +238,12 @@ impl ProjectionStoreV1 {
         {
             match std::fs::read(&files.relations_snapshot_path) {
                 Ok(bytes) => {
-                    if CcxsSnapshot::snapshot_blake3_hex(&bytes) == h {
-                        match CcxsSnapshot::decode(&bytes) {
+                    if CcxsnapSnapshot::snapshot_blake3_hex(&bytes) == h {
+                        match CcxsnapSnapshot::decode(&bytes) {
                             Ok(snap) => match meta.artifact_relations.schema_version {
                                 1 => {
                                     if let Some((_, block)) =
-                                        snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_EDGES_V1)
+                                        snap.blocks.iter().find(|(t, _)| *t == CCXSNAP_BLOCK_EDGES_V1)
                                     {
                                         if let Ok(edges) = decode_relations_edges_v1(block) {
                                             state.relations = edges;
@@ -254,7 +256,7 @@ impl ProjectionStoreV1 {
                                 }
                                 2 => {
                                     if let Some((_, block)) =
-                                        snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_HOT_PTRS_V1)
+                                        snap.blocks.iter().find(|(t, _)| *t == CCXSNAP_BLOCK_HOT_PTRS_V1)
                                     {
                                         match decode_hot_ptrs_v1(block) {
                                             Ok(ptrs) => {
@@ -272,8 +274,10 @@ impl ProjectionStoreV1 {
                                 }
                                 3 => {
                                     if let (Some((_, hot_block)), Some((_, dir_block))) = (
-                                        snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_HOT_PTRS_V1),
-                                        snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_COLD_SEGMENT_DIR_V1),
+                                        snap.blocks.iter().find(|(t, _)| *t == CCXSNAP_BLOCK_HOT_PTRS_V1),
+                                        snap.blocks
+                                            .iter()
+                                            .find(|(t, _)| *t == CCXSNAP_BLOCK_COLD_SEGMENT_DIR_V1),
                                     ) {
                                         match (decode_hot_ptrs_v1(hot_block), decode_cold_segment_dir_v1(dir_block)) {
                                             (Ok(ptrs), Ok(dir)) => {
@@ -326,12 +330,12 @@ impl ProjectionStoreV1 {
         {
             match std::fs::read(&files.dependents_snapshot_path) {
                 Ok(bytes) => {
-                    if CcxsSnapshot::snapshot_blake3_hex(&bytes) == h {
-                        match CcxsSnapshot::decode(&bytes) {
+                    if CcxsnapSnapshot::snapshot_blake3_hex(&bytes) == h {
+                        match CcxsnapSnapshot::decode(&bytes) {
                             Ok(snap) => match meta.artifact_dependents.schema_version {
                                 1 => {
                                     if let Some((_, block)) =
-                                        snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_EDGES_V1)
+                                        snap.blocks.iter().find(|(t, _)| *t == CCXSNAP_BLOCK_EDGES_V1)
                                     {
                                         if let Ok(edges) = decode_dependents_edges_v1(block) {
                                             state.dependents = edges;
@@ -344,7 +348,7 @@ impl ProjectionStoreV1 {
                                 }
                                 2 => {
                                     if let Some((_, block)) =
-                                        snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_HOT_PTRS_V1)
+                                        snap.blocks.iter().find(|(t, _)| *t == CCXSNAP_BLOCK_HOT_PTRS_V1)
                                     {
                                         match decode_hot_ptrs_v1(block) {
                                             Ok(ptrs) => {
@@ -362,8 +366,10 @@ impl ProjectionStoreV1 {
                                 }
                                 3 => {
                                     if let (Some((_, hot_block)), Some((_, dir_block))) = (
-                                        snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_HOT_PTRS_V1),
-                                        snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_COLD_SEGMENT_DIR_V1),
+                                        snap.blocks.iter().find(|(t, _)| *t == CCXSNAP_BLOCK_HOT_PTRS_V1),
+                                        snap.blocks
+                                            .iter()
+                                            .find(|(t, _)| *t == CCXSNAP_BLOCK_COLD_SEGMENT_DIR_V1),
                                     ) {
                                         match (decode_hot_ptrs_v1(hot_block), decode_cold_segment_dir_v1(dir_block)) {
                                             (Ok(ptrs), Ok(dir)) => {
@@ -416,10 +422,12 @@ impl ProjectionStoreV1 {
         {
             match std::fs::read(&files.pressure_snapshot_path) {
                 Ok(bytes) => {
-                    if CcxsSnapshot::snapshot_blake3_hex(&bytes) == h {
-                        match CcxsSnapshot::decode(&bytes) {
+                    if CcxsnapSnapshot::snapshot_blake3_hex(&bytes) == h {
+                        match CcxsnapSnapshot::decode(&bytes) {
                             Ok(snap) => {
-                                if let Some((_, block)) = snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_EVENTS_V1) {
+                                if let Some((_, block)) =
+                                    snap.blocks.iter().find(|(t, _)| *t == CCXSNAP_BLOCK_EVENTS_V1)
+                                {
                                     if let Ok(rows) = decode_pressure_rows_v1(block) {
                                         state.pressure = rows;
                                     } else {
@@ -625,9 +633,9 @@ impl ProjectionStoreV1 {
 
         // Snapshot 1: artifact_living_state (hot rows).
         let living_rows = encode_living_rows_v1(&self.state.living);
-        let living_snapshot = CcxsSnapshot {
-            header: CcxsSnapshotHeaderV1 {
-                projection_id: CcxsProjectionId::ArtifactLivingState,
+        let living_snapshot = CcxsnapSnapshot {
+            header: CcxsnapSnapshotHeaderV1 {
+                projection_id: CcxsnapProjectionId::ArtifactLivingState,
                 schema_version: 1,
                 created_at_unix_ns,
                 shard_id: self.shard_id,
@@ -635,12 +643,12 @@ impl ProjectionStoreV1 {
                 cursor_segment_seq,
                 cursor_offset,
                 block_count: 1,
-                codec: CCXS_CODEC_NONE,
+                codec: CCXSNAP_CODEC_NONE,
             },
-            blocks: vec![(CCXS_BLOCK_ROWS_V1, living_rows)],
+            blocks: vec![(CCXSNAP_BLOCK_ROWS_V1, living_rows)],
         };
         let living_bytes = living_snapshot.encode()?;
-        let living_hash = CcxsSnapshot::snapshot_blake3_hex(&living_bytes);
+        let living_hash = CcxsnapSnapshot::snapshot_blake3_hex(&living_bytes);
         write_atomic(&self.files.living_snapshot_path, &living_bytes)?;
 
         // Snapshot 2: artifact_relations (hot pointers -> cold adjacency blocks).
@@ -651,9 +659,9 @@ impl ProjectionStoreV1 {
             &self.relations_block_locs,
             &self.relations_cold_segments,
         )?);
-        let relations_snapshot = CcxsSnapshot {
-            header: CcxsSnapshotHeaderV1 {
-                projection_id: CcxsProjectionId::ArtifactRelations,
+        let relations_snapshot = CcxsnapSnapshot {
+            header: CcxsnapSnapshotHeaderV1 {
+                projection_id: CcxsnapProjectionId::ArtifactRelations,
                 schema_version: 3,
                 created_at_unix_ns,
                 shard_id: self.shard_id,
@@ -661,22 +669,22 @@ impl ProjectionStoreV1 {
                 cursor_segment_seq,
                 cursor_offset,
                 block_count: 2,
-                codec: CCXS_CODEC_NONE,
+                codec: CCXSNAP_CODEC_NONE,
             },
             blocks: vec![
-                (CCXS_BLOCK_HOT_PTRS_V1, relations_hot),
-                (CCXS_BLOCK_COLD_SEGMENT_DIR_V1, relations_seg_dir),
+                (CCXSNAP_BLOCK_HOT_PTRS_V1, relations_hot),
+                (CCXSNAP_BLOCK_COLD_SEGMENT_DIR_V1, relations_seg_dir),
             ],
         };
         let relations_bytes = relations_snapshot.encode()?;
-        let relations_hash = CcxsSnapshot::snapshot_blake3_hex(&relations_bytes);
+        let relations_hash = CcxsnapSnapshot::snapshot_blake3_hex(&relations_bytes);
         write_atomic(&self.files.relations_snapshot_path, &relations_bytes)?;
 
         // Snapshot 3: pressure_events (hot rows).
         let pressure_rows = encode_pressure_rows_v1(&self.state.pressure);
-        let pressure_snapshot = CcxsSnapshot {
-            header: CcxsSnapshotHeaderV1 {
-                projection_id: CcxsProjectionId::PressureEvents,
+        let pressure_snapshot = CcxsnapSnapshot {
+            header: CcxsnapSnapshotHeaderV1 {
+                projection_id: CcxsnapProjectionId::PressureEvents,
                 schema_version: 1,
                 created_at_unix_ns,
                 shard_id: self.shard_id,
@@ -684,12 +692,12 @@ impl ProjectionStoreV1 {
                 cursor_segment_seq,
                 cursor_offset,
                 block_count: 1,
-                codec: CCXS_CODEC_NONE,
+                codec: CCXSNAP_CODEC_NONE,
             },
-            blocks: vec![(CCXS_BLOCK_EVENTS_V1, pressure_rows)],
+            blocks: vec![(CCXSNAP_BLOCK_EVENTS_V1, pressure_rows)],
         };
         let pressure_bytes = pressure_snapshot.encode()?;
-        let pressure_hash = CcxsSnapshot::snapshot_blake3_hex(&pressure_bytes);
+        let pressure_hash = CcxsnapSnapshot::snapshot_blake3_hex(&pressure_bytes);
         write_atomic(&self.files.pressure_snapshot_path, &pressure_bytes)?;
 
         // Snapshot 4: artifact_dependents (hot pointers -> cold adjacency blocks).
@@ -700,9 +708,9 @@ impl ProjectionStoreV1 {
             &self.dependents_block_locs,
             &self.dependents_cold_segments,
         )?);
-        let dependents_snapshot = CcxsSnapshot {
-            header: CcxsSnapshotHeaderV1 {
-                projection_id: CcxsProjectionId::ArtifactDependents,
+        let dependents_snapshot = CcxsnapSnapshot {
+            header: CcxsnapSnapshotHeaderV1 {
+                projection_id: CcxsnapProjectionId::ArtifactDependents,
                 schema_version: 3,
                 created_at_unix_ns,
                 shard_id: self.shard_id,
@@ -710,15 +718,15 @@ impl ProjectionStoreV1 {
                 cursor_segment_seq,
                 cursor_offset,
                 block_count: 2,
-                codec: CCXS_CODEC_NONE,
+                codec: CCXSNAP_CODEC_NONE,
             },
             blocks: vec![
-                (CCXS_BLOCK_HOT_PTRS_V1, dependents_hot),
-                (CCXS_BLOCK_COLD_SEGMENT_DIR_V1, dependents_seg_dir),
+                (CCXSNAP_BLOCK_HOT_PTRS_V1, dependents_hot),
+                (CCXSNAP_BLOCK_COLD_SEGMENT_DIR_V1, dependents_seg_dir),
             ],
         };
         let dependents_bytes = dependents_snapshot.encode()?;
-        let dependents_hash = CcxsSnapshot::snapshot_blake3_hex(&dependents_bytes);
+        let dependents_hash = CcxsnapSnapshot::snapshot_blake3_hex(&dependents_bytes);
         write_atomic(&self.files.dependents_snapshot_path, &dependents_bytes)?;
 
         // Finally: projections.meta.json (source of truth).
@@ -1297,7 +1305,7 @@ fn reachable_cold_segments_from_snapshot_v1(
     }
 
     let bytes = std::fs::read(snapshot_path)?;
-    let actual = CcxsSnapshot::snapshot_blake3_hex(&bytes);
+    let actual = CcxsnapSnapshot::snapshot_blake3_hex(&bytes);
     if actual != expected {
         return Err(ProjectionError::InvalidEvent {
             msg: format!(
@@ -1309,8 +1317,12 @@ fn reachable_cold_segments_from_snapshot_v1(
         });
     }
 
-    let snap = CcxsSnapshot::decode(&bytes)?;
-    let Some((_, dir_block)) = snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_COLD_SEGMENT_DIR_V1) else {
+    let snap = CcxsnapSnapshot::decode(&bytes)?;
+    let Some((_, dir_block)) = snap
+        .blocks
+        .iter()
+        .find(|(t, _)| *t == CCXSNAP_BLOCK_COLD_SEGMENT_DIR_V1)
+    else {
         return Err(ProjectionError::InvalidEvent {
             msg: format!("snapshot missing cold segment dir block at {}", snapshot_path.display()),
         });
@@ -1578,19 +1590,19 @@ mod tests {
         );
         assert_eq!(
             files.living_snapshot_path,
-            PathBuf::from("/data/shard-0001/projections/artifact_living_state.snapshot.ccxs")
+            PathBuf::from("/data/shard-0001/projections/artifact_living_state.snapshot.ccxsnap")
         );
         assert_eq!(
             files.relations_snapshot_path,
-            PathBuf::from("/data/shard-0001/projections/artifact_relations.snapshot.ccxs")
+            PathBuf::from("/data/shard-0001/projections/artifact_relations.snapshot.ccxsnap")
         );
         assert_eq!(
             files.pressure_snapshot_path,
-            PathBuf::from("/data/shard-0001/projections/pressure_events.snapshot.ccxs")
+            PathBuf::from("/data/shard-0001/projections/pressure_events.snapshot.ccxsnap")
         );
         assert_eq!(
             files.dependents_snapshot_path,
-            PathBuf::from("/data/shard-0001/projections/artifact_dependents.snapshot.ccxs")
+            PathBuf::from("/data/shard-0001/projections/artifact_dependents.snapshot.ccxsnap")
         );
         assert_eq!(
             files.cold_relations_dir,
@@ -2986,9 +2998,9 @@ mod tests {
     // ── reachable_cold_segments_from_snapshot_v1 ────────────────────
 
     fn write_relations_snapshot_v3(path: &Path, segs: &BTreeMap<[u8; 32], u64>) -> String {
-        let snap = CcxsSnapshot {
-            header: CcxsSnapshotHeaderV1 {
-                projection_id: CcxsProjectionId::ArtifactRelations,
+        let snap = CcxsnapSnapshot {
+            header: CcxsnapSnapshotHeaderV1 {
+                projection_id: CcxsnapProjectionId::ArtifactRelations,
                 schema_version: 3,
                 created_at_unix_ns: 0,
                 shard_id: 1,
@@ -2996,22 +3008,22 @@ mod tests {
                 cursor_segment_seq: 0,
                 cursor_offset: 0,
                 block_count: 2,
-                codec: CCXS_CODEC_NONE,
+                codec: CCXSNAP_CODEC_NONE,
             },
             blocks: vec![
-                (CCXS_BLOCK_HOT_PTRS_V1, encode_hot_ptrs_v1(&BTreeMap::new())),
-                (CCXS_BLOCK_COLD_SEGMENT_DIR_V1, encode_cold_segment_dir_v1(segs)),
+                (CCXSNAP_BLOCK_HOT_PTRS_V1, encode_hot_ptrs_v1(&BTreeMap::new())),
+                (CCXSNAP_BLOCK_COLD_SEGMENT_DIR_V1, encode_cold_segment_dir_v1(segs)),
             ],
         };
         let bytes = snap.encode().unwrap();
         write_atomic(path, &bytes).unwrap();
-        CcxsSnapshot::snapshot_blake3_hex(&bytes)
+        CcxsnapSnapshot::snapshot_blake3_hex(&bytes)
     }
 
     #[test]
     fn reachable_cold_segments_schema_below_v3_is_unknown() {
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("relations.ccxs");
+        let path = tmp.path().join("relations.ccxsnap");
         assert!(reachable_cold_segments_from_snapshot_v1(&path, 2, Some("deadbeef"))
             .unwrap()
             .is_none());
@@ -3020,7 +3032,7 @@ mod tests {
     #[test]
     fn reachable_cold_segments_without_expected_hash_is_unknown() {
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("relations.ccxs");
+        let path = tmp.path().join("relations.ccxsnap");
         assert!(reachable_cold_segments_from_snapshot_v1(&path, 3, None)
             .unwrap()
             .is_none());
@@ -3032,7 +3044,7 @@ mod tests {
     #[test]
     fn reachable_cold_segments_missing_snapshot_file_errors() {
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("relations.ccxs");
+        let path = tmp.path().join("relations.ccxsnap");
         let err = reachable_cold_segments_from_snapshot_v1(&path, 3, Some(&"a".repeat(64))).unwrap_err();
         assert!(
             format!("{err}").contains("snapshot missing but"),
@@ -3043,7 +3055,7 @@ mod tests {
     #[test]
     fn reachable_cold_segments_hash_mismatch_errors() {
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("relations.ccxs");
+        let path = tmp.path().join("relations.ccxsnap");
         let mut segs = BTreeMap::new();
         segs.insert([0x31u8; 32], 99u64);
         let _hash = write_relations_snapshot_v3(&path, &segs);
@@ -3057,10 +3069,10 @@ mod tests {
     #[test]
     fn reachable_cold_segments_missing_dir_block_errors() {
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("relations.ccxs");
-        let snap = CcxsSnapshot {
-            header: CcxsSnapshotHeaderV1 {
-                projection_id: CcxsProjectionId::ArtifactRelations,
+        let path = tmp.path().join("relations.ccxsnap");
+        let snap = CcxsnapSnapshot {
+            header: CcxsnapSnapshotHeaderV1 {
+                projection_id: CcxsnapProjectionId::ArtifactRelations,
                 schema_version: 3,
                 created_at_unix_ns: 0,
                 shard_id: 1,
@@ -3068,13 +3080,13 @@ mod tests {
                 cursor_segment_seq: 0,
                 cursor_offset: 0,
                 block_count: 1,
-                codec: CCXS_CODEC_NONE,
+                codec: CCXSNAP_CODEC_NONE,
             },
-            blocks: vec![(CCXS_BLOCK_HOT_PTRS_V1, encode_hot_ptrs_v1(&BTreeMap::new()))],
+            blocks: vec![(CCXSNAP_BLOCK_HOT_PTRS_V1, encode_hot_ptrs_v1(&BTreeMap::new()))],
         };
         let bytes = snap.encode().unwrap();
         write_atomic(&path, &bytes).unwrap();
-        let hash = CcxsSnapshot::snapshot_blake3_hex(&bytes);
+        let hash = CcxsnapSnapshot::snapshot_blake3_hex(&bytes);
         let err = reachable_cold_segments_from_snapshot_v1(&path, 3, Some(&hash)).unwrap_err();
         assert!(
             format!("{err}").contains("missing cold segment dir block"),
@@ -3085,7 +3097,7 @@ mod tests {
     #[test]
     fn reachable_cold_segments_reads_dir_block() {
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("relations.ccxs");
+        let path = tmp.path().join("relations.ccxsnap");
         let mut segs = BTreeMap::new();
         segs.insert([0x41u8; 32], 1_024u64);
         segs.insert([0x42u8; 32], 2_048u64);
@@ -3384,7 +3396,7 @@ mod tests {
     }
 
     /// A snapshot whose recorded hash matches but whose body is not a decodable
-    /// `.ccxs` container is equally a reset, not a partial load.
+    /// `.ccxsnap` container is equally a reset, not a partial load.
     #[test]
     fn load_or_init_undecodable_snapshot_resets_meta_to_genesis() {
         let tmp = TempDir::new().unwrap();
@@ -3393,10 +3405,10 @@ mod tests {
         let files = ProjectionFilesV1::for_shard_dir(&shard_dir);
         std::fs::create_dir_all(&files.projections_dir).unwrap();
 
-        let garbage = b"CCXS-ish but not really".to_vec();
+        let garbage = b"CSNP-ish but not really".to_vec();
         let mut meta = crate::meta::ProjectionsMetaV1::empty_now();
         meta.commit_id = 5;
-        meta.artifact_living_state.snapshot_blake3 = Some(CcxsSnapshot::snapshot_blake3_hex(&garbage));
+        meta.artifact_living_state.snapshot_blake3 = Some(CcxsnapSnapshot::snapshot_blake3_hex(&garbage));
         store_projections_meta_v1(&files.meta_path, &meta).unwrap();
         std::fs::write(&files.living_snapshot_path, &garbage).unwrap();
 
@@ -3415,9 +3427,9 @@ mod tests {
         let files = ProjectionFilesV1::for_shard_dir(&shard_dir);
         std::fs::create_dir_all(&files.projections_dir).unwrap();
 
-        let snap = CcxsSnapshot {
-            header: CcxsSnapshotHeaderV1 {
-                projection_id: CcxsProjectionId::ArtifactRelations,
+        let snap = CcxsnapSnapshot {
+            header: CcxsnapSnapshotHeaderV1 {
+                projection_id: CcxsnapProjectionId::ArtifactRelations,
                 schema_version: 99,
                 created_at_unix_ns: 0,
                 shard_id: 1,
@@ -3425,16 +3437,16 @@ mod tests {
                 cursor_segment_seq: 0,
                 cursor_offset: 0,
                 block_count: 1,
-                codec: CCXS_CODEC_NONE,
+                codec: CCXSNAP_CODEC_NONE,
             },
-            blocks: vec![(CCXS_BLOCK_EDGES_V1, Vec::new())],
+            blocks: vec![(CCXSNAP_BLOCK_EDGES_V1, Vec::new())],
         };
         let bytes = snap.encode().unwrap();
         std::fs::write(&files.relations_snapshot_path, &bytes).unwrap();
 
         let mut meta = crate::meta::ProjectionsMetaV1::empty_now();
         meta.artifact_relations.schema_version = 99;
-        meta.artifact_relations.snapshot_blake3 = Some(CcxsSnapshot::snapshot_blake3_hex(&bytes));
+        meta.artifact_relations.snapshot_blake3 = Some(CcxsnapSnapshot::snapshot_blake3_hex(&bytes));
         store_projections_meta_v1(&files.meta_path, &meta).unwrap();
 
         let Err(err) = ProjectionStoreV1::load_or_init(&shard_dir, 1, 1) else {
@@ -3454,9 +3466,9 @@ mod tests {
         let files = ProjectionFilesV1::for_shard_dir(&shard_dir);
         std::fs::create_dir_all(&files.projections_dir).unwrap();
 
-        let snap = CcxsSnapshot {
-            header: CcxsSnapshotHeaderV1 {
-                projection_id: CcxsProjectionId::ArtifactDependents,
+        let snap = CcxsnapSnapshot {
+            header: CcxsnapSnapshotHeaderV1 {
+                projection_id: CcxsnapProjectionId::ArtifactDependents,
                 schema_version: 42,
                 created_at_unix_ns: 0,
                 shard_id: 1,
@@ -3464,16 +3476,16 @@ mod tests {
                 cursor_segment_seq: 0,
                 cursor_offset: 0,
                 block_count: 1,
-                codec: CCXS_CODEC_NONE,
+                codec: CCXSNAP_CODEC_NONE,
             },
-            blocks: vec![(CCXS_BLOCK_EDGES_V1, Vec::new())],
+            blocks: vec![(CCXSNAP_BLOCK_EDGES_V1, Vec::new())],
         };
         let bytes = snap.encode().unwrap();
         std::fs::write(&files.dependents_snapshot_path, &bytes).unwrap();
 
         let mut meta = crate::meta::ProjectionsMetaV1::empty_now();
         meta.artifact_dependents.schema_version = 42;
-        meta.artifact_dependents.snapshot_blake3 = Some(CcxsSnapshot::snapshot_blake3_hex(&bytes));
+        meta.artifact_dependents.snapshot_blake3 = Some(CcxsnapSnapshot::snapshot_blake3_hex(&bytes));
         store_projections_meta_v1(&files.meta_path, &meta).unwrap();
 
         let Err(err) = ProjectionStoreV1::load_or_init(&shard_dir, 1, 1) else {

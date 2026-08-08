@@ -1285,7 +1285,7 @@ fn add_snapshot_evidence_artifacts(
                 summaries,
                 projection_key.clone(),
                 EvidenceArtifactDescriptorV1 {
-                    kind: "projection_snapshot_ccxs".to_string(),
+                    kind: "projection_snapshot_ccxsnap".to_string(),
                     media_type: "application/octet-stream".to_string(),
                     path: dst_meta.relative_path.clone(),
                     blake3: dst_meta.blake3.clone(),
@@ -5192,10 +5192,10 @@ mod tests {
     // ══════════════════════════════════════════════════════════════════
 
     const PROJECTION_FILES: [(&str, &str); 4] = [
-        ("artifact_living_state", "artifact_living_state.snapshot.ccxs"),
-        ("artifact_relations", "artifact_relations.snapshot.ccxs"),
-        ("pressure_events", "pressure_events.snapshot.ccxs"),
-        ("artifact_dependents", "artifact_dependents.snapshot.ccxs"),
+        ("artifact_living_state", "artifact_living_state.snapshot.ccxsnap"),
+        ("artifact_relations", "artifact_relations.snapshot.ccxsnap"),
+        ("pressure_events", "pressure_events.snapshot.ccxsnap"),
+        ("artifact_dependents", "artifact_dependents.snapshot.ccxsnap"),
     ];
 
     /// Materialise `shards/shard-NNNN/projections` with all four snapshots and

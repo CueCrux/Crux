@@ -23,7 +23,7 @@
 |---|---|---|
 | **`.ccxseg`** | A sealed, append-only segment (header + frames + TOC + footer). The unit of I1's `segment_hash`. | `corecrux-segment/src/builder.rs`, `decoder.rs` |
 | **`.ccxi`** | **C**oreCrux **C**ompanion **I**ndex — the seal-time inverted index (vocab table + PForDelta postings + per-doc table) that powers BM25. Built when `CORECRUXD_BUILD_CCXI=1`. | `crates/corecrux-index/src/ccxi.rs` |
-| **`.ccxs`** | Projection companion snapshot (living-row / hot-pointer / relations / cold-segment blocks). | `crates/corecrux-projections/src/` |
+| **`.ccxsnap`** | Projection snapshot (living-row / hot-pointer / relations / cold-segment blocks), magic `CSNP`. **Not** a segment companion — it deliberately sits outside the `ccx<lane>` namespace, which is reserved for CoreCrux lane companions. Was `.ccxs` until 2026-08-08, which collided with CoreCrux's subject-profile/traits companion. | `crates/corecrux-projections/src/ccxsnap.rs` |
 | **`.ccxv`** | Precomputed dense-vector companion for locally-ingested prose — written at seal time next to its `.ccxseg` (same stem) and served by the local cosine `DenseProvider`. | `corecruxd/src/local_ingest.rs` (`write_ccxv`) |
 | **`.cruxpack`** | A passport-signed, BLAKE3-hash-anchored memory-portability transfer envelope (schema `crux.cruxpack.v1`) — a snapshot of one daemon's memory for export/import. | `crates/corecrux-memory/src/cruxpack.rs` (`CRUXPACK_SCHEMA_V1`) |
 | **`.ccxn`** | Graph **topology** lane file (entity/edge topology). Default-OFF lane. *(inferred — lane id `topology`)* | `corecrux-retrieval/src/graph.rs`; console `gr-topology` |

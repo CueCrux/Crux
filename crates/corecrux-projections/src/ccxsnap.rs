@@ -3,12 +3,12 @@
 // Licensed under the Apache License, Version 2.0.
 // See LICENSE in the repository root.
 
-//! `.ccxs` companion file types + error variants (CcxsError, CcxsSnapshot, CCXS_BLOCK_* tags).
+//! `.ccxsnap` companion file types + error variants (CcxsnapError, CcxsnapSnapshot, CCXSNAP_BLOCK_* tags).
 
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum CcxsError {
+pub enum CcxsnapError {
     #[error("buffer too small")]
     BufferTooSmall,
     #[error("invalid magic: expected {expected:?}, got {actual:?}")]
@@ -27,24 +27,24 @@ pub enum CcxsError {
     Invalid { msg: String },
 }
 
-pub type Result<T> = std::result::Result<T, CcxsError>;
+pub type Result<T> = std::result::Result<T, CcxsnapError>;
 
-pub const CCXS_MAGIC: [u8; 4] = *b"CCXS";
-pub const CCXS_V1: u32 = 1;
-pub const CCXS_CODEC_NONE: u32 = 0;
+pub const CCXSNAP_MAGIC: [u8; 4] = *b"CSNP";
+pub const CCXSNAP_V1: u32 = 1;
+pub const CCXSNAP_CODEC_NONE: u32 = 0;
 
 // Block type identifiers (v1). Keep stable.
-pub const CCXS_BLOCK_ROWS_V1: u32 = 1;
-pub const CCXS_BLOCK_EDGES_V1: u32 = 2;
-pub const CCXS_BLOCK_EVENTS_V1: u32 = 3;
-pub const CCXS_BLOCK_STATS_V1: u32 = 4;
-pub const CCXS_BLOCK_ADJ_INDEX_V1: u32 = 5;
-pub const CCXS_BLOCK_HOT_PTRS_V1: u32 = 6;
-pub const CCXS_BLOCK_COLD_SEGMENT_DIR_V1: u32 = 7;
+pub const CCXSNAP_BLOCK_ROWS_V1: u32 = 1;
+pub const CCXSNAP_BLOCK_EDGES_V1: u32 = 2;
+pub const CCXSNAP_BLOCK_EVENTS_V1: u32 = 3;
+pub const CCXSNAP_BLOCK_STATS_V1: u32 = 4;
+pub const CCXSNAP_BLOCK_ADJ_INDEX_V1: u32 = 5;
+pub const CCXSNAP_BLOCK_HOT_PTRS_V1: u32 = 6;
+pub const CCXSNAP_BLOCK_COLD_SEGMENT_DIR_V1: u32 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
-pub enum CcxsProjectionId {
+pub enum CcxsnapProjectionId {
     ArtifactLivingState = 1,
     ArtifactRelations = 2,
     PressureEvents = 3,
@@ -55,7 +55,7 @@ pub enum CcxsProjectionId {
     EntityCurrentState = 12,
 }
 
-impl CcxsProjectionId {
+impl CcxsnapProjectionId {
     pub fn from_u32(id: u32) -> Result<Self> {
         match id {
             1 => Ok(Self::ArtifactLivingState),
@@ -65,7 +65,7 @@ impl CcxsProjectionId {
             10 => Ok(Self::EntityCount),
             11 => Ok(Self::EntityTimeline),
             12 => Ok(Self::EntityCurrentState),
-            other => Err(CcxsError::UnsupportedProjectionId { id: other }),
+            other => Err(CcxsnapError::UnsupportedProjectionId { id: other }),
         }
     }
 
@@ -83,8 +83,8 @@ impl CcxsProjectionId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CcxsSnapshotHeaderV1 {
-    pub projection_id: CcxsProjectionId,
+pub struct CcxsnapSnapshotHeaderV1 {
+    pub projection_id: CcxsnapProjectionId,
     pub schema_version: u32,
     pub created_at_unix_ns: u64,
     pub shard_id: u32,
@@ -96,13 +96,13 @@ pub struct CcxsSnapshotHeaderV1 {
 }
 
 #[derive(Debug, Clone)]
-pub struct CcxsSnapshot {
-    pub header: CcxsSnapshotHeaderV1,
+pub struct CcxsnapSnapshot {
+    pub header: CcxsnapSnapshotHeaderV1,
     pub blocks: Vec<(u32, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct CcxsSnapshotSummary {
+pub struct CcxsnapSnapshotSummary {
     pub projection: String,
     pub schema_version: u32,
     pub created_at_unix_ns: u64,
@@ -112,31 +112,31 @@ pub struct CcxsSnapshotSummary {
     pub cursor_offset: u64,
     pub block_count: u32,
     pub snapshot_blake3: String,
-    pub blocks: Vec<CcxsBlockSummary>,
+    pub blocks: Vec<CcxsnapBlockSummary>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct CcxsBlockSummary {
+pub struct CcxsnapBlockSummary {
     pub block_type: u32,
     pub len: u64,
     pub blake3: String,
 }
 
-impl CcxsSnapshot {
+impl CcxsnapSnapshot {
     pub fn snapshot_blake3_hex(bytes: &[u8]) -> String {
         blake3::hash(bytes).to_hex().to_string()
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
-        if self.header.codec != CCXS_CODEC_NONE {
-            return Err(CcxsError::Invalid {
+        if self.header.codec != CCXSNAP_CODEC_NONE {
+            return Err(CcxsnapError::Invalid {
                 msg: format!("unsupported codec {}", self.header.codec),
             });
         }
         let mut out: Vec<u8> = Vec::with_capacity(4096);
 
-        out.extend_from_slice(&CCXS_MAGIC);
-        out.extend_from_slice(&CCXS_V1.to_le_bytes());
+        out.extend_from_slice(&CCXSNAP_MAGIC);
+        out.extend_from_slice(&CCXSNAP_V1.to_le_bytes());
         out.extend_from_slice(&(self.header.projection_id as u32).to_le_bytes());
         out.extend_from_slice(&self.header.schema_version.to_le_bytes());
         out.extend_from_slice(&self.header.created_at_unix_ns.to_le_bytes());
@@ -163,17 +163,17 @@ impl CcxsSnapshot {
     pub fn decode(input: &[u8]) -> Result<Self> {
         let mut c = Cursor::new(input);
         let magic = c.read_4()?;
-        if magic != CCXS_MAGIC {
-            return Err(CcxsError::InvalidMagic {
-                expected: CCXS_MAGIC,
+        if magic != CCXSNAP_MAGIC {
+            return Err(CcxsnapError::InvalidMagic {
+                expected: CCXSNAP_MAGIC,
                 actual: magic,
             });
         }
         let v = c.read_u32()?;
-        if v != CCXS_V1 {
-            return Err(CcxsError::UnsupportedVersion { v });
+        if v != CCXSNAP_V1 {
+            return Err(CcxsnapError::UnsupportedVersion { v });
         }
-        let projection_id = CcxsProjectionId::from_u32(c.read_u32()?)?;
+        let projection_id = CcxsnapProjectionId::from_u32(c.read_u32()?)?;
         let schema_version = c.read_u32()?;
         let created_at_unix_ns = c.read_u64()?;
         let shard_id = c.read_u32()?;
@@ -184,8 +184,8 @@ impl CcxsSnapshot {
         let codec = c.read_u32()?;
         let _ = c.read_exact(64)?; // reserved
 
-        if codec != CCXS_CODEC_NONE {
-            return Err(CcxsError::Invalid {
+        if codec != CCXSNAP_CODEC_NONE {
+            return Err(CcxsnapError::Invalid {
                 msg: format!("unsupported codec {}", codec),
             });
         }
@@ -198,7 +198,7 @@ impl CcxsSnapshot {
             let bytes = c.read_exact(len)?.to_vec();
             let actual_hash = blake3::hash(&bytes);
             if actual_hash.as_bytes() != &expected_hash {
-                return Err(CcxsError::BlockHashMismatch {
+                return Err(CcxsnapError::BlockHashMismatch {
                     block_type,
                     expected: blake3::Hash::from(expected_hash).to_hex().to_string(),
                     actual: actual_hash.to_hex().to_string(),
@@ -208,7 +208,7 @@ impl CcxsSnapshot {
         }
 
         Ok(Self {
-            header: CcxsSnapshotHeaderV1 {
+            header: CcxsnapSnapshotHeaderV1 {
                 projection_id,
                 schema_version,
                 created_at_unix_ns,
@@ -223,7 +223,7 @@ impl CcxsSnapshot {
         })
     }
 
-    pub fn summary(input: &[u8]) -> Result<CcxsSnapshotSummary> {
+    pub fn summary(input: &[u8]) -> Result<CcxsnapSnapshotSummary> {
         let snap = Self::decode(input)?;
         let snapshot_blake3 = Self::snapshot_blake3_hex(input);
         let mut blocks = Vec::new();
@@ -247,14 +247,14 @@ impl CcxsSnapshot {
             let len = c.read_u64()?;
             let h = c.read_32()?;
             let _bytes = c.read_exact(len as usize)?;
-            blocks.push(CcxsBlockSummary {
+            blocks.push(CcxsnapBlockSummary {
                 block_type,
                 len,
                 blake3: blake3::Hash::from(h).to_hex().to_string(),
             });
         }
 
-        Ok(CcxsSnapshotSummary {
+        Ok(CcxsnapSnapshotSummary {
             projection: snap.header.projection_id.as_str().to_string(),
             schema_version: snap.header.schema_version,
             created_at_unix_ns: snap.header.created_at_unix_ns,
@@ -280,9 +280,9 @@ impl<'a> Cursor<'a> {
     }
 
     fn read_exact(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self.pos.checked_add(n).ok_or(CcxsError::BufferTooSmall)?;
+        let end = self.pos.checked_add(n).ok_or(CcxsnapError::BufferTooSmall)?;
         if end > self.input.len() {
-            return Err(CcxsError::BufferTooSmall);
+            return Err(CcxsnapError::BufferTooSmall);
         }
         let out = &self.input[self.pos..end];
         self.pos = end;
@@ -318,73 +318,76 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::*;
 
-    // ── CcxsProjectionId ────────────────────────────────────────────
+    // ── CcxsnapProjectionId ────────────────────────────────────────────
 
     #[test]
     fn projection_id_from_u32_valid_values() {
         assert!(matches!(
-            CcxsProjectionId::from_u32(1),
-            Ok(CcxsProjectionId::ArtifactLivingState)
+            CcxsnapProjectionId::from_u32(1),
+            Ok(CcxsnapProjectionId::ArtifactLivingState)
         ));
         assert!(matches!(
-            CcxsProjectionId::from_u32(2),
-            Ok(CcxsProjectionId::ArtifactRelations)
+            CcxsnapProjectionId::from_u32(2),
+            Ok(CcxsnapProjectionId::ArtifactRelations)
         ));
         assert!(matches!(
-            CcxsProjectionId::from_u32(3),
-            Ok(CcxsProjectionId::PressureEvents)
+            CcxsnapProjectionId::from_u32(3),
+            Ok(CcxsnapProjectionId::PressureEvents)
         ));
         assert!(matches!(
-            CcxsProjectionId::from_u32(4),
-            Ok(CcxsProjectionId::ArtifactDependents)
+            CcxsnapProjectionId::from_u32(4),
+            Ok(CcxsnapProjectionId::ArtifactDependents)
         ));
         assert!(matches!(
-            CcxsProjectionId::from_u32(10),
-            Ok(CcxsProjectionId::EntityCount)
+            CcxsnapProjectionId::from_u32(10),
+            Ok(CcxsnapProjectionId::EntityCount)
         ));
         assert!(matches!(
-            CcxsProjectionId::from_u32(11),
-            Ok(CcxsProjectionId::EntityTimeline)
+            CcxsnapProjectionId::from_u32(11),
+            Ok(CcxsnapProjectionId::EntityTimeline)
         ));
         assert!(matches!(
-            CcxsProjectionId::from_u32(12),
-            Ok(CcxsProjectionId::EntityCurrentState)
+            CcxsnapProjectionId::from_u32(12),
+            Ok(CcxsnapProjectionId::EntityCurrentState)
         ));
     }
 
     #[test]
     fn projection_id_from_u32_invalid() {
-        assert!(CcxsProjectionId::from_u32(0).is_err());
-        assert!(CcxsProjectionId::from_u32(5).is_err());
-        assert!(CcxsProjectionId::from_u32(9).is_err());
-        assert!(CcxsProjectionId::from_u32(100).is_err());
+        assert!(CcxsnapProjectionId::from_u32(0).is_err());
+        assert!(CcxsnapProjectionId::from_u32(5).is_err());
+        assert!(CcxsnapProjectionId::from_u32(9).is_err());
+        assert!(CcxsnapProjectionId::from_u32(100).is_err());
     }
 
     #[test]
     fn projection_id_as_str() {
-        assert_eq!(CcxsProjectionId::ArtifactLivingState.as_str(), "artifact_living_state");
-        assert_eq!(CcxsProjectionId::ArtifactRelations.as_str(), "artifact_relations");
-        assert_eq!(CcxsProjectionId::PressureEvents.as_str(), "pressure_events");
-        assert_eq!(CcxsProjectionId::ArtifactDependents.as_str(), "artifact_dependents");
-        assert_eq!(CcxsProjectionId::EntityCount.as_str(), "entity_count");
-        assert_eq!(CcxsProjectionId::EntityTimeline.as_str(), "entity_timeline");
-        assert_eq!(CcxsProjectionId::EntityCurrentState.as_str(), "entity_current_state");
+        assert_eq!(
+            CcxsnapProjectionId::ArtifactLivingState.as_str(),
+            "artifact_living_state"
+        );
+        assert_eq!(CcxsnapProjectionId::ArtifactRelations.as_str(), "artifact_relations");
+        assert_eq!(CcxsnapProjectionId::PressureEvents.as_str(), "pressure_events");
+        assert_eq!(CcxsnapProjectionId::ArtifactDependents.as_str(), "artifact_dependents");
+        assert_eq!(CcxsnapProjectionId::EntityCount.as_str(), "entity_count");
+        assert_eq!(CcxsnapProjectionId::EntityTimeline.as_str(), "entity_timeline");
+        assert_eq!(CcxsnapProjectionId::EntityCurrentState.as_str(), "entity_current_state");
     }
 
     #[test]
     fn projection_id_repr_roundtrip() {
         for id in [1u32, 2, 3, 4, 10, 11, 12] {
-            let pid = CcxsProjectionId::from_u32(id).unwrap();
+            let pid = CcxsnapProjectionId::from_u32(id).unwrap();
             assert_eq!(pid as u32, id);
         }
     }
 
-    // ── CcxsSnapshot encode/decode roundtrip ────────────────────────
+    // ── CcxsnapSnapshot encode/decode roundtrip ────────────────────────
 
-    fn sample_snapshot() -> CcxsSnapshot {
-        CcxsSnapshot {
-            header: CcxsSnapshotHeaderV1 {
-                projection_id: CcxsProjectionId::ArtifactLivingState,
+    fn sample_snapshot() -> CcxsnapSnapshot {
+        CcxsnapSnapshot {
+            header: CcxsnapSnapshotHeaderV1 {
+                projection_id: CcxsnapProjectionId::ArtifactLivingState,
                 schema_version: 1,
                 created_at_unix_ns: 1_700_000_000_000_000_000,
                 shard_id: 7,
@@ -392,11 +395,11 @@ mod tests {
                 cursor_segment_seq: 42,
                 cursor_offset: 128,
                 block_count: 2,
-                codec: CCXS_CODEC_NONE,
+                codec: CCXSNAP_CODEC_NONE,
             },
             blocks: vec![
-                (CCXS_BLOCK_ROWS_V1, vec![1, 2, 3, 4]),
-                (CCXS_BLOCK_EDGES_V1, vec![10, 20, 30]),
+                (CCXSNAP_BLOCK_ROWS_V1, vec![1, 2, 3, 4]),
+                (CCXSNAP_BLOCK_EDGES_V1, vec![10, 20, 30]),
             ],
         }
     }
@@ -405,26 +408,26 @@ mod tests {
     fn encode_decode_roundtrip() {
         let snap = sample_snapshot();
         let bytes = snap.encode().unwrap();
-        let decoded = CcxsSnapshot::decode(&bytes).unwrap();
+        let decoded = CcxsnapSnapshot::decode(&bytes).unwrap();
 
-        assert_eq!(decoded.header.projection_id, CcxsProjectionId::ArtifactLivingState);
+        assert_eq!(decoded.header.projection_id, CcxsnapProjectionId::ArtifactLivingState);
         assert_eq!(decoded.header.schema_version, 1);
         assert_eq!(decoded.header.shard_id, 7);
         assert_eq!(decoded.header.epoch, 3);
         assert_eq!(decoded.header.cursor_segment_seq, 42);
         assert_eq!(decoded.header.cursor_offset, 128);
         assert_eq!(decoded.blocks.len(), 2);
-        assert_eq!(decoded.blocks[0].0, CCXS_BLOCK_ROWS_V1);
+        assert_eq!(decoded.blocks[0].0, CCXSNAP_BLOCK_ROWS_V1);
         assert_eq!(decoded.blocks[0].1, vec![1, 2, 3, 4]);
-        assert_eq!(decoded.blocks[1].0, CCXS_BLOCK_EDGES_V1);
+        assert_eq!(decoded.blocks[1].0, CCXSNAP_BLOCK_EDGES_V1);
         assert_eq!(decoded.blocks[1].1, vec![10, 20, 30]);
     }
 
     #[test]
     fn encode_decode_empty_blocks() {
-        let snap = CcxsSnapshot {
-            header: CcxsSnapshotHeaderV1 {
-                projection_id: CcxsProjectionId::PressureEvents,
+        let snap = CcxsnapSnapshot {
+            header: CcxsnapSnapshotHeaderV1 {
+                projection_id: CcxsnapProjectionId::PressureEvents,
                 schema_version: 1,
                 created_at_unix_ns: 0,
                 shard_id: 0,
@@ -432,22 +435,22 @@ mod tests {
                 cursor_segment_seq: 0,
                 cursor_offset: 0,
                 block_count: 0,
-                codec: CCXS_CODEC_NONE,
+                codec: CCXSNAP_CODEC_NONE,
             },
             blocks: vec![],
         };
         let bytes = snap.encode().unwrap();
-        let decoded = CcxsSnapshot::decode(&bytes).unwrap();
+        let decoded = CcxsnapSnapshot::decode(&bytes).unwrap();
         assert_eq!(decoded.blocks.len(), 0);
-        assert_eq!(decoded.header.projection_id, CcxsProjectionId::PressureEvents);
+        assert_eq!(decoded.header.projection_id, CcxsnapProjectionId::PressureEvents);
     }
 
     #[test]
     fn snapshot_blake3_hex_is_deterministic() {
         let snap = sample_snapshot();
         let bytes = snap.encode().unwrap();
-        let h1 = CcxsSnapshot::snapshot_blake3_hex(&bytes);
-        let h2 = CcxsSnapshot::snapshot_blake3_hex(&bytes);
+        let h1 = CcxsnapSnapshot::snapshot_blake3_hex(&bytes);
+        let h2 = CcxsnapSnapshot::snapshot_blake3_hex(&bytes);
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64);
     }
@@ -456,8 +459,8 @@ mod tests {
     fn decode_rejects_bad_magic() {
         let mut bytes = sample_snapshot().encode().unwrap();
         bytes[0] = b'X';
-        let err = CcxsSnapshot::decode(&bytes).unwrap_err();
-        assert!(matches!(err, CcxsError::InvalidMagic { .. }));
+        let err = CcxsnapSnapshot::decode(&bytes).unwrap_err();
+        assert!(matches!(err, CcxsnapError::InvalidMagic { .. }));
     }
 
     #[test]
@@ -468,8 +471,8 @@ mod tests {
         bytes[5] = 0;
         bytes[6] = 0;
         bytes[7] = 0;
-        let err = CcxsSnapshot::decode(&bytes).unwrap_err();
-        assert!(matches!(err, CcxsError::UnsupportedVersion { v: 99 }));
+        let err = CcxsnapSnapshot::decode(&bytes).unwrap_err();
+        assert!(matches!(err, CcxsnapError::UnsupportedVersion { v: 99 }));
     }
 
     #[test]
@@ -478,21 +481,21 @@ mod tests {
         // Corrupt a byte in the first block's data (after header + block_type + len + hash)
         let last_idx = bytes.len() - 1;
         bytes[last_idx] ^= 0xFF;
-        let err = CcxsSnapshot::decode(&bytes).unwrap_err();
-        assert!(matches!(err, CcxsError::BlockHashMismatch { .. }));
+        let err = CcxsnapSnapshot::decode(&bytes).unwrap_err();
+        assert!(matches!(err, CcxsnapError::BlockHashMismatch { .. }));
     }
 
     #[test]
     fn decode_rejects_empty_buffer() {
-        let err = CcxsSnapshot::decode(&[]).unwrap_err();
-        assert!(matches!(err, CcxsError::BufferTooSmall));
+        let err = CcxsnapSnapshot::decode(&[]).unwrap_err();
+        assert!(matches!(err, CcxsnapError::BufferTooSmall));
     }
 
     #[test]
     fn decode_rejects_truncated_header() {
         let bytes = sample_snapshot().encode().unwrap();
-        let err = CcxsSnapshot::decode(&bytes[..20]).unwrap_err();
-        assert!(matches!(err, CcxsError::BufferTooSmall));
+        let err = CcxsnapSnapshot::decode(&bytes[..20]).unwrap_err();
+        assert!(matches!(err, CcxsnapError::BufferTooSmall));
     }
 
     #[test]
@@ -500,7 +503,7 @@ mod tests {
         let mut snap = sample_snapshot();
         snap.header.codec = 99;
         let err = snap.encode().unwrap_err();
-        assert!(matches!(err, CcxsError::Invalid { .. }));
+        assert!(matches!(err, CcxsnapError::Invalid { .. }));
     }
 
     #[test]
@@ -515,33 +518,33 @@ mod tests {
         bytes[codec_offset + 1] = 0;
         bytes[codec_offset + 2] = 0;
         bytes[codec_offset + 3] = 0;
-        let err = CcxsSnapshot::decode(&bytes).unwrap_err();
-        assert!(matches!(err, CcxsError::Invalid { .. }));
+        let err = CcxsnapSnapshot::decode(&bytes).unwrap_err();
+        assert!(matches!(err, CcxsnapError::Invalid { .. }));
     }
 
     #[test]
     fn summary_round_trip() {
         let snap = sample_snapshot();
         let bytes = snap.encode().unwrap();
-        let summary = CcxsSnapshot::summary(&bytes).unwrap();
+        let summary = CcxsnapSnapshot::summary(&bytes).unwrap();
         assert_eq!(summary.projection, "artifact_living_state");
         assert_eq!(summary.schema_version, 1);
         assert_eq!(summary.shard_id, 7);
         assert_eq!(summary.epoch, 3);
         assert_eq!(summary.block_count, 2);
         assert_eq!(summary.blocks.len(), 2);
-        assert_eq!(summary.blocks[0].block_type, CCXS_BLOCK_ROWS_V1);
+        assert_eq!(summary.blocks[0].block_type, CCXSNAP_BLOCK_ROWS_V1);
         assert_eq!(summary.blocks[0].len, 4);
-        assert_eq!(summary.blocks[1].block_type, CCXS_BLOCK_EDGES_V1);
+        assert_eq!(summary.blocks[1].block_type, CCXSNAP_BLOCK_EDGES_V1);
         assert_eq!(summary.blocks[1].len, 3);
         assert!(!summary.snapshot_blake3.is_empty());
     }
 
-    // ── CcxsSnapshotSummary serialization ───────────────────────────
+    // ── CcxsnapSnapshotSummary serialization ───────────────────────────
 
     #[test]
     fn snapshot_summary_serializes() {
-        let summary = CcxsSnapshotSummary {
+        let summary = CcxsnapSnapshotSummary {
             projection: "artifact_living_state".to_string(),
             schema_version: 1,
             created_at_unix_ns: 0,
@@ -551,8 +554,8 @@ mod tests {
             cursor_offset: 0,
             block_count: 1,
             snapshot_blake3: "abc".to_string(),
-            blocks: vec![CcxsBlockSummary {
-                block_type: CCXS_BLOCK_ROWS_V1,
+            blocks: vec![CcxsnapBlockSummary {
+                block_type: CCXSNAP_BLOCK_ROWS_V1,
                 len: 10,
                 blake3: "def".to_string(),
             }],
@@ -560,36 +563,36 @@ mod tests {
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["projection"], "artifact_living_state");
         assert_eq!(json["block_count"], 1);
-        assert_eq!(json["blocks"][0]["block_type"], CCXS_BLOCK_ROWS_V1);
+        assert_eq!(json["blocks"][0]["block_type"], CCXSNAP_BLOCK_ROWS_V1);
     }
 
-    // ── CcxsError display ───────────────────────────────────────────
+    // ── CcxsnapError display ───────────────────────────────────────────
 
     #[test]
     fn error_display_messages() {
-        let e = CcxsError::BufferTooSmall;
+        let e = CcxsnapError::BufferTooSmall;
         assert_eq!(e.to_string(), "buffer too small");
 
-        let e = CcxsError::InvalidMagic {
-            expected: CCXS_MAGIC,
+        let e = CcxsnapError::InvalidMagic {
+            expected: CCXSNAP_MAGIC,
             actual: [0, 0, 0, 0],
         };
         assert!(e.to_string().contains("invalid magic"));
 
-        let e = CcxsError::UnsupportedVersion { v: 99 };
+        let e = CcxsnapError::UnsupportedVersion { v: 99 };
         assert!(e.to_string().contains("99"));
 
-        let e = CcxsError::UnsupportedProjectionId { id: 42 };
+        let e = CcxsnapError::UnsupportedProjectionId { id: 42 };
         assert!(e.to_string().contains("42"));
 
-        let e = CcxsError::BlockHashMismatch {
+        let e = CcxsnapError::BlockHashMismatch {
             block_type: 1,
             expected: "aaa".to_string(),
             actual: "bbb".to_string(),
         };
         assert!(e.to_string().contains("block hash mismatch"));
 
-        let e = CcxsError::Invalid {
+        let e = CcxsnapError::Invalid {
             msg: "test error".to_string(),
         };
         assert!(e.to_string().contains("test error"));
@@ -655,21 +658,21 @@ mod tests {
         assert_eq!(out, [0x01, 0x02, 0x03, 0x04]);
     }
 
-    // ── CcxsSnapshot: various projection IDs ────────────────────────
+    // ── CcxsnapSnapshot: various projection IDs ────────────────────────
 
     #[test]
     fn encode_decode_all_projection_ids() {
         for (id, name) in [
-            (CcxsProjectionId::ArtifactLivingState, "artifact_living_state"),
-            (CcxsProjectionId::ArtifactRelations, "artifact_relations"),
-            (CcxsProjectionId::PressureEvents, "pressure_events"),
-            (CcxsProjectionId::ArtifactDependents, "artifact_dependents"),
-            (CcxsProjectionId::EntityCount, "entity_count"),
-            (CcxsProjectionId::EntityTimeline, "entity_timeline"),
-            (CcxsProjectionId::EntityCurrentState, "entity_current_state"),
+            (CcxsnapProjectionId::ArtifactLivingState, "artifact_living_state"),
+            (CcxsnapProjectionId::ArtifactRelations, "artifact_relations"),
+            (CcxsnapProjectionId::PressureEvents, "pressure_events"),
+            (CcxsnapProjectionId::ArtifactDependents, "artifact_dependents"),
+            (CcxsnapProjectionId::EntityCount, "entity_count"),
+            (CcxsnapProjectionId::EntityTimeline, "entity_timeline"),
+            (CcxsnapProjectionId::EntityCurrentState, "entity_current_state"),
         ] {
-            let snap = CcxsSnapshot {
-                header: CcxsSnapshotHeaderV1 {
+            let snap = CcxsnapSnapshot {
+                header: CcxsnapSnapshotHeaderV1 {
                     projection_id: id,
                     schema_version: 1,
                     created_at_unix_ns: 0,
@@ -678,12 +681,12 @@ mod tests {
                     cursor_segment_seq: 0,
                     cursor_offset: 0,
                     block_count: 0,
-                    codec: CCXS_CODEC_NONE,
+                    codec: CCXSNAP_CODEC_NONE,
                 },
                 blocks: vec![],
             };
             let bytes = snap.encode().unwrap();
-            let decoded = CcxsSnapshot::decode(&bytes).unwrap();
+            let decoded = CcxsnapSnapshot::decode(&bytes).unwrap();
             assert_eq!(decoded.header.projection_id.as_str(), name);
         }
     }
@@ -693,13 +696,13 @@ mod tests {
     #[test]
     fn block_type_constants_are_distinct() {
         let types = [
-            CCXS_BLOCK_ROWS_V1,
-            CCXS_BLOCK_EDGES_V1,
-            CCXS_BLOCK_EVENTS_V1,
-            CCXS_BLOCK_STATS_V1,
-            CCXS_BLOCK_ADJ_INDEX_V1,
-            CCXS_BLOCK_HOT_PTRS_V1,
-            CCXS_BLOCK_COLD_SEGMENT_DIR_V1,
+            CCXSNAP_BLOCK_ROWS_V1,
+            CCXSNAP_BLOCK_EDGES_V1,
+            CCXSNAP_BLOCK_EVENTS_V1,
+            CCXSNAP_BLOCK_STATS_V1,
+            CCXSNAP_BLOCK_ADJ_INDEX_V1,
+            CCXSNAP_BLOCK_HOT_PTRS_V1,
+            CCXSNAP_BLOCK_COLD_SEGMENT_DIR_V1,
         ];
         let mut seen = std::collections::HashSet::new();
         for t in types {
@@ -707,12 +710,12 @@ mod tests {
         }
     }
 
-    // ── CcxsSnapshotHeaderV1 equality ──────────────────────────────
+    // ── CcxsnapSnapshotHeaderV1 equality ──────────────────────────────
 
     #[test]
-    fn ccxs_snapshot_header_equality() {
-        let h1 = CcxsSnapshotHeaderV1 {
-            projection_id: CcxsProjectionId::ArtifactLivingState,
+    fn ccxsnap_snapshot_header_equality() {
+        let h1 = CcxsnapSnapshotHeaderV1 {
+            projection_id: CcxsnapProjectionId::ArtifactLivingState,
             schema_version: 1,
             created_at_unix_ns: 100,
             shard_id: 1,
@@ -720,7 +723,7 @@ mod tests {
             cursor_segment_seq: 3,
             cursor_offset: 4,
             block_count: 0,
-            codec: CCXS_CODEC_NONE,
+            codec: CCXSNAP_CODEC_NONE,
         };
         let h2 = h1.clone();
         assert_eq!(h1, h2);
@@ -730,9 +733,9 @@ mod tests {
 
     #[test]
     fn encode_decode_many_blocks() {
-        let snap = CcxsSnapshot {
-            header: CcxsSnapshotHeaderV1 {
-                projection_id: CcxsProjectionId::ArtifactRelations,
+        let snap = CcxsnapSnapshot {
+            header: CcxsnapSnapshotHeaderV1 {
+                projection_id: CcxsnapProjectionId::ArtifactRelations,
                 schema_version: 2,
                 created_at_unix_ns: 42,
                 shard_id: 3,
@@ -740,18 +743,18 @@ mod tests {
                 cursor_segment_seq: 100,
                 cursor_offset: 200,
                 block_count: 5,
-                codec: CCXS_CODEC_NONE,
+                codec: CCXSNAP_CODEC_NONE,
             },
             blocks: vec![
-                (CCXS_BLOCK_ROWS_V1, vec![1; 100]),
-                (CCXS_BLOCK_EDGES_V1, vec![2; 200]),
-                (CCXS_BLOCK_EVENTS_V1, vec![3; 50]),
-                (CCXS_BLOCK_STATS_V1, vec![4; 10]),
-                (CCXS_BLOCK_ADJ_INDEX_V1, vec![5; 150]),
+                (CCXSNAP_BLOCK_ROWS_V1, vec![1; 100]),
+                (CCXSNAP_BLOCK_EDGES_V1, vec![2; 200]),
+                (CCXSNAP_BLOCK_EVENTS_V1, vec![3; 50]),
+                (CCXSNAP_BLOCK_STATS_V1, vec![4; 10]),
+                (CCXSNAP_BLOCK_ADJ_INDEX_V1, vec![5; 150]),
             ],
         };
         let bytes = snap.encode().unwrap();
-        let decoded = CcxsSnapshot::decode(&bytes).unwrap();
+        let decoded = CcxsnapSnapshot::decode(&bytes).unwrap();
         assert_eq!(decoded.blocks.len(), 5);
         assert_eq!(decoded.blocks[0].1.len(), 100);
         assert_eq!(decoded.blocks[4].1.len(), 150);
@@ -764,9 +767,9 @@ mod tests {
     fn summary_block_hashes_match_blake3() {
         let data = vec![42u8; 64];
         let expected_hash = blake3::hash(&data).to_hex().to_string();
-        let snap = CcxsSnapshot {
-            header: CcxsSnapshotHeaderV1 {
-                projection_id: CcxsProjectionId::PressureEvents,
+        let snap = CcxsnapSnapshot {
+            header: CcxsnapSnapshotHeaderV1 {
+                projection_id: CcxsnapProjectionId::PressureEvents,
                 schema_version: 1,
                 created_at_unix_ns: 0,
                 shard_id: 0,
@@ -774,12 +777,12 @@ mod tests {
                 cursor_segment_seq: 0,
                 cursor_offset: 0,
                 block_count: 1,
-                codec: CCXS_CODEC_NONE,
+                codec: CCXSNAP_CODEC_NONE,
             },
-            blocks: vec![(CCXS_BLOCK_EVENTS_V1, data)],
+            blocks: vec![(CCXSNAP_BLOCK_EVENTS_V1, data)],
         };
         let bytes = snap.encode().unwrap();
-        let summary = CcxsSnapshot::summary(&bytes).unwrap();
+        let summary = CcxsnapSnapshot::summary(&bytes).unwrap();
         assert_eq!(summary.blocks[0].blake3, expected_hash);
     }
 
@@ -787,9 +790,9 @@ mod tests {
 
     #[test]
     fn snapshot_blake3_hex_differs_for_different_content() {
-        let snap1 = CcxsSnapshot {
-            header: CcxsSnapshotHeaderV1 {
-                projection_id: CcxsProjectionId::ArtifactLivingState,
+        let snap1 = CcxsnapSnapshot {
+            header: CcxsnapSnapshotHeaderV1 {
+                projection_id: CcxsnapProjectionId::ArtifactLivingState,
                 schema_version: 1,
                 created_at_unix_ns: 0,
                 shard_id: 0,
@@ -797,15 +800,15 @@ mod tests {
                 cursor_segment_seq: 0,
                 cursor_offset: 0,
                 block_count: 1,
-                codec: CCXS_CODEC_NONE,
+                codec: CCXSNAP_CODEC_NONE,
             },
-            blocks: vec![(CCXS_BLOCK_ROWS_V1, vec![1, 2, 3])],
+            blocks: vec![(CCXSNAP_BLOCK_ROWS_V1, vec![1, 2, 3])],
         };
         let bytes1 = snap1.encode().unwrap();
 
-        let snap2 = CcxsSnapshot {
-            header: CcxsSnapshotHeaderV1 {
-                projection_id: CcxsProjectionId::ArtifactLivingState,
+        let snap2 = CcxsnapSnapshot {
+            header: CcxsnapSnapshotHeaderV1 {
+                projection_id: CcxsnapProjectionId::ArtifactLivingState,
                 schema_version: 1,
                 created_at_unix_ns: 0,
                 shard_id: 0,
@@ -813,15 +816,15 @@ mod tests {
                 cursor_segment_seq: 0,
                 cursor_offset: 0,
                 block_count: 1,
-                codec: CCXS_CODEC_NONE,
+                codec: CCXSNAP_CODEC_NONE,
             },
-            blocks: vec![(CCXS_BLOCK_ROWS_V1, vec![4, 5, 6])],
+            blocks: vec![(CCXSNAP_BLOCK_ROWS_V1, vec![4, 5, 6])],
         };
         let bytes2 = snap2.encode().unwrap();
 
         assert_ne!(
-            CcxsSnapshot::snapshot_blake3_hex(&bytes1),
-            CcxsSnapshot::snapshot_blake3_hex(&bytes2)
+            CcxsnapSnapshot::snapshot_blake3_hex(&bytes1),
+            CcxsnapSnapshot::snapshot_blake3_hex(&bytes2)
         );
     }
 
@@ -833,11 +836,11 @@ mod tests {
         let bytes = snap.encode().unwrap();
         // Truncate in the middle of block data
         let truncated = &bytes[..bytes.len() - 1];
-        let err = CcxsSnapshot::decode(truncated).unwrap_err();
+        let err = CcxsnapSnapshot::decode(truncated).unwrap_err();
         // Should be either BufferTooSmall or BlockHashMismatch
         assert!(matches!(
             err,
-            CcxsError::BufferTooSmall | CcxsError::BlockHashMismatch { .. }
+            CcxsnapError::BufferTooSmall | CcxsnapError::BlockHashMismatch { .. }
         ));
     }
 
@@ -852,7 +855,7 @@ mod tests {
         bytes[9] = 0;
         bytes[10] = 0;
         bytes[11] = 0;
-        let err = CcxsSnapshot::decode(&bytes).unwrap_err();
-        assert!(matches!(err, CcxsError::UnsupportedProjectionId { id: 99 }));
+        let err = CcxsnapSnapshot::decode(&bytes).unwrap_err();
+        assert!(matches!(err, CcxsnapError::UnsupportedProjectionId { id: 99 }));
     }
 }

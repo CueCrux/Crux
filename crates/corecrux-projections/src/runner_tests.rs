@@ -22,9 +22,9 @@ mod tests {
     };
     use uuid::Uuid;
 
-    use crate::ccxs::CcxsSnapshot;
-    use crate::ccxs::CCXS_BLOCK_COLD_SEGMENT_DIR_V1;
-    use crate::ccxs::CCXS_BLOCK_HOT_PTRS_V1;
+    use crate::ccxsnap::CcxsnapSnapshot;
+    use crate::ccxsnap::CCXSNAP_BLOCK_COLD_SEGMENT_DIR_V1;
+    use crate::ccxsnap::CCXSNAP_BLOCK_HOT_PTRS_V1;
     use crate::codec_v1::decode_hot_ptrs_v1;
     use crate::cold_segment_v1::{
         cold_segment_path_v1, decode_cold_segment_dir_v1, read_and_verify_cold_segment_index_v1,
@@ -237,11 +237,11 @@ mod tests {
         let mut proj_a = crate::ProjectionStoreV1::load_or_init(&shard_dir_a, 1, 1).unwrap();
         let _ = proj_a.rebuild_from_genesis(&storage_a, /*batch_frames=*/ 1).unwrap();
         let living_a = std::fs::read(&proj_a.files.living_snapshot_path).unwrap();
-        let living_hash_a = CcxsSnapshot::snapshot_blake3_hex(&living_a);
+        let living_hash_a = CcxsnapSnapshot::snapshot_blake3_hex(&living_a);
         let relations_a = std::fs::read(&proj_a.files.relations_snapshot_path).unwrap();
-        let relations_hash_a = CcxsSnapshot::snapshot_blake3_hex(&relations_a);
+        let relations_hash_a = CcxsnapSnapshot::snapshot_blake3_hex(&relations_a);
         let dependents_a = std::fs::read(&proj_a.files.dependents_snapshot_path).unwrap();
-        let dependents_hash_a = CcxsSnapshot::snapshot_blake3_hex(&dependents_a);
+        let dependents_hash_a = CcxsnapSnapshot::snapshot_blake3_hex(&dependents_a);
 
         let cold_rel_files_a = collect_cold_files(&proj_a.files.cold_relations_dir);
         let cold_dep_files_a = collect_cold_files(&proj_a.files.cold_dependents_dir);
@@ -251,11 +251,11 @@ mod tests {
         let mut proj_b = crate::ProjectionStoreV1::load_or_init(&shard_dir_b, 1, 1).unwrap();
         let _ = proj_b.rebuild_from_genesis(&storage_b, /*batch_frames=*/ 1024).unwrap();
         let living_b = std::fs::read(&proj_b.files.living_snapshot_path).unwrap();
-        let living_hash_b = CcxsSnapshot::snapshot_blake3_hex(&living_b);
+        let living_hash_b = CcxsnapSnapshot::snapshot_blake3_hex(&living_b);
         let relations_b = std::fs::read(&proj_b.files.relations_snapshot_path).unwrap();
-        let relations_hash_b = CcxsSnapshot::snapshot_blake3_hex(&relations_b);
+        let relations_hash_b = CcxsnapSnapshot::snapshot_blake3_hex(&relations_b);
         let dependents_b = std::fs::read(&proj_b.files.dependents_snapshot_path).unwrap();
-        let dependents_hash_b = CcxsSnapshot::snapshot_blake3_hex(&dependents_b);
+        let dependents_hash_b = CcxsnapSnapshot::snapshot_blake3_hex(&dependents_b);
 
         let cold_rel_files_b = collect_cold_files(&proj_b.files.cold_relations_dir);
         let cold_dep_files_b = collect_cold_files(&proj_b.files.cold_dependents_dir);
@@ -1693,11 +1693,15 @@ mod tests {
     }
 
     fn assert_hot_ptrs_resolve(cold_segments_dir: &Path, snapshot_bytes: &[u8]) {
-        let snap = CcxsSnapshot::decode(snapshot_bytes).unwrap();
-        let Some((_, block)) = snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_HOT_PTRS_V1) else {
+        let snap = CcxsnapSnapshot::decode(snapshot_bytes).unwrap();
+        let Some((_, block)) = snap.blocks.iter().find(|(t, _)| *t == CCXSNAP_BLOCK_HOT_PTRS_V1) else {
             panic!("snapshot missing hot ptr block");
         };
-        let Some((_, dir_block)) = snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_COLD_SEGMENT_DIR_V1) else {
+        let Some((_, dir_block)) = snap
+            .blocks
+            .iter()
+            .find(|(t, _)| *t == CCXSNAP_BLOCK_COLD_SEGMENT_DIR_V1)
+        else {
             panic!("snapshot missing cold segment dir block");
         };
         let ptrs = decode_hot_ptrs_v1(block).unwrap();

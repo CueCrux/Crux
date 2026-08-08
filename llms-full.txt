@@ -178,7 +178,7 @@ SPA — `dist/` only, not a cargo member — and is excluded below.)
 | `corecrux-memory` | Versioned fact store + session store; decay, supersession, CROWN receipts | `Fact`, `FactStore`, `mark_superseded`, `ContradictionCandidateV1`, `ConsolidationReceiptV1`, `consolidate_facts_v1` | crux-lens-features, crux-mcp, crux-observe, corecruxctl, corecruxd | 11.7k |
 | `corecrux-index` | Companion inverted index (`.ccxi`) built at seal time; powers BM25 | `CcxiBuilder`, `CcxiReader`, `CcxiHeader`, `pfordelta_encode`/`pfordelta_decode` | corecrux-retrieval, crux-mcp, corecrux-storage, corecruxctl, corecruxd | 1.1k |
 | `corecrux-retrieval` | Fused retrieval — BM25 + graph-signal fusion over `.ccxi` | `fused_retrieve`, `IndexManager`, `FusionWeights`, `FusedHit` | corecruxd, crux-mcp | 2.1k |
-| `corecrux-projections` | Living-objects projections + snapshots (`.ccxs`) + deterministic parity harness | `ProjectionEventV1`, `CcxsProjectionId`, `build_cold_segment_v1`, `apply`/`apply_at` | corecrux-retrieval, corecruxctl, crux-mcp, crux-session, corecruxd | 12.4k |
+| `corecrux-projections` | Living-objects projections + snapshots (`.ccxsnap`) + deterministic parity harness | `ProjectionEventV1`, `CcxsnapProjectionId`, `build_cold_segment_v1`, `apply`/`apply_at` | corecrux-retrieval, corecruxctl, crux-mcp, crux-session, corecruxd | 12.4k |
 | `crux-lens-features` | Feature Registry lens over the memory substrate (coverage / gap reporting) | `compute_coverage_report`, `compute_gaps`, `compute_promise_coverage` | crux-mcp, corecruxd | 0.5k |
 
 ## Routing, identity, sessions
@@ -473,7 +473,7 @@ a codified defect class, not a code-derived formula.*
 |---|---|---|
 | **`.ccxseg`** | A sealed, append-only segment (header + frames + TOC + footer). The unit of I1's `segment_hash`. | `corecrux-segment/src/builder.rs`, `decoder.rs` |
 | **`.ccxi`** | **C**oreCrux **C**ompanion **I**ndex — the seal-time inverted index (vocab table + PForDelta postings + per-doc table) that powers BM25. Built when `CORECRUXD_BUILD_CCXI=1`. | `crates/corecrux-index/src/ccxi.rs` |
-| **`.ccxs`** | Projection companion snapshot (living-row / hot-pointer / relations / cold-segment blocks). | `crates/corecrux-projections/src/` |
+| **`.ccxsnap`** | Projection snapshot (living-row / hot-pointer / relations / cold-segment blocks), magic `CSNP`. **Not** a segment companion — it deliberately sits outside the `ccx<lane>` namespace, which is reserved for CoreCrux lane companions. Was `.ccxs` until 2026-08-08, which collided with CoreCrux's subject-profile/traits companion. | `crates/corecrux-projections/src/ccxsnap.rs` |
 | **`.ccxv`** | Precomputed dense-vector companion for locally-ingested prose — written at seal time next to its `.ccxseg` (same stem) and served by the local cosine `DenseProvider`. | `corecruxd/src/local_ingest.rs` (`write_ccxv`) |
 | **`.cruxpack`** | A passport-signed, BLAKE3-hash-anchored memory-portability transfer envelope (schema `crux.cruxpack.v1`) — a snapshot of one daemon's memory for export/import. | `crates/corecrux-memory/src/cruxpack.rs` (`CRUXPACK_SCHEMA_V1`) |
 | **`.ccxn`** | Graph **topology** lane file (entity/edge topology). Default-OFF lane. *(inferred — lane id `topology`)* | `corecrux-retrieval/src/graph.rs`; console `gr-topology` |

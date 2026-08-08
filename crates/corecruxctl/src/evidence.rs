@@ -6,7 +6,7 @@
 //! Evidence verifier — verifies receipts against a keyring, loads projection meta, prints a verification report.
 
 use corecrux_frame::{compute_header_hash, decode_canonical_header_bytes_v1};
-use corecrux_projections::{load_projections_meta_v1, CcxsSnapshot};
+use corecrux_projections::{load_projections_meta_v1, CcxsnapSnapshot};
 use corecrux_receipts::{
     verify_receipt_v1, Ed25519KeyRingV1, ReplayExportManifestV1, VerificationReportV1, VerifyReceiptInput,
 };
@@ -550,13 +550,13 @@ fn verify_projection_artifacts(pack_dir: &Path, manifest: &EvidenceManifestV1) -
             .parent()
             .ok_or_else(|| format!("projection meta has no parent: {}", meta_path.display()))?;
         for snapshot_artifact in manifest.artifacts.values().filter(|candidate| {
-            candidate.kind == "projection_snapshot_ccxs" && pack_dir.join(&candidate.path).parent() == Some(meta_dir)
+            is_projection_snapshot_kind(&candidate.kind) && pack_dir.join(&candidate.path).parent() == Some(meta_dir)
         }) {
             let snapshot_path = pack_dir.join(&snapshot_artifact.path);
             let projection = projection_name_from_snapshot_artifact(snapshot_artifact)
                 .ok_or_else(|| format!("projection snapshot missing source ref: {}", snapshot_artifact.path))?;
             let expected = expected_projection_hash(&meta, &projection);
-            let actual = CcxsSnapshot::snapshot_blake3_hex(&std::fs::read(&snapshot_path)?);
+            let actual = CcxsnapSnapshot::snapshot_blake3_hex(&std::fs::read(&snapshot_path)?);
             checks.push(EvidenceVerifyCheckV1 {
                 name: format!("snapshot_hash:{projection}:{}", snapshot_artifact.path),
                 ok: expected.as_deref() == Some(actual.as_str()),
@@ -569,6 +569,19 @@ fn verify_projection_artifacts(pack_dir: &Path, manifest: &EvidenceManifestV1) -
         }
     }
     Ok((checks, skipped))
+}
+
+/// Artifact `kind` emitted for a projection snapshot. The `_ccxs` spelling is the
+/// pre-rename name: the projections snapshot vacated the `.ccxs` extension so that
+/// `ccx<lane>` stays the CoreCrux segment-companion namespace (ExecPlan
+/// `crux-companion-vocabulary-unification-2026-08-08` M1). Verification accepts
+/// both spellings so an audit pack issued before the rename still reads; only the
+/// new spelling is ever written.
+pub(crate) const PROJECTION_SNAPSHOT_KIND: &str = "projection_snapshot_ccxsnap";
+const PROJECTION_SNAPSHOT_KIND_LEGACY: &str = "projection_snapshot_ccxs";
+
+fn is_projection_snapshot_kind(kind: &str) -> bool {
+    kind == PROJECTION_SNAPSHOT_KIND || kind == PROJECTION_SNAPSHOT_KIND_LEGACY
 }
 
 fn projection_name_from_snapshot_artifact(artifact: &corecrux_types::EvidenceArtifactDescriptorV1) -> Option<String> {
@@ -2086,14 +2099,39 @@ mod tests {
         assert_eq!(expected_projection_hash(&meta, "unknown"), None);
     }
 
+    // ── projection snapshot artifact kind ──────────────────────────
+
+    /// An audit pack issued before the `.ccxs` → `.ccxsnap` rename carries the
+    /// old `kind` string. Verification must still read it, or renaming the
+    /// artifact kind silently invalidates every previously-issued pack.
+    #[test]
+    fn projection_snapshot_kind_accepts_legacy_and_current_spellings() {
+        assert!(is_projection_snapshot_kind("projection_snapshot_ccxsnap"));
+        assert!(is_projection_snapshot_kind("projection_snapshot_ccxs"));
+        assert!(!is_projection_snapshot_kind("replay_input_segment"));
+        assert!(!is_projection_snapshot_kind("projection_snapshot"));
+        // Only the current spelling is ever written.
+        assert_eq!(PROJECTION_SNAPSHOT_KIND, "projection_snapshot_ccxsnap");
+    }
+
+    /// The block-type ids are serialised *inside* the snapshot, so the rename
+    /// was allowed to move their identifiers but never their values. The magic
+    /// is the one on-disk value that did change, deliberately.
+    #[test]
+    fn ccxsnap_rename_preserved_block_ids_and_rotated_magic() {
+        use corecrux_projections::{CCXSNAP_BLOCK_HOT_PTRS_V1, CCXSNAP_BLOCK_STATS_V1};
+        assert_eq!(CCXSNAP_BLOCK_STATS_V1, 4);
+        assert_eq!(CCXSNAP_BLOCK_HOT_PTRS_V1, 6);
+    }
+
     // ── projection_name_from_snapshot_artifact ─────────────────────
 
     #[test]
     fn projection_name_from_snapshot_artifact_finds_name() {
         let artifact = corecrux_types::EvidenceArtifactDescriptorV1 {
-            kind: "projection_snapshot_ccxs".to_string(),
+            kind: "projection_snapshot_ccxsnap".to_string(),
             media_type: "application/octet-stream".to_string(),
-            path: "snapshot.ccxs".to_string(),
+            path: "snapshot.ccxsnap".to_string(),
             blake3: "hash".to_string(),
             size_bytes: 100,
             status: EvidenceStatusV1::Pass,
@@ -3414,14 +3452,14 @@ mod tests {
 
     // ── verify_projection_artifacts ─────────────────────────────────
 
-    /// Lay out `<pack>/proj/{projections.meta.json, living.ccxs}` and return
+    /// Lay out `<pack>/proj/{projections.meta.json, living.ccxsnap}` and return
     /// the manifest describing both. `snapshot_hash_in_meta` controls whether
     /// the meta records the snapshot's real hash.
     fn projection_pack(dir: &Path, snapshot_hash_in_meta: Option<String>) -> EvidenceManifestV1 {
         let proj_dir = dir.join("proj");
         std::fs::create_dir_all(&proj_dir).expect("mkdir");
-        let snapshot_bytes = b"pretend-ccxs-snapshot-bytes".to_vec();
-        std::fs::write(proj_dir.join("living.ccxs"), &snapshot_bytes).expect("write snapshot");
+        let snapshot_bytes = b"pretend-ccxsnap-snapshot-bytes".to_vec();
+        std::fs::write(proj_dir.join("living.ccxsnap"), &snapshot_bytes).expect("write snapshot");
 
         let mut meta = corecrux_projections::ProjectionsMetaV1::empty_now();
         meta.artifact_living_state.snapshot_blake3 = snapshot_hash_in_meta;
@@ -3431,7 +3469,12 @@ mod tests {
         )
         .expect("write meta");
 
-        let mut snapshot_desc = descriptor_bytes("projection_snapshot_ccxs", "proj/living.ccxs", &snapshot_bytes, true);
+        let mut snapshot_desc = descriptor_bytes(
+            "projection_snapshot_ccxsnap",
+            "proj/living.ccxsnap",
+            &snapshot_bytes,
+            true,
+        );
         snapshot_desc.source_refs = vec![EvidenceSourceRefV1::ProjectionSnapshot {
             shard_id: 1,
             projection: "artifact_living_state".to_string(),
@@ -3459,7 +3502,7 @@ mod tests {
     #[test]
     fn verify_projection_artifacts_matching_snapshot_hash_passes() {
         let dir = tempdir().expect("tempdir");
-        let expected = CcxsSnapshot::snapshot_blake3_hex(b"pretend-ccxs-snapshot-bytes");
+        let expected = CcxsnapSnapshot::snapshot_blake3_hex(b"pretend-ccxsnap-snapshot-bytes");
         let manifest = projection_pack(dir.path(), Some(expected));
         let (checks, _checks_skipped) = verify_projection_artifacts(dir.path(), &manifest).expect("checks");
         assert_eq!(checks.len(), 1);

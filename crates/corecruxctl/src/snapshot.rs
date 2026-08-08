@@ -3,11 +3,11 @@
 // Licensed under the Apache License, Version 2.0.
 // See LICENSE in the repository root.
 
-//! Snapshot loader — opens a `.ccxs` snapshot via `corecrux-projections` and prints its contents.
+//! Snapshot loader — opens a `.ccxsnap` snapshot via `corecrux-projections` and prints its contents.
 
 use std::path::{Path, PathBuf};
 
-use corecrux_projections::{load_projections_meta_v1, CcxsSnapshot};
+use corecrux_projections::{load_projections_meta_v1, CcxsnapSnapshot};
 
 #[derive(Debug, Clone)]
 pub struct SnapshotOptions {
@@ -111,19 +111,19 @@ struct ProjectionDef {
 const PROJECTIONS: [ProjectionDef; 4] = [
     ProjectionDef {
         key: "artifact_living_state",
-        file: "artifact_living_state.snapshot.ccxs",
+        file: "artifact_living_state.snapshot.ccxsnap",
     },
     ProjectionDef {
         key: "artifact_relations",
-        file: "artifact_relations.snapshot.ccxs",
+        file: "artifact_relations.snapshot.ccxsnap",
     },
     ProjectionDef {
         key: "pressure_events",
-        file: "pressure_events.snapshot.ccxs",
+        file: "pressure_events.snapshot.ccxsnap",
     },
     ProjectionDef {
         key: "artifact_dependents",
-        file: "artifact_dependents.snapshot.ccxs",
+        file: "artifact_dependents.snapshot.ccxsnap",
     },
 ];
 
@@ -213,7 +213,7 @@ pub fn verify_snapshots(
                 item.reason = Some("MISSING_SNAPSHOT".to_string());
             } else {
                 let bytes = std::fs::read(&path)?;
-                let actual = CcxsSnapshot::snapshot_blake3_hex(&bytes);
+                let actual = CcxsnapSnapshot::snapshot_blake3_hex(&bytes);
                 item.actual_blake3 = Some(actual.clone());
                 if Some(actual) != expected {
                     item.ok = false;
@@ -367,7 +367,7 @@ mod tests {
                 shard_id: 0,
                 projections: vec![SnapshotProjectionListItem {
                     projection: "artifact_living_state".to_string(),
-                    path: "/data/shards/shard-0000/projections/artifact_living_state.snapshot.ccxs".to_string(),
+                    path: "/data/shards/shard-0000/projections/artifact_living_state.snapshot.ccxsnap".to_string(),
                     exists: true,
                     bytes: 1024,
                     expected_blake3: Some("abc".to_string()),
@@ -476,7 +476,7 @@ mod tests {
 
         // Create one snapshot file
         fs::write(
-            proj_dir.join("artifact_living_state.snapshot.ccxs"),
+            proj_dir.join("artifact_living_state.snapshot.ccxsnap"),
             b"fake snapshot data",
         )
         .unwrap();

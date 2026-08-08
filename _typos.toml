@@ -8,7 +8,10 @@ extend-exclude = ["**/console-3d/vendor/"]
 metalness = "metalness"
 ccxi = "ccxi"
 ccxseg = "ccxseg"
-ccxs = "ccxs"
+# Projections snapshot companion. Was `ccxs`, renamed so that `ccx<lane>` stays
+# the CoreCrux segment-companion namespace (a snapshot is not a lane).
+ccxsnap = "ccxsnap"
+CSNP = "CSNP"
 corecrux = "corecrux"
 corecruxd = "corecruxd"
 corecruxctl = "corecruxctl"
