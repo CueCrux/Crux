@@ -11134,16 +11134,35 @@
         bar.appendChild(clearBtn);
         host.appendChild(bar);
 
+        // Pull-out inspector. Chrome is the console's own graph-inspector shape
+        // (.canvas-graph-inspector / .cv-insp-*) so it reads as part of the
+        // shell; the CONTENT layout is the prototype's — badges, blurb,
+        // milestone meter, then the three relation lists.
+        var panel = el('aside', { 'class': 'canvas-graph-inspector pb-panel',
+          role: 'dialog', 'aria-label': 'Plan detail', 'aria-hidden': 'true' });
+        var pTop = el('div', { 'class': 'cv-insp-topbar' });
+        var pType = el('span', { 'class': 'canvas-insp-type', text: 'EXECPLAN' });
+        var pClose = el('button', { type: 'button', 'class': 'cv-insp-btn pb-panel-x',
+          'aria-label': 'Close plan detail', text: '×' });
+        pClose.addEventListener('click', function () {
+          state.plan = null; applyAll();
+        });
+        pTop.appendChild(pType); pTop.appendChild(pClose);
+        var pBody = el('div', { 'class': 'cv-insp-body' });
+        panel.appendChild(pTop); panel.appendChild(pBody);
+
         var layout = patchbayLayout(d);
         var wires = patchbayRoutes(layout, d);
         var canvas = pbCanvas(layout, wires, state, function () { applyAll(); });
-        host.appendChild(canvas.svg);
+        var stage = el('div', { 'class': 'pb-stage' });
+        stage.appendChild(canvas.svg);
+        stage.appendChild(panel);
+        host.appendChild(stage);
 
-        // Detail line — a selection that changes nothing but a highlight is a
-        // dead end, so name what is selected and why it matters.
-        var detail = el('p', { 'class': 'v2card-sub pb-detail' });
-        host.appendChild(detail);
 
+
+        function selectPlanFromPanel(slug) { state.plan = slug; state.plane = null; state.service = null; applyAll(); }
+        function selectServiceFromPanel(key) { state.service = key; state.plan = null; state.plane = null; applyAll(); }
 
         function applyAll() {
           var fresh = {}, freshN = 0, p, k;
@@ -11257,30 +11276,16 @@
             ' · ' + planes.length + ' systems · ' + (d.link_count || 0) + ' edges · ' +
             services.length + ' services';
 
-          // Detail text.
+          // Panel: open on a plan selection, closed otherwise.
           if (state.plan) {
             var sp = null;
             for (k = 0; k < plans.length; k++) { if (plans[k].slug === state.plan) { sp = plans[k]; } }
-            if (sp) {
-              var bits = [sp.title || sp.slug, sp.state,
-                (sp.milestones_total ? (sp.milestones_done || 0) + '/' + sp.milestones_total + ' milestones' : 'no milestones declared')];
-              if (sp.risk) { bits.push(sp.risk + ' risk'); }
-              if ((sp.links || []).length) { bits.push('depends on ' + sp.links.length); }
-              if ((sp.services || []).length) { bits.push('touches ' + sp.services.join(', ')); }
-              detail.textContent = bits.join(' · ') + (sp.blurb ? ' — ' + sp.blurb : '');
-            }
-          } else if (state.plane) {
-            var n = 0;
-            for (k = 0; k < plans.length; k++) { if (plans[k].plane === state.plane) { n++; } }
-            detail.textContent = state.plane + ' — ' + n + (n === 1 ? ' open plan' : ' open plans') + '. Click it again, or Clear selection, to show the whole board.';
+            if (sp) { pbFillPanel(pBody, sp, plans, now, selectPlanFromPanel, selectServiceFromPanel); }
+            panel.classList.add('is-open');
+            panel.setAttribute('aria-hidden', 'false');
           } else {
-            if (state.live > 0) {
-              detail.textContent = freshN
-                ? freshN + ' plan' + (freshN === 1 ? '' : 's') + ' worked on in the last ' + state.live + 'h. Recency comes from the newest fact on a plan, not its file timestamp.'
-                : 'No plan has a recorded fact in the last ' + state.live + 'h — widen the window. (Recency is fact activity, not file mtime.)';
-            } else {
-              detail.textContent = 'Click a card or a system to isolate it. Wires are declared dependencies.';
-            }
+            panel.classList.remove('is-open');
+            panel.setAttribute('aria-hidden', 'true');
           }
         }
         applyAll();
@@ -11532,6 +11537,86 @@
     else if (rail.side === 'left') { pts = [{ x: chip.x, y: cy }, { x: rail.x + rail.w / 2 + 16, y: cy }, { x: rail.x + rail.w / 2 + 16, y: rail.y }, { x: rail.x + rail.w / 2, y: rail.y }]; }
     else { pts = [{ x: chip.x + PB_CW, y: cy }, { x: rail.x - rail.w / 2 - 16, y: cy }, { x: rail.x - rail.w / 2 - 16, y: rail.y }, { x: rail.x - rail.w / 2, y: rail.y }]; }
     return pbRoundPath(pts, PB_RADIUS);
+  }
+
+  // Panel content — the prototype's layout: identity, badges, the sentence,
+  // the milestone meter, then the three relation lists. Every relation is a
+  // BUTTON: the prototype's panel was navigable, and a list of slugs you cannot
+  // click is just more text.
+  function pbFillPanel(body, p, plans, now, onPlan, onService) {
+    body.textContent = '';
+
+    body.appendChild(el('h3', { 'class': 'cv-insp-title', text: p.title || p.slug }));
+    body.appendChild(el('p', { 'class': 'cv-insp-sub pb-panel-slug', text: p.slug }));
+
+    // Badges: state, system, risk, recency — the four things you judge a plan on.
+    var badges = el('div', { 'class': 'cv-insp-badges pb-panel-badges' });
+    var stateB = el('span', { 'class': 'cv-badge pb-badge-state', text: (p.state || '').replace('_', ' ') });
+    if (stateB.style) { stateB.style.color = pbStateColor(p.state); }
+    badges.appendChild(stateB);
+    badges.appendChild(el('span', { 'class': 'cv-badge cv-badge-type', text: p.plane || '' }));
+    if (p.risk) { badges.appendChild(el('span', { 'class': 'cv-badge pb-badge-risk', text: p.risk + ' risk' })); }
+    var ageH = pbAgeHours(p, now);
+    badges.appendChild(el('span', { 'class': 'cv-badge pb-badge-age',
+      text: isFinite(ageH) ? pbAgeLabel(ageH) : 'no recorded activity' }));
+    body.appendChild(badges);
+
+    if (p.blurb) { body.appendChild(el('p', { 'class': 'pb-panel-blurb', text: p.blurb })); }
+
+    // Milestones, with the meter rather than a bare fraction.
+    body.appendChild(el('div', { 'class': 'cv-insp-linked-h', text: 'Milestones' }));
+    var total = p.milestones_total || 0, done = p.milestones_done || 0;
+    body.appendChild(el('p', { 'class': 'cv-insp-sub pb-panel-ms',
+      text: total ? done + ' of ' + total + ' gated' + (p.current_milestone ? ' · now at ' + p.current_milestone : '')
+                  : 'no milestones declared' }));
+    var track = el('div', { 'class': 'pb-panel-meter' });
+    var fill = el('i', {});
+    if (fill.style) {
+      fill.style.width = (total ? Math.round(100 * done / total) : 0) + '%';
+      fill.style.background = pbStateColor(p.state);
+    }
+    track.appendChild(fill);
+    body.appendChild(track);
+
+    // Relations. Each list states what the relation MEANS, because "declared"
+    // and "mentioned" are different claims and the panel is where that lands.
+    pbPanelList(body, 'Touches', (p.services || []), 'Shared services this plan works against',
+      function (k) { return k; }, onService);
+    pbPanelList(body, 'Depends on', (p.links || []), 'Declared blocking dependencies (Depends on / Extended by)',
+      function (slug) { return pbTitleOf(plans, slug); }, onPlan);
+    pbPanelList(body, 'Mentions', (p.mentions || []), 'Referenced in prose — not a dependency',
+      function (slug) { return pbTitleOf(plans, slug); }, onPlan);
+
+    var inbound = [];
+    for (var i = 0; i < plans.length; i++) {
+      if ((plans[i].links || []).indexOf(p.slug) >= 0) { inbound.push(plans[i].slug); }
+    }
+    pbPanelList(body, 'Blocks', inbound, 'Plans that declare a dependency on this one',
+      function (slug) { return pbTitleOf(plans, slug); }, onPlan);
+  }
+
+  function pbTitleOf(plans, slug) {
+    for (var i = 0; i < plans.length; i++) { if (plans[i].slug === slug) { return plans[i].title || slug; } }
+    return slug;
+  }
+  function pbAgeLabel(h) {
+    if (h < 1) { return 'worked on <1h ago'; }
+    if (h < 48) { return 'worked on ' + Math.round(h) + 'h ago'; }
+    return 'worked on ' + Math.round(h / 24) + 'd ago';
+  }
+  // A section is omitted entirely when empty: an empty "Depends on" heading
+  // reads as a load failure, whereas its absence reads as "none", which is true.
+  function pbPanelList(body, heading, items, why, labelOf, onPick) {
+    if (!items || !items.length) { return; }
+    body.appendChild(el('div', { 'class': 'cv-insp-linked-h', text: heading + ' (' + items.length + ')' }));
+    body.appendChild(el('p', { 'class': 'cv-insp-sub pb-panel-why', text: why }));
+    var list = el('div', { 'class': 'pb-panel-list' });
+    items.forEach(function (it) {
+      var b = el('button', { type: 'button', 'class': 'pb-panel-item', text: labelOf(it) });
+      b.addEventListener('click', function () { if (onPick) { onPick(it); } });
+      list.appendChild(b);
+    });
+    body.appendChild(list);
   }
 
   // Wrap a label into at most `max` lines of ~`width` chars, on word bounds.

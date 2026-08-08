@@ -1879,6 +1879,44 @@ function extractThemeVars(theme) {
       check(pbLiveFixture.plans.every(function (p) { return p.last_activity_unix_ms; }),
         '[patchbay] fixture sanity: recency is driven by last_activity_unix_ms');
 
+      // ---- pull-out panel --------------------------------------------------
+      // Chrome is the console's graph inspector; the CONTENT is the prototype's.
+      // Drive it: closed by default, opens on a card, carries the sections, and
+      // its relation entries navigate rather than just describing.
+      const panelNode = byClass('pb-panel')[0];
+      check(!!panelNode, '[patchbay] a pull-out detail panel must exist');
+      check(!/is-open/.test(panelNode.className || ''),
+        '[patchbay] the panel must start closed');
+      check(panelNode.getAttribute('aria-hidden') === 'true',
+        '[patchbay] a closed panel must be hidden from assistive tech');
+      const pcard = byClass('pb-chip').filter(function (n) { return n.getAttribute('data-slug') === 'f1'; })[0];
+      pcard.click();
+      check(/is-open/.test(byClass('pb-panel')[0].className || ''),
+        '[patchbay] selecting a card must open the panel');
+      check(byClass('pb-panel')[0].getAttribute('aria-hidden') === 'false',
+        '[patchbay] an open panel must be exposed to assistive tech');
+      const heads = byClass('cv-insp-linked-h').map(function (n) { return n.textContent; });
+      check(heads.some(function (h) { return /Milestones/.test(h); }),
+        '[patchbay] the panel must carry the milestone section');
+      check(heads.some(function (h) { return /Depends on/.test(h); }),
+        '[patchbay] the panel must list declared dependencies (f1 declares f2)');
+      check(byClass('cv-insp-title').length === 1,
+        '[patchbay] the panel must name the plan it is describing');
+      check(byClass('cv-badge').length >= 3,
+        '[patchbay] the panel must badge state, system and recency');
+      // A relation entry NAVIGATES.
+      const depBtn = byClass('pb-panel-item').filter(function (n) { return n.textContent === 'Fresh two'; })[0];
+      check(!!depBtn, '[patchbay] a declared dependency must appear as a clickable entry');
+      depBtn.click();
+      check((byClass('cv-insp-title')[0] || {}).textContent === 'Fresh two',
+        '[patchbay] clicking a relation must walk the panel to that plan, not just describe it');
+      // Close.
+      byClass('pb-panel-x')[0].click();
+      check(!/is-open/.test(byClass('pb-panel')[0].className || ''),
+        '[patchbay] the close control must shut the panel');
+      check(byClass('pb-sel').length === 0,
+        '[patchbay] closing the panel must clear the card selection with it');
+
       // ---- selection still works alongside filters -------------------------
       sel('pb-clear')[0].click();
       const f1 = byClass('pb-chip').filter(function (n) { return n.getAttribute('data-slug') === 'f1'; })[0];
