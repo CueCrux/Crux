@@ -327,8 +327,8 @@ def run_live_cases(
 ) -> list[Failure]:
     """Properties about the round trip. Needs a daemon with the context
     surface ON, and optionally a second one with it OFF for the 404 case."""
-    from corecrux_client.errors import CoreCruxError
-    from corecrux_client.types import StoreFact
+    from cuecrux_client.errors import CueCruxError
+    from cuecrux_client.types import StoreFact
 
     out: list[Failure] = []
 
@@ -434,7 +434,7 @@ def run_live_cases(
     if gated_off_client is not None:
         try:
             adapter.fetch(gated_off_client, token_budget=500)
-        except CoreCruxError as err:
+        except CueCruxError as err:
             check(
                 "gated-off-404",
                 err.status_code == 404,
@@ -442,7 +442,7 @@ def run_live_cases(
             )
         except Exception as err:  # noqa: BLE001
             out.append(
-                Failure(adapter.name, "gated-off-404", f"expected CoreCruxError, got {err!r}")
+                Failure(adapter.name, "gated-off-404", f"expected CueCruxError, got {err!r}")
             )
         else:
             out.append(

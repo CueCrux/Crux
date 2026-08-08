@@ -4,8 +4,8 @@
 
 """Crux Daemon Python client."""
 
-from .client import AsyncCoreCruxClient, CoreCruxClient
-from .errors import CoreCruxError
+from .client import AsyncCueCruxClient, CueCruxClient
+from .errors import CueCruxError
 from .types import (
     Fact,
     FactQueryResult,
@@ -18,9 +18,9 @@ from .types import (
 )
 
 __all__ = [
-    "AsyncCoreCruxClient",
-    "CoreCruxClient",
-    "CoreCruxError",
+    "AsyncCueCruxClient",
+    "CueCruxClient",
+    "CueCruxError",
     "Fact",
     "FactQueryResult",
     "SessionState",

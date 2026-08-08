@@ -160,13 +160,13 @@ def fetch_bundle(
     query: str | None = None,
     token_budget: int | None = None,
 ) -> ContextBundle:
-    """Fetch and reshape a bundle using a ``corecrux_client`` instance.
+    """Fetch and reshape a bundle using a ``cuecrux_client`` instance.
 
-    ``client`` is a ``CoreCruxClient`` (or anything with a compatible
+    ``client`` is a ``CueCruxClient`` (or anything with a compatible
     ``context()``), so adapters inherit the SDK's auth, timeouts and error
     types instead of re-implementing them.
 
-    Raises ``CoreCruxError`` with status 404 when the daemon's context surface
+    Raises ``CueCruxError`` with status 404 when the daemon's context surface
     is disabled (``CORECRUXD_CONTEXT_SURFACE`` unset) -- a loud failure, not an
     empty bundle, so a misconfigured daemon cannot look like an empty memory.
     """

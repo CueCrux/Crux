@@ -1,7 +1,7 @@
 # SDK release lifecycle
 
 Policy for every published CueCrux SDK package. In this repo:
-`@cuecrux/client` (npm, `sdks/typescript/`) and `corecrux-client` (PyPI,
+`@cuecrux/client` (npm, `sdks/typescript/`) and `cuecrux-client` (PyPI,
 `sdks/python/`). The same policy governs portfolio packages published from
 other repos (`@cuecrux/engine-client`, future `cuecrux-*` integration
 packages such as the LangChain adapter) — link here rather than fork the
@@ -83,7 +83,7 @@ change that was not accompanied by a version bump.
 - [ ] npm: enable Trusted Publishing for `@cuecrux/client`; edit
       `sdk-typescript.yml` (add `id-token: write`, `--provenance`, drop
       `NODE_AUTH_TOKEN`).
-- [ ] PyPI: add trusted publisher for `corecrux-client`; edit
+- [ ] PyPI: add trusted publisher for `cuecrux-client`; edit
       `sdk-python.yml` (swap twine for `pypa/gh-action-pypi-publish`).
 - [ ] Delete `NPM_TOKEN` / `PYPI_TOKEN` secrets after one successful
       OIDC publish each.

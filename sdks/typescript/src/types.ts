@@ -4,8 +4,8 @@
 
 // ── Client options ──────────────────────────────────────────────────
 
-export interface CoreCruxOptions {
-  /** Base URL of the CoreCrux daemon (e.g. `http://localhost:14800`). */
+export interface CueCruxOptions {
+  /** Base URL of the CueCrux daemon (e.g. `http://localhost:14800`). */
   baseUrl: string;
   /** Bearer token for authentication. */
   token?: string;
@@ -368,7 +368,7 @@ export type CruxEventType = (typeof CRUX_EVENT_TYPES)[number];
 
 // ── Error ───────────────────────────────────────────────────────────
 
-/** RFC 9457 Problem Details returned by the CoreCrux API on error. */
+/** RFC 9457 Problem Details returned by the CueCrux API on error. */
 export interface ProblemDetails {
   type: string;
   title: string;

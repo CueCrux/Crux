@@ -2,7 +2,7 @@
 # Licensed under the Apache License, Version 2.0.
 # See LICENSE in the repository root.
 
-"""CoreCrux API data types."""
+"""CueCrux API data types."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from typing import Any
 
 @dataclass
 class Fact:
-    """A stored fact returned by the CoreCrux API."""
+    """A stored fact returned by the CueCrux API."""
 
     fact_id: str
     entity: str
@@ -30,7 +30,7 @@ class Fact:
 
 @dataclass
 class StoreFact:
-    """Payload for creating a new fact via the CoreCrux API."""
+    """Payload for creating a new fact via the CueCrux API."""
 
     entity: str
     key: str
@@ -94,7 +94,7 @@ class FactQueryResult:
 
 @dataclass
 class SessionState:
-    """Stored session state returned by the CoreCrux API."""
+    """Stored session state returned by the CueCrux API."""
 
     session_id: str
     state: dict[str, Any]

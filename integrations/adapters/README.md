@@ -31,11 +31,11 @@ the routes 404 when it is off, deliberately, so a disabled surface cannot be
 mistaken for an empty memory).
 
 ```python
-from corecrux_client import CoreCruxClient
+from cuecrux_client import CueCruxClient
 from crux_adapters.langchain import CruxContextRetriever, to_system_message
 from crux_adapters.core import fetch_bundle
 
-client = CoreCruxClient("http://127.0.0.1:14800")
+client = CueCruxClient("http://127.0.0.1:14800")
 
 # As a retriever, for any chain that takes one:
 retriever = CruxContextRetriever(client=client, entity="project:atlas", token_budget=2000)

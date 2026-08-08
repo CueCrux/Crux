@@ -2,7 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 // See LICENSE in the repository root.
 
-// Wire-shape tests for the CoreCrux TypeScript SDK.
+// Wire-shape tests for the CueCrux TypeScript SDK.
 //
 // These run against a real local HTTP server (node:http) rather than a
 // patched `fetch`, so the assertions cover what actually goes on the socket:
@@ -17,7 +17,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { after, before, beforeEach, test } from "node:test";
 
-import { CoreCruxClient, CoreCruxError, parseSseBlock } from "../dist/index.js";
+import { CueCruxClient, CueCruxError, parseSseBlock } from "../dist/index.js";
 
 const SSE_BODY =
   ": keep-alive\n\n" +
@@ -94,7 +94,7 @@ beforeEach(() => {
   calls = [];
 });
 
-const client = () => new CoreCruxClient({ baseUrl });
+const client = () => new CueCruxClient({ baseUrl });
 
 /** Assert the most recent request's method and path, and return it. */
 function lastCall(method, path) {
@@ -308,7 +308,7 @@ test("deleteExtension returns false on 404", async () => {
   assert.equal(await client().deleteExtension("missing"), false);
 });
 
-test("a 500 surfaces as CoreCruxError carrying the RFC 9457 problem body", async () => {
+test("a 500 surfaces as CueCruxError carrying the RFC 9457 problem body", async () => {
   // Only getExtension and deleteExtension swallow a status; every other
   // method must propagate. `boom` makes the stub answer 500.
   const err = await client()
@@ -316,7 +316,7 @@ test("a 500 surfaces as CoreCruxError carrying the RFC 9457 problem body", async
     .then(() => null)
     .catch((e) => e);
 
-  assert.ok(err instanceof CoreCruxError, `expected CoreCruxError, got ${err}`);
+  assert.ok(err instanceof CueCruxError, `expected CueCruxError, got ${err}`);
   assert.equal(err.status, 500);
   assert.equal(err.message, "stub failure");
   assert.equal(err.problem.title, "Internal Server Error");
