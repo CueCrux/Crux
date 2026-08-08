@@ -548,9 +548,27 @@ pub(super) async fn post_local_ingest(
     )
     .await
     {
-        Ok(summary) => summary,
+        Ok(summary) => {
+            let mut streak = state.seal_failed_streak.write().await;
+            *streak = (0, None);
+            summary
+        }
         Err(msg) => {
-            tracing::error!(error = %msg, "local-ingest seal failed");
+            // Count the streak so `/readyz` can report a dead write path. A 500
+            // per request and nothing else is what let host `crux` sit broken
+            // for 38 hours: reads were fine, so every probe stayed green.
+            let streak = {
+                let mut streak = state.seal_failed_streak.write().await;
+                streak.0 = streak.0.saturating_add(1);
+                streak.1 = Some(msg.clone());
+                streak.0
+            };
+            state.metrics.inc_local_ingest_seal_failed();
+            tracing::error!(
+                error = %msg,
+                consecutive_failures = streak,
+                "local-ingest seal failed"
+            );
             return problem_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("local ingest seal failed: {msg}"),

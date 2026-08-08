@@ -5278,6 +5278,267 @@ mod tests {
             "the referenced segment's .ccxi companion must NOT be quarantined on reopen"
         );
     }
+
+    // ══ Segment retirement (ExecPlan crux-erasure-manifest-repair-2026-08-08) ══
+    //
+    // Tenant-erasure reclaim used to unlink a segment's file group and leave its
+    // MANIFEST entry behind. `ShardStorage::open` opens every referenced segment,
+    // so one dangling entry made the shard unopenable and killed every write
+    // while reads carried on regardless. These cover the tombstone that fixes it.
+
+    /// Seal `count` segments in their own shard root and return it.
+    fn seal_n_segments(count: u64) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let options = ShardStorageOptions {
+            head_max_record_bytes: 0,
+            build_ccxi: true,
+            ..Default::default()
+        };
+        for i in 0..count {
+            let mut storage = ShardStorage::open(dir.path(), 0, 1, options.clone()).unwrap();
+            let stream_id = format!("doc-{i}");
+            let stream_hash = corecrux_frame::stream_hash_xxhash64("t", "corpus", &stream_id).unwrap();
+            storage
+                .append_batch(
+                    stream_hash,
+                    0,
+                    "t",
+                    "corpus",
+                    &stream_id,
+                    "2026-01-01T00:00:00Z",
+                    &[AppendEventInput {
+                        event_id: &format!("evt-{i}"),
+                        occurred_at: "2026-01-01T00:00:00Z",
+                        event_type: "evt",
+                        content_type: "text/plain",
+                        payload_bytes: b"hello",
+                    }],
+                )
+                .unwrap();
+            storage.force_seal_head().unwrap();
+        }
+        dir
+    }
+
+    fn unlink_group(shard_dir: &Path, segment_seq: u64) {
+        let prefix = format!("seg-{segment_seq:020}-");
+        for entry in std::fs::read_dir(shard_dir.join("segments")).unwrap().flatten() {
+            if entry.file_name().to_str().unwrap().starts_with(&prefix) {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+    }
+
+    /// The failure mode itself, so the fix is anchored to a real repro.
+    #[test]
+    fn a_dangling_manifest_entry_makes_the_shard_unopenable() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = seal_n_segments(3);
+        unlink_group(&dir.path().join("shard-0000"), 2);
+        let err = match ShardStorage::open(dir.path(), 0, 1, ShardStorageOptions::default()) {
+            Ok(_) => panic!("a manifest entry with no file must fail open"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, StorageError::Io { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn retiring_a_segment_lets_the_shard_open_again() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = seal_n_segments(3);
+        unlink_group(&dir.path().join("shard-0000"), 2);
+
+        let outcome = retire_segments_in_manifest(dir.path(), 0, &[2]).expect("retire");
+        assert_eq!(outcome.retired, vec![2]);
+        assert!(outcome.not_present.is_empty());
+
+        let storage = ShardStorage::open(dir.path(), 0, 1, ShardStorageOptions::default())
+            .ok()
+            .expect("open after retire");
+        assert!(!storage.segments_by_seq.contains_key(&2));
+        assert!(storage.segments_by_seq.contains_key(&1));
+        assert!(storage.segments_by_seq.contains_key(&3));
+    }
+
+    /// The tombstone is an append: every pre-existing byte survives, so a bad
+    /// run can never be worse than the state it started from.
+    #[test]
+    fn retiring_appends_and_never_rewrites() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = seal_n_segments(3);
+        let manifest_path = dir.path().join("shard-0000").join("MANIFEST");
+        let before = std::fs::read(&manifest_path).unwrap();
+
+        let outcome = retire_segments_in_manifest(dir.path(), 0, &[2]).expect("retire");
+
+        let after = std::fs::read(&manifest_path).unwrap();
+        assert_eq!(&after[..before.len()], &before[..]);
+        assert_eq!(after.len() as u64, outcome.manifest_end);
+        assert!(after.len() > before.len());
+    }
+
+    /// A retired sequence stays retired across reopen — the tombstone is durable
+    /// state, not a one-shot in-memory filter.
+    #[test]
+    fn a_retired_segment_stays_retired_across_reopen() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = seal_n_segments(3);
+        unlink_group(&dir.path().join("shard-0000"), 2);
+        retire_segments_in_manifest(dir.path(), 0, &[2]).expect("retire");
+
+        for _ in 0..2 {
+            let storage = ShardStorage::open(dir.path(), 0, 1, ShardStorageOptions::default())
+                .ok()
+                .expect("reopen");
+            assert_eq!(storage.segments_by_seq.len(), 2);
+            drop(storage);
+        }
+        let catalog = load_manifest_segment_catalog(&dir.path().join("shard-0000")).unwrap();
+        assert!(catalog.segments.iter().all(|s| s.segment_seq != 2));
+    }
+
+    /// Retiring an unknown sequence is a no-op, not an error: the erasure caller
+    /// may retry after a partial batch.
+    #[test]
+    fn retiring_an_unknown_segment_is_a_no_op() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = seal_n_segments(2);
+        let manifest_path = dir.path().join("shard-0000").join("MANIFEST");
+        let before = std::fs::read(&manifest_path).unwrap();
+
+        let outcome = retire_segments_in_manifest(dir.path(), 0, &[99]).expect("retire");
+        assert!(outcome.retired.is_empty());
+        assert_eq!(outcome.not_present, vec![99]);
+        // The reported end must still be the real one, not a default: a caller
+        // that trusts it to locate the append point would corrupt the log.
+        assert_eq!(outcome.manifest_end, before.len() as u64);
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), before);
+    }
+
+    /// A shard with no MANIFEST has no entry that can dangle, so retiring is a
+    /// no-op the caller may proceed past — not an error that blocks reclaim on
+    /// segments which were never registered with a `ShardStorage`.
+    #[test]
+    fn retiring_on_a_shard_with_no_manifest_reports_everything_absent() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("shard-0000")).unwrap();
+
+        let outcome = retire_segments_in_manifest(dir.path(), 0, &[7, 8]).expect("a missing manifest is not an error");
+        assert!(outcome.retired.is_empty());
+        assert_eq!(
+            outcome.not_present,
+            vec![7, 8],
+            "every sequence must be reported absent"
+        );
+        assert_eq!(outcome.manifest_end, 0);
+        assert!(
+            !dir.path().join("shard-0000").join("MANIFEST").exists(),
+            "no manifest is created"
+        );
+    }
+
+    /// A segment can still be written and sealed after a sibling is retired —
+    /// the whole point of the repair.
+    #[test]
+    fn writes_resume_after_a_retire() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = seal_n_segments(3);
+        unlink_group(&dir.path().join("shard-0000"), 2);
+        retire_segments_in_manifest(dir.path(), 0, &[2]).expect("retire");
+
+        let options = ShardStorageOptions {
+            head_max_record_bytes: 0,
+            build_ccxi: true,
+            ..Default::default()
+        };
+        let mut storage = ShardStorage::open(dir.path(), 0, 1, options).ok().expect("open");
+        let stream_hash = corecrux_frame::stream_hash_xxhash64("t", "corpus", "doc-new").unwrap();
+        storage
+            .append_batch(
+                stream_hash,
+                0,
+                "t",
+                "corpus",
+                "doc-new",
+                "2026-01-01T00:00:00Z",
+                &[AppendEventInput {
+                    event_id: "evt-new",
+                    occurred_at: "2026-01-01T00:00:00Z",
+                    event_type: "evt",
+                    content_type: "text/plain",
+                    payload_bytes: b"after the repair",
+                }],
+            )
+            .expect("append after retire");
+        drop(storage);
+
+        // `head_max_record_bytes: 0` seals inside `append_batch`, so the proof is
+        // a new segment in the catalog, not a `force_seal_head` return.
+        let catalog = load_manifest_segment_catalog(&dir.path().join("shard-0000")).unwrap();
+        assert_eq!(catalog.segments.len(), 3, "2 survivors + 1 written after the repair");
+        assert!(catalog.segments.iter().any(|s| s.segment_seq == 4));
+        assert!(catalog.segments.iter().all(|s| s.segment_seq != 2));
+    }
+
+    /// Regression: `.ccxp` was missing from the companion allowlist, so every
+    /// open swept every live embedding-profile sidecar into quarantine (635 of
+    /// them on host `crux`). Silent, because a segment with no `.ccxp` reads as
+    /// legacy and is scored without the fingerprint check it exists to enforce.
+    #[test]
+    fn live_companions_survive_reopen() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = seal_n_segments(1);
+        let shard_dir = dir.path().join("shard-0000");
+
+        let stem = std::fs::read_dir(shard_dir.join("segments"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_str().unwrap().to_string())
+            .find(|n| n.ends_with(".ccxseg"))
+            .expect("a sealed segment")
+            .trim_end_matches(".ccxseg")
+            .to_string();
+
+        for ext in ["ccxv", "ccxp"] {
+            std::fs::write(shard_dir.join("segments").join(format!("{stem}.{ext}")), b"companion").unwrap();
+        }
+
+        let reopened = ShardStorage::open(dir.path(), 0, 1, ShardStorageOptions::default());
+        assert!(reopened.is_ok(), "reopen must succeed");
+        drop(reopened);
+
+        for ext in ["ccxseg", "ccxi", "ccxv", "ccxp"] {
+            assert!(
+                shard_dir.join("segments").join(format!("{stem}.{ext}")).exists(),
+                ".{ext} companion of a live segment must not be quarantined"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(shard_dir.join("quarantine")).unwrap().count(),
+            0,
+            "nothing belonging to a referenced segment should be swept"
+        );
+    }
+
+    /// The companions of a *retired* segment are a different case: once the
+    /// segment is gone they are genuine orphans and the sweep should take them.
+    #[test]
+    fn orphaned_companions_are_still_quarantined() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = seal_n_segments(2);
+        let shard_dir = dir.path().join("shard-0000");
+        let stem = format!("seg-{:020}-{}", 2, "0100000000000000_placeholder");
+        let orphan = shard_dir.join("segments").join(format!("{stem}.ccxp"));
+        std::fs::write(&orphan, b"orphan").unwrap();
+
+        let reopened = ShardStorage::open(dir.path(), 0, 1, ShardStorageOptions::default());
+        assert!(reopened.is_ok(), "reopen must succeed");
+        drop(reopened);
+
+        assert!(!orphan.exists(), "a companion with no segment is an orphan");
+        assert_eq!(std::fs::read_dir(shard_dir.join("quarantine")).unwrap().count(), 1);
+    }
 }
 
 #[cfg(test)]

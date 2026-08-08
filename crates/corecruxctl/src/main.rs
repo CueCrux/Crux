@@ -21,8 +21,8 @@ use corecruxctl::{
     admin, agent_wiring, audit_export, audit_pack, c2pa_x509, code_chain, code_health, compaction_sync, config_bundle,
     cost, deploy_audit, evidence, explain, export, extensions, fixture_digest, gaps, hooks, identity_cli, incident,
     ingest, inspect_receipt, learn, login, machine, memory, memory_pack, observe_ingest, openclaw, output_verify,
-    parity, projections, receipts, reconcile, replay, repo, session_sync, shard, shardmap, smoke, snapshot,
-    stage1_import, start, storage, structured_log, studio, tooling_env, verify_store,
+    parity, projections, receipts, reconcile, repair_manifest, replay, repo, session_sync, shard, shardmap, smoke,
+    snapshot, stage1_import, start, storage, structured_log, studio, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -1975,6 +1975,24 @@ enum StorageCommand {
         #[arg(long)]
         node_id: Option<String>,
     },
+    /// Report (and optionally repair) MANIFEST entries whose segment file is gone.
+    ///
+    /// One dangling entry makes the shard impossible to open, which fails every
+    /// write while reads carry on — see ExecPlan
+    /// `crux-erasure-manifest-repair-2026-08-08`. Repair appends `RemoveSegment`
+    /// tombstones; it never rewrites existing manifest bytes.
+    #[command(name = "repair-manifest")]
+    RepairManifest {
+        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict to one shard. Default scans every shard.
+        #[arg(long)]
+        shard: Option<u32>,
+        /// Append the tombstones. Without this the command only reports.
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2925,6 +2943,17 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     ops_grpc: grpc,
                     ops_scopes: scopes,
                     node_id,
+                })?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
+            StorageCommand::RepairManifest { data_dir, shard, apply } => {
+                let default_dir =
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string());
+                let report = repair_manifest::repair_manifest(&repair_manifest::RepairManifestOptions {
+                    data_dir: data_dir.unwrap_or_else(|| PathBuf::from(default_dir)),
+                    shard,
+                    apply,
                 })?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())

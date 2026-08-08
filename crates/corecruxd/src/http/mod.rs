@@ -356,6 +356,14 @@ pub struct AppState {
     pub operating_mode: crate::product::OperatingMode,
     pub enabled_pro_services: Vec<String>,
     pub read_retry_failed_readyz_threshold: u64,
+    pub seal_failed_readyz_threshold: u64,
+    /// Consecutive local-ingest seal failures, with the most recent error. Reset
+    /// to `(0, None)` by any successful seal.
+    ///
+    /// The write path had no health signal at all until 2026-08-08: ingest 500'd
+    /// on every request for 38 hours while `/readyz` stayed green, because
+    /// readiness only ever asked about reads, locks and capacity.
+    pub seal_failed_streak: Arc<RwLock<(u64, Option<String>)>>,
     pub commit_level: CommitLevel,
     pub metrics: Metrics,
     pub node_id: String,

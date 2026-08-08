@@ -215,7 +215,7 @@ pub(super) async fn post_forget_tenants(
     let recorded_at = chrono::Utc::now().to_rfc3339();
     let forgotten_path = state.data_dir.join(FORGOTTEN_TENANTS_FILE);
 
-    let outcomes = {
+    let (outcomes, manifest_retire_failed) = {
         let mut index = state.retrieval_index.write().await;
         // One watermark for the whole batch: every segment sealed so far is
         // erased, anything ingested afterwards is not.
@@ -277,9 +277,50 @@ pub(super) async fn post_forget_tenants(
         }
 
         // ── Layer 2 (irreversible) — only after the mask is durable ─────────
+        //
+        // MANIFEST before unlink. Until 2026-08-08 this loop went straight to
+        // `reclaim_segment`, which unlinks the file group and never touches the
+        // shard manifest. The manifest kept referencing 17 deleted segments, so
+        // every later `ShardStorage::open` failed on `File::open` and took the
+        // whole write path down — reads were unaffected, `/readyz` stayed green,
+        // and nobody noticed for 38 hours. See ExecPlan
+        // `crux-erasure-manifest-repair-2026-08-08`.
+        //
+        // If the manifest cannot be updated, nothing is unlinked. The mask is
+        // already durable, so the corpus is still correctly hidden; the disk
+        // space simply is not freed, which is the same outcome as `reclaim=false`
+        // and is recoverable by re-running the forget.
+        let mut manifest_retired: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut manifest_retire_failed: Option<String> = None;
         if reclaim {
+            let wanted: Vec<u64> = outcomes.iter().flat_map(|o| o.reclaimable.iter().copied()).collect();
+            match corecrux_storage::retire_segments_in_manifest(
+                &state.data_dir.join("shards"),
+                crate::local_ingest::LOCAL_INGEST_SHARD_ID,
+                &wanted,
+            ) {
+                Ok(retire) => {
+                    // `not_present` joins `retired`: a segment the manifest never
+                    // referenced is an orphan, and unlinking it is still correct.
+                    manifest_retired.extend(retire.retired.iter().copied());
+                    manifest_retired.extend(retire.not_present.iter().copied());
+                }
+                Err(err) => {
+                    tracing::error!(
+                        ?err,
+                        segments = wanted.len(),
+                        "tenant-erasure-manifest-retire-failed; segment files retained (masked, not reclaimed)"
+                    );
+                    manifest_retire_failed = Some(err.to_string());
+                }
+            }
+        }
+        if reclaim && manifest_retire_failed.is_none() {
             for outcome in &mut outcomes {
                 for &segment_seq in &outcome.reclaimable {
+                    if !manifest_retired.contains(&segment_seq) {
+                        continue;
+                    }
                     match index.reclaim_segment(segment_seq) {
                         Ok(bytes) => {
                             outcome.segments_reclaimed += 1;
@@ -316,7 +357,7 @@ pub(super) async fn post_forget_tenants(
                 );
             }
         }
-        outcomes
+        (outcomes, manifest_retire_failed)
     };
 
     let actor = crate::auth::describe_http_evidence(&state.auth, &headers)
@@ -381,12 +422,17 @@ pub(super) async fn post_forget_tenants(
             "tenants": per_tenant.len(),
             "per_tenant": per_tenant,
             "scope": "retrieval_corpus",
-            "reclaimed": reclaim,
-            "durability": if reclaim {
-                "mask persisted; whole-tenant segment files deleted (irreversible)"
-            } else {
-                "mask persisted; segment files retained (reversible until reclaimed)"
+            "reclaimed": reclaim && manifest_retire_failed.is_none(),
+            "durability": match (reclaim, manifest_retire_failed.as_deref()) {
+                (true, None) => "mask persisted; whole-tenant segment files deleted (irreversible)",
+                // Reclaim was asked for and refused. Saying "deleted" here would
+                // be a lie the operator could only catch by listing the shard.
+                (true, Some(_)) => {
+                    "mask persisted; segment files retained because the MANIFEST could not be updated (see manifest_error)"
+                }
+                (false, _) => "mask persisted; segment files retained (reversible until reclaimed)",
             },
+            "manifest_error": manifest_retire_failed,
         })),
     )
         .into_response()

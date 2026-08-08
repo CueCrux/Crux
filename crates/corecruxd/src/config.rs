@@ -417,6 +417,9 @@ pub struct Config {
     pub append_lane_scope: AppendLaneScope,
     pub tail_cache_enabled: bool,
     pub read_retry_failed_readyz_threshold: u64,
+    /// Consecutive local-ingest seal failures before `/readyz` reports the write
+    /// path down. `0` disables the check.
+    pub seal_failed_readyz_threshold: u64,
     pub backpressure_high_watermark_ratio: f64,
     pub backpressure_low_watermark_ratio: f64,
     pub backpressure_retry_after_ms: u32,
@@ -1046,6 +1049,14 @@ pub fn load_config() -> Config {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
+    // Defaults ON. A total write outage that leaves `/readyz` green is exactly
+    // how host `crux` lost 38 hours of ingest without a single alert; a check
+    // that ships disabled would not have caught it either. Consecutive rather
+    // than cumulative, so one malformed document cannot unready the node.
+    let seal_failed_readyz_threshold = std::env::var("CORECRUXD_SEAL_FAILED_READYZ_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
     let mut backpressure_high_watermark_ratio: f64 = std::env::var("CORECRUXD_BACKPRESSURE_HIGH_WATERMARK_RATIO")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
@@ -1200,6 +1211,7 @@ pub fn load_config() -> Config {
         append_lane_scope,
         tail_cache_enabled,
         read_retry_failed_readyz_threshold,
+        seal_failed_readyz_threshold,
         backpressure_high_watermark_ratio,
         backpressure_low_watermark_ratio,
         backpressure_retry_after_ms,
@@ -1802,6 +1814,8 @@ mod tests {
         assert_eq!(cfg.append_lane_scope, AppendLaneScope::Global);
         assert!(cfg.tail_cache_enabled);
         assert_eq!(cfg.read_retry_failed_readyz_threshold, 3);
+        // Must default ON: a write path that fails silently is the defect.
+        assert_eq!(cfg.seal_failed_readyz_threshold, 3);
         // backpressure defaults
         assert!((cfg.backpressure_high_watermark_ratio - 0.90).abs() < 0.001);
         assert!((cfg.backpressure_low_watermark_ratio - 0.80).abs() < 0.001);

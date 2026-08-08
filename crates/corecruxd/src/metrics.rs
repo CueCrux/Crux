@@ -62,6 +62,7 @@ pub struct Metrics {
     append_latency_seconds: HistogramVec,
     stream_read_latency_seconds: HistogramVec,
     read_retry_total: CounterVec,
+    local_ingest_seal_failed_total: Counter,
     store_lock_wait_seconds: HistogramVec,
     store_lock_hold_seconds: HistogramVec,
     store_service_seconds: HistogramVec,
@@ -630,6 +631,18 @@ impl Metrics {
         registry
             .register(Box::new(read_retry_total.clone()))
             .expect("register corecrux_read_retry_total");
+
+        // The write path's alertable signal. Until 2026-08-08 a seal failure was
+        // a log line and an HTTP 500 and nothing else, so a total ingest outage
+        // was invisible to monitoring for 38 hours.
+        let local_ingest_seal_failed_total = Counter::new(
+            "corecrux_local_ingest_seal_failed_total",
+            "Local ingest requests that failed at seal",
+        )
+        .expect("corecrux_local_ingest_seal_failed_total counter");
+        registry
+            .register(Box::new(local_ingest_seal_failed_total.clone()))
+            .expect("register corecrux_local_ingest_seal_failed_total");
 
         let store_lock_wait_seconds = HistogramVec::new(
             prometheus::HistogramOpts::new(
@@ -1494,6 +1507,7 @@ impl Metrics {
             append_latency_seconds,
             stream_read_latency_seconds,
             read_retry_total,
+            local_ingest_seal_failed_total,
             store_lock_wait_seconds,
             store_lock_hold_seconds,
             store_service_seconds,
@@ -1806,6 +1820,14 @@ impl Metrics {
 
     pub fn inc_read_retry(&self, op: &str, reason: &str, outcome: &str) {
         self.read_retry_total.with_label_values(&[op, reason, outcome]).inc();
+    }
+
+    pub fn inc_local_ingest_seal_failed(&self) {
+        self.local_ingest_seal_failed_total.inc();
+    }
+
+    pub fn local_ingest_seal_failed_total(&self) -> u64 {
+        self.local_ingest_seal_failed_total.get().max(0.0).round() as u64
     }
 
     pub fn read_retry_failed_total(&self, reason: &str) -> u64 {

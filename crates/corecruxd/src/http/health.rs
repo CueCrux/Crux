@@ -194,6 +194,18 @@ pub(super) async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
             read_retry_failed_total, state.read_retry_failed_readyz_threshold
         ))
     };
+    let (seal_failed_streak, seal_failed_last_error) = state.seal_failed_streak.read().await.clone();
+    let seal_ok = state.seal_failed_readyz_threshold == 0 || seal_failed_streak < state.seal_failed_readyz_threshold;
+    let seal_error = if seal_ok {
+        None
+    } else {
+        Some(format!(
+            "local ingest seal failing (consecutive={} threshold={}): {}",
+            seal_failed_streak,
+            state.seal_failed_readyz_threshold,
+            seal_failed_last_error.as_deref().unwrap_or("unknown")
+        ))
+    };
     let projection_snapshot_issues = if let Some(pool) = state.dataplane_pool.as_ref() {
         pool.projection_snapshot_issues().await
     } else {
@@ -264,6 +276,7 @@ pub(super) async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
         && replicated_commit_dataplane_ok
         && replicated_commit_topology_ok
         && read_retry_failed_ok
+        && seal_ok
         && projection_snapshots_valid_ok
         && corruption_state_clear
         && control_evidence_ready
@@ -306,6 +319,13 @@ pub(super) async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
             name: "read_retry_failed_threshold",
             ok: false,
             error: read_retry_failed_error,
+        });
+    }
+    if !seal_ok {
+        checks.push(ReadyCheck {
+            name: "local_ingest_seal",
+            ok: false,
+            error: seal_error,
         });
     }
     if !projection_snapshots_valid_ok {
