@@ -87,8 +87,13 @@ ep reap <repo>           # then remove
 ```
 
 Removes only worktrees under `<repo>-worktrees/` whose branch is already an ancestor of
-`origin/main`, and skips anything with uncommitted changes. It never touches the primary
-checkout.
+`origin/main`. It never touches the primary checkout, a tree with uncommitted changes, or a
+tree a live process is sitting in.
+
+That last guard earned itself on the first real run: 5 of 24 "stale" worktrees had live
+processes inside — running integration-test binaries and an active shell. **Merged-to-main
+says the branch is finished; it says nothing about whether someone is standing in the
+directory.** Always `--dry` first and read the `in-use` lines.
 
 Do this at closeout, not "later". Later has produced 20 stale worktrees and 43 live ones;
 each carries a `target/` directory that can run ~22GB, and a full disk makes **all 43**

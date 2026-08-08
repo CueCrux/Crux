@@ -17,9 +17,18 @@ update_status()        # behind → get_bootstrap("docs","upgrade") before deplo
 ep board 10
 ```
 
-Capture your session id once, cheaply:
-`cuecrux_session(intent="session_review", max_capabilities=5, hide_exclusions=true)` →
-`export EP_SESSION=<session_id>`. Without it `ep announce` cannot claim.
+Capture your session id once, cheaply — the trim knobs are **nested under `hints`**, and
+passing them top-level is silently ignored:
+
+```
+cuecrux_session(intent="execplan_execution",
+                hints={max_capabilities: 5, hide_exclusions: true})
+→ export EP_SESSION=<session_id>
+```
+
+Without it `ep announce` cannot claim. `announce` needs this **bound** id, not the Claude
+Code session UUID — announcing with the UUID returns 200 and never joins presence, so the
+board stays empty and the announce looks like it worked.
 
 ## 1. Pick
 

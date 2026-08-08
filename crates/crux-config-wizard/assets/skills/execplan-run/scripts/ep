@@ -90,13 +90,20 @@ cmd_preflight() {
 cmd_announce() {
   local slug=${1:?slug} ms=${2:-} paths=${3:-} ttl=${4:-14400}
   [ -n "${EP_SESSION:-}" ] || die "EP_SESSION unset — export the session_id_hex from cuecrux_session"
+  # Declare the worktree when we are in one. Announcing intent without it leaves
+  # the checkout unattributed, so a worktree outlives its plan as an orphan that
+  # only a full merge-base walk can find. Auto-detected: the operator should not
+  # have to remember a flag for something git already knows.
+  local wt=""; wt=$(git rev-parse --show-toplevel 2>/dev/null || true)
+  case "$wt" in "$WS"/*-worktrees/*) ;; *) wt="";; esac
   local body; body=$(jq -nc --arg s "$EP_SESSION" --arg p "${EP_PROJECT:-default}" --arg e "$slug" \
-    --arg m "$ms" --arg paths "$paths" --argjson ttl "$ttl" \
+    --arg m "$ms" --arg paths "$paths" --arg wt "$wt" --argjson ttl "$ttl" \
     '{session_id:$s,project_id:$p,execplan_slug:$e,ttl_seconds:$ttl}
      + (if $m=="" then {} else {milestone:$m} end)
+     + (if $wt=="" then {} else {worktree:$wt} end)
      + (if $paths=="" then {} else {paths:($paths|split(","))} end)')
   api POST "/v1/coord/announce" "$body" | jq -r '
-    "announced \(.intent.execplan_slug // "-")@\(.intent.milestone // "-") peers=\(.live_peer_intents // 0)",
+    "announced \(.intent.execplan_slug // "-")@\(.intent.milestone // "-") peers=\(.live_peer_intents // 0)\(if .intent.worktree then " wt=\(.intent.worktree)" else "" end)",
     (.overlaps[]? | "⚠ overlap \(.kind): \(.peer_passport_id) has \(.theirs)")'
 }
 
@@ -118,14 +125,24 @@ cmd_worktree() {
 
 # ── reap ───────────────────────────────────────────────────────────────────
 # Delete worktrees whose branch is already an ancestor of origin/main. This is
-# the leak: 9 of 16 Crux worktrees measured stale on 2026-08-06.
-# --dry lists only. Never touches the primary checkout or a dirty tree.
+# the leak: 20 of 63 workspace worktrees measured stale on 2026-08-06.
+# --dry lists only. Four things are never removed: the primary checkout, a tree
+# outside the <repo>-worktrees/ layout, a tree with uncommitted work, and a tree
+# some live process is sitting in.
+#
+# That last guard is not theoretical. On the first real run, 2 of 21 "stale"
+# worktrees had live processes inside — a running integration-test binary and an
+# active shell. Merged-to-main means the branch is done; it says nothing about
+# whether anyone is standing in the directory.
 cmd_reap() {
   local dry=0 only=""
   for a in "$@"; do case "$a" in --dry) dry=1;; *) only=$a;; esac; done
   local repos; repos=$(ls -d "$WS"/*-worktrees 2>/dev/null | sed 's/-worktrees$//')
   [ -n "$only" ] && repos=$(echo "$repos" | grep -i "$only")
-  local n_stale=0 n_live=0 n_dirty=0
+  # Snapshot every live process cwd once — cheaper than re-walking /proc per tree.
+  # A process whose exe lives under the tree (cargo test binaries) also counts.
+  local cwds; cwds=$( { readlink /proc/[0-9]*/cwd; readlink /proc/[0-9]*/exe; } 2>/dev/null | sort -u )
+  local n_stale=0 n_live=0 n_dirty=0 n_inuse=0
   for root in $repos; do
     [ -d "$root/.git" ] || continue
     git -C "$root" fetch -q origin main 2>/dev/null
@@ -136,6 +153,9 @@ cmd_reap() {
       local br; br=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
       if [ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]; then
         echo "dirty  $dir ($br) — uncommitted work, skipped"; n_dirty=$((n_dirty+1)); continue
+      fi
+      if printf '%s\n' "$cwds" | grep -q "^$dir\(/\|$\)"; then
+        echo "in-use $dir ($br) — live process inside, skipped"; n_inuse=$((n_inuse+1)); continue
       fi
       if [ "$br" != HEAD ] && git -C "$root" merge-base --is-ancestor "$br" origin/main 2>/dev/null; then
         n_stale=$((n_stale+1))
@@ -151,7 +171,7 @@ cmd_reap() {
     done < <(git -C "$root" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}')
     [ "$dry" = 1 ] || git -C "$root" worktree prune 2>/dev/null
   done
-  echo "── stale=$n_stale live=$n_live dirty-skipped=$n_dirty$([ "$dry" = 1 ] && echo ' (dry run)')"
+  echo "── stale=$n_stale live=$n_live dirty-skipped=$n_dirty in-use-skipped=$n_inuse$([ "$dry" = 1 ] && echo ' (dry run)')"
 }
 
 # ── pr ─────────────────────────────────────────────────────────────────────
@@ -160,15 +180,20 @@ cmd_pr() {
   local action=${1:?open|watch|merge} dir=${2:-.}
   case "$action" in
     open)
-      local title=${3:?title} bodyfile=${4:-}
+      # bodyfile defaults to `-` (stdin), which is also the pnpm/Engine-repo habit.
+      local title=${3:?title} bodyfile=${4:--}
       local br; br=$(git -C "$dir" rev-parse --abbrev-ref HEAD)
       git -C "$dir" push -u origin "$br" 2>&1 | tail -2
-      if [ -n "$bodyfile" ]; then
-        gh pr create -R "$(gh repo view --json nameWithOwner -q .nameWithOwner -C "$dir" 2>/dev/null)" \
-          --head "$br" --base main --title "$title" --body-file "$bodyfile" 2>&1 | tail -3
-      else
-        gh pr create --head "$br" --base main --title "$title" --body-file - 2>&1 | tail -3
-      fi ;;
+      # Two separate traps here, both hit in practice:
+      #  1. `gh` has no -C/--cwd flag. Passing one made `gh repo view` fail, so -R
+      #     got an empty string. It resolves the repo from the cwd — so run it in $dir.
+      #  2. `gh` is frequently a snap, and snap confinement gives it a PRIVATE /tmp:
+      #     a --body-file path under /tmp reads as "no such file or directory" even
+      #     though the file is plainly there. Feed the body on stdin instead, which
+      #     no confinement can break. `cat -` passes stdin straight through, so this
+      #     one line covers both a real path and the "-" default.
+      # --head is explicit: gh otherwise takes the head branch from the CWD's branch.
+      cat "$bodyfile" | ( cd "$dir" && gh pr create --head "$br" --base main --title "$title" --body-file - ) 2>&1 | tail -3 ;;
     watch)   # poll until checks settle; prints one line per state change
       local br; br=$(git -C "$dir" rev-parse --abbrev-ref HEAD)
       local num; num=$(gh pr list --head "$br" --json number -q '.[0].number' 2>/dev/null)

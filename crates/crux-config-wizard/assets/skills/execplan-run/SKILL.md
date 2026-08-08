@@ -95,8 +95,9 @@ exist in the daemon but are not advertised to this client. `ep` reaches them ove
 | gate a milestone | MCP `store_fact` (`execplan_gate` is not surfaced) |
 | orchestrator objects | **501, gated default-OFF.** `create_orchestrator` / `attach_to_orchestrator` are scaffolds. Do not build on them. |
 
-`cuecrux_session()` with no `max_capabilities` returns ~4k tokens of capability graph. Pass
-`max_capabilities: 5, hide_exclusions: true` when all you need is the `session_id`.
+`cuecrux_session()` returns ~4k tokens of capability graph. To trim it, the knobs are **nested
+under `hints`** — `hints: {max_capabilities: 5, hide_exclusions: true}`. Passing them at the
+top level is silently ignored and you get the full graph anyway (verified 2026-08-06).
 
 ## Delegation — do not restate these
 
