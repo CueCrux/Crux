@@ -1052,6 +1052,8 @@ pub(crate) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         operating_mode: crate::product::OperatingMode::FreeLocal,
         enabled_pro_services: Vec::new(),
         read_retry_failed_readyz_threshold: 0,
+        seal_failed_readyz_threshold: 0,
+        seal_failed_streak: Arc::new(RwLock::new((0, None))),
         commit_level: CommitLevel::LocalCommit,
         metrics,
         node_id: "node-a".to_string(),
@@ -4639,6 +4641,48 @@ async fn readyz_fails_when_corruption_detected() {
     assert_eq!(body["ok"], false);
     let checks = body["checks"].as_array().expect("checks array");
     assert!(checks.iter().any(|c| c["name"] == "corruption_state_clear"));
+}
+
+/// The 2026-08-07 outage in one test: ingest 500s on every request while every
+/// other readiness signal stays green. Before this check `/readyz` said `ok`
+/// through 38 hours of total write failure.
+#[tokio::test]
+async fn readyz_fails_when_local_ingest_seal_keeps_failing() {
+    let mut state = test_app_state(16);
+    state.seal_failed_readyz_threshold = 3;
+    mark_ready_except_control(&state).await;
+    {
+        let mut streak = state.seal_failed_streak.write().await;
+        *streak = (3, Some("storage error: No such file or directory".to_string()));
+    }
+    let resp = health::readyz(State(state)).await.into_response();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json_body(resp).await;
+    assert_eq!(body["ok"], false);
+    let checks = body["checks"].as_array().expect("checks array");
+    let check = checks
+        .iter()
+        .find(|c| c["name"] == "local_ingest_seal")
+        .expect("local_ingest_seal check");
+    assert!(
+        check["error"].as_str().unwrap_or_default().contains("No such file"),
+        "the check must carry the underlying seal error: {check}"
+    );
+}
+
+/// One failure is not an outage. A single malformed document must not unready
+/// the node, or the check becomes something operators route around.
+#[tokio::test]
+async fn readyz_tolerates_a_seal_failure_below_the_threshold() {
+    let mut state = test_app_state(16);
+    state.seal_failed_readyz_threshold = 3;
+    mark_ready_except_control(&state).await;
+    {
+        let mut streak = state.seal_failed_streak.write().await;
+        *streak = (2, Some("transient".to_string()));
+    }
+    let resp = health::readyz(State(state)).await.into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]

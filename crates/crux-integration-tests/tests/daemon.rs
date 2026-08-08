@@ -1711,6 +1711,28 @@ fn tenant_corpus_erasure_masks_survives_restart_and_reclaims() {
         "the co-tenant corpus is still served after a reclaim + restart"
     );
     assert_eq!(daemon.get("/readyz").unwrap().status().as_u16(), 200);
+
+    // The gap this test used to have. Reclaim unlinked the segment group and
+    // left its MANIFEST entry behind, so the *next* write — not this restart,
+    // not any read — was the thing that broke. `ShardStorage::open` runs per
+    // ingest and died on the dangling entry, which took host `crux` down for 38
+    // hours while every assertion above would still have passed.
+    // ExecPlan `crux-erasure-manifest-repair-2026-08-08`.
+    ingest(&daemon, "erasure-c", "c1", "gyrfalcon arctic plumage");
+    assert_eq!(
+        search_hits(&daemon, "erasure-c", "gyrfalcon arctic"),
+        1,
+        "ingest must still work after a reclaim"
+    );
+
+    // And it must survive a restart, i.e. the manifest on disk is coherent
+    // rather than merely tolerated by the running process.
+    daemon.restart();
+    assert_eq!(search_hits(&daemon, "erasure-c", "gyrfalcon arctic"), 1);
+    assert_eq!(search_hits(&daemon, "erasure-b", "peregrine falcon"), 1);
+    ingest(&daemon, "erasure-d", "d1", "saker falcon steppe range");
+    assert_eq!(search_hits(&daemon, "erasure-d", "saker falcon"), 1);
+    assert_eq!(daemon.get("/readyz").unwrap().status().as_u16(), 200);
 }
 
 #[test]

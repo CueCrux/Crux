@@ -1360,10 +1360,126 @@ mod mutants_tests_read;
 
 // Re-export manifest items that were previously pub at crate root.
 pub use manifest::{
-    encode_manifest_add_segment_v1, encode_manifest_header_v1, frame_manifest_record, load_manifest_segment_catalog,
+    encode_manifest_add_segment_v1, encode_manifest_header_v1, encode_manifest_remove_segment_v1,
+    frame_manifest_record, load_manifest_segment_catalog,
 };
 // Manifest internals used by ShardStorage::open().
 use manifest::load_manifest_records;
+
+/// Framed manifest bytes that retire `segment_seq` and its L0 directory run.
+///
+/// The two records travel together on purpose. A `RemoveSegment` on its own
+/// leaves the directory pointing at a segment that is no longer in
+/// `segments_by_seq`, and that is a hard read error rather than a miss (see
+/// `read.rs`, "segment referenced by locator missing"). Emitting the pair from
+/// one function makes that invariant structural instead of something every
+/// caller has to remember.
+///
+/// L0 run ids are segment sequences (`append.rs`, `publish_dir_run_v1` on seal).
+/// If directory compaction is ever enabled by default, extents for a removed
+/// segment can also survive inside a merged higher-level run, and this pair
+/// stops being sufficient on its own.
+/// Outcome of [`retire_segments_in_manifest`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManifestRetireOutcomeV1 {
+    /// Sequences that were in the manifest and now carry a tombstone.
+    pub retired: Vec<u64>,
+    /// Sequences that were not in the manifest at all — already retired, or
+    /// never present. Recorded rather than errored so a retry after a partial
+    /// batch is a no-op instead of a failure.
+    pub not_present: Vec<u64>,
+    /// Manifest length after the append.
+    pub manifest_end: u64,
+}
+
+/// Retire segments from a shard's MANIFEST without opening the shard.
+///
+/// Deliberately **not** a `ShardStorage` method. `ShardStorage::open` reads and
+/// opens every segment the manifest references, which is precisely what a shard
+/// with dangling entries can no longer do — a repair path built on `open` could
+/// never run on the shard that needs it. This works on the manifest alone.
+///
+/// Callers must unlink the segment files *after* this returns, never before:
+/// the append is fsynced here, so a crash in that window leaves files on disk
+/// under a manifest that has already forgotten them (inert, reclaimable again),
+/// whereas the reverse ordering is what took host `crux` ingest down for 38
+/// hours on 2026-08-07.
+///
+/// Takes the shard's `LOCK` exclusively, so it is safe against a running daemon:
+/// it will fail rather than interleave with a concurrent `ShardStorage::open`.
+pub fn retire_segments_in_manifest(
+    root: &Path,
+    shard_id: u32,
+    segment_seqs: &[u64],
+) -> Result<ManifestRetireOutcomeV1> {
+    let paths = ShardPaths::for_root(root, shard_id);
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&paths.lock_path)
+        .map_err(io_err)?;
+    lock_file.try_lock_exclusive().map_err(io_err)?;
+
+    // No manifest means no manifest entry can dangle, so there is nothing to
+    // retire and the caller is free to unlink. Erroring here would block reclaim
+    // on shards whose segments were never registered with a `ShardStorage` at
+    // all — the opposite of the failure this guards. Safe under the flock we
+    // just took: `ShardStorage::open` takes the same lock before it creates one.
+    if !paths.manifest_path.exists() {
+        return Ok(ManifestRetireOutcomeV1 {
+            not_present: segment_seqs.to_vec(),
+            ..Default::default()
+        });
+    }
+
+    let catalog = load_manifest_segment_catalog(&paths.shard_dir)?;
+    let present: HashSet<u64> = catalog.segments.iter().map(|s| s.segment_seq).collect();
+
+    let mut out = ManifestRetireOutcomeV1 {
+        manifest_end: catalog.manifest_end,
+        ..Default::default()
+    };
+    let mut framed: Vec<u8> = Vec::new();
+    for &seq in segment_seqs {
+        if present.contains(&seq) {
+            framed.extend_from_slice(&encode_manifest_segment_removal_v1(seq));
+            out.retired.push(seq);
+        } else {
+            out.not_present.push(seq);
+        }
+    }
+    if framed.is_empty() {
+        return Ok(out);
+    }
+
+    let mut manifest = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&paths.manifest_path)
+        .map_err(io_err)?;
+    // Append at the catalog's end offset, not the file length: a torn tail is
+    // already truncated by the catalog load, and writing past it would preserve
+    // the junk the loader just decided to drop.
+    manifest.seek(SeekFrom::Start(catalog.manifest_end)).map_err(io_err)?;
+    manifest.write_all(&framed).map_err(io_err)?;
+    manifest.sync_all().map_err(io_err)?;
+
+    out.manifest_end = catalog.manifest_end + framed.len() as u64;
+    Ok(out)
+}
+
+pub fn encode_manifest_segment_removal_v1(segment_seq: u64) -> Vec<u8> {
+    let mut out = frame_manifest_record(&encode_manifest_remove_segment_v1(segment_seq));
+    out.extend_from_slice(&frame_manifest_record(&manifest::encode_manifest_remove_dir_run_v1(
+        DirRunKey {
+            level: 0,
+            run_id: segment_seq,
+        },
+    )));
+    out
+}
 impl ShardStorage {
     pub fn open(root: &Path, shard_id: u32, epoch: u64, options: ShardStorageOptions) -> Result<Self> {
         if options.event_id_hash_prefix_len == 0 || options.event_id_hash_prefix_len > 16 {
@@ -1470,14 +1586,21 @@ impl ShardStorage {
                 if let Some(seq) = parse_segment_seq_from_filename(name) {
                     max_seg_seq_on_disk = max_seg_seq_on_disk.max(seq);
                 }
-                // Companion files (`.ccxi` BM25 index, `.ccxv` dense vectors) are
-                // collateral of their sealed `.ccxseg`, not standalone MANIFEST
-                // entries. A companion whose segment is still referenced must be
-                // kept — otherwise reopening a shard quarantines live retrieval
-                // indexes (quarantine-on-restart class; ExecPlan
-                // cpu-prose-ingest-door-2026-07-01 M2/M3). Only genuinely orphaned
-                // companions (segment gone) are swept.
-                let referenced_companion = [".ccxi", ".ccxv"].iter().any(|ext| {
+                // Companion files (`.ccxi` BM25 index, `.ccxv` dense vectors,
+                // `.ccxp` embedding profile) are collateral of their sealed
+                // `.ccxseg`, not standalone MANIFEST entries. A companion whose
+                // segment is still referenced must be kept — otherwise reopening a
+                // shard quarantines live retrieval indexes (quarantine-on-restart
+                // class; ExecPlan cpu-prose-ingest-door-2026-07-01 M2/M3). Only
+                // genuinely orphaned companions (segment gone) are swept.
+                //
+                // `.ccxp` was missing from this list until 2026-08-08, so every
+                // open swept every live profile sidecar into quarantine (635 of
+                // them on host `crux`). That is silent, not loud: a segment with no
+                // `.ccxp` reads as legacy and is scored *without* the embedding
+                // fingerprint check the sidecar exists to enforce. Any new
+                // companion extension has to be added here too.
+                let referenced_companion = [".ccxi", ".ccxv", ".ccxp"].iter().any(|ext| {
                     name.strip_suffix(ext)
                         .is_some_and(|stem| referenced.contains(&format!("segments/{stem}.ccxseg")))
                 });

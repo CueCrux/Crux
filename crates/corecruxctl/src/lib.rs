@@ -55,6 +55,7 @@ pub mod projections;
 pub mod quickstart;
 pub mod receipts;
 pub mod reconcile;
+pub mod repair_manifest;
 pub mod replay;
 pub mod repo;
 pub mod session_sync;
