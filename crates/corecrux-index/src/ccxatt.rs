@@ -345,6 +345,164 @@ pub fn companion_digest(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
+// ── on-disk form ────────────────────────────────────────────────────────────
+//
+// A `.ccxatt` file **is** the signing preimage, with one `sig\t<hex>` line
+// appended. Nothing is re-serialised on the way in or out.
+//
+// That is deliberate. The classic signature bug is a verifier that decodes a
+// document, re-encodes it to rebuild the preimage, and disagrees with the signer
+// by a space, a key order, or a number format — so a valid signature reads as
+// invalid, or worse, two different documents share one preimage. Here the bytes
+// that were signed are the bytes on disk, so that class of bug cannot occur.
+
+/// Line prefix carrying the detached signature.
+const SIG_PREFIX: &str = "sig\t";
+
+/// Serialise a signed attestation: canonical body, then the signature line.
+pub fn encode_attestation(body: &AttestationBody, signature: &[u8; 64]) -> Vec<u8> {
+    let mut out = body.signing_bytes();
+    out.extend_from_slice(SIG_PREFIX.as_bytes());
+    for b in signature {
+        out.extend_from_slice(format!("{b:02x}").as_bytes());
+    }
+    out.push(b'\n');
+    out
+}
+
+/// Parse a `.ccxatt`, returning the body **and the exact preimage bytes read from
+/// disk** alongside the signature.
+///
+/// The caller verifies against the returned preimage, not against a re-encoding of
+/// the body — see the module note above.
+pub fn decode_attestation(data: &[u8]) -> std::result::Result<ParsedAttestation, AttestationFailure> {
+    let text = std::str::from_utf8(data).map_err(|e| AttestationFailure::Malformed(format!("not utf-8: {e}")))?;
+    let sig_at = text
+        .rfind(&format!("\n{SIG_PREFIX}"))
+        .ok_or_else(|| AttestationFailure::Malformed("no signature line".into()))?;
+    // +1 keeps the newline that terminates the last body line inside the preimage.
+    let preimage = &text[..=sig_at];
+    let sig_hex = text[sig_at + 1 + SIG_PREFIX.len()..].trim();
+    if sig_hex.len() != 128 {
+        return Err(AttestationFailure::Malformed(format!(
+            "signature must be 128 hex chars, got {}",
+            sig_hex.len()
+        )));
+    }
+    let mut signature = [0u8; 64];
+    for (i, slot) in signature.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&sig_hex[i * 2..i * 2 + 2], 16)
+            .map_err(|e| AttestationFailure::Malformed(format!("bad signature hex: {e}")))?;
+    }
+
+    let mut lines = preimage.lines();
+    let mut next = |field: &str| -> std::result::Result<String, AttestationFailure> {
+        lines
+            .next()
+            .map(str::to_string)
+            .ok_or_else(|| AttestationFailure::Malformed(format!("truncated: missing {field}")))
+    };
+    let schema = next("schema")?;
+    let shard_id = next("shard_id")?
+        .parse()
+        .map_err(|_| AttestationFailure::Malformed("bad shard_id".into()))?;
+    let segment_seq = next("segment_seq")?
+        .parse()
+        .map_err(|_| AttestationFailure::Malformed("bad segment_seq".into()))?;
+    let segment_id = next("segment_id")?;
+    let tenant_raw = next("tenant_id")?;
+    let provenance = next("provenance")?;
+    let issued_at = next("issued_at")?
+        .parse()
+        .map_err(|_| AttestationFailure::Malformed("bad issued_at".into()))?;
+    let producer_pubkey = next("producer_pubkey")?;
+    let producer_fpr = next("producer_fpr")?;
+    let builder_commit = next("builder_commit")?;
+
+    let mut companions = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() != 4 {
+            return Err(AttestationFailure::Malformed(format!(
+                "companion row needs 4 columns, got {}",
+                cols.len()
+            )));
+        }
+        companions.push(CompanionDigest {
+            ext: cols[0].to_string(),
+            key: (!cols[1].is_empty()).then(|| cols[1].to_string()),
+            blake3: cols[2].to_string(),
+            bytes: cols[3]
+                .parse()
+                .map_err(|_| AttestationFailure::Malformed("bad companion size".into()))?,
+        });
+    }
+
+    Ok(ParsedAttestation {
+        body: AttestationBody {
+            schema,
+            shard_id,
+            segment_seq,
+            segment_id,
+            tenant_id: (!tenant_raw.is_empty()).then_some(tenant_raw),
+            provenance,
+            issued_at,
+            producer_pubkey,
+            producer_fpr,
+            builder_commit,
+            companions,
+        },
+        signature,
+        preimage: preimage.as_bytes().to_vec(),
+    })
+}
+
+/// A parsed `.ccxatt`: the decoded body, its signature, and the exact bytes that
+/// were signed.
+#[derive(Debug, Clone)]
+pub struct ParsedAttestation {
+    pub body: AttestationBody,
+    pub signature: [u8; 64],
+    /// Bytes as read from disk — what the signature must be checked against.
+    pub preimage: Vec<u8>,
+}
+
+/// Verify a `.ccxatt` read from disk.
+///
+/// Two checks the in-memory [`verify_attestation`] cannot make on its own:
+///
+/// 1. **The signature is checked over the bytes actually on disk**, so a verifier
+///    can never disagree with a signer over canonicalisation.
+/// 2. **Those bytes must equal how we re-render the parsed body.** Without this a
+///    crafted preimage could carry one meaning in its raw bytes and parse to
+///    another — signed as A, interpreted as B. Cheap to check, and it closes the
+///    gap that verifying-over-the-preimage would otherwise open.
+pub fn verify_parsed<F>(
+    parsed: &ParsedAttestation,
+    roots: &TrustRoots,
+    expected_segment_id: &str,
+    companion_bytes: F,
+) -> std::result::Result<Provenance, AttestationFailure>
+where
+    F: FnMut(&str, Option<&str>) -> Option<Vec<u8>>,
+{
+    if parsed.body.signing_bytes() != parsed.preimage {
+        return Err(AttestationFailure::Malformed(
+            "on-disk bytes do not match the parsed body's canonical form".into(),
+        ));
+    }
+    verify_attestation(
+        &parsed.body,
+        &parsed.signature,
+        roots,
+        expected_segment_id,
+        companion_bytes,
+    )
+}
+
 impl From<AttestationFailure> for IndexError {
     fn from(f: AttestationFailure) -> Self {
         IndexError::IntegrityFailure {
@@ -524,6 +682,76 @@ mod tests {
             body("s", vec![a], "root", vk).signing_bytes(),
             body("s", vec![b2], "root", vk).signing_bytes()
         );
+    }
+
+    // ── on-disk round-trip ────────────────────────────────────────────
+
+    #[test]
+    fn encode_decode_round_trips_and_verifies_from_disk_bytes() {
+        let sk = key(11);
+        let vk = sk.verifying_key().to_bytes();
+        let payload = b"companion".to_vec();
+        let b = body("seg-rt", vec![digest_of(&payload, "ccxe")], "root", vk);
+        let sig = sk.sign(&b.signing_bytes()).to_bytes();
+
+        let encoded = encode_attestation(&b, &sig);
+        let parsed = decode_attestation(&encoded).expect("decode");
+        assert_eq!(parsed.body, b, "body must survive the round trip");
+        assert_eq!(parsed.signature, sig);
+
+        let roots = TrustRoots::new().with_platform_root("root", vk);
+        let got = verify_parsed(&parsed, &roots, "seg-rt", |_, _| Some(payload.clone()));
+        assert_eq!(got, Ok(Provenance::Platform));
+    }
+
+    /// The file IS the preimage — no re-serialisation happens on either side.
+    #[test]
+    fn the_file_contains_the_signing_preimage_verbatim() {
+        let sk = key(12);
+        let b = body(
+            "seg-p",
+            vec![digest_of(b"x", "ccxe")],
+            "root",
+            sk.verifying_key().to_bytes(),
+        );
+        let encoded = encode_attestation(&b, &sk.sign(&b.signing_bytes()).to_bytes());
+        let parsed = decode_attestation(&encoded).unwrap();
+        assert_eq!(parsed.preimage, b.signing_bytes());
+    }
+
+    /// A preimage crafted to parse as one thing while having signed another is
+    /// rejected, even though its signature is genuine over the bytes on disk.
+    #[test]
+    fn preimage_that_disagrees_with_its_parsed_body_is_rejected() {
+        let sk = key(13);
+        let vk = sk.verifying_key().to_bytes();
+        let b = body("seg-c", vec![digest_of(b"x", "ccxe")], "root", vk);
+        let mut raw = String::from_utf8(b.signing_bytes()).unwrap();
+        // A trailing blank line parses away but changes the bytes.
+        raw.push('\n');
+        let sig = sk.sign(raw.as_bytes()).to_bytes();
+        let mut encoded = raw.into_bytes();
+        encoded.extend_from_slice(b"sig\t");
+        for byte in sig {
+            encoded.extend_from_slice(format!("{byte:02x}").as_bytes());
+        }
+        encoded.push(b'\n');
+
+        let parsed = decode_attestation(&encoded).expect("decodes");
+        let roots = TrustRoots::new().with_platform_root("root", vk);
+        let got = verify_parsed(&parsed, &roots, "seg-c", |_, _| Some(b"x".to_vec()));
+        assert!(
+            matches!(got, Err(AttestationFailure::Malformed(_))),
+            "signed-as-A parsed-as-B must be refused, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn truncated_or_unsigned_files_are_malformed_not_panics() {
+        assert!(decode_attestation(b"").is_err());
+        assert!(decode_attestation(b"just some text\n").is_err());
+        assert!(decode_attestation(b"schema\nsig\tnothex\n").is_err());
+        assert!(decode_attestation(&[0xff, 0xfe, 0xfd]).is_err());
     }
 
     // ── mode semantics ────────────────────────────────────────────────
