@@ -141,21 +141,21 @@ pub enum Quantization {
     Int8 = 2,
     /// TurboQuant 4-bit packed-resident (2× denser than int8). Vectors are stored
     /// rotated+quantised and kept PACKED in RAM (decode-in-scoring) — the resident
-    /// RAM win. See [`crate::turboquant`].
+    /// RAM win. See the `turboquant` module.
     TurboQuant4 = 3,
     /// TurboQuant 2-bit packed-resident (4× denser than int8).
     TurboQuant2 = 4,
     /// int8 kept PACKED resident (1 byte/dim) and decoded (`q/127`) in scoring —
     /// the **recall-neutral** RAM win (~4× smaller resident than f32 at int8's
     /// accuracy). Same on-disk bytes as [`Self::Int8`]; differs only in that the
-    /// reader does NOT expand to `Vec<Vec<f32>>`. See [`Int8PackedVectors`].
+    /// reader does NOT expand to `Vec<Vec<f32>>`. See `Int8PackedVectors`.
     Int8Packed = 5,
 }
 
 impl Quantization {
     /// Bytes per dim for the per-element layouts (float/int8). TurboQuant modes are
     /// sub-byte and byte-packed PER VECTOR, not per dim — callers must branch on
-    /// [`Self::is_turbo`] and use [`turboquant::packed_vector_len`] instead.
+    /// [`Self::is_turbo`] and use `turboquant::packed_vector_len` instead.
     pub fn bytes_per_dim(self) -> usize {
         match self {
             Self::Float32 => 4,
@@ -551,7 +551,7 @@ impl Int8PackedVectors {
 /// table) against the recomputed values.
 ///
 /// The writer has always stamped these hashes ([`CcxeBuilder::build`] footer),
-/// but [`CcxeReader::parse`] never checks them: parse validates structure and
+/// but `CcxeReader::parse` never checks them: parse validates structure and
 /// sizing only, so truncation is caught while **in-place bit corruption inside
 /// the vector area or doc table is served silently** (and companion staleness
 /// still reports `Current` — the fingerprint lives in the unhashed metadata).
@@ -691,7 +691,7 @@ impl CcxeReader {
     /// The CE reads eagerly. Upstream offers an `mmap` variant that makes packed
     /// vector codes file-backed and reclaimable under memory pressure; it needs
     /// `unsafe`, which this workspace forbids at the lint level, so it is absent
-    /// here (see [`VectorBytes`] and VENDORED_FROM.md). A large dense companion
+    /// here (see `VectorBytes` and VENDORED_FROM.md). A large dense companion
     /// is therefore fully resident once loaded.
     pub fn from_path<P: AsRef<Path>>(path: P) -> crate::Result<Self> {
         let data = std::fs::read(path.as_ref())?;
@@ -1023,10 +1023,12 @@ impl CcxeReader {
         let n = self.num_vectors();
         let query_norm = query.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-10);
         // TurboQuant: rotate the query ONCE (orthonormal rotation preserves cosine).
-        let rq = self
+        // Carried together with the packed set so "rotated query exists iff packed
+        // exists" is a property of the type rather than an assertion in the loop.
+        let packed_rq = self
             .packed
             .as_ref()
-            .map(|p| turboquant::rotate_padded(query, &p.params));
+            .map(|p| (p, turboquant::rotate_padded(query, &p.params)));
 
         let mut scores: Vec<(u32, f32)> = Vec::with_capacity(indices.len());
         for &idx in indices {
@@ -1040,13 +1042,9 @@ impl CcxeReader {
             if !keep(doc_id) {
                 continue;
             }
-            let score = if let Some(p) = &self.packed {
+            let score = if let Some((p, rq)) = &packed_rq {
                 let decoded = p.decode(i);
-                turboquant::cosine_rotated(
-                    &decoded,
-                    rq.as_ref().expect("rq is Some whenever self.packed is Some"),
-                    query_norm,
-                )
+                turboquant::cosine_rotated(&decoded, rq, query_norm)
             } else if let Some(ip) = &self.int8_packed {
                 let vec = ip.decode(i);
                 let dot: f32 = query.iter().zip(vec.iter()).map(|(a, b)| a * b).sum();
