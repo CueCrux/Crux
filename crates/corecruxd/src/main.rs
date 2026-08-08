@@ -1356,7 +1356,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )
             .with_artefact_store(state.artefact_store.clone())
             // Dense re-rank on the MCP `query` tool (parity with the REST
-            // text-search lane): the `.ccxv` companion readers live in this
+            // text-search lane): the `.ccxe` companion readers live in this
             // crate, so hand crux-mcp a constructor instead of the readers.
             .with_dense_provider_factory({
                 let data_dir = state.data_dir.clone();

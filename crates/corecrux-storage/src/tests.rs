@@ -5500,7 +5500,7 @@ mod tests {
             .trim_end_matches(".ccxseg")
             .to_string();
 
-        for ext in ["ccxv", "ccxp"] {
+        for ext in ["ccxe", "ccxprof"] {
             std::fs::write(shard_dir.join("segments").join(format!("{stem}.{ext}")), b"companion").unwrap();
         }
 
@@ -5508,7 +5508,7 @@ mod tests {
         assert!(reopened.is_ok(), "reopen must succeed");
         drop(reopened);
 
-        for ext in ["ccxseg", "ccxi", "ccxv", "ccxp"] {
+        for ext in ["ccxseg", "ccxi", "ccxe", "ccxprof"] {
             assert!(
                 shard_dir.join("segments").join(format!("{stem}.{ext}")).exists(),
                 ".{ext} companion of a live segment must not be quarantined"

@@ -504,7 +504,7 @@ pub(super) async fn post_query_text_search(
     );
 
     // Dense re-rank (buyer-fit M3.2): when the node has an embedder (the
-    // pure-Rust LocalHashEmbedder by default) AND this corpus has `.ccxv`
+    // pure-Rust LocalHashEmbedder by default) AND this corpus has `.ccxe`
     // companions, embed the query and re-rank the BM25 candidate pool by a fused
     // score = 0.7*bm25_norm + 0.3*cosine. Absent an embedder or vectors the lane
     // stays inert — bit-identical BM25. BM25 coverage reporting is preserved.

@@ -68,7 +68,7 @@ impl DenseStatus {
 /// Classify the dense outcome of one ingest. `expected` is how many chunks
 /// should carry a vector (every chunk for a server-embedded ingest; the chunks
 /// that carried one for a caller-supplied batch; zero otherwise), `written` is
-/// how many the seal actually persisted to the `.ccxv` companion.
+/// how many the seal actually persisted to the `.ccxe` companion.
 pub(super) fn dense_status(sealed: bool, expected: usize, written: usize) -> DenseStatus {
     if !sealed {
         return DenseStatus::NotApplicable;
@@ -284,7 +284,7 @@ pub(super) async fn post_local_ingest(
 
     // Server-side local embedding (buyer-fit M3.2): when the caller supplied no
     // dense vectors at all and the node has an embedder (the pure-Rust
-    // LocalHashEmbedder by default), embed every chunk here so the `.ccxv`
+    // LocalHashEmbedder by default), embed every chunk here so the `.ccxe`
     // companion is written and prose dense recall works offline with zero
     // external service. If the caller supplied ANY vector we respect theirs and
     // do not mix a local 256-dim vector into a foreign-dimension batch (the seal
@@ -399,7 +399,7 @@ pub(super) async fn post_local_ingest(
         }
     }
 
-    // The profile to persist alongside the `.ccxv` companion: the node embedder's
+    // The profile to persist alongside the `.ccxe` companion: the node embedder's
     // for server-embedded ingests; the caller's declared profile for supplied
     // vectors (or a dimension-only marker when undeclared, so a later query with a
     // different embedder can still tell the space apart).
@@ -1387,11 +1387,11 @@ mod tests {
 
     /// buyer-fit M3.2 (Track B): with the node's local embedder wired and NO
     /// client-supplied vectors, ingest embeds every chunk server-side, writes the
-    /// `.ccxv` companion, and the prose text-search path dense-re-ranks the query
+    /// `.ccxe` companion, and the prose text-search path dense-re-ranks the query
     /// — all with no external embedding service.
     #[tokio::test]
     #[serial_test::serial]
-    async fn m3_server_side_local_embedding_writes_ccxv_and_query_dense_reranks() {
+    async fn m3_server_side_local_embedding_writes_ccxe_and_query_dense_reranks() {
         std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
         let mut state = super::super::tests::test_app_state(16);
         state.local_ingest_enabled = true;
@@ -1429,13 +1429,13 @@ mod tests {
             "local embedder dimension persisted"
         );
 
-        // The `.ccxv` companion landed next to the sealed segment.
+        // The `.ccxe` companion landed next to the sealed segment.
         let seg_dir = data_dir.join("shards").join("shard-0000").join("segments");
-        let has_ccxv = std::fs::read_dir(&seg_dir)
+        let has_ccxe = std::fs::read_dir(&seg_dir)
             .unwrap()
             .flatten()
-            .any(|e| e.file_name().to_string_lossy().ends_with(".ccxv"));
-        assert!(has_ccxv, ".ccxv dense companion must be written at ingest");
+            .any(|e| e.file_name().to_string_lossy().ends_with(".ccxe"));
+        assert!(has_ccxe, ".ccxe dense companion must be written at ingest");
 
         // Text-search now dense-re-ranks: the fused score space is reported and
         // the dense lane is active — with no external embedder configured.
@@ -1469,7 +1469,7 @@ mod tests {
         );
     }
 
-    /// A prose ingest with NO embedder wired stays BM25-only: no `.ccxv`, and the
+    /// A prose ingest with NO embedder wired stays BM25-only: no `.ccxe`, and the
     /// query path leaves the dense lane inert (bit-identical to the prior path).
     #[tokio::test]
     #[serial_test::serial]
@@ -1489,11 +1489,11 @@ mod tests {
         assert_eq!(json["dense_vectors"], serde_json::json!(0), "no embedder ⇒ no vectors");
 
         let seg_dir = data_dir.join("shards").join("shard-0000").join("segments");
-        let has_ccxv = std::fs::read_dir(&seg_dir)
+        let has_ccxe = std::fs::read_dir(&seg_dir)
             .unwrap()
             .flatten()
-            .any(|e| e.file_name().to_string_lossy().ends_with(".ccxv"));
-        assert!(!has_ccxv, "no .ccxv without an embedder");
+            .any(|e| e.file_name().to_string_lossy().ends_with(".ccxe"));
+        assert!(!has_ccxe, "no .ccxe without an embedder");
 
         let ts_body = crate::http::query::TextSearchBody {
             tenant_id: "tenant-noemb".to_string(),
@@ -1565,11 +1565,11 @@ mod tests {
         );
     }
 
-    /// buyer-fit M3.3: a server-embedded ingest writes the `.ccxp` profile sidecar
-    /// recording the node embedder, next to the `.ccxv`.
+    /// buyer-fit M3.3: a server-embedded ingest writes the `.ccxprof` profile sidecar
+    /// recording the node embedder, next to the `.ccxe`.
     #[tokio::test]
     #[serial_test::serial]
-    async fn m3_ccxp_profile_sidecar_written_on_server_embed() {
+    async fn m3_ccxprof_profile_sidecar_written_on_server_embed() {
         let mut state = super::super::tests::test_app_state(16);
         state.local_ingest_enabled = true;
         state
@@ -1579,21 +1579,21 @@ mod tests {
             .set_embedder(Box::new(corecrux_memory::embeddings::LocalHashEmbedder::default()));
         let data_dir = state.data_dir.clone();
 
-        let body = body_with("tenant-ccxp", "docs", &[("d1", "profile sidecar coverage prose")]);
+        let body = body_with("tenant-ccxprof", "docs", &[("d1", "profile sidecar coverage prose")]);
         let resp = post_local_ingest(State(state), HeaderMap::new(), Json(body))
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
         let seg_dir = data_dir.join("shards").join("shard-0000").join("segments");
-        let ccxp = std::fs::read_dir(&seg_dir)
+        let ccxprof = std::fs::read_dir(&seg_dir)
             .unwrap()
             .flatten()
             .map(|e| e.path())
-            .find(|p| p.extension().is_some_and(|x| x == "ccxp"))
-            .expect(".ccxp sidecar must be written");
+            .find(|p| p.extension().is_some_and(|x| x == "ccxprof"))
+            .expect(".ccxprof sidecar must be written");
         let profile: corecrux_memory::embeddings::SemanticProfile =
-            serde_json::from_slice(&std::fs::read(&ccxp).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(&ccxprof).unwrap()).unwrap();
         assert_eq!(profile.model, corecrux_memory::embeddings::LOCAL_HASH_EMBEDDER_MODEL);
         assert_eq!(profile.dimensions, 256);
     }

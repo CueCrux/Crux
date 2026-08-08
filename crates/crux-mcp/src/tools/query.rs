@@ -53,7 +53,7 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
     );
 
     // Dense re-rank (parity with `POST /v1/query/text-search`): when the
-    // node has an embedder and this corpus has `.ccxv` vector companions,
+    // node has an embedder and this corpus has `.ccxe` vector companions,
     // fuse `0.7*bm25_norm + 0.3*cosine` over the BM25 candidate pool.
     // Any missing piece — no factory (tests/stdio), no embedder, embed
     // failure, no vectors — degrades to bit-identical BM25. The

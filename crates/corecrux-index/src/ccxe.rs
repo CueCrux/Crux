@@ -215,11 +215,15 @@ impl Quantization {
 /// metadata and reproduced at read.
 ///
 /// **CE port note.** Upstream also exposes `configured_quantization()`, which reads
-/// `CORECRUXD_CCXE_QUANT` to pick the on-disk mode for newly built segments. That is a
-/// platform-builder concern and is deliberately absent here: constraint C7 of ExecPlan
-/// `crux-companion-vocabulary-unification-2026-08-08` keeps the CE unable to author the
-/// companions the platform sells, and the CE's own builder writes
-/// [`Quantization::Float32`] unconditionally. The CE still *reads* every mode.
+/// `CORECRUXD_CCXE_QUANT` to choose the on-disk mode for newly built segments. That
+/// is a platform-builder policy knob and is deliberately absent here: constraint C7
+/// of ExecPlan `crux-companion-vocabulary-unification-2026-08-08` keeps the CE from
+/// being *steered* into authoring the companions the platform sells, and the CE's
+/// writer picks [`Quantization::Float32`] unconditionally.
+///
+/// This seed helper stays because encoding is how the crate self-tests its own
+/// decoder — the round-trip tests build TurboQuant data in order to read it back.
+/// It grants no capability `CcxeBuilder::set_turbo_seed` did not already have.
 pub fn configured_turbo_seed(segment_seq: u64) -> u64 {
     segment_seq ^ 0x7551_B0A7_C0DE_5EED
 }
