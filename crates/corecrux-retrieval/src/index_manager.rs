@@ -274,7 +274,7 @@ pub struct SegmentFootprint {
     pub docs_total: usize,
     pub docs_tenant: usize,
     /// Size of the whole segment file group — every file sharing the `.ccxi`
-    /// stem (`.ccxseg`, `.ccxi`, `.ccxv`, `.ccxp`). Zero for segments loaded
+    /// stem (`.ccxseg`, `.ccxi`, `.ccxe`, `.ccxprof`). Zero for segments loaded
     /// from bytes rather than from disk.
     pub bytes: u64,
     /// Every doc in the segment belongs to this tenant — the precondition for
@@ -429,8 +429,8 @@ impl IndexManager {
     }
 }
 
-/// Delete every file sharing the segment's stem (`.ccxseg`, `.ccxi`, `.ccxv`,
-/// `.ccxp`, and any `.partial` left by an interrupted write) and return the
+/// Delete every file sharing the segment's stem (`.ccxseg`, `.ccxi`, `.ccxe`,
+/// `.ccxprof`, and any `.partial` left by an interrupted write) and return the
 /// bytes freed. The `stem.` prefix is exact, so a neighbouring segment in the
 /// same directory is never touched.
 fn delete_segment_group(ccxi_path: &Path) -> crate::Result<u64> {
@@ -478,7 +478,7 @@ fn segment_group_sizes<'a, I: Iterator<Item = &'a Path>>(paths: I) -> std::colle
                 let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
                     continue;
                 };
-                // `.ccxv.partial` and friends stem to "seg-…-….ccxv"; take the
+                // `.ccxe.partial` and friends stem to "seg-…-….ccxe"; take the
                 // leading segment stem so partials count against their group.
                 let stem = stem.split_once(".ccx").map_or(stem, |(head, _)| head);
                 let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
@@ -861,7 +861,7 @@ mod tests {
         std::fs::write(tmp.path().join(format!("{stem}.ccxi")), &ccxi).unwrap();
         // Siblings written by the seal path — they are what a reclaim frees too.
         std::fs::write(tmp.path().join(format!("{stem}.ccxseg")), vec![0u8; 500]).unwrap();
-        std::fs::write(tmp.path().join(format!("{stem}.ccxv")), vec![0u8; 250]).unwrap();
+        std::fs::write(tmp.path().join(format!("{stem}.ccxe")), vec![0u8; 250]).unwrap();
         std::fs::write(tmp.path().join(format!("{stem}.ccxp")), vec![0u8; 50]).unwrap();
         // A different segment in the same directory must not be counted.
         std::fs::write(
@@ -990,7 +990,7 @@ mod tests {
         let ccxi = build_ccxi_for(seq, tenants);
         std::fs::write(dir.join(format!("{stem}.ccxi")), &ccxi).unwrap();
         std::fs::write(dir.join(format!("{stem}.ccxseg")), vec![0u8; 400]).unwrap();
-        std::fs::write(dir.join(format!("{stem}.ccxv")), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.join(format!("{stem}.ccxe")), vec![0u8; 100]).unwrap();
         ccxi.len() as u64 + 400 + 100
     }
 

@@ -59,7 +59,7 @@ pub struct ProseChunk {
     /// The chunk text. Stored verbatim as the frame payload and tokenized for BM25.
     pub text: String,
     /// Optional precomputed dense vector (from CruxEngine). When present, persisted
-    /// as the `.ccxv` companion and served via `CosineDenseProvider` (M3). All
+    /// as the `.ccxe` companion and served via `CosineDenseProvider` (M3). All
     /// vectors in one ingest must share a dimension.
     pub dense_vector: Option<Vec<f32>>,
 }
@@ -91,7 +91,7 @@ pub struct SealSummary {
     pub receipt_material_hash: Option<[u8; 32]>,
     /// Dense vector dimension, if any chunk carried a `dense_vector` (M3).
     pub dense_dim: Option<usize>,
-    /// Number of dense vectors persisted to the `.ccxv` companion (M3).
+    /// Number of dense vectors persisted to the `.ccxe` companion (M3).
     pub dense_vectors: usize,
 }
 
@@ -104,7 +104,7 @@ pub enum LocalIngestError {
     DenseDimMismatch { expected: usize, found: usize },
     /// The underlying `corecrux-storage` append/seal path failed.
     Storage(StorageError),
-    /// Persisting the `.ccxv` dense companion failed.
+    /// Persisting the `.ccxe` dense companion failed.
     DenseIo(String),
 }
 
@@ -242,23 +242,35 @@ pub fn seal_prose_documents(
 
     let seal = storage.force_seal_head()?;
 
-    // M3: persist the dense companion (`.ccxv`) alongside the sealed segment,
-    // named with the same stem as its `.ccxseg` so the loader can find it by seq.
-    // M3.3: also persist the `.ccxp` profile sidecar (the SemanticProfile that
-    // produced these vectors) so the query path can refuse to score a segment
-    // whose embedding fingerprint differs from the query embedder's, rather than
-    // silently scoring across incompatible vector spaces.
+    // Persist the dense companion (`.ccxe`) alongside the sealed segment, named
+    // with the same stem as its `.ccxseg` so the loader can find it by seq. The
+    // format is the CoreCrux one, so a companion the platform computed and one
+    // this daemon built locally are the same bytes on disk.
+    //
+    // The `.ccxprof` sidecar records the SemanticProfile that produced these
+    // vectors, so the query path can refuse to score a segment whose embedding
+    // fingerprint differs from the query embedder's rather than silently scoring
+    // across incompatible vector spaces.
     let mut dense_written = 0usize;
     if seal.sealed && !dense_entries.is_empty() {
         if let (Some(receipt), Some(dim)) = (seal.seal_receipt.as_ref(), dense_dim) {
             let segments_dir = shards_root.join(format!("shard-{shard_id:04}")).join("segments");
             let stem = format!("seg-{:020}-{}", receipt.segment_seq, hex16(&receipt.segment_id.0));
-            let path = segments_dir.join(format!("{stem}.ccxv"));
-            write_ccxv(&path, dim as u32, &dense_entries).map_err(|e| LocalIngestError::DenseIo(e.to_string()))?;
+            let path = segments_dir.join(format!("{stem}.ccxe"));
+            let model_id = dense_profile.as_ref().map_or("unknown", |p| p.model.as_str());
+            write_ccxe(
+                &path,
+                shard_id,
+                receipt.segment_seq,
+                dim as u16,
+                model_id,
+                &dense_entries,
+            )
+            .map_err(|e| LocalIngestError::DenseIo(e.to_string()))?;
             dense_written = dense_entries.len();
             if let Some(profile) = dense_profile {
-                let profile_path = segments_dir.join(format!("{stem}.ccxp"));
-                write_ccxp(&profile_path, profile).map_err(|e| LocalIngestError::DenseIo(e.to_string()))?;
+                let profile_path = segments_dir.join(format!("{stem}.ccxprof"));
+                write_ccxprof(&profile_path, profile).map_err(|e| LocalIngestError::DenseIo(e.to_string()))?;
             }
         }
     }
@@ -275,98 +287,83 @@ pub fn seal_prose_documents(
     })
 }
 
-// ── `.ccxv` dense companion (CPU `.ccxe`-equivalent) ────────────────────────
+// ── `.ccxe` dense companion ─────────────────────────────────────────────────
 //
-// Minimal, deterministic on-disk format co-located with a sealed segment:
-//   magic:  u32 LE = "CCXV"
-//   version:u16 LE = 1
-//   dim:    u32 LE  (all vectors share this dimension)
-//   count:  u32 LE
-//   count × { doc_id: u32 LE, dim × f32 LE }
+// The CoreCrux dense-companion format, ported into `corecrux-index` (see that
+// crate's VENDORED_FROM.md). The CE used to write a bespoke `.ccxe` here; sharing
+// the platform's format is what lets a daemon read a companion CueCrux computed
+// for it and one it embedded locally through the same reader.
 //
-// `doc_id` is the segment-local frame index (matches the `.ccxi` doc ordering).
-// This is the free CPU counterpart to the paid GPU `.ccxe`; both are consumed
-// behind the `DenseProvider` trait.
+// The CE always writes `Quantization::Float32`. It READS every mode the platform
+// emits, including the packed TurboQuant ones.
 
-const CCXV_MAGIC: u32 = 0x5643_5843; // "CXCV"-ish tag; version-guarded below.
-const CCXV_VERSION: u16 = 1;
-
-/// `(doc_id, vector)` entries read from a `.ccxv` companion.
+/// `(doc_id, vector)` entries read from a `.ccxe` companion.
 type DenseEntries = Vec<(u32, Vec<f32>)>;
 
-fn write_ccxv(path: &Path, dim: u32, entries: &[(u32, Vec<f32>)]) -> std::io::Result<()> {
-    let mut buf = Vec::with_capacity(16 + entries.len() * (4 + dim as usize * 4));
-    buf.extend_from_slice(&CCXV_MAGIC.to_le_bytes());
-    buf.extend_from_slice(&CCXV_VERSION.to_le_bytes());
-    buf.extend_from_slice(&dim.to_le_bytes());
-    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for (doc_id, vec) in entries {
-        buf.extend_from_slice(&doc_id.to_le_bytes());
-        for &f in vec {
-            buf.extend_from_slice(&f.to_le_bytes());
-        }
+/// Write a `.ccxe` dense companion atomically (tmp → rename).
+fn write_ccxe(
+    path: &Path,
+    shard_id: u32,
+    segment_seq: u64,
+    dim: u16,
+    model_id: &str,
+    entries: &[(u32, Vec<f32>)],
+) -> std::io::Result<()> {
+    // `epoch` is a dataplane compaction generation the CE does not track; 0 is the
+    // "unversioned" value and is what the reader expects when it is absent.
+    let mut builder = corecrux_index::CcxeBuilder::new(shard_id, segment_seq, 0, dim, model_id);
+    for (doc_id, vector) in entries {
+        builder.add_vector(*doc_id, vector.clone());
     }
-    // Atomic write: tmp → rename.
-    let tmp = path.with_extension("ccxv.partial");
-    std::fs::write(&tmp, &buf)?;
+    let tmp = path.with_extension("ccxe.partial");
+    std::fs::write(&tmp, builder.build())?;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
-/// Write the `.ccxp` profile sidecar (JSON [`corecrux_memory::embeddings::SemanticProfile`])
-/// atomically alongside a segment's `.ccxv` (buyer-fit M3.3). Records which
-/// embedder produced the segment's vectors so the query path can refuse to score
-/// an incompatible vector space.
-fn write_ccxp(path: &Path, profile: &corecrux_memory::embeddings::SemanticProfile) -> std::io::Result<()> {
+/// Write the `.ccxprof` profile sidecar (JSON [`corecrux_memory::embeddings::SemanticProfile`])
+/// atomically alongside a segment's `.ccxe`. Records which embedder produced the
+/// segment's vectors so the query path can refuse to score an incompatible vector
+/// space.
+///
+/// This deliberately stayed a sidecar rather than folding into the `.ccxe` header.
+/// The header carries `model_id`, but the strict-profile check also compares
+/// `tokenizer`, `prompt_template_version`, `normalisation` and the derived
+/// fingerprint, and the V2 metadata block's flags are POSITIONAL — an unknown flag
+/// desyncs every field after it, so the CE cannot extend the format without
+/// coordinating with CoreCrux. The extension moved off `.ccxprof` (which is CoreCrux's
+/// structured-fact projection companion) to `.ccxprof`, which claims nothing in the
+/// `ccx<lane>` namespace.
+fn write_ccxprof(path: &Path, profile: &corecrux_memory::embeddings::SemanticProfile) -> std::io::Result<()> {
     let json = serde_json::to_vec_pretty(profile).map_err(std::io::Error::other)?;
-    let tmp = path.with_extension("ccxp.partial");
+    let tmp = path.with_extension("ccxprof.partial");
     std::fs::write(&tmp, &json)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
-/// Read a `.ccxp` profile sidecar. Returns `None` when absent or unparsable
+/// Read a `.ccxprof` profile sidecar. Returns `None` when absent or unparsable
 /// (treated as an unknown/legacy profile rather than fatal).
-fn read_ccxp(path: &Path) -> Option<corecrux_memory::embeddings::SemanticProfile> {
+fn read_ccxprof(path: &Path) -> Option<corecrux_memory::embeddings::SemanticProfile> {
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Read a `.ccxv` companion → (dim, [(doc_id, vector)]). Returns `None` on a bad
+/// Read a `.ccxe` companion → (dim, [(doc_id, vector)]). Returns `None` on a bad
 /// magic/version or a truncated file (treated as absent rather than fatal).
 ///
-/// Serve-side (consumed by [`build_dense_provider`]): live on the prose
-/// text-search query path when a node embedder is configured (buyer-fit M3.2).
-fn read_ccxv(path: &Path) -> Option<(u32, DenseEntries)> {
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.len() < 14 {
+/// Serve-side (consumed by [`build_dense_provider`]): live on the prose text-search
+/// query path when a node embedder is configured. Packed modes are decoded here so
+/// a platform-built quantised companion serves through the same path as a locally
+/// built f32 one.
+fn read_ccxe(path: &Path) -> Option<(u32, DenseEntries)> {
+    let reader = corecrux_index::CcxeReader::from_path(path).ok()?;
+    let dim = u32::from(reader.header.dim);
+    let vectors = reader.decoded_vectors();
+    if vectors.len() != reader.doc_ids.len() {
         return None;
     }
-    let magic = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
-    let version = u16::from_le_bytes(bytes[4..6].try_into().ok()?);
-    if magic != CCXV_MAGIC || version != CCXV_VERSION {
-        return None;
-    }
-    let dim = u32::from_le_bytes(bytes[6..10].try_into().ok()?);
-    let count = u32::from_le_bytes(bytes[10..14].try_into().ok()?) as usize;
-    let stride = 4 + dim as usize * 4;
-    let mut off = 14;
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
-        if off + stride > bytes.len() {
-            return None;
-        }
-        let doc_id = u32::from_le_bytes(bytes[off..off + 4].try_into().ok()?);
-        let mut v = Vec::with_capacity(dim as usize);
-        let mut p = off + 4;
-        for _ in 0..dim {
-            v.push(f32::from_le_bytes(bytes[p..p + 4].try_into().ok()?));
-            p += 4;
-        }
-        out.push((doc_id, v));
-        off += stride;
-    }
-    Some((dim, out))
+    Some((dim, reader.doc_ids.iter().copied().zip(vectors).collect()))
 }
 
 /// Parsed dense data for one sealed segment (buyer-fit FU3 cache). Sealed
@@ -382,7 +379,7 @@ struct CachedDenseSegment {
 /// Cache map: `(shards_dir, segment_seq)` → parsed dense segment.
 type DenseSegmentCache = std::collections::HashMap<(std::path::PathBuf, u64), std::sync::Arc<CachedDenseSegment>>;
 
-/// Process-wide cache of parsed `.ccxv`/`.ccxp` companions so the prose
+/// Process-wide cache of parsed `.ccxe`/`.ccxprof` companions so the prose
 /// query-dense path does not re-read (and re-`read_dir`) every companion from
 /// disk on every query (buyer-fit FU3). Keyed by `(shards_dir, segment_seq)`:
 /// the shards dir disambiguates otherwise-colliding seqs across data dirs (and
@@ -407,7 +404,7 @@ pub enum DenseProfileCompatibilityError {
     InvalidVectorCompanion { segment_seq: u64 },
 }
 
-/// Build a [`corecrux_retrieval::CosineDenseProvider`] over all sealed `.ccxv` companions, keyed by
+/// Build a [`corecrux_retrieval::CosineDenseProvider`] over all sealed `.ccxe` companions, keyed by
 /// `(doc_id, segment_index)` to match [`corecrux_retrieval::fused::fused_retrieve`]'s
 /// enumeration (`segment_index` = position in `index_mgr.readers()`, which is
 /// ascending `segment_seq`). Returns `None` when no dense vectors are stored, so
@@ -415,11 +412,11 @@ pub enum DenseProfileCompatibilityError {
 ///
 /// Consumed live by the prose text-search query path (buyer-fit M3.2): when a
 /// node embedder is configured the query is embedded and this builds the
-/// `CosineDenseProvider` over the corpus `.ccxv` companions for dense re-rank.
-/// `expected_fingerprint` (buyer-fit M3.3): when `Some`, a segment whose `.ccxp`
+/// `CosineDenseProvider` over the corpus `.ccxe` companions for dense re-rank.
+/// `expected_fingerprint` (buyer-fit M3.3): when `Some`, a segment whose `.ccxprof`
 /// profile records a DIFFERENT embedding fingerprint is skipped — its vectors
 /// live in an incompatible space and must not be cosine-scored against this
-/// query. A segment with no `.ccxp` (legacy) is included; the `CosineDenseProvider`
+/// query. A segment with no `.ccxprof` (legacy) is included; the `CosineDenseProvider`
 /// still guards on dimension. `None` includes every segment (fixture callers).
 pub fn build_dense_provider(
     index_mgr: &corecrux_retrieval::IndexManager,
@@ -471,16 +468,16 @@ fn build_dense_provider_inner(
         let cached = if let Some(c) = cache.get(&(shards_dir.clone(), seq)) {
             Arc::clone(c)
         } else {
-            let Some(path) = find_ccxv_for_seq(&shards_dir, seq) else {
+            let Some(path) = find_ccxe_for_seq(&shards_dir, seq) else {
                 continue;
             };
-            let Some((dimension, entries)) = read_ccxv(&path) else {
+            let Some((dimension, entries)) = read_ccxe(&path) else {
                 if strict_profile {
                     return Err(DenseProfileCompatibilityError::InvalidVectorCompanion { segment_seq: seq });
                 }
                 continue;
             };
-            let profile = read_ccxp(&path.with_extension("ccxp"));
+            let profile = read_ccxprof(&path.with_extension("ccxprof"));
             let c = Arc::new(CachedDenseSegment {
                 dimension: dimension as usize,
                 entries,
@@ -546,8 +543,8 @@ fn build_dense_provider_inner(
     )))
 }
 
-/// Locate the `.ccxv` companion for a segment sequence across all shards.
-fn find_ccxv_for_seq(shards_dir: &Path, seq: u64) -> Option<std::path::PathBuf> {
+/// Locate the `.ccxe` companion for a segment sequence across all shards.
+fn find_ccxe_for_seq(shards_dir: &Path, seq: u64) -> Option<std::path::PathBuf> {
     let prefix = format!("seg-{seq:020}-");
     let shard_entries = std::fs::read_dir(shards_dir).ok()?;
     for shard in shard_entries.flatten() {
@@ -558,7 +555,7 @@ fn find_ccxv_for_seq(shards_dir: &Path, seq: u64) -> Option<std::path::PathBuf> 
         for f in files.flatten() {
             let name = f.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with(&prefix) && name.ends_with(".ccxv") {
+            if name.starts_with(&prefix) && name.ends_with(".ccxe") {
                 return Some(f.path());
             }
         }
@@ -1028,7 +1025,7 @@ mod tests {
         mgr.scan_and_load(&segments_dir).expect("scan");
 
         // Query embedding aligned to doc B (doc_id 1). Weight dense heavily.
-        let provider = build_dense_provider(&mgr, data_dir, &[0.0, 1.0], None).expect("provider from .ccxv");
+        let provider = build_dense_provider(&mgr, data_dir, &[0.0, 1.0], None).expect("provider from .ccxe");
         assert_eq!(provider.len(), 2);
         let weights = FusionWeights {
             bm25: 0.1,
@@ -1135,7 +1132,7 @@ mod tests {
             .unwrap()
             .flatten()
             .map(|entry| entry.path())
-            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("ccxp"))
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("ccxprof"))
             .expect("profile companion");
         let mut forged_profile = matching_profile.clone();
         forged_profile.profile_id = "sp_forged".to_string();
@@ -1175,10 +1172,15 @@ mod tests {
             .unwrap()
             .flatten()
             .map(|entry| entry.path())
-            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("ccxv"))
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("ccxe"))
             .expect("vector companion");
         let mut vector_bytes = std::fs::read(&vector_path).expect("read vector companion");
-        vector_bytes[6..10].copy_from_slice(&1u32.to_le_bytes());
+        // Forge the stored dimension so it disagrees with the profile. `.ccxe` keeps
+        // `dim` as a u16 at offset 26 of its 256-byte header (the old `.ccxv` layout
+        // had it as a u32 at offset 6). `parse` does not verify the footer hashes —
+        // that is `verify_footer_hashes`, called explicitly — so the forgery reaches
+        // the dimension check rather than tripping an integrity error first.
+        vector_bytes[26..28].copy_from_slice(&1u16.to_le_bytes());
         std::fs::write(&vector_path, vector_bytes).expect("forge vector dimension");
         let mut dimension_index = IndexManager::new();
         dimension_index
@@ -1298,7 +1300,7 @@ mod tests {
         }
     }
 
-    /// M3 gate (b): ingest-without-vectors writes no `.ccxv`, the provider is
+    /// M3 gate (b): ingest-without-vectors writes no `.ccxe`, the provider is
     /// absent, and BM25-only fused retrieval still serves.
     #[test]
     #[serial_test::serial]
@@ -1323,7 +1325,7 @@ mod tests {
         let mut mgr = IndexManager::new();
         mgr.scan_and_load(&segments_dir).expect("scan");
 
-        // No .ccxv → no provider.
+        // No .ccxe → no provider.
         assert!(build_dense_provider(&mgr, data_dir, &[0.0, 1.0], None).is_none());
 
         // BM25-only fused retrieval still returns the doc (dense lane inert).

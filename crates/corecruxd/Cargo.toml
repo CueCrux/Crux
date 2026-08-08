@@ -78,6 +78,7 @@ zstd = { workspace = true }
 zip = { workspace = true }
 
 corecrux-frame = { path = "../corecrux-frame" }
+corecrux-index = { path = "../corecrux-index" }
 crux-escrow = { path = "../crux-escrow" }
 corecrux-billing = { path = "../corecrux-billing" }
 corecrux-memory = { path = "../corecrux-memory" }
@@ -124,7 +125,6 @@ tree-sitter-swift = "=0.7.3"
 tree-sitter-php = "=0.24.2"
 
 [dev-dependencies]
-corecrux-index = { path = "../corecrux-index" }
 rcgen = { workspace = true }
 serial_test = { workspace = true }
 tempfile = { workspace = true }

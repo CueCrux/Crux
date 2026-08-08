@@ -94,7 +94,7 @@ pub struct McpContext {
     pub revocation_enforced: bool,
     /// corecruxd-injected constructor for the CPU cosine dense lane
     /// (`(index, query_embedding, expected_fingerprint) → provider`). The
-    /// `.ccxv` companion readers live in corecruxd, so the daemon supplies
+    /// `.ccxe` companion readers live in corecruxd, so the daemon supplies
     /// this at wiring time; `None` (tests, stdio-only) keeps `query`
     /// BM25-only — bit-identical pre-existing behaviour.
     pub dense_provider_factory: Option<DenseProviderFactory>,

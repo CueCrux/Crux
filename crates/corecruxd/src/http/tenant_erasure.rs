@@ -6,7 +6,7 @@
 //! Tenant **corpus** erasure — `GET /v1/admin/tenants/{tenantId}/footprint`
 //! and `POST /v1/admin/forget-tenants`.
 //!
-//! Scope: the retrieval corpus (sealed segments + their `.ccxi`/`.ccxv`/`.ccxp`
+//! Scope: the retrieval corpus (sealed segments + their `.ccxi`/`.ccxe`/`.ccxprof`
 //! companions) ONLY. A tenant also owns facts, sessions and activity rows,
 //! which this surface does not touch — hence the response key `corpus_erased`,
 //! never `tenant_forgotten`.
@@ -810,7 +810,7 @@ mod tests {
             let stem = format!("seg-{seq:020}-abcdef{seq}");
             std::fs::write(segments.join(format!("{stem}.ccxi")), segment_bytes(&tenants, seq)).unwrap();
             std::fs::write(segments.join(format!("{stem}.ccxseg")), vec![0u8; 400]).unwrap();
-            std::fs::write(segments.join(format!("{stem}.ccxv")), vec![0u8; 100]).unwrap();
+            std::fs::write(segments.join(format!("{stem}.ccxe")), vec![0u8; 100]).unwrap();
         }
         state.retrieval_index.write().await.scan_and_load(&segments).unwrap();
         (state, segments)
