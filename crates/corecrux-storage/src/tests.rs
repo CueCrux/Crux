@@ -5529,7 +5529,7 @@ mod tests {
         let dir = seal_n_segments(2);
         let shard_dir = dir.path().join("shard-0000");
         let stem = format!("seg-{:020}-{}", 2, "0100000000000000_placeholder");
-        let orphan = shard_dir.join("segments").join(format!("{stem}.ccxp"));
+        let orphan = shard_dir.join("segments").join(format!("{stem}.ccxprof"));
         std::fs::write(&orphan, b"orphan").unwrap();
 
         let reopened = ShardStorage::open(dir.path(), 0, 1, ShardStorageOptions::default());
