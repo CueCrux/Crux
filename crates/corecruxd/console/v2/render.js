@@ -10903,10 +10903,18 @@
     var bySlug = {}, reqs = [], j;
     for (i = 0; i < layout.chips.length; i++) { bySlug[layout.chips[i].plan.slug] = layout.chips[i]; }
     for (i = 0; i < layout.chips.length; i++) {
-      var chip = layout.chips[i], links = chip.plan.links || [];
+      var chip = layout.chips[i];
+      var links = chip.plan.links || [];
       for (j = 0; j < links.length; j++) {
         var target = bySlug[links[j]];
-        if (target) { reqs.push({ a: chip, b: target, from: chip.plan.slug, to: links[j] }); }
+        if (target) { reqs.push({ a: chip, b: target, from: chip.plan.slug, to: links[j], kind: 'declared' }); }
+      }
+      // Prose mentions ride the same router on their own axis, so they are laid
+      // out with the same guarantees but drawn as a weaker claim.
+      var ment = chip.plan.mentions || [];
+      for (j = 0; j < ment.length; j++) {
+        var mt = bySlug[ment[j]];
+        if (mt) { reqs.push({ a: chip, b: mt, from: chip.plan.slug, to: ment[j], kind: 'mention' }); }
       }
     }
     if (!reqs.length) { return []; }
@@ -10972,7 +10980,7 @@
     for (pass = 0; pass < 2; pass++) {
       order.forEach(function (q) { if (q.cells) { markUsed(q.cells, usage, -1); } run(q); });
     }
-    return reqs.map(function (q) { return { from: q.from, to: q.to, pts: q.pts }; });
+    return reqs.map(function (q) { return { from: q.from, to: q.to, pts: q.pts, kind: q.kind || 'declared' }; });
   }
 
   // ---- paint + interaction (M4 canvas, M5 polish) ------------------------
@@ -11055,7 +11063,7 @@
         }
 
         var now = pbNow(), i;
-        var state = { plan: null, plane: null, live: 0, states: {}, planeFilter: '' };
+        var state = { plan: null, plane: null, service: null, live: 0, states: {}, planeFilter: '' };
 
         // ---- controls -------------------------------------------------------
         // One compact bar, not a wall of stat tiles: the counts people wanted to
@@ -11136,17 +11144,6 @@
         var detail = el('p', { 'class': 'v2card-sub pb-detail' });
         host.appendChild(detail);
 
-        // Legend.
-        var legend = el('div', { 'class': 'v2card-sub pb-legend' });
-        ['in_progress', 'blocked', 'planned', 'drafting'].forEach(function (st) {
-          legend.appendChild(el('span', { 'class': 'pb-legend-item' }, [
-            el('i', { 'class': 'pb-swatch', style: 'background:' + pbStateColor(st) }),
-            el('span', { text: st.replace('_', ' ') })
-          ]));
-        });
-        legend.appendChild(el('span', { 'class': 'pb-legend-item', text: 'wires are declared dependencies (Depends on / Extended by), not mentions' }));
-        legend.appendChild(el('span', { 'class': 'pb-legend-item', text: 'drag to pan · scroll to zoom · click a system to isolate it' }));
-        host.appendChild(legend);
 
         function applyAll() {
           var fresh = {}, freshN = 0, p, k;
@@ -11178,8 +11175,15 @@
 
           // Focus set: a selected plan pulls in what it declares and what
           // declares it; a selected system pulls in its members.
-          var focus = null;
-          if (state.plan) {
+          var focus = null, focusIsHard = false;
+          if (state.service) {
+            // A service selection answers "what touches this?" — the plans that
+            // do not are not context, they are noise, so they go rather than fade.
+            focus = {}; focusIsHard = true;
+            for (k = 0; k < plans.length; k++) {
+              if ((plans[k].services || []).indexOf(state.service) >= 0) { focus[plans[k].slug] = true; }
+            }
+          } else if (state.plan) {
             focus = {};
             focus[state.plan] = true;
             var sel = null;
@@ -11189,22 +11193,44 @@
               if ((plans[k].links || []).indexOf(state.plan) >= 0) { focus[plans[k].slug] = true; }
             }
           } else if (state.plane) {
-            focus = {};
-            for (k = 0; k < plans.length; k++) { if (plans[k].plane === state.plane) { focus[plans[k].slug] = true; } }
+            // Selecting a system shows that system and everything it actually
+            // engages with (declared or mentioned, in either direction). What it
+            // does not engage with is REMOVED, not greyed — greying still asks
+            // you to visually subtract 200 cards.
+            focus = {}; focusIsHard = true;
+            for (k = 0; k < plans.length; k++) {
+              if (plans[k].plane === state.plane) { focus[plans[k].slug] = true; }
+            }
+            for (k = 0; k < plans.length; k++) {
+              p = plans[k];
+              var mine = p.plane === state.plane;
+              var rel = (p.links || []).concat(p.mentions || []);
+              for (var r2 = 0; r2 < rel.length; r2++) {
+                if (mine) { focus[rel[r2]] = true; }
+                else if (focus[rel[r2]] === true && p.plane !== state.plane) { focus[p.slug] = true; }
+              }
+            }
           }
 
           canvas.chips.forEach(function (entry) {
             var slug = entry.plan.slug;
-            var on = shown[slug] && (!focus || focus[slug]);
-            if (on) { entry.node.classList.remove('pb-dim'); } else { entry.node.classList.add('pb-dim'); }
+            var inFocus = !focus || focus[slug];
+            var on = shown[slug] && inFocus;
+            entry.node.classList.remove('pb-dim');
+            entry.node.classList.remove('pb-gone');
+            if (!on) { entry.node.classList.add(focusIsHard && !inFocus ? 'pb-gone' : 'pb-dim'); }
             if (state.plan === slug) { entry.node.classList.add('pb-sel'); } else { entry.node.classList.remove('pb-sel'); }
             // Freshness only reads while nothing is selected — a glow competing
             // with a selection highlight says two things at once.
             if (!focus && fresh[slug]) { entry.node.classList.add('pb-fresh'); } else { entry.node.classList.remove('pb-fresh'); }
           });
           canvas.wires.forEach(function (w) {
-            var visible = shown[w.from] && shown[w.to];
-            if (visible) { w.node.classList.remove('pb-dim'); } else { w.node.classList.add('pb-dim'); }
+            var bothShown = shown[w.from] && shown[w.to];
+            var bothFocus = !focus || (focus[w.from] && focus[w.to]);
+            w.node.classList.remove('pb-dim'); w.node.classList.remove('pb-gone');
+            if (!bothShown || !bothFocus) {
+              w.node.classList.add(focusIsHard && !bothFocus ? 'pb-gone' : 'pb-dim');
+            }
             var hot = (state.plan && (w.from === state.plan || w.to === state.plan)) ||
               (state.plane && focus && (focus[w.from] || focus[w.to]));
             if (hot) { w.node.classList.add('pb-hot'); } else { w.node.classList.remove('pb-hot'); }
@@ -11213,7 +11239,17 @@
           });
           canvas.plates.forEach(function (pl) {
             if (state.plane === pl.key) { pl.node.classList.add('pb-sel'); } else { pl.node.classList.remove('pb-sel'); }
+            // A plate with nothing left visible inside it is just an empty box.
+            var any = false;
+            for (var q = 0; q < plans.length; q++) {
+              if (plans[q].plane === pl.key && shown[plans[q].slug] && (!focus || focus[plans[q].slug])) { any = true; break; }
+            }
+            if (any) { pl.node.classList.remove('pb-gone'); } else { pl.node.classList.add('pb-gone'); }
           });
+          (canvas.rails || []).forEach(function (rl) {
+            if (state.service === rl.key) { rl.node.classList.add('pb-sel'); } else { rl.node.classList.remove('pb-sel'); }
+          });
+          drawCables(canvas, state.service, plans, shown);
 
           sum.textContent = (shownN === plans.length
             ? plans.length + ' open plans'
@@ -11276,20 +11312,26 @@
     });
     var root = sv('g', { 'class': 'pb-root' });
     svg.appendChild(root);
-    var gPlate = sv('g'), gWire = sv('g'), gLabel = sv('g'), gSvc = sv('g'), gChip = sv('g');
-    root.appendChild(gPlate); root.appendChild(gWire); root.appendChild(gLabel);
-    root.appendChild(gSvc); root.appendChild(gChip);
+    var gPlate = sv('g'), gWire = sv('g'), gCable = sv('g'), gLabel = sv('g'),
+        gSvc = sv('g'), gChip = sv('g');
+    root.appendChild(gPlate); root.appendChild(gWire); root.appendChild(gCable);
+    root.appendChild(gLabel); root.appendChild(gSvc); root.appendChild(gChip);
 
-    var plates = [], chipsOut = [], wiresOut = [], i;
+    var plates = [], chipsOut = [], wiresOut = [], railsOut = [], i;
 
     function selectPlane(key) {
       state.plane = (state.plane === key) ? null : key;
-      state.plan = null;
+      state.plan = null; state.service = null;
       if (onChange) { onChange(); }
     }
     function selectPlan(slug) {
       state.plan = (state.plan === slug) ? null : slug;
-      state.plane = null;
+      state.plane = null; state.service = null;
+      if (onChange) { onChange(); }
+    }
+    function selectService(key) {
+      state.service = (state.service === key) ? null : key;
+      state.plan = null; state.plane = null;
       if (onChange) { onChange(); }
     }
     function keyActivate(fn) {
@@ -11318,9 +11360,10 @@
       }(layout.sections[i]));
     }
     for (i = 0; i < wires.length; i++) {
-      var wnode = sv('path', { 'class': 'pb-wire', d: pbRoundPath(wires[i].pts, PB_RADIUS) });
+      var wcls = wires[i].kind === 'mention' ? 'pb-wire pb-wire-mention' : 'pb-wire';
+      var wnode = sv('path', { 'class': wcls, d: pbRoundPath(wires[i].pts, PB_RADIUS) });
       gWire.appendChild(wnode);
-      wiresOut.push({ from: wires[i].from, to: wires[i].to, node: wnode });
+      wiresOut.push({ from: wires[i].from, to: wires[i].to, kind: wires[i].kind, node: wnode });
     }
     for (i = 0; i < layout.centres.length; i++) {
       (function (c) {
@@ -11336,14 +11379,27 @@
         gLabel.appendChild(g);
       }(layout.centres[i]));
     }
+    // Service rails are CONTROLS, not labels: a count you cannot click is a
+    // dead end, which is exactly how they read on the live page.
     for (i = 0; i < layout.services.length; i++) {
-      var s2 = layout.services[i];
-      gSvc.appendChild(sv('rect', { 'class': 'pb-rail',
-        x: s2.x - s2.w / 2, y: s2.y - PB_RAIL_H / 2, width: s2.w, height: PB_RAIL_H, rx: 10 }));
-      var rt = sv('text', { 'class': 'pb-rail-t', x: s2.x, y: s2.y - 2, 'text-anchor': 'middle' });
-      rt.textContent = s2.key; gSvc.appendChild(rt);
-      var rn = sv('text', { 'class': 'pb-rail-n', x: s2.x, y: s2.y + 13, 'text-anchor': 'middle' });
-      rn.textContent = s2.n + (s2.n === 1 ? ' plan' : ' plans'); gSvc.appendChild(rn);
+      (function (s2) {
+        var g = sv('g', { 'class': 'pb-rail-g', tabindex: '0', role: 'button',
+          'data-service': s2.key,
+          'aria-label': 'Service ' + s2.key + ', touched by ' + s2.n +
+            ' plans. Activate to wire it to them.' });
+        g.appendChild(sv('rect', { 'class': 'pb-rail',
+          x: s2.x - s2.w / 2, y: s2.y - PB_RAIL_H / 2, width: s2.w, height: PB_RAIL_H, rx: 10 }));
+        var rt = sv('text', { 'class': 'pb-rail-t', x: s2.x, y: s2.y - 2, 'text-anchor': 'middle' });
+        rt.textContent = s2.key; g.appendChild(rt);
+        var rn = sv('text', { 'class': 'pb-rail-n', x: s2.x, y: s2.y + 13, 'text-anchor': 'middle' });
+        rn.textContent = s2.n + (s2.n === 1 ? ' plan' : ' plans'); g.appendChild(rn);
+        if (g.addEventListener) {
+          g.addEventListener('click', function () { selectService(s2.key); });
+          g.addEventListener('keydown', keyActivate(function () { selectService(s2.key); }));
+        }
+        gSvc.appendChild(g);
+        railsOut.push({ key: s2.key, node: g, svc: s2 });
+      }(layout.services[i]));
     }
     for (i = 0; i < layout.chips.length; i++) {
       (function (ch) {
@@ -11378,7 +11434,7 @@
           g.addEventListener('keydown', keyActivate(function () { selectPlan(p.slug); }));
         }
         gChip.appendChild(g);
-        chipsOut.push({ plan: p, node: g });
+        chipsOut.push({ plan: p, node: g, chipGeom: { x: ch.x, y: ch.y } });
       }(layout.chips[i]));
     }
 
@@ -11433,7 +11489,49 @@
     }
     paint();
 
-    return { svg: svg, chips: chipsOut, wires: wiresOut, plates: plates, view: view, zoomBy: zoomBy };
+    return { svg: svg, chips: chipsOut, wires: wiresOut, plates: plates, rails: railsOut,
+      gCable: gCable, sv: sv, view: view, zoomBy: zoomBy };
+  }
+
+  // Cables from a selected service rail to every plan that touches it. Routed
+  // with the same orthogonal router as the wires, so they obey the same
+  // guarantees (X/Y only, never through a plate).
+  function drawCables(canvas, serviceKey, plans, shown) {
+    var g = canvas.gCable;
+    while (g.firstChild || (g.childNodes && g.childNodes.length)) {
+      if (g.removeChild && g.childNodes.length) { g.removeChild(g.childNodes[0]); } else { break; }
+    }
+    if (!serviceKey) { return; }
+    var rail = null, i;
+    for (i = 0; i < (canvas.rails || []).length; i++) {
+      if (canvas.rails[i].key === serviceKey) { rail = canvas.rails[i].svc; }
+    }
+    if (!rail) { return; }
+    var reqs = [];
+    canvas.chips.forEach(function (entry) {
+      var p = entry.plan;
+      if (!shown[p.slug]) { return; }
+      if ((p.services || []).indexOf(serviceKey) < 0) { return; }
+      reqs.push({ chip: entry.chipGeom, plan: p });
+    });
+    reqs.forEach(function (r) {
+      if (!r.chip) { return; }
+      var d = pbCablePath(r.chip, rail);
+      if (d) { g.appendChild(canvas.sv('path', { 'class': 'pb-cable', d: d })); }
+    });
+  }
+
+  // A cable is a simple L into the rail: it crosses the board rather than
+  // threading the gutters, so routing it through A* would cost a lot for a
+  // line whose job is only "this card reaches that rail".
+  function pbCablePath(chip, rail) {
+    var cx = chip.x + PB_CW / 2, cy = chip.y + PB_CH / 2;
+    var pts;
+    if (rail.side === 'top') { pts = [{ x: cx, y: chip.y }, { x: cx, y: rail.y + PB_RAIL_H / 2 + 16 }, { x: rail.x, y: rail.y + PB_RAIL_H / 2 + 16 }, { x: rail.x, y: rail.y + PB_RAIL_H / 2 }]; }
+    else if (rail.side === 'bottom') { pts = [{ x: cx, y: chip.y + PB_CH }, { x: cx, y: rail.y - PB_RAIL_H / 2 - 16 }, { x: rail.x, y: rail.y - PB_RAIL_H / 2 - 16 }, { x: rail.x, y: rail.y - PB_RAIL_H / 2 }]; }
+    else if (rail.side === 'left') { pts = [{ x: chip.x, y: cy }, { x: rail.x + rail.w / 2 + 16, y: cy }, { x: rail.x + rail.w / 2 + 16, y: rail.y }, { x: rail.x + rail.w / 2, y: rail.y }]; }
+    else { pts = [{ x: chip.x + PB_CW, y: cy }, { x: rail.x - rail.w / 2 - 16, y: cy }, { x: rail.x - rail.w / 2 - 16, y: rail.y }, { x: rail.x - rail.w / 2, y: rail.y }]; }
+    return pbRoundPath(pts, PB_RADIUS);
   }
 
   // Wrap a label into at most `max` lines of ~`width` chars, on word bounds.

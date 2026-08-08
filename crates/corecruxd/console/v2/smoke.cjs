@@ -1780,8 +1780,8 @@ function extractThemeVars(theme) {
         '[patchbay] renderPatchbay must surface the declared-edge count');
       check(t.indexOf('Postgres') >= 0,
         '[patchbay] the canvas must name the services it wires to');
-      check(t.indexOf('not mentions') >= 0,
-        '[patchbay] the legend must state that wires are declared dependencies, not mentions');
+      check(byClass('pb-legend').length === 0,
+        '[patchbay] the explainer block is gone — the controls and the subtitle carry it');
       check(t.indexOf('Reading the board') < 0,
         '[patchbay] the loading line must be cleared once the read resolves');
     }).catch(function (e) {
@@ -1892,7 +1892,10 @@ function extractThemeVars(theme) {
       check(byClass('pb-sel').length === 0, '[patchbay] activating a selected card again must clear the selection');
       const plate = byClass('pb-plate-g')[0];
       plate.click();
-      check(byClass('pb-dim').length > 0, '[patchbay] activating a system must isolate it');
+      check(byClass('pb-gone').length > 0,
+        '[patchbay] activating a system must REMOVE the plans it does not engage with, not grey them');
+      check(byClass('pb-dim').length === 0,
+        '[patchbay] a system selection must not leave half-faded cards alongside removed ones');
       plate.click();
       const target = byClass('pb-chip').filter(function (n) { return n.getAttribute('data-slug') === 's1'; })[0];
       (target._handlers.keydown || []).forEach(function (fn) { fn({ key: 'Enter', preventDefault: function () {} }); });
@@ -2088,6 +2091,23 @@ function extractThemeVars(theme) {
     check(render.patchbayRoutes(L2, noEdge).length === 0,
       '[patchbay] a board with no declared edges must route nothing and not throw');
   }
+
+  // The wire vocabulary lives in the destination subtitle now that the
+  // on-page explainer is gone — if it lives nowhere, the board is a mystery.
+  if (pb) {
+    check(/declared dependencies/i.test(pb.sub || ''),
+      '[patchbay] the destination subtitle must say what a solid wire means');
+    check(/mention/i.test(pb.sub || ''),
+      '[patchbay] the destination subtitle must say what a dashed wire means');
+  }
+  // Service rails must be operable, not decorative: a count you cannot click is
+  // exactly how they read on the live page.
+  check(/pb-rail-g/.test(renderSrc) && /selectService/.test(renderSrc),
+    '[patchbay] service rails must be clickable and wire to the plans that touch them');
+  check(/pb-cable/.test(renderSrc),
+    '[patchbay] selecting a service must draw cables to its plans');
+  check(/pb-wire-mention/.test(renderSrc),
+    '[patchbay] prose mentions must be drawn as a distinct, weaker edge than a declared dependency');
 
   const lg = (pages.DESTS || []).filter(function (d) { return d.id === 'linkgraph'; })[0];
   check(!!lg, '[linkgraph] pages.DESTS must register the linkgraph destination');
