@@ -690,7 +690,7 @@ ci_assertions:
     - post_credit_spend
     - handle_issue_passport
     - handle_declare_constraint
-    - write_ccxv
+    - write_ccxe
     - BootstrapSeeder
   tests:
     - tampering_with_signature_breaks_signature_check
