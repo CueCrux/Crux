@@ -12,10 +12,16 @@
 //!
 //! The index is built on CPU at seal time and loaded (decompressed) to GPU device memory at query time.
 
+mod ccxe;
 mod ccxi;
 mod pfordelta;
 mod tokenizer;
+mod turboquant;
 
+pub use ccxe::{
+    model_id_file_key, verify_footer_hashes, CcxeBuildFingerprint, CcxeBuilder, CcxeReader, Quantization,
+    CCXE_HEADER_LEN, CCXE_VERSION, CCXE_VERSION_V1, CCXE_VERSION_V2,
+};
 pub use ccxi::{CcxiBuilder, CcxiHeader, CcxiReader, DocEntry, VocabEntry, CCXI_MAGIC, CCXI_VERSION};
 pub use pfordelta::{pfordelta_decode, pfordelta_encode};
 pub use tokenizer::{tokenize, Token};
