@@ -108,7 +108,7 @@ To understand what makes this tamper-evident, read these symbols in order:
 
 ## Build / test
 
-- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.58
+- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.59
   (`[workspace.package]` in `Cargo.toml` is authoritative, and
   `scripts/check-agent-docs.sh` fails the build when this line disagrees with it).
 - `cargo build --workspace --locked`
@@ -509,7 +509,7 @@ schema: crux-agent-manifest/v1
 summary: Local-first, tamper-evident retrieval + memory engine with signed, replayable receipts.
 msrv: "1.88.0"
 edition: "2021"
-workspace_version: "0.5.58"
+workspace_version: "0.5.59"
 
 verify_commands:
   - cargo test --workspace
@@ -4223,6 +4223,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.59] - 2026-08-08
+
+### Fixed
+
+- **Erasing a tenant's corpus could take every subsequent write down with it.**
+  `POST /v1/admin/forget-tenants` with `"reclaim": true` deleted each
+  whole-tenant segment's file group but never updated the shard MANIFEST.
+  `ShardStorage::open` opens every segment the manifest references, and local
+  ingest opens the shard once per request, so from the first reclaim onward
+  *every* `POST /v1/local/ingest` returned 500 — while reads, which scan the
+  `segments/` directory rather than the manifest, carried on normally. On the
+  affected host that combination went unnoticed for 38 hours: 17 dangling
+  entries, all ingest dead, `/readyz` green throughout.
+  - Reclaim now appends a `RemoveSegment` tombstone to the manifest and fsyncs
+    it **before** unlinking anything. A crash in that window leaves files on
+    disk under a manifest that has already forgotten them — inert, and
+    reclaimable again — instead of files deleted with the manifest still
+    pointing at them.
+  - If the manifest cannot be updated, nothing is unlinked and the response says
+    so (`reclaimed: false`, plus a `manifest_error`) rather than reporting a
+    reclaim that did not happen.
+  - `RemoveSegment` is a new manifest record type. Removal is expressed as an
+    **append**, so no existing record or checksum is rewritten. Older daemons
+    skip the unknown record and simply see the pre-repair state, which makes a
+    downgrade safe but means an affected shard is only repaired once running
+    0.5.59 or later.
+- **`corecruxctl storage repair-manifest`** reports MANIFEST entries whose
+  segment file is missing, and with `--apply` retires them. It works on the
+  manifest alone rather than through `ShardStorage`, because opening the shard
+  is precisely what a shard in this state can no longer do.
+- **Live `.ccxp` embedding-profile sidecars were being quarantined on every
+  shard open.** The companion allowlist named `.ccxi` and `.ccxv` but not
+  `.ccxp`, so each open swept every profile sidecar out of `segments/`. This
+  failed silently in the worst direction: a segment with no `.ccxp` reads as
+  legacy and is scored *without* the embedding-fingerprint check the sidecar
+  exists to enforce. Recovering the files is a matter of moving them back out of
+  `quarantine/`.
+
+### Added
+
+- **The write path now has a health signal.** Local-ingest seal failures
+  increment `corecrux_local_ingest_seal_failed_total`, and after 3 consecutive
+  failures `/readyz` reports `local_ingest_seal` unhealthy with the underlying
+  error. Consecutive rather than cumulative, so a single malformed document
+  cannot unready a node. Tune or disable with
+  `CORECRUXD_SEAL_FAILED_READYZ_THRESHOLD` (`0` disables); it defaults to on,
+  because a write path that fails silently is what made the outage above last as
+  long as it did.
+
 ## [0.5.58] - 2026-08-07
 
 ### Fixed
@@ -5041,7 +5090,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-deny` supply chain and licence audit in CI
 - `cargo-audit` CVE scanning in CI
 
-[unreleased]: https://github.com/CueCrux/Crux/compare/v0.5.54...HEAD
+[unreleased]: https://github.com/CueCrux/Crux/compare/v0.5.59...HEAD
+[0.5.59]: https://github.com/CueCrux/Crux/compare/v0.5.58...v0.5.59
 [0.5.58]: https://github.com/CueCrux/Crux/compare/v0.5.57...v0.5.58
 [0.5.57]: https://github.com/CueCrux/Crux/compare/v0.5.56...v0.5.57
 [0.5.56]: https://github.com/CueCrux/Crux/compare/v0.5.55...v0.5.56
