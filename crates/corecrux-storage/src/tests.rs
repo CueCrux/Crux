@@ -5409,7 +5409,33 @@ mod tests {
         let outcome = retire_segments_in_manifest(dir.path(), 0, &[99]).expect("retire");
         assert!(outcome.retired.is_empty());
         assert_eq!(outcome.not_present, vec![99]);
+        // The reported end must still be the real one, not a default: a caller
+        // that trusts it to locate the append point would corrupt the log.
+        assert_eq!(outcome.manifest_end, before.len() as u64);
         assert_eq!(std::fs::read(&manifest_path).unwrap(), before);
+    }
+
+    /// A shard with no MANIFEST has no entry that can dangle, so retiring is a
+    /// no-op the caller may proceed past — not an error that blocks reclaim on
+    /// segments which were never registered with a `ShardStorage`.
+    #[test]
+    fn retiring_on_a_shard_with_no_manifest_reports_everything_absent() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("shard-0000")).unwrap();
+
+        let outcome = retire_segments_in_manifest(dir.path(), 0, &[7, 8]).expect("a missing manifest is not an error");
+        assert!(outcome.retired.is_empty());
+        assert_eq!(
+            outcome.not_present,
+            vec![7, 8],
+            "every sequence must be reported absent"
+        );
+        assert_eq!(outcome.manifest_end, 0);
+        assert!(
+            !dir.path().join("shard-0000").join("MANIFEST").exists(),
+            "no manifest is created"
+        );
     }
 
     /// A segment can still be written and sealed after a sibling is retired —
