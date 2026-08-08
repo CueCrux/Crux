@@ -3149,9 +3149,10 @@
      rather than sitting in a letterboxed panel inside it. */
   .pb-canvas { display: block; width: 100%; height: auto; margin: 4px 0 2px; }
   .patchbay-region-host { display: flex; flex-direction: column; }
-  .patchbay-region-host .pb-canvas {
+  .patchbay-region-host .pb-stage {
     width: 100vw; max-width: 100vw; margin-left: 50%; transform: translateX(-50%);
     height: calc(100vh - 210px); min-height: 420px; }
+  .patchbay-region-host .pb-stage .pb-canvas { width: 100%; height: 100%; }
   .patchbay-region-host .pb-canvas svg, .patchbay-region-host svg.pb-canvas { height: 100%; }
   .pb-plate { fill: var(--bg, var(--surface2)); stroke: none; filter: drop-shadow(0 6px 10px rgba(0,0,0,.30)); }
   .pb-centre { fill: var(--surface); stroke: var(--edge); stroke-width: 1; }
@@ -3219,7 +3220,33 @@
     border: 1px solid var(--edge); background: var(--surface); color: var(--ink2); cursor: pointer; }
   .pb-chip-btn:focus-visible, .pb-clear:focus-visible, .pb-select:focus-visible {
     outline: 2px solid var(--acc); outline-offset: 2px; }
-  .pb-detail { margin-top: 4px; min-height: 1.4em; }
+  /* The canvas and its inspector share a positioning context so the panel
+     docks to the board rather than the page. */
+  .pb-stage { position: relative; display: block; }
+  /* Chrome is the console's graph inspector (.canvas-graph-inspector supplies
+     the shape, the slide-in and the shadow); only the content layout below is
+     the Patchbay's own. */
+  .pb-panel { width: 420px; }
+  .pb-panel-x { font-size: 18px; line-height: 1; }
+  .pb-panel-slug { font-family: var(--font-mono); font-size: 10px; word-break: break-all;
+    margin-top: 2px; }
+  .pb-panel-badges { flex-wrap: wrap; margin-top: 8px; }
+  .pb-badge-state { background: var(--surface2); border: 1px solid var(--edge); }
+  .pb-badge-risk { background: color-mix(in srgb, var(--crit) 16%, transparent); color: var(--crit); }
+  .pb-badge-age { background: var(--surface2); color: var(--ink3); }
+  .pb-panel-blurb { margin: 10px 0 2px; font-size: 13px; line-height: 1.62; color: var(--ink);
+    max-width: 60ch; }
+  .pb-panel-ms { margin: 2px 0 4px; font-variant-numeric: tabular-nums; }
+  .pb-panel-meter { height: 6px; border-radius: 999px; background: var(--surface2);
+    border: 1px solid var(--edge); overflow: hidden; margin-bottom: 4px; }
+  .pb-panel-meter i { display: block; height: 100%; border-radius: 999px; }
+  .pb-panel-why { margin: 0 0 4px; font-size: 11px; }
+  .pb-panel-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 4px; }
+  .pb-panel-item { text-align: left; font: inherit; font-size: 11.5px; line-height: 1.4;
+    padding: 6px 9px; border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface2); color: var(--ink2); cursor: pointer; }
+  .pb-panel-item:hover { border-color: var(--acc); color: var(--ink); }
+  .pb-panel-item:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
   @media (prefers-reduced-motion: reduce) {
     .pb-chip, .pb-wire { transition: none; }
     .pb-chip:hover, .pb-chip.pb-sel { transform: none; }
