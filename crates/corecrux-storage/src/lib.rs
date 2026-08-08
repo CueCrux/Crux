@@ -1586,21 +1586,27 @@ impl ShardStorage {
                 if let Some(seq) = parse_segment_seq_from_filename(name) {
                     max_seg_seq_on_disk = max_seg_seq_on_disk.max(seq);
                 }
-                // Companion files (`.ccxi` BM25 index, `.ccxv` dense vectors,
-                // `.ccxp` embedding profile) are collateral of their sealed
+                // Companion files (`.ccxi` BM25 index, `.ccxe` dense vectors,
+                // `.ccxprof` embedding profile) are collateral of their sealed
                 // `.ccxseg`, not standalone MANIFEST entries. A companion whose
                 // segment is still referenced must be kept — otherwise reopening a
                 // shard quarantines live retrieval indexes (quarantine-on-restart
                 // class; ExecPlan cpu-prose-ingest-door-2026-07-01 M2/M3). Only
                 // genuinely orphaned companions (segment gone) are swept.
                 //
-                // `.ccxp` was missing from this list until 2026-08-08, so every
-                // open swept every live profile sidecar into quarantine (635 of
-                // them on host `crux`). That is silent, not loud: a segment with no
-                // `.ccxp` reads as legacy and is scored *without* the embedding
-                // fingerprint check the sidecar exists to enforce. Any new
-                // companion extension has to be added here too.
-                let referenced_companion = [".ccxi", ".ccxv", ".ccxp"].iter().any(|ext| {
+                // The profile sidecar (then `.ccxp`) was missing from this list
+                // until 2026-08-08, so every open swept every live sidecar into
+                // quarantine (635 of them on host `crux`). That is silent, not
+                // loud: a segment with no profile reads as legacy and is scored
+                // *without* the embedding-fingerprint check the sidecar exists to
+                // enforce.
+                //
+                // **This list is one of the three wiring points for any new
+                // companion extension** (storage allowlist, projection registry,
+                // load-at-startup). Miss it and the file is quarantined on the
+                // next open. It is why the `.ccxv`→`.ccxe` / `.ccxp`→`.ccxprof`
+                // rename had to land here in the same commit as the writers.
+                let referenced_companion = [".ccxi", ".ccxe", ".ccxprof"].iter().any(|ext| {
                     name.strip_suffix(ext)
                         .is_some_and(|stem| referenced.contains(&format!("segments/{stem}.ccxseg")))
                 });

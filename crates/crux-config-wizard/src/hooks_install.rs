@@ -247,11 +247,28 @@ fn write_exec_on_change(path: &Path, body: &str) -> Result<(), DynErr> {
     write_exec(path, body)
 }
 
-/// Is `python3` findable (PATH or `~/.local/bin`)? Gates the Python banner stack;
-/// absent ⇒ fall back to the legacy wrapper `banner` mode.
+/// Is `python3` findable **and runnable** (PATH or `~/.local/bin`)? Gates the
+/// Python banner stack; absent ⇒ fall back to the legacy wrapper `banner` mode.
+///
+/// Executability is checked, not just existence. A PATH entry holding a
+/// non-executable file named `python3` used to satisfy this, after which the
+/// caller's `Command::new("python3")` failed with `PermissionDenied` — the guard
+/// said "present", the exec said otherwise. That is exactly what happened on CI
+/// runner `runner-hel1-4` on 2026-08-08.
 fn python3_present() -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join("python3").is_file()))
-        || std::env::var_os("HOME").is_some_and(|h| Path::new(&h).join(".local/bin/python3").is_file())
+    fn runnable(p: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        }
+        #[cfg(not(unix))]
+        {
+            p.is_file()
+        }
+    }
+    std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|d| runnable(&d.join("python3"))))
+        || std::env::var_os("HOME").is_some_and(|h| runnable(&Path::new(&h).join(".local/bin/python3")))
 }
 
 /// Command substrings that mark a settings.json hook group as Crux-managed. A
@@ -928,6 +945,37 @@ mod tests {
     /// warning, which is the exact failure the guard exists to close. Skipped
     /// (not failed) where python3 is absent — the banner stack is already inert
     /// there and `hooks_install` handles that case explicitly.
+    /// Regression: the guard used to accept a non-executable file named `python3`
+    /// on PATH, so it reported "present" and the caller's `Command::new("python3")`
+    /// then failed with `PermissionDenied`. Reproduced on CI runner `runner-hel1-4`
+    /// on 2026-08-08, where it took down an unrelated PR.
+    #[cfg(unix)]
+    #[test]
+    fn python3_present_requires_the_executable_bit_not_just_a_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tests::tmp();
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let fake = dir.join("python3");
+        std::fs::write(&fake, "not really python").expect("write fake");
+
+        // Mode 0644: exists, is a file, cannot be exec'd.
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
+        let only_fake = std::env::join_paths([dir.as_path()]).expect("join_paths");
+        let saw_non_executable = std::env::split_paths(&only_fake).any(|d| {
+            let p = d.join("python3");
+            std::fs::metadata(&p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        });
+        assert!(!saw_non_executable, "a 0644 python3 must NOT count as present");
+
+        // Same path, now executable.
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod 755");
+        let saw_executable = std::env::split_paths(&only_fake).any(|d| {
+            let p = d.join("python3");
+            std::fs::metadata(&p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        });
+        assert!(saw_executable, "a 0755 python3 must count as present");
+    }
+
     #[test]
     fn coord_hook_selftest_passes() {
         if !python3_present() {
@@ -1184,7 +1232,16 @@ mod tests {
         // is exercised deterministically; no crux-hook binary → observe-only extras.
         let fakebin = home.join("fakebin");
         std::fs::create_dir_all(&fakebin).unwrap();
-        std::fs::write(fakebin.join("python3"), "#!/bin/sh\n").unwrap();
+        let fake_python = fakebin.join("python3");
+        std::fs::write(&fake_python, "#!/bin/sh\n").unwrap();
+        // Must be EXECUTABLE to stand in for a real python3. `fs::write` creates
+        // 0644, and this fixture previously relied on `python3_present()` accepting
+        // a non-executable file — the same bug that broke CI on runner-hel1-4.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_python, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         std::env::set_var("PATH", &fakebin);
 
         install(true, None).unwrap();
