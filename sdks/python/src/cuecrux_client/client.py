@@ -2,7 +2,7 @@
 # Licensed under the Apache License, Version 2.0.
 # See LICENSE in the repository root.
 
-"""Synchronous and asynchronous CoreCrux HTTP clients."""
+"""Synchronous and asynchronous CueCrux HTTP clients."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from typing import Any
 
 import httpx
 
-from .errors import CoreCruxError
+from .errors import CueCruxError
 from .types import (
     Fact,
     FactQueryResult,
@@ -44,7 +44,7 @@ def _raise_for_status(resp: httpx.Response) -> None:
         body = resp.json()
     else:
         body = {}
-    raise CoreCruxError(
+    raise CueCruxError(
         resp.status_code,
         body.get("detail", resp.text),
         body.get("type", ""),
@@ -200,12 +200,12 @@ def _store_fact_payload(fact: StoreFact) -> dict[str, Any]:
 # Synchronous client
 # ---------------------------------------------------------------------------
 
-class CoreCruxClient:
-    """Synchronous CoreCrux HTTP client.
+class CueCruxClient:
+    """Synchronous CueCrux HTTP client.
 
     Usage::
 
-        with CoreCruxClient("http://localhost:14800", token="...") as client:
+        with CueCruxClient("http://localhost:14800", token="...") as client:
             info = client.healthz()
             fact = client.store_fact(StoreFact(entity="user", key="name", value="Alice"))
     """
@@ -225,7 +225,7 @@ class CoreCruxClient:
 
     # -- context manager --
 
-    def __enter__(self) -> CoreCruxClient:
+    def __enter__(self) -> CueCruxClient:
         return self
 
     def __exit__(self, *args: object) -> None:
@@ -276,7 +276,7 @@ class CoreCruxClient:
         try:
             data = self._request("GET", f"/v1/facts/{fact_id}")
             return _to_fact(data)
-        except CoreCruxError as exc:
+        except CueCruxError as exc:
             if exc.status_code == 404:
                 return None
             raise
@@ -289,7 +289,7 @@ class CoreCruxClient:
         try:
             data = self._request("DELETE", f"/v1/facts/{fact_id}")
             return data.get("deleted", False)
-        except CoreCruxError as exc:
+        except CueCruxError as exc:
             if exc.status_code == 404:
                 return False
             raise
@@ -358,7 +358,7 @@ class CoreCruxClient:
         try:
             data = self._request("GET", f"/v1/sessions/{session_id}/state")
             return _to_session(data)
-        except CoreCruxError as exc:
+        except CueCruxError as exc:
             if exc.status_code == 404:
                 return None
             raise
@@ -693,7 +693,7 @@ class CoreCruxClient:
         """GET /v1/extensions/{id} -- one extension, or None if absent."""
         try:
             return self._request("GET", f"/v1/extensions/{extension_id}")
-        except CoreCruxError as err:
+        except CueCruxError as err:
             if err.status_code == 404:
                 return None
             raise
@@ -707,7 +707,7 @@ class CoreCruxClient:
         try:
             self._request("DELETE", f"/v1/extensions/{extension_id}")
             return True
-        except CoreCruxError as err:
+        except CueCruxError as err:
             if err.status_code == 404:
                 return False
             raise
@@ -821,12 +821,12 @@ class CoreCruxClient:
 # Asynchronous client
 # ---------------------------------------------------------------------------
 
-class AsyncCoreCruxClient:
-    """Asynchronous CoreCrux HTTP client (uses ``httpx.AsyncClient``).
+class AsyncCueCruxClient:
+    """Asynchronous CueCrux HTTP client (uses ``httpx.AsyncClient``).
 
     Usage::
 
-        async with AsyncCoreCruxClient("http://localhost:14800", token="...") as client:
+        async with AsyncCueCruxClient("http://localhost:14800", token="...") as client:
             info = await client.healthz()
             fact = await client.store_fact(StoreFact(entity="user", key="name", value="Alice"))
     """
@@ -846,7 +846,7 @@ class AsyncCoreCruxClient:
 
     # -- context manager --
 
-    async def __aenter__(self) -> AsyncCoreCruxClient:
+    async def __aenter__(self) -> AsyncCueCruxClient:
         return self
 
     async def __aexit__(self, *args: object) -> None:
@@ -894,7 +894,7 @@ class AsyncCoreCruxClient:
         try:
             data = await self._request("GET", f"/v1/facts/{fact_id}")
             return _to_fact(data)
-        except CoreCruxError as exc:
+        except CueCruxError as exc:
             if exc.status_code == 404:
                 return None
             raise
@@ -904,7 +904,7 @@ class AsyncCoreCruxClient:
         try:
             data = await self._request("DELETE", f"/v1/facts/{fact_id}")
             return data.get("deleted", False)
-        except CoreCruxError as exc:
+        except CueCruxError as exc:
             if exc.status_code == 404:
                 return False
             raise
@@ -970,7 +970,7 @@ class AsyncCoreCruxClient:
         try:
             data = await self._request("GET", f"/v1/sessions/{session_id}/state")
             return _to_session(data)
-        except CoreCruxError as exc:
+        except CueCruxError as exc:
             if exc.status_code == 404:
                 return None
             raise
@@ -1302,7 +1302,7 @@ class AsyncCoreCruxClient:
         """GET /v1/extensions/{id} -- one extension, or None if absent."""
         try:
             return await self._request("GET", f"/v1/extensions/{extension_id}")
-        except CoreCruxError as err:
+        except CueCruxError as err:
             if err.status_code == 404:
                 return None
             raise
@@ -1316,7 +1316,7 @@ class AsyncCoreCruxClient:
         try:
             await self._request("DELETE", f"/v1/extensions/{extension_id}")
             return True
-        except CoreCruxError as err:
+        except CueCruxError as err:
             if err.status_code == 404:
                 return False
             raise

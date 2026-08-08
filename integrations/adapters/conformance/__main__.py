@@ -48,12 +48,12 @@ def main(argv: list[str]) -> int:
             # A skipped live layer is not a pass. The gate needs both.
             return 2 if not failures else 1
         print(f"\n── live ───────────────────────────────────────────────\n  daemon: {binary}")
-        from corecrux_client import CoreCruxClient
+        from cuecrux_client import CueCruxClient
 
         with Daemon(binary) as on, Daemon(binary, context_surface=False) as off:
             with (
-                CoreCruxClient(on.base_url) as client,
-                CoreCruxClient(off.base_url) as gated_off,
+                CueCruxClient(on.base_url) as client,
+                CueCruxClient(off.base_url) as gated_off,
             ):
                 for adapter in adapters:
                     found = run_live_cases(adapter, client, gated_off_client=gated_off)

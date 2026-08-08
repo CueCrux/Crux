@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.0 — 2026-08-08
+
+**Renamed.** This package was published as `corecrux-client` through 0.2.0.
+`corecrux` is an internal crate and database namespace, not a product, and it
+should never have been the name a user types. The distribution is now
+`cuecrux-client`, matching `@cuecrux/client` on npm, and the import is
+`cuecrux_client`.
+
+- `pip install cuecrux-client` (was `corecrux-client`)
+- `from cuecrux_client import CueCruxClient` (was `from corecrux_client import CoreCruxClient`)
+- `CoreCruxClient` → `CueCruxClient`, `AsyncCoreCruxClient` → `AsyncCueCruxClient`,
+  `CoreCruxError` → `CueCruxError`
+
+No behaviour changes. Versions continue from 0.2.0 rather than restarting, so
+the number still reads forward for anyone moving across. `corecrux-client` is
+yanked on PyPI and receives no further releases.
+
 ## 0.2.0 — 2026-08-07
 
 - Cover the context, review, consolidation, ingest, extension and event

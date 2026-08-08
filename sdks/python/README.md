@@ -1,4 +1,4 @@
-# CoreCrux Python Client
+# CueCrux Python Client
 
 Python client for the [Crux Daemon](https://github.com/CueCrux/Crux) HTTP API.
 
@@ -7,7 +7,7 @@ Provides both synchronous and asynchronous interfaces using [httpx](https://www.
 ## Installation
 
 ```bash
-pip install corecrux-client
+pip install cuecrux-client
 ```
 
 Or install from source:
@@ -20,9 +20,9 @@ pip install -e .
 ## Quick start (sync)
 
 ```python
-from corecrux_client import CoreCruxClient, StoreFact
+from cuecrux_client import CueCruxClient, StoreFact
 
-with CoreCruxClient("http://localhost:14800", token="my-token") as client:
+with CueCruxClient("http://localhost:14800", token="my-token") as client:
     # Health check
     print(client.healthz())
 
@@ -49,10 +49,10 @@ with CoreCruxClient("http://localhost:14800", token="my-token") as client:
 
 ```python
 import asyncio
-from corecrux_client import AsyncCoreCruxClient, StoreFact
+from cuecrux_client import AsyncCueCruxClient, StoreFact
 
 async def main():
-    async with AsyncCoreCruxClient("http://localhost:14800", token="my-token") as client:
+    async with AsyncCueCruxClient("http://localhost:14800", token="my-token") as client:
         fact = await client.store_fact(StoreFact(
             entity="user::alice",
             key="preferred_language",
@@ -68,22 +68,22 @@ asyncio.run(main())
 Pass a bearer token when constructing the client:
 
 ```python
-client = CoreCruxClient(token="my-bearer-token")
+client = CueCruxClient(token="my-bearer-token")
 ```
 
 The token is sent as `Authorization: Bearer <token>` on every request.
 
 ## Error handling
 
-All non-2xx responses raise `CoreCruxError`:
+All non-2xx responses raise `CueCruxError`:
 
 ```python
-from corecrux_client import CoreCruxClient, CoreCruxError
+from cuecrux_client import CueCruxClient, CueCruxError
 
-with CoreCruxClient() as client:
+with CueCruxClient() as client:
     try:
         client.get_fact("nonexistent-id")
-    except CoreCruxError as e:
+    except CueCruxError as e:
         print(e.status_code)  # 404
         print(e.detail)       # "fact 'nonexistent-id' not found"
 ```

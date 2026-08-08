@@ -3,8 +3,8 @@ requires = ["hatchling==1.31.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "corecrux-client"
-version = "0.2.0"
+name = "cuecrux-client"
+version = "0.3.0"
 description = "Python client for Crux Daemon"
 readme = "README.md"
 license = "Apache-2.0"
@@ -17,4 +17,4 @@ Documentation = "https://github.com/CueCrux/Crux/tree/main/sdks/python"
 Repository = "https://github.com/CueCrux/Crux"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/corecrux_client"]
+packages = ["src/cuecrux_client"]

@@ -14,7 +14,7 @@ import type {
   ContextBundle,
   ContextMessages,
   ContextOptions,
-  CoreCruxOptions,
+  CueCruxOptions,
   CruxEvent,
   ExpiryApplyResult,
   ExtractOptions,
@@ -51,16 +51,16 @@ import type {
 // ── Error class ─────────────────────────────────────────────────────
 
 /**
- * Error thrown when the CoreCrux API returns a non-2xx response.
+ * Error thrown when the CueCrux API returns a non-2xx response.
  * Carries the RFC 9457 Problem Details body when available.
  */
-export class CoreCruxError extends Error {
+export class CueCruxError extends Error {
   public readonly status: number;
   public readonly problem: ProblemDetails | null;
 
   constructor(status: number, message: string, problem: ProblemDetails | null = null) {
     super(message);
-    this.name = "CoreCruxError";
+    this.name = "CueCruxError";
     this.status = status;
     this.problem = problem;
   }
@@ -104,11 +104,11 @@ export function parseSseBlock(block: string): unknown | null {
 
 // ── Client ──────────────────────────────────────────────────────────
 
-export class CoreCruxClient {
+export class CueCruxClient {
   private readonly baseUrl: string;
   private readonly headers: Record<string, string>;
 
-  constructor(options: CoreCruxOptions) {
+  constructor(options: CueCruxOptions) {
     // Strip trailing slash for consistent path joining.
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
     this.headers = {
@@ -155,7 +155,7 @@ export class CoreCruxClient {
     try {
       return await this.request<Fact>("GET", `/v1/facts/${encodeURIComponent(factId)}`);
     } catch (err) {
-      if (err instanceof CoreCruxError && err.status === 404) {
+      if (err instanceof CueCruxError && err.status === 404) {
         return null;
       }
       throw err;
@@ -168,7 +168,7 @@ export class CoreCruxClient {
       await this.request<{ deleted: boolean }>("DELETE", `/v1/facts/${encodeURIComponent(factId)}`);
       return true;
     } catch (err) {
-      if (err instanceof CoreCruxError && err.status === 404) {
+      if (err instanceof CueCruxError && err.status === 404) {
         return false;
       }
       throw err;
@@ -217,7 +217,7 @@ export class CoreCruxClient {
         `/v1/sessions/${encodeURIComponent(sessionId)}/state`,
       );
     } catch (err) {
-      if (err instanceof CoreCruxError && err.status === 404) {
+      if (err instanceof CueCruxError && err.status === 404) {
         return null;
       }
       throw err;
@@ -418,7 +418,7 @@ export class CoreCruxClient {
     try {
       return await this.request<Record<string, unknown>>("GET", `/v1/extensions/${encodeURIComponent(id)}`);
     } catch (err) {
-      if (err instanceof CoreCruxError && err.status === 404) {
+      if (err instanceof CueCruxError && err.status === 404) {
         return null;
       }
       throw err;
@@ -436,7 +436,7 @@ export class CoreCruxClient {
       await this.request("DELETE", `/v1/extensions/${encodeURIComponent(id)}`);
       return true;
     } catch (err) {
-      if (err instanceof CoreCruxError && err.status === 404) {
+      if (err instanceof CueCruxError && err.status === 404) {
         return false;
       }
       throw err;
@@ -553,7 +553,7 @@ export class CoreCruxClient {
     });
 
     if (!response.body) {
-      throw new CoreCruxError(response.status, "event stream response had no body");
+      throw new CueCruxError(response.status, "event stream response had no body");
     }
 
     const reader = response.body.getReader();
@@ -634,7 +634,7 @@ export class CoreCruxClient {
     return response.status === 204 ? "" : await response.text();
   }
 
-  /** Issue the request and turn a non-2xx into a {@link CoreCruxError}. */
+  /** Issue the request and turn a non-2xx into a {@link CueCruxError}. */
   private async send(
     method: string,
     path: string,
@@ -660,7 +660,7 @@ export class CoreCruxClient {
 
     if (!response.ok) {
       let problem: ProblemDetails | null = null;
-      let message = `CoreCrux API error: ${response.status} ${response.statusText}`;
+      let message = `CueCrux API error: ${response.status} ${response.statusText}`;
 
       try {
         const contentType = response.headers.get("content-type") ?? "";
@@ -675,7 +675,7 @@ export class CoreCruxClient {
         // Ignore JSON parse failures — the status/statusText message is sufficient.
       }
 
-      throw new CoreCruxError(response.status, message, problem);
+      throw new CueCruxError(response.status, message, problem);
     }
 
     return response;

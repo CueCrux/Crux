@@ -19,9 +19,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from corecrux_client import CoreCruxClient  # noqa: E402
-from corecrux_client.errors import CoreCruxError  # noqa: E402
-from corecrux_client.types import StoreFact  # noqa: E402
+from cuecrux_client import CueCruxClient  # noqa: E402
+from cuecrux_client.errors import CueCruxError  # noqa: E402
+from cuecrux_client.types import StoreFact  # noqa: E402
 
 failures: list[str] = []
 
@@ -30,7 +30,7 @@ def check(name: str, fn, *, allow_status: tuple[int, ...] = ()) -> object:
     """Run one probe. An allowed status counts as reached, not broken."""
     try:
         result = fn()
-    except CoreCruxError as err:
+    except CueCruxError as err:
         if err.status_code in allow_status:
             print(f"  ok   {name} (HTTP {err.status_code}, expected)")
             return None
@@ -46,7 +46,7 @@ def check(name: str, fn, *, allow_status: tuple[int, ...] = ()) -> object:
 
 
 def main(base_url: str) -> int:
-    with CoreCruxClient(base_url) as client:
+    with CueCruxClient(base_url) as client:
         client.store_fact(
             StoreFact(entity="smoke:m6", key="surface", value="sdk breadth", confidence=1.0)
         )
@@ -173,7 +173,7 @@ def main(base_url: str) -> int:
 
         thread = threading.Thread(target=reader, daemon=True)
         thread.start()
-        with CoreCruxClient(base_url) as writer:
+        with CueCruxClient(base_url) as writer:
             import time
 
             time.sleep(0.5)  # let the subscriber attach before the write

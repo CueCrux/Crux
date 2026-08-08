@@ -20,15 +20,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "sdks" / "python" / "src"))
 
-from corecrux_client import CoreCruxClient  # noqa: E402
-from corecrux_client.types import StoreFact  # noqa: E402
+from cuecrux_client import CueCruxClient  # noqa: E402
+from cuecrux_client.types import StoreFact  # noqa: E402
 
 from crux_adapters.core import fetch_bundle  # noqa: E402
 from crux_adapters.crewai import CruxMemoryTool, to_context_string  # noqa: E402
 
 
 def run(base_url: str) -> int:
-    with CoreCruxClient(base_url) as client:
+    with CueCruxClient(base_url) as client:
         client.store_fact(
             StoreFact(entity="project:atlas", key="database", value="Postgres 16, not MySQL")
         )

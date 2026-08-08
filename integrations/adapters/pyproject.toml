@@ -11,7 +11,7 @@ license = "Apache-2.0"
 requires-python = ">=3.10"
 # The adapters are thin wrappers over GET /v1/context and reuse the Python SDK
 # for auth, timeouts and error types rather than re-implementing them.
-dependencies = ["corecrux-client>=0.2"]
+dependencies = ["cuecrux-client>=0.3"]
 
 [project.optional-dependencies]
 # One extra per framework: installing the LangChain adapter must not drag in

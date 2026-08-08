@@ -13,9 +13,9 @@ npm install @cuecrux/client
 ## Quick start
 
 ```typescript
-import { CoreCruxClient } from "@cuecrux/client";
+import { CueCruxClient } from "@cuecrux/client";
 
-const client = new CoreCruxClient({
+const client = new CueCruxClient({
   baseUrl: "http://localhost:14800",
   token: "your-bearer-token", // optional
 });
@@ -173,7 +173,7 @@ cannot authenticate against a daemon with auth on.
 Pass a bearer token in the constructor:
 
 ```typescript
-const client = new CoreCruxClient({
+const client = new CueCruxClient({
   baseUrl: "http://localhost:14800",
   token: "crx_your_token_here",
 });
@@ -187,17 +187,17 @@ a reverse proxy that injects credentials.
 
 ## Error handling
 
-All methods throw `CoreCruxError` on non-2xx responses. The error carries the HTTP
+All methods throw `CueCruxError` on non-2xx responses. The error carries the HTTP
 status code and, when the server returns RFC 9457 Problem Details, the full problem
 body:
 
 ```typescript
-import { CoreCruxError } from "@cuecrux/client";
+import { CueCruxError } from "@cuecrux/client";
 
 try {
   await client.getFact("nonexistent");
 } catch (err) {
-  if (err instanceof CoreCruxError) {
+  if (err instanceof CueCruxError) {
     console.error(err.status);           // 404
     console.error(err.message);          // "fact 'nonexistent' not found"
     console.error(err.problem?.type);    // "https://errors.cuecrux.com/not-found"

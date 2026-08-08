@@ -94,7 +94,7 @@ def _build_retriever_class() -> Any:
         """
 
         client: Any
-        """A ``corecrux_client.CoreCruxClient``."""
+        """A ``cuecrux_client.CueCruxClient``."""
 
         entity: str | None = None
         """Typed address resolved first, e.g. ``execplan:<slug>``."""

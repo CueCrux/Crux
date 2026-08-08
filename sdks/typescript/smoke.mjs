@@ -11,10 +11,10 @@
 //
 // Usage: node smoke.mjs <base_url>
 
-import { CoreCruxClient, CoreCruxError } from "./dist/index.js";
+import { CueCruxClient, CueCruxError } from "./dist/index.js";
 
 const baseUrl = process.argv[2] ?? "http://127.0.0.1:14800";
-const client = new CoreCruxClient({ baseUrl });
+const client = new CueCruxClient({ baseUrl });
 const failures = [];
 
 /** Run one probe. An allowed status counts as reached, not broken. */
@@ -24,11 +24,11 @@ async function check(name, fn, allowStatus = []) {
     console.log(`  ok   ${name}`);
     return result;
   } catch (err) {
-    if (err instanceof CoreCruxError && allowStatus.includes(err.status)) {
+    if (err instanceof CueCruxError && allowStatus.includes(err.status)) {
       console.log(`  ok   ${name} (HTTP ${err.status}, expected)`);
       return null;
     }
-    const detail = err instanceof CoreCruxError ? `HTTP ${err.status} ${err.message}` : String(err);
+    const detail = err instanceof CueCruxError ? `HTTP ${err.status} ${err.message}` : String(err);
     failures.push(`${name}: ${detail}`);
     console.log(`  FAIL ${name}: ${detail}`);
     return null;

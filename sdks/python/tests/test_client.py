@@ -2,7 +2,7 @@
 # Licensed under the Apache License, Version 2.0.
 # See LICENSE in the repository root.
 
-"""Wire-shape tests for the CoreCrux Python SDK.
+"""Wire-shape tests for the CueCrux Python SDK.
 
 These run against a real local HTTP server (stdlib ``http.server``) rather
 than a patched transport, so the assertions cover what actually goes on the
@@ -26,12 +26,12 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from corecrux_client.client import (  # noqa: E402
-    AsyncCoreCruxClient,
-    CoreCruxClient,
+from cuecrux_client.client import (  # noqa: E402
+    AsyncCueCruxClient,
+    CueCruxClient,
     _sse_event,
 )
-from corecrux_client.errors import CoreCruxError  # noqa: E402
+from cuecrux_client.errors import CueCruxError  # noqa: E402
 
 # Requests the stub server saw, oldest first.
 CALLS: list[dict[str, object]] = []
@@ -141,7 +141,7 @@ class WireShapeTest(unittest.TestCase):
 
     def setUp(self) -> None:
         CALLS.clear()
-        self.client = CoreCruxClient(self.base_url)
+        self.client = CueCruxClient(self.base_url)
         self.addCleanup(self.client.close)
 
     @property
@@ -318,7 +318,7 @@ class WireShapeTest(unittest.TestCase):
         self.assertFalse(self.client.delete_extension("missing"))
 
     def test_other_errors_still_raise(self) -> None:
-        with self.assertRaises(CoreCruxError) as ctx:
+        with self.assertRaises(CueCruxError) as ctx:
             self.client._request("GET", "/v1/extensions/missing")
         self.assertEqual(ctx.exception.status_code, 404)
 
@@ -364,7 +364,7 @@ class AsyncParityTest(unittest.TestCase):
 
     def test_async_client_mirrors_the_sync_surface(self) -> None:
         async def run() -> list[dict[str, object]]:
-            async with AsyncCoreCruxClient(self.base_url) as client:
+            async with AsyncCueCruxClient(self.base_url) as client:
                 await client.context(entity="e", token_budget=500)
                 await client.post_context(query="q")
                 self.assertEqual(await client.context_markdown(), "# Crux context\n")
@@ -404,8 +404,8 @@ class AsyncParityTest(unittest.TestCase):
         def surface(cls: type) -> set[str]:
             return {n for n in dir(cls) if not n.startswith("_")}
 
-        sync_only = surface(CoreCruxClient) - surface(AsyncCoreCruxClient)
-        async_only = surface(AsyncCoreCruxClient) - surface(CoreCruxClient)
+        sync_only = surface(CueCruxClient) - surface(AsyncCueCruxClient)
+        async_only = surface(AsyncCueCruxClient) - surface(CueCruxClient)
         self.assertEqual(sync_only, set(), "sync client has methods the async client lacks")
         self.assertEqual(async_only, set(), "async client has methods the sync client lacks")
 

@@ -2,11 +2,11 @@
 # Licensed under the Apache License, Version 2.0.
 # See LICENSE in the repository root.
 
-"""CoreCrux error types."""
+"""CueCrux error types."""
 
 
-class CoreCruxError(Exception):
-    """Raised when the CoreCrux API returns a non-2xx response.
+class CueCruxError(Exception):
+    """Raised when the CueCrux API returns a non-2xx response.
 
     Attributes:
         status_code: HTTP status code from the server.
@@ -18,4 +18,4 @@ class CoreCruxError(Exception):
         self.status_code = status_code
         self.detail = detail
         self.type = type
-        super().__init__(f"CoreCrux error {status_code}: {detail}")
+        super().__init__(f"CueCrux error {status_code}: {detail}")

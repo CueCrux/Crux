@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0 — 2026-08-08
+
+**Breaking: exported names.** The package name was always right, but the types
+it exported were not — `CoreCrux` is an internal crate and database namespace,
+not a product.
+
+- `CoreCruxClient` → `CueCruxClient`
+- `AsyncCoreCruxClient` → `AsyncCueCruxClient`
+- `CoreCruxError` → `CueCruxError`
+- `CoreCruxOptions` → `CueCruxOptions`
+
+No behaviour changes. 0.3.0 was tagged but never reached npm — its publish step
+was broken (`npm publish package/*.tgz` without a leading `./`, which npm read
+as a GitHub shorthand), so 0.4.0 is the first release carrying the 0.3.0
+surface work as well.
+
 ## 0.3.0 — 2026-08-07
 
 - Cover the context, review, consolidation, ingest, extension and event
