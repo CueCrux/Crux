@@ -6,9 +6,22 @@
 //! Orchestrator MCP tools (orchestrators plan).
 //!
 //! Thin loopback wrappers over the daemon's `/v1/orchestrators/*` surface,
-//! mirroring the `coordination.rs` pattern. The HTTP endpoints are stubs
-//! today (gated default-OFF, 501 when called), so these handlers currently
-//! surface that 501 to the caller — by design for the Package S scaffold.
+//! mirroring the `coordination.rs` pattern.
+//!
+//! The HTTP surface is **implemented** — seven handlers persisting to the
+//! entity store under `ORCHESTRATOR_KIND` — and feature-flagged off by default
+//! behind `CORECRUXD_ORCHESTRATORS`, the same posture as `CORECRUXD_COORD` and
+//! `CORECRUXD_PUNCHCARD`. With the flag off every route answers a 501 naming
+//! the variable to set.
+//!
+//! This comment previously read "the HTTP endpoints are stubs today … by design
+//! for the Package S scaffold". That was true when the MCP wrappers were
+//! written and stopped being true when the endpoints landed; nothing updated
+//! it. A 2026-08-06 audit read it, concluded the tools were unimplemented
+//! scaffolding advertised for no reason, and proposed removing them from the
+//! surface — which would have made a working feature undiscoverable to any
+//! operator who enables the flag. A stale doc comment is a live hazard when it
+//! describes capability.
 
 use serde_json::{json, Value};
 
@@ -19,18 +32,19 @@ use crate::tools::coordination::{
 };
 
 pub const CREATE_ORCHESTRATOR_DESCRIPTION: &str =
-    "Create a multi-agent orchestrator — a coordinator that groups work items and member passports under one umbrella. Returns the minted orchestrator record.";
+    "Create a multi-agent orchestrator — a coordinator that groups work items and member passports under one umbrella. Returns the minted orchestrator record. Requires CORECRUXD_ORCHESTRATORS=1 on the daemon.";
 
 pub const ATTACH_TO_ORCHESTRATOR_DESCRIPTION: &str =
-    "Attach a member to an orchestrator's roster. `member_ref` may be a work item id (w_…), an execplan id (execplan:…), a handoff id (ho_…), or a passport (id like `claude-work`, or principal_id like `ce:…:local`). The member type is inferred from the ref; pass an explicit `member_type` (passport|work|execplan|handoff) to override.";
+    "Attach a member to an orchestrator's roster. `member_ref` may be a work item id (w_…), an execplan id (execplan:…), a handoff id (ho_…), or a passport (id like `claude-work`, or principal_id like `ce:…:local`). The member type is inferred from the ref; pass an explicit `member_type` (passport|work|execplan|handoff) to override. Requires CORECRUXD_ORCHESTRATORS=1 on the daemon.";
 
-pub const DETACH_FROM_ORCHESTRATOR_DESCRIPTION: &str = "Detach a member from an orchestrator.";
+pub const DETACH_FROM_ORCHESTRATOR_DESCRIPTION: &str =
+    "Detach a member from an orchestrator. Requires CORECRUXD_ORCHESTRATORS=1 on the daemon.";
 
 pub const LIST_ORCHESTRATORS_DESCRIPTION: &str =
-    "List orchestrators defined on this daemon, optionally filtered by tenant_id or state.";
+    "List orchestrators defined on this daemon, optionally filtered by tenant_id or state. Requires CORECRUXD_ORCHESTRATORS=1 on the daemon.";
 
 pub const UPDATE_ORCHESTRATOR_DESCRIPTION: &str =
-    "Update an orchestrator's name, assignee_passport, or state (planned|active|done|archived). Use state=archived to close out an orchestrator. Returns the updated record.";
+    "Update an orchestrator's name, assignee_passport, or state (planned|active|done|archived). Use state=archived to close out an orchestrator. Returns the updated record. Requires CORECRUXD_ORCHESTRATORS=1 on the daemon.";
 
 fn required_str<'a>(args: &'a Value, key: &str, tool: &str) -> Result<&'a str, JsonRpcError> {
     args.get(key).and_then(Value::as_str).ok_or_else(|| JsonRpcError {
@@ -143,6 +157,27 @@ mod tests {
         Arc,
     };
     use std::time::Duration;
+
+    /// Every orchestrator tool must name its feature flag in its description.
+    /// The surface advertises these whether or not `CORECRUXD_ORCHESTRATORS` is
+    /// set, so without this the first an agent knows of the gate is a 501 from
+    /// a tool it was invited to call. `coord_announce` already states its own
+    /// flag this way; this pins the same convention rather than inventing one.
+    #[test]
+    fn every_orchestrator_description_names_its_feature_flag() {
+        for (name, desc) in [
+            ("create_orchestrator", CREATE_ORCHESTRATOR_DESCRIPTION),
+            ("attach_to_orchestrator", ATTACH_TO_ORCHESTRATOR_DESCRIPTION),
+            ("detach_from_orchestrator", DETACH_FROM_ORCHESTRATOR_DESCRIPTION),
+            ("list_orchestrators", LIST_ORCHESTRATORS_DESCRIPTION),
+            ("update_orchestrator", UPDATE_ORCHESTRATOR_DESCRIPTION),
+        ] {
+            assert!(
+                desc.contains("CORECRUXD_ORCHESTRATORS=1"),
+                "{name} description must name the flag that gates it: {desc}"
+            );
+        }
+    }
 
     #[test]
     fn urlencoding_handles_special_chars() {
