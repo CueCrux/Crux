@@ -736,6 +736,7 @@ dependencies = [
  "blake3",
  "corecrux-frame",
  "corecrux-segment",
+ "ed25519-dalek",
  "half",
  "memmap2",
  "proptest",
