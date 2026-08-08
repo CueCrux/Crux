@@ -11,7 +11,7 @@
 //! - stable encoding for snapshot/meta files
 
 pub mod assembly_cache;
-mod ccxs;
+mod ccxsnap;
 mod codec_v1;
 mod cold_segment_v1;
 pub mod context_bundle;
@@ -24,9 +24,9 @@ mod runner;
 pub mod session_plans_by_principal;
 mod state;
 
-pub use ccxs::CCXS_BLOCK_STATS_V1;
-pub use ccxs::{CcxsProjectionId, CcxsSnapshot, CcxsSnapshotHeaderV1, CcxsSnapshotSummary};
-pub use ccxs::{CCXS_BLOCK_ADJ_INDEX_V1, CCXS_BLOCK_HOT_PTRS_V1};
+pub use ccxsnap::CCXSNAP_BLOCK_STATS_V1;
+pub use ccxsnap::{CcxsnapProjectionId, CcxsnapSnapshot, CcxsnapSnapshotHeaderV1, CcxsnapSnapshotSummary};
+pub use ccxsnap::{CCXSNAP_BLOCK_ADJ_INDEX_V1, CCXSNAP_BLOCK_HOT_PTRS_V1};
 pub use events::EntityFactV1;
 pub use events::CONTENT_TYPE_PROJ_BIN_V1;
 pub use events::{
@@ -91,7 +91,7 @@ pub enum ProjectionError {
     #[error("invalid projection event: {msg}")]
     InvalidEvent { msg: String },
     #[error("snapshot: {0}")]
-    Snapshot(#[from] ccxs::CcxsError),
+    Snapshot(#[from] ccxsnap::CcxsnapError),
     #[error("meta: {0}")]
     Meta(#[from] meta::MetaError),
 }

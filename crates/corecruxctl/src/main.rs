@@ -1862,7 +1862,7 @@ enum CcxiCommand {
 
 #[derive(Debug, Subcommand)]
 enum ProjectionsCommand {
-    /// Rebuild all projections from genesis (pure replay) and write CCXS snapshots + meta.
+    /// Rebuild all projections from genesis (pure replay) and write CCXSNAP snapshots + meta.
     Rebuild {
         /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
         #[arg(long)]

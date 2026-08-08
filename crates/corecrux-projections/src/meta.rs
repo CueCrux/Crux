@@ -273,7 +273,7 @@ fn module_version(module_id: &str, schema_version: u32, config: &str, created_at
         "corecrux-projections:{MODULE_VERSION}:{module_id}:schema:{schema_version}:runner_v1:state_v1"
     ));
     let config_hash = hash_hex(&format!(
-        "corecrux-projections:{module_id}:schema:{schema_version}:ccxs_v1:codec_none:{config}"
+        "corecrux-projections:{module_id}:schema:{schema_version}:ccxsnap_v1:codec_none:{config}"
     ));
     ProjectionModuleVersionV1 {
         schema: PROJECTION_MODULE_VERSION_SCHEMA_V1.to_string(),

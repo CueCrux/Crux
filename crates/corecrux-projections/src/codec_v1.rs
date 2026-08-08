@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0.
 // See LICENSE in the repository root.
 
-//! v1 binary codecs for living-row, hot-pointer, relations, dependents, and pressure-row blocks inside `.ccxs` companions.
+//! v1 binary codecs for living-row, hot-pointer, relations, dependents, and pressure-row blocks inside `.ccxsnap` companions.
 
 // SAFETY: All .try_into().unwrap() in decode functions below operate on fixed-size
 // sub-slices carved from chunks_exact(STRIDE). The slice lengths are compile-time
