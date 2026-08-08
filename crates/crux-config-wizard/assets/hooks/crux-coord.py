@@ -18,17 +18,28 @@ Two things were not obvious and are encoded here so nobody has to rediscover the
    agent token, so an agent cannot announce over MCP. The HTTP routes accept the
    same CRUX_AGENT_TOKEN. We therefore bind over MCP and announce over HTTP.
 
+3. Announcing intent only covers half the risk. A peer declaring "I am editing
+   this tree" says nothing about the session that is about to `git clean` it.
+   On 2026-08-06 one session cleaned a shared checkout and deleted another's
+   uncommitted artefact; both were live, neither was warned, because the
+   coordination plane only ever saw *edits*. `check` therefore also inspects
+   Bash commands for tree-destroying git verbs — see `destructive_target`.
+
 Verbs
 -----
   announce   bind (once, cached) then declare focus for this session + cwd
-  check      warn when a peer session has declared the path we are about to edit
+  check      warn when a peer session has claimed what we are about to touch —
+             the file for an Edit/Write, or the tree for a destructive Bash git
   clear      zero-TTL announce, releasing this session's intent
+  selftest   run the offline assertions for `destructive_target` (no daemon, no
+             network); exits non-zero on a miss so CI can gate the matcher
 
 Everything is advisory and fail-open: a coord outage must never block an edit.
 Reads the hook payload on stdin (Claude Code passes session_id / cwd / tool_input).
 """
 import json
 import os
+import re
 import socket
 import sys
 import urllib.error
@@ -111,9 +122,71 @@ def announce(hook, clear=False):
     }, _auth())
 
 
+# Git verbs that discard uncommitted or untracked work in a tree. `stash` is
+# here because `git stash -u` removes untracked files exactly as `clean` does;
+# `stash list`/`show` are read-only and excluded. `worktree remove` is included
+# because the worktree reaper runs it against trees other sessions may be in.
+#
+# Deliberately git-only. `rm -rf` is more destructive still, but its target is
+# not reliably recoverable from the command line (globs, several args, relative
+# paths), and warning on the session cwd instead would fire on every `rm -rf`
+# of an unrelated temp dir. A guard that cries wolf gets switched off.
+_DESTRUCTIVE_GIT = re.compile(
+    r"\bgit\b(?:\s+-C\s+(?P<dir>\S+))?[^|;&]*?\s"
+    r"(?:clean\b|reset\s+--hard\b|checkout\s+(?:-f|--force)\b"
+    r"|stash(?!\s+(?:list|show))\b|worktree\s+remove\b)"
+)
+
+
+def destructive_target(command, cwd):
+    """The tree a destructive git command would act on, or None if it is benign.
+
+    `git -C <dir>` retargets the command, so the tree at risk is <dir>, not the
+    session cwd — missing that would warn about the wrong repo, or stay silent
+    on the right one. Returns an absolute path so it compares against the
+    absolute paths peers announce.
+    """
+    if not command:
+        return None
+    m = _DESTRUCTIVE_GIT.search(command)
+    if not m:
+        return None
+    d = m.group("dir")
+    if not d:
+        return cwd or None
+    return d if os.path.isabs(d) else os.path.normpath(os.path.join(cwd or "", d))
+
+
+def _under(child, parent):
+    parent = parent.rstrip("/")
+    return child == parent or child.startswith(parent + "/")
+
+
+def _overlaps(target, claimed, destructive):
+    """Does `target` collide with a peer's `claimed` path?
+
+    For an edit, only one direction matters: the file is inside the claimed
+    tree. For a destructive command the target is itself a *tree*, so the
+    reverse also counts — `git clean` at a repo root wipes every announced path
+    beneath it, and that is the more damaging direction, not the less.
+    """
+    if _under(target, claimed):
+        return True
+    return destructive and _under(claimed, target)
+
+
 def check(hook):
-    """Warn when a peer has declared the path this Edit/Write is about to touch."""
-    target = (hook.get("tool_input") or {}).get("file_path") or ""
+    """Warn when a peer has claimed what this tool call is about to touch.
+
+    Two shapes: an Edit/Write names a `file_path`; a Bash call names a
+    `command`, which matters only when it would destroy a tree.
+    """
+    tool_input = hook.get("tool_input") or {}
+    target = tool_input.get("file_path") or ""
+    destructive = False
+    if not target:
+        target = destructive_target(tool_input.get("command") or "", hook.get("cwd") or os.getcwd()) or ""
+        destructive = bool(target)
     if not target:
         return
     mine = None
@@ -128,7 +201,7 @@ def check(hook):
         if s.get("session_id_hex") == mine:
             continue
         for p in ((s.get("intent") or {}).get("paths") or []):
-            if p and (target.startswith(p.rstrip("/") + "/") or target == p):
+            if p and _overlaps(target, p, destructive):
                 intent = s.get("intent") or {}
                 slug = intent.get("execplan_slug") or "no plan"
                 # Surface the host: matching is path-based, so a second
@@ -142,14 +215,70 @@ def check(hook):
     if hits:
         # stderr, exit 0: advisory. Blocking on a peer's advisory claim would
         # turn a coordination aid into an outage the moment coord is wrong.
-        print(f"[crux-coord] peer session(s) claim {target}: {', '.join(sorted(set(hits)))}",
-              file=sys.stderr)
+        who = ", ".join(sorted(set(hits)))
+        if destructive:
+            print(f"[crux-coord] DESTRUCTIVE: this command discards uncommitted/untracked work "
+                  f"under {target}, claimed by {who}. Uncommitted work there is not recoverable.",
+                  file=sys.stderr)
+        else:
+            print(f"[crux-coord] peer session(s) claim {target}: {who}", file=sys.stderr)
+
+
+def selftest():
+    """Offline assertions for the matcher. No daemon, no network, no stdin.
+
+    `check` itself needs a live coord plane, so the part worth gating in CI is
+    the pure decision: does this command destroy a tree, and which one. A false
+    negative here is a silently-missed warning — the exact failure this guard
+    exists to close.
+    """
+    cwd = "/w/repo"
+    for cmd in [
+        "git clean -fd",
+        "git reset --hard origin/main",
+        "git checkout -f main",
+        "git checkout --force main",
+        "git stash",
+        "git stash -u",
+        "git worktree remove /w/repo-worktrees/x",
+    ]:
+        assert destructive_target(cmd, cwd) == cwd, f"missed destructive: {cmd}"
+    for cmd in [
+        "git status",
+        "git stash list",
+        "git stash show",
+        "git checkout main",
+        "git reset --soft HEAD~1",
+        "cargo test --workspace",
+        "",
+    ]:
+        assert destructive_target(cmd, cwd) is None, f"false positive: {cmd}"
+    # `-C` retargets the command; warning about the session cwd would name the
+    # wrong repo and stay silent on the one actually at risk.
+    assert destructive_target("git -C /other/repo clean -fd", cwd) == "/other/repo"
+    assert destructive_target("git -C ../sib clean -fd", cwd) == "/w/sib"
+    # Overlap is one-directional for an edit, bidirectional for a destroy: a
+    # clean at a repo root wipes every announced path beneath it.
+    assert _overlaps("/w/repo/src/a.rs", "/w/repo", False)
+    assert not _overlaps("/w/repo", "/w/repo/src", False)
+    assert _overlaps("/w/repo", "/w/repo/src", True)
+    assert not _overlaps("/w/other", "/w/repo", True)
+    # A sibling whose name merely starts with the claimed path is not inside it.
+    assert not _overlaps("/w/repo-backup/x", "/w/repo", True)
+    print("[crux-coord] selftest ok")
+    return 0
 
 
 def main():
-    # `check` runs on every Edit/Write, so it must be switchable off without
-    # editing settings.json — an unhealthy daemon should cost one env var, not a
-    # hook-config edit on every workstation.
+    # First, and ahead of the CRUX_COORD gate: selftest is an offline CI entry
+    # point, not a hook. Behind the gate, a workstation or runner with
+    # CRUX_COORD=0 would exit 0 without asserting anything — a green run that
+    # tested nothing, which is worse than a red one.
+    if len(sys.argv) > 1 and sys.argv[1] == "selftest":
+        return selftest()
+    # `check` runs on every Edit/Write and Bash call, so it must be switchable
+    # off without editing settings.json — an unhealthy daemon should cost one
+    # env var, not a hook-config edit on every workstation.
     if os.environ.get("CRUX_COORD", "1") == "0":
         return 0
     verb = sys.argv[1] if len(sys.argv) > 1 else "announce"

@@ -1706,6 +1706,7 @@ mod tests {
             execplan_slug: Some("plan-x".to_string()),
             milestone: Some("M1".to_string()),
             deploy_target: None,
+            worktree: None,
             paths: Vec::new(),
             note: None,
             announced_at_unix_ms: at_ms,

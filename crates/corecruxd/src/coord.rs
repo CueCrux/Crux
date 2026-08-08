@@ -79,6 +79,19 @@ pub struct CoordIntent {
     /// `deploy_target` warning — advisory, mirroring the execplan-slug overlap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deploy_target: Option<String>,
+    /// Absolute path of the git worktree this session is working in, when it is
+    /// working in one. Optional + `skip_serializing_if` so an intent that
+    /// declares none stays byte-identical on the wire.
+    ///
+    /// `paths` says what will be touched; this says *where the checkout lives*,
+    /// which is the thing that outlives the work. A worktree whose plan has
+    /// closed is an orphan, and until now nothing recorded the association — the
+    /// reaper had to rediscover it by walking every repo and testing each branch
+    /// against `origin/main`. That walk cannot see a worktree whose branch is
+    /// unmerged but whose plan is finished, and it cannot tell a session's own
+    /// live worktree from an abandoned one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
     /// Repo-relative paths (files or directory prefixes) the session expects
     /// to touch. Informational — enforceable leases are punchcards.
     #[serde(default)]
@@ -496,6 +509,7 @@ mod tests {
             execplan_slug: Some(slug.to_string()),
             milestone: None,
             deploy_target: None,
+            worktree: None,
             paths: vec![],
             note: None,
             announced_at_unix_ms: 0,
@@ -775,6 +789,7 @@ mod collision_signal_tests {
             execplan_slug: slug.map(str::to_string),
             milestone: None,
             deploy_target: None,
+            worktree: None,
             paths: paths.iter().map(|s| s.to_string()).collect(),
             note: None,
             announced_at_unix_ms: 1_000,

@@ -283,6 +283,24 @@ pub fn tool_affinity(tool: &str) -> &'static str {
         | "learn"
         | "token_savings" => "audit",
         "proof_verify" | "receipt_verify" | "output_attest" => "proof",
+        // Work board + coordination plane. Same argument as the context-graph
+        // block above, and the same one CORE_FLOOR makes for the handoff pair:
+        // clients only call advertised tools. Coordination that no client can
+        // invoke detects no collisions — on 2026-08-06 two live sessions
+        // overlapped on one checkout and one deleted the other's file, with
+        // `coord_announce` deployed and unreachable from both.
+        "list_work"
+        | "create_work"
+        | "update_work_state"
+        | "comment_on_work"
+        | "coord_announce"
+        | "coord_status"
+        | "punch_in"
+        | "punch_out"
+        | "check_punchcard"
+        | "list_punchcards"
+        | "execplan_write"
+        | "execplan_gate" => "work",
         _ => "",
     }
 }
@@ -473,7 +491,13 @@ mod tests {
             !names.contains(&"github_search"),
             "irrelevant tool must not be surfaced"
         );
-        assert!(!names.contains(&"list_work"), "irrelevant tool must not be surfaced");
+        // `list_work` carries the `work` affinity, which `audit_review` does not
+        // bias — so it still scores 0 here. Affinity alone never surfaces a tool;
+        // an intent has to ask for it.
+        assert!(
+            !names.contains(&"list_work"),
+            "work-affinity tool must not surface under an intent that does not bias it"
+        );
         assert!(names.len() <= CORE_FLOOR.len() + DYNAMIC_TOP_N, "respects top_n cap");
         assert!(names.len() < list_tools().len(), "still far smaller than full");
     }
@@ -505,6 +529,68 @@ mod tests {
         assert_eq!(tool_affinity("receipt_verify"), "proof");
         assert_eq!(tool_affinity("save_session"), "session");
         assert_eq!(tool_affinity("github_search"), "", "unmapped tool ⇒ no affinity");
+    }
+
+    /// The twelve tools an agent executing an ExecPlan has to reach. Every one
+    /// was unmapped before 2026-08-06 and therefore scored 0 in *every* intent —
+    /// the collision detection and board reads documented in the workspace guide
+    /// were uninvokable from the client that was told to use them.
+    const WORK_TOOLS: &[&str] = &[
+        "list_work",
+        "create_work",
+        "update_work_state",
+        "comment_on_work",
+        "coord_announce",
+        "coord_status",
+        "punch_in",
+        "punch_out",
+        "check_punchcard",
+        "list_punchcards",
+        "execplan_write",
+        "execplan_gate",
+    ];
+
+    #[test]
+    fn work_tools_all_carry_the_work_affinity() {
+        for t in WORK_TOOLS {
+            assert_eq!(
+                tool_affinity(t),
+                "work",
+                "{t} must carry an affinity — unmapped means bias 0 in every intent"
+            );
+        }
+    }
+
+    /// Guards the half that is easy to get wrong: an affinity tag is inert
+    /// unless some intent biases it. Both halves of the M1 fix, asserted together.
+    #[test]
+    fn execplan_execution_intent_surfaces_the_coordination_plane() {
+        let shaped = shape_dynamic(list_tools(), Some("execplan_execution"), DYNAMIC_TOP_N);
+        let names: Vec<&str> = shaped.iter().map(|t| t.name.as_str()).collect();
+        for t in ["coord_announce", "list_work"] {
+            assert!(names.contains(&t), "execplan_execution must surface {t}; got {names:?}");
+        }
+        assert!(
+            names.len() <= CORE_FLOOR.len() + DYNAMIC_TOP_N,
+            "must respect the top_n cap, got {}",
+            names.len()
+        );
+        assert!(names.len() < list_tools().len(), "still far smaller than full");
+    }
+
+    /// Flag-off proof: adding an affinity arm and an intent entry must not move
+    /// the no-intent surface, which is what a cold agent gets.
+    #[test]
+    fn work_affinity_does_not_leak_into_the_no_intent_floor() {
+        let shaped = shape_dynamic(list_tools(), None, DYNAMIC_TOP_N);
+        let names: Vec<&str> = shaped.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names.len(), CORE_FLOOR.len(), "no intent ⇒ floor only");
+        for t in WORK_TOOLS {
+            assert!(
+                !names.contains(t),
+                "{t} must not reach the floor without a declared intent"
+            );
+        }
     }
 
     /// An unmapped tool scores 0 and is unreachable beyond the floor in every

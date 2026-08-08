@@ -314,6 +314,35 @@ fn projects_work_and_coordination_tools_flow() {
         .unwrap();
     assert!(work_list["count"].as_u64().unwrap() >= 1);
 
+    // `fields=slim` is the projection the boot banner and every token-conscious
+    // agent reads (the full board is ~164k tokens; ranked slim is ~650). Assert
+    // its shape on the wire: the six load-bearing keys survive, the heavy ones
+    // stay out, and `stale` is omitted rather than null for a kanban row — the
+    // flag only means something for ExecPlan-projection items.
+    let slim_list: serde_json::Value = d
+        .get(&format!(
+            "/v1/work?project_id={project_id}&state=planned&tenant_id=tenant-a&fields=slim"
+        ))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let slim_rows = slim_list["work"].as_array().unwrap();
+    assert!(!slim_rows.is_empty(), "slim projection returned no rows");
+    let row = slim_rows[0].as_object().unwrap();
+    assert!(
+        row.contains_key("id") && row.contains_key("state"),
+        "slim row lost id/state"
+    );
+    assert!(
+        !row.contains_key("body") && !row.contains_key("provenance"),
+        "slim must not carry full-row fields"
+    );
+    assert!(
+        !row.contains_key("stale"),
+        "kanban rows have no staleness — the key must be absent, not null"
+    );
+
     let applied: serde_json::Value = d
         .patch_json(
             &format!("/v1/work/{work_id}"),
