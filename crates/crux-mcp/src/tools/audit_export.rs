@@ -369,6 +369,21 @@ mod tests {
         })
     }
 
+    async fn seed_operator_fact(ctx: &McpContext, entity: &str, key: &str, value: &str) {
+        let mut store = ctx.fact_store.write().await;
+        store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: entity.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+            source_receipt: Some("test:typed-operator-workflow".to_string()),
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: Some("daemon:test".to_string()),
+        });
+    }
+
     fn redirect_export_dir(td: &tempfile::TempDir) {
         env::set_var(EXPORT_DIR_ENV, td.path());
     }
@@ -429,18 +444,8 @@ mod tests {
         handle_store_fact(&json!({"entity": "project-x", "key": "k", "value": "v1"}), &ctx)
             .await
             .unwrap();
-        handle_store_fact(
-            &json!({"entity": "__ops::config-audit", "key": "sha256:abc", "value": "audited"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
-        handle_store_fact(
-            &json!({"entity": "__bootstrap__::pattern:retry", "key": "Retry", "value": "exp"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        seed_operator_fact(&ctx, "__ops::config-audit", "sha256:abc", "audited").await;
+        seed_operator_fact(&ctx, "__bootstrap__::pattern:retry", "Retry", "exp").await;
 
         let resp = handle_audit_export_bundle(
             &json!({"token_budget": 1000, "scope": {"include_reserved": true}}),
@@ -485,12 +490,7 @@ mod tests {
         handle_store_fact(&json!({"entity": "project-x", "key": "k", "value": "v"}), &ctx)
             .await
             .unwrap();
-        handle_store_fact(
-            &json!({"entity": "__ops::config-audit", "key": "sha256:abc", "value": "ok"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        seed_operator_fact(&ctx, "__ops::config-audit", "sha256:abc", "ok").await;
 
         let resp = handle_audit_export_bundle(
             &json!({"token_budget": 1000, "scope": {"include_reserved": true}}),

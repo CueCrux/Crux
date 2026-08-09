@@ -279,7 +279,8 @@ pub mod rc {
 /// Whether `entity` falls under any of the granted prefixes. Used by
 /// `read_fact` and to filter `query_facts` results post-fetch.
 pub(crate) fn entity_matches_any_prefix(entity: &str, prefixes: &[String]) -> bool {
-    prefixes.iter().any(|p| !p.is_empty() && entity.starts_with(p.as_str()))
+    crate::fact_privacy::default_private_entity_prefix(entity).is_none()
+        && prefixes.iter().any(|p| !p.is_empty() && entity.starts_with(p.as_str()))
 }
 
 /// Whether a `query_facts` prefix is acceptable for the given grant. The
@@ -287,7 +288,7 @@ pub(crate) fn entity_matches_any_prefix(entity: &str, prefixes: &[String]) -> bo
 /// prefix (i.e. `query_prefix.starts_with(granted)`). The empty string
 /// never satisfies this — modules can't enumerate everything.
 pub(crate) fn query_prefix_within_grant(query_prefix: &str, granted: &[String]) -> bool {
-    if query_prefix.is_empty() {
+    if query_prefix.is_empty() || crate::fact_privacy::private_scope_intersection(query_prefix).is_some() {
         return false;
     }
     granted
@@ -753,7 +754,6 @@ fn register_fact_abi(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
                     key,
                     value,
                     confidence,
-                    horizon_class: None,
                 }) {
                     Ok(f) => f,
                     Err(_) => return HOST_RC_HOST_INTERNAL,
@@ -1093,6 +1093,9 @@ mod tests {
         // Empty prefix in the grant is ignored (defence — we never want
         // an empty string to match-all by accident).
         assert!(!entity_matches_any_prefix("anything", &["".to_string()]));
+        assert!(!entity_matches_any_prefix("__passport__::victim", &["__".to_string()]));
+        assert!(entity_matches_any_prefix("g", &["g".to_string()]));
+        assert!(!entity_matches_any_prefix("github::owner/repo", &["g".to_string()]));
     }
 
     #[test]
@@ -1106,6 +1109,7 @@ mod tests {
         assert!(!query_prefix_within_grant("", &granted));
         // Out-of-grant prefix.
         assert!(!query_prefix_within_grant("__other__::", &granted));
+        assert!(!query_prefix_within_grant("__passport__::", &["__".to_string()]));
     }
 
     // ── M6.2: HostFactStore mock + integration tests ────────────────────

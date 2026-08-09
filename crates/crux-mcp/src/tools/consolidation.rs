@@ -161,6 +161,17 @@ pub async fn handle_memory_consolidate(args: &Value, ctx: &McpContext) -> Result
     let entity = require_str(args, "entity")?.to_string();
     let key = require_str(args, "key")?.to_string();
     let canonical_value = require_str(args, "canonical_value")?.to_string();
+    if let Some(prefix) = corecrux_memory::fact_privacy::generic_create_reserved_entity_prefix(&entity) {
+        return Err(JsonRpcError {
+            code: crate::dispatch::CAPABILITY_DENIED,
+            message: format!("cannot consolidate create-reserved namespace `{prefix}`"),
+            data: Some(json!({
+                "error_code": "RESERVED_ENTITY_PREFIX",
+                "entity": entity,
+                "reserved_prefix": prefix,
+            })),
+        });
+    }
 
     let target_fact_ids = string_array(args, "target_fact_ids");
     if target_fact_ids.is_empty() {
@@ -247,6 +258,7 @@ fn consolidation_error_to_rpc(err: ConsolidationErrorV1) -> JsonRpcError {
         ConsolidationErrorV1::TargetPinned(_) => (crate::dispatch::CAPABILITY_DENIED, "target_pinned"),
         ConsolidationErrorV1::TargetPrivate(_) => (crate::dispatch::CAPABILITY_DENIED, "target_private"),
         ConsolidationErrorV1::TargetReceiptLinked(_) => (crate::dispatch::CAPABILITY_DENIED, "target_receipt_linked"),
+        ConsolidationErrorV1::TargetDaemonOwned { .. } => (crate::dispatch::CAPABILITY_DENIED, "target_daemon_owned"),
         ConsolidationErrorV1::TargetHighConfidence { .. } => {
             (crate::dispatch::CAPABILITY_DENIED, "target_high_confidence")
         }
@@ -398,6 +410,30 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code, crate::dispatch::CAPABILITY_DENIED);
+        disable();
+    }
+
+    #[tokio::test]
+    async fn consolidate_rejects_daemon_owned_namespace() {
+        let _g = flag_lock().lock().await;
+        enable();
+        let alice = agent_ctx("alice");
+        let err = handle_memory_consolidate(
+            &json!({
+                "entity": "__passport__::victim",
+                "key": "record",
+                "canonical_value": "forged",
+                "target_fact_ids": ["f_x"]
+            }),
+            &alice,
+        )
+        .await
+        .expect_err("generic consolidation must not write control state");
+        assert_eq!(err.code, crate::dispatch::CAPABILITY_DENIED);
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data["error_code"].as_str()),
+            Some("RESERVED_ENTITY_PREFIX")
+        );
         disable();
     }
 

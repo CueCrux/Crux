@@ -389,6 +389,8 @@ pub enum ConsolidationErrorV1 {
     TargetPrivate(String),
     #[error("target fact is receipt-linked: {0}")]
     TargetReceiptLinked(String),
+    #[error("target fact belongs to daemon-owned namespace '{prefix}': {fact_id}")]
+    TargetDaemonOwned { fact_id: String, prefix: String },
     #[error("target fact confidence is protected: {fact_id} confidence={confidence}")]
     TargetHighConfidence { fact_id: String, confidence: String },
     #[error("target fact is outside requested entity/key: {0}")]
@@ -875,7 +877,12 @@ impl FactStore {
 
     /// Insert a fact directly into the HashMap and indexes WITHOUT appending
     /// to the journal. Used during replay to avoid re-writing events.
-    fn replay_journal_insert(&mut self, fact: Fact) {
+    fn replay_journal_insert(&mut self, mut fact: Fact) {
+        // Upgrade hardening: rows written before a namespace became
+        // born-private must acquire the current privacy classification during
+        // replay. Otherwise a stale `private:false` control row can re-enter
+        // sync, export, retention, and generic mutation surfaces after restart.
+        crate::fact_privacy::enforce_global_fact(&mut fact);
         let fact_id = fact.fact_id.clone();
         let entity = fact.entity.clone();
         let key = fact.key.clone();
@@ -1968,6 +1975,7 @@ impl FactStore {
             .values()
             .filter(|f| !f.deleted && !f.private && f.stored_at < cutoff)
             .filter(|f| !f.entity.starts_with("__sync_tombstone__::"))
+            .filter(|f| crate::fact_privacy::daemon_owned_entity_prefix(&f.entity).is_none())
             .filter(|f| !holds.iter().any(|hold| hold.covers_fact(f)))
             .map(|f| f.fact_id.clone())
             .collect();
@@ -2105,6 +2113,12 @@ impl FactStore {
             }
             if req.protected_fact_ids.iter().any(|id| id == fact_id) {
                 return Err(ConsolidationErrorV1::TargetPinned(fact_id.clone()));
+            }
+            if let Some(prefix) = crate::fact_privacy::daemon_owned_entity_prefix(&fact.entity) {
+                return Err(ConsolidationErrorV1::TargetDaemonOwned {
+                    fact_id: fact_id.clone(),
+                    prefix: prefix.to_string(),
+                });
             }
             if fact.private {
                 return Err(ConsolidationErrorV1::TargetPrivate(fact_id.clone()));
@@ -2546,6 +2560,24 @@ mod tests {
     }
 
     #[test]
+    fn journal_replay_reclassifies_legacy_control_fact_as_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fact = dedup_fixture("f_legacy_public_passport", "__passport__::legacy-forgery", "record", 1);
+        fact.private = false;
+        fact.value = r#"{"tier":"operator"}"#.to_string();
+        let line = serde_json::to_string(&JournalEvent::Store { fact }).unwrap();
+        std::fs::write(dir.path().join("facts.jsonl"), format!("{line}\n")).unwrap();
+
+        let store = FactStore::with_persistence(dir.path()).unwrap();
+        let replayed = store.get("f_legacy_public_passport").unwrap();
+        assert!(replayed.private, "current born-private policy must apply on replay");
+        assert!(
+            store.export(None, None, 10).facts.is_empty(),
+            "reclassified control rows must not become sync-export eligible"
+        );
+    }
+
+    #[test]
     fn store_and_retrieve_fact() {
         let mut store = FactStore::new();
 
@@ -2905,6 +2937,48 @@ mod tests {
             .expect_err("receipt-linked targets are protected");
         assert_eq!(err, ConsolidationErrorV1::TargetReceiptLinked(linked.fact_id.clone()));
         assert!(store.get(&linked.fact_id).unwrap().superseded_by.is_none());
+    }
+
+    #[test]
+    fn consolidate_facts_v1_rejects_legacy_public_daemon_control_target() {
+        let mut store = FactStore::new();
+        let control = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "__passport__::legacy".to_string(),
+            key: "record".to_string(),
+            value: "{}".to_string(),
+            source_receipt: None,
+            confidence: 0.1,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        // Simulate a row persisted before born-private enforcement.
+        store.facts.get_mut(&control.fact_id).unwrap().private = false;
+
+        let err = store
+            .consolidate_facts_v1(ConsolidationRequestV1 {
+                consolidation_id: "con-control-guard".to_string(),
+                entity: "__passport__::legacy".to_string(),
+                key: "record".to_string(),
+                canonical_value: r#"{"tier":"operator"}"#.to_string(),
+                target_fact_ids: vec![control.fact_id.clone()],
+                protected_fact_ids: vec![],
+                confidence: 0.2,
+                source_receipt: None,
+                actor: Some("operator".to_string()),
+                horizon_class: None,
+                protected_confidence_floor: 0.99,
+            })
+            .expect_err("daemon control targets are protected independently of privacy");
+        assert_eq!(
+            err,
+            ConsolidationErrorV1::TargetDaemonOwned {
+                fact_id: control.fact_id.clone(),
+                prefix: "__passport__::".to_string(),
+            }
+        );
+        assert!(store.get(&control.fact_id).unwrap().superseded_by.is_none());
     }
 
     // ── buyer-fit M2: atomic consolidation + receipted undo ──────────────
@@ -3926,6 +4000,17 @@ mod tests {
             horizon_class: None,
             actor: None,
         });
+        let control = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "__passport__::legacy".into(),
+            key: "record".into(),
+            value: "{}".into(),
+            source_receipt: None,
+            confidence: 0.1,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
         store.store(StoreFact {
             tenant_hash: "default".to_string(),
             entity: "e".into(),
@@ -3940,12 +4025,16 @@ mod tests {
         // Backdate the first fact well past the cutoff.
         old.stored_at = Utc::now() - chrono::Duration::days(120);
         store.facts.get_mut(&old.fact_id).unwrap().stored_at = old.stored_at;
+        let legacy = store.facts.get_mut(&control.fact_id).unwrap();
+        legacy.stored_at = old.stored_at;
+        legacy.private = false;
 
         let cutoff = Utc::now() - chrono::Duration::days(90);
         let marked = store.mark_retention_eligible(cutoff);
         assert_eq!(marked, vec![old.fact_id.clone()]);
         assert!(store.get(&old.fact_id).is_none());
-        assert_eq!(store.count(), 1); // only the fresh fact remains live
+        assert!(store.get(&control.fact_id).is_some());
+        assert_eq!(store.count(), 2); // fresh fact + protected legacy control
     }
 
     #[test]

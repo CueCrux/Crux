@@ -223,6 +223,8 @@ pub enum ReviewError {
     /// Auto-promotion refused: unscored or below threshold. The candidate is
     /// unchanged and remains review-only.
     FailClosed(String),
+    /// Candidate targets a namespace generic promotion cannot create.
+    ReservedNamespace(String),
     /// Underlying store write failed.
     Store(String),
 }
@@ -233,6 +235,9 @@ impl std::fmt::Display for ReviewError {
             ReviewError::NotFound => write!(f, "candidate not found"),
             ReviewError::AlreadyPromoted => write!(f, "candidate already promoted"),
             ReviewError::FailClosed(why) => write!(f, "promotion refused (fail-closed): {why}"),
+            ReviewError::ReservedNamespace(prefix) => {
+                write!(f, "promotion refused for create-reserved namespace `{prefix}`")
+            }
             ReviewError::Store(e) => write!(f, "candidate store error: {e}"),
         }
     }
@@ -255,6 +260,9 @@ pub fn promote(
     let cand = get_candidate(store, candidate_id).ok_or(ReviewError::NotFound)?;
     if cand.status == CandidateStatus::Promoted {
         return Err(ReviewError::AlreadyPromoted);
+    }
+    if let Some(prefix) = corecrux_memory::fact_privacy::generic_create_reserved_entity_prefix(&cand.proposed_entity) {
+        return Err(ReviewError::ReservedNamespace(prefix.to_string()));
     }
     if let PromotionMode::Auto { score_threshold } = &mode {
         match cand.verifier_score {
@@ -503,6 +511,27 @@ mod tests {
         let real = real_fact_present(&store, "person:user", "owns_cat_count").expect("promoted fact present");
         assert_eq!(real.actor.as_deref(), Some("auto-capture:promoted-by:myles"));
         assert_eq!(get_candidate(&store, "c1").unwrap().status, CandidateStatus::Promoted);
+    }
+
+    #[test]
+    fn explicit_promote_cannot_target_daemon_owned_control_state() {
+        let mut store = FactStore::new();
+        let mut candidate = sample_body("c1");
+        candidate.proposed_entity = "__passport__::victim".to_string();
+        candidate.proposed_key = "record".to_string();
+        write_candidate(&mut store, &candidate, None).unwrap();
+
+        let err = promote(
+            &mut store,
+            "c1",
+            PromotionMode::Explicit {
+                reviewer: "myles".to_string(),
+            },
+            "t",
+        )
+        .expect_err("review promotion is not a control-record writer");
+        assert_eq!(err, ReviewError::ReservedNamespace("__passport__::".to_string()));
+        assert!(real_fact_present(&store, "__passport__::victim", "record").is_none());
     }
 
     #[test]

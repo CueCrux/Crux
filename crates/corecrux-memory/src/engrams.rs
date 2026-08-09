@@ -25,7 +25,7 @@ pub const ENGRAM_ENTITY_PREFIX: &str = "__engram__::";
 const LOCAL_ENGRAM_MANIFEST_SCHEMA: &str = "crux.local.engram_manifest.v1";
 pub const SESSION_PROCEDURE_SCHEMA: &str = "cuecrux.memory.session_procedure.v1";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct LocalEngram {
     pub id: String,
     pub name: String,
@@ -59,6 +59,83 @@ fn default_enabled() -> bool {
     true
 }
 
+/// Validate an operator-provided overlay before it can enter the protected
+/// engram namespace. This deliberately validates structure and resource
+/// bounds, not the semantic truth of prompt content.
+pub fn validate_local_engram(engram: &LocalEngram) -> Result<(), String> {
+    fn bounded_nonempty(value: &str, field: &str, max: usize) -> Result<(), String> {
+        let len = value.len();
+        if value.trim().is_empty() {
+            return Err(format!("{field} must not be empty"));
+        }
+        if len > max {
+            return Err(format!("{field} exceeds {max} bytes"));
+        }
+        Ok(())
+    }
+    fn bounded_optional(value: Option<&str>, field: &str, max: usize) -> Result<(), String> {
+        if let Some(value) = value {
+            if value.len() > max {
+                return Err(format!("{field} exceeds {max} bytes"));
+            }
+        }
+        Ok(())
+    }
+    fn safe_identifier(value: &str, field: &str) -> Result<(), String> {
+        bounded_nonempty(value, field, 128)?;
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+        {
+            return Err(format!(
+                "{field} may contain only ASCII letters, digits, '-', '_', '.', and ':'"
+            ));
+        }
+        Ok(())
+    }
+
+    safe_identifier(&engram.id, "id")?;
+    safe_identifier(&engram.name, "name")?;
+    safe_identifier(&engram.version, "version")?;
+    safe_identifier(&engram.intent_bucket, "intent_bucket")?;
+    bounded_nonempty(&engram.content, "content", 65_536)?;
+    bounded_optional(engram.query_pattern.as_deref(), "query_pattern", 4_096)?;
+    bounded_optional(engram.applicable_why.as_deref(), "applicable_why", 8_192)?;
+    bounded_optional(engram.generated_class.as_deref(), "generated_class", 128)?;
+    bounded_optional(engram.source_chunk_set_hash.as_deref(), "source_chunk_set_hash", 256)?;
+    bounded_optional(engram.inherited_reason.as_deref(), "inherited_reason", 8_192)?;
+    bounded_optional(engram.policy_hash.as_deref(), "policy_hash", 256)?;
+    if engram.source_chunk_hashes.len() > 256 {
+        return Err("source_chunk_hashes exceeds 256 entries".to_string());
+    }
+    if engram.source_chunk_hashes.iter().any(|hash| hash.len() > 256) {
+        return Err("source_chunk_hashes entry exceeds 256 bytes".to_string());
+    }
+    let rank = |value: &str| match value {
+        "fast" => Some(0_u8),
+        "capable" => Some(1),
+        "frontier" => Some(2),
+        _ => None,
+    };
+    let min = engram
+        .capability_class_min
+        .as_deref()
+        .map(|value| rank(value).ok_or_else(|| format!("invalid capability_class_min '{value}'")))
+        .transpose()?;
+    let max = engram
+        .capability_class_max
+        .as_deref()
+        .map(|value| rank(value).ok_or_else(|| format!("invalid capability_class_max '{value}'")))
+        .transpose()?;
+    if min.zip(max).is_some_and(|(min, max)| min > max) {
+        return Err("capability_class_min must not exceed capability_class_max".to_string());
+    }
+    if engram.created_at_unix_ms == 0 {
+        return Err("created_at_unix_ms must be non-zero".to_string());
+    }
+    Ok(())
+}
+
 /// Built-in catalog merged with fact-backed overlays under `__engram__::*`.
 /// An overlay replaces a builtin with the same `(name, version)`.
 pub fn local_catalog_with_overlays(store: &FactStore) -> Vec<LocalEngram> {
@@ -77,6 +154,9 @@ pub fn local_catalog_with_overlays(store: &FactStore) -> Vec<LocalEngram> {
             continue;
         }
         if let Ok(engram) = serde_json::from_str::<LocalEngram>(&fact.value) {
+            if validate_local_engram(&engram).is_err() {
+                continue;
+            }
             out.retain(|e| !(e.name == engram.name && e.version == engram.version));
             out.push(engram);
         }
@@ -427,6 +507,46 @@ mod tests {
         let served: Vec<_> = catalog.iter().filter(|e| e.name == "code-minimalism").collect();
         assert_eq!(served.len(), 1, "overlay must replace, not duplicate");
         assert_eq!(served[0].content, "operator-tuned ladder");
+    }
+
+    #[test]
+    fn overlay_validation_rejects_malformed_or_unbounded_control_content() {
+        let mut overlay = builtin_engrams().remove(0);
+        assert!(validate_local_engram(&overlay).is_ok());
+
+        overlay.name = "../escape".to_string();
+        assert!(validate_local_engram(&overlay).unwrap_err().contains("name"));
+
+        overlay.name = "safe-name".to_string();
+        overlay.content = "x".repeat(65_537);
+        assert!(validate_local_engram(&overlay).unwrap_err().contains("content"));
+
+        overlay.content = "safe".to_string();
+        overlay.capability_class_min = Some("frontier".to_string());
+        overlay.capability_class_max = Some("fast".to_string());
+        assert!(validate_local_engram(&overlay).unwrap_err().contains("must not exceed"));
+    }
+
+    #[test]
+    fn invalid_legacy_overlay_is_ignored_on_load() {
+        let mut store = FactStore::new();
+        let mut invalid = builtin_engrams().remove(0);
+        invalid.name = "../escape".to_string();
+        store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: format!("{ENGRAM_ENTITY_PREFIX}legacy-poison"),
+            key: "engram".to_string(),
+            value: serde_json::to_string(&invalid).unwrap(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: None,
+        });
+
+        assert!(local_catalog_with_overlays(&store)
+            .iter()
+            .all(|engram| engram.name != "../escape"));
     }
 
     #[test]

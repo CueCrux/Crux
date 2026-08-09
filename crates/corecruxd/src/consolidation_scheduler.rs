@@ -160,7 +160,11 @@ pub fn select_expiry_candidates(
         if out.len() >= limit {
             break;
         }
-        if fact.deleted || fact.superseded_by.is_some() || fact_is_protected(fact, &pinned) {
+        if fact.deleted
+            || fact.superseded_by.is_some()
+            || fact_is_protected(fact, &pinned)
+            || crate::fact_privacy::daemon_owned_entity_prefix(&fact.entity).is_some()
+        {
             continue;
         }
         let stale = crux_mcp::tools::freshness::fact_freshness(fact, now, policy) == Freshness::Stale;
@@ -485,13 +489,24 @@ mod tests {
         let policy = decay::DecayPolicy::from_env();
         // High-confidence (>= PROTECTED_CONFIDENCE_FLOOR) but stale → protected,
         // so never proposed for expiry even though it is stale.
-        let facts = vec![synth(
-            "f_prot",
-            "svc",
-            1.0,
-            HorizonClass::Volatile,
-            now - chrono::Duration::hours(48),
-        )];
+        let facts = vec![
+            synth(
+                "f_prot",
+                "svc",
+                1.0,
+                HorizonClass::Volatile,
+                now - chrono::Duration::hours(48),
+            ),
+            // Simulate a pre-policy daemon-control row that was persisted
+            // public and has since gone stale/low-confidence.
+            synth(
+                "f_legacy_control",
+                "__passport__::legacy",
+                0.1,
+                HorizonClass::Volatile,
+                now - chrono::Duration::hours(48),
+            ),
+        ];
         assert!(select_expiry_candidates(&facts, now, policy, 50).is_empty());
     }
 

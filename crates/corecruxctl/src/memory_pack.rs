@@ -85,6 +85,11 @@ pub fn render_private_summary(summary: &PrivateSummary) -> String {
     }
     let _ = writeln!(
         out,
+        "  (daemon-control facts: {} — ALWAYS excluded)",
+        summary.protected_excluded
+    );
+    let _ = writeln!(
+        out,
         "  (deleted facts: {} — ALWAYS excluded, no flag overrides erasure)",
         summary.deleted_excluded
     );
