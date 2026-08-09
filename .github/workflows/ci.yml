@@ -13,6 +13,9 @@ on:
   # waiting on them. No-op until a merge queue is enabled on `main`.
   merge_group:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
