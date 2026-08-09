@@ -11,6 +11,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -20,6 +23,6 @@ jobs:
     name: No private-monorepo refs
     runs-on: [self-hosted, ci, Linux]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Run guard
         run: bash scripts/check-no-private-paths.sh
