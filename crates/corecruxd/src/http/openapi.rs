@@ -46,6 +46,8 @@ use utoipa::OpenApi;
         super::facts::query_facts,
         super::facts::export_facts,
         super::facts::list_facts,
+        // Engrams
+        super::engrams::upsert_engram,
         // Sessions
         super::facts::put_session_state,
         super::facts::get_session_state,
@@ -243,6 +245,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/credits/spend", methods: &["POST"], tag: "Credits", auth: "feature-gated", summary: "Credits spend" },
     RouteEntry { path: "/v1/edges", methods: &["GET", "PUT", "DELETE"], tag: "Edges", auth: "read-write", summary: "Edges" },
     RouteEntry { path: "/v1/engrams", methods: &["GET"], tag: "Engrams", auth: "read", summary: "Engrams" },
+    RouteEntry { path: "/v1/engrams/{name}", methods: &["PUT"], tag: "Engrams", auth: "admin-write", summary: "Validated engram overlay upsert" },
     RouteEntry { path: "/v1/entities", methods: &["GET"], tag: "Entities", auth: "read", summary: "Entities" },
     RouteEntry { path: "/v1/entities/{kind}/{id}", methods: &["GET", "PUT", "DELETE"], tag: "Entities", auth: "read-write", summary: "Entities {kind} {id}" },
     RouteEntry { path: "/v1/entities/{kind}/{id}/history", methods: &["GET"], tag: "Entities", auth: "read", summary: "Entities {kind} {id} history" },

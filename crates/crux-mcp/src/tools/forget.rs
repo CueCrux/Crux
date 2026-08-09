@@ -108,7 +108,8 @@ fn parse_scope(args: &Value) -> Result<ForgetScopeV1, JsonRpcError> {
 }
 
 fn is_reserved(entity: &str) -> bool {
-    RESERVED_PREFIXES.iter().any(|p| entity.starts_with(p))
+    corecrux_memory::fact_privacy::daemon_owned_entity_prefix(entity).is_some()
+        || RESERVED_PREFIXES.iter().any(|p| entity.starts_with(p))
 }
 
 fn glob_matches(glob: &str, candidate: &str) -> bool {
@@ -622,6 +623,21 @@ mod tests {
         })
     }
 
+    async fn seed_operator_fact(ctx: &McpContext, entity: &str) {
+        let mut store = ctx.fact_store.write().await;
+        store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: entity.to_string(),
+            key: "k".to_string(),
+            value: "v".to_string(),
+            source_receipt: Some("test:typed-operator-workflow".to_string()),
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: Some("daemon:test".to_string()),
+        });
+    }
+
     #[test]
     fn glob_matches_basic() {
         assert!(glob_matches("foo", "foo"));
@@ -687,12 +703,7 @@ mod tests {
         let ctx = agent_ctx("alice");
         // Reserved prefix; user-facing dry-run must skip it even if the
         // scope would otherwise include it.
-        handle_store_fact(
-            &json!({"entity": "__bootstrap__::pattern:test", "key": "k", "value": "v"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        seed_operator_fact(&ctx, "__bootstrap__::pattern:test").await;
         let resp = handle_memory_forget_dry_run(
             &json!({"scope": {"type": "entity_prefix", "value": "__bootstrap__::"}}),
             &ctx,
@@ -991,12 +1002,7 @@ mod tests {
     async fn memory_forget_skips_reserved_prefixes_even_with_matching_scope() {
         let _guard = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("alice");
-        handle_store_fact(
-            &json!({"entity": "__ops::config-audit", "key": "k", "value": "v"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        seed_operator_fact(&ctx, "__ops::config-audit").await;
         let resp = handle_memory_forget(
             &json!({
                 "scope": {"type": "entity_prefix", "value": "__ops::"},

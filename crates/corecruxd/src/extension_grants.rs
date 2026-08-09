@@ -90,36 +90,7 @@ pub struct ExtensionGrant {
 /// authoritative regardless of grant; checking here means we surface the
 /// rejection at issue time instead of silently dropping writes at dispatch.
 fn is_prefix_grantable(prefix: &str) -> bool {
-    // Identical to the daemon's default-private list. Kept inline rather
-    // than imported from `fact_privacy` because that module is private.
-    const RESERVED: &[&str] = &[
-        "__ax__::",
-        "__ax_session::",
-        "__constraints__::",
-        "__project_layer__::",
-        "__plane__::",
-        "__plane_layer__::",
-        "__workspace__::",
-        "__workspace_scan__::",
-        "__repo_registry__::",
-        "__repo_scan__::",
-        "__repo_codegraph_ids__::",
-        "__repo_extdeps__::",
-        "__storybook__::",
-        "__dossier__::",
-        "__project_repo_link__::",
-        "__extension__::",
-        "__extension_grant__::",
-        "__work__::",
-        "__work_transition__::",
-        "__passport__::",
-        "__mint_request__::",
-        "__bootstrap__::",
-        "__project__::",
-        "decisions::",
-        "github::",
-    ];
-    !RESERVED.iter().any(|reserved| prefix.starts_with(reserved))
+    crate::fact_privacy::private_scope_intersection(prefix).is_none()
 }
 
 fn validate_extension_id(id: &str) -> Result<(), GrantError> {
@@ -411,15 +382,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_privacy_gated_prefix_in_grant() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut s = store();
-        let mut bad = input("ext.example.quote", "p_alice");
-        bad.allowed_prefixes_write.push("__ax__::".to_string());
-        let err = issue_grant(&mut s, dir.path(), true, None, bad, 1).expect_err("forbidden");
-        match err {
-            GrantError::PrefixForbidden(p) => assert!(p.starts_with("__ax__::")),
-            other => panic!("unexpected error: {other}"),
+    fn rejects_exact_child_and_parent_scopes_intersecting_private_namespaces() {
+        for forbidden in ["__ax__::", "__ax__::child", "__", "github::owner/repo"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut s = store();
+            let mut bad = input("ext.example.quote", "p_alice");
+            bad.allowed_prefixes_write.push(forbidden.to_string());
+            let err = issue_grant(&mut s, dir.path(), true, None, bad, 1).expect_err("forbidden");
+            match err {
+                GrantError::PrefixForbidden(p) => assert_eq!(p, forbidden),
+                other => panic!("unexpected error: {other}"),
+            }
         }
     }
 

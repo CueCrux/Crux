@@ -18,11 +18,13 @@ use serde_json::json;
 
 use corecrux_memory::engrams::{
     build_engram_manifest, compute_engram_set_hash, current_session_procedure, hash_json, local_catalog_with_overlays,
-    model_id_to_capability_class, prompt_hash, resolve_from_catalog, SESSION_PROCEDURE_SCHEMA,
+    model_id_to_capability_class, prompt_hash, resolve_from_catalog, validate_local_engram, LocalEngram,
+    ENGRAM_ENTITY_PREFIX, SESSION_PROCEDURE_SCHEMA,
 };
 
 use super::{
-    problem_response, require_http_any_scope, AppState, HeaderMap, IntoResponse, Json, Query, State, StatusCode,
+    http_scope_context, problem_response, require_http_any_scope, AppState, HeaderMap, IntoResponse, Json, Path, Query,
+    State, StatusCode,
 };
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +67,37 @@ pub(super) struct ResolveEngramsBody {
     pub model_id: Option<String>,
     #[serde(default, alias = "modelId")]
     pub model_id_camel: Option<String>,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub(super) struct UpsertEngramBody {
+    pub version: String,
+    pub intent_bucket: String,
+    #[serde(default)]
+    pub query_pattern: Option<String>,
+    pub content: String,
+    #[serde(default)]
+    pub applicable_why: Option<String>,
+    #[serde(default)]
+    pub capability_class_min: Option<String>,
+    #[serde(default)]
+    pub capability_class_max: Option<String>,
+    #[serde(default)]
+    pub generated_class: Option<String>,
+    #[serde(default)]
+    pub source_chunk_hashes: Vec<String>,
+    #[serde(default)]
+    pub source_chunk_set_hash: Option<String>,
+    #[serde(default)]
+    pub inherited_reason: Option<String>,
+    #[serde(default)]
+    pub policy_hash: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// `GET /v1/engrams` — list active engrams without content.
@@ -113,6 +146,110 @@ pub(super) async fn list_engrams(
             "schema": "crux.local.engrams.list.v1",
             "engrams": rows,
             "total": total,
+        })),
+    )
+        .into_response()
+}
+
+/// Typed, authenticated engram overlay upsert. Generic fact writers cannot
+/// address `__engram__::`; this path validates the complete control object and
+/// stamps server-owned identity, time, privacy, and provenance fields.
+#[utoipa::path(
+    put,
+    path = "/v1/engrams/{name}",
+    tag = "Engrams",
+    params(("name" = String, Path, description = "Engram name")),
+    request_body = UpsertEngramBody,
+    responses(
+        (status = 201, description = "Validated engram overlay stored"),
+        (status = 400, description = "Invalid engram"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "admin:write required"),
+    ),
+    security(("bearer_auth" = []))
+)]
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn upsert_engram(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<UpsertEngramBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["admin:write"]) {
+        return problem.into_response();
+    }
+    let ctx = match http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(problem) => return problem.into_response(),
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis().max(1) as u64;
+    let identity_seed = format!("{name}@{}", body.version);
+    let id_hash = blake3::hash(identity_seed.as_bytes()).to_hex().to_string();
+    let engram = LocalEngram {
+        id: format!("eng_overlay_{}", &id_hash[..16]),
+        name,
+        version: body.version,
+        intent_bucket: body.intent_bucket,
+        query_pattern: body.query_pattern,
+        content: body.content,
+        applicable_why: body.applicable_why,
+        capability_class_min: body.capability_class_min,
+        capability_class_max: body.capability_class_max,
+        generated_class: body.generated_class,
+        source_chunk_hashes: body.source_chunk_hashes,
+        source_chunk_set_hash: body.source_chunk_set_hash,
+        inherited_reason: body.inherited_reason,
+        policy_hash: body.policy_hash,
+        enabled: body.enabled,
+        created_at_unix_ms: now_ms,
+    };
+    if let Err(err) = validate_local_engram(&engram) {
+        return problem_response(StatusCode::BAD_REQUEST, err);
+    }
+    let tenant_hash = match super::facts::tenant_hash_for_write_context(&ctx) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
+    let actor = ctx.passport_id.clone().unwrap_or_else(|| state.passport_fpr.clone());
+    let value = match serde_json::to_string(&engram) {
+        Ok(value) => value,
+        Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    };
+    let receipt_material = format!("{actor}\0{value}");
+    let source_receipt = format!(
+        "engram-upsert:blake3:{}",
+        blake3::hash(receipt_material.as_bytes()).to_hex()
+    );
+    let entity = format!("{ENGRAM_ENTITY_PREFIX}{}::{}", engram.name, engram.version);
+    let stored = {
+        let mut store = state.fact_store.write().await;
+        match store.try_store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash,
+            entity: entity.clone(),
+            key: "engram".to_string(),
+            value,
+            source_receipt: Some(source_receipt.clone()),
+            confidence: 1.0,
+            private: true,
+            horizon_class: Some(corecrux_memory::fact_store::HorizonClass::Stable),
+            actor: Some(actor.clone()),
+        }) {
+            Ok(fact) => fact,
+            Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        }
+    };
+
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "schema": "crux.local.engram_upsert.v1",
+            "fact_id": stored.fact_id,
+            "entity": entity,
+            "name": engram.name,
+            "version": engram.version,
+            "prompt_hash": prompt_hash(&engram.content),
+            "actor": actor,
+            "source_receipt": source_receipt,
         })),
     )
         .into_response()

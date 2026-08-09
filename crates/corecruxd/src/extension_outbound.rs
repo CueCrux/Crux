@@ -312,9 +312,10 @@ fn find_tool<'a>(
 /// reject privacy-gated prefixes at grant-issue time; this is a final
 /// per-call belt-and-braces check.
 fn write_allowed_by_grant(grant_prefixes_write: &[String], proposed_entity: &str) -> bool {
-    grant_prefixes_write
-        .iter()
-        .any(|prefix| proposed_entity.starts_with(prefix))
+    crate::fact_privacy::generic_create_reserved_entity_prefix(proposed_entity).is_none()
+        && grant_prefixes_write
+            .iter()
+            .any(|prefix| proposed_entity.starts_with(prefix))
 }
 
 /// Parse an `allowed_hosts` entry into a host and optional port. Entries
@@ -906,6 +907,17 @@ mod tests {
         assert_eq!(outcome.accepted_fact_writes, 1);
         assert_eq!(outcome.dropped_fact_writes, 1);
         assert!(outcome.drop_reasons[0].contains("__ax__::"));
+    }
+
+    #[test]
+    fn forged_broad_grant_cannot_write_daemon_control_state() {
+        let broad = vec!["__".to_string()];
+        assert!(!write_allowed_by_grant(&broad, "__passport__::victim"));
+        assert!(!write_allowed_by_grant(&broad, "__work__::project::item"));
+        assert!(write_allowed_by_grant(
+            &["personal::".to_string()],
+            "personal::quotes::today"
+        ));
     }
 
     #[test]

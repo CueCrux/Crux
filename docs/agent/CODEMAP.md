@@ -23,7 +23,7 @@ SPA — `dist/` only, not a cargo member — and is excluded below.)
 
 | Crate | Purpose | Key public symbols | Used by | ~LOC |
 |---|---|---|---|---|
-| `corecrux-memory` | Versioned fact store + session store; decay, supersession, CROWN receipts | `Fact`, `FactStore`, `mark_superseded`, `ContradictionCandidateV1`, `ConsolidationReceiptV1`, `consolidate_facts_v1` | crux-lens-features, crux-mcp, crux-observe, corecruxctl, corecruxd | 11.7k |
+| `corecrux-memory` | Versioned fact store + session store; decay, supersession, CROWN receipts | `Fact`, `FactStore`, `mark_superseded`, `DEFAULT_PRIVATE_PREFIXES`, `DAEMON_OWNED_ENTITY_PREFIXES`, `consolidate_facts_v1` | crux-lens-features, crux-mcp, crux-observe, corecruxctl, corecruxd | 11.7k |
 | `corecrux-index` | Companion inverted index (`.ccxi`) built at seal time; powers BM25 | `CcxiBuilder`, `CcxiReader`, `CcxiHeader`, `pfordelta_encode`/`pfordelta_decode` | corecrux-retrieval, crux-mcp, corecrux-storage, corecruxctl, corecruxd | 1.1k |
 | `corecrux-retrieval` | Fused retrieval — BM25 + graph-signal fusion over `.ccxi` | `fused_retrieve`, `IndexManager`, `FusionWeights`, `FusedHit` | corecruxd, crux-mcp | 2.1k |
 | `corecrux-projections` | Living-objects projections + snapshots (`.ccxsnap`) + deterministic parity harness | `ProjectionEventV1`, `CcxsnapProjectionId`, `build_cold_segment_v1`, `apply`/`apply_at` | corecrux-retrieval, corecruxctl, crux-mcp, crux-session, corecruxd | 12.4k |

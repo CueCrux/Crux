@@ -652,15 +652,22 @@ mod tests {
         handle_store_fact(&json!({"entity": "project-x", "key": "name", "value": "open"}), &ctx)
             .await
             .unwrap();
-        handle_store_fact(&json!({"entity": "__ops::audit", "key": "k", "value": "x"}), &ctx)
-            .await
-            .unwrap();
-        handle_store_fact(
-            &json!({"entity": "__bootstrap__::pat:y", "key": "k", "value": "y"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        {
+            let mut store = ctx.fact_store.write().await;
+            for (entity, value) in [("__ops::audit", "x"), ("__bootstrap__::pat:y", "y")] {
+                store.store(corecrux_memory::fact_store::StoreFact {
+                    tenant_hash: "default".to_string(),
+                    entity: entity.to_string(),
+                    key: "k".to_string(),
+                    value: value.to_string(),
+                    source_receipt: None,
+                    confidence: 1.0,
+                    private: true,
+                    horizon_class: None,
+                    actor: None,
+                });
+            }
+        }
 
         let res = handle_memory_freshness(&json!({"top_k": 50, "token_budget": 1000}), &ctx)
             .await

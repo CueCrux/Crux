@@ -264,6 +264,11 @@ pub(super) async fn post_promote(
             // 422: the request is well-formed but the fail-closed gate refuses it.
             problem_response(StatusCode::UNPROCESSABLE_ENTITY, format!("promotion refused: {why}")).into_response()
         }
+        Err(candidate_store::ReviewError::ReservedNamespace(prefix)) => problem_response(
+            StatusCode::FORBIDDEN,
+            format!("promotion targets create-reserved namespace `{prefix}`"),
+        )
+        .into_response(),
         Err(candidate_store::ReviewError::Store(e)) => {
             problem_response(StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
         }

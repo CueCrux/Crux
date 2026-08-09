@@ -1152,6 +1152,10 @@ pub(crate) fn router_with_route_auth(
         // Local MemoryCrux-compatible engram/session-procedure surfaces.
         .route("/v1/engrams", get(self::engrams::list_engrams))
         .route(
+            "/v1/engrams/{name}",
+            axum::routing::put(self::engrams::upsert_engram),
+        )
+        .route(
             "/v1/memory/session-init",
             axum::routing::post(self::engrams::memory_session_init),
         )
