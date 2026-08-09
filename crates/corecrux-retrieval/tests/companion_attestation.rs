@@ -207,6 +207,46 @@ fn a_missing_attestation_loads_in_warn_and_refuses_in_enforce() {
     assert!(enf_mgr.readers().is_empty());
 }
 
+/// Surface 3 reports what the **answer** rested on, not what the corpus holds.
+///
+/// This is the whole reason it is not a corpus-wide count: with two segments
+/// present and only one contributing hits, a corpus tally would report an
+/// unattested segment on an answer that never touched it — and, worse, report
+/// clean on an answer that did.
+#[test]
+fn the_query_provenance_tally_counts_only_contributing_segments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let key = test_key();
+
+    // Segment 1 is signed; segment 2 is not.
+    let signed = write_segment_with_ccxi(tmp.path(), 1, "acme");
+    sign_attestation(tmp.path(), &signed, &key, "acme");
+    write_segment_with_ccxi(tmp.path(), 2, "acme");
+
+    let mut mgr = IndexManager::new();
+    mgr.set_attestation_policy(policy(AttestationMode::Warn, &key));
+    mgr.scan_and_load(tmp.path()).unwrap();
+    assert_eq!(mgr.readers().len(), 2, "both serve in warn");
+
+    // An answer drawn only from reader position 0 (the signed segment).
+    let only_signed = mgr.provenance_tally_for_reader_indices([0usize]);
+    assert_eq!(only_signed.contributing_segments, 1);
+    assert_eq!(only_signed.local, 1);
+    assert_eq!(only_signed.none, 0, "the unattested segment did not answer this");
+    assert!(only_signed.is_clean());
+
+    // An answer that touched the unattested one says so.
+    let touched_unattested = mgr.provenance_tally_for_reader_indices([1usize]);
+    assert_eq!(touched_unattested.none, 1);
+    assert!(!touched_unattested.is_clean());
+
+    // Ten hits from one segment are one contributing segment, not ten.
+    let repeated = mgr.provenance_tally_for_reader_indices([0usize, 0, 0, 1, 1]);
+    assert_eq!(repeated.contributing_segments, 2);
+    assert_eq!(repeated.local, 1);
+    assert_eq!(repeated.none, 1);
+}
+
 /// The interaction that only exists because M4 made discovery the erasure
 /// enumeration: a refused segment loses its **lanes**, never its **visibility**.
 ///

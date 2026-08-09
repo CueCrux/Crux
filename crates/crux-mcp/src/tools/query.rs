@@ -138,6 +138,13 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
         })
         .collect();
 
+    // Surface 3 of 4: provenance of the segments this answer actually drew from.
+    // Deliberately not a corpus-wide count — that would say what the daemon
+    // holds, never what this result rested on. Always present, including when
+    // clean: an absent block is ambiguous between "nothing wrong" and "too old
+    // to check", which is the one thing a provenance signal must not be.
+    let provenance = index.provenance_tally_for_reader_indices(hits.iter().map(|h| h.segment_index));
+
     let mut inner = json!({
         "results": results_json,
         "total_candidates": result.total_candidates,
@@ -148,6 +155,7 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
         },
         "meta": {
             "source_label": "local_tenant_index",
+            "provenance": provenance,
             "score_space": score_space,
             "score_merge_rule": score_merge_rule,
             "mixed_profile_merge_rule": MIXED_PROFILE_MERGE_RULE,

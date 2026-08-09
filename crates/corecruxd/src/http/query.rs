@@ -686,6 +686,11 @@ pub(super) async fn post_query_text_search(
         })
         .collect();
 
+    // Surface 3 of 4: provenance of the segments behind THIS answer, not of the
+    // corpus. Always present, clean or not — an absent block cannot be told
+    // apart from a daemon too old to check.
+    let provenance = index.provenance_tally_for_reader_indices(results.iter().map(|h| h.segment_index));
+
     let mut response = serde_json::json!({
         "results": result_items,
         "coverage": {
@@ -695,6 +700,7 @@ pub(super) async fn post_query_text_search(
         },
         "meta": {
             "backend": "corecrux-v5-bm25",
+            "provenance": provenance,
             "took_ms": took_ms,
             "segments_searched": readers.len(),
             "total_docs": index.total_docs(),

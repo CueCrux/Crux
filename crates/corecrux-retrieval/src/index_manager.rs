@@ -332,6 +332,44 @@ impl IndexManager {
         out
     }
 
+    /// Provenance of the segments that actually produced hits.
+    ///
+    /// Surface 3 of 4 exists so the warning reaches the *answer*, not only boot
+    /// — and a corpus-wide count cannot do that: it says what the daemon holds,
+    /// never what this result rested on. `indices` are `segment_index` values
+    /// from the hits, which are positions in [`IndexManager::readers`], so the
+    /// ordering here must be that same filtered order.
+    ///
+    /// Duplicates collapse: ten hits from one segment are one contributing
+    /// segment, not ten.
+    pub fn provenance_tally_for_reader_indices(&self, indices: impl IntoIterator<Item = usize>) -> ProvenanceTally {
+        let by_position: Vec<Option<Provenance>> = self
+            .segments
+            .values()
+            .filter(|s| s.reader.is_some())
+            .map(|s| s.provenance)
+            .collect();
+
+        let unique: BTreeSet<usize> = indices.into_iter().collect();
+        let mut tally = ProvenanceTally::default();
+        for idx in unique {
+            let Some(slot) = by_position.get(idx) else {
+                continue;
+            };
+            tally.contributing_segments += 1;
+            match slot {
+                Some(Provenance::Platform) => tally.platform += 1,
+                Some(Provenance::Local) => tally.local += 1,
+                Some(Provenance::None) => tally.none += 1,
+                Some(Provenance::Invalid) => tally.invalid += 1,
+                // No policy configured. Distinct from `none` on purpose: "we did
+                // not check" is not "we checked and found nothing".
+                None => tally.unverified += 1,
+            }
+        }
+        tally
+    }
+
     /// Segments whose provenance cost them their lanes. Still discovered,
     /// attributable and erasable.
     pub fn refused_segments(&self) -> Vec<u64> {
@@ -583,6 +621,30 @@ pub struct SegmentFootprint {
     /// Every doc in the segment belongs to this tenant — the precondition for
     /// reclaiming the file group wholesale.
     pub whole_tenant: bool,
+}
+
+/// Provenance of the segments behind one set of results.
+///
+/// Always reported, including when everything is clean: an absent block is
+/// ambiguous between "nothing wrong" and "this daemon is too old to check", and
+/// that ambiguity is exactly what a provenance signal must not have.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ProvenanceTally {
+    /// Distinct segments that produced at least one hit.
+    pub contributing_segments: usize,
+    pub platform: usize,
+    pub local: usize,
+    pub none: usize,
+    pub invalid: usize,
+    /// Contributing segments scanned with no policy configured.
+    pub unverified: usize,
+}
+
+impl ProvenanceTally {
+    /// True when every contributing segment carries a verified stamp.
+    pub fn is_clean(&self) -> bool {
+        self.none == 0 && self.invalid == 0 && self.unverified == 0
+    }
 }
 
 /// A tenant's retrieval-corpus footprint across all loaded segments.
