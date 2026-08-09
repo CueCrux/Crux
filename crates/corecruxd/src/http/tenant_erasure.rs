@@ -54,6 +54,10 @@ pub(super) async fn get_tenant_footprint(
     }
 
     let tenant_hash = tenant_hash_xxhash64(&tenant_id);
+    // Enumerate from disk first: a footprint is the blast radius an operator
+    // decides on, so it must not omit a segment that was sealed since the last
+    // scan. This takes the write lock, unlike the read-only inventory itself.
+    state.retrieval_index.write().await.refresh_from_disk();
     let footprint = state.retrieval_index.read().await.tenant_footprint(tenant_hash);
 
     (
@@ -66,6 +70,7 @@ pub(super) async fn get_tenant_footprint(
             "docs": footprint.docs,
             "bytes": footprint.bytes,
             "mixed_segments": footprint.mixed_segments,
+            "unattributable_segments": footprint.unattributable_segments,
             "segments": footprint.segments,
         })),
     )
@@ -215,17 +220,28 @@ pub(super) async fn post_forget_tenants(
     let recorded_at = chrono::Utc::now().to_rfc3339();
     let forgotten_path = state.data_dir.join(FORGOTTEN_TENANTS_FILE);
 
-    let (outcomes, manifest_retire_failed) = {
+    let (outcomes, manifest_retire_failed, unattributable) = {
         let mut index = state.retrieval_index.write().await;
+        // Enumerate from disk, not from the loaded set. A segment sealed since
+        // the last scan is otherwise absent from `self.segments`, and the
+        // reclaim below would report `Ok(0)` and leave its files in place —
+        // erasure silently failing is the one outcome this surface may not have.
+        let discovered = index.refresh_from_disk();
+        if discovered > 0 {
+            tracing::info!(discovered, "tenant-erasure-discovered-segments-before-erasing");
+        }
         // One watermark for the whole batch: every segment sealed so far is
         // erased, anything ingested afterwards is not.
         let watermark = index.max_segment_seq().unwrap_or(0);
         let mut outcomes = Vec::with_capacity(tenant_ids.len());
         let mut previous = Vec::with_capacity(tenant_ids.len());
 
+        let mut unattributable = 0usize;
         for tenant_id in &tenant_ids {
             let tenant_hash = tenant_hash_xxhash64(tenant_id);
             let footprint = index.tenant_footprint(tenant_hash);
+            // A corpus-wide property, identical for every tenant in the batch.
+            unattributable = unattributable.max(footprint.unattributable_segments);
             previous.push((
                 tenant_hash,
                 index.forget_tenant(ForgottenTenant {
@@ -357,7 +373,16 @@ pub(super) async fn post_forget_tenants(
                 );
             }
         }
-        (outcomes, manifest_retire_failed)
+        if unattributable > 0 {
+            // Not a failure of this request, but the erasure cannot be called
+            // complete: these segments hold data nobody can assign an owner to.
+            tracing::error!(
+                unattributable,
+                "tenant-erasure-unattributable-segments: discovered segments could not be attributed to \
+                 any tenant and were neither masked nor reclaimed"
+            );
+        }
+        (outcomes, manifest_retire_failed, unattributable)
     };
 
     let actor = crate::auth::describe_http_evidence(&state.auth, &headers)
@@ -415,6 +440,28 @@ pub(super) async fn post_forget_tenants(
         })
         .collect();
 
+    let durability = {
+        let base = match (reclaim, manifest_retire_failed.as_deref()) {
+            (true, None) => "mask persisted; whole-tenant segment files deleted (irreversible)",
+            // Reclaim was asked for and refused. Saying "deleted" here would be
+            // a lie the operator could only catch by listing the shard.
+            (true, Some(_)) => {
+                "mask persisted; segment files retained because the MANIFEST could not be updated (see manifest_error)"
+            }
+            (false, _) => "mask persisted; segment files retained (reversible until reclaimed)",
+        };
+        // The completeness caveat belongs in the sentence an operator actually
+        // reads, not only in a count they have to interpret.
+        if unattributable > 0 {
+            format!(
+                "{base}. INCOMPLETE: {unattributable} segment(s) on disk could not be attributed to any \
+                 tenant and were neither masked nor reclaimed"
+            )
+        } else {
+            base.to_string()
+        }
+    };
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -422,16 +469,11 @@ pub(super) async fn post_forget_tenants(
             "tenants": per_tenant.len(),
             "per_tenant": per_tenant,
             "scope": "retrieval_corpus",
+            // Non-zero means the corpus holds segments no tenant could be
+            // assigned to; they were neither masked nor reclaimed.
+            "unattributable_segments": unattributable,
             "reclaimed": reclaim && manifest_retire_failed.is_none(),
-            "durability": match (reclaim, manifest_retire_failed.as_deref()) {
-                (true, None) => "mask persisted; whole-tenant segment files deleted (irreversible)",
-                // Reclaim was asked for and refused. Saying "deleted" here would
-                // be a lie the operator could only catch by listing the shard.
-                (true, Some(_)) => {
-                    "mask persisted; segment files retained because the MANIFEST could not be updated (see manifest_error)"
-                }
-                (false, _) => "mask persisted; segment files retained (reversible until reclaimed)",
-            },
+            "durability": durability,
             "manifest_error": manifest_retire_failed,
         })),
     )
@@ -824,6 +866,93 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    /// End-to-end M4 gate: a real sealed segment with **no `.ccxi`** is
+    /// discovered, attributed to its tenant, and removed completely by the
+    /// erasure route.
+    ///
+    /// All four fail on the pre-M4 daemon: the scan matched `.ccxi`, so the
+    /// segment was never loaded; `tenant_footprint` read tenancy from the doc
+    /// table it does not have; and `reclaim_segment` returned `Ok(0)` for a
+    /// segment absent from the loaded set, leaving the subject's data on disk
+    /// while reporting a successful erasure.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn erasure_reclaims_a_segment_that_has_no_ccxi() {
+        use crate::local_ingest::{seal_prose_documents, ProseChunk, ProseDocument};
+
+        let state = test_app_state(1);
+        let data_dir = state.data_dir.clone();
+        for (tenant, text) in [
+            ("acme", "the peregrine falcon is the fastest animal"),
+            ("globex", "kubernetes ingress controllers and routing"),
+        ] {
+            seal_prose_documents(
+                &data_dir,
+                crate::local_ingest::LOCAL_INGEST_SHARD_ID,
+                1,
+                tenant,
+                "corpus",
+                "2026-08-09T00:00:00Z",
+                &[ProseDocument {
+                    doc_id: format!("doc-{tenant}"),
+                    chunks: vec![ProseChunk {
+                        chunk_id: format!("doc-{tenant}::0"),
+                        text: text.to_string(),
+                        dense_vector: None,
+                    }],
+                }],
+                None,
+            )
+            .expect("seal");
+        }
+
+        // Strip acme's BM25 companion: what remains is exactly the shape of a
+        // fact-only segment, which cannot have one at all.
+        let segments = data_dir.join("shards").join("shard-0000").join("segments");
+        let acme_stem = std::fs::read_dir(&segments)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.extension().and_then(|e| e.to_str()) == Some("ccxi")
+                    && corecrux_index::CcxiReader::from_bytes(&std::fs::read(p).unwrap())
+                        .map(|r| {
+                            r.docs
+                                .iter()
+                                .any(|d| d.tenant_hash_full == tenant_hash_xxhash64("acme"))
+                        })
+                        .unwrap_or(false)
+            })
+            .expect("acme .ccxi");
+        std::fs::remove_file(&acme_stem).expect("remove ccxi");
+        let acme_ccxseg = acme_stem.with_extension("ccxseg");
+        assert!(acme_ccxseg.exists());
+
+        state.retrieval_index.write().await.scan_and_load(&segments).unwrap();
+        assert_eq!(
+            state.retrieval_index.read().await.segments_without_ccxi().len(),
+            1,
+            "discovered despite having no .ccxi"
+        );
+
+        let (status, body) = forget(&state, serde_json::json!({ "tenant_ids": ["acme"], "reclaim": true })).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let row = &body["per_tenant"][0];
+        assert_eq!(row["docs_masked"], 1, "attributed from the segment's frame headers");
+        assert_eq!(row["segments_reclaimed"], 1);
+        assert_eq!(row["mixed_segments_retained"], 0);
+        assert_eq!(body["unattributable_segments"], 0);
+
+        assert!(!acme_ccxseg.exists(), "the subject's segment must actually be gone");
+        // The co-tenant's segment and its companion are untouched.
+        let remaining = segment_files(&segments);
+        assert!(
+            remaining.iter().any(|n| n.ends_with(".ccxi")),
+            "globex's companion should survive: {remaining:?}"
+        );
     }
 
     #[tokio::test]

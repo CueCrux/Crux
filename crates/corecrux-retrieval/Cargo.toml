@@ -13,8 +13,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 xxhash-rust = { workspace = true, features = ["xxh64"] }
 
+corecrux-frame = { path = "../corecrux-frame" }
 corecrux-index = { path = "../corecrux-index" }
 corecrux-projections = { path = "../corecrux-projections" }
+corecrux-segment = { path = "../corecrux-segment" }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

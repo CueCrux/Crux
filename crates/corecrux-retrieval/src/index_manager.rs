@@ -10,11 +10,13 @@
 //! - Warm: older segments, held in host RAM
 //! - Cold: superseded segments on NVMe, loaded on demand
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use corecrux_index::CcxiReader;
+
+use crate::segment_tenants::{read_segment_membership, SegmentMembership};
 
 /// Memory tier for a loaded segment index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,12 +48,22 @@ pub struct ForgottenTenant {
     pub segments_reclaimed: usize,
 }
 
-/// Manages loaded .ccxi indexes across multiple sealed segments.
+/// Manages sealed segments: their `.ccxi` indexes where one exists, and their
+/// identity and tenant membership where one does not.
+///
+/// Discovery keys off `.ccxseg` — the segment file itself — not off `.ccxi`.
+/// A `.ccxi` is a *companion*: a fact-only segment cannot have one (there is no
+/// prose for a BM25-over-text extractor to index), and keying discovery off it
+/// left such segments permanently invisible **and permanently un-erasable**.
 pub struct IndexManager {
-    /// segment_seq → loaded CcxiReader
+    /// segment_seq → discovered segment
     segments: BTreeMap<u64, LoadedSegment>,
     /// tenant_hash → erasure record. Consulted on every tenant-scoped query.
     forgotten: BTreeMap<u64, ForgottenTenant>,
+    /// Directories handed to [`IndexManager::scan_and_load`], re-read by
+    /// [`IndexManager::refresh_from_disk`] so erasure enumerates from disk
+    /// rather than trusting whatever the last scan happened to load.
+    scanned_dirs: BTreeSet<PathBuf>,
     /// Maximum bytes of index data to keep in hot tier (memory budget).
     hot_budget_bytes: usize,
     /// Current hot tier usage in bytes.
@@ -63,8 +75,24 @@ pub struct IndexManager {
 }
 
 struct LoadedSegment {
-    reader: CcxiReader,
-    /// Source `.ccxi` path. Empty for segments loaded from bytes.
+    /// `None` for a segment with no `.ccxi` companion — discovered, attributable
+    /// and erasable, but contributing nothing to the BM25 lane.
+    reader: Option<CcxiReader>,
+    /// Tenant membership read from the segment's own frame headers, derived on
+    /// first use and only for segments with no `.ccxi` to read it from.
+    ///
+    /// Lazy on purpose: deriving it means reading the whole segment, and
+    /// discovery runs on the ingest path after every seal. Doing it eagerly
+    /// would put a full re-read of a just-sealed segment into that path — and
+    /// nothing there needs the answer. Attribution is an admin-time question, so
+    /// it is paid for at admin time.
+    ///
+    /// The inner `None` is "could not be read", which is *not* the same as
+    /// empty; see [`TenantFootprint::unattributable_segments`].
+    membership: std::sync::OnceLock<Option<SegmentMembership>>,
+    /// A path in the segment's on-disk file group; only the stem is load-bearing
+    /// (`.ccxseg` when discovered by scan, `.ccxi` when loaded directly). Empty
+    /// for segments loaded from bytes.
     path: PathBuf,
     tier: IndexTier,
     size_bytes: usize,
@@ -72,11 +100,55 @@ struct LoadedSegment {
     promoted_at: Option<Instant>,
 }
 
+impl LoadedSegment {
+    /// Tenant membership from the segment's frames, reading it if this is the
+    /// first ask. `None` when the segment could not be read.
+    fn membership(&self) -> Option<&SegmentMembership> {
+        self.membership
+            .get_or_init(|| {
+                if self.path.as_os_str().is_empty() {
+                    return None;
+                }
+                match read_segment_membership(&self.path) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        tracing::error!(
+                            path = %self.path.display(),
+                            error = %e,
+                            "segment-membership-unreadable: segment is discovered but cannot be \
+                             attributed to a tenant"
+                        );
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// Documents in the segment, from whichever source attributes it.
+    fn docs_total(&self) -> usize {
+        match &self.reader {
+            Some(reader) => reader.docs.len(),
+            None => self.membership().map_or(0, |m| m.docs_total),
+        }
+    }
+
+    /// Documents belonging to `tenant_hash`, or `None` when the segment cannot
+    /// be attributed at all.
+    fn docs_for_tenant(&self, tenant_hash: u64) -> Option<usize> {
+        match &self.reader {
+            Some(reader) => Some(reader.docs.iter().filter(|d| d.tenant_hash_full == tenant_hash).count()),
+            None => self.membership().map(|m| m.docs_for(tenant_hash)),
+        }
+    }
+}
+
 impl IndexManager {
     pub fn new() -> Self {
         Self {
             segments: BTreeMap::new(),
             forgotten: BTreeMap::new(),
+            scanned_dirs: BTreeSet::new(),
             hot_budget_bytes: 4 * 1024 * 1024 * 1024, // 4GB default
             hot_bytes: 0,
             min_residency: std::time::Duration::from_secs(60),
@@ -117,11 +189,45 @@ impl IndexManager {
         self.segments.insert(
             seq,
             LoadedSegment {
-                reader,
+                reader: Some(reader),
+                membership: std::sync::OnceLock::new(),
                 path: path.to_path_buf(),
                 tier,
                 size_bytes: size,
                 promoted_at,
+            },
+        );
+        Ok(seq)
+    }
+
+    /// Register a sealed segment that carries no `.ccxi` companion.
+    ///
+    /// It serves no BM25 lane, so it costs no hot-tier budget and stays `Cold`.
+    /// What it gains is identity and attribution: it appears in
+    /// [`IndexManager::tenant_footprint`] and can be reclaimed.
+    ///
+    /// A segment whose contents cannot be read is still registered, with no
+    /// membership. Refusing to register it would put it back where this change
+    /// found it — invisible and un-erasable — so instead it is visible and
+    /// reported as unattributable, which is loud rather than silent.
+    ///
+    /// Only the segment's 4 KiB header is read here. Its tenant membership is
+    /// derived on first use; see [`LoadedSegment::membership`].
+    pub fn register_segment_without_ccxi(&mut self, ccxseg_path: &Path) -> crate::Result<u64> {
+        let Some(seq) = segment_seq_of(ccxseg_path) else {
+            return Err(crate::RetrievalError::Internal {
+                msg: format!("cannot determine segment_seq for {}", ccxseg_path.display()),
+            });
+        };
+        self.segments.insert(
+            seq,
+            LoadedSegment {
+                reader: None,
+                membership: std::sync::OnceLock::new(),
+                path: ccxseg_path.to_path_buf(),
+                tier: IndexTier::Cold,
+                size_bytes: 0,
+                promoted_at: None,
             },
         );
         Ok(seq)
@@ -135,7 +241,8 @@ impl IndexManager {
         self.segments.insert(
             seq,
             LoadedSegment {
-                reader,
+                reader: Some(reader),
+                membership: std::sync::OnceLock::new(),
                 path: PathBuf::new(),
                 tier: IndexTier::Hot,
                 size_bytes: size,
@@ -147,8 +254,12 @@ impl IndexManager {
     }
 
     /// Get all loaded readers (for multi-segment scoring).
+    ///
+    /// Segments with no `.ccxi` are absent by construction — they have no doc
+    /// table to score against. They are still discovered and erasable; see
+    /// [`IndexManager::segment_seqs`].
     pub fn readers(&self) -> Vec<&CcxiReader> {
-        self.segments.values().map(|s| &s.reader).collect()
+        self.segments.values().filter_map(|s| s.reader.as_ref()).collect()
     }
 
     /// Get readers filtered by tier.
@@ -156,18 +267,33 @@ impl IndexManager {
         self.segments
             .values()
             .filter(|s| s.tier == tier)
-            .map(|s| &s.reader)
+            .filter_map(|s| s.reader.as_ref())
             .collect()
     }
 
-    /// Total number of documents across all loaded segments.
+    /// Total number of documents across all discovered segments.
     pub fn total_docs(&self) -> usize {
-        self.segments.values().map(|s| s.reader.docs.len()).sum()
+        self.segments.values().map(LoadedSegment::docs_total).sum()
     }
 
-    /// Number of loaded segments.
+    /// Number of discovered segments, `.ccxi` or not.
     pub fn segment_count(&self) -> usize {
         self.segments.len()
+    }
+
+    /// Every discovered segment's sequence, ascending — including those with no
+    /// `.ccxi`.
+    pub fn segment_seqs(&self) -> Vec<u64> {
+        self.segments.keys().copied().collect()
+    }
+
+    /// Discovered segments carrying no `.ccxi` companion.
+    pub fn segments_without_ccxi(&self) -> Vec<u64> {
+        self.segments
+            .iter()
+            .filter(|(_, s)| s.reader.is_none())
+            .map(|(&seq, _)| seq)
+            .collect()
     }
 
     /// Tier statistics.
@@ -177,12 +303,12 @@ impl IndexManager {
             match seg.tier {
                 IndexTier::Hot => {
                     stats.hot_segments += 1;
-                    stats.hot_docs += seg.reader.docs.len();
+                    stats.hot_docs += seg.docs_total();
                     stats.hot_bytes += seg.size_bytes;
                 }
                 IndexTier::Warm => {
                     stats.warm_segments += 1;
-                    stats.warm_docs += seg.reader.docs.len();
+                    stats.warm_docs += seg.docs_total();
                     stats.warm_bytes += seg.size_bytes;
                 }
                 IndexTier::Cold => {
@@ -194,33 +320,104 @@ impl IndexManager {
         stats
     }
 
-    /// Scan a directory for .ccxi files and load them all.
+    /// Discover a directory's sealed segments and load what each one offers.
+    ///
+    /// Keyed off `.ccxseg`, the segment file itself: present by definition, it
+    /// *is* the segment's identity, and it couples to nothing. A segment with a
+    /// `.ccxi` loads its index as before; one without is registered for
+    /// attribution and erasure.
+    ///
+    /// A `.ccxi` with no `.ccxseg` beside it is still loaded. That is a broken
+    /// on-disk state, but it is one the previous scan served, and refusing it
+    /// here would silently drop a corpus rather than report a problem.
+    ///
+    /// Returns the number of segments newly discovered, or upgraded from
+    /// companion-less to indexed.
     pub fn scan_and_load(&mut self, dir: &Path) -> crate::Result<usize> {
-        let mut count = 0;
+        self.scanned_dirs.insert(dir.to_path_buf());
         if !dir.exists() {
             return Ok(0);
         }
+
+        // One pass to group the directory by segment stem, so a segment is
+        // considered once with everything it has, rather than once per file.
+        let mut groups: BTreeMap<String, SegmentGroup> = BTreeMap::new();
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().is_some_and(|e| e == "ccxi") {
-                // Skip if already loaded
-                if let Some(seq_str) = path.file_stem().and_then(|s| s.to_str()) {
-                    if let Some(seq) = extract_segment_seq(seq_str) {
-                        if self.segments.contains_key(&seq) {
-                            continue;
-                        }
-                    }
-                }
-                match self.load_ccxi(&path) {
-                    Ok(_) => count += 1,
-                    Err(e) => {
-                        tracing::warn!("failed to load .ccxi {:?}: {}", path, e);
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
+                continue;
+            };
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("ccxseg") => groups.entry(stem).or_default().ccxseg = Some(path),
+                Some("ccxi") => groups.entry(stem).or_default().ccxi = Some(path),
+                _ => {}
+            }
+        }
+
+        let mut count = 0;
+        let mut without_ccxi = 0;
+        for (stem, group) in groups {
+            // Cheap pre-check against the filename before any file is read.
+            if let Some(seq) = extract_segment_seq(&stem) {
+                if let Some(existing) = self.segments.get(&seq) {
+                    // Already known — but a segment scanned in the window
+                    // between the `.ccxseg` rename and the companion write is
+                    // registered without a reader, and skipping it forever
+                    // would cost it its BM25 lane permanently. Revisit it once
+                    // its `.ccxi` appears.
+                    if existing.reader.is_some() || group.ccxi.is_none() {
+                        continue;
                     }
                 }
             }
+            match (&group.ccxi, &group.ccxseg) {
+                (Some(ccxi), _) => match self.load_ccxi(ccxi) {
+                    Ok(_) => count += 1,
+                    Err(e) => tracing::warn!("failed to load .ccxi {:?}: {}", ccxi, e),
+                },
+                (None, Some(ccxseg)) => match self.register_segment_without_ccxi(ccxseg) {
+                    Ok(_) => {
+                        count += 1;
+                        without_ccxi += 1;
+                    }
+                    Err(e) => tracing::warn!("failed to register segment {:?}: {}", ccxseg, e),
+                },
+                (None, None) => {}
+            }
+        }
+        if without_ccxi > 0 {
+            // These are discovered and erasable but serve no BM25 lane. Saying
+            // so is what stops it being diagnosed later as missing recall.
+            tracing::warn!(
+                segments = without_ccxi,
+                dir = %dir.display(),
+                "segments-without-ccxi: discovered and erasable, but they contribute no BM25 lane"
+            );
         }
         Ok(count)
+    }
+
+    /// Re-read every directory ever passed to [`IndexManager::scan_and_load`].
+    ///
+    /// Erasure calls this first so it enumerates from **disk**, not from
+    /// whatever the last scan happened to load: a segment sealed since then is
+    /// otherwise absent from the loaded set, and `reclaim_segment` would report
+    /// `Ok(0)` and leave its files in place.
+    ///
+    /// Returns the number of segments newly discovered. A directory that has
+    /// since become unreadable is logged and skipped rather than failing the
+    /// refresh — a partial refresh still erases more than no refresh.
+    pub fn refresh_from_disk(&mut self) -> usize {
+        let dirs: Vec<PathBuf> = self.scanned_dirs.iter().cloned().collect();
+        let mut found = 0;
+        for dir in dirs {
+            match self.scan_and_load(&dir) {
+                Ok(n) => found += n,
+                Err(e) => tracing::warn!(?dir, error = %e, "segment-refresh-scan-failed"),
+            }
+        }
+        found
     }
 
     /// Rebalance tiers based on hot tier memory budget.
@@ -236,6 +433,14 @@ impl IndexManager {
         let seqs: Vec<u64> = self.segments.keys().rev().copied().collect();
         for seq in seqs {
             if let Some(seg) = self.segments.get_mut(&seq) {
+                // A segment with no `.ccxi` holds no index in memory, so it is
+                // not a tier candidate: promoting it would report hot segments
+                // that cost nothing and serve nothing.
+                if seg.reader.is_none() {
+                    seg.tier = IndexTier::Cold;
+                    seg.promoted_at = None;
+                    continue;
+                }
                 if self.hot_bytes + seg.size_bytes <= self.hot_budget_bytes {
                     if seg.tier != IndexTier::Hot {
                         seg.promoted_at = Some(now);
@@ -291,6 +496,12 @@ pub struct TenantFootprint {
     /// Segments the tenant shares with at least one other tenant. These cannot
     /// be reclaimed by deleting the file group.
     pub mixed_segments: usize,
+    /// Segments that were discovered on disk but could not be attributed to any
+    /// tenant, because neither a `.ccxi` doc table nor readable frame headers
+    /// were available. A non-zero count means an erasure cannot be claimed
+    /// complete: these are excluded from the reclaim set, since deleting a
+    /// segment you cannot attribute risks a co-tenant's data.
+    pub unattributable_segments: usize,
 }
 
 /// File name of the erasure mask inside the daemon's data dir.
@@ -394,13 +605,13 @@ impl IndexManager {
         let mut out = TenantFootprint::default();
         let mut hits: Vec<(u64, usize, usize, Option<PathBuf>)> = Vec::new();
         for (&seq, seg) in &self.segments {
-            let docs_total = seg.reader.docs.len();
-            let docs_tenant = seg
-                .reader
-                .docs
-                .iter()
-                .filter(|d| d.tenant_hash_full == tenant_hash)
-                .count();
+            let docs_total = seg.docs_total();
+            let Some(docs_tenant) = seg.docs_for_tenant(tenant_hash) else {
+                // Discovered but unreadable: it may or may not hold this
+                // tenant's data, and guessing either way is wrong. Report it.
+                out.unattributable_segments += 1;
+                continue;
+            };
             if docs_tenant == 0 {
                 continue;
             }
@@ -510,6 +721,55 @@ impl std::fmt::Debug for IndexManager {
 }
 
 /// Extract segment_seq from a filename like "seg-00000000000000000001-abcdef.ccxi"
+/// The files of one segment found by a directory scan, grouped by stem.
+#[derive(Default)]
+struct SegmentGroup {
+    ccxseg: Option<PathBuf>,
+    ccxi: Option<PathBuf>,
+}
+
+/// The leading `SEGMENT_HEADER_LEN` bytes of a segment file, or `None` if it is
+/// unreadable or shorter than a header.
+fn read_segment_header_bytes(ccxseg_path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut buf = vec![0u8; corecrux_segment::SEGMENT_HEADER_LEN];
+    let mut file = std::fs::File::open(ccxseg_path).ok()?;
+    file.read_exact(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// A segment's sequence, preferring the sealed header over the filename.
+///
+/// The header is authoritative — the filename is a convention, and a renamed or
+/// hand-copied file would otherwise be registered under the wrong sequence and
+/// erased in someone else's place. The filename is the fallback so a segment
+/// whose header will not decode is still discovered rather than dropped.
+fn segment_seq_of(ccxseg_path: &Path) -> Option<u64> {
+    let from_name = ccxseg_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(extract_segment_seq);
+
+    // Header only — discovery runs after every seal, so it must not read a
+    // whole segment to learn its number.
+    let from_header = read_segment_header_bytes(ccxseg_path)
+        .and_then(|bytes| corecrux_segment::decode_segment_header_v1(&bytes).ok())
+        .map(|header| header.segment_seq);
+
+    if let (Some(name), Some(header)) = (from_name, from_header) {
+        if name != header {
+            tracing::warn!(
+                path = ?ccxseg_path,
+                filename_seq = name,
+                header_seq = header,
+                "segment-seq-mismatch: trusting the sealed header"
+            );
+        }
+    }
+    from_header.or(from_name)
+}
+
 fn extract_segment_seq(stem: &str) -> Option<u64> {
     let parts: Vec<&str> = stem.split('-').collect();
     if parts.len() >= 2 {

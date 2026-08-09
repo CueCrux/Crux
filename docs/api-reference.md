@@ -240,6 +240,18 @@ Two layers:
   restore-from-backup only. Segments shared with another tenant are never deleted;
   they stay masked and are reported as `mixed_segments_retained`.
 
+Both routes re-read the shard directories from disk before answering, so a
+segment sealed since the last scan is inside the blast radius rather than
+silently outside it. Segments are found by their `.ccxseg` file, not by a
+companion: a segment holding fact records has no `.ccxi` to key off, and it is
+still erasable. Tenant membership comes from the `.ccxi` doc table where one
+exists and from the segment's own frame headers where it does not.
+
+A segment that is on disk but cannot be read at all is reported as
+`unattributable_segments` on both routes, and is neither masked nor reclaimed —
+deleting a segment whose owner cannot be established risks a co-tenant's data.
+A non-zero count means an erasure is incomplete and needs an operator.
+
 Scope is the **retrieval corpus only**. A tenant's facts, sessions and activity
 rows are untouched, so the response says `corpus_erased`, not `tenant_forgotten`.
 Each tenant's erasure mints a signed governance receipt carrying counts, the
