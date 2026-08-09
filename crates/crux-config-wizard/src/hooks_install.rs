@@ -282,7 +282,11 @@ fn resolve_python3(path_var: Option<&OsStr>, home: Option<&OsStr>) -> Option<Pat
             p.is_file()
         }
     }
-    let on_path = path_var.and_then(|paths| std::env::split_paths(paths).map(|d| d.join("python3")).find(|p| runnable(p)));
+    let on_path = path_var.and_then(|paths| {
+        std::env::split_paths(paths)
+            .map(|d| d.join("python3"))
+            .find(|p| runnable(p))
+    });
     on_path.or_else(|| {
         home.map(|h| Path::new(h).join(".local/bin/python3"))
             .filter(|p| runnable(p))
@@ -1028,7 +1032,10 @@ mod tests {
         // And with neither leg satisfiable, it stays absent rather than handing
         // back a name the caller would fail to exec.
         assert_eq!(
-            resolve_python3(Some(empty.as_os_str()), Some(tests::tmp().join("empty-home").as_os_str())),
+            resolve_python3(
+                Some(empty.as_os_str()),
+                Some(tests::tmp().join("empty-home").as_os_str())
+            ),
             None
         );
     }
