@@ -11,7 +11,7 @@ use crate::footer::decode_segment_footer_v1;
 use crate::header::decode_segment_header_v1;
 use crate::toc::{compute_toc_payload_hash, decode_toc_entry_v1, decode_toc_header_v1};
 use crate::trailer::decode_trailer_index_v1;
-use crate::util::{is_sorted_toc, read_u64};
+use crate::util::{is_sorted_toc, read_u16, read_u32, read_u64};
 use crate::{
     Result, SegmentError, SegmentFooterV1, SegmentHeaderV1, TocEntryV1, TocHeaderV1, FRAME_MAGIC_CRX1,
     RECORD_BLOCK_CODEC_LZ4_V1, RECORD_BLOCK_CODEC_NONE_V1, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN, TOC_ENTRY_LEN,
@@ -161,24 +161,27 @@ pub struct SegmentFrameHeaderV1 {
 /// (`SEGMENT_HEADER_LEN + record_off`) into the stream this returns, so the two
 /// must be produced together.
 fn reassemble_record_stream_v1(bytes: &[u8], toc_header: &TocHeaderV1, footer: &SegmentFooterV1) -> Result<Vec<u8>> {
+    // Bounds come from `.get`, not from hand-written comparisons. `decode_segment_v1`
+    // has already established that these ranges lie inside the buffer, so a
+    // comparison here is a guard no input can reach — unverifiable by a test and
+    // therefore not worth writing. `.get` keeps the same protection against a
+    // future where that validation changes, without the untestable branch.
     let toc_off = footer.toc_offset as usize;
     let toc_len = footer.toc_len as usize;
     let toc_end = toc_off.checked_add(toc_len).ok_or(SegmentError::BufferTooSmall)?;
-    if toc_end > bytes.len() {
-        return Err(SegmentError::BufferTooSmall);
-    }
-    let trailer = decode_trailer_index_v1(&bytes[toc_off..toc_end], toc_header)?;
+    let toc_area = bytes.get(toc_off..toc_end).ok_or(SegmentError::BufferTooSmall)?;
+    let trailer = decode_trailer_index_v1(toc_area, toc_header)?;
 
     let record_off = footer.record_area_offset as usize;
     let record_len = footer.record_area_len as usize;
     let record_end = record_off.checked_add(record_len).ok_or(SegmentError::BufferTooSmall)?;
-    if record_end > bytes.len() {
-        return Err(SegmentError::BufferTooSmall);
-    }
 
     // No trailer index (pre-Phase-5 segment): the record area *is* the stream.
     let Some(trailer) = trailer.filter(|t| !t.blocks.is_empty()) else {
-        return Ok(bytes[record_off..record_end].to_vec());
+        return bytes
+            .get(record_off..record_end)
+            .map(<[u8]>::to_vec)
+            .ok_or(SegmentError::BufferTooSmall);
     };
 
     let mut blocks = trailer.blocks;
@@ -189,10 +192,7 @@ fn reassemble_record_stream_v1(bytes: &[u8], toc_header: &TocHeaderV1, footer: &
         let end = start
             .checked_add(block.compressed_len as usize)
             .ok_or(SegmentError::BufferTooSmall)?;
-        if end > bytes.len() {
-            return Err(SegmentError::BufferTooSmall);
-        }
-        let stored = &bytes[start..end];
+        let stored = bytes.get(start..end).ok_or(SegmentError::BufferTooSmall)?;
         let plain =
             match block.codec {
                 RECORD_BLOCK_CODEC_NONE_V1 => stored.to_vec(),
@@ -230,8 +230,9 @@ fn reassemble_record_stream_v1(bytes: &[u8], toc_header: &TocHeaderV1, footer: &
 /// unsealed file is an error rather than a short list — a caller attributing
 /// data to a tenant must not mistake "could not read it" for "holds nothing".
 ///
-/// Handles both record-block codecs and the 4 KiB block padding; see
-/// [`reassemble_record_stream_v1`].
+/// Handles both record-block codecs and the 4 KiB block padding: the record
+/// area on disk is not the logical frame stream, so it is reassembled from the
+/// trailer's block index before any TOC offset is applied to it.
 pub fn decode_segment_frame_headers_v1(bytes: &[u8]) -> Result<Vec<SegmentFrameHeaderV1>> {
     let (_header, toc_header, entries, footer) = decode_segment_v1(bytes)?;
     let stream = reassemble_record_stream_v1(bytes, &toc_header, &footer)?;
@@ -247,30 +248,25 @@ pub fn decode_segment_frame_headers_v1(bytes: &[u8]) -> Result<Vec<SegmentFrameH
         let frame_end = record_off
             .checked_add(entry.frame_len as usize)
             .ok_or(SegmentError::BufferTooSmall)?;
-        if frame_end > stream.len() {
-            return Err(SegmentError::BufferTooSmall);
-        }
-        let frame = &stream[record_off..frame_end];
+        let frame = stream.get(record_off..frame_end).ok_or(SegmentError::BufferTooSmall)?;
+
         // Frame prologue: magic(4) | ver(2) | header_len(2) | payload_len(4).
-        if frame.len() < 12 {
-            return Err(SegmentError::BufferTooSmall);
-        }
-        let magic = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]);
+        // `read_u32`/`read_u16` are the crate's bounds-checked readers, so a
+        // frame shorter than its prologue fails here rather than needing a
+        // length guard of its own.
+        let magic = read_u32(frame, 0)?;
         if magic != FRAME_MAGIC_CRX1 {
             return Err(SegmentError::InvalidMagic {
                 expected: FRAME_MAGIC_CRX1,
                 actual: magic,
             });
         }
-        let header_len = u16::from_le_bytes([frame[6], frame[7]]) as usize;
+        let header_len = read_u16(frame, 6)? as usize;
         let header_end = 12usize.checked_add(header_len).ok_or(SegmentError::BufferTooSmall)?;
-        if header_end > frame.len() {
-            return Err(SegmentError::BufferTooSmall);
-        }
         out.push(SegmentFrameHeaderV1 {
             stream_hash: entry.stream_hash,
             seq: entry.seq,
-            header_bytes: frame[12..header_end].to_vec(),
+            header_bytes: frame.get(12..header_end).ok_or(SegmentError::BufferTooSmall)?.to_vec(),
         });
     }
     Ok(out)

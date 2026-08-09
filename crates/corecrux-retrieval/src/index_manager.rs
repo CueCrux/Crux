@@ -211,8 +211,10 @@ impl IndexManager {
     /// found it — invisible and un-erasable — so instead it is visible and
     /// reported as unattributable, which is loud rather than silent.
     ///
-    /// Only the segment's 4 KiB header is read here. Its tenant membership is
-    /// derived on first use; see [`LoadedSegment::membership`].
+    /// Only the segment's 4 KiB header is read here — discovery runs on the
+    /// ingest path after every seal, so it must not read a whole segment.
+    /// Tenant membership is derived from the segment's frames on first use, by
+    /// [`IndexManager::tenant_footprint`].
     pub fn register_segment_without_ccxi(&mut self, ccxseg_path: &Path) -> crate::Result<u64> {
         let Some(seq) = segment_seq_of(ccxseg_path) else {
             return Err(crate::RetrievalError::Internal {
