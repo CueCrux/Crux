@@ -833,6 +833,70 @@ mod tests {
         xxhash_rust::xxh64::xxh64(tenant_id.as_bytes(), 0)
     }
 
+    /// The `.ccxseg` frame headers and the `.ccxi` doc table must attribute a
+    /// segment identically.
+    ///
+    /// This is what licenses reading tenancy from the segment when a `.ccxi` is
+    /// absent (M4). If the two sources could disagree, the fallback would not be
+    /// a fallback — it would be a second, quietly different answer to "whose
+    /// data is this", on the path that decides what an erasure deletes.
+    #[test]
+    #[serial_test::serial]
+    fn segment_frame_headers_attribute_the_same_tenants_as_the_ccxi() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+
+        for (tenant, text) in [
+            ("tenant-parity-a", "the peregrine falcon is the fastest animal"),
+            ("tenant-parity-b", "kubernetes ingress controllers and routing"),
+        ] {
+            seal_prose_documents(
+                data_dir,
+                0,
+                1,
+                tenant,
+                "corpus",
+                "2026-08-09T00:00:00Z",
+                &[ProseDocument {
+                    doc_id: format!("doc-{tenant}"),
+                    chunks: vec![ProseChunk {
+                        chunk_id: format!("doc-{tenant}::0"),
+                        text: text.to_string(),
+                        dense_vector: None,
+                    }],
+                }],
+                None,
+            )
+            .expect("seal");
+        }
+
+        let segments_dir = data_dir.join("shards").join("shard-0000").join("segments");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&segments_dir).expect("read segments dir") {
+            let path = entry.expect("entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("ccxseg") {
+                continue;
+            }
+            let ccxi_path = path.with_extension("ccxi");
+            let ccxi = corecrux_index::CcxiReader::from_bytes(&std::fs::read(&ccxi_path).expect("read ccxi"))
+                .expect("parse ccxi");
+
+            // What the `.ccxi` doc table says.
+            let mut from_ccxi: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+            for doc in &ccxi.docs {
+                *from_ccxi.entry(doc.tenant_hash_full).or_insert(0) += 1;
+            }
+
+            // What the segment's own frame headers say.
+            let membership = corecrux_retrieval::read_segment_membership(&path).expect("membership");
+
+            assert_eq!(membership.tenants, from_ccxi, "{path:?}");
+            assert_eq!(membership.docs_total, ccxi.docs.len(), "{path:?}");
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "both sealed segments must have been compared");
+    }
+
     /// M0 gate: seal a 1-doc / 1-chunk segment to a temp data_dir entirely on CPU
     /// (no `DataPlaneStore`), then BM25-retrieve it via the ordinary retrieval path.
     #[test]

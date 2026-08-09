@@ -13,10 +13,12 @@ pub mod dense;
 pub mod fused;
 pub mod graph;
 pub mod index_manager;
+pub mod segment_tenants;
 
 pub use dense::{CosineDenseProvider, DenseProvider};
 pub use graph::{apply_graph_boost, EntityMatch, GraphParams, RelationEdge};
 pub use index_manager::{IndexManager, IndexTier, TierStats};
+pub use segment_tenants::{read_segment_membership, SegmentMembership};
 
 use thiserror::Error;
 

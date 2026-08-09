@@ -143,4 +143,4 @@ pub use builder::{build_segment_v1, build_segment_v1_with_block_codec};
 pub use sealer::{seal_segment_v1_from_record_area, seal_segment_v1_from_record_area_with_block_codec};
 
 // Decoder
-pub use decoder::decode_segment_v1;
+pub use decoder::{decode_segment_frame_headers_v1, decode_segment_v1, SegmentFrameHeaderV1};
