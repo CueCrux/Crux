@@ -54,7 +54,10 @@ ureq = { version = "2.12.1", default-features = false, features = ["tls", "json"
 url = { workspace = true }
 uuid = { workspace = true }
 parking_lot = "0.12.3"
-# rand_core 0.6 matches p256 0.13's CryptoRng trait. We only use OsRng.
+# Raw-bytes RNG for `audit_signing_key`'s seed only (`OsRng.fill_bytes`). It no
+# longer has to match p256's `CryptoRng`: since p256 0.14 every key here is built
+# via the `Generate` trait's ambient system RNG, so no `rand_core` type crosses
+# into p256. That decoupling is why a p256 bump need not drag this version along.
 rand_core = { version = "0.6.4", features = ["std", "getrandom"] }
 ring = "0.17.14"
 

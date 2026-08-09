@@ -48,6 +48,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use p256::ecdsa::signature::hazmat::PrehashSigner;
 use p256::ecdsa::SigningKey as P256SigningKey;
+use p256::elliptic_curve::Generate as _;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use p256::SecretKey;
 use parking_lot::RwLock;
@@ -320,7 +321,10 @@ impl VaultPkiX509Signer {
     /// CSR, POST to Vault, parse the returned chain, write key + chain
     /// to disk atomically, and swap the in-memory state.
     pub fn regenerate_leaf(&self) -> Result<()> {
-        let secret = SecretKey::random(&mut rand_core::OsRng);
+        // `Generate::generate()` draws from the system's ambient CSPRNG, which is
+        // what `OsRng` was here. Both panic if the OS RNG itself fails, so the
+        // failure behaviour of this path is unchanged by the p256 0.14 bump.
+        let secret = SecretKey::generate();
         let key_pkcs8_pem = secret
             .to_pkcs8_pem(LineEnding::LF)
             .map_err(|e| VaultPkiSignerError::KeyEncoding(e.to_string()))?
