@@ -26,6 +26,7 @@
 //! saves it via its own `login` module before delegating here), which keeps this
 //! module free of network and credential concerns and unit-testable in a tempdir.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// Boxed error type for the install path.
@@ -247,15 +248,29 @@ fn write_exec_on_change(path: &Path, body: &str) -> Result<(), DynErr> {
     write_exec(path, body)
 }
 
-/// Is `python3` findable **and runnable** (PATH or `~/.local/bin`)? Gates the
-/// Python banner stack; absent ⇒ fall back to the legacy wrapper `banner` mode.
+/// Where is `python3`, if it is findable **and runnable** (PATH or
+/// `~/.local/bin`)? Gates the Python banner stack; `None` ⇒ fall back to the
+/// legacy wrapper `banner` mode.
 ///
 /// Executability is checked, not just existence. A PATH entry holding a
 /// non-executable file named `python3` used to satisfy this, after which the
 /// caller's `Command::new("python3")` failed with `PermissionDenied` — the guard
 /// said "present", the exec said otherwise. That is exactly what happened on CI
 /// runner `runner-hel1-4` on 2026-08-08.
-fn python3_present() -> bool {
+///
+/// The resolved path is returned rather than a bare bool because the two legs
+/// are not interchangeable at exec time: a hit via the `~/.local/bin` fallback
+/// is *not* reachable by a bare `Command::new("python3")`, which searches PATH
+/// only. Returning a bool let a caller pair "present" with a bare-name exec and
+/// get `NotFound` — the same guard-vs-exec split as above, one leg over. Callers
+/// that exec must use this path; `python3_present` is for gating alone.
+fn python3_path() -> Option<PathBuf> {
+    resolve_python3(std::env::var_os("PATH").as_deref(), std::env::var_os("HOME").as_deref())
+}
+
+/// The resolution itself, over explicit `PATH`/`HOME` so it is testable without
+/// mutating process env (which is `unsafe` and racy across parallel tests).
+fn resolve_python3(path_var: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
     fn runnable(p: &Path) -> bool {
         #[cfg(unix)]
         {
@@ -267,8 +282,17 @@ fn python3_present() -> bool {
             p.is_file()
         }
     }
-    std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|d| runnable(&d.join("python3"))))
-        || std::env::var_os("HOME").is_some_and(|h| runnable(&Path::new(&h).join(".local/bin/python3")))
+    let on_path = path_var.and_then(|paths| std::env::split_paths(paths).map(|d| d.join("python3")).find(|p| runnable(p)));
+    on_path.or_else(|| {
+        home.map(|h| Path::new(h).join(".local/bin/python3"))
+            .filter(|p| runnable(p))
+    })
+}
+
+/// Is `python3` findable and runnable? See [`python3_path`] — callers that go on
+/// to exec it must use that path, not the bare name.
+fn python3_present() -> bool {
+    python3_path().is_some()
 }
 
 /// Command substrings that mark a settings.json hook group as Crux-managed. A
@@ -976,17 +1000,80 @@ mod tests {
         assert!(saw_executable, "a 0755 python3 must count as present");
     }
 
+    /// A hit via the `~/.local/bin` fallback must come back as its full path.
+    /// It reported only "present" before, and the caller then exec'd the bare
+    /// name — which searches PATH, where this interpreter is *not*. That is the
+    /// `run python3: NotFound` that failed Coverage on the runner whose
+    /// `$HOME/.local/bin` is off PATH (PR #682, 2026-08-09).
+    #[cfg(unix)]
+    #[test]
+    fn resolve_python3_returns_the_fallback_path_not_just_presence() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tests::tmp();
+        let bin = home.join(".local/bin");
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        let py = bin.join("python3");
+        std::fs::write(&py, "#!/bin/sh\n").expect("write python3");
+        std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).expect("chmod 755");
+
+        // An empty PATH cannot resolve `python3`; only the HOME leg can.
+        let empty = std::env::join_paths([tests::tmp().join("no-python-here")]).expect("join_paths");
+        let found = resolve_python3(Some(empty.as_os_str()), Some(home.as_os_str()));
+        assert_eq!(
+            found.as_deref(),
+            Some(py.as_path()),
+            "the fallback interpreter must resolve to its full path, since a bare `python3` would not find it"
+        );
+
+        // And with neither leg satisfiable, it stays absent rather than handing
+        // back a name the caller would fail to exec.
+        assert_eq!(
+            resolve_python3(Some(empty.as_os_str()), Some(tests::tmp().join("empty-home").as_os_str())),
+            None
+        );
+    }
+
+    /// PATH wins when both legs resolve: that is the interpreter a bare-name
+    /// exec would have picked, so preferring it keeps behaviour unchanged where
+    /// the old bool was already correct.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_python3_prefers_path_over_the_home_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tests::tmp();
+        let home_bin = home.join(".local/bin");
+        std::fs::create_dir_all(&home_bin).expect("home bin");
+        let home_py = home_bin.join("python3");
+        std::fs::write(&home_py, "#!/bin/sh\n").expect("write home python3");
+        std::fs::set_permissions(&home_py, std::fs::Permissions::from_mode(0o755)).expect("chmod 755");
+
+        let path_dir = tests::tmp();
+        std::fs::create_dir_all(&path_dir).expect("path dir");
+        let path_py = path_dir.join("python3");
+        std::fs::write(&path_py, "#!/bin/sh\n").expect("write path python3");
+        std::fs::set_permissions(&path_py, std::fs::Permissions::from_mode(0o755)).expect("chmod 755");
+
+        let path_var = std::env::join_paths([path_dir.as_path()]).expect("join_paths");
+        assert_eq!(
+            resolve_python3(Some(path_var.as_os_str()), Some(home.as_os_str())).as_deref(),
+            Some(path_py.as_path())
+        );
+    }
+
     #[test]
     fn coord_hook_selftest_passes() {
-        if !python3_present() {
+        // Exec the *resolved* interpreter: a `~/.local/bin/python3` that is not
+        // on PATH is "present" but not reachable by bare name, which is how this
+        // test failed on the coverage runner (`run python3: NotFound`).
+        let Some(python3) = python3_path() else {
             eprintln!("python3 absent — skipping coord selftest");
             return;
-        }
+        };
         let dir = tests::tmp();
         std::fs::create_dir_all(&dir).expect("tmp dir");
         let script = dir.join("crux-coord.py");
         std::fs::write(&script, COORD_PY).expect("write hook");
-        let out = std::process::Command::new("python3")
+        let out = std::process::Command::new(&python3)
             .arg(&script)
             .arg("selftest")
             .output()
