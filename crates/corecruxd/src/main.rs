@@ -30,6 +30,7 @@ mod attention;
 mod auth;
 mod code_intel;
 mod codegraph_fusion;
+mod companion_attestation;
 mod config;
 mod console_index;
 mod consolidation_scheduler;

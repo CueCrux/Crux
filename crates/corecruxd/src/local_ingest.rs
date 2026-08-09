@@ -275,6 +275,32 @@ pub fn seal_prose_documents(
         }
     }
 
+    // Self-sign whatever companions this seal produced, so a locally-built
+    // segment resolves to provenance `local` rather than `none`. Deliberately
+    // outside the dense branch above: the `.ccxi` written by the storage seal
+    // path needs covering just as much, and a segment with no dense lane is not
+    // a segment with no provenance.
+    //
+    // Never fails the ingest — see `companion_attestation`.
+    if let Some(receipt) = seal.seal_receipt.as_ref().filter(|_| seal.sealed) {
+        let segments_dir = shards_root.join(format!("shard-{shard_id:04}")).join("segments");
+        let id_hex = hex16(&receipt.segment_id.0);
+        let stem = format!("seg-{:020}-{}", receipt.segment_seq, id_hex);
+        crate::companion_attestation::write_local_attestation(
+            data_dir,
+            &segments_dir,
+            &stem,
+            shard_id,
+            receipt.segment_seq,
+            &id_hex,
+            tenant_id,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        );
+    }
+
     Ok(SealSummary {
         segment_seq: seal.segment_seq.unwrap_or(0),
         frame_count: seal.frame_count.unwrap_or(0),
@@ -831,6 +857,108 @@ mod tests {
 
     fn tenant_hash(tenant_id: &str) -> u64 {
         xxhash_rust::xxh64::xxh64(tenant_id.as_bytes(), 0)
+    }
+
+    /// Locate the single `.ccxatt` under a data dir, if one was written.
+    fn find_ccxatt(data_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        std::fs::read_dir(data_dir.join("shards").join("shard-0000").join("segments"))
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("ccxatt"))
+    }
+
+    fn seal_one(data_dir: &std::path::Path, tenant: &str) {
+        seal_prose_documents(
+            data_dir,
+            0,
+            1,
+            tenant,
+            "corpus",
+            "2026-08-09T00:00:00Z",
+            &[ProseDocument {
+                doc_id: "doc-1".to_string(),
+                chunks: vec![ProseChunk {
+                    chunk_id: "doc-1::0".to_string(),
+                    text: "the peregrine falcon is the fastest animal on earth".to_string(),
+                    dense_vector: None,
+                }],
+            }],
+            None,
+        )
+        .expect("seal");
+    }
+
+    /// The false-positive guard, and the reason self-signing exists at all: a
+    /// segment this daemon built resolves to `local`, not `none`.
+    ///
+    /// If this ever fails, every ordinary local ingest trips the missing-provenance
+    /// alarm, operators learn to ignore it, and the whole control is worth nothing.
+    #[test]
+    #[serial_test::serial]
+    fn a_locally_sealed_segment_self_signs_and_verifies_as_local() {
+        use corecrux_index::{decode_attestation, verify_parsed, Provenance, TrustRoots};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        // The daemon mints this at startup; a bare temp dir has none yet.
+        let key = crux_session::passport::LocalPassportKey::from_data_dir(data_dir).expect("passport key");
+
+        seal_one(data_dir, "tenant-attest");
+
+        let att_path = find_ccxatt(data_dir).expect("a .ccxatt must be written beside the companions");
+        let stem = att_path.file_stem().and_then(|s| s.to_str()).expect("stem").to_string();
+        let segment_id_hex = stem.rsplit('-').next().expect("id").to_string();
+
+        let parsed = decode_attestation(&std::fs::read(&att_path).unwrap()).expect("parse");
+        assert_eq!(parsed.body.provenance, "local");
+        assert_eq!(parsed.body.tenant_id.as_deref(), Some("tenant-attest"));
+        assert!(
+            parsed.body.companions.iter().any(|c| c.ext == "ccxi"),
+            "the BM25 companion is written by the seal path and must be covered: {:?}",
+            parsed.body.companions
+        );
+
+        let roots = TrustRoots::new().with_local_device(key.passport_fpr(), key.verifying_key_bytes());
+        let segments_dir = att_path.parent().unwrap().to_path_buf();
+        let provenance = verify_parsed(&parsed, &roots, &segment_id_hex, |ext, key| {
+            let name = match key {
+                Some(k) => format!("{stem}.{ext}@{k}"),
+                None => format!("{stem}.{ext}"),
+            };
+            std::fs::read(segments_dir.join(name)).ok()
+        })
+        .expect("must verify against this daemon's own device key");
+        assert_eq!(provenance, Provenance::Local);
+    }
+
+    /// Attestation is a control layered on the write path, not part of it. With
+    /// no passport key there is no stamp — and the ingest still succeeds.
+    #[test]
+    #[serial_test::serial]
+    fn a_missing_passport_key_skips_the_stamp_and_never_fails_the_ingest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        // No `LocalPassportKey::from_data_dir` call: the key genuinely does not exist.
+        seal_one(data_dir, "tenant-nokey");
+
+        assert!(
+            find_ccxatt(data_dir).is_none(),
+            "no key means no stamp — and emphatically not a minted one"
+        );
+        assert!(
+            !data_dir.join("passport.key").exists(),
+            "sealing must never mint a signing identity as a side effect"
+        );
+        // The corpus is intact regardless: the segment and its companion are there.
+        let segments = data_dir.join("shards").join("shard-0000").join("segments");
+        let names: Vec<String> = std::fs::read_dir(&segments)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n.ends_with(".ccxseg")), "{names:?}");
+        assert!(names.iter().any(|n| n.ends_with(".ccxi")), "{names:?}");
     }
 
     /// The `.ccxseg` frame headers and the `.ccxi` doc table must attribute a
