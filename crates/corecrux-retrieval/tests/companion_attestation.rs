@@ -176,7 +176,10 @@ fn a_tampered_companion_is_refused_in_every_mode() {
 
         assert_eq!(mgr.segment_provenance(1), Some(Provenance::Invalid), "{mode:?}");
         assert_eq!(mgr.refused_segments(), vec![1], "{mode:?}");
-        assert!(mgr.readers().is_empty(), "tampered bytes must never be served in {mode:?}");
+        assert!(
+            mgr.readers().is_empty(),
+            "tampered bytes must never be served in {mode:?}"
+        );
     }
 }
 

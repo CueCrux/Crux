@@ -290,14 +290,15 @@ pub fn seal_prose_documents(
             data_dir,
             &segments_dir,
             &stem,
-            shard_id,
-            receipt.segment_seq,
-            &id_hex,
-            tenant_id,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+            crate::companion_attestation::SealedSegmentRef {
+                shard_id,
+                segment_seq: receipt.segment_seq,
+                segment_id_hex: &id_hex,
+                tenant_id,
+                issued_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+            },
         );
     }
 

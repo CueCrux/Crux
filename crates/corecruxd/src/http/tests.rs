@@ -7894,7 +7894,7 @@ async fn version_runtime_capability_descriptor_full_profile() {
     let Some(capability_values) = capabilities.as_object() else {
         panic!("runtime_capabilities.capabilities must be a JSON object");
     };
-    assert_eq!(capability_values.len(), 8);
+    assert_eq!(capability_values.len(), 9);
     for capability in capability_values.values() {
         assert!(capability["availability"].is_string());
         assert!(capability["reason_code"].is_string());
@@ -7925,6 +7925,17 @@ async fn version_runtime_capability_descriptor_full_profile() {
         "embedding_delegation_not_configured"
     );
     assert_eq!(capabilities["embedding_delegation"]["configured"], false);
+
+    // Companion provenance on an empty corpus: nothing unattested, nothing
+    // refused, and the check is on — so `available`, not `degraded`. The counts
+    // ride in `detail`, which only this capability carries.
+    assert_eq!(capabilities["companion_provenance"]["availability"], "available");
+    assert_eq!(capabilities["companion_provenance"]["reason_code"], "available");
+    assert_eq!(capabilities["companion_provenance"]["degraded"], false);
+    assert_eq!(capabilities["companion_provenance"]["detail"]["mode"], "warn");
+    for tally in ["platform", "local", "none", "invalid", "refused"] {
+        assert_eq!(capabilities["companion_provenance"]["detail"][tally], 0, "{tally}");
+    }
     #[cfg(feature = "hosted-surfaces")]
     {
         assert_eq!(capabilities["rerank_gpu"]["availability"], "available");

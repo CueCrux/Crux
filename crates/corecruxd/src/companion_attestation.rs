@@ -162,6 +162,18 @@ pub fn log_startup_summary(index: &corecrux_retrieval::IndexManager, mode: Attes
     }
 }
 
+/// Identity of the segment being attested — the fields the signed body binds.
+pub struct SealedSegmentRef<'a> {
+    pub shard_id: u32,
+    pub segment_seq: u64,
+    /// Hex segment id, matching the `.ccxseg` filename stem.
+    pub segment_id_hex: &'a str,
+    pub tenant_id: &'a str,
+    /// Unix seconds. Passed in rather than read here so the signing path has no
+    /// clock of its own.
+    pub issued_at: u64,
+}
+
 /// Files that are never *covered* companions: the segment itself (bound by
 /// `segment_id` in the signed body, not by digest), the attestation, and the
 /// debris of an interrupted write.
@@ -218,12 +230,15 @@ pub fn write_local_attestation(
     data_dir: &Path,
     segments_dir: &Path,
     stem: &str,
-    shard_id: u32,
-    segment_seq: u64,
-    segment_id_hex: &str,
-    tenant_id: &str,
-    issued_at: u64,
+    segment: SealedSegmentRef<'_>,
 ) -> Option<usize> {
+    let SealedSegmentRef {
+        shard_id,
+        segment_seq,
+        segment_id_hex,
+        tenant_id,
+        issued_at,
+    } = segment;
     use ed25519_dalek::Signer as _;
 
     let key_path = crux_session::passport::passport_key_path(data_dir);

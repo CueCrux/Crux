@@ -480,12 +480,40 @@ fn embedding_delegation_runtime_state(
     }
 }
 
+/// Live companion-provenance tallies for `/v1/version`.
+///
+/// The mode is read from config rather than cached on the index: an operator who
+/// changes it wants `/v1/version` to say so after a restart, and this is the
+/// surface they check.
+async fn companion_provenance_runtime(state: &AppState) -> crate::product::CompanionProvenanceRuntime {
+    use corecrux_index::AttestationMode;
+
+    let mode = std::env::var(crate::companion_attestation::MODE_ENV)
+        .map(|raw| AttestationMode::from_str_or_default(&raw))
+        .unwrap_or_default();
+    let index = state.retrieval_index.read().await;
+    let counts = index.provenance_counts();
+    crate::product::CompanionProvenanceRuntime {
+        mode: match mode {
+            AttestationMode::Off => "off",
+            AttestationMode::Warn => "warn",
+            AttestationMode::Enforce => "enforce",
+        },
+        platform: counts.get("platform").copied().unwrap_or(0),
+        local: counts.get("local").copied().unwrap_or(0),
+        none: counts.get("none").copied().unwrap_or(0),
+        invalid: counts.get("invalid").copied().unwrap_or(0),
+        refused: index.refused_segments().len(),
+    }
+}
+
 fn runtime_capability_descriptor(
     state: &AppState,
     sync_status: &corecrux_memory::sync::SyncRuntimeStatus,
     local_embedder_configured: bool,
     local_embedder_initialized: bool,
     embedding_delegation: crate::product::EmbeddingDelegationRuntimeState,
+    companion_provenance: crate::product::CompanionProvenanceRuntime,
 ) -> crate::product::RuntimeCapabilityDescriptor {
     crate::product::RuntimeCapabilityDescriptor::from_runtime(
         state.operating_mode,
@@ -499,6 +527,7 @@ fn runtime_capability_descriptor(
             rerank_endpoint_configured: rerank_endpoint_configured(state),
             graph_expand_configured: is_query_feature_enabled("CORECRUXD_QUERY_GRAPH_EXPAND"),
             console_link_graph_configured: super::console::corecrux_graph_base_url_configured(),
+            companion_provenance,
         },
     )
 }
@@ -535,6 +564,7 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
             local_embedder_configured,
             local_embedder_configured && semantic_profile.is_some(),
             embedding_delegation,
+            companion_provenance_runtime(&state).await,
         ));
     let retrieval_segment_count = state.retrieval_index.read().await.segment_count();
     let protocol_contracts =
@@ -647,6 +677,7 @@ pub(super) async fn get_admin_version(State(state): State<AppState>, headers: He
             local_embedder_configured,
             local_embedder_configured && semantic_profile.is_some(),
             embedding_delegation,
+            companion_provenance_runtime(&state).await,
         ));
     let retrieval_segment_count = state.retrieval_index.read().await.segment_count();
     let protocol_contracts =

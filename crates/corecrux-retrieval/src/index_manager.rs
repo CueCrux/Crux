@@ -473,7 +473,7 @@ impl IndexManager {
                     if !permitted {
                         tracing::error!(
                             segment_seq = seq,
-                            provenance = provenance.map(Provenance::slug).unwrap_or("unknown"),
+                            provenance = provenance.map_or("unknown", Provenance::slug),
                             reason_code = reason_code.unwrap_or("companion_unattested"),
                             stem = %stem,
                             "companion-provenance-refused: segment discovered and erasable, but its \

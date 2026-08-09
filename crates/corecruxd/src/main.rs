@@ -814,8 +814,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // Companion provenance must be installed BEFORE the first scan: it
             // governs what those segments are permitted to serve, and a scan
             // that ran without it has already decided.
-            let attestation_mode =
-                crate::companion_attestation::install_policy(&mut idx, &config.data_dir);
+            let attestation_mode = crate::companion_attestation::install_policy(&mut idx, &config.data_dir);
             // Load-at-startup wiring: reload sealed `.ccxi` companions when the
             // storage layer builds them (`build_ccxi`) OR when the local
             // prose-ingest door is enabled — otherwise local-ingest segments
