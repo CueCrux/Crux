@@ -28,7 +28,10 @@
 
 use std::path::Path;
 
-use corecrux_index::{companion_digest, encode_attestation, AttestationBody, CompanionDigest, CCXATT_SCHEMA_V1};
+use corecrux_index::{
+    companion_digest, encode_attestation, AttestationBody, AttestationMode, CompanionDigest, TrustRoots,
+    CCXATT_SCHEMA_V1,
+};
 
 /// Enforcement posture. `off | warn | enforce`, defaulting to `warn`.
 pub const MODE_ENV: &str = "CORECRUXD_COMPANION_ATTESTATION";
@@ -41,6 +44,123 @@ pub const PLATFORM_TRUST_ROOT_ENV: &str = "CORECRUXD_COMPANION_TRUST_ROOT_PUBKEY
 
 /// Fingerprint (issuer kid) the platform pubkey is registered under.
 pub const PLATFORM_TRUST_ROOT_FPR_ENV: &str = "CORECRUXD_COMPANION_TRUST_ROOT_FPR";
+
+/// Build the policy from config and install it on the index manager.
+///
+/// Returns the mode in force, for the surfaces that must report it — including
+/// `off`, which is reported as `degraded` precisely so that turning the alarm
+/// off is visible rather than invisible.
+///
+/// The daemon's own passport key is registered as the local device root, which
+/// is what lets a companion this daemon built resolve to `local` instead of
+/// `none`. A platform root is registered when both env vars are set; without it
+/// a platform-signed bundle resolves to `Invalid` (unknown producer) rather than
+/// silently downgrading to `none` — an unknown signer is not the same as no
+/// signer, and must not be treated as one.
+pub fn install_policy(index: &mut corecrux_retrieval::IndexManager, data_dir: &Path) -> AttestationMode {
+    let mode = std::env::var(MODE_ENV)
+        .map(|raw| AttestationMode::from_str_or_default(&raw))
+        .unwrap_or_default();
+
+    let mut roots = TrustRoots::new();
+
+    let key_path = crux_session::passport::passport_key_path(data_dir);
+    match crux_session::passport::LocalPassportKey::from_existing_path(&key_path) {
+        Ok(key) => {
+            roots = roots.with_local_device(key.passport_fpr(), key.verifying_key_bytes());
+        }
+        Err(err) => {
+            // Without the local root, this daemon cannot recognise its own work,
+            // and every locally-sealed segment reads as `none`. Loud, because in
+            // `enforce` it would refuse the operator's own corpus.
+            tracing::warn!(
+                path = %key_path.display(),
+                error = %err,
+                "companion-attestation-no-local-root: this daemon cannot verify companions it built itself"
+            );
+        }
+    }
+
+    match (
+        std::env::var(PLATFORM_TRUST_ROOT_FPR_ENV),
+        std::env::var(PLATFORM_TRUST_ROOT_ENV),
+    ) {
+        (Ok(fpr), Ok(hex_key)) => match parse_pubkey_hex(&hex_key) {
+            Some(pubkey) => {
+                roots = roots.with_platform_root(fpr.trim(), pubkey);
+            }
+            None => tracing::warn!(
+                env = PLATFORM_TRUST_ROOT_ENV,
+                "companion-attestation-bad-platform-root: expected 64 hex characters; root not registered"
+            ),
+        },
+        (Err(_), Err(_)) => {}
+        _ => tracing::warn!(
+            "companion-attestation-partial-platform-root: {PLATFORM_TRUST_ROOT_FPR_ENV} and \
+             {PLATFORM_TRUST_ROOT_ENV} must be set together; root not registered"
+        ),
+    }
+
+    index.set_attestation_policy(corecrux_retrieval::AttestationPolicy::new(mode, roots));
+    tracing::info!(mode = ?mode, "companion-attestation-policy-installed");
+    mode
+}
+
+fn parse_pubkey_hex(raw: &str) -> Option<[u8; 32]> {
+    let raw = raw.trim();
+    if raw.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(raw.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Surface 1 of 4 — the startup summary.
+///
+/// A `WARN` per segment scrolls past on a long boot, so the count is restated
+/// once at `ERROR` level. `off` reports itself, because an operator who inherits
+/// a daemon should be able to see that the check was disabled.
+pub fn log_startup_summary(index: &corecrux_retrieval::IndexManager, mode: AttestationMode) {
+    let counts = index.provenance_counts();
+    let unattested = counts.get("none").copied().unwrap_or(0);
+    let invalid = counts.get("invalid").copied().unwrap_or(0);
+    let refused = index.refused_segments().len();
+
+    tracing::info!(
+        mode = ?mode,
+        platform = counts.get("platform").copied().unwrap_or(0),
+        local = counts.get("local").copied().unwrap_or(0),
+        none = unattested,
+        invalid,
+        refused,
+        "companion-provenance-summary"
+    );
+
+    if invalid > 0 {
+        tracing::error!(
+            invalid,
+            "companion-provenance-INVALID: segments whose companions do not match their signed \
+             digests were refused their lanes in every mode; they remain discoverable and erasable"
+        );
+    }
+    if unattested > 0 {
+        tracing::error!(
+            unattested,
+            mode = ?mode,
+            "companion-provenance-UNATTESTED: segments carry no .ccxatt; in `warn` they are served \
+             anyway, in `enforce` they are not"
+        );
+    }
+    if matches!(mode, AttestationMode::Off) {
+        tracing::error!(
+            "companion-provenance-OFF: companion attestation is disabled; missing provenance will \
+             not be reported. This daemon is running degraded by configuration."
+        );
+    }
+}
 
 /// Files that are never *covered* companions: the segment itself (bound by
 /// `segment_id` in the signed body, not by digest), the attestation, and the

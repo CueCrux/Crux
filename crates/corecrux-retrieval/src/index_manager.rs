@@ -16,6 +16,9 @@ use std::time::Instant;
 
 use corecrux_index::CcxiReader;
 
+use corecrux_index::Provenance;
+
+use crate::segment_attestation::AttestationPolicy;
 use crate::segment_tenants::{read_segment_membership, SegmentMembership};
 
 /// Memory tier for a loaded segment index.
@@ -64,6 +67,9 @@ pub struct IndexManager {
     /// [`IndexManager::refresh_from_disk`] so erasure enumerates from disk
     /// rather than trusting whatever the last scan happened to load.
     scanned_dirs: BTreeSet<PathBuf>,
+    /// Companion provenance policy. `None` means verification is not configured
+    /// at all (unit tests, embedded uses); the daemon always configures one.
+    attestation: Option<AttestationPolicy>,
     /// Maximum bytes of index data to keep in hot tier (memory budget).
     hot_budget_bytes: usize,
     /// Current hot tier usage in bytes.
@@ -98,6 +104,12 @@ struct LoadedSegment {
     size_bytes: usize,
     /// When this segment was last promoted to Hot tier.
     promoted_at: Option<Instant>,
+    /// Companion provenance as resolved at scan time. `None` when no policy is
+    /// configured, or for a segment loaded from bytes.
+    provenance: Option<Provenance>,
+    /// Set when provenance refused this segment its lanes. It is still
+    /// discovered, attributable and erasable — only unserved.
+    refused: bool,
 }
 
 impl LoadedSegment {
@@ -149,6 +161,7 @@ impl IndexManager {
             segments: BTreeMap::new(),
             forgotten: BTreeMap::new(),
             scanned_dirs: BTreeSet::new(),
+            attestation: None,
             hot_budget_bytes: 4 * 1024 * 1024 * 1024, // 4GB default
             hot_bytes: 0,
             min_residency: std::time::Duration::from_secs(60),
@@ -195,6 +208,8 @@ impl IndexManager {
                 tier,
                 size_bytes: size,
                 promoted_at,
+                provenance: None,
+                refused: false,
             },
         );
         Ok(seq)
@@ -230,6 +245,8 @@ impl IndexManager {
                 tier: IndexTier::Cold,
                 size_bytes: 0,
                 promoted_at: None,
+                provenance: None,
+                refused: false,
             },
         );
         Ok(seq)
@@ -249,6 +266,8 @@ impl IndexManager {
                 tier: IndexTier::Hot,
                 size_bytes: size,
                 promoted_at: Some(Instant::now()),
+                provenance: None,
+                refused: false,
             },
         );
         self.hot_bytes += size;
@@ -287,6 +306,45 @@ impl IndexManager {
     /// `.ccxi`.
     pub fn segment_seqs(&self) -> Vec<u64> {
         self.segments.keys().copied().collect()
+    }
+
+    /// Install the companion-provenance policy consulted by every scan.
+    ///
+    /// Set before the first `scan_and_load`: it governs what those segments are
+    /// permitted to serve, and a scan that ran without it has already decided.
+    pub fn set_attestation_policy(&mut self, policy: AttestationPolicy) {
+        self.attestation = Some(policy);
+    }
+
+    /// Segments per provenance state, keyed by [`Provenance::slug`].
+    ///
+    /// Drives the `/v1/version` capability and the startup summary. Segments
+    /// scanned with no policy configured are absent, not counted as `none` —
+    /// "we did not check" and "we checked and found nothing" are different
+    /// claims.
+    pub fn provenance_counts(&self) -> BTreeMap<&'static str, usize> {
+        let mut out = BTreeMap::new();
+        for seg in self.segments.values() {
+            if let Some(p) = seg.provenance {
+                *out.entry(p.slug()).or_insert(0) += 1;
+            }
+        }
+        out
+    }
+
+    /// Segments whose provenance cost them their lanes. Still discovered,
+    /// attributable and erasable.
+    pub fn refused_segments(&self) -> Vec<u64> {
+        self.segments
+            .iter()
+            .filter(|(_, s)| s.refused)
+            .map(|(&seq, _)| seq)
+            .collect()
+    }
+
+    /// Provenance of one discovered segment, if a policy resolved it.
+    pub fn segment_provenance(&self, segment_seq: u64) -> Option<Provenance> {
+        self.segments.get(&segment_seq).and_then(|s| s.provenance)
     }
 
     /// Discovered segments carrying no `.ccxi` companion.
@@ -373,19 +431,57 @@ impl IndexManager {
                     }
                 }
             }
-            match (&group.ccxi, &group.ccxseg) {
-                (Some(ccxi), _) => match self.load_ccxi(ccxi) {
-                    Ok(_) => count += 1,
-                    Err(e) => tracing::warn!("failed to load .ccxi {:?}: {}", ccxi, e),
-                },
-                (None, Some(ccxseg)) => match self.register_segment_without_ccxi(ccxseg) {
-                    Ok(_) => {
-                        count += 1;
+            // Resolve provenance before deciding what this segment gets. A
+            // refusal costs it its lanes, never its visibility: discovery is
+            // also the erasure enumeration, so dropping a refused segment here
+            // would make it un-erasable — reopening the exact hole keying
+            // discovery off `.ccxseg` was meant to close. Refused means
+            // *unserved*, not *unseen*.
+            let (provenance, permitted, reason_code) = match self.attestation.as_ref() {
+                Some(policy) => {
+                    // Resolved once: verification hashes every covered companion,
+                    // so asking twice would double the cost of every scan.
+                    let resolved = policy.resolve(dir, &stem);
+                    (
+                        Some(resolved.provenance),
+                        policy.permits(resolved.provenance),
+                        resolved.reason_code,
+                    )
+                }
+                None => (None, true, None),
+            };
+
+            let outcome = match (&group.ccxi, &group.ccxseg, permitted) {
+                (Some(ccxi), _, true) => self.load_ccxi(ccxi).map(|seq| (seq, false)),
+                (None, Some(ccxseg), true) => self.register_segment_without_ccxi(ccxseg).map(|seq| (seq, true)),
+                // Refused: register it for attribution and erasure only.
+                (_, Some(ccxseg), false) => self.register_segment_without_ccxi(ccxseg).map(|seq| (seq, true)),
+                (Some(ccxi), None, false) => self.register_segment_without_ccxi(ccxi).map(|seq| (seq, true)),
+                (None, None, _) => continue,
+            };
+
+            match outcome {
+                Ok((seq, lane_less)) => {
+                    count += 1;
+                    if lane_less && permitted {
                         without_ccxi += 1;
                     }
-                    Err(e) => tracing::warn!("failed to register segment {:?}: {}", ccxseg, e),
-                },
-                (None, None) => {}
+                    if let Some(seg) = self.segments.get_mut(&seq) {
+                        seg.provenance = provenance;
+                        seg.refused = !permitted;
+                    }
+                    if !permitted {
+                        tracing::error!(
+                            segment_seq = seq,
+                            provenance = provenance.map(Provenance::slug).unwrap_or("unknown"),
+                            reason_code = reason_code.unwrap_or("companion_unattested"),
+                            stem = %stem,
+                            "companion-provenance-refused: segment discovered and erasable, but its \
+                             lanes are withheld"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(stem = %stem, error = %e, "segment-load-failed"),
             }
         }
         if without_ccxi > 0 {

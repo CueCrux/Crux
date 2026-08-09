@@ -862,6 +862,7 @@ dependencies = [
  "corecrux-projections",
  "corecrux-segment",
  "criterion",
+ "ed25519-dalek",
  "serde",
  "serde_json",
  "tempfile",
