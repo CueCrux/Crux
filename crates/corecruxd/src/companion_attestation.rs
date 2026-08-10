@@ -6,7 +6,7 @@
 //! Companion provenance attestation — the daemon-side wiring of `.ccxatt`.
 //!
 //! The format, the four provenance states and the three modes live in
-//! [`corecrux_index::ccxatt`]. This module is what makes them happen: the daemon
+//! `corecrux-index`'s `ccxatt` module. This module is what makes them happen: the daemon
 //! signs the companions it builds itself, and verifies the ones it is handed.
 //!
 //! ## Why the CE signs its own work
@@ -15,7 +15,7 @@
 //! only means something if `none` is genuinely anomalous — if every free local
 //! ingest tripped the alarm, operators would learn to ignore it and the signal
 //! would be worth nothing. So a locally-built companion is signed with this
-//! daemon's own device key and resolves to [`Provenance::Local`], not `none`.
+//! daemon's own device key and resolves to provenance `local`, not `none`.
 //! The warning then fires only when someone has handed us companions from
 //! nowhere.
 //!

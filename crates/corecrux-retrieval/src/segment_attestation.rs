@@ -5,7 +5,7 @@
 
 //! Load-time provenance resolution for a segment's companions.
 //!
-//! The format and the mode semantics live in [`corecrux_index::ccxatt`]; this is
+//! The format and the mode semantics live in `corecrux-index`'s `ccxatt` module; this is
 //! where they meet the scan. For each discovered segment the policy answers one
 //! question — who produced these companions — and the scan decides what to do
 //! about it.
