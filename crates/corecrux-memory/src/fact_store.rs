@@ -2682,14 +2682,20 @@ impl FactStore {
         canonical_fact_id: &str,
         source_fact_ids: &[String],
     ) -> Result<ConsolidationUndoReportV1, ConsolidationErrorV1> {
-        if source_fact_ids.is_empty() {
-            return Err(ConsolidationErrorV1::NoUndoSources);
-        }
+        // Existence (within the caller's tenant) is checked BEFORE the
+        // empty-sources guard. Both orders reject the request, but only this one
+        // distinguishes "no such canonical" (404) from "you named one but sent
+        // no sources" (400) — and an id that does not exist for this caller is
+        // the more useful answer of the two. Reversing these silently turned
+        // every unknown-canonical undo into a 400.
         let canonical = self
             .facts
             .get(canonical_fact_id)
             .filter(|fact| fact.tenant_hash == tenant_hash)
             .ok_or_else(|| ConsolidationErrorV1::TargetNotFound(canonical_fact_id.to_string()))?;
+        if source_fact_ids.is_empty() {
+            return Err(ConsolidationErrorV1::NoUndoSources);
+        }
         let Some(recorded_sources) = self.consolidation_sources.get(canonical_fact_id) else {
             return Err(ConsolidationErrorV1::NotConsolidationCanonical(
                 canonical_fact_id.to_string(),

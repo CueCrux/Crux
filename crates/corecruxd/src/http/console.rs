@@ -4337,18 +4337,27 @@ mod tests {
 
     // ── Small pure helpers ───────────────────────────────────────────────
 
+    /// Replaces `console_actor_from_headers_defaults_trims_and_ignores_blank`.
+    ///
+    /// That test asserted the actor was read straight off `x-corecrux-passport-id`,
+    /// trimmed, defaulting to `console` when absent. That behaviour is what this
+    /// slice removes: an unauthenticated caller could name themselves as the
+    /// actor on a review mutation just by setting a header, and the attribution
+    /// on the resulting receipt would carry their claim as fact.
+    ///
+    /// `console_mutation_authority` derives both tenant and actor from the
+    /// authenticated context instead. Kept as a test rather than deleted so the
+    /// old behaviour cannot quietly return.
     #[test]
-    fn console_actor_from_headers_defaults_trims_and_ignores_blank() {
-        assert_eq!(console_actor_from_headers(&HeaderMap::new()), "console");
+    fn console_mutation_authority_does_not_take_the_actor_from_a_bare_header() {
+        let state = st_dev();
         let mut headers = HeaderMap::new();
         headers.insert("x-corecrux-passport-id", "  claude-work ".parse().unwrap());
-        assert_eq!(console_actor_from_headers(&headers), "claude-work");
-        let mut blank = HeaderMap::new();
-        blank.insert("x-corecrux-passport-id", "   ".parse().unwrap());
-        assert_eq!(
-            console_actor_from_headers(&blank),
-            "console",
-            "a blank header must not become a blank actor"
+
+        let denied = console_mutation_authority(&state, &headers);
+        assert!(
+            denied.is_err(),
+            "a passport header with no credential behind it must not authorise a review mutation"
         );
     }
 
@@ -4765,8 +4774,6 @@ mod tests {
                 Json(ConsolidationUndoRequest {
                     canonical_fact_id: "f1".to_string(),
                     source_fact_ids: Vec::new(),
-                    entity: None,
-                    key: None,
                 })
             )
             .await
@@ -5431,7 +5438,10 @@ mod tests {
             // shape `contradiction_candidates_v1` reports.
             let first = seed_conf(&mut store, "service:api", "enabled", "enabled", false, 0.7);
             seed_conf(&mut store, "service:api", "enabled", "disabled", false, 0.7);
-            assert!(store.clear_superseded(&first), "simulate an unresolved conflict");
+            assert!(
+                store.clear_superseded("default", &first),
+                "simulate an unresolved conflict"
+            );
         }
         let resp = get_console_review_queue(
             State(state),
@@ -5505,7 +5515,11 @@ mod tests {
         assert_eq!(body["expired_count"], 0);
         assert_eq!(body["skipped_count"], 2, "the repeated id is counted once");
         assert_eq!(body["skipped"][0]["reason"], "not_a_current_expiry_candidate");
-        assert_eq!(body["actor"], "console");
+        // `operator:unverified:` prefix, not a bare `console`: this request
+        // carried no credential, and recording it as plain `console` made an
+        // unauthenticated caller indistinguishable from an authenticated one in
+        // the audit trail.
+        assert_eq!(body["actor"], "operator:unverified:console");
         assert_eq!(state.fact_store.read().await.count(), 1, "nothing was deleted");
     }
 
@@ -5518,8 +5532,6 @@ mod tests {
             Json(ConsolidationUndoRequest {
                 canonical_fact_id: "no-such-fact".to_string(),
                 source_fact_ids: Vec::new(),
-                entity: None,
-                key: None,
             }),
         )
         .await
@@ -5536,6 +5548,13 @@ mod tests {
             let mut store = state.fact_store.write().await;
             let first = seed_conf(&mut store, "person:alice", "city", "NYC", false, 0.6);
             let second = seed_conf(&mut store, "person:alice", "city", "New York", false, 0.6);
+            // Seeding the same (entity, key) twice makes `second` supersede
+            // `first`, and consolidation now refuses an already-retired target
+            // (`TargetAlreadySuperseded`) rather than resurrecting it into a new
+            // canonical. Both targets have to be live for this test to be about
+            // merge-then-undo at all, which is why the edge is cleared here —
+            // the same setup the fact_store consolidation tests use.
+            assert!(store.clear_superseded("default", &first));
             (first, second)
         };
         let request: corecrux_memory::fact_store::ConsolidationRequestV1 = serde_json::from_value(json!({
@@ -5543,7 +5562,7 @@ mod tests {
             "entity": "person:alice",
             "key": "city",
             "canonical_value": "New York City",
-            "target_fact_ids": [first, second],
+            "target_fact_ids": [first.clone(), second.clone()],
         }))
         .unwrap();
         let mut headers = HeaderMap::new();
@@ -5559,11 +5578,21 @@ mod tests {
         let resp = post_console_review_consolidation_undo(
             State(state),
             HeaderMap::new(),
+            // Two changes from the pre-slice shape of this request:
+            //
+            // `entity` / `key` are gone — the handler derives them from the
+            // canonical fact itself, so a caller cannot point an undo at one
+            // fact while naming another's entity/key.
+            //
+            // `source_fact_ids` is now required and checked against what the
+            // consolidation actually recorded (`UndoSourceMismatch`). An empty
+            // vec used to mean "restore whatever this canonical retired"; the
+            // caller now has to state what it believes it is reversing, so a
+            // stale client cannot blanket-restore a set that changed underneath
+            // it.
             Json(ConsolidationUndoRequest {
                 canonical_fact_id: canonical.clone(),
-                source_fact_ids: Vec::new(),
-                entity: Some("person:alice".to_string()),
-                key: Some("city".to_string()),
+                source_fact_ids: vec![first, second],
             }),
         )
         .await
@@ -5914,7 +5943,7 @@ mod tests {
             let mut store = state.fact_store.write().await;
             let first = seed_conf(&mut store, "service:api", "enabled", "enabled", false, 0.7);
             seed_conf(&mut store, "service:api", "enabled", "disabled", false, 0.7);
-            assert!(store.clear_superseded(&first));
+            assert!(store.clear_superseded("default", &first));
         }
         let resp = get_console_review_contradictions(
             State(state),

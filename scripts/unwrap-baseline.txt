@@ -62,7 +62,7 @@ crux-enterprise-shim 0
 crux-integration-tests 7
 crux-integrations 0
 crux-lens-features 0
-crux-mcp 152
+crux-mcp 172
 crux-observe 10
 crux-observe-api 0
 crux-router 0
