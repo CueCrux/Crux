@@ -17,8 +17,7 @@
 use serde_json::Value;
 
 use super::{
-    problem_response, require_http_any_scope, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Query,
-    State, StatusCode,
+    problem_response, require_http_any_scope, AppState, HeaderMap, IntoResponse, Json, Query, State, StatusCode,
 };
 use crate::agentgraph_kinds::PUNCHCARD_KIND;
 use crate::coord::{CoordIntent, LeaseSummary};
@@ -26,6 +25,7 @@ use crate::coord::{CoordIntent, LeaseSummary};
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct ActiveQuery {
     pub project_id: Option<String>,
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -128,19 +128,36 @@ pub(super) async fn get_coord_active(
     if !state.coord_enabled {
         return coord_disabled_response();
     }
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-        return problem.into_response();
+    let context = match crate::auth::passport_bound_context(&state.auth, &headers) {
+        Ok(context) => context,
+        Err(problem) => return problem.into_response(),
+    };
+    if !context.has_scope("admin:read") {
+        return problem_response(
+            StatusCode::FORBIDDEN,
+            "admin:read scope required for coordination status",
+        );
     }
+    let tenant_id = match context.resolve_authorized_tenant(q.tenant_id.as_deref()) {
+        Ok(tenant_id) => tenant_id,
+        Err(problem) => return problem.into_response(),
+    };
     let now = now_unix_ms();
     let store = state.fact_store.read().await;
     let bindings = crate::session_bindings::list_bindings(&store);
     let intents = crate::coord::list_intents(&store, q.project_id.as_deref());
-    let mut work_in_flight = crate::work::list_work(&store, q.project_id.as_deref(), Some("in_progress"), None, None);
+    let mut work_in_flight = crate::work::list_work(
+        &store,
+        q.project_id.as_deref(),
+        Some("in_progress"),
+        Some(&tenant_id),
+        None,
+    );
     work_in_flight.extend(crate::work::list_work(
         &store,
         q.project_id.as_deref(),
         Some("blocked"),
-        None,
+        Some(&tenant_id),
         None,
     ));
     drop(store);
@@ -331,7 +348,10 @@ mod tests {
         state.coord_enabled = false;
         let resp = get_coord_active(
             StateExtract(state.clone()),
-            QueryExtract(ActiveQuery { project_id: None }),
+            QueryExtract(ActiveQuery {
+                project_id: None,
+                tenant_id: None,
+            }),
             HeaderMap::new(),
         )
         .await
@@ -371,6 +391,7 @@ mod tests {
             StateExtract(state.clone()),
             Query(ActiveQuery {
                 project_id: Some("proj".to_string()),
+                tenant_id: None,
             }),
             HeaderMap::new(),
         )
@@ -471,6 +492,7 @@ mod tests {
             StateExtract(state.clone()),
             QueryExtract(ActiveQuery {
                 project_id: Some("proj".to_string()),
+                tenant_id: None,
             }),
             HeaderMap::new(),
         )
@@ -492,6 +514,7 @@ mod tests {
             StateExtract(state),
             QueryExtract(ActiveQuery {
                 project_id: Some("other".to_string()),
+                tenant_id: None,
             }),
             HeaderMap::new(),
         )
@@ -518,6 +541,7 @@ mod tests {
             StateExtract(state),
             QueryExtract(ActiveQuery {
                 project_id: Some("proj".to_string()),
+                tenant_id: None,
             }),
             HeaderMap::new(),
         )
@@ -565,6 +589,7 @@ mod tests {
             StateExtract(state),
             QueryExtract(ActiveQuery {
                 project_id: Some("proj".to_string()),
+                tenant_id: None,
             }),
             HeaderMap::new(),
         )

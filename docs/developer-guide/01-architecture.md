@@ -107,7 +107,7 @@ in dev mode gets a 401 with
 |---|---|
 | `Authorization: Bearer <token>` | Token or, in `dev_scopes`, a literal scope list ([auth.rs:373](../../crates/corecruxd/src/auth.rs#L373)) |
 | `X-Corecrux-Scopes` | Scope list, comma- or whitespace-separated ([auth.rs:363](../../crates/corecruxd/src/auth.rs#L363)) |
-| `X-Corecrux-Passport-Id` | Acting passport. Trusted verbatim under `off`/`dev_scopes`; under JWT modes it must match the token's `passport_id` claim or you get 403 `PASSPORT_HEADER_MISMATCH` ([auth.rs:1186](../../crates/corecruxd/src/auth.rs#L1186)) |
+| `X-Corecrux-Passport-Id` | Identity selector. Under `off`/`dev_scopes` it is only a caller assertion: authority-sensitive mutations persist it as `operator:unverified:<id>`, and local work state changes always enter review. Under JWT modes it must match the token identity or you get 403 `PASSPORT_HEADER_MISMATCH`; human gate decisions additionally require a canonical `passport_id` claim and reject agent tokens. Unmapped MCP automation is namespaced as `agent:<token-name>`; only an explicit agent-passport mapping can grant a real passport identity ([auth.rs](../../crates/corecruxd/src/auth.rs)) |
 | `X-Corecrux-Tenant-Id` | Tenant selector ([auth.rs:1151](../../crates/corecruxd/src/auth.rs#L1151)) |
 
 ### Scopes you will meet in this guide

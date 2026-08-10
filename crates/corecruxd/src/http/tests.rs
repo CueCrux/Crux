@@ -14047,10 +14047,89 @@ async fn projects_members_tenants_layers_repos_and_graph_round_trip() {
     assert_eq!(delete_member.status(), StatusCode::NO_CONTENT);
 }
 
+const WORK_AUTH_TEST_SECRET: &str = "work-auth-test-secret-at-least-32-bytes";
+const WORK_AUTH_TEST_ISSUER: &str = "corecrux-work-test";
+const WORK_AUTH_TEST_AUDIENCE: &str = "corecrux";
+
+fn work_auth_test_state(action_max_pending: usize) -> AppState {
+    let mut state = test_app_state_with_auth(action_max_pending, AuthMode::Off);
+    state.auth = crate::auth::Authz::test_hs256(
+        WORK_AUTH_TEST_SECRET.as_bytes(),
+        WORK_AUTH_TEST_ISSUER,
+        WORK_AUTH_TEST_AUDIENCE,
+    );
+    state
+}
+
+fn work_auth_headers(tenant_id: &str, passport_id: Option<&str>, scopes: &str) -> HeaderMap {
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs()
+        .saturating_add(3_600) as usize;
+    let mut claims = serde_json::json!({
+        "exp": exp,
+        "iss": WORK_AUTH_TEST_ISSUER,
+        "aud": WORK_AUTH_TEST_AUDIENCE,
+        "scope": scopes,
+        "tenant_id": tenant_id,
+    });
+    if let Some(passport_id) = passport_id {
+        claims["passport_id"] = serde_json::json!(passport_id);
+    }
+    work_auth_headers_from_claims(claims)
+}
+
+fn work_auth_headers_from_claims(claims: serde_json::Value) -> HeaderMap {
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(WORK_AUTH_TEST_SECRET.as_bytes()),
+    )
+    .expect("work auth test JWT");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer header"),
+    );
+    headers
+}
+
+fn work_auth_sub_headers(tenant_id: &str, subject: &str, scopes: &str) -> HeaderMap {
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs()
+        .saturating_add(3_600) as usize;
+    work_auth_headers_from_claims(serde_json::json!({
+        "exp": exp,
+        "iss": WORK_AUTH_TEST_ISSUER,
+        "aud": WORK_AUTH_TEST_AUDIENCE,
+        "scope": scopes,
+        "tenant_id": tenant_id,
+        "sub": subject,
+    }))
+}
+
+fn work_auth_missing_tenant_headers(passport_id: &str, scopes: &str) -> HeaderMap {
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs()
+        .saturating_add(3_600) as usize;
+    work_auth_headers_from_claims(serde_json::json!({
+        "exp": exp,
+        "iss": WORK_AUTH_TEST_ISSUER,
+        "aud": WORK_AUTH_TEST_AUDIENCE,
+        "scope": scopes,
+        "passport_id": passport_id,
+    }))
+}
+
 #[serial_test::serial]
 #[tokio::test]
 async fn work_post_then_list_then_patch_state_round_trip() {
-    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let state = work_auth_test_state(16);
     {
         let mut store = state.fact_store.write().await;
         crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
@@ -14059,7 +14138,7 @@ async fn work_post_then_list_then_patch_state_round_trip() {
 
     let create_resp = super::work::post_work(
         State(state.clone()),
-        dev_scope_headers("facts:write"),
+        work_auth_headers("personal", Some("personal-default"), "facts:write"),
         Json(super::work::CreateWorkBody {
             project_id: "default".to_string(),
             title: "fix the thing".to_string(),
@@ -14069,7 +14148,7 @@ async fn work_post_then_list_then_patch_state_round_trip() {
             tenant_id: Some("personal".to_string()),
             linked_pr: None,
             linked_issue: None,
-            created_by_passport: "personal-default".to_string(),
+            created_by_passport: Some("personal-default".to_string()),
         }),
     )
     .await
@@ -14083,7 +14162,7 @@ async fn work_post_then_list_then_patch_state_round_trip() {
         Query(super::work::ListWorkQuery {
             project_id: Some("default".to_string()),
             state: Some("planned".to_string()),
-            tenant_id: None,
+            tenant_id: Some("personal".to_string()),
             assignee_passport: None,
             source: super::work::WorkSource::default(),
             orchestrator: None,
@@ -14091,7 +14170,7 @@ async fn work_post_then_list_then_patch_state_round_trip() {
             limit: None,
             fields: None,
         }),
-        dev_scope_headers("admin:read"),
+        work_auth_headers("personal", Some("personal-default"), "admin:read"),
     )
     .await
     .into_response();
@@ -14101,7 +14180,7 @@ async fn work_post_then_list_then_patch_state_round_trip() {
     let patch_resp = super::work::patch_work(
         State(state.clone()),
         Path(work_id.clone()),
-        dev_scope_headers("facts:write"),
+        work_auth_headers("personal", Some("personal-default"), "facts:write"),
         Json(super::work::UpdateWorkBody {
             title: None,
             body: None,
@@ -14112,7 +14191,7 @@ async fn work_post_then_list_then_patch_state_round_trip() {
             linked_issue: None,
             blocker_reason: None,
             blocker_kind: None,
-            by_passport: "personal-default".to_string(),
+            by_passport: Some("personal-default".to_string()),
         }),
     )
     .await
@@ -14122,14 +14201,730 @@ async fn work_post_then_list_then_patch_state_round_trip() {
     assert_eq!(patched["applied"], true);
     assert_eq!(patched["work"]["state"], "in_progress");
 
-    let txn_resp = super::work::get_transitions(State(state), Path(work_id), dev_scope_headers("admin:read"))
-        .await
-        .into_response();
+    let txn_resp = super::work::get_transitions(
+        State(state),
+        Path(work_id),
+        work_auth_headers("personal", Some("personal-default"), "admin:read"),
+    )
+    .await
+    .into_response();
     let txn_body = json_body(txn_resp).await;
     let txns = txn_body["transitions"].as_array().expect("transitions");
     assert_eq!(txns.len(), 2, "create + transition");
     assert_eq!(txns[0]["from_state"], "(none)");
     assert_eq!(txns[1]["to_state"], "in_progress");
+}
+
+#[tokio::test]
+async fn work_jwt_actor_and_tenant_isolation_matrix() {
+    let state = work_auth_test_state(16);
+    let (work_a, work_b) = {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed passports");
+        crate::projects::seed_default_if_missing(&mut store, 1).expect("seed project");
+        let create = |tenant: &str, actor: &str, title: &str| crate::work::CreateWorkInput {
+            project_id: "default".to_string(),
+            title: title.to_string(),
+            body: None,
+            state: None,
+            assignee_passport: None,
+            tenant_id: Some(tenant.to_string()),
+            linked_pr: None,
+            linked_issue: None,
+            created_by_passport: actor.to_string(),
+        };
+        let a = crate::work::create_work(&mut store, create("tenant-a", "passport-a", "tenant a"), 1_000)
+            .expect("create tenant A");
+        let b = crate::work::create_work(&mut store, create("tenant-b", "passport-b", "tenant b"), 1_100)
+            .expect("create tenant B");
+        crate::work::add_comment(&mut store, &b.id, "passport-b", "tenant b comment", 1_200).expect("comment tenant B");
+        let queued = crate::work::update_work(
+            &mut store,
+            &b.id,
+            crate::work::UpdateWorkInput {
+                title: None,
+                body: None,
+                state: Some("in_progress".to_string()),
+                assignee_passport: None,
+                tenant_id: None,
+                linked_pr: None,
+                linked_issue: None,
+                blocker_reason: None,
+                blocker_kind: None,
+            },
+            crate::work::UpdateWorkContext {
+                by_passport: "passport-b".to_string(),
+                passport_gated: true,
+                now_unix_ms: 1_300,
+            },
+        )
+        .expect("queue tenant B transition");
+        assert!(matches!(queued, crate::work::UpdateOutcome::Queued(_)));
+        (a, b)
+    };
+
+    let read_a = || work_auth_headers("tenant-a", Some("passport-a"), "admin:read");
+    let write_a = || work_auth_headers("tenant-a", Some("passport-a"), "facts:write");
+
+    let list = super::work::get_work(
+        State(state.clone()),
+        Query(super::work::ListWorkQuery {
+            project_id: None,
+            state: None,
+            tenant_id: None,
+            assignee_passport: None,
+            source: super::work::WorkSource::Kanban,
+            orchestrator: None,
+            ranked: false,
+            limit: None,
+            fields: None,
+        }),
+        read_a(),
+    )
+    .await
+    .into_response();
+    assert_eq!(list.status(), StatusCode::OK);
+    let listed = json_body(list).await;
+    assert_eq!(listed["count"], 1);
+    assert_eq!(listed["work"][0]["id"], work_a.id);
+
+    let cross_list = super::work::get_work(
+        State(state.clone()),
+        Query(super::work::ListWorkQuery {
+            project_id: None,
+            state: None,
+            tenant_id: Some("tenant-b".to_string()),
+            assignee_passport: None,
+            source: super::work::WorkSource::Kanban,
+            orchestrator: None,
+            ranked: false,
+            limit: None,
+            fields: None,
+        }),
+        read_a(),
+    )
+    .await
+    .into_response();
+    assert_eq!(cross_list.status(), StatusCode::FORBIDDEN);
+
+    for response in [
+        super::work::get_work_item(State(state.clone()), Path(work_b.id.clone()), read_a())
+            .await
+            .into_response(),
+        super::work::get_comments(State(state.clone()), Path(work_b.id.clone()), read_a())
+            .await
+            .into_response(),
+        super::work::get_transitions(State(state.clone()), Path(work_b.id.clone()), read_a())
+            .await
+            .into_response(),
+    ] {
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    let pending = super::work::get_pending_gates(
+        State(state.clone()),
+        Query(super::work::GateListQuery {
+            by_passport: None,
+            tenant_id: None,
+        }),
+        read_a(),
+    )
+    .await
+    .into_response();
+    assert_eq!(pending.status(), StatusCode::OK);
+    assert_eq!(json_body(pending).await["count"], 0);
+
+    let before_denied = {
+        let store = state.fact_store.read().await;
+        store.all_facts().count()
+    };
+    let cross_patch = super::work::patch_work(
+        State(state.clone()),
+        Path(work_b.id.clone()),
+        write_a(),
+        Json(super::work::UpdateWorkBody {
+            title: Some("stolen".to_string()),
+            body: None,
+            state: None,
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: None,
+            blocker_kind: None,
+            by_passport: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(cross_patch.status(), StatusCode::FORBIDDEN);
+    let cross_comment = super::work::post_comment(
+        State(state.clone()),
+        Path(work_b.id.clone()),
+        write_a(),
+        Json(super::work::CommentBody {
+            author_passport: None,
+            body: "stolen".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(cross_comment.status(), StatusCode::FORBIDDEN);
+
+    let spoof_create = super::work::post_work(
+        State(state.clone()),
+        write_a(),
+        Json(super::work::CreateWorkBody {
+            project_id: "default".to_string(),
+            title: "spoof".to_string(),
+            body: None,
+            state: None,
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            created_by_passport: Some("passport-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(spoof_create.status(), StatusCode::FORBIDDEN);
+    let cross_create = super::work::post_work(
+        State(state.clone()),
+        write_a(),
+        Json(super::work::CreateWorkBody {
+            project_id: "default".to_string(),
+            title: "cross tenant".to_string(),
+            body: None,
+            state: None,
+            assignee_passport: None,
+            tenant_id: Some("tenant-b".to_string()),
+            linked_pr: None,
+            linked_issue: None,
+            created_by_passport: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(cross_create.status(), StatusCode::FORBIDDEN);
+    let spoof_patch = super::work::patch_work(
+        State(state.clone()),
+        Path(work_a.id.clone()),
+        write_a(),
+        Json(super::work::UpdateWorkBody {
+            title: Some("spoof".to_string()),
+            body: None,
+            state: None,
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: None,
+            blocker_kind: None,
+            by_passport: Some("passport-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(spoof_patch.status(), StatusCode::FORBIDDEN);
+    let spoof_comment = super::work::post_comment(
+        State(state.clone()),
+        Path(work_a.id.clone()),
+        write_a(),
+        Json(super::work::CommentBody {
+            author_passport: Some("passport-b".to_string()),
+            body: "spoof".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(spoof_comment.status(), StatusCode::FORBIDDEN);
+
+    let missing_identity = super::work::post_work(
+        State(state.clone()),
+        work_auth_headers("tenant-a", None, "facts:write"),
+        Json(super::work::CreateWorkBody {
+            project_id: "default".to_string(),
+            title: "anonymous".to_string(),
+            body: None,
+            state: None,
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            created_by_passport: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(missing_identity.status(), StatusCode::FORBIDDEN);
+    let missing_tenant = super::work::post_work(
+        State(state.clone()),
+        work_auth_missing_tenant_headers("passport-a", "facts:write"),
+        Json(super::work::CreateWorkBody {
+            project_id: "default".to_string(),
+            title: "tenantless".to_string(),
+            body: None,
+            state: None,
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            created_by_passport: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(missing_tenant.status(), StatusCode::FORBIDDEN);
+
+    let after_denied = {
+        let store = state.fact_store.read().await;
+        store.all_facts().count()
+    };
+    assert_eq!(after_denied, before_denied, "denied work requests must not write facts");
+
+    for initial_state in ["drafting", "in_progress", "complete", "deployed", "pending_approval"] {
+        let before = {
+            let store = state.fact_store.read().await;
+            store.all_facts().count()
+        };
+        let response = super::work::post_work(
+            State(state.clone()),
+            write_a(),
+            Json(super::work::CreateWorkBody {
+                project_id: "default".to_string(),
+                title: format!("bad initial {initial_state}"),
+                body: None,
+                state: Some(initial_state.to_string()),
+                assignee_passport: None,
+                tenant_id: None,
+                linked_pr: None,
+                linked_issue: None,
+                created_by_passport: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let store = state.fact_store.read().await;
+        assert_eq!(store.all_facts().count(), before);
+    }
+
+    for tenant_change in [Some(Some("tenant-b".to_string())), Some(None)] {
+        let response = super::work::patch_work(
+            State(state.clone()),
+            Path(work_a.id.clone()),
+            write_a(),
+            Json(super::work::UpdateWorkBody {
+                title: None,
+                body: None,
+                state: None,
+                assignee_passport: None,
+                tenant_id: tenant_change,
+                linked_pr: None,
+                linked_issue: None,
+                blocker_reason: None,
+                blocker_kind: None,
+                by_passport: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    let queued_unknown = super::work::patch_work(
+        State(state.clone()),
+        Path(work_a.id.clone()),
+        work_auth_headers("tenant-a", Some("unknown-passport"), "facts:write"),
+        Json(super::work::UpdateWorkBody {
+            title: None,
+            body: None,
+            state: Some("in_progress".to_string()),
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: None,
+            blocker_kind: None,
+            by_passport: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(queued_unknown.status(), StatusCode::ACCEPTED);
+    let queued = json_body(queued_unknown).await;
+    assert_eq!(queued["queued"]["requested_by_passport"], "unknown-passport");
+}
+
+#[tokio::test]
+async fn work_local_assertions_are_tagged_and_known_ungated_passports_still_queue() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed passports");
+        crate::projects::seed_default_if_missing(&mut store, 1).expect("seed project");
+        let passport = crate::passports::get_passport(&store, "personal-default").expect("personal passport");
+        assert!(
+            !passport.agent_work_gate,
+            "fixture must be an ordinarily ungated passport"
+        );
+    }
+    let expected_actor = "operator:unverified:personal-default";
+    let headers = || dev_scope_passport_headers("facts:write", "personal-default");
+
+    let created = super::work::post_work(
+        State(state.clone()),
+        headers(),
+        Json(super::work::CreateWorkBody {
+            project_id: "default".to_string(),
+            title: "local assertion attribution".to_string(),
+            body: None,
+            state: None,
+            assignee_passport: None,
+            tenant_id: Some("tenant-a".to_string()),
+            linked_pr: None,
+            linked_issue: None,
+            created_by_passport: Some("personal-default".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created = json_body(created).await;
+    assert_eq!(created["created_by_passport"], expected_actor);
+    let work_id = created["id"].as_str().expect("created work id").to_string();
+
+    let commented = super::work::post_comment(
+        State(state.clone()),
+        Path(work_id.clone()),
+        headers(),
+        Json(super::work::CommentBody {
+            author_passport: Some("personal-default".to_string()),
+            body: "locally asserted comment".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(commented.status(), StatusCode::CREATED);
+    assert_eq!(json_body(commented).await["author_passport"], expected_actor);
+
+    let transition = super::work::patch_work(
+        State(state.clone()),
+        Path(work_id.clone()),
+        headers(),
+        Json(super::work::UpdateWorkBody {
+            title: None,
+            body: None,
+            state: Some("in_progress".to_string()),
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: None,
+            blocker_kind: None,
+            by_passport: Some("personal-default".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(transition.status(), StatusCode::ACCEPTED);
+    let transition = json_body(transition).await;
+    assert_eq!(transition["applied"], false);
+    assert_eq!(transition["queued"]["requested_by_passport"], expected_actor);
+
+    let store = state.fact_store.read().await;
+    let persisted = crate::work::get_work(&store, &work_id).expect("persisted work");
+    assert_eq!(persisted.created_by_passport, expected_actor);
+    assert_eq!(
+        persisted.state, "planned",
+        "unverified state transition must remain gated"
+    );
+    assert_eq!(
+        crate::work::list_comments(&store, &work_id)[0].author_passport,
+        expected_actor
+    );
+    let pending = crate::work::list_pending_gates(&store, Some("tenant-a"), Some(expected_actor));
+    assert_eq!(pending.len(), 1);
+    assert!(
+        store
+            .all_facts()
+            .filter(|fact| { fact.entity.contains(&work_id) || fact.entity.contains(pending[0].action_id.as_str()) })
+            .all(|fact| fact.actor.as_deref() == Some(expected_actor)),
+        "all local work mutations must retain the durable unverified actor tag"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn unmapped_agent_token_cannot_inherit_colliding_passport_policy() -> Result<(), Box<dyn std::error::Error>> {
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    const AGENT_TOKEN: &str = "abcdef0123456789abcdef0123456789abcdef0123456789";
+    let _secret = EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", SECRET);
+    let _issuer = EnvVarGuard::unset("CORECRUXD_JWT_ISS");
+    let _audience = EnvVarGuard::unset("CORECRUXD_JWT_AUD");
+    let _accept = EnvVarGuard::set("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS", "1");
+    let _tokens = EnvVarGuard::set("CRUX_AGENT_TOKENS", &format!("personal-default:{AGENT_TOKEN}"));
+    let _scopes = EnvVarGuard::set("CORECRUXD_AGENT_TOKEN_HTTP_SCOPES", "facts:write");
+    let _tenant = EnvVarGuard::set("CORECRUXD_AGENT_TOKEN_HTTP_TENANT", "tenant-a");
+    let _passport_flag = EnvVarGuard::unset("CORECRUXD_AGENT_PASSPORTS");
+    let _passport_map = EnvVarGuard::unset("CRUX_AGENT_PASSPORTS");
+
+    let mut state = test_app_state_with_auth(16, AuthMode::Off);
+    state.auth = crate::auth::Authz::from_env(AuthMode::JwtHs256).expect("agent-token auth config");
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed passports");
+        crate::projects::seed_default_if_missing(&mut store, 1).expect("seed project");
+        let colliding = crate::passports::get_passport(&store, "personal-default").expect("colliding passport");
+        assert!(
+            !colliding.agent_work_gate,
+            "fixture must prove the human passport would ordinarily be ungated"
+        );
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {AGENT_TOKEN}"))?,
+    );
+
+    let created = super::work::post_work(
+        State(state.clone()),
+        headers.clone(),
+        Json(super::work::CreateWorkBody {
+            project_id: "default".to_string(),
+            title: "agent-token collision regression".to_string(),
+            body: None,
+            state: None,
+            assignee_passport: None,
+            tenant_id: Some("tenant-a".to_string()),
+            linked_pr: None,
+            linked_issue: None,
+            created_by_passport: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created = json_body(created).await;
+    assert_eq!(created["created_by_passport"], "agent:personal-default");
+    let work_id = created["id"].as_str().expect("created work id").to_string();
+
+    let transitioned = super::work::patch_work(
+        State(state.clone()),
+        Path(work_id.clone()),
+        headers,
+        Json(super::work::UpdateWorkBody {
+            title: None,
+            body: None,
+            state: Some("in_progress".to_string()),
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: None,
+            blocker_kind: None,
+            by_passport: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(transitioned.status(), StatusCode::ACCEPTED);
+    let transitioned = json_body(transitioned).await;
+    assert_eq!(transitioned["applied"], false);
+    assert_eq!(
+        transitioned["queued"]["requested_by_passport"],
+        "agent:personal-default"
+    );
+
+    let store = state.fact_store.read().await;
+    let persisted = crate::work::get_work(&store, &work_id).expect("persisted work");
+    assert_eq!(persisted.state, "planned");
+    assert_eq!(persisted.created_by_passport, "agent:personal-default");
+    Ok(())
+}
+
+#[tokio::test]
+async fn coord_active_filters_embedded_work_by_verified_tenant() {
+    let mut state = work_auth_test_state(16);
+    state.coord_enabled = true;
+    let (work_a, work_b) = {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed passports");
+        crate::projects::seed_default_if_missing(&mut store, 1).expect("seed project");
+        let mut create = |tenant: &str, actor: &str, now| {
+            let work = crate::work::create_work(
+                &mut store,
+                crate::work::CreateWorkInput {
+                    project_id: "default".to_string(),
+                    title: format!("{tenant} work"),
+                    body: None,
+                    state: None,
+                    assignee_passport: None,
+                    tenant_id: Some(tenant.to_string()),
+                    linked_pr: None,
+                    linked_issue: None,
+                    created_by_passport: actor.to_string(),
+                },
+                now,
+            )
+            .expect("create work");
+            let outcome = crate::work::update_work(
+                &mut store,
+                &work.id,
+                crate::work::UpdateWorkInput {
+                    title: None,
+                    body: None,
+                    state: Some("in_progress".to_string()),
+                    assignee_passport: None,
+                    tenant_id: None,
+                    linked_pr: None,
+                    linked_issue: None,
+                    blocker_reason: None,
+                    blocker_kind: None,
+                },
+                crate::work::UpdateWorkContext {
+                    by_passport: actor.to_string(),
+                    passport_gated: false,
+                    now_unix_ms: now + 1,
+                },
+            )
+            .expect("transition work");
+            assert!(matches!(outcome, crate::work::UpdateOutcome::Applied(_)));
+            work.id
+        };
+        (
+            create("tenant-a", "passport-a", 1_000),
+            create("tenant-b", "passport-b", 2_000),
+        )
+    };
+
+    let response = super::coord::get_coord_active(
+        State(state.clone()),
+        Query(super::coord::ActiveQuery {
+            project_id: None,
+            tenant_id: None,
+        }),
+        work_auth_headers("tenant-a", Some("passport-a"), "admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let work = body["work_in_flight"].as_array().expect("work in flight");
+    assert_eq!(work.len(), 1);
+    assert_eq!(work[0]["id"], work_a);
+    assert!(work.iter().all(|item| item["id"] != work_b));
+
+    let cross_tenant = super::coord::get_coord_active(
+        State(state),
+        Query(super::coord::ActiveQuery {
+            project_id: None,
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+        work_auth_headers("tenant-a", Some("passport-a"), "admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(cross_tenant.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn generic_http_entities_hide_and_reject_governed_kinds() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.entity_store.write().await;
+        store
+            .upsert(
+                "orchestrator",
+                "orc_secret",
+                serde_json::json!({"tenant_id":"tenant-b","name":"secret"}),
+                "seed",
+                None,
+            )
+            .expect("seed governed entity");
+        store
+            .upsert(
+                "capability",
+                "visible",
+                serde_json::json!({"name":"visible"}),
+                "seed",
+                None,
+            )
+            .expect("seed visible entity");
+    }
+
+    let denied_get = super::entities::get_entity(
+        State(state.clone()),
+        Path(("orchestrator".to_string(), "orc_secret".to_string())),
+        dev_scope_headers("facts:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(denied_get.status(), StatusCode::FORBIDDEN);
+    let denied_list = super::entities::list_entities(
+        State(state.clone()),
+        Query(super::entities::ListEntitiesQuery {
+            kind: Some("orchestrator".to_string()),
+            limit: None,
+            include_deleted: false,
+        }),
+        dev_scope_headers("facts:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(denied_list.status(), StatusCode::FORBIDDEN);
+    let denied_put = super::entities::put_entity(
+        State(state.clone()),
+        Path(("orchestrator".to_string(), "orc_secret".to_string())),
+        dev_scope_headers("facts:write"),
+        Json(super::entities::UpsertEntityBody {
+            payload: serde_json::json!({"tenant_id":"tenant-a","name":"stolen"}),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(denied_put.status(), StatusCode::FORBIDDEN);
+    let denied_history = super::entities::get_entity_history(
+        State(state.clone()),
+        Path(("orchestrator".to_string(), "orc_secret".to_string())),
+        dev_scope_headers("facts:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(denied_history.status(), StatusCode::FORBIDDEN);
+    let denied_delete = super::entities::delete_entity(
+        State(state.clone()),
+        Path(("orchestrator".to_string(), "orc_secret".to_string())),
+        dev_scope_headers("facts:write"),
+    )
+    .await
+    .into_response();
+    assert_eq!(denied_delete.status(), StatusCode::FORBIDDEN);
+
+    let unfiltered = super::entities::list_entities(
+        State(state.clone()),
+        Query(super::entities::ListEntitiesQuery {
+            kind: None,
+            limit: Some(1),
+            include_deleted: false,
+        }),
+        dev_scope_headers("facts:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(unfiltered.status(), StatusCode::OK);
+    let body = json_body(unfiltered).await;
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["entities"][0]["kind"], "capability");
+
+    let store = state.entity_store.read().await;
+    let governed = store
+        .get("orchestrator", "orc_secret")
+        .expect("governed entity remains");
+    assert_eq!(governed.version, 1);
+    assert!(!governed.deleted);
+    assert_eq!(governed.payload["tenant_id"], "tenant-b");
 }
 
 #[serial_test::serial]
@@ -14185,6 +14980,7 @@ async fn status_feed_disabled_returns_notice_not_error() {
         State(state),
         axum::extract::Query(super::work::StatusFeedQuery {
             work_id: None,
+            tenant_id: None,
             limit: None,
         }),
         dev_scope_headers("admin:read"),
@@ -14301,7 +15097,8 @@ fn gate_test_observation_count(state: &AppState) -> Result<usize, Box<dyn std::e
 }
 
 #[tokio::test]
-async fn work_gate_spoofed_body_is_denied_and_bound_passport_is_stored() -> Result<(), Box<dyn std::error::Error>> {
+async fn work_gate_spoofed_local_assertion_is_denied_and_accepted_actor_is_tagged(
+) -> Result<(), Box<dyn std::error::Error>> {
     for approve in [true, false] {
         let (state, _work_id, action_id) = gate_test_state(AuthMode::DevScopes, Some("tenant-a")).await?;
         let spoofed = gate_test_resolve(
@@ -14340,7 +15137,10 @@ async fn work_gate_spoofed_body_is_denied_and_bound_passport_is_stored() -> Resu
             return Err(std::io::Error::other("resolved gate fact missing").into());
         };
         let gate: crate::work::PendingGateAction = serde_json::from_str(&fact.value)?;
-        assert_eq!(gate.resolved_by_passport.as_deref(), Some("approver-a"));
+        assert_eq!(
+            gate.resolved_by_passport.as_deref(),
+            Some("operator:unverified:approver-a")
+        );
         assert_ne!(gate.resolved_by_passport.as_deref(), Some("approver-b"));
     }
     Ok(())
@@ -14383,15 +15183,8 @@ async fn work_gate_read_only_token_is_denied_in_route_auth_shadow() -> Result<()
 async fn work_gate_missing_passport_is_denied_closed() -> Result<(), Box<dyn std::error::Error>> {
     for approve in [true, false] {
         let (state, _work_id, action_id) = gate_test_state(AuthMode::DevScopes, Some("tenant-a")).await?;
-        let response = gate_test_resolve(
-            &state,
-            &action_id,
-            dev_scope_headers("facts:write"),
-            Some("approver-a"),
-            approve,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = gate_test_resolve(&state, &action_id, dev_scope_headers("facts:write"), None, approve).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let store = state.fact_store.read().await;
         let entity = format!("{}::{action_id}", crate::work::WORK_GATE_ENTITY_PREFIX);
@@ -14400,6 +15193,85 @@ async fn work_gate_missing_passport_is_denied_closed() -> Result<(), Box<dyn std
         };
         let gate: crate::work::PendingGateAction = serde_json::from_str(&fact.value)?;
         assert_eq!(gate.status, "pending");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn work_gate_requires_canonical_passport_and_tenant_claims() -> Result<(), Box<dyn std::error::Error>> {
+    for approve in [true, false] {
+        let (mut state, _work_id, action_id) = gate_test_state(AuthMode::Off, Some("tenant-a")).await?;
+        state.auth = crate::auth::Authz::test_hs256(
+            WORK_AUTH_TEST_SECRET.as_bytes(),
+            WORK_AUTH_TEST_ISSUER,
+            WORK_AUTH_TEST_AUDIENCE,
+        );
+
+        let sub_only = gate_test_resolve(
+            &state,
+            &action_id,
+            work_auth_sub_headers("tenant-a", "approver-a", "facts:write"),
+            None,
+            approve,
+        )
+        .await;
+        assert_eq!(sub_only.status(), StatusCode::FORBIDDEN);
+
+        let missing_tenant = gate_test_resolve(
+            &state,
+            &action_id,
+            work_auth_missing_tenant_headers("approver-a", "facts:write"),
+            None,
+            approve,
+        )
+        .await;
+        assert_eq!(missing_tenant.status(), StatusCode::FORBIDDEN);
+
+        let store = state.fact_store.read().await;
+        let entity = format!("{}::{action_id}", crate::work::WORK_GATE_ENTITY_PREFIX);
+        let fact = gate_test_latest_fact(&store, &entity)
+            .ok_or_else(|| std::io::Error::other("pending gate missing after denied identity attempts"))?;
+        let gate: crate::work::PendingGateAction = serde_json::from_str(&fact.value)?;
+        assert_eq!(gate.status, "pending");
+        assert_eq!(gate_test_observation_count(&state)?, 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn work_gate_rejects_registered_agent_token_as_human_decision() -> Result<(), Box<dyn std::error::Error>> {
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    const AGENT_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+    let _secret = EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", SECRET);
+    let _issuer = EnvVarGuard::unset("CORECRUXD_JWT_ISS");
+    let _audience = EnvVarGuard::unset("CORECRUXD_JWT_AUD");
+    let _accept = EnvVarGuard::set("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS", "1");
+    let _tokens = EnvVarGuard::set("CRUX_AGENT_TOKENS", &format!("approver-agent:{AGENT_TOKEN}"));
+    let _scopes = EnvVarGuard::set("CORECRUXD_AGENT_TOKEN_HTTP_SCOPES", "facts:write");
+    let _tenant = EnvVarGuard::set("CORECRUXD_AGENT_TOKEN_HTTP_TENANT", "tenant-a");
+    let _passport_flag = EnvVarGuard::unset("CORECRUXD_AGENT_PASSPORTS");
+    let _passport_map = EnvVarGuard::unset("CRUX_AGENT_PASSPORTS");
+
+    for approve in [true, false] {
+        let (state, _work_id, action_id) = gate_test_state(AuthMode::JwtHs256, Some("tenant-a")).await?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {AGENT_TOKEN}"))?,
+        );
+        let response = gate_test_resolve(&state, &action_id, headers, None, approve).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(gate_test_observation_count(&state)?, 0);
+
+        let store = state.fact_store.read().await;
+        let entity = format!("{}::{action_id}", crate::work::WORK_GATE_ENTITY_PREFIX);
+        let fact = gate_test_latest_fact(&store, &entity)
+            .ok_or_else(|| std::io::Error::other("agent-token pending gate missing"))?;
+        let gate: crate::work::PendingGateAction = serde_json::from_str(&fact.value)?;
+        assert_eq!(gate.status, "pending");
+        assert_eq!(gate.resolved_by_passport, None);
+        assert_eq!(gate.receipt_id, None);
     }
     Ok(())
 }
@@ -14627,7 +15499,7 @@ async fn work_gate_jwt_binding_and_cross_tenant_enforcement() -> Result<(), Box<
             gate_test_state(AuthMode::JwtHs256, Some("tenant-y")).await?;
         {
             let mut store = drift_state.fact_store.write().await;
-            let _ = crate::work::update_work(
+            let immutable = crate::work::update_work(
                 &mut store,
                 &drift_work_id,
                 crate::work::UpdateWorkInput {
@@ -14646,7 +15518,32 @@ async fn work_gate_jwt_binding_and_cross_tenant_enforcement() -> Result<(), Box<
                     passport_gated: false,
                     now_unix_ms: 2_500,
                 },
-            )?;
+            )
+            .expect_err("ordinary work updates must not move a tenant");
+            assert!(matches!(immutable, crate::work::WorkError::TenantImmutable));
+
+            // Model an already-corrupt/legacy row so the independent gate-drift
+            // fail-closed check remains covered without using the now-closed
+            // public tenant-mutation path.
+            let mut drifted = crate::work::get_work(&store, &drift_work_id)
+                .ok_or_else(|| std::io::Error::other("drift work fixture missing"))?;
+            drifted.tenant_id = Some("tenant-x".to_string());
+            store.store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: format!(
+                    "{}::{}::{}",
+                    crate::work::WORK_ENTITY_PREFIX,
+                    drifted.project_id,
+                    drifted.id
+                ),
+                key: crate::work::RECORD_KEY.to_string(),
+                value: serde_json::to_string(&drifted)?,
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: Some("test:legacy-corruption".to_string()),
+            });
         }
         let current_tenant_attempt = gate_test_resolve(
             &drift_state,
@@ -14675,6 +15572,7 @@ async fn work_gate_jwt_binding_and_cross_tenant_enforcement() -> Result<(), Box<
 async fn work_gate_receipt_resolves_and_resolution_facts_are_attributed() -> Result<(), Box<dyn std::error::Error>> {
     for approve in [true, false] {
         let (mut state, work_id, action_id) = gate_test_state(AuthMode::DevScopes, Some("tenant-a")).await?;
+        let expected_actor = "operator:unverified:approver-a";
         let response = gate_test_resolve(
             &state,
             &action_id,
@@ -14728,7 +15626,7 @@ async fn work_gate_receipt_resolves_and_resolution_facts_are_attributed() -> Res
         };
         assert_eq!(
             receipt_fields.get("reviewer_passport").map(String::as_str),
-            Some("approver-a")
+            Some(expected_actor)
         );
         assert_eq!(
             receipt_fields.get("decision").map(String::as_str),
@@ -14795,10 +15693,10 @@ async fn work_gate_receipt_resolves_and_resolution_facts_are_attributed() -> Res
         let Some(gate_fact) = gate_test_latest_fact(&store, &gate_entity) else {
             return Err(std::io::Error::other("resolved gate fact missing").into());
         };
-        assert_eq!(gate_fact.actor.as_deref(), Some("approver-a"));
+        assert_eq!(gate_fact.actor.as_deref(), Some(expected_actor));
         assert_eq!(gate_fact.source_receipt.as_deref(), Some(receipt_id));
         let gate: crate::work::PendingGateAction = serde_json::from_str(&gate_fact.value)?;
-        assert_eq!(gate.resolved_by_passport.as_deref(), Some("approver-a"));
+        assert_eq!(gate.resolved_by_passport.as_deref(), Some(expected_actor));
         assert_eq!(gate.receipt_id.as_deref(), Some(receipt_id));
 
         let expected_gate_status = if approve { "approved" } else { "rejected" };
@@ -14815,10 +15713,10 @@ async fn work_gate_receipt_resolves_and_resolution_facts_are_attributed() -> Res
         let Some(transition_fact) = transition else {
             return Err(std::io::Error::other("gate resolution transition fact missing").into());
         };
-        assert_eq!(transition_fact.actor.as_deref(), Some("approver-a"));
+        assert_eq!(transition_fact.actor.as_deref(), Some(expected_actor));
         assert_eq!(transition_fact.source_receipt.as_deref(), Some(receipt_id));
         let transition: crate::work::WorkTransition = serde_json::from_str(&transition_fact.value)?;
-        assert_eq!(transition.by_passport, "approver-a");
+        assert_eq!(transition.by_passport, expected_actor);
         assert_eq!(transition.receipt_id.as_deref(), Some(receipt_id));
 
         if approve {
@@ -14826,7 +15724,7 @@ async fn work_gate_receipt_resolves_and_resolution_facts_are_attributed() -> Res
             let Some(work_fact) = gate_test_latest_fact(&store, &work_entity) else {
                 return Err(std::io::Error::other("approved work fact missing").into());
             };
-            assert_eq!(work_fact.actor.as_deref(), Some("approver-a"));
+            assert_eq!(work_fact.actor.as_deref(), Some(expected_actor));
             assert_eq!(work_fact.source_receipt.as_deref(), Some(receipt_id));
         }
     }
@@ -15175,7 +16073,7 @@ async fn work_patch_with_gated_passport_returns_202_queued() {
     let patch_resp = super::work::patch_work(
         State(state.clone()),
         Path(work_id),
-        dev_scope_headers("facts:write"),
+        dev_scope_passport_headers("facts:write", "personal-default"),
         Json(super::work::UpdateWorkBody {
             title: None,
             body: None,
@@ -15186,7 +16084,7 @@ async fn work_patch_with_gated_passport_returns_202_queued() {
             linked_issue: None,
             blocker_reason: None,
             blocker_kind: None,
-            by_passport: "personal-default".to_string(),
+            by_passport: Some("personal-default".to_string()),
         }),
     )
     .await
@@ -15198,7 +16096,10 @@ async fn work_patch_with_gated_passport_returns_202_queued() {
 
     let pending_resp = super::work::get_pending_gates(
         State(state),
-        Query(super::work::GateListQuery { by_passport: None }),
+        Query(super::work::GateListQuery {
+            by_passport: None,
+            tenant_id: None,
+        }),
         dev_scope_headers("admin:read"),
     )
     .await
@@ -15246,9 +16147,9 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
     let comment_resp = super::work::post_comment(
         State(state.clone()),
         Path(work_id.clone()),
-        dev_scope_headers("facts:write"),
+        dev_scope_passport_headers("facts:write", "personal-default"),
         Json(super::work::CommentBody {
-            author_passport: "personal-default".to_string(),
+            author_passport: Some("personal-default".to_string()),
             body: "ready for review".to_string(),
         }),
     )
@@ -15290,7 +16191,7 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
     let queue_for_reject = super::work::patch_work(
         State(state.clone()),
         Path(work_id.clone()),
-        dev_scope_headers("facts:write"),
+        dev_scope_passport_headers("facts:write", "personal-default"),
         Json(super::work::UpdateWorkBody {
             title: Some("queued reject".to_string()),
             body: None,
@@ -15301,7 +16202,7 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
             linked_issue: None,
             blocker_reason: Some(Some("needs approval".to_string())),
             blocker_kind: Some(crate::work::BlockerKind::NeedsApproval),
-            by_passport: "personal-default".to_string(),
+            by_passport: Some("personal-default".to_string()),
         }),
     )
     .await
@@ -15324,7 +16225,7 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
     let queue_for_approve = super::work::patch_work(
         State(state.clone()),
         Path(work_id),
-        dev_scope_headers("facts:write"),
+        dev_scope_passport_headers("facts:write", "personal-default"),
         Json(super::work::UpdateWorkBody {
             title: None,
             body: None,
@@ -15335,7 +16236,7 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
             linked_issue: None,
             blocker_reason: None,
             blocker_kind: None,
-            by_passport: "personal-default".to_string(),
+            by_passport: Some("personal-default".to_string()),
         }),
     )
     .await
@@ -21251,7 +22152,7 @@ async fn seeded_work_state() -> crate::http::AppState {
     ] {
         let resp = super::work::post_work(
             State(state.clone()),
-            dev_scope_headers("facts:write"),
+            dev_scope_passport_headers("facts:write", "personal-default"),
             Json(super::work::CreateWorkBody {
                 project_id: "default".to_string(),
                 title: title.to_string(),
@@ -21261,7 +22162,7 @@ async fn seeded_work_state() -> crate::http::AppState {
                 tenant_id: None,
                 linked_pr: None,
                 linked_issue: None,
-                created_by_passport: "personal-default".to_string(),
+                created_by_passport: Some("personal-default".to_string()),
             }),
         )
         .await
@@ -21422,26 +22323,31 @@ async fn work_ranked_drops_terminal_states() {
     )
     .await;
     let victim = listed["work"][0]["id"].as_str().expect("id").to_string();
-    let patched = super::work::patch_work(
-        State(state.clone()),
-        Path(victim.clone()),
-        dev_scope_headers("facts:write"),
-        Json(super::work::UpdateWorkBody {
-            title: None,
-            body: None,
-            state: Some("complete".to_string()),
-            assignee_passport: None,
-            tenant_id: None,
-            linked_pr: None,
-            linked_issue: None,
-            blocker_reason: None,
-            blocker_kind: None,
-            by_passport: "personal-default".to_string(),
-        }),
-    )
-    .await
-    .into_response();
-    assert_eq!(patched.status(), StatusCode::OK);
+    {
+        let mut store = state.fact_store.write().await;
+        let outcome = crate::work::update_work(
+            &mut store,
+            &victim,
+            crate::work::UpdateWorkInput {
+                title: None,
+                body: None,
+                state: Some("complete".to_string()),
+                assignee_passport: None,
+                tenant_id: None,
+                linked_pr: None,
+                linked_issue: None,
+                blocker_reason: None,
+                blocker_kind: None,
+            },
+            crate::work::UpdateWorkContext {
+                by_passport: "test:ranking-fixture".to_string(),
+                passport_gated: false,
+                now_unix_ms: 10_000,
+            },
+        )
+        .expect("fixture transition");
+        assert!(matches!(outcome, crate::work::UpdateOutcome::Applied(_)));
+    }
 
     let ranked = json_body(
         super::work::get_work(
@@ -21513,26 +22419,53 @@ async fn workbench_brief_open_work_is_ranked_and_slim() {
         crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
         crate::projects::seed_default_if_missing(&mut store, 1).expect("project seed");
     }
-    // One planned + one in_progress: ranking must put in_progress first.
+    // One planned + one in_progress: create both through the only permitted
+    // initial state, then transition the active item through the normal rail.
     for (title, st) in [("zzz planned work", "planned"), ("aaa active work", "in_progress")] {
         let resp = super::work::post_work(
             State(state.clone()),
-            dev_scope_headers("facts:write"),
+            dev_scope_passport_headers("facts:write", "personal-default"),
             Json(super::work::CreateWorkBody {
                 project_id: "default".to_string(),
                 title: title.to_string(),
                 body: None,
-                state: Some(st.to_string()),
+                state: Some("planned".to_string()),
                 assignee_passport: None,
                 tenant_id: Some("business::acme".to_string()),
                 linked_pr: None,
                 linked_issue: None,
-                created_by_passport: "personal-default".to_string(),
+                created_by_passport: Some("personal-default".to_string()),
             }),
         )
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::CREATED);
+        if st != "planned" {
+            let work_id = json_body(resp).await["id"].as_str().expect("work id").to_string();
+            let mut store = state.fact_store.write().await;
+            let transitioned = crate::work::update_work(
+                &mut store,
+                &work_id,
+                crate::work::UpdateWorkInput {
+                    title: None,
+                    body: None,
+                    state: Some(st.to_string()),
+                    assignee_passport: None,
+                    tenant_id: None,
+                    linked_pr: None,
+                    linked_issue: None,
+                    blocker_reason: None,
+                    blocker_kind: None,
+                },
+                crate::work::UpdateWorkContext {
+                    by_passport: "test:workbench-fixture".to_string(),
+                    passport_gated: false,
+                    now_unix_ms: 10_000,
+                },
+            )
+            .expect("fixture transition");
+            assert!(matches!(transitioned, crate::work::UpdateOutcome::Applied(_)));
+        }
     }
 
     let resp = super::workbench::get_agent_brief(

@@ -138,6 +138,7 @@ struct AgentTokenHttpConfig {
     registry: crux_mcp::agent::AgentRegistry,
     scopes: BTreeSet<String>,
     tenants: TenantAllow,
+    passport_map: Option<crux_mcp::agent_passport::AgentPassportMap>,
 }
 
 /// Env flag enabling HTTP acceptance of MCP agent tokens. Default off.
@@ -170,10 +171,13 @@ fn build_agent_http_config() -> Option<AgentTokenHttpConfig> {
         .ok()
         .unwrap_or_else(|| "*".to_string());
     let tenants = tenant_allow_from_str(&tenant_raw);
+    let passport_map =
+        env_truthy("CORECRUXD_AGENT_PASSPORTS").then(crux_mcp::agent_passport::AgentPassportMap::from_env_or_default);
     Some(AgentTokenHttpConfig {
         registry,
         scopes,
         tenants,
+        passport_map,
     })
 }
 
@@ -213,13 +217,40 @@ impl AgentTokenHttpConfig {
     /// If `token` is a registered agent token, return an `AuthContext` carrying
     /// the configured scopes + tenant binding, attributed to the agent name.
     fn try_auth(&self, token: &str) -> Option<AuthContext> {
-        self.registry.lookup(token).map(|agent| AuthContext {
-            subject: Some(format!("agent:{}", agent.name)),
-            passport_id: Some(format!("agent:{}", agent.name)),
-            scopes: self.scopes.clone(),
-            tenants: self.tenants.clone(),
-            canonical_passport_claim_verified: false,
-            credential_is_agent_token: true,
+        self.registry.lookup(token).and_then(|agent| {
+            // An opaque agent-token name is an automation principal, not a
+            // passport. Namespace it unless the operator explicitly supplied
+            // an agent→passport mapping; otherwise a token named like a real
+            // passport could inherit that passport's human/ungated policy.
+            let automation_id = format!("agent:{}", agent.name);
+            let (passport_id, tenants) = if let Some(passport_map) = &self.passport_map {
+                if let Some(group) = passport_map.get_group(&agent.name) {
+                    require_tenant_allowed(&self.tenants, &group.tenant).ok()?;
+                    let mut tenant = BTreeSet::new();
+                    tenant.insert(group.tenant.clone());
+                    (group.passport.clone(), TenantAllow::Only(tenant))
+                } else {
+                    // Flag-on but unmapped agents remain automation principals
+                    // and are confined to default, matching MCP authority.
+                    require_tenant_allowed(&self.tenants, "default").ok()?;
+                    let mut tenant = BTreeSet::new();
+                    tenant.insert("default".to_string());
+                    (automation_id.clone(), TenantAllow::Only(tenant))
+                }
+            } else {
+                // The token registry cryptographically verifies this name. It
+                // is a valid *automation* principal even when passport mapping
+                // is disabled, but it is never a human passport by name alone.
+                (automation_id, self.tenants.clone())
+            };
+            Some(AuthContext {
+                subject: Some(format!("agent:{}", agent.name)),
+                passport_id: Some(passport_id),
+                scopes: self.scopes.clone(),
+                tenants,
+                canonical_passport_claim_verified: false,
+                credential_is_agent_token: true,
+            })
         })
     }
 }
@@ -958,6 +989,10 @@ pub struct HttpScopeContext {
     pub scopes: Vec<String>,
     pub passport_id: Option<String>,
     auth_enforced: bool,
+    /// Auth-off and DevScopes are explicit local-development modes. They can
+    /// carry caller assertions, but those assertions are never verified
+    /// principals and must be durably labelled as such.
+    local_unverified_identity: bool,
     passport_override_used: bool,
     canonical_passport_claim_verified: bool,
     credential_is_agent_token: bool,
@@ -1125,6 +1160,12 @@ impl HttpScopeContext {
         self.auth_enforced
     }
 
+    /// Whether caller-supplied identity is permitted only as an explicitly
+    /// unverified local-development assertion.
+    pub(crate) fn local_unverified_identity(&self) -> bool {
+        self.local_unverified_identity
+    }
+
     /// Whether the verified JWT carried a canonical, non-empty `passport_id`
     /// claim. This is stricter than the ordinary identity fallback to `sub`.
     pub(crate) fn canonical_passport_claim_verified(&self) -> bool {
@@ -1151,6 +1192,57 @@ impl HttpScopeContext {
     /// Tenant an HTTP read is scoped to. `None` → default tenant.
     pub(crate) fn resolve_read_tenant(&self) -> Option<String> {
         resolve_read_tenant_flagged(&self.tenants, TenantStampMode::from_env())
+    }
+
+    /// Resolve one concrete tenant for an authority-sensitive surface,
+    /// independent of the legacy tenant-stamping rollout flag.
+    ///
+    /// `requested` is the route/body/query target. The optional
+    /// `x-corecrux-tenant-id` selector is treated as an additional constraint:
+    /// when both are present they must agree. Tokens with no tenant claim are
+    /// confined to `default`; multi-tenant tokens must select one tenant; and a
+    /// wildcard/admin token may explicitly select any tenant. Authenticated
+    /// tokens without a tenant claim are denied; this authority-sensitive
+    /// surface does not inherit the legacy shared-default fallback.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn resolve_authorized_tenant(&self, requested: Option<&str>) -> Result<String, ProblemResponse> {
+        let requested = requested.map(str::trim).filter(|value| !value.is_empty());
+        let header = self
+            .write_tenant_selector
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let (Some(requested), Some(header)) = (requested, header) {
+            if requested != header {
+                return Err(ProblemResponse(
+                    ProblemDetails::forbidden("route tenant does not match x-corecrux-tenant-id").with_extensions(
+                        serde_json::json!({
+                            "code": "TENANT_SELECTOR_MISMATCH",
+                            "routeTenantId": requested,
+                            "headerTenantId": header,
+                        }),
+                    ),
+                ));
+            }
+        }
+        let selector = requested.or(header);
+        if matches!(self.tenants, TenantAllow::Missing) && self.auth_enforced {
+            return Err(ProblemResponse(
+                ProblemDetails::forbidden("token is missing a tenant claim").with_extensions(serde_json::json!({
+                    "code": "TENANT_CLAIM_MISSING",
+                })),
+            ));
+        }
+        if matches!(self.tenants, TenantAllow::Missing) && selector.is_some_and(|tenant| tenant != "default") {
+            return Err(ProblemResponse(
+                ProblemDetails::forbidden("token without a tenant claim is confined to the default tenant")
+                    .with_extensions(serde_json::json!({
+                        "code": "TENANT_FORBIDDEN",
+                        "tenantId": selector,
+                    })),
+            ));
+        }
+        Ok(resolve_write_tenant_on(&self.tenants, selector)?.unwrap_or_else(|| "default".to_string()))
     }
 }
 
@@ -1184,6 +1276,7 @@ pub fn passport_bound_context(auth: &Authz, headers: &HeaderMap) -> Result<HttpS
         scopes: ctx.scopes.into_iter().collect(),
         passport_id,
         auth_enforced: auth.mode != AuthMode::Off,
+        local_unverified_identity: matches!(auth.mode, AuthMode::Off | AuthMode::DevScopes),
         passport_override_used,
         canonical_passport_claim_verified: ctx.canonical_passport_claim_verified,
         credential_is_agent_token: ctx.credential_is_agent_token,
@@ -1655,6 +1748,9 @@ mod tests {
         // The agent token authenticates on HTTP with the configured scopes.
         require_http_scopes(&auth, &headers, &["query:read", "facts:write"]).expect("agent token accepted");
         require_http_scopes_for_tenant(&auth, &headers, &["query:read"], "any-tenant").expect("tenant * allows any");
+        let context = passport_bound_context(&auth, &headers).expect("agent token context");
+        assert_eq!(context.passport_id.as_deref(), Some("agent:drivew"));
+        assert!(context.credential_is_agent_token());
 
         // A bogus bearer is still rejected.
         let mut bad = HeaderMap::new();
@@ -1674,6 +1770,56 @@ mod tests {
             "CORECRUXD_AGENT_TOKEN_HTTP_TENANT",
         ] {
             std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn agent_token_http_context_uses_configured_passport_and_tenant_mapping() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        const AGENT_TOK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
+        std::env::remove_var(ALLOW_WEAK_HS256_SECRET_ENV);
+        std::env::remove_var("CORECRUXD_JWT_ISS");
+        std::env::remove_var("CORECRUXD_JWT_AUD");
+        std::env::set_var("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS", "1");
+        std::env::set_var("CRUX_AGENT_TOKENS", format!("drivew:{AGENT_TOK}"));
+        std::env::set_var("CORECRUXD_AGENT_TOKEN_HTTP_SCOPES", "query:read facts:write");
+        std::env::set_var("CORECRUXD_AGENT_TOKEN_HTTP_TENANT", "tenant-a");
+        std::env::set_var("CORECRUXD_AGENT_PASSPORTS", "1");
+        std::env::set_var("CRUX_AGENT_PASSPORTS", "drivew:drive-pass:tenant-a");
+
+        let auth = Authz::from_env(AuthMode::JwtHs256).expect("auth from env");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {AGENT_TOK}").parse().unwrap(),
+        );
+        headers.insert("x-corecrux-passport-id", "drive-pass".parse().unwrap());
+        let context = passport_bound_context(&auth, &headers).expect("mapped agent context");
+        assert_eq!(context.passport_id.as_deref(), Some("drive-pass"));
+        assert_eq!(context.resolve_authorized_tenant(None).unwrap(), "tenant-a");
+        assert_eq!(context.resolve_authorized_tenant(Some("tenant-a")).unwrap(), "tenant-a");
+        assert!(context.resolve_authorized_tenant(Some("tenant-b")).is_err());
+        assert!(context.credential_is_agent_token());
+        assert!(!context.canonical_passport_claim_verified());
+
+        let mut mismatched = headers;
+        mismatched.insert("x-corecrux-passport-id", "other-passport".parse().unwrap());
+        assert!(passport_bound_context(&auth, &mismatched).is_err());
+
+        for key in [
+            "CORECRUXD_JWT_HS256_SECRET",
+            "CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS",
+            "CRUX_AGENT_TOKENS",
+            "CORECRUXD_AGENT_TOKEN_HTTP_SCOPES",
+            "CORECRUXD_AGENT_TOKEN_HTTP_TENANT",
+            "CORECRUXD_AGENT_PASSPORTS",
+            "CRUX_AGENT_PASSPORTS",
+        ] {
+            std::env::remove_var(key);
         }
     }
 
