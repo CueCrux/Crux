@@ -41,6 +41,7 @@
 //! ignore it, and the signal would be worth nothing.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use crate::IndexError;
 
@@ -511,6 +512,116 @@ impl From<AttestationFailure> for IndexError {
     }
 }
 
+/// Identity of a segment being self-signed, and who is signing it.
+///
+/// Passed as one value because the signed body binds all of it: an attestation
+/// that did not name its segment could be replayed onto another one's bytes.
+pub struct LocalAttestationRequest<'a> {
+    pub shard_id: u32,
+    pub segment_seq: u64,
+    /// Hex segment id, matching the `.ccxseg` filename stem.
+    pub segment_id_hex: &'a str,
+    pub tenant_id: Option<&'a str>,
+    /// Unix seconds. Passed in so this path has no clock of its own.
+    pub issued_at: u64,
+    pub producer_fpr: &'a str,
+    pub builder_commit: &'a str,
+}
+
+/// Every companion sharing `stem`, with its digest, sorted for determinism.
+///
+/// The `.ccxseg` is excluded — the body binds it by `segment_id`, not by digest
+/// — as are attestations themselves and the debris of interrupted writes.
+/// Handles the model-keyed form (`<stem>.ccxe@<key>`) so a rebuild under a
+/// second embedder is covered as its own entry rather than colliding.
+pub fn collect_companion_digests(segments_dir: &Path, stem: &str) -> std::io::Result<Vec<CompanionDigest>> {
+    let prefix = format!("{stem}.");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(segments_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if rest == "ccxseg" || rest.starts_with(CCXATT_EXT) || rest.contains(".partial") {
+            continue;
+        }
+        let (ext, key) = match rest.split_once('@') {
+            Some((ext, key)) => (ext.to_string(), Some(key.to_string())),
+            None => (rest.to_string(), None),
+        };
+        let bytes = std::fs::read(entry.path())?;
+        out.push(CompanionDigest {
+            ext,
+            key,
+            blake3: companion_digest(&bytes),
+            bytes: bytes.len() as u64,
+        });
+    }
+    out.sort_by(|a, b| (&a.ext, &a.key).cmp(&(&b.ext, &b.key)));
+    Ok(out)
+}
+
+/// Sign a segment's companions with a local device key and write `<stem>.ccxatt`.
+///
+/// Returns the number of companions covered, or `None` when the segment has
+/// none — a fact-only segment legitimately has nothing to attest, which is not
+/// an error.
+///
+/// Written tmp-then-rename, like every other companion: a reader must never
+/// catch a half-written attestation and read a short file as tampering.
+///
+/// The single implementation behind both the daemon's seal path and
+/// `corecruxctl attest-companions`. Two copies of this would be two chances for
+/// the backfill and the live writer to disagree about what a signature covers.
+pub fn write_local_attestation(
+    segments_dir: &Path,
+    stem: &str,
+    request: &LocalAttestationRequest<'_>,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> std::io::Result<Option<usize>> {
+    use ed25519_dalek::Signer as _;
+
+    let companions = collect_companion_digests(segments_dir, stem)?;
+    if companions.is_empty() {
+        return Ok(None);
+    }
+
+    let body = AttestationBody {
+        schema: CCXATT_SCHEMA_V1.to_string(),
+        shard_id: request.shard_id,
+        segment_seq: request.segment_seq,
+        segment_id: request.segment_id_hex.to_string(),
+        tenant_id: request.tenant_id.map(str::to_string),
+        provenance: "local".to_string(),
+        issued_at: request.issued_at,
+        producer_pubkey: hex_lower(&signing_key.verifying_key().to_bytes()),
+        producer_fpr: request.producer_fpr.to_string(),
+        builder_commit: request.builder_commit.to_string(),
+        companions,
+    };
+    let signature = signing_key.sign(&body.signing_bytes()).to_bytes();
+    let encoded = encode_attestation(&body, &signature);
+
+    let final_path = segments_dir.join(format!("{stem}.{CCXATT_EXT}"));
+    let tmp_path = segments_dir.join(format!("{stem}.{CCXATT_EXT}.partial"));
+    if let Err(err) = std::fs::write(&tmp_path, &encoded).and_then(|()| std::fs::rename(&tmp_path, &final_path)) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(Some(body.companions.len()))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,5 +902,53 @@ mod tests {
         );
         assert_eq!(AttestationMode::from_str_or_default(" off "), AttestationMode::Off);
         assert_eq!(AttestationMode::default(), AttestationMode::Warn);
+    }
+
+    /// A stamp this writer produces must verify as `local`.
+    ///
+    /// The failure this guards is worse than the problem the backfill solves: a
+    /// backfill that wrote attestations the loader rejects would turn a corpus of
+    /// `none` into a corpus of `invalid` — and `invalid` refuses to load in
+    /// EVERY mode, including `off`. Unattested data still serves; data with a
+    /// broken stamp does not. So the writer and the verifier are pinned together
+    /// here, in the crate that owns both.
+    #[test]
+    fn a_written_attestation_verifies_as_local_against_the_signing_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = "seg-00000000000000000009-abcdef";
+        std::fs::write(dir.path().join(format!("{stem}.ccxseg")), vec![0u8; 64]).unwrap();
+        std::fs::write(dir.path().join(format!("{stem}.ccxi")), vec![1u8; 48]).unwrap();
+        std::fs::write(dir.path().join(format!("{stem}.ccxe")), vec![2u8; 96]).unwrap();
+
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let request = LocalAttestationRequest {
+            shard_id: 0,
+            segment_seq: 9,
+            segment_id_hex: "abcdef",
+            tenant_id: None,
+            issued_at: 1_754_700_000,
+            producer_fpr: "device-fpr",
+            builder_commit: "test",
+        };
+        let covered = write_local_attestation(dir.path(), stem, &request, &key)
+            .expect("write")
+            .expect("two companions to cover");
+        assert_eq!(covered, 2, "the .ccxseg is bound by id, not covered by digest");
+
+        let raw = std::fs::read(dir.path().join(format!("{stem}.ccxatt"))).unwrap();
+        let parsed = decode_attestation(&raw).expect("parse");
+        let roots = TrustRoots::new().with_local_device("device-fpr", key.verifying_key().to_bytes());
+        let provenance = verify_parsed(&parsed, &roots, "abcdef", |ext, _key| {
+            std::fs::read(dir.path().join(format!("{stem}.{ext}"))).ok()
+        })
+        .expect("a stamp we just wrote must verify");
+        assert_eq!(provenance, Provenance::Local);
+
+        // And it must still catch tampering afterwards.
+        std::fs::write(dir.path().join(format!("{stem}.ccxi")), vec![3u8; 48]).unwrap();
+        let after = verify_parsed(&parsed, &roots, "abcdef", |ext, _key| {
+            std::fs::read(dir.path().join(format!("{stem}.{ext}"))).ok()
+        });
+        assert!(matches!(after, Err(AttestationFailure::DigestMismatch { .. })));
     }
 }

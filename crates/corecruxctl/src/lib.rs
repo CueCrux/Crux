@@ -20,6 +20,7 @@
 
 pub mod admin;
 pub mod agent_wiring;
+pub mod attest_companions;
 pub mod audit_export;
 pub mod audit_pack;
 pub mod benchmark;

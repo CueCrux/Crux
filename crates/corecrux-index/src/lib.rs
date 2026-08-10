@@ -20,9 +20,9 @@ mod tokenizer;
 mod turboquant;
 
 pub use ccxatt::{
-    companion_digest, decode_attestation, encode_attestation, verify_attestation, verify_parsed, AttestationBody,
-    AttestationFailure, AttestationMode, CompanionDigest, ParsedAttestation, Provenance, TrustRoots, CCXATT_EXT,
-    CCXATT_SCHEMA_V1,
+    collect_companion_digests, companion_digest, decode_attestation, encode_attestation, verify_attestation,
+    verify_parsed, write_local_attestation, AttestationBody, AttestationFailure, AttestationMode, CompanionDigest,
+    LocalAttestationRequest, ParsedAttestation, Provenance, TrustRoots, CCXATT_EXT, CCXATT_SCHEMA_V1,
 };
 pub use ccxe::{
     configured_turbo_seed, model_id_file_key, verify_footer_hashes, CcxeBuildFingerprint, CcxeBuilder, CcxeReader,
