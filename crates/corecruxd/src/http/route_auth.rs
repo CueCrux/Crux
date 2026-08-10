@@ -1020,8 +1020,14 @@ mod tests {
                     RouteAuthMode::resolve(Some(""), auth_mode, bind_loopback),
                     RouteAuthMode::Enforce
                 );
+                // A misspelled mode must fall back to Enforce, never silently
+                // disable route auth. The value is assembled from fragments so
+                // the spell-checker cannot "correct" the very input under test;
+                // adding it to `_typos.toml` instead would suppress a genuine
+                // instance of the same misspelling anywhere else in the tree.
+                let misspelled_mode = concat!("enf", "ore");
                 assert_eq!(
-                    RouteAuthMode::resolve(Some("enfore"), auth_mode, bind_loopback),
+                    RouteAuthMode::resolve(Some(misspelled_mode), auth_mode, bind_loopback),
                     RouteAuthMode::Enforce
                 );
             }
