@@ -564,6 +564,56 @@ impl Int8PackedVectors {
 /// area on every load would tax the daemon hot path. Offline tools opt in —
 /// `corecruxctl ccxe verify-companions`, or `CORECRUXCTL_CCXE_VERIFY_HASH=1`
 /// at the offline parse sites.
+/// Read a `.ccxe`'s authoritative `model_id` **without parsing its vectors**.
+///
+/// The `@<key>` filename suffix is a disambiguator, never the model identity —
+/// the header is. But the query path has to answer "is this companion mine?"
+/// for every segment on every query, and `CcxeReader::from_path` reads the whole
+/// file to answer it, which on a corpus with two keyed companions per segment
+/// would mean loading (and caching) the vectors of a model the caller is about
+/// to reject. This reads the first [`CCXE_HEADER_LEN`] bytes and stops.
+///
+/// An empty string means the header carries no model id (legacy/unlabelled), a
+/// distinct case from "the file is unreadable", which is an `Err`.
+pub fn read_model_id_from_path<P: AsRef<Path>>(path: P) -> crate::Result<String> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path.as_ref())?;
+    let mut header = [0u8; CCXE_HEADER_LEN];
+    file.read_exact(&mut header)?;
+    model_id_from_header_bytes(&header)
+}
+
+/// The `model_id` field of an already-read `.ccxe` header block.
+///
+/// Same magic and version gating as the full parser, so a file this accepts is
+/// one [`CcxeReader`] will also accept — the selection step must not admit a
+/// companion the load step would then reject.
+pub fn model_id_from_header_bytes(header: &[u8]) -> crate::Result<String> {
+    if header.len() < CCXE_HEADER_LEN {
+        return Err(IndexError::BufferTooSmall);
+    }
+    let magic = read_u32(header, 0);
+    if magic != CCXE_MAGIC {
+        return Err(IndexError::InvalidMagic {
+            expected: CCXE_MAGIC,
+            actual: magic,
+        });
+    }
+    let version = read_u16(header, 4);
+    if version != CCXE_VERSION_V1 && version != CCXE_VERSION_V2 {
+        return Err(IndexError::UnsupportedVersion { version });
+    }
+    let model_id_len = read_u16(header, 33) as usize;
+    if model_id_len == 0
+        || model_id_len > CCXE_MODEL_ID_MAX_LEN
+        || CCXE_MODEL_ID_OFFSET + model_id_len > CCXE_HEADER_LEN
+    {
+        return Ok(String::new());
+    }
+    Ok(String::from_utf8_lossy(&header[CCXE_MODEL_ID_OFFSET..CCXE_MODEL_ID_OFFSET + model_id_len]).to_string())
+}
+
 pub fn verify_footer_hashes(data: &[u8]) -> crate::Result<()> {
     if data.len() < CCXE_HEADER_LEN + CCXE_FOOTER_LEN {
         return Err(IndexError::BufferTooSmall);

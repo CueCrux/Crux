@@ -556,6 +556,7 @@ pub(super) async fn post_query_text_search(
                 &state.data_dir,
                 query_embedding,
                 &expected_fingerprint.hash,
+                semantic_profile.as_ref().map(|profile| profile.model.as_str()),
             ) {
                 Ok(provider) => {
                     state.fact_store.read().await.clear_semantic_profile_mismatch();
@@ -575,6 +576,7 @@ pub(super) async fn post_query_text_search(
                 embedding_fingerprint
                     .as_ref()
                     .map(|fingerprint| fingerprint.hash.as_str()),
+                semantic_profile.as_ref().map(|profile| profile.model.as_str()),
             )
         }
     } else {

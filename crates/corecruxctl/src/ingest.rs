@@ -640,50 +640,105 @@ struct EmbeddingData {
     embedding: Vec<f32>,
 }
 
+/// OpenAI-compatible embedding client, one text per call.
+///
+/// Shared by `crux-ingest --embed` and `rebuild-companions`, because both ask
+/// the same question of the same door and two clients would be two chances to
+/// disagree about the endpoint shape, the auth header, or what counts as a
+/// usable vector. One call per text is also the metering unit on the delegated
+/// door (1 credit/call), so a caller can count calls and report spend.
+pub(crate) struct EmbeddingClient {
+    endpoint: String,
+    model: String,
+    api_key: Option<String>,
+    agent: ureq::Agent,
+}
+
+impl EmbeddingClient {
+    /// Resolve from `CORECRUXD_EMBEDDING_URL` / `CORECRUXD_EMBEDDING_MODEL`,
+    /// with explicit overrides taking precedence.
+    ///
+    /// `required_by` names the flag in the error, so "you need a URL" says which
+    /// command needed one.
+    pub(crate) fn from_env(
+        url_override: Option<&str>,
+        model_override: Option<&str>,
+        required_by: &str,
+    ) -> Result<Self, DynErr> {
+        let base = url_override
+            .map(str::to_string)
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                std::env::var("CORECRUXD_EMBEDDING_URL")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .ok_or_else(|| format!("{required_by} requires CORECRUXD_EMBEDDING_URL or --embedding-url"))?;
+        let model = model_override
+            .map(str::to_string)
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                std::env::var("CORECRUXD_EMBEDDING_MODEL")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .unwrap_or_else(|| "nomic-embed-text".to_string());
+        Ok(Self {
+            endpoint: embedding_endpoint(&base),
+            model,
+            api_key: std::env::var("OPENAI_API_KEY")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            agent: ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(120)))
+                .build()
+                .into(),
+        })
+    }
+
+    pub(crate) fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Embed one text. One HTTP call, one credit on the metered door.
+    pub(crate) fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+        let mut builder = self.agent.post(&self.endpoint);
+        if let Some(api_key) = &self.api_key {
+            builder = builder.header("authorization", format!("Bearer {api_key}"));
+        }
+        let mut response = match builder.send_json(EmbeddingRequest {
+            model: &self.model,
+            input: text,
+        }) {
+            Ok(response) => response,
+            Err(ureq::Error::StatusCode(code)) => {
+                return Err(format!("embedding request failed (HTTP {code}) at {}", self.endpoint));
+            }
+            Err(error) => return Err(format!("embedding request to {} failed: {error}", self.endpoint)),
+        };
+        let parsed: EmbeddingResponse = response
+            .body_mut()
+            .read_json()
+            .map_err(|error| format!("embedding response did not parse: {error}"))?;
+        let vector = parsed
+            .data
+            .into_iter()
+            .next()
+            .map(|item| item.embedding)
+            .ok_or("embedding endpoint returned no vectors")?;
+        if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
+            return Err("embedding endpoint returned an empty or non-finite vector".to_string());
+        }
+        Ok(vector)
+    }
+}
+
 fn embed_documents(documents: &mut [IngestDocument]) -> Result<(), DynErr> {
-    let base = std::env::var("CORECRUXD_EMBEDDING_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or("--embed requires CORECRUXD_EMBEDDING_URL")?;
-    let model = std::env::var("CORECRUXD_EMBEDDING_MODEL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "nomic-embed-text".to_string());
-    let endpoint = embedding_endpoint(&base);
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(120)))
-        .build()
-        .into();
+    let client = EmbeddingClient::from_env(None, None, "--embed")?;
     let mut dimensions = None;
     for document in documents {
         for chunk in &mut document.chunks {
-            let mut builder = agent.post(&endpoint);
-            if let Some(api_key) = &api_key {
-                builder = builder.header("authorization", format!("Bearer {api_key}"));
-            }
-            let mut response = match builder.send_json(EmbeddingRequest {
-                model: &model,
-                input: &chunk.text,
-            }) {
-                Ok(response) => response,
-                Err(ureq::Error::StatusCode(code)) => {
-                    return Err(format!("embedding request failed (HTTP {code}) at {endpoint}").into());
-                }
-                Err(error) => return Err(format!("embedding request to {endpoint} failed: {error}").into()),
-            };
-            let parsed: EmbeddingResponse = response.body_mut().read_json()?;
-            let vector = parsed
-                .data
-                .into_iter()
-                .next()
-                .map(|item| item.embedding)
-                .ok_or("embedding endpoint returned no vectors")?;
-            if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
-                return Err("embedding endpoint returned an empty or non-finite vector".into());
-            }
+            let vector = client.embed(&chunk.text)?;
             match dimensions {
                 None => dimensions = Some(vector.len()),
                 Some(expected) if expected != vector.len() => {

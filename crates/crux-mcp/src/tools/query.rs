@@ -68,7 +68,8 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
             let expected_fingerprint = embedding_fingerprint
                 .as_ref()
                 .map(|fingerprint| fingerprint.hash.as_str());
-            if let Some(provider) = factory(&index, &query_embedding, expected_fingerprint) {
+            let query_model_id = semantic_profile.as_ref().map(|profile| profile.model.as_str());
+            if let Some(provider) = factory(&index, &query_embedding, expected_fingerprint, query_model_id) {
                 use corecrux_retrieval::dense::DenseProvider as _;
                 let max_bm25 = result.hits.iter().map(|h| h.score).fold(0.0f32, f32::max).max(1e-9);
                 for h in &mut result.hits {
@@ -559,7 +560,7 @@ mod tests {
         // Factory gives doc1 a perfectly aligned vector (cosine 1) and doc0
         // nothing -> fused order flips, score space says so.
         let mut ctx = ctx;
-        ctx.dense_provider_factory = Some(std::sync::Arc::new(|_, emb: &[f32], _| {
+        ctx.dense_provider_factory = Some(std::sync::Arc::new(|_, emb: &[f32], _, _| {
             let mut vectors = std::collections::HashMap::new();
             vectors.insert((1u32, 0usize), emb.to_vec());
             Some(corecrux_retrieval::CosineDenseProvider::new(emb, vectors))

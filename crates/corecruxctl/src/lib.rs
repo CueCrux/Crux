@@ -54,6 +54,7 @@ pub mod output_verify;
 pub mod parity;
 pub mod projections;
 pub mod quickstart;
+pub mod rebuild_companions;
 pub mod receipts;
 pub mod reconcile;
 pub mod repair_manifest;

@@ -1371,12 +1371,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let data_dir = state.data_dir.clone();
                 std::sync::Arc::new(move |index_mgr: &corecrux_retrieval::IndexManager,
                                           query_embedding: &[f32],
-                                          expected_fingerprint: Option<&str>| {
+                                          expected_fingerprint: Option<&str>,
+                                          query_model_id: Option<&str>| {
                     crate::local_ingest::build_dense_provider(
                         index_mgr,
                         &data_dir,
                         query_embedding,
                         expected_fingerprint,
+                        query_model_id,
                     )
                 })
             }),

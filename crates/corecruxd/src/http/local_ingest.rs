@@ -473,6 +473,7 @@ pub(super) async fn post_local_ingest(
                 &state.data_dir,
                 probe_embedding,
                 &profile.embedding_fingerprint.hash,
+                Some(profile.model.as_str()),
             )
         };
         match compatibility {
