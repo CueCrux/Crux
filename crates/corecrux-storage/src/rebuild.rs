@@ -467,6 +467,13 @@ mod tests {
     }
 
     fn seal_prose(dir: &Path, texts: &[&str]) -> String {
+        seal_prose_as(dir, "doc-1", texts)
+    }
+
+    /// Seal one segment under `doc_id`. Distinct ids let a test build a
+    /// multi-segment corpus — re-using one would be deduplicated by the storage
+    /// idempotency layer rather than sealing a second segment.
+    fn seal_prose_as(dir: &Path, doc_id: &str, texts: &[&str]) -> String {
         use crate::{AppendEventInput, ShardStorage, ShardStorageOptions};
 
         let mut storage = ShardStorage::open(
@@ -483,21 +490,21 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, text)| AppendEventInput {
-                event_id: Box::leak(format!("evt-{i}").into_boxed_str()),
+                event_id: Box::leak(format!("{doc_id}-evt-{i}").into_boxed_str()),
                 occurred_at: "2026-08-11T00:00:00Z",
                 event_type: "corecrux.prose.chunk.v1",
                 content_type: "text/plain; charset=utf-8",
                 payload_bytes: text.as_bytes(),
             })
             .collect();
-        let stream_hash = corecrux_frame::stream_hash_xxhash64("tenant-a", "corpus", "doc-1").unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64("tenant-a", "corpus", doc_id).unwrap();
         storage
             .append_batch(
                 stream_hash,
                 0,
                 "tenant-a",
                 "corpus",
-                "doc-1",
+                doc_id,
                 "2026-08-11T00:00:00Z",
                 &events,
             )
@@ -505,6 +512,35 @@ mod tests {
         storage.force_seal_head().unwrap();
         drop(storage);
         sealed_stem(dir)
+    }
+
+    /// Seal a segment holding one binary fact record and no prose — the
+    /// `no_text_payloads` shape (LME-S `seg-0021` is the real-world example).
+    fn seal_fact_only(dir: &Path, doc_id: &str) {
+        use crate::{AppendEventInput, ShardStorage, ShardStorageOptions};
+
+        let mut storage = ShardStorage::open(&dir.join("shards"), 0, 1, ShardStorageOptions::default()).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64("tenant-a", "facts", doc_id).unwrap();
+        storage
+            .append_batch(
+                stream_hash,
+                0,
+                "tenant-a",
+                "facts",
+                doc_id,
+                "2026-08-11T00:00:00Z",
+                &[AppendEventInput {
+                    event_id: Box::leak(format!("{doc_id}-fact-1").into_boxed_str()),
+                    occurred_at: "2026-08-11T00:00:00Z",
+                    event_type: "corecrux.entity.fact.v1",
+                    content_type: "application/cbor",
+                    // Invalid UTF-8: a binary fact record, not prose.
+                    payload_bytes: &[0xff, 0xfe, 0xfd, 0xfc],
+                }],
+            )
+            .unwrap();
+        storage.force_seal_head().unwrap();
+        drop(storage);
     }
 
     fn segments_dir(dir: &Path) -> PathBuf {
@@ -570,31 +606,8 @@ mod tests {
     /// permanently unrebuildable.
     #[test]
     fn a_segment_with_no_text_payloads_is_skipped_not_failed() {
-        use crate::{AppendEventInput, ShardStorage, ShardStorageOptions};
-
         let tmp = tempfile::tempdir().unwrap();
-        let mut storage = ShardStorage::open(&tmp.path().join("shards"), 0, 1, ShardStorageOptions::default()).unwrap();
-        let stream_hash = corecrux_frame::stream_hash_xxhash64("tenant-a", "facts", "doc-1").unwrap();
-        storage
-            .append_batch(
-                stream_hash,
-                0,
-                "tenant-a",
-                "facts",
-                "doc-1",
-                "2026-08-11T00:00:00Z",
-                &[AppendEventInput {
-                    event_id: "fact-1",
-                    occurred_at: "2026-08-11T00:00:00Z",
-                    event_type: "corecrux.entity.fact.v1",
-                    content_type: "application/cbor",
-                    // Invalid UTF-8: a binary fact record, not prose.
-                    payload_bytes: &[0xff, 0xfe, 0xfd, 0xfc],
-                }],
-            )
-            .unwrap();
-        storage.force_seal_head().unwrap();
-        drop(storage);
+        seal_fact_only(tmp.path(), "doc-1");
 
         let embedder = FakeEmbedder::new("model-b", 8);
         let report = rebuild_ccxe_companions(tmp.path(), &embedder, &RebuildOptions::default(), |_| {}).unwrap();
@@ -806,5 +819,259 @@ mod tests {
         assert_eq!(report.failed, 1);
         assert_eq!(report.rebuilt, 0);
         assert!(matches!(report.segments[0].status, RebuildStatus::Failed { .. }));
+    }
+
+    // ── mutation survivors (cargo-mutants --in-diff, PR #688) ───────────────
+    //
+    // Each of the following closes an assertion gap a surviving mutant proved
+    // was there: the code was right, but nothing would have noticed if it
+    // stopped being right.
+
+    /// An embedder that cannot describe itself writes **no** profile sidecar —
+    /// not an empty one.
+    ///
+    /// `profile_json`'s default is `None`, and nothing asserted that. A default
+    /// returning `Some(vec![])` would have written a zero-byte
+    /// `.ccxprof@<key>`, which the query path reads as a profile that fails to
+    /// parse rather than as a companion that has none — the difference between
+    /// "legacy, score it" and "malformed, refuse it".
+    #[test]
+    fn an_embedder_without_a_profile_writes_no_sidecar() {
+        struct NoProfile;
+        impl DenseRebuildEmbedder for NoProfile {
+            fn model_id(&self) -> &str {
+                "model-b"
+            }
+            fn embed(&self, _text: &str) -> std::result::Result<Vec<f32>, String> {
+                Ok(vec![0.25, 0.75])
+            }
+            // profile_json deliberately left at its default.
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let stem = seal_prose(tmp.path(), &["alpha text"]);
+        let report = rebuild_ccxe_companions(tmp.path(), &NoProfile, &RebuildOptions::default(), |_| {}).unwrap();
+
+        assert_eq!(report.rebuilt, 1, "the companion itself is still written");
+        assert!(segments_dir(tmp.path()).join(format!("{stem}.ccxe@model-b")).exists());
+
+        let sidecars: Vec<String> = std::fs::read_dir(segments_dir(tmp.path()))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".ccxprof"))
+            .collect();
+        assert!(
+            sidecars.is_empty(),
+            "no profile means no sidecar, not an empty one: {sidecars:?}"
+        );
+    }
+
+    /// The sidecar that IS written carries the embedder's own bytes, verbatim.
+    ///
+    /// Nothing compared the file against `profile_json`'s return, so the write
+    /// could have persisted any constant and every test would still have passed
+    /// — while the strict query path compared a fingerprint against whatever
+    /// that constant happened to be.
+    #[test]
+    fn the_profile_sidecar_holds_exactly_what_the_embedder_returned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stem = seal_prose(tmp.path(), &["alpha text", "beta text"]);
+        let embedder = FakeEmbedder::new("BAAI/bge-m3", 8);
+        let report = rebuild_ccxe_companions(tmp.path(), &embedder, &RebuildOptions::default(), |_| {}).unwrap();
+        assert_eq!(report.rebuilt, 1);
+
+        let written = std::fs::read(segments_dir(tmp.path()).join(format!("{stem}.ccxprof@baai-bge-m3"))).unwrap();
+        // The dimension in the sidecar is the one OBSERVED in the vectors (8),
+        // never a configured guess — a sidecar disagreeing with its own
+        // companion fails the strict check it exists to satisfy.
+        assert_eq!(
+            written,
+            embedder.profile_json(8).expect("this embedder describes itself"),
+            "the sidecar must be the embedder's own bytes"
+        );
+        assert!(
+            String::from_utf8_lossy(&written).contains("\"dimensions\":8"),
+            "and it must record the observed dimension: {}",
+            String::from_utf8_lossy(&written)
+        );
+    }
+
+    /// `rebuilt_segments()` names the segments a run actually wrote, and callers
+    /// re-sign exactly that set.
+    ///
+    /// Nothing consumed the iterator, so it could have yielded nothing at all.
+    /// In `corecruxctl` that is the set handed to the attestation refresh: an
+    /// empty one leaves every rebuilt companion uncovered, which is hazard (b)
+    /// re-opened silently.
+    #[test]
+    fn rebuilt_segments_names_only_the_segments_that_were_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let written = seal_prose_as(tmp.path(), "doc-prose", &["alpha text"]);
+        // A second, fact-only segment that the rebuild must skip.
+        seal_fact_only(tmp.path(), "doc-facts");
+
+        let report = rebuild_ccxe_companions(
+            tmp.path(),
+            &FakeEmbedder::new("model-b", 4),
+            &RebuildOptions::default(),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(report.rebuilt, 1);
+        assert_eq!(report.skipped, 1);
+
+        let named: Vec<&str> = report.rebuilt_segments().map(|s| s.stem.as_str()).collect();
+        assert_eq!(named, vec![written.as_str()], "only the prose segment was written");
+        assert!(report
+            .rebuilt_segments()
+            .all(|s| matches!(s.status, RebuildStatus::Rebuilt { .. })));
+    }
+
+    /// `segments_scanned` counts every segment the run considered.
+    ///
+    /// It was only ever asserted as zero (the filter tests), and zero is a fixed
+    /// point of the mutation that replaced its increment with a multiply. Two
+    /// segments, counted exactly, is what distinguishes them.
+    #[test]
+    fn segments_scanned_counts_every_segment_considered() {
+        let tmp = tempfile::tempdir().unwrap();
+        seal_prose_as(tmp.path(), "doc-one", &["alpha text"]);
+        seal_prose_as(tmp.path(), "doc-two", &["beta text"]);
+
+        let report = rebuild_ccxe_companions(
+            tmp.path(),
+            &FakeEmbedder::new("model-b", 4),
+            &RebuildOptions::default(),
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(report.segments_scanned, 2, "both segments were considered");
+        assert_eq!(report.rebuilt, 2);
+        assert_eq!(report.segments.len(), 2);
+        assert_eq!(report.embedding_calls, 2, "one call per chunk across both segments");
+    }
+
+    /// An empty-text frame is skipped, not embedded.
+    ///
+    /// A zero-length payload is still valid UTF-8, so only the `!is_empty()`
+    /// guard separates it from prose. Embedding one would spend a credit on
+    /// nothing and put a meaningless vector into the companion under a `doc_id`
+    /// the `.ccxi` has no document for.
+    #[test]
+    fn an_empty_text_frame_is_skipped_and_never_embedded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stem = seal_prose_as(tmp.path(), "doc-mixed", &["alpha text", "", "gamma text"]);
+
+        let report = rebuild_ccxe_companions(
+            tmp.path(),
+            &FakeEmbedder::new("model-b", 4),
+            &RebuildOptions::default(),
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(report.rebuilt, 1);
+        assert_eq!(report.embedding_calls, 2, "the empty frame must not be embedded");
+        assert_eq!(report.vectors_written, 2);
+
+        // And it consumes its doc_id rather than renumbering, exactly as a
+        // non-UTF-8 fact frame does.
+        let reader =
+            corecrux_index::CcxeReader::from_path(segments_dir(tmp.path()).join(format!("{stem}.ccxe@model-b")))
+                .unwrap();
+        assert_eq!(reader.doc_ids, vec![0, 2], "the empty frame consumes doc_id 1");
+    }
+
+    /// A vector that is empty, or that carries a non-finite value, fails its
+    /// segment — either one alone is disqualifying.
+    ///
+    /// Only one arm of that disjunction needs to hold, and neither was
+    /// exercised. A NaN reaching the companion makes every cosine score against
+    /// that segment NaN, which sorts unpredictably rather than ranking low.
+    #[test]
+    fn an_empty_or_non_finite_vector_fails_the_segment() {
+        struct Fixed(Vec<f32>);
+        impl DenseRebuildEmbedder for Fixed {
+            fn model_id(&self) -> &str {
+                "model-b"
+            }
+            fn embed(&self, _text: &str) -> std::result::Result<Vec<f32>, String> {
+                Ok(self.0.clone())
+            }
+        }
+
+        for (label, vector) in [
+            ("empty", Vec::new()),
+            ("nan", vec![0.5, f32::NAN]),
+            ("infinite", vec![0.5, f32::INFINITY]),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let stem = seal_prose(tmp.path(), &["alpha text"]);
+            let report =
+                rebuild_ccxe_companions(tmp.path(), &Fixed(vector), &RebuildOptions::default(), |_| {}).unwrap();
+
+            assert_eq!(report.failed, 1, "{label} vector must fail its segment");
+            assert_eq!(report.rebuilt, 0, "{label}");
+            match &report.segments[0].status {
+                RebuildStatus::Failed { error } => {
+                    assert!(error.contains("empty or non-finite"), "{label}: {error}");
+                }
+                other => panic!("{label}: expected Failed, got {other:?}"),
+            }
+            assert!(
+                !segments_dir(tmp.path()).join(format!("{stem}.ccxe@model-b")).exists(),
+                "{label}: nothing may be written"
+            );
+        }
+    }
+
+    /// A dimension change part-way through a segment fails it, loudly.
+    ///
+    /// The `.ccxe` header carries ONE `dim` for the whole vector area, so a
+    /// short vector after a long one is not a bad score — it is a companion
+    /// whose vector area no longer aligns with its own stride, misreading every
+    /// document after the change.
+    #[test]
+    fn a_dimension_change_within_a_segment_fails_it() {
+        /// Returns 4 dims for the first call and 2 for every one after.
+        struct Shrinking(std::cell::Cell<usize>);
+        impl DenseRebuildEmbedder for Shrinking {
+            fn model_id(&self) -> &str {
+                "model-b"
+            }
+            fn embed(&self, _text: &str) -> std::result::Result<Vec<f32>, String> {
+                let seen = self.0.get();
+                self.0.set(seen + 1);
+                Ok(if seen == 0 { vec![0.5; 4] } else { vec![0.5; 2] })
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let stem = seal_prose(tmp.path(), &["alpha text", "beta text"]);
+        let report = rebuild_ccxe_companions(
+            tmp.path(),
+            &Shrinking(std::cell::Cell::new(0)),
+            &RebuildOptions::default(),
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.rebuilt, 0);
+        match &report.segments[0].status {
+            RebuildStatus::Failed { error } => {
+                assert!(
+                    error.contains("dimension changed") && error.contains("expected 4") && error.contains("got 2"),
+                    "the error must name both dimensions: {error}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(
+            !segments_dir(tmp.path()).join(format!("{stem}.ccxe@model-b")).exists(),
+            "a segment that changed dimension mid-way must write nothing"
+        );
     }
 }
