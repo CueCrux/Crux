@@ -58,8 +58,9 @@ pub use ccxdi::{
     CCXDI_SCHEMA_VERSION, CCXDI_SCHEMA_VERSION_TENANT_HASH, CCXDI_VERSION, NO_HEADER,
 };
 pub use ccxe::{
-    configured_turbo_seed, model_id_file_key, verify_footer_hashes, CcxeBuildFingerprint, CcxeBuilder, CcxeReader,
-    Quantization, CCXE_HEADER_LEN, CCXE_VERSION, CCXE_VERSION_V1, CCXE_VERSION_V2,
+    configured_turbo_seed, model_id_file_key, model_id_from_header_bytes, read_model_id_from_path,
+    verify_footer_hashes, CcxeBuildFingerprint, CcxeBuilder, CcxeReader, Quantization, CCXE_HEADER_LEN, CCXE_VERSION,
+    CCXE_VERSION_V1, CCXE_VERSION_V2,
 };
 pub use ccxev::{
     CcxevHeader, CcxevModality, CcxevReader, ExtractedEvent, CCXEV_MAGIC, CCXEV_NO_TIME, CCXEV_RECORD_OFF_UNKNOWN,

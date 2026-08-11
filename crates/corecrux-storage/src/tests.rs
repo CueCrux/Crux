@@ -5565,10 +5565,85 @@ mod tests {
         );
     }
 
+    /// Regression (M7): the model-keyed companion form `<stem>.ccxe@<key>` does
+    /// **not** end in `.ccxe`, so the exact-`strip_suffix` allowlist quarantined
+    /// every one of them — the same silent sweep that took 635 sidecars on host
+    /// `crux`, but on the file a rebuild had just spent credits producing.
+    ///
+    /// Opened twice, because the sweep runs on every open: a bug that survives
+    /// the first open still has to survive the second.
+    #[test]
+    fn keyed_companions_survive_repeated_reopen() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = seal_n_segments(1);
+        let shard_dir = dir.path().join("shard-0000");
+
+        let stem = std::fs::read_dir(shard_dir.join("segments"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_str().unwrap().to_string())
+            .find(|n| n.ends_with(".ccxseg"))
+            .expect("a sealed segment")
+            .trim_end_matches(".ccxseg")
+            .to_string();
+
+        let keyed = [
+            format!("{stem}.ccxe@baai-bge-m3"),
+            format!("{stem}.ccxprof@baai-bge-m3"),
+            format!("{stem}.ccxe@nomic-embed-text-v1.5"),
+        ];
+        for name in &keyed {
+            std::fs::write(shard_dir.join("segments").join(name), b"companion").unwrap();
+        }
+
+        for open in 1..=2 {
+            let reopened = ShardStorage::open(dir.path(), 0, 1, ShardStorageOptions::default());
+            assert!(reopened.is_ok(), "reopen {open} must succeed");
+            drop(reopened);
+
+            for name in &keyed {
+                assert!(
+                    shard_dir.join("segments").join(name).exists(),
+                    "{name} must survive open {open}"
+                );
+            }
+            assert_eq!(
+                std::fs::read_dir(shard_dir.join("quarantine")).unwrap().count(),
+                0,
+                "nothing keyed to a referenced segment should be swept on open {open}"
+            );
+        }
+    }
+
+    /// A keyed companion whose segment is gone is still an orphan — the fix for
+    /// the sweep must not turn into an exemption from it.
+    #[test]
+    fn orphaned_keyed_companions_are_still_quarantined() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = seal_n_segments(2);
+        let shard_dir = dir.path().join("shard-0000");
+        let orphan = shard_dir
+            .join("segments")
+            .join("seg-00000000000000009999-deadbeef.ccxe@baai-bge-m3");
+        std::fs::write(&orphan, b"orphan").unwrap();
+
+        let reopened = ShardStorage::open(dir.path(), 0, 1, ShardStorageOptions::default());
+        assert!(reopened.is_ok(), "reopen must succeed");
+        drop(reopened);
+
+        assert!(!orphan.exists(), "a keyed companion with no segment is an orphan");
+        assert_eq!(std::fs::read_dir(shard_dir.join("quarantine")).unwrap().count(), 1);
+    }
+
     /// `.ccxse` ends with the same four characters as `.ccxs` does, and `.ccxprof`
     /// starts with `.ccxp`. The allowlist matches by whole-suffix, so neither pair
     /// aliases — but a future switch to `contains`/`starts_with` would make them, and
     /// the failure would look like "some companions survive" rather than a hard error.
+    ///
+    /// The keyed cases below exist because this merge is where the two halves met:
+    /// M5 added the near-miss extensions, M7 added the `@`-keyed matcher, and only
+    /// their combination can alias. `companion_stem` must reject the near-misses in
+    /// keyed form too, and must accept a genuine keyed companion.
     #[test]
     fn lane_companion_extensions_do_not_alias_each_other() {
         for (name, ext) in [
@@ -5580,9 +5655,19 @@ mod tests {
                 name.strip_suffix(ext).is_none(),
                 "{name} must not be matched by the {ext} allowlist entry"
             );
+            assert!(
+                companion_stem(name, ext).is_none(),
+                "{name} must not be matched by the keyed matcher for {ext} either"
+            );
         }
         assert_eq!("seg-0001.ccxs".strip_suffix(".ccxs"), Some("seg-0001"));
         assert_eq!("seg-0001.ccxse".strip_suffix(".ccxse"), Some("seg-0001"));
+        // Keyed near-misses: the pre-`@` head is what the extension check runs on.
+        assert!(companion_stem("seg-0001.ccxse@k", ".ccxs").is_none());
+        assert!(companion_stem("seg-0001.ccxprof@k", ".ccxp").is_none());
+        // And the genuine keyed forms resolve to their stem.
+        assert_eq!(companion_stem("seg-0001.ccxe@baai-bge-m3", ".ccxe"), Some("seg-0001"));
+        assert_eq!(companion_stem("seg-0001.ccxs@k", ".ccxs"), Some("seg-0001"));
     }
 
     /// The companions of a *retired* segment are a different case: once the

@@ -93,18 +93,27 @@ pub struct McpContext {
     /// `CRUX_PASSPORT_REVOCATION` — **launch default ON**; `=0` disables enforcement.
     pub revocation_enforced: bool,
     /// corecruxd-injected constructor for the CPU cosine dense lane
-    /// (`(index, query_embedding, expected_fingerprint) → provider`). The
-    /// `.ccxe` companion readers live in corecruxd, so the daemon supplies
-    /// this at wiring time; `None` (tests, stdio-only) keeps `query`
-    /// BM25-only — bit-identical pre-existing behaviour.
+    /// (`(index, query_embedding, expected_fingerprint, query_model_id) →
+    /// provider`). The `.ccxe` companion readers live in corecruxd, so the
+    /// daemon supplies this at wiring time; `None` (tests, stdio-only) keeps
+    /// `query` BM25-only — bit-identical pre-existing behaviour.
     pub dense_provider_factory: Option<DenseProviderFactory>,
 }
 
 /// Constructor for the dense re-rank provider on the MCP `query` path.
 /// Returns `None` when the corpus has no usable vectors — the caller then
 /// stays BM25-only.
-pub type DenseProviderFactory =
-    Arc<dyn Fn(&IndexManager, &[f32], Option<&str>) -> Option<corecrux_retrieval::CosineDenseProvider> + Send + Sync>;
+///
+/// `query_model_id` is the embedder behind `query_embedding`. It carries the
+/// M7 fusion guard onto this surface: a segment may hold several model-keyed
+/// `.ccxe` companions, and the provider must score only against the one whose
+/// header model id is this. Passing `None` selects the unkeyed companion, which
+/// is the pre-M7 behaviour and correct for a node with no semantic profile.
+pub type DenseProviderFactory = Arc<
+    dyn Fn(&IndexManager, &[f32], Option<&str>, Option<&str>) -> Option<corecrux_retrieval::CosineDenseProvider>
+        + Send
+        + Sync,
+>;
 
 /// passport-revocation M3: read the `CRUX_PASSPORT_REVOCATION` flag. Launch
 /// default ON (proven live) — a revoked passport is reduced to read-only.

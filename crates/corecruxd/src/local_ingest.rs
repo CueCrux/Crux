@@ -403,15 +403,32 @@ struct CachedDenseSegment {
     profile: Option<corecrux_memory::embeddings::SemanticProfile>,
 }
 
-/// Cache map: `(shards_dir, segment_seq)` → parsed dense segment.
-type DenseSegmentCache = std::collections::HashMap<(std::path::PathBuf, u64), std::sync::Arc<CachedDenseSegment>>;
+/// Cache map: `(shards_dir, segment_seq, companion file name)` → parsed dense
+/// segment.
+type DenseSegmentCache =
+    std::collections::HashMap<(std::path::PathBuf, u64, String), std::sync::Arc<CachedDenseSegment>>;
 
 /// Process-wide cache of parsed `.ccxe`/`.ccxprof` companions so the prose
 /// query-dense path does not re-read (and re-`read_dir`) every companion from
-/// disk on every query (buyer-fit FU3). Keyed by `(shards_dir, segment_seq)`:
-/// the shards dir disambiguates otherwise-colliding seqs across data dirs (and
-/// across tests). Pruned to the live segment set of the queried shards dir on
-/// each build, so it stays bounded by the corpus and drops erased segments.
+/// disk on every query (buyer-fit FU3). Keyed by `(shards_dir, segment_seq,
+/// companion file name)`: the shards dir disambiguates otherwise-colliding seqs
+/// across data dirs (and across tests). Pruned to the live segment set of the
+/// queried shards dir on each build, so it stays bounded by the corpus and drops
+/// erased segments.
+///
+/// **The file name is part of the key, and that is load-bearing** (M7). A
+/// segment can now hold more than one companion — `<stem>.ccxe` and
+/// `<stem>.ccxe@<key>` for a rebuild under a second embedder. Keyed by
+/// `(shards_dir, seq)` alone, the first model to be queried after a rebuild
+/// would poison the entry for every other model: a model-B query would be
+/// served model-A's cached vectors, scored in the wrong semantic space, and
+/// still return a plausible ranking. Keying on the file makes the two entries
+/// distinct rather than rival.
+///
+/// A rebuild is an offline operation that only ever *adds* a file, so a live
+/// entry is never invalidated by one. The exception is `rebuild-companions
+/// --force`, which rewrites a key in place; run against a live daemon, that
+/// daemon keeps serving the pre-force parse until it restarts.
 static DENSE_SEGMENT_CACHE: std::sync::LazyLock<std::sync::Mutex<DenseSegmentCache>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
@@ -450,10 +467,18 @@ pub fn build_dense_provider(
     data_dir: &Path,
     query_embedding: &[f32],
     expected_fingerprint: Option<&str>,
+    query_model_id: Option<&str>,
 ) -> Option<corecrux_retrieval::CosineDenseProvider> {
-    build_dense_provider_inner(index_mgr, data_dir, query_embedding, expected_fingerprint, false)
-        .ok()
-        .flatten()
+    build_dense_provider_inner(
+        index_mgr,
+        data_dir,
+        query_embedding,
+        expected_fingerprint,
+        query_model_id,
+        false,
+    )
+    .ok()
+    .flatten()
 }
 
 /// Delegation-specific dense provider construction. Unlike the legacy/local
@@ -464,8 +489,16 @@ pub fn build_dense_provider_strict(
     data_dir: &Path,
     query_embedding: &[f32],
     expected_fingerprint: &str,
+    query_model_id: Option<&str>,
 ) -> Result<Option<corecrux_retrieval::CosineDenseProvider>, DenseProfileCompatibilityError> {
-    build_dense_provider_inner(index_mgr, data_dir, query_embedding, Some(expected_fingerprint), true)
+    build_dense_provider_inner(
+        index_mgr,
+        data_dir,
+        query_embedding,
+        Some(expected_fingerprint),
+        query_model_id,
+        true,
+    )
 }
 
 fn build_dense_provider_inner(
@@ -473,6 +506,7 @@ fn build_dense_provider_inner(
     data_dir: &Path,
     query_embedding: &[f32],
     expected_fingerprint: Option<&str>,
+    query_model_id: Option<&str>,
     strict_profile: bool,
 ) -> Result<Option<corecrux_retrieval::CosineDenseProvider>, DenseProfileCompatibilityError> {
     use std::collections::{HashMap, HashSet};
@@ -480,6 +514,7 @@ fn build_dense_provider_inner(
 
     let shards_dir = data_dir.join("shards");
     let readers = index_mgr.readers();
+    let query_model_key = query_model_id.map(corecrux_index::model_id_file_key);
 
     // Recover from a poisoned lock rather than panic (a panicking holder would
     // only have left a partially-updated cache, which is safe to reuse).
@@ -487,30 +522,45 @@ fn build_dense_provider_inner(
     // Bound the cache to this shards dir's live segment set; leave other data
     // dirs' entries untouched.
     let live: HashSet<u64> = readers.iter().map(|r| r.header.segment_seq).collect();
-    cache.retain(|(sd, seq), _| sd != &shards_dir || live.contains(seq));
+    cache.retain(|(sd, seq, _), _| sd != &shards_dir || live.contains(seq));
 
     let mut vectors: HashMap<(u32, usize), Vec<f32>> = HashMap::new();
     for (segment_index, reader) in readers.iter().enumerate() {
         let seq = reader.header.segment_seq;
-        let cached = if let Some(c) = cache.get(&(shards_dir.clone(), seq)) {
+        let path = match select_ccxe_for_seq(&shards_dir, seq, query_model_key.as_deref()) {
+            CcxeSelection::Selected(path) => path,
+            CcxeSelection::NoCompanion => continue,
+            CcxeSelection::OtherModelOnly => {
+                // The fusion guard: this segment's vectors live in another
+                // model's space, so they are structurally excluded rather than
+                // scored. Strict delegation refuses instead — see
+                // `CcxeSelection`.
+                if strict_profile {
+                    return Err(DenseProfileCompatibilityError::FingerprintMismatch { segment_seq: seq });
+                }
+                continue;
+            }
+        };
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let cached = if let Some(c) = cache.get(&(shards_dir.clone(), seq, file_name.clone())) {
             Arc::clone(c)
         } else {
-            let Some(path) = find_ccxe_for_seq(&shards_dir, seq) else {
-                continue;
-            };
             let Some((dimension, entries)) = read_ccxe(&path) else {
                 if strict_profile {
                     return Err(DenseProfileCompatibilityError::InvalidVectorCompanion { segment_seq: seq });
                 }
                 continue;
             };
-            let profile = read_ccxprof(&path.with_extension("ccxprof"));
+            let profile = read_ccxprof(&ccxprof_path_for(&path));
             let c = Arc::new(CachedDenseSegment {
                 dimension: dimension as usize,
                 entries,
                 profile,
             });
-            cache.insert((shards_dir.clone(), seq), Arc::clone(&c));
+            cache.insert((shards_dir.clone(), seq, file_name), Arc::clone(&c));
             c
         };
         // Local/generic embedders retain the existing compatible-subset
@@ -570,10 +620,23 @@ fn build_dense_provider_inner(
     )))
 }
 
-/// Locate the `.ccxe` companion for a segment sequence across all shards.
-fn find_ccxe_for_seq(shards_dir: &Path, seq: u64) -> Option<std::path::PathBuf> {
+/// Every `.ccxe` companion of a segment sequence across all shards, with the
+/// `@<key>` suffix of each (`None` for the unkeyed form).
+///
+/// Before M7 this returned the first file ending in `.ccxe` — which meant a
+/// model-keyed companion, whose name ends in `@<key>`, was invisible. A rebuild
+/// would write one, the daemon would never look at it, and the dense lane would
+/// silently keep serving the old model.
+/// Dense-companion extension, with its dot. A keyed companion is this plus
+/// `@<key>`, which is why matching cannot go through `Path::extension`.
+const CCXE_SUFFIX: &str = ".ccxe";
+
+fn ccxe_candidates_for_seq(shards_dir: &Path, seq: u64) -> Vec<(std::path::PathBuf, Option<String>)> {
     let prefix = format!("seg-{seq:020}-");
-    let shard_entries = std::fs::read_dir(shards_dir).ok()?;
+    let mut out = Vec::new();
+    let Ok(shard_entries) = std::fs::read_dir(shards_dir) else {
+        return out;
+    };
     for shard in shard_entries.flatten() {
         let segments = shard.path().join("segments");
         let Ok(files) = std::fs::read_dir(&segments) else {
@@ -582,13 +645,144 @@ fn find_ccxe_for_seq(shards_dir: &Path, seq: u64) -> Option<std::path::PathBuf> 
         for f in files.flatten() {
             let name = f.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with(&prefix) && name.ends_with(".ccxe") {
-                return Some(f.path());
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            // Exact, case-sensitive suffixes: these names are written by the
+            // seal path and the rebuild, never by a user, so a case-insensitive
+            // match would only widen what counts as a companion.
+            if name.ends_with(CCXE_SUFFIX) {
+                out.push((f.path(), None));
+            } else if let Some((head, key)) = name.rsplit_once('@') {
+                if head.ends_with(CCXE_SUFFIX) && !key.is_empty() {
+                    out.push((f.path(), Some(key.to_string())));
+                }
             }
         }
     }
-    None
+    // Deterministic order, so two queries on the same corpus resolve the same
+    // companion when several would qualify.
+    out.sort();
+    out
 }
+
+/// The `.ccxprof` sidecar that describes one `.ccxe` companion.
+///
+/// The sidecar is per-companion, not per-segment: `<stem>.ccxe` is described by
+/// `<stem>.ccxprof`, and `<stem>.ccxe@<key>` by `<stem>.ccxprof@<key>`. A
+/// rebuild under a second model writes both halves of its own pair. Sharing one
+/// sidecar between two companions would have it assert the wrong model for one
+/// of them — which, on the strict path, is the difference between refusing an
+/// incompatible vector space and blessing it.
+fn ccxprof_path_for(ccxe_path: &Path) -> std::path::PathBuf {
+    let name = ccxe_path.file_name().map(|n| n.to_string_lossy().to_string());
+    let Some(name) = name else {
+        return ccxe_path.with_extension("ccxprof");
+    };
+    let renamed = match name.rsplit_once('@') {
+        Some((head, key)) => match head.strip_suffix(".ccxe") {
+            Some(stem) => format!("{stem}.ccxprof@{key}"),
+            None => return ccxe_path.with_extension("ccxprof"),
+        },
+        None => match name.strip_suffix(".ccxe") {
+            Some(stem) => format!("{stem}.ccxprof"),
+            None => return ccxe_path.with_extension("ccxprof"),
+        },
+    };
+    ccxe_path.with_file_name(renamed)
+}
+
+/// Pick the one `.ccxe` companion of a segment that belongs to the query's
+/// embedder — the CE-side **fusion guard**.
+///
+/// A model-M query is scored only against model-M vectors. Companions under any
+/// other key are structurally skipped rather than merely discouraged, so mixing
+/// two semantic spaces in one ranking is impossible rather than unlikely. This
+/// mirrors CoreCrux's `embedder-pool-per-tenant-bundle-2026-06-16` M3b guard.
+///
+/// **Model identity comes from the header, never the filename.** The `@<key>`
+/// suffix is used to *order* the candidates so the common case reads one header
+/// and stops; the accept/reject decision is always the header's `model_id`. A
+/// file renamed by hand, or copied between corpora, is therefore judged by what
+/// it contains.
+///
+/// One deliberate escape: if **no** candidate carries a model id at all, the
+/// first is accepted. Those are companions written before the id was stamped,
+/// and a corpus of them should degrade to the pre-M7 behaviour (serve, with the
+/// dimension and `.ccxprof` guards still applying) rather than go dark on
+/// upgrade. The escape closes as soon as any candidate *is* labelled: a segment
+/// that holds a labelled companion is a segment whose models are known, and an
+/// unlabelled sibling there is not a safe default.
+fn select_ccxe_for_seq(shards_dir: &Path, seq: u64, query_model_key: Option<&str>) -> CcxeSelection {
+    let candidates = ccxe_candidates_for_seq(shards_dir, seq);
+    if candidates.is_empty() {
+        return CcxeSelection::NoCompanion;
+    }
+    let Some(want) = query_model_key else {
+        // No query-side model identity (fixture callers): keep the pre-M7 choice
+        // of the unkeyed companion, falling back to the first keyed one.
+        return candidates
+            .iter()
+            .find(|(_, key)| key.is_none())
+            .or_else(|| candidates.first())
+            .map_or(CcxeSelection::NoCompanion, |(path, _)| {
+                CcxeSelection::Selected(path.clone())
+            });
+    };
+
+    // Filename-key match first, then the unkeyed companion, then the rest — an
+    // ordering hint only. Each is still confirmed against its header below.
+    let mut ordered: Vec<&(std::path::PathBuf, Option<String>)> = candidates.iter().collect();
+    ordered.sort_by_key(|(_, key)| match key {
+        Some(key) if key == want => 0u8,
+        None => 1,
+        Some(_) => 2,
+    });
+
+    let mut any_labelled = false;
+    for (path, _) in &ordered {
+        match corecrux_index::read_model_id_from_path(path) {
+            Ok(model_id) if !model_id.is_empty() && model_id != UNLABELLED_MODEL_ID => {
+                any_labelled = true;
+                if corecrux_index::model_id_file_key(&model_id) == want {
+                    return CcxeSelection::Selected((*path).clone());
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                // Unreadable header: not this query's companion. The load path
+                // reports a malformed companion; selection only declines it.
+                tracing::debug!(segment_seq = seq, path = %path.display(), %err, "ccxe-header-unreadable");
+            }
+        }
+    }
+    if any_labelled {
+        return CcxeSelection::OtherModelOnly;
+    }
+    ordered.first().map_or(CcxeSelection::NoCompanion, |(path, _)| {
+        CcxeSelection::Selected(path.clone())
+    })
+}
+
+/// Which `.ccxe` a segment offers this query.
+///
+/// [`CcxeSelection::OtherModelOnly`] is deliberately distinct from
+/// [`CcxeSelection::NoCompanion`]. On the ordinary path both mean "this segment
+/// contributes nothing to the dense lane", but on the **strict** delegation path
+/// they are opposite events: a segment with no dense companion at all has
+/// nothing to prove, while a segment holding another model's vectors is exactly
+/// the incompatibility strict mode exists to refuse. Collapsing the two would
+/// turn a fail-closed 503 into an apparently successful sparse-only 200 — the
+/// silent degradation the strict path was added to prevent.
+enum CcxeSelection {
+    NoCompanion,
+    Selected(std::path::PathBuf),
+    OtherModelOnly,
+}
+
+/// `model_id` the CE writes when no semantic profile was available. Distinct
+/// from a real model name, and treated as "unlabelled" by the fusion guard.
+const UNLABELLED_MODEL_ID: &str = "unknown";
 
 /// Lower-hex encode a 16-byte segment id (matches the storage filename scheme).
 fn hex16(bytes: &[u8; 16]) -> String {
@@ -1218,7 +1412,7 @@ mod tests {
         mgr.scan_and_load(&segments_dir).expect("scan");
 
         // Query embedding aligned to doc B (doc_id 1). Weight dense heavily.
-        let provider = build_dense_provider(&mgr, data_dir, &[0.0, 1.0], None).expect("provider from .ccxe");
+        let provider = build_dense_provider(&mgr, data_dir, &[0.0, 1.0], None, None).expect("provider from .ccxe");
         assert_eq!(provider.len(), 2);
         let weights = FusionWeights {
             bm25: 0.1,
@@ -1269,6 +1463,7 @@ mod tests {
             profiled.path(),
             &[1.0, 0.0],
             &matching_profile.embedding_fingerprint.hash,
+            None,
         )
         .expect("matching profile")
         .is_some());
@@ -1278,6 +1473,7 @@ mod tests {
                 profiled.path(),
                 &[1.0, 0.0],
                 &wrong_profile.embedding_fingerprint.hash,
+                None,
             ),
             Err(DenseProfileCompatibilityError::FingerprintMismatch { .. })
         ));
@@ -1304,6 +1500,7 @@ mod tests {
                 unlabelled.path(),
                 &[1.0, 0.0],
                 &matching_profile.embedding_fingerprint.hash,
+                None,
             ),
             Err(DenseProfileCompatibilityError::MissingProfile { .. })
         ));
@@ -1340,6 +1537,7 @@ mod tests {
                 forged.path(),
                 &[1.0, 0.0],
                 &matching_profile.embedding_fingerprint.hash,
+                None,
             ),
             Err(DenseProfileCompatibilityError::InvalidProfile { .. })
         ));
@@ -1385,6 +1583,7 @@ mod tests {
                 wrong_dimension.path(),
                 &[1.0, 0.0],
                 &matching_profile.embedding_fingerprint.hash,
+                None,
             ),
             Err(DenseProfileCompatibilityError::DimensionMismatch { .. })
         ));
@@ -1422,8 +1621,8 @@ mod tests {
             .unwrap();
 
         // Two builds: the second is a cache hit and must match the first.
-        let p1 = build_dense_provider(&mgr_a, tmp_a.path(), &[1.0, 0.0], None).expect("provider a1");
-        let p2 = build_dense_provider(&mgr_a, tmp_a.path(), &[1.0, 0.0], None).expect("provider a2");
+        let p1 = build_dense_provider(&mgr_a, tmp_a.path(), &[1.0, 0.0], None, None).expect("provider a1");
+        let p2 = build_dense_provider(&mgr_a, tmp_a.path(), &[1.0, 0.0], None, None).expect("provider a2");
         assert_eq!(p1.len(), 1);
         assert_eq!(
             p1.dense_score(0, 0),
@@ -1459,7 +1658,7 @@ mod tests {
 
         // Query [1, 0] against corpus B's orthogonal doc → 0.0. If the cache
         // collided on seq 0 it would wrongly return corpus A's ~1.0.
-        let pb = build_dense_provider(&mgr_b, tmp_b.path(), &[1.0, 0.0], None).expect("provider b");
+        let pb = build_dense_provider(&mgr_b, tmp_b.path(), &[1.0, 0.0], None, None).expect("provider b");
         assert_eq!(
             pb.dense_score(0, 0),
             Some(0.0),
@@ -1519,7 +1718,7 @@ mod tests {
         mgr.scan_and_load(&segments_dir).expect("scan");
 
         // No .ccxe → no provider.
-        assert!(build_dense_provider(&mgr, data_dir, &[0.0, 1.0], None).is_none());
+        assert!(build_dense_provider(&mgr, data_dir, &[0.0, 1.0], None, None).is_none());
 
         // BM25-only fused retrieval still returns the doc (dense lane inert).
         let req = fused_req(tenant, "bm25 document", vec![0.0], FusionWeights::default());
@@ -1654,5 +1853,259 @@ mod tests {
             None,
         );
         assert_eq!(c.hits.len(), 0, "unrelated tenant sees nothing");
+    }
+
+    // ── M7: companion rebuild + the CE-side fusion guard ────────────────────
+    //
+    // ExecPlan crux-companion-vocabulary-unification-2026-08-08 M7. These drive
+    // the real rebuild engine (`corecrux_storage::rebuild`) rather than
+    // hand-writing the companion it produces, so the gate is tested against the
+    // thing the CLI actually runs.
+
+    /// Embedder that returns a fixed vector per chunk text, so model A and model
+    /// B can be made to disagree about the same document in a way a score can
+    /// detect: reading the wrong model's vectors inverts the ranking rather than
+    /// perturbing it.
+    struct SwapEmbedder;
+
+    impl corecrux_storage::rebuild::DenseRebuildEmbedder for SwapEmbedder {
+        fn model_id(&self) -> &str {
+            "BAAI/bge-m3"
+        }
+
+        fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+            // Exactly the inverse of the vectors sealed under model A.
+            if text.contains("alpha") {
+                Ok(vec![0.0, 1.0])
+            } else {
+                Ok(vec![1.0, 0.0])
+            }
+        }
+
+        fn profile_json(&self, dimensions: usize) -> Option<Vec<u8>> {
+            let profile = corecrux_memory::embeddings::SemanticProfile::from_parts(
+                "BAAI/bge-m3",
+                dimensions,
+                "model_default",
+                "none",
+                "none",
+            );
+            serde_json::to_vec(&profile).ok()
+        }
+    }
+
+    /// Seal a two-chunk corpus under model A, then rebuild it under model B.
+    /// Returns `(data_dir, index_manager, model_a_profile)`.
+    fn corpus_rebuilt_under_a_second_model() -> (
+        tempfile::TempDir,
+        IndexManager,
+        corecrux_memory::embeddings::SemanticProfile,
+    ) {
+        let profile_a =
+            corecrux_memory::embeddings::SemanticProfile::from_parts("model-a", 2, "model_default", "none", "none");
+        let tmp = tempfile::tempdir().unwrap();
+        let docs = vec![
+            ProseDocument {
+                doc_id: "d0".to_string(),
+                chunks: vec![dense_chunk("d0::0", "alpha document", vec![1.0, 0.0])],
+            },
+            ProseDocument {
+                doc_id: "d1".to_string(),
+                chunks: vec![dense_chunk("d1::0", "beta document", vec![0.0, 1.0])],
+            },
+        ];
+        seal_prose_documents(
+            tmp.path(),
+            0,
+            1,
+            "tenant-m7",
+            "corpus",
+            "2026-08-11T00:00:00Z",
+            &docs,
+            Some(&profile_a),
+        )
+        .expect("seal under model A");
+
+        let mut mgr = IndexManager::new();
+        mgr.scan_and_load(&tmp.path().join("shards").join("shard-0000").join("segments"))
+            .expect("scan");
+        (tmp, mgr, profile_a)
+    }
+
+    fn rebuild_under_model_b(data_dir: &Path) -> corecrux_storage::rebuild::RebuildReport {
+        corecrux_storage::rebuild::rebuild_ccxe_companions(
+            data_dir,
+            &SwapEmbedder,
+            &corecrux_storage::rebuild::RebuildOptions::default(),
+            |_| {},
+        )
+        .expect("rebuild")
+    }
+
+    /// Test 18 (M7 gate): a query under model A returns **byte-identical**
+    /// results after a model-B rebuild.
+    ///
+    /// The model-A query runs first, so the dense cache is already populated
+    /// when the second companion lands. That is the poisoning case: keyed by
+    /// `(shards_dir, seq)` alone the entry would be shared between the two
+    /// models, and whichever queried first would decide what the other saw.
+    #[test]
+    #[serial_test::serial]
+    fn m7_model_a_query_is_unchanged_by_a_model_b_rebuild() {
+        use corecrux_retrieval::dense::DenseProvider;
+
+        let (tmp, mgr, profile_a) = corpus_rebuilt_under_a_second_model();
+        let query = [1.0f32, 0.0];
+
+        let before = build_dense_provider(&mgr, tmp.path(), &query, None, Some(&profile_a.model))
+            .expect("provider under model A");
+        let before_scores: Vec<Option<f32>> = (0..2).map(|doc| before.dense_score(doc, 0)).collect();
+        assert_eq!(before_scores[0].unwrap(), 1.0, "doc0 is model-A-aligned");
+        assert_eq!(before_scores[1].unwrap(), 0.0, "doc1 is orthogonal under model A");
+
+        let report = rebuild_under_model_b(tmp.path());
+        assert_eq!(report.rebuilt, 1);
+        assert_eq!(report.model_key, "baai-bge-m3");
+
+        let after = build_dense_provider(&mgr, tmp.path(), &query, None, Some(&profile_a.model))
+            .expect("provider under model A after the rebuild");
+        let after_scores: Vec<Option<f32>> = (0..2).map(|doc| after.dense_score(doc, 0)).collect();
+        assert_eq!(
+            before_scores, after_scores,
+            "the fusion guard must leave a model-A query bit-identical"
+        );
+        assert_eq!(before.len(), after.len());
+    }
+
+    /// Test 17 + 19 (M7 gate): both companions exist after the rebuild, a query
+    /// under model B uses the new one, and neither reads the other's vectors.
+    ///
+    /// Model B's vectors are model A's swapped, so "read the wrong model" is not
+    /// a subtle score drift — it is the opposite document ranked first.
+    #[test]
+    #[serial_test::serial]
+    fn m7_model_b_query_uses_the_rebuilt_companion_and_not_model_a_vectors() {
+        use corecrux_retrieval::dense::DenseProvider;
+
+        let (tmp, mgr, profile_a) = corpus_rebuilt_under_a_second_model();
+        let segments = tmp.path().join("shards").join("shard-0000").join("segments");
+        rebuild_under_model_b(tmp.path());
+
+        // Test 17: both companions exist; neither overwrote the other.
+        let names: Vec<String> = std::fs::read_dir(&segments)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".ccxe"))
+            .collect();
+        assert_eq!(names.len(), 2, "one companion per model: {names:?}");
+        assert!(names.iter().any(|n| n.ends_with(".ccxe")), "model A's: {names:?}");
+        assert!(
+            names.iter().any(|n| n.ends_with(".ccxe@baai-bge-m3")),
+            "model B's: {names:?}"
+        );
+
+        let query = [1.0f32, 0.0];
+        let under_b =
+            build_dense_provider(&mgr, tmp.path(), &query, None, Some("BAAI/bge-m3")).expect("provider under model B");
+        // Under model B the vectors are swapped, so the SAME query ranks the
+        // other document first. Reading model A's vectors here would give
+        // (1.0, 0.0) — the assertion below is exactly that separation.
+        assert_eq!(
+            under_b.dense_score(0, 0).unwrap(),
+            0.0,
+            "doc0 is orthogonal under model B"
+        );
+        assert_eq!(under_b.dense_score(1, 0).unwrap(), 1.0, "doc1 is model-B-aligned");
+
+        let under_a = build_dense_provider(&mgr, tmp.path(), &query, None, Some(&profile_a.model))
+            .expect("provider under model A");
+        assert_eq!(under_a.dense_score(0, 0).unwrap(), 1.0);
+        assert_eq!(under_a.dense_score(1, 0).unwrap(), 0.0);
+    }
+
+    /// A model with no companion on this corpus is scored against **nothing**,
+    /// not against whatever happens to be there. Structural, not advisory: this
+    /// is what makes mixing two semantic spaces impossible rather than unlikely.
+    #[test]
+    #[serial_test::serial]
+    fn m7_a_third_model_gets_no_dense_lane_rather_than_someone_elses_vectors() {
+        let (tmp, mgr, _profile_a) = corpus_rebuilt_under_a_second_model();
+        rebuild_under_model_b(tmp.path());
+
+        assert!(
+            build_dense_provider(&mgr, tmp.path(), &[1.0, 0.0], None, Some("intfloat/e5-large")).is_none(),
+            "a model with no companion here must get no dense lane"
+        );
+    }
+
+    /// The rebuild writes its own `.ccxprof@<key>`, and the strict path reads
+    /// the sidecar belonging to the companion it selected — not the segment's
+    /// original one.
+    ///
+    /// Sharing one sidecar between two companions would have it assert model A's
+    /// fingerprint over model B's vectors, which on the strict path is the
+    /// difference between refusing an incompatible vector space and blessing it.
+    #[test]
+    #[serial_test::serial]
+    fn m7_the_rebuilt_companion_carries_its_own_profile_sidecar() {
+        let (tmp, mgr, profile_a) = corpus_rebuilt_under_a_second_model();
+        rebuild_under_model_b(tmp.path());
+
+        let profile_b =
+            corecrux_memory::embeddings::SemanticProfile::from_parts("BAAI/bge-m3", 2, "model_default", "none", "none");
+        // Model B's own fingerprint verifies against model B's companion.
+        assert!(build_dense_provider_strict(
+            &mgr,
+            tmp.path(),
+            &[1.0, 0.0],
+            &profile_b.embedding_fingerprint.hash,
+            Some(&profile_b.model),
+        )
+        .expect("model B's sidecar must describe model B's vectors")
+        .is_some());
+
+        // And model A's fingerprint is refused against model B's companion,
+        // rather than passing because the segment's original sidecar was reused.
+        assert!(matches!(
+            build_dense_provider_strict(
+                &mgr,
+                tmp.path(),
+                &[1.0, 0.0],
+                &profile_a.embedding_fingerprint.hash,
+                Some(&profile_b.model),
+            ),
+            Err(DenseProfileCompatibilityError::FingerprintMismatch { .. })
+        ));
+    }
+
+    /// The `@<key>` filename is a hint for ordering candidates; the header is
+    /// the authority. A companion renamed to claim another model's key must be
+    /// judged by what it contains.
+    #[test]
+    #[serial_test::serial]
+    fn m7_a_mislabelled_filename_does_not_override_the_header() {
+        let (tmp, mgr, _profile_a) = corpus_rebuilt_under_a_second_model();
+        let segments = tmp.path().join("shards").join("shard-0000").join("segments");
+        let unkeyed = std::fs::read_dir(&segments)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("ccxe"))
+            .expect("model A's companion");
+
+        // Rename model A's companion to claim model B's key. Its header still
+        // says model-a.
+        let name = unkeyed.file_name().unwrap().to_string_lossy().to_string();
+        std::fs::rename(&unkeyed, segments.join(format!("{name}@baai-bge-m3"))).unwrap();
+
+        assert!(
+            build_dense_provider(&mgr, tmp.path(), &[1.0, 0.0], None, Some("BAAI/bge-m3")).is_none(),
+            "the header, not the suffix, decides whose vectors these are"
+        );
+        assert!(
+            build_dense_provider(&mgr, tmp.path(), &[1.0, 0.0], None, Some("model-a")).is_some(),
+            "and they are still model A's, wherever the file was moved to"
+        );
     }
 }

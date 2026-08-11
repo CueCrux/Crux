@@ -21,8 +21,9 @@ use corecruxctl::{
     admin, agent_wiring, attest_companions, audit_export, audit_pack, c2pa_x509, code_chain, code_health,
     compaction_sync, config_bundle, cost, deploy_audit, evidence, explain, export, extensions, fixture_digest, gaps,
     hooks, identity_cli, incident, ingest, inspect_receipt, learn, login, machine, memory, memory_pack, observe_ingest,
-    openclaw, output_verify, parity, projections, receipts, reconcile, repair_manifest, replay, repo, session_sync,
-    shard, shardmap, smoke, snapshot, stage1_import, start, storage, structured_log, studio, tooling_env, verify_store,
+    openclaw, output_verify, parity, projections, rebuild_companions, receipts, reconcile, repair_manifest, replay,
+    repo, session_sync, shard, shardmap, smoke, snapshot, stage1_import, start, storage, structured_log, studio,
+    tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -671,6 +672,48 @@ enum Command {
         /// Re-sign segments that already carry a `.ccxatt`.
         #[arg(long)]
         force: bool,
+    },
+
+    /// Rebuild a segment's dense companion under a different embedder, without
+    /// destroying the one it already has.
+    ///
+    /// Offline, idempotent and **additive**: the new vectors are written to
+    /// `<stem>.ccxe@<model-key>` alongside the existing companion, so the dense
+    /// lane keeps serving the old model throughout. Cutover is pointing the
+    /// query embedder at the new model; rollback is pointing it back. Nothing
+    /// here ever deletes — `--force` rewrites only the key being built.
+    ///
+    /// Re-running skips segments that already carry the key, so an interrupted
+    /// run costs only what is left. On a delegated embedder each chunk is one
+    /// metered call, and the report states the count.
+    #[command(name = "rebuild-companions")]
+    RebuildCompanions {
+        /// Daemon data dir. Defaults to CORECRUXD_DATA_DIR.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Companion type to rebuild. Only `ccxe` is supported.
+        #[arg(long = "type", default_value = "ccxe")]
+        companion_type: String,
+        /// Model id to embed with. Defaults to CORECRUXD_EMBEDDING_MODEL.
+        #[arg(long)]
+        model: Option<String>,
+        /// Embedding endpoint. Defaults to CORECRUXD_EMBEDDING_URL.
+        #[arg(long)]
+        embedding_url: Option<String>,
+        /// Restrict to one shard id.
+        #[arg(long)]
+        shard: Option<u32>,
+        /// Restrict to one segment sequence.
+        #[arg(long)]
+        segment: Option<u64>,
+        /// Re-embed and rewrite the companion for this model key if it exists.
+        /// Never touches another model's key.
+        #[arg(long)]
+        force: bool,
+        /// Report what would be rebuilt. Embeds nothing, writes nothing, spends
+        /// nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Identity-federation helpers — fingerprint card + link-statement
@@ -4548,6 +4591,80 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     println!("  {stem}: {err}");
                 }
                 return Err(format!("{} segment(s) could not be attested", report.failed.len()).into());
+            }
+            Ok(())
+        }
+
+        Command::RebuildCompanions {
+            data_dir,
+            companion_type,
+            model,
+            embedding_url,
+            shard,
+            segment,
+            force,
+            dry_run,
+        } => {
+            let data_dir = data_dir
+                .or_else(|| std::env::var("CORECRUXD_DATA_DIR").ok().map(PathBuf::from))
+                .ok_or("rebuild-companions requires --data-dir or CORECRUXD_DATA_DIR")?;
+            let report = rebuild_companions::run(
+                &rebuild_companions::Args {
+                    data_dir,
+                    companion_type,
+                    model,
+                    embedding_url,
+                    shard,
+                    segment,
+                    force,
+                    dry_run,
+                },
+                |segment| {
+                    // Per-segment, because on a real corpus this runs for hours
+                    // and a summary at the end is not progress.
+                    use corecrux_storage::rebuild::RebuildStatus;
+                    match &segment.status {
+                        RebuildStatus::Rebuilt { vectors, dimensions } => {
+                            println!("  {} rebuilt ({vectors} vectors, dim {dimensions})", segment.stem);
+                        }
+                        RebuildStatus::AlreadyPresent => println!("  {} already present", segment.stem),
+                        RebuildStatus::Skipped { reason } => println!("  {} skipped: {reason}", segment.stem),
+                        RebuildStatus::Failed { error } => println!("  {} FAILED: {error}", segment.stem),
+                    }
+                },
+            )?;
+
+            let rebuild = &report.rebuild;
+            println!("model: {} (key {})", rebuild.model_id, rebuild.model_key);
+            println!("segments scanned: {}", rebuild.segments_scanned);
+            if dry_run {
+                println!("would rebuild: {}", rebuild.rebuilt);
+            } else {
+                println!(
+                    "rebuilt: {} segment(s), {} vector(s)",
+                    rebuild.rebuilt, rebuild.vectors_written
+                );
+                println!("attestations refreshed: {}", report.attestations_refreshed);
+            }
+            println!(
+                "already present (skipped, not re-embedded): {}",
+                rebuild.already_present
+            );
+            println!("skipped, no text payloads: {}", rebuild.skipped);
+            // The credit line. A delegated embedder bills one credit per call,
+            // so this is what the run cost, stated rather than inferred.
+            println!("embedding calls: {}", rebuild.embedding_calls);
+
+            let mut failures = rebuild.failed;
+            if !report.attestation_failures.is_empty() {
+                println!("attestation failures: {}", report.attestation_failures.len());
+                for (stem, err) in &report.attestation_failures {
+                    println!("  {stem}: {err}");
+                }
+                failures += report.attestation_failures.len();
+            }
+            if failures > 0 {
+                return Err(format!("{failures} segment(s) did not complete").into());
             }
             Ok(())
         }

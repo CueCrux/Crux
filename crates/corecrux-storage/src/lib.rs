@@ -1341,6 +1341,7 @@ mod companions;
 mod integrity;
 mod manifest;
 mod read;
+pub mod rebuild;
 mod replication;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -1607,17 +1608,15 @@ impl ShardStorage {
                 // next open. It is why the `.ccxv`→`.ccxe` / `.ccxp`→`.ccxprof`
                 // rename had to land here in the same commit as the writers.
                 //
-                // The seven platform lane companions were added at M5 of the
-                // companion-vocabulary ExecPlan. The CE only *reads* them, but a file
-                // it cannot author is exactly the file it must not sweep: quarantining
-                // a platform-supplied companion is unrecoverable locally.
-                let referenced_companion = [
-                    ".ccxi", ".ccxe", ".ccxprof", ".ccxatt", ".ccxs", ".ccxse", ".ccxdi", ".ccxal", ".ccxn", ".ccxf",
-                    ".ccxev", ".ccxp",
-                ]
-                .iter()
-                .any(|ext| {
-                    name.strip_suffix(ext)
+                // Matching goes through [`companion_stem`] rather than a bare
+                // `strip_suffix`, because the model-keyed form is a *suffix* on
+                // the extension, not on the filename: `<stem>.ccxe@baai-bge-m3`
+                // does not end in `.ccxe`. A rebuild under a second embedder
+                // (ExecPlan crux-companion-vocabulary-unification M7) writes
+                // exactly that, and a plain `strip_suffix` would sweep every one
+                // of them into quarantine on the next shard open.
+                let referenced_companion = COMPANION_EXTENSIONS.iter().any(|ext| {
+                    companion_stem(name, ext)
                         .is_some_and(|stem| referenced.contains(&format!("segments/{stem}.ccxseg")))
                 });
                 if referenced_companion {
@@ -2713,6 +2712,38 @@ fn frame_len_at(bytes: &[u8], offset: u64) -> Option<usize> {
         .checked_add(header_len)?
         .checked_add(payload_len)?
         .checked_add(4)
+}
+
+/// Companion extensions that belong to a sealed segment and are kept as long as
+/// that segment is referenced by the MANIFEST.
+///
+/// Companions are collateral of their `.ccxseg`, not standalone MANIFEST
+/// entries, so shard open has to recognise them or sweep them into quarantine.
+/// The seven platform lane companions joined at M5 of the companion-vocabulary
+/// ExecPlan. The CE only *reads* them, but a file it cannot author is exactly
+/// the file it must not sweep: quarantining a platform-supplied companion is
+/// unrecoverable locally.
+pub const COMPANION_EXTENSIONS: [&str; 12] = [
+    ".ccxi", ".ccxe", ".ccxprof", ".ccxatt", ".ccxs", ".ccxse", ".ccxdi", ".ccxal", ".ccxn", ".ccxf", ".ccxev", ".ccxp",
+];
+
+/// The segment stem a companion filename belongs to, for one extension.
+///
+/// Handles both the plain form (`<stem>.ccxe`) and the model-keyed form
+/// (`<stem>.ccxe@<key>`), which a companion rebuild under a second embedder
+/// writes alongside the first rather than over it. The key is a disambiguator
+/// only — the authoritative `model_id` is read from the `.ccxe` header, never
+/// from this suffix — so nothing here interprets it beyond requiring it to be
+/// non-empty.
+pub fn companion_stem<'a>(name: &'a str, ext: &str) -> Option<&'a str> {
+    if let Some(stem) = name.strip_suffix(ext) {
+        return Some(stem);
+    }
+    let (head, key) = name.rsplit_once('@')?;
+    if key.is_empty() {
+        return None;
+    }
+    head.strip_suffix(ext)
 }
 
 fn hex16(bytes: &[u8; 16]) -> String {
