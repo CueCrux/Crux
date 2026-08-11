@@ -474,11 +474,30 @@ a codified defect class, not a code-derived formula.*
 | **`.ccxseg`** | A sealed, append-only segment (header + frames + TOC + footer). The unit of I1's `segment_hash`. | `corecrux-segment/src/builder.rs`, `decoder.rs` |
 | **`.ccxi`** | **C**oreCrux **C**ompanion **I**ndex — the seal-time inverted index (vocab table + PForDelta postings + per-doc table) that powers BM25. Built when `CORECRUXD_BUILD_CCXI=1`. | `crates/corecrux-index/src/ccxi.rs` |
 | **`.ccxsnap`** | Projection snapshot (living-row / hot-pointer / relations / cold-segment blocks), magic `CSNP`. **Not** a segment companion — it deliberately sits outside the `ccx<lane>` namespace, which is reserved for CoreCrux lane companions. Was `.ccxs` until 2026-08-08, which collided with CoreCrux's subject-profile/traits companion. | `crates/corecrux-projections/src/ccxsnap.rs` |
-| **`.ccxv`** | Precomputed dense-vector companion for locally-ingested prose — written at seal time next to its `.ccxseg` (same stem) and served by the local cosine `DenseProvider`. | `corecruxd/src/local_ingest.rs` (`write_ccxv`) |
+| **`.ccxe`** | Dense-vector companion, CoreCrux format — model-keyed as `<stem>.ccxe@<key>`, with the authoritative `model_id` in the **header, never the filename**. Written at seal time beside its `.ccxseg` and served by the local cosine `DenseProvider`. Was the CE-only bespoke `.ccxv` until 2026-08-08. | `crates/corecrux-index/src/ccxe.rs`; writer `corecruxd/src/local_ingest.rs` |
+| **`.ccxprof`** | Embedder-profile sidecar (JSON `SemanticProfile`) recording tokenizer / prompt-template / normalisation / fingerprint — the parts of the profile the `.ccxe` header does not carry. Was `.ccxp` until 2026-08-08, which collided with CoreCrux's projection companion. | `corecruxd/src/local_ingest.rs` (`write_ccxprof`) |
+| **`.ccxatt`** | Detached CROWN attestation over a segment's whole companion bundle — binds segment identity plus a per-companion blake3 digest. Resolves to provenance `platform` / `local` / `invalid` / `none`; `invalid` refuses to load in every mode. | `crates/corecrux-index/src/ccxatt.rs` |
 | **`.cruxpack`** | A passport-signed, BLAKE3-hash-anchored memory-portability transfer envelope (schema `crux.cruxpack.v1`) — a snapshot of one daemon's memory for export/import. | `crates/corecrux-memory/src/cruxpack.rs` (`CRUXPACK_SCHEMA_V1`) |
-| **`.ccxn`** | Graph **topology** lane file (entity/edge topology). Default-OFF lane. *(inferred — lane id `topology`)* | `corecrux-retrieval/src/graph.rs`; console `gr-topology` |
-| **`.ccxst`** | RAPTOR **navtree** lane file (hierarchical abstractive nav tree). Default-OFF lane. *(inferred — lane id `navtree`)* | `corecruxd` console lane `navtree` |
-| **`.ccxf`** | **Frame-substrate** lane file (reverse-frame / query↔question embeddings). Default-OFF. *(inferred — lane id `frames`)* | `corecrux-retrieval/src/fused.rs` |
+
+### Platform lane companions (reader-only in the CE)
+
+Computed by the CueCrux platform and shipped to a customer daemon, which reads them
+locally. The CE ports the `Ccx*Reader` half only — constraint C7 of ExecPlan
+`crux-companion-vocabulary-unification-2026-08-08`, enforced by
+`scripts/assert-reader-only-companions.sh`. A reader is inert without artifacts, and only
+the platform produces artifacts. Provenance: `crates/corecrux-index/VENDORED_FROM.md`.
+
+| Extension | Meaning | Defined at |
+|---|---|---|
+| **`.ccxs`** | **Subject-profile / traits** companion — `(subject_kind, subject_id) → [(predicate, object)]`, binary-searched by `xxh64(kind_byte ‖ subject_id)`. | `crates/corecrux-index/src/ccxs.rs` |
+| **`.ccxse`** | **Subject-trait embeddings** — one vector per `.ccxs` trait, keyed by the same subject hash; the header's `source_ccxs_crc` pins which `.ccxs` it was built from. | `crates/corecrux-index/src/ccxse.rs` |
+| **`.ccxdi`** | **Document index** for the `indexing` lane — per-doc regions and read-pointers with Q8.8 salience. Schema v2 stamps a per-doc `tenant_hash`. | `crates/corecrux-index/src/ccxdi.rs` |
+| **`.ccxal`** | **Vernacular atoms** for the `vernacular` lane — D0 pointer crystals (back to source spans) and D1 claim-graph atoms, plus an OOV surface pool. | `crates/corecrux-index/src/ccxal.rs` |
+| **`.ccxn`** | **Entity matrix** — `canonical_name → [(session_id, doc_id, frame_offset)]` plus `canonical_name → EntityType`. Callers must normalise through `canonicalise` before lookup. *(Superseded the earlier inferred "graph topology lane" entry, which was wrong.)* | `crates/corecrux-index/src/ccxn.rs` |
+| **`.ccxf`** | **Reverse frames** — short canonical-form questions a session uniquely answers, keyed back to `(session_id, doc_id)`. Lane id `topology`. *(Superseded the earlier inferred "query↔question embeddings" entry, which was wrong.)* | `crates/corecrux-index/src/ccxf.rs` |
+| **`.ccxev`** | **Extracted events** — verb-anchored `(verb_class, object, time, modality)` records. A scoring signal, not a candidate generator. v2 adds `record_off`, the stable physical join key. | `crates/corecrux-index/src/ccxev.rs` |
+| **`.ccxp`** | **Structured-fact projections** — `UserAction` / `UserAttribute` / `TemporalEvent` / `CountState` / `UserPreference` facts keyed to a source frame. | `crates/corecrux-index/src/ccxp.rs` |
+| **`.ccxst`** | RAPTOR **navtree** lane file. **Not ported** — 0% deployed coverage, explicitly excluded by the ExecPlan. | CoreCrux only |
 
 ## Receipt subtypes (modules in `corecrux-receipts/src/`)
 

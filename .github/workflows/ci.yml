@@ -152,6 +152,8 @@ jobs:
       - name: Unwrap/expect ratchet
         run: bash scripts/unwrap-ratchet.sh
       - run: bash scripts/assert-daemon-release-boundary.sh
+      - name: Reader-only companion ports (ExecPlan C7)
+        run: bash scripts/assert-reader-only-companions.sh
       - run: bash scripts/ci-cargo-with-fallback.sh clippy --workspace -- -D warnings
       - name: Reclaim per-job CARGO_HOME
         if: always()
