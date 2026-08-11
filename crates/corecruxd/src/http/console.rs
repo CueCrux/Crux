@@ -1348,10 +1348,22 @@ fn canonical_lane_key(name: &str) -> Option<&'static str> {
         "cosine" | "dense" | "vec" | "vector" => Some("cosine"),
         "sparse" | "splade" => Some("sparse"),
         "hyde" => Some("hyde"),
-        "topology" => Some("topology"),
-        "vernacular" => Some("vernacular"),
+        // The companion extension is accepted as an alias for its lane, so an operator
+        // can name a lane by the artifact they can see on disk. `ccxdi`/`ccxev` were
+        // already aliased; `ccxf`/`ccxal`/`ccxs`/`ccxse` complete the set for the
+        // readers ported at M5 of the companion-vocabulary ExecPlan.
+        //
+        // `.ccxn` (entity) and `.ccxp` (projection) are deliberately absent: neither
+        // lane exists in `default_lane_weights`, and `normalize_lane_weights` rejects
+        // any key that is not a real lane. Aliasing them would let an operator set a
+        // weight the fusion path never reads — a silently ignored setting is worse
+        // than a rejected one. They arrive with the M6 scorer ruling.
+        "topology" | "ccxf" => Some("topology"),
+        "vernacular" | "ccxal" => Some("vernacular"),
         "indexing" | "ccxdi" => Some("indexing"),
-        "topology_trait_expansion" | "trait_expansion" | "ccxse_expansion" => Some("topology_trait_expansion"),
+        "topology_trait_expansion" | "trait_expansion" | "ccxse_expansion" | "ccxs" | "ccxse" => {
+            Some("topology_trait_expansion")
+        }
         "navtree" | "nav" | "ccxst" => Some("navtree"),
         "events" | "event" | "ccxev" => Some("events"),
         _ => None,
@@ -3555,6 +3567,38 @@ mod lane_weight_tests {
         assert_eq!(canonical_lane_key("nav"), Some("navtree"));
         assert_eq!(canonical_lane_key("event"), Some("events"));
         assert_eq!(canonical_lane_key("nonsense"), None);
+    }
+
+    /// Every companion whose reader landed at M5 resolves to its lane by extension,
+    /// and every alias must land on a lane `default_lane_weights` actually carries —
+    /// `normalize_lane_weights` rejects anything else, so an alias to a non-lane would
+    /// be a setting the operator can name and the fusion path never reads.
+    #[test]
+    fn ported_companion_extensions_alias_to_real_lanes() {
+        let defaults = default_lane_weights();
+        for (ext, lane) in [
+            ("ccxdi", "indexing"),
+            ("ccxev", "events"),
+            ("ccxf", "topology"),
+            ("ccxal", "vernacular"),
+            ("ccxs", "topology_trait_expansion"),
+            ("ccxse", "topology_trait_expansion"),
+        ] {
+            assert_eq!(canonical_lane_key(ext), Some(lane), "{ext} must alias to {lane}");
+            assert!(defaults.contains_key(lane), "{lane} must be a real lane");
+        }
+    }
+
+    /// `.ccxn` and `.ccxp` have readers but no lane yet — the M6 scorer ruling decides
+    /// whether they get one. Until then, naming them must be an error the operator
+    /// sees, not a weight that is silently dropped.
+    #[test]
+    fn companions_without_a_lane_are_rejected_rather_than_silently_accepted() {
+        assert_eq!(canonical_lane_key("ccxn"), None);
+        assert_eq!(canonical_lane_key("ccxp"), None);
+        let mut raw = BTreeMap::new();
+        raw.insert("ccxn".to_string(), 1.0);
+        assert!(normalize_lane_weights(&raw).is_err());
     }
 
     #[test]
