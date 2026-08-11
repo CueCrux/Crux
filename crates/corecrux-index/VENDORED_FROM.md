@@ -137,8 +137,8 @@ commented at its site.
     well-formed files is identical; on malformed ones the result is `None`/`Err` rather
     than a wrapped index.
 11. **Doc comments were retargeted.** Upstream module docs reference CoreCrux-internal
-    ExecPlans, Postgres tables, `PlanCrux/docs/...` paths and sibling crates that do not
-    exist in this repo. The *format* documentation — layouts, offsets, invariants,
+    ExecPlans, Postgres tables, planning-monorepo doc paths and sibling crates that do
+    not exist in this repo. The *format* documentation — layouts, offsets, invariants,
     rationale — is kept verbatim in substance; the unresolvable cross-references are
     replaced with prose, because `RUSTDOCFLAGS="-D warnings"` is a CI gate and a link to
     a path outside the repo is not checkable by a reader.
