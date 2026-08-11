@@ -224,7 +224,7 @@ jobs:
       # host having python3-venv and does not install into the persistent
       # runner's system python. Same action, pin and runner label as
       # audit-vectors.yml, which is the proven pattern here.
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.12'
       - name: Escrow verification cross-check (Rust vs Python reference)

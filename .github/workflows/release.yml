@@ -169,7 +169,7 @@ jobs:
 
       - name: Install cosign
         # sigstore/cosign-installer v4.1.2 (pinned SHA — floating tags are a T.5 vector)
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           # Pin cosign 2.x: v3.0 `sign-blob` writes a Sigstore bundle by default
           # and the legacy --output-signature/--output-certificate-only call
@@ -325,7 +325,8 @@ jobs:
     # NOTE: referenced by TAG, not commit SHA — the slsa-github-generator
     # explicitly requires tag refs for its reusable workflows (it verifies
     # its own release integrity internally; SHA refs are unsupported).
-    # Documented exception to the pinned-SHA rule — see ExecPlan decision log.
+    # Documented exception to the pinned-SHA rule —
+    # see docs/supply-chain/action-pinning-exceptions.md.
     uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
     with:
       base64-subjects: ${{ needs.combine-hashes.outputs.hashes }}
@@ -348,7 +349,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: 'v2.4.3'
 
