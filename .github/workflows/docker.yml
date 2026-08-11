@@ -115,7 +115,7 @@ jobs:
 
       - name: Trivy scan (SARIF report, CRITICAL+HIGH)
         # aquasecurity/trivy-action v0.36.0
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: local/crux-daemon:scan
           format: sarif
@@ -124,8 +124,8 @@ jobs:
           exit-code: "0"
 
       - name: Upload Trivy SARIF to Security tab
-        # github/codeql-action v4.36.2
-        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3
+        # github/codeql-action v4.37.6
+        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
         if: always()
         with:
           sarif_file: trivy-results.sarif
@@ -134,7 +134,7 @@ jobs:
       - name: Trivy gate (fail on CRITICAL)
         if: ${{ inputs.skip_trivy_gate != true }}
         # aquasecurity/trivy-action v0.36.0
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: local/crux-daemon:scan
           format: table
@@ -226,7 +226,7 @@ jobs:
       - name: Generate image SBOM (syft)
         if: github.event_name != 'pull_request'
         # anchore/sbom-action v0.24.0 (pinned SHA)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
           format: cyclonedx-json
@@ -237,7 +237,7 @@ jobs:
       - name: Install cosign
         if: github.event_name != 'pull_request'
         # sigstore/cosign-installer v4.1.2 (pinned SHA)
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign image + attest SBOM (cosign keyless)
         if: github.event_name != 'pull_request'
