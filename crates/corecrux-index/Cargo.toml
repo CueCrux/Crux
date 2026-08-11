@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
 # `.ccxe` reads f16-quantised vectors and mmaps large companions. Both arrive with
 # the ported dense-companion format — see VENDORED_FROM.md.
 half = "2.7.1"

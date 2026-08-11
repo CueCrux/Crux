@@ -30,6 +30,7 @@ mod attention;
 mod auth;
 mod code_intel;
 mod codegraph_fusion;
+mod companion_attestation;
 mod config;
 mod console_index;
 mod consolidation_scheduler;
@@ -810,6 +811,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         retention_days: config.retention_days,
         retrieval_index: {
             let mut idx = corecrux_retrieval::IndexManager::new();
+            // Companion provenance must be installed BEFORE the first scan: it
+            // governs what those segments are permitted to serve, and a scan
+            // that ran without it has already decided.
+            let attestation_mode = crate::companion_attestation::install_policy(&mut idx, &config.data_dir);
             // Load-at-startup wiring: reload sealed `.ccxi` companions when the
             // storage layer builds them (`build_ccxi`) OR when the local
             // prose-ingest door is enabled — otherwise local-ingest segments
@@ -829,6 +834,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }
                 tracing::info!(total, "ccxi-indexes-loaded-at-startup");
+                // Surface 1 of 4: a per-segment WARN is not enough on its own,
+                // because a long boot scrolls. One ERROR-level summary names the
+                // count so an operator sees it without reading every line.
+                crate::companion_attestation::log_startup_summary(&idx, attestation_mode);
             }
             // Load-at-startup wiring for the tenant erasure mask: without it a
             // restart would silently re-serve a corpus the operator erased.

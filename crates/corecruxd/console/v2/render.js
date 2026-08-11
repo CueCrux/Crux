@@ -33,7 +33,8 @@
     Object.freeze(['hosted_sync', 'Hosted sync']),
     Object.freeze(['projection_queries', 'Projection queries']),
     Object.freeze(['graph_expand', 'Graph expansion']),
-    Object.freeze(['console_link_graph', 'Link graph (CoreCrux proxy)'])
+    Object.freeze(['console_link_graph', 'Link graph (CoreCrux proxy)']),
+    Object.freeze(['companion_provenance', 'Companion provenance'])
   ]);
 
   // ---- Environment shims (only used when rendering in a browser) ---------

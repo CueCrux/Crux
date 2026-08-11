@@ -5084,6 +5084,45 @@
     document.body.appendChild(bar);
   }
 
+  // Surface 4 of 4 — companion provenance.
+  //
+  // Persistent, not a toast: the point of the whole control is that a missing
+  // provenance stamp cannot be waved away, and a notification that disappears on
+  // its own is exactly the affordance for waving it away. Driven entirely by the
+  // `companion_provenance` capability in /v1/version, so the console makes no
+  // judgement of its own — the daemon already decided what `degraded` means.
+  //
+  // No innerHTML anywhere below: every value here is server data rendered as
+  // text, so a hostile reason string cannot become markup.
+  function showProvenanceBanner(capability) {
+    if (!capability || capability.degraded !== true) { return; }
+    if (document.getElementById('provenanceBanner')) { return; }
+
+    var detail = capability.detail || {};
+    var code = capability.reason_code || '';
+    var critical = (code === 'companion_attestation_invalid');
+    var text;
+    if (critical) {
+      text = 'Companion provenance FAILED on ' + (detail.invalid || 0) + ' segment(s): their files do not '
+        + 'match their signed digests. Those segments serve nothing, in every mode. They remain erasable.';
+    } else if (code === 'companion_attestation_off') {
+      text = 'Companion attestation is OFF. Missing provenance is not being reported on this daemon.';
+    } else {
+      text = (detail.none || 0) + ' segment(s) carry no companion attestation'
+        + (detail.mode === 'enforce' ? ' and are not being served (enforce).' : ' and are being served anyway (warn).');
+    }
+
+    var bar = el('div', { id: 'provenanceBanner', role: 'status' });
+    // Stack under the session banner rather than on top of it: a signed-out
+    // operator needs the sign-in link more than they need this.
+    var top = document.getElementById('authBanner') ? '44px' : '0';
+    bar.style.cssText = 'position:fixed;top:' + top + ';left:0;right:0;z-index:99998;display:flex;gap:12px;'
+      + 'align-items:center;justify-content:center;padding:8px 16px;background:var('
+      + (critical ? '--crit' : '--warn') + ');color:#111;font:600 13px/1.4 system-ui,-apple-system,sans-serif';
+    bar.appendChild(el('span', { text: text }));
+    document.body.appendChild(bar);
+  }
+
   // ---- Status pill (top-right) -------------------------------------------
   // No address / node-id in the text — origin + node id now live on the System
   // destination. States: Connected · Local (auth 'off') / Connected · Platform
@@ -5804,6 +5843,7 @@
         setStatusPill();
         setTopChips();
         setBrand();
+        showProvenanceBanner(get(window.CRUX_RUNTIME_CAPABILITIES, ['capabilities', 'companion_provenance']));
         route();
         // M16b — load the workspace config model (async, non-blocking): rebuilds
         // the switcher + rail icons and re-routes if we booted onto a #/w/ route.

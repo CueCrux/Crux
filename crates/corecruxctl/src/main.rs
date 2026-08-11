@@ -18,11 +18,11 @@ use clap::{Parser, Subcommand};
 
 use corecruxctl::verify_escrow;
 use corecruxctl::{
-    admin, agent_wiring, audit_export, audit_pack, c2pa_x509, code_chain, code_health, compaction_sync, config_bundle,
-    cost, deploy_audit, evidence, explain, export, extensions, fixture_digest, gaps, hooks, identity_cli, incident,
-    ingest, inspect_receipt, learn, login, machine, memory, memory_pack, observe_ingest, openclaw, output_verify,
-    parity, projections, receipts, reconcile, repair_manifest, replay, repo, session_sync, shard, shardmap, smoke,
-    snapshot, stage1_import, start, storage, structured_log, studio, tooling_env, verify_store,
+    admin, agent_wiring, attest_companions, audit_export, audit_pack, c2pa_x509, code_chain, code_health,
+    compaction_sync, config_bundle, cost, deploy_audit, evidence, explain, export, extensions, fixture_digest, gaps,
+    hooks, identity_cli, incident, ingest, inspect_receipt, learn, login, machine, memory, memory_pack, observe_ingest,
+    openclaw, output_verify, parity, projections, receipts, reconcile, repair_manifest, replay, repo, session_sync,
+    shard, shardmap, smoke, snapshot, stage1_import, start, storage, structured_log, studio, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -647,6 +647,30 @@ enum Command {
     Openclaw {
         #[command(subcommand)]
         command: OpenclawCommand,
+    },
+
+    /// Stamp companion provenance on segments sealed before attestation
+    /// existed (`.ccxatt` backfill).
+    ///
+    /// Signs what is already on disk with this daemon's own passport key, using
+    /// the same writer the seal path uses. A backfilled stamp says "this daemon
+    /// vouches for these bytes as they are now" — it is `local` provenance and
+    /// does NOT retroactively prove where the bytes came from. Settle that
+    /// before running it on a corpus that may hold companions from elsewhere.
+    #[command(name = "attest-companions")]
+    AttestCompanions {
+        /// Daemon data dir. Defaults to CORECRUXD_DATA_DIR.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict to one shard id.
+        #[arg(long)]
+        shard: Option<u32>,
+        /// Report what would be stamped, write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Re-sign segments that already carry a `.ccxatt`.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Identity-federation helpers — fingerprint card + link-statement
@@ -4489,6 +4513,43 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     Ok(())
                 }
             }
+        }
+
+        Command::AttestCompanions {
+            data_dir,
+            shard,
+            dry_run,
+            force,
+        } => {
+            let data_dir = data_dir
+                .or_else(|| std::env::var("CORECRUXD_DATA_DIR").ok().map(PathBuf::from))
+                .ok_or("attest-companions requires --data-dir or CORECRUXD_DATA_DIR")?;
+            let report = attest_companions::run(&attest_companions::Args {
+                data_dir,
+                shard,
+                dry_run,
+                force,
+            })?;
+            if dry_run {
+                println!("would attest: {}", report.would_attest);
+            } else {
+                println!(
+                    "attested: {} segment(s), {} companion(s) covered",
+                    report.attested, report.companions_covered
+                );
+            }
+            println!("already attested: {}", report.already_attested);
+            println!("no companions (nothing to attest): {}", report.no_companions);
+            // Failures are named, not just counted: a backfill that half-worked
+            // must say which segments are still unstamped.
+            if !report.failed.is_empty() {
+                println!("failed: {}", report.failed.len());
+                for (stem, err) in &report.failed {
+                    println!("  {stem}: {err}");
+                }
+                return Err(format!("{} segment(s) could not be attested", report.failed.len()).into());
+            }
+            Ok(())
         }
 
         // ── identity federation (G4) ───────────────────────────────

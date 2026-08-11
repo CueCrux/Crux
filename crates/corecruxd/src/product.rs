@@ -323,6 +323,10 @@ pub struct RuntimeCapabilities {
     /// (render from the capability plan, never the route registry). See ExecPlan
     /// `wikicrux-link-graph-explorer-2026-07-23` (M4).
     pub console_link_graph: RuntimeCapability,
+    /// Who produced the companions this daemon is serving. `degraded` when any
+    /// segment is unattested or refused — and when the check itself is off,
+    /// because "we turned the alarm off" has to be visible.
+    pub companion_provenance: RuntimeCapability,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -330,6 +334,10 @@ pub struct RuntimeCapability {
     pub availability: &'static str,
     pub reason_code: &'static str,
     pub reason: &'static str,
+    /// Capability-specific counts. Omitted entirely when absent, so every
+    /// existing consumer of this shape is unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
     pub compiled: bool,
     pub configured: bool,
     pub initialized: bool,
@@ -348,6 +356,37 @@ pub struct RuntimeCapabilityInputs {
     /// The CoreCrux link-graph console mediation proxy is configured (graph
     /// upstream base URL env set). Sourced from `http::console` at `/v1/version`.
     pub console_link_graph_configured: bool,
+    /// Live companion-provenance tallies, read from the retrieval index.
+    pub companion_provenance: CompanionProvenanceRuntime,
+}
+
+/// Snapshot of companion provenance across the loaded corpus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompanionProvenanceRuntime {
+    /// `off` | `warn` | `enforce`.
+    pub mode: &'static str,
+    pub platform: usize,
+    pub local: usize,
+    pub none: usize,
+    pub invalid: usize,
+    /// Segments whose provenance cost them their lanes (still erasable).
+    pub refused: usize,
+}
+
+impl Default for CompanionProvenanceRuntime {
+    /// An empty corpus under the ship default. Notably `mode: "warn"`, not `""`:
+    /// a default that reads as "no mode" would report the capability as
+    /// configured-off and quietly mark a healthy daemon degraded.
+    fn default() -> Self {
+        Self {
+            mode: "warn",
+            platform: 0,
+            local: 0,
+            none: 0,
+            invalid: 0,
+            refused: 0,
+        }
+    }
 }
 
 /// Safe, public projection of the delegation client's live breaker state.
@@ -603,9 +642,59 @@ impl RuntimeCapabilityDescriptor {
                 projection_queries,
                 graph_expand,
                 console_link_graph,
+                companion_provenance: companion_provenance_capability(inputs.companion_provenance),
             },
         }
     }
+}
+
+/// Surface 2 of 4 — the machine-readable one the console reads.
+///
+/// `degraded` is the honest state for all three bad outcomes: companions from
+/// nowhere, companions that fail their own digests, and a daemon told not to
+/// look. The last is deliberate — an operator inheriting a box must be able to
+/// see that the alarm was disabled, so `off` reports itself rather than
+/// reporting clean.
+fn companion_provenance_capability(runtime: CompanionProvenanceRuntime) -> RuntimeCapability {
+    let stages = RuntimeCapabilityStages {
+        compiled: true,
+        configured: runtime.mode != "off",
+        initialized: true,
+        entitled: true,
+        degraded: runtime.mode == "off" || runtime.invalid > 0 || runtime.none > 0,
+    };
+    let detail = serde_json::json!({
+        "mode": runtime.mode,
+        "platform": runtime.platform,
+        "local": runtime.local,
+        "none": runtime.none,
+        "invalid": runtime.invalid,
+        "refused": runtime.refused,
+    });
+
+    let mut capability = if runtime.mode == "off" {
+        RuntimeCapability::degraded(
+            "companion_attestation_off",
+            "Companion attestation is disabled; missing provenance is not reported.",
+            stages,
+        )
+    } else if runtime.invalid > 0 {
+        RuntimeCapability::degraded(
+            "companion_attestation_invalid",
+            "Some companions do not match their signed digests and were refused their lanes.",
+            stages,
+        )
+    } else if runtime.none > 0 {
+        RuntimeCapability::degraded(
+            "companion_unattested",
+            "Some segments carry no companion attestation.",
+            stages,
+        )
+    } else {
+        RuntimeCapability::available(stages)
+    };
+    capability.detail = Some(detail);
+    capability
 }
 
 impl RuntimeCapability {
@@ -618,6 +707,7 @@ impl RuntimeCapability {
             availability: "available",
             reason_code,
             reason,
+            detail: None,
             compiled: stages.compiled,
             configured: stages.configured,
             initialized: stages.initialized,
@@ -631,6 +721,7 @@ impl RuntimeCapability {
             availability: "unavailable",
             reason_code,
             reason,
+            detail: None,
             compiled: stages.compiled,
             configured: stages.configured,
             initialized: stages.initialized,
@@ -644,6 +735,7 @@ impl RuntimeCapability {
             availability: "degraded",
             reason_code,
             reason,
+            detail: None,
             compiled: stages.compiled,
             configured: stages.configured,
             initialized: stages.initialized,
@@ -1302,6 +1394,7 @@ mod tests {
                 rerank_endpoint_configured: true,
                 graph_expand_configured: true,
                 console_link_graph_configured: false,
+                companion_provenance: CompanionProvenanceRuntime::default(),
             },
         );
 
@@ -1328,6 +1421,7 @@ mod tests {
                 rerank_endpoint_configured: false,
                 graph_expand_configured: true,
                 console_link_graph_configured: false,
+                companion_provenance: CompanionProvenanceRuntime::default(),
             },
         );
         assert!(!missing_endpoint.capabilities.rerank_gpu.configured);
@@ -1351,6 +1445,7 @@ mod tests {
                 rerank_endpoint_configured: false,
                 graph_expand_configured: true,
                 console_link_graph_configured: false,
+                companion_provenance: CompanionProvenanceRuntime::default(),
             },
         );
         let hosted_sync = descriptor.capabilities.hosted_sync;
@@ -1378,6 +1473,7 @@ mod tests {
                 rerank_endpoint_configured: false,
                 graph_expand_configured: true,
                 console_link_graph_configured: false,
+                companion_provenance: CompanionProvenanceRuntime::default(),
             },
         );
 
@@ -1403,6 +1499,7 @@ mod tests {
                 rerank_endpoint_configured: false,
                 graph_expand_configured: true,
                 console_link_graph_configured: false,
+                companion_provenance: CompanionProvenanceRuntime::default(),
             },
         );
         assert_eq!(circuit_open.capabilities.embedding_delegation.availability, "degraded");

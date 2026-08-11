@@ -12,12 +12,18 @@
 //!
 //! The index is built on CPU at seal time and loaded (decompressed) to GPU device memory at query time.
 
+mod ccxatt;
 mod ccxe;
 mod ccxi;
 mod pfordelta;
 mod tokenizer;
 mod turboquant;
 
+pub use ccxatt::{
+    collect_companion_digests, companion_digest, decode_attestation, encode_attestation, verify_attestation,
+    verify_parsed, write_local_attestation, AttestationBody, AttestationFailure, AttestationMode, CompanionDigest,
+    LocalAttestationRequest, ParsedAttestation, Provenance, TrustRoots, CCXATT_EXT, CCXATT_SCHEMA_V1,
+};
 pub use ccxe::{
     configured_turbo_seed, model_id_file_key, verify_footer_hashes, CcxeBuildFingerprint, CcxeBuilder, CcxeReader,
     Quantization, CCXE_HEADER_LEN, CCXE_VERSION, CCXE_VERSION_V1, CCXE_VERSION_V2,
