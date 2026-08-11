@@ -35,7 +35,6 @@ use corecrux_memory::fact_store::{ConsolidationErrorV1, ConsolidationRequestV1, 
 
 use crate::dispatch::McpContext;
 use crate::protocol::{JsonRpcError, INVALID_PARAMS};
-use crate::scope;
 
 /// Environment flag that gates the consolidation read/write surfaces.
 ///
@@ -71,8 +70,8 @@ fn feature_disabled_error() -> JsonRpcError {
 }
 
 fn require_passport(ctx: &McpContext, tool: &str) -> Result<String, JsonRpcError> {
-    match scope::agent_name(ctx.agent.as_ref()) {
-        Some(name) => Ok(name.to_string()),
+    match ctx.authority_identity() {
+        Some(identity) => Ok(identity),
         None => Err(JsonRpcError {
             code: crate::dispatch::CAPABILITY_DENIED,
             message: format!("{tool} requires an authenticated passport (anonymous calls rejected)"),
@@ -99,7 +98,7 @@ pub async fn handle_memory_contradictions(args: &Value, ctx: &McpContext) -> Res
     // The pass itself is bounded by `limit`; we additionally trim by the
     // mandatory token budget so a contradiction-heavy store can't blow the
     // output-token budget (QC.2 primary defence).
-    let candidates = store.contradiction_candidates_v1(limit);
+    let candidates = store.contradiction_candidates_v1(&ctx.scope_tenant(), limit);
     drop(store);
 
     let mut rows: Vec<Value> = Vec::new();
@@ -222,7 +221,7 @@ pub async fn handle_memory_consolidate(args: &Value, ctx: &McpContext) -> Result
 
     let report = {
         let mut store = ctx.fact_store.write().await;
-        store.consolidate_facts_v1(req)
+        store.consolidate_facts_v1(&ctx.scope_tenant(), req)
     };
 
     match report {
@@ -250,11 +249,20 @@ pub async fn handle_memory_consolidate(args: &Value, ctx: &McpContext) -> Result
 /// (mirrors the console route's HTTP status mapping).
 fn consolidation_error_to_rpc(err: ConsolidationErrorV1) -> JsonRpcError {
     let (code, reason) = match &err {
-        ConsolidationErrorV1::NoTargets | ConsolidationErrorV1::TargetOutsideEntityKey(_) => {
-            (INVALID_PARAMS, "invalid_request")
-        }
+        ConsolidationErrorV1::NoTargets
+        | ConsolidationErrorV1::MissingConsolidationId
+        | ConsolidationErrorV1::TargetOutsideEntityKey(_)
+        | ConsolidationErrorV1::ImplicitPriorNotTarget(_)
+        | ConsolidationErrorV1::NoUndoSources
+        | ConsolidationErrorV1::NotConsolidationCanonical(_)
+        | ConsolidationErrorV1::UndoSourceMismatch(_) => (INVALID_PARAMS, "invalid_request"),
+        ConsolidationErrorV1::CanonicalSuperseded(_) => (crate::dispatch::CAPABILITY_DENIED, "canonical_superseded"),
         ConsolidationErrorV1::TargetNotFound(_) => (INVALID_PARAMS, "target_not_found"),
         ConsolidationErrorV1::TargetDeleted(_) => (crate::dispatch::CAPABILITY_DENIED, "target_deleted"),
+        ConsolidationErrorV1::TargetAlreadySuperseded(_) => {
+            (crate::dispatch::CAPABILITY_DENIED, "target_already_superseded")
+        }
+        ConsolidationErrorV1::DuplicateTarget(_) => (INVALID_PARAMS, "duplicate_target"),
         ConsolidationErrorV1::TargetPinned(_) => (crate::dispatch::CAPABILITY_DENIED, "target_pinned"),
         ConsolidationErrorV1::TargetPrivate(_) => (crate::dispatch::CAPABILITY_DENIED, "target_private"),
         ConsolidationErrorV1::TargetReceiptLinked(_) => (crate::dispatch::CAPABILITY_DENIED, "target_receipt_linked"),
@@ -380,7 +388,7 @@ mod tests {
         .unwrap();
         {
             let mut store = alice.fact_store.write().await;
-            assert!(store.clear_superseded(&a_id), "simulate unresolved conflict");
+            assert!(store.clear_superseded("default", &a_id), "simulate unresolved conflict");
         }
 
         let res = handle_memory_contradictions(&json!({"token_budget": 2000}), &alice)
@@ -465,7 +473,7 @@ mod tests {
             .unwrap_or_else(|| fact_id_of(&newer));
         {
             let mut store = alice.fact_store.write().await;
-            assert!(store.clear_superseded(&old_id), "make both targets active");
+            assert!(store.clear_superseded("default", &old_id), "make both targets active");
         }
 
         let res = handle_memory_consolidate(
@@ -492,7 +500,12 @@ mod tests {
             store.get(&old_id).unwrap().superseded_by.as_deref(),
             Some(canonical.as_str())
         );
-        let history = store.fact_history("proj", "status");
+        assert_eq!(
+            store.get(&canonical).unwrap().actor.as_deref(),
+            Some("agent:alice"),
+            "unmapped token names must not be stored as human passport authority"
+        );
+        let history = store.fact_history("default", "proj", "status");
         assert_eq!(history.len(), 3, "consolidation must preserve version history");
         disable();
     }

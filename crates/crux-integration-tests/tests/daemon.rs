@@ -130,9 +130,40 @@ fn console_integrations_api() {
         .any(|pack| { pack["manifest"]["id"] == "mcp.cursor" }));
 }
 
+/// Agent token for the dedicated daemon below. Must satisfy the strength
+/// policy (>= 32 bytes, safe charset) or the registry refuses it and MCP
+/// silently falls back to no-auth — see `crux_mcp::agent::is_safe_agent_token`.
+const WORK_FLOW_AGENT_TOKEN: &str = "crux_at_work_flow_0123456789abcdef";
+
 #[test]
 fn projects_work_and_coordination_tools_flow() {
-    let d = daemon();
+    // A dedicated daemon, not the shared one: MCP work mutations now require an
+    // authenticated authority, and the shared instance runs without an agent
+    // token. Tokenising the shared daemon instead would 401 the ~20 other MCP
+    // calls in this file that are legitimately testing the unauthenticated
+    // read surface, so the token is scoped to this test.
+    //
+    // HTTP behaviour is unchanged by the token: the daemon still runs
+    // `CORECRUXD_AUTH_MODE=off`, so the assertions below about unverified local
+    // identities still exercise that path.
+    let owned = crux_integration_tests::TestDaemon::start_with_agent_token(WORK_FLOW_AGENT_TOKEN);
+    let d = &owned;
+    let mcp_tool_call = |tool: &str, arguments: serde_json::Value| -> serde_json::Value {
+        owned
+            .mcp_post_json_with_token(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": unique_id("mcp"),
+                    "method": "tools/call",
+                    "params": { "name": tool, "arguments": arguments }
+                }),
+                WORK_FLOW_AGENT_TOKEN,
+            )
+            .unwrap()
+            .into_body()
+            .read_json()
+            .unwrap()
+    };
     let project_id = unique_id("coverage-project");
     let actor_passport = unique_id("coverage-actor");
     let gated_passport = unique_id("coverage-gate");
@@ -356,7 +387,21 @@ fn projects_work_and_coordination_tools_flow() {
         .into_body()
         .read_json()
         .unwrap();
-    assert_eq!(applied["applied"], true);
+    // This harness runs the daemon with `CORECRUXD_AUTH_MODE=off`, so the
+    // caller is a local *unverified* identity. Naming `actor_passport` in the
+    // body is an assertion about who you are, not proof of it — and it used to
+    // be enough to apply a transition directly whenever that passport happened
+    // to be ungated. Selecting an ungated passport was therefore a review
+    // bypass available to anyone who could reach the port.
+    //
+    // Both passports now queue under auth-off. The gated/ungated distinction is
+    // still live, but only for identities that are actually authenticated; it
+    // is no longer reachable by assertion. The `gated_passport` case below is
+    // kept because it now pins the same outcome for a second reason.
+    assert_eq!(
+        applied["applied"], false,
+        "an unverified local identity must not apply a work transition by naming an ungated passport"
+    );
 
     let comment: serde_json::Value = d
         .post_json(
@@ -400,8 +445,19 @@ fn projects_work_and_coordination_tools_flow() {
     assert_eq!(queued["applied"], false);
     let action_id = queued["queued"]["action_id"].as_str().unwrap();
 
+    // Queued actions record the actor as `operator:unverified:<passport>` under
+    // auth-off, not the bare passport: what was actually established is "someone
+    // unauthenticated claimed to be this passport". Filtering on the bare value
+    // now matches nothing, which is the intended shape — the prefix is the whole
+    // provenance signal and dropping it would make an assertion look like proof.
     let pending: serde_json::Value = d
-        .get(&format!("/v1/work/gate/pending?by_passport={gated_passport}"))
+        // `tenant_id` is now required to see this item: the gate queue is
+        // tenant-scoped, and without it the request resolves to `default` while
+        // the work item lives under `tenant-a`. An unscoped pending queue used
+        // to show every tenant's queued mutations to any reader.
+        .get(&format!(
+            "/v1/work/gate/pending?tenant_id=tenant-a&by_passport=operator:unverified:{gated_passport}"
+        ))
         .unwrap()
         .into_body()
         .read_json()
@@ -436,6 +492,17 @@ fn projects_work_and_coordination_tools_flow() {
     assert_ne!(approved_transition["by_passport"], actor_passport);
     assert_eq!(approved_transition["receipt_id"], approved["receipt_id"]);
 
+    // From here the actor is the *authenticated MCP agent*, not an asserted
+    // passport. `create_work` / `update_work_state` / `comment_on_work` now
+    // require the claimed passport to match the authority behind the token
+    // (`claimed_identity_matches`), so a caller can no longer attribute a work
+    // mutation to someone else simply by naming them. The single-token registry
+    // resolves to the agent identity `default`.
+    let mcp_passport = "default";
+    // Likewise the tenant: the agent answers for its own tenant, and naming
+    // another one is refused rather than honoured.
+    let mcp_tenant = "default";
+
     let mcp_projects = mcp_text_json(&mcp_tool_call("list_projects", json!({})));
     assert!(mcp_projects["projects"]
         .as_array()
@@ -453,15 +520,15 @@ fn projects_work_and_coordination_tools_flow() {
             "title": "MCP-created coverage work",
             "body": "Created through coordination tool",
             "state": "planned",
-            "tenant_id": "tenant-b",
-            "created_by_passport": actor_passport
+            "tenant_id": mcp_tenant,
+            "created_by_passport": mcp_passport
         }),
     ));
     let mcp_work_id = mcp_work["id"].as_str().unwrap();
 
     let mcp_list_work = mcp_text_json(&mcp_tool_call(
         "list_work",
-        json!({"project_id": project_id, "tenant_id": "tenant-b"}),
+        json!({"project_id": project_id, "tenant_id": mcp_tenant}),
     ));
     assert!(mcp_list_work["count"].as_u64().unwrap() >= 1);
 
@@ -470,17 +537,21 @@ fn projects_work_and_coordination_tools_flow() {
         json!({
             "work_id": mcp_work_id,
             "state": "blocked",
-            "by_passport": actor_passport,
+            "by_passport": mcp_passport,
             "blocker_reason": "waiting for CI"
         }),
     ));
-    assert_eq!(mcp_updated["applied"], true);
+    // Queued, not applied: the agent identity has no passport record, so it is
+    // treated as work-gated (`agent_work_gate` defaults on for an unknown
+    // passport). Authenticating proves who the caller is; it does not by itself
+    // grant the right to move someone's work item without review.
+    assert_eq!(mcp_updated["applied"], false);
 
     let mcp_comment = mcp_text_json(&mcp_tool_call(
         "comment_on_work",
         json!({
             "work_id": mcp_work_id,
-            "author_passport": actor_passport,
+            "author_passport": mcp_passport,
             "body": "MCP comment coverage"
         }),
     ));

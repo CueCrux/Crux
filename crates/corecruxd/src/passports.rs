@@ -527,7 +527,7 @@ pub fn delete_passport(store: &mut FactStore, id: &str) -> Result<(), PassportsE
     });
     for fact in result.facts {
         if fact.key == PASSPORT_RECORD_KEY {
-            store.delete(&fact.fact_id);
+            store.delete(&fact.tenant_hash, &fact.fact_id);
         }
     }
     Ok(())

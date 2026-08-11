@@ -186,6 +186,7 @@ pub async fn handle_memory_acknowledge_use(args: &Value, ctx: &McpContext) -> Re
     let aliases = ctx.scope_aliases();
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
 
+    let tenant_hash = ctx.scope_tenant();
     let store = ctx.fact_store.read().await;
     let now = chrono::Utc::now();
     let mut filtered_entries: Vec<AckFactEntry> = Vec::with_capacity(fact_ids.len());
@@ -194,7 +195,7 @@ pub async fn handle_memory_acknowledge_use(args: &Value, ctx: &McpContext) -> Re
     let mut not_visible_count = 0usize;
 
     for fid in &fact_ids {
-        let Some(fact) = store.get(fid) else {
+        let Some(fact) = store.get_for_tenant(fid, &tenant_hash) else {
             not_found_count += 1;
             continue;
         };

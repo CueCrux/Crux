@@ -272,7 +272,7 @@ jobs:
           # as an unrelated red on whatever PR happened to be second.
           # Own range, above HTTP/MCP's 15000-23999 band.
           GRPC_PORT=$((24000 + (${{ github.run_id }} % 4500)))
-          CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR="$DATA_DIR" \
+          CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_ROUTE_AUTH=enforce CORECRUXD_DATA_DIR="$DATA_DIR" \
             CORECRUXD_HTTP_PORT="$HTTP_PORT" CORECRUXD_MCP_PORT="$MCP_PORT" \
             CORECRUXD_GRPC_PORT="$GRPC_PORT" \
             ./target/debug/corecruxd &

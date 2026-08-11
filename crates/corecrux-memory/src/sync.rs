@@ -434,7 +434,7 @@ pub fn offboard_tenant_mirror(store: &mut FactStore, tenant_id: &str, membership
         let pre_wipe_hash = hash_facts(tenant_id, &facts);
         let mut deleted_this_collection = 0usize;
         for fact in facts {
-            if store.delete(&fact.fact_id) {
+            if store.delete(&fact.tenant_hash, &fact.fact_id) {
                 deleted_this_collection += 1;
                 deleted_fact_ids.push(fact.fact_id.clone());
                 let tombstone = store.store(crate::fact_store::StoreFact {

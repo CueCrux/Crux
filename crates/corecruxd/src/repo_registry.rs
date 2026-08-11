@@ -276,9 +276,12 @@ pub fn delete_repo(store: &mut FactStore, tenant_id: &str, repo_id: &str) -> Res
         crate::repo_codegraph::extdeps_entity(tenant_id, repo_id),
     ] {
         let facts = store.get_by_entity(&entity);
-        let ids: Vec<String> = facts.into_iter().map(|fact| fact.fact_id.clone()).collect();
-        for fact_id in ids {
-            store.delete(&fact_id);
+        let ids: Vec<(String, String)> = facts
+            .into_iter()
+            .map(|fact| (fact.tenant_hash.clone(), fact.fact_id.clone()))
+            .collect();
+        for (tenant_hash, fact_id) in ids {
+            store.delete(&tenant_hash, &fact_id);
         }
     }
     Ok(())

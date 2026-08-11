@@ -148,7 +148,7 @@ const PATHS: &[MutationPath] = &[
     },
     MutationPath {
         id: 13,
-        name: "set_horizon/reverify/record_access (in-memory metadata)",
+        name: "set_horizon[_for_tenant]/reverify[_for_tenant]/record_access (in-memory metadata)",
         class: Class::JustifiedMaintenance,
         backing_test: "",
         followup_ref: "",
@@ -213,7 +213,9 @@ const NON_DURABLE_MUTATORS: &[&str] = &[
     "set_semantic_dedup",
     "take_near_duplicates",
     "set_horizon",
+    "set_horizon_for_tenant",
     "reverify",
+    "reverify_for_tenant",
     "record_access",
 ];
 

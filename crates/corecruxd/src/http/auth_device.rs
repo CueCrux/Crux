@@ -627,6 +627,7 @@ async fn issue_device_tokens(state: &AppState, tenant_id: &str, scopes: &[String
     let sub = format!("device:{cred_id}");
     let claims = ScopedClaims {
         sub: &sub,
+        passport_id: None,
         scopes: &scope_refs,
         tenant_id,
         ttl_secs: ISSUED_TOKEN_TTL_SECS,
@@ -717,6 +718,7 @@ pub(super) async fn post_device_refresh(State(_state): State<AppState>, Json(req
     let sub = format!("device:{cred_id}");
     let claims = ScopedClaims {
         sub: &sub,
+        passport_id: None,
         scopes: &scope_refs,
         tenant_id: &tenant_id,
         ttl_secs: ISSUED_TOKEN_TTL_SECS,

@@ -239,7 +239,7 @@ mod tests {
         let state = test_app_state(1);
         let doomed = seed(&state, MACHINES_ENTITY, "hostGone", serde_json::json!({"os": "linux"})).await;
         seed(&state, MACHINES_ENTITY, "hostKept", serde_json::json!({"os": "linux"})).await;
-        assert!(state.fact_store.write().await.delete(&doomed.fact_id));
+        assert!(state.fact_store.write().await.delete("default", &doomed.fact_id));
 
         let body = summary(state).await;
         let ids: Vec<&str> = body["machines"]

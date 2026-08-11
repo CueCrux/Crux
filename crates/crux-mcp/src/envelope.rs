@@ -376,7 +376,7 @@ pub async fn build_envelope_for_query_facts(args: &Value, ctx: &McpContext) -> E
 
     let q = FactQuery {
         min_effective_confidence: None,
-        tenant_hash: None,
+        tenant_hash: Some(ctx.scope_tenant()),
         query,
         entity,
         entity_prefix: None,

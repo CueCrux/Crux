@@ -923,10 +923,14 @@ pub(super) async fn get_console_review_contradictions(
     if let Err(problem) = require_console_read(&state, &headers) {
         return problem.into_response();
     }
+    let tenant_hash = match console_tenant(&state, &headers) {
+        Ok(tenant_hash) => tenant_hash,
+        Err(problem) => return problem.into_response(),
+    };
     let limit = query.limit.unwrap_or(50).min(250);
     let candidates = {
         let store = state.fact_store.read().await;
-        store.contradiction_candidates_v1(limit)
+        store.contradiction_candidates_v1(&tenant_hash, limit)
     };
     (
         StatusCode::OK,
@@ -956,12 +960,17 @@ pub(super) async fn get_console_review_queue(
     if let Err(problem) = require_console_read(&state, &headers) {
         return problem.into_response();
     }
+    let tenant_hash = match console_tenant(&state, &headers) {
+        Ok(tenant_hash) => tenant_hash,
+        Err(problem) => return problem.into_response(),
+    };
     let limit = query.limit.unwrap_or(50).min(250);
     let (runs, live_contradictions) = {
         let store = state.fact_store.read().await;
         // Confidence 1.0 on every review receipt ⇒ query_inner's confidence-desc,
         // stored_at-desc order already yields newest-first.
         let result = store.query(&corecrux_memory::fact_store::FactQuery {
+            tenant_hash: Some(tenant_hash.clone()),
             entity_prefix: Some(crate::consolidation_scheduler::REVIEW_ENTITY_PREFIX.to_string()),
             top_k: limit,
             ..Default::default()
@@ -983,7 +992,7 @@ pub(super) async fn get_console_review_queue(
         // Live contradiction pass so the console still shows current
         // contradictions even when the scheduler is OFF (nothing surfaced yet) —
         // repointing the page to the queue must not hide them (review finding 6).
-        let live = store.contradiction_candidates_v1(limit);
+        let live = store.contradiction_candidates_v1(&tenant_hash, limit);
         (runs, live)
     };
     (
@@ -1037,6 +1046,10 @@ pub(super) async fn post_console_review_expiries(
     if let Err(problem) = require_console_write(&state, &headers) {
         return problem.into_response();
     }
+    let (tenant_hash, actor) = match console_mutation_authority(&state, &headers) {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
     if body.fact_ids.is_empty() {
         return problem_response(
             StatusCode::BAD_REQUEST,
@@ -1046,14 +1059,13 @@ pub(super) async fn post_console_review_expiries(
     if body.fact_ids.len() > MAX_EXPIRY_BATCH {
         return problem_response(StatusCode::BAD_REQUEST, "fact_ids exceeds the 500-id per-request cap");
     }
-    let actor = console_actor_from_headers(&headers);
     let (expired, skipped) = {
         let mut store = state.fact_store.write().await;
         // Recompute the live candidate set under the SAME write lock we delete
         // under — atomic revalidation, no TOCTOU. `select_expiry_candidates`
         // applies the protection + stale/low-confidence rules exactly as the
         // scheduler does at proposal time.
-        let facts: Vec<corecrux_memory::Fact> = store.all_facts().cloned().collect();
+        let facts: Vec<corecrux_memory::Fact> = store.all_facts_for_tenant(&tenant_hash).cloned().collect();
         let now = chrono::Utc::now();
         let policy = corecrux_projections::decay::DecayPolicy::from_env();
         let current: std::collections::HashMap<String, String> =
@@ -1070,7 +1082,7 @@ pub(super) async fn post_console_review_expiries(
                 continue; // de-dup so a repeated id is counted once
             }
             match current.get(id) {
-                Some(reason) => match store.try_delete(id) {
+                Some(reason) => match store.try_delete(&tenant_hash, id) {
                     Ok(true) => expired.push(serde_json::json!({ "fact_id": id, "reason": reason })),
                     Ok(false) => {
                         skipped.push(serde_json::json!({ "fact_id": id, "reason": "not_found_or_already_deleted" }));
@@ -1110,19 +1122,22 @@ pub(super) async fn post_console_review_consolidation(
     if let Err(problem) = require_console_write(&state, &headers) {
         return problem.into_response();
     }
+    let (tenant_hash, actor) = match console_mutation_authority(&state, &headers) {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
     if body.consolidation_id.trim().is_empty() {
         body.consolidation_id = format!("console-{}", uuid::Uuid::new_v4());
     }
-    if body.actor.as_deref().unwrap_or_default().trim().is_empty() {
-        body.actor = Some(console_actor_from_headers(&headers));
-    }
+    // Body fields are data, never authority. Always overwrite the legacy
+    // actor hint with the principal resolved from the verified request.
+    body.actor = Some(actor.clone());
     // Capture the audit fields before the request is moved into the store op.
     let entity = body.entity.clone();
     let key = body.key.clone();
-    let actor = body.actor.clone().unwrap_or_else(|| "console".to_string());
     let report = {
         let mut store = state.fact_store.write().await;
-        store.consolidate_facts_v1(body)
+        store.consolidate_facts_v1(&tenant_hash, body)
     };
     match report {
         Ok(report) => {
@@ -1133,9 +1148,12 @@ pub(super) async fn post_console_review_consolidation(
                 &report.receipt,
                 &entity,
                 &key,
-                &actor,
-                "canonical_merge",
-                &now,
+                super::consolidation_receipt::ConsolidationReceiptContext {
+                    tenant_hash: &tenant_hash,
+                    actor: &actor,
+                    strategy: "canonical_merge",
+                    created_at: &now,
+                },
             );
             (
                 StatusCode::OK,
@@ -1157,10 +1175,6 @@ pub(super) struct ConsolidationUndoRequest {
     pub canonical_fact_id: String,
     #[serde(default)]
     pub source_fact_ids: Vec<String>,
-    #[serde(default)]
-    pub entity: Option<String>,
-    #[serde(default)]
-    pub key: Option<String>,
 }
 
 /// `POST /v1/console/review/consolidations/undo` — atomically reverse a
@@ -1176,14 +1190,23 @@ pub(super) async fn post_console_review_consolidation_undo(
     if let Err(problem) = require_console_write(&state, &headers) {
         return problem.into_response();
     }
-    let actor = console_actor_from_headers(&headers);
+    let (tenant_hash, actor) = match console_mutation_authority(&state, &headers) {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
     let undo = {
         let mut store = state.fact_store.write().await;
-        store.consolidate_undo_v1(&req.canonical_fact_id, &req.source_fact_ids)
+        let target = store
+            .get_for_tenant_including_deleted(&req.canonical_fact_id, &tenant_hash)
+            .map(|fact| (fact.entity.clone(), fact.key.clone()));
+        store
+            .consolidate_undo_v1(&tenant_hash, &req.canonical_fact_id, &req.source_fact_ids)
+            .map(|undo| (undo, target))
     };
     match undo {
-        Ok(undo) => {
+        Ok((undo, target)) => {
             let now = chrono::Utc::now().to_rfc3339();
+            let (entity, key) = target.unwrap_or_default();
             let receipt = corecrux_memory::fact_store::ConsolidationReceiptV1 {
                 consolidation_id: format!("undo:{}", req.canonical_fact_id),
                 canonical_fact_id: undo.canonical_fact_id.clone(),
@@ -1194,11 +1217,14 @@ pub(super) async fn post_console_review_consolidation_undo(
             let signed = super::consolidation_receipt::mint_consolidation_receipt(
                 &state,
                 &receipt,
-                req.entity.as_deref().unwrap_or(""),
-                req.key.as_deref().unwrap_or(""),
-                &actor,
-                "undo",
-                &now,
+                &entity,
+                &key,
+                super::consolidation_receipt::ConsolidationReceiptContext {
+                    tenant_hash: &tenant_hash,
+                    actor: &actor,
+                    strategy: "undo",
+                    created_at: &now,
+                },
             );
             (
                 StatusCode::OK,
@@ -1216,27 +1242,62 @@ pub(super) async fn post_console_review_consolidation_undo(
     }
 }
 
-fn console_actor_from_headers(headers: &HeaderMap) -> String {
-    headers
-        .get("x-corecrux-passport-id")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("console")
-        .to_string()
+#[allow(clippy::result_large_err)]
+fn console_mutation_authority(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(String, String), axum::response::Response> {
+    let context = crate::auth::http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)?;
+    let tenant_hash = context
+        .resolve_authorized_tenant(None)
+        .map_err(IntoResponse::into_response)?;
+    let actor = if context.local_unverified_identity() {
+        format!(
+            "operator:unverified:{}",
+            context.passport_id.as_deref().unwrap_or("console")
+        )
+    } else {
+        if context.passport_override_used() {
+            return Err(problem_response(
+                StatusCode::FORBIDDEN,
+                "passport impersonation is not permitted for console review mutations",
+            ));
+        }
+        context.passport_id.clone().ok_or_else(|| {
+            problem_response(
+                StatusCode::FORBIDDEN,
+                "an authenticated passport is required for console review mutations",
+            )
+        })?
+    };
+    Ok((tenant_hash, actor))
+}
+
+#[allow(clippy::result_large_err)]
+fn console_tenant(state: &AppState, headers: &HeaderMap) -> Result<String, crate::problem::ProblemResponse> {
+    crate::auth::http_scope_context(&state.auth, headers)?.resolve_authorized_tenant(None)
 }
 
 fn consolidation_problem(err: corecrux_memory::fact_store::ConsolidationErrorV1) -> axum::response::Response {
     use corecrux_memory::fact_store::ConsolidationErrorV1;
     let status = match &err {
-        ConsolidationErrorV1::NoTargets | ConsolidationErrorV1::TargetOutsideEntityKey(_) => StatusCode::BAD_REQUEST,
+        ConsolidationErrorV1::NoTargets
+        | ConsolidationErrorV1::MissingConsolidationId
+        | ConsolidationErrorV1::TargetOutsideEntityKey(_)
+        | ConsolidationErrorV1::ImplicitPriorNotTarget(_)
+        | ConsolidationErrorV1::NoUndoSources
+        | ConsolidationErrorV1::NotConsolidationCanonical(_)
+        | ConsolidationErrorV1::UndoSourceMismatch(_) => StatusCode::BAD_REQUEST,
         ConsolidationErrorV1::TargetNotFound(_) => StatusCode::NOT_FOUND,
+        ConsolidationErrorV1::DuplicateTarget(_) => StatusCode::BAD_REQUEST,
         ConsolidationErrorV1::TargetDeleted(_)
+        | ConsolidationErrorV1::TargetAlreadySuperseded(_)
         | ConsolidationErrorV1::TargetPinned(_)
         | ConsolidationErrorV1::TargetPrivate(_)
         | ConsolidationErrorV1::TargetReceiptLinked(_)
         | ConsolidationErrorV1::TargetDaemonOwned { .. }
-        | ConsolidationErrorV1::TargetHighConfidence { .. } => StatusCode::CONFLICT,
+        | ConsolidationErrorV1::TargetHighConfidence { .. }
+        | ConsolidationErrorV1::CanonicalSuperseded(_) => StatusCode::CONFLICT,
         ConsolidationErrorV1::Journal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     problem_response(status, err.to_string())
@@ -2888,7 +2949,6 @@ pub(super) async fn get_console_facts(
     if let Err(problem) = require_console_read(&state, &headers) {
         return problem.into_response();
     }
-
     let q = query
         .q
         .as_ref()
@@ -2958,7 +3018,6 @@ pub(super) async fn post_console_fact_add(
         Ok(ctx) => ctx,
         Err(problem) => return problem.into_response(),
     };
-
     let entity = body.entity.trim();
     let key = body.key.trim();
     let value = body.value.trim();
@@ -4278,18 +4337,27 @@ mod tests {
 
     // ── Small pure helpers ───────────────────────────────────────────────
 
+    /// Replaces `console_actor_from_headers_defaults_trims_and_ignores_blank`.
+    ///
+    /// That test asserted the actor was read straight off `x-corecrux-passport-id`,
+    /// trimmed, defaulting to `console` when absent. That behaviour is what this
+    /// slice removes: an unauthenticated caller could name themselves as the
+    /// actor on a review mutation just by setting a header, and the attribution
+    /// on the resulting receipt would carry their claim as fact.
+    ///
+    /// `console_mutation_authority` derives both tenant and actor from the
+    /// authenticated context instead. Kept as a test rather than deleted so the
+    /// old behaviour cannot quietly return.
     #[test]
-    fn console_actor_from_headers_defaults_trims_and_ignores_blank() {
-        assert_eq!(console_actor_from_headers(&HeaderMap::new()), "console");
+    fn console_mutation_authority_does_not_take_the_actor_from_a_bare_header() {
+        let state = st_dev();
         let mut headers = HeaderMap::new();
         headers.insert("x-corecrux-passport-id", "  claude-work ".parse().unwrap());
-        assert_eq!(console_actor_from_headers(&headers), "claude-work");
-        let mut blank = HeaderMap::new();
-        blank.insert("x-corecrux-passport-id", "   ".parse().unwrap());
-        assert_eq!(
-            console_actor_from_headers(&blank),
-            "console",
-            "a blank header must not become a blank actor"
+
+        let denied = console_mutation_authority(&state, &headers);
+        assert!(
+            denied.is_err(),
+            "a passport header with no credential behind it must not authorise a review mutation"
         );
     }
 
@@ -4706,8 +4774,6 @@ mod tests {
                 Json(ConsolidationUndoRequest {
                     canonical_fact_id: "f1".to_string(),
                     source_fact_ids: Vec::new(),
-                    entity: None,
-                    key: None,
                 })
             )
             .await
@@ -5372,7 +5438,10 @@ mod tests {
             // shape `contradiction_candidates_v1` reports.
             let first = seed_conf(&mut store, "service:api", "enabled", "enabled", false, 0.7);
             seed_conf(&mut store, "service:api", "enabled", "disabled", false, 0.7);
-            assert!(store.clear_superseded(&first), "simulate an unresolved conflict");
+            assert!(
+                store.clear_superseded("default", &first),
+                "simulate an unresolved conflict"
+            );
         }
         let resp = get_console_review_queue(
             State(state),
@@ -5446,7 +5515,11 @@ mod tests {
         assert_eq!(body["expired_count"], 0);
         assert_eq!(body["skipped_count"], 2, "the repeated id is counted once");
         assert_eq!(body["skipped"][0]["reason"], "not_a_current_expiry_candidate");
-        assert_eq!(body["actor"], "console");
+        // `operator:unverified:` prefix, not a bare `console`: this request
+        // carried no credential, and recording it as plain `console` made an
+        // unauthenticated caller indistinguishable from an authenticated one in
+        // the audit trail.
+        assert_eq!(body["actor"], "operator:unverified:console");
         assert_eq!(state.fact_store.read().await.count(), 1, "nothing was deleted");
     }
 
@@ -5459,8 +5532,6 @@ mod tests {
             Json(ConsolidationUndoRequest {
                 canonical_fact_id: "no-such-fact".to_string(),
                 source_fact_ids: Vec::new(),
-                entity: None,
-                key: None,
             }),
         )
         .await
@@ -5477,6 +5548,13 @@ mod tests {
             let mut store = state.fact_store.write().await;
             let first = seed_conf(&mut store, "person:alice", "city", "NYC", false, 0.6);
             let second = seed_conf(&mut store, "person:alice", "city", "New York", false, 0.6);
+            // Seeding the same (entity, key) twice makes `second` supersede
+            // `first`, and consolidation now refuses an already-retired target
+            // (`TargetAlreadySuperseded`) rather than resurrecting it into a new
+            // canonical. Both targets have to be live for this test to be about
+            // merge-then-undo at all, which is why the edge is cleared here —
+            // the same setup the fact_store consolidation tests use.
+            assert!(store.clear_superseded("default", &first));
             (first, second)
         };
         let request: corecrux_memory::fact_store::ConsolidationRequestV1 = serde_json::from_value(json!({
@@ -5484,7 +5562,7 @@ mod tests {
             "entity": "person:alice",
             "key": "city",
             "canonical_value": "New York City",
-            "target_fact_ids": [first, second],
+            "target_fact_ids": [first.clone(), second.clone()],
         }))
         .unwrap();
         let mut headers = HeaderMap::new();
@@ -5500,11 +5578,21 @@ mod tests {
         let resp = post_console_review_consolidation_undo(
             State(state),
             HeaderMap::new(),
+            // Two changes from the pre-slice shape of this request:
+            //
+            // `entity` / `key` are gone — the handler derives them from the
+            // canonical fact itself, so a caller cannot point an undo at one
+            // fact while naming another's entity/key.
+            //
+            // `source_fact_ids` is now required and checked against what the
+            // consolidation actually recorded (`UndoSourceMismatch`). An empty
+            // vec used to mean "restore whatever this canonical retired"; the
+            // caller now has to state what it believes it is reversing, so a
+            // stale client cannot blanket-restore a set that changed underneath
+            // it.
             Json(ConsolidationUndoRequest {
                 canonical_fact_id: canonical.clone(),
-                source_fact_ids: Vec::new(),
-                entity: Some("person:alice".to_string()),
-                key: Some("city".to_string()),
+                source_fact_ids: vec![first, second],
             }),
         )
         .await
@@ -5855,7 +5943,7 @@ mod tests {
             let mut store = state.fact_store.write().await;
             let first = seed_conf(&mut store, "service:api", "enabled", "enabled", false, 0.7);
             seed_conf(&mut store, "service:api", "enabled", "disabled", false, 0.7);
-            assert!(store.clear_superseded(&first));
+            assert!(store.clear_superseded("default", &first));
         }
         let resp = get_console_review_contradictions(
             State(state),

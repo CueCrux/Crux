@@ -179,7 +179,10 @@ mode the HTTP API then *also* accepts a registered MCP agent token (mapped to
 `CORECRUXD_AGENT_TOKEN_HTTP_SCOPES` / `CORECRUXD_AGENT_TOKEN_HTTP_TENANT`). Then
 `corecruxctl login --token <agent-token>` stores one long-lived token that works
 on both ports, survives daemon restarts, and works with native MCP clients that
-send a fixed bearer. Default off, so HTTP stays JWT-only unless you opt in.
+send a fixed bearer. An unmapped token acts as the namespaced automation
+principal `agent:<token-name>`; only an explicit `CRUX_AGENT_PASSPORTS` entry
+maps it to a real passport. Default off, so HTTP stays JWT-only unless you opt
+in.
 
 Daemon-side rails 2 and 3 are opt-in and default off (see `config.example.env`:
 `CORECRUXD_TS_IDENTITY_ENABLED`, `CORECRUXD_DEVICE_GRANT_ENABLED`). Issuance mints

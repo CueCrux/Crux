@@ -37,6 +37,7 @@ auth:
 config:
   logFormat: "json"
   buildCcxi: "1"
+  routeAuthMode: "enforce"
 
 # -- Extra environment variables injected into the container
 # Example:

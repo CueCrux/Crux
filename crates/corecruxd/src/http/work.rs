@@ -221,12 +221,11 @@ pub(super) struct CreateWorkBody {
     pub linked_pr: Option<String>,
     #[serde(default)]
     pub linked_issue: Option<String>,
-    /// Required: which passport is creating the item. The HTTP layer accepts
-    /// it explicitly so callers without a session binding can still write.
-    /// Aliases: `by_passport`, `author_passport` (the other work routes use
-    /// these names; accepting all three reduces caller error).
-    #[serde(alias = "by_passport", alias = "author_passport")]
-    pub created_by_passport: String,
+    /// Legacy identity hint. In an enforcing auth mode it may be omitted and,
+    /// when present, must match the authenticated passport. Auth-off mode
+    /// requires it and persists an explicitly unverified actor tag.
+    #[serde(default, alias = "by_passport", alias = "author_passport")]
+    pub created_by_passport: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -251,17 +250,16 @@ pub(super) struct UpdateWorkBody {
     /// rejected by serde; absent = leave unchanged.
     #[serde(default)]
     pub blocker_kind: Option<crate::work::BlockerKind>,
-    /// Identity making the change. Determines whether the change is gated.
-    /// Aliases: `created_by_passport`, `author_passport`.
-    #[serde(alias = "created_by_passport", alias = "author_passport")]
-    pub by_passport: String,
+    /// Legacy identity hint; authority comes from the authenticated context.
+    #[serde(default, alias = "created_by_passport", alias = "author_passport")]
+    pub by_passport: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct CommentBody {
-    /// Aliases: `by_passport`, `created_by_passport`.
-    #[serde(alias = "by_passport", alias = "created_by_passport")]
-    pub author_passport: String,
+    /// Legacy identity hint; authority comes from the authenticated context.
+    #[serde(default, alias = "by_passport", alias = "created_by_passport")]
+    pub author_passport: Option<String>,
     pub body: String,
 }
 
@@ -290,6 +288,7 @@ pub(super) use super::approval_receipts::{
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct GateListQuery {
     pub by_passport: Option<String>,
+    pub tenant_id: Option<String>,
 }
 
 /// Query-string booleans, permissively. Bare `serde` accepts only `true`/`false`,
@@ -326,15 +325,101 @@ fn now_unix_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+struct ResolvedWorkActor {
+    context: crate::auth::HttpScopeContext,
+    /// Durable actor/user-facing passport field. Auth-off assertions carry an
+    /// explicit prefix so they cannot be confused with verified passports.
+    actor_id: String,
+    /// Raw passport id used only to look up the agent-work-gate policy.
+    passport_lookup_id: String,
+}
+
+#[allow(clippy::result_large_err)]
+pub(super) fn work_scope_context(
+    state: &AppState,
+    headers: &HeaderMap,
+    required_scope: &str,
+) -> Result<crate::auth::HttpScopeContext, Response> {
+    let context = crate::auth::passport_bound_context(&state.auth, headers).map_err(IntoResponse::into_response)?;
+    if !context.has_scope(required_scope) {
+        return Err(problem_response(
+            StatusCode::FORBIDDEN,
+            format!("{required_scope} scope required for work access"),
+        ));
+    }
+    Ok(context)
+}
+
+#[allow(clippy::result_large_err)]
+fn resolve_work_actor(
+    state: &AppState,
+    headers: &HeaderMap,
+    hint: Option<&str>,
+) -> Result<ResolvedWorkActor, Response> {
+    let context = work_scope_context(state, headers, "facts:write")?;
+    let hint = hint.map(str::trim).filter(|value| !value.is_empty());
+    if !context.local_unverified_identity() {
+        if context.passport_override_used() {
+            return Err(problem_response(
+                StatusCode::FORBIDDEN,
+                "passport impersonation is not permitted for work mutations",
+            ));
+        }
+        let Some(passport_id) = context.passport_id.as_deref() else {
+            return Err(problem_response(
+                StatusCode::FORBIDDEN,
+                "an authenticated passport is required for work mutations",
+            ));
+        };
+        if hint.is_some_and(|claimed| claimed != passport_id) {
+            return Err(problem_response(
+                StatusCode::FORBIDDEN,
+                "body passport does not match the authenticated passport",
+            ));
+        }
+        Ok(ResolvedWorkActor {
+            actor_id: passport_id.to_string(),
+            passport_lookup_id: passport_id.to_string(),
+            context,
+        })
+    } else {
+        let header_hint = context.passport_id.as_deref();
+        if let (Some(body_hint), Some(header_hint)) = (hint, header_hint) {
+            if body_hint != header_hint {
+                return Err(problem_response(
+                    StatusCode::FORBIDDEN,
+                    "body passport does not match the local identity assertion header",
+                ));
+            }
+        }
+        let Some(asserted) = hint.or(header_hint) else {
+            return Err(problem_response(
+                StatusCode::BAD_REQUEST,
+                "an explicit passport identity assertion is required in local unverified mode",
+            ));
+        };
+        Ok(ResolvedWorkActor {
+            actor_id: format!("{AUTH_OFF_APPROVER_PREFIX}{asserted}"),
+            passport_lookup_id: asserted.to_string(),
+            context,
+        })
+    }
+}
+
 #[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_work(
     State(state): State<AppState>,
     Query(q): Query<ListWorkQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-        return problem.into_response();
-    }
+    let context = match work_scope_context(&state, &headers, "admin:read") {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    let tenant_id = match context.resolve_authorized_tenant(q.tenant_id.as_deref()) {
+        Ok(tenant_id) => tenant_id,
+        Err(problem) => return problem.into_response(),
+    };
     if let Some(s) = &q.state {
         if crate::work::validate_state(s).is_err() {
             return problem_response(
@@ -349,9 +434,9 @@ pub(super) async fn get_work(
     }
     let store = state.fact_store.read().await;
 
-    let kanban_items = kanban_items_for_query(&store, &q);
+    let kanban_items = kanban_items_for_query(&store, &q, &tenant_id);
     let mut execplan_items = if matches!(q.source, WorkSource::Execplans | WorkSource::All) {
-        execplan_items_for_query(&store, &q)
+        execplan_items_for_query(&store, &q, &tenant_id)
     } else {
         Vec::new()
     };
@@ -360,12 +445,19 @@ pub(super) async fn get_work(
     // ExecPlan items that are members of the requested orchestrator (kanban
     // items already carry it from the membership write path), then below we
     // keep only items whose `orchestrator_id` matches.
-    if let Some(orc_id) = q.orchestrator.as_deref() {
-        let estore = state.entity_store.read().await;
-        let member_ids = crate::http::orchestrators::orchestrator_member_refs(&estore, orc_id);
-        drop(estore);
-        crate::work_execplans::stamp_orchestrator_id(&mut execplan_items, &member_ids, orc_id);
-    }
+    let requested_orchestrator_members = if let Some(orc_id) = q.orchestrator.as_deref() {
+        if orc_id == crate::work_execplans::default_orchestrator_id() {
+            None
+        } else {
+            let estore = state.entity_store.read().await;
+            let member_ids = crate::http::orchestrators::orchestrator_member_refs(&estore, orc_id, &tenant_id);
+            drop(estore);
+            crate::work_execplans::stamp_orchestrator_id(&mut execplan_items, &member_ids, orc_id);
+            Some(member_ids)
+        }
+    } else {
+        None
+    };
     drop(store);
 
     // Per-ExecPlan token-burn rollup: join the cost lens (one report per coding
@@ -375,10 +467,9 @@ pub(super) async fn get_work(
     // skipped when there are no ExecPlan items to stamp. Cost reports are
     // per-tenant; attribute the requested tenant's (default `default`).
     if crate::cost::cost_lens_enabled() && !execplan_items.is_empty() {
-        let tenant = q.tenant_id.as_deref().unwrap_or("default");
         let reports = {
             let cstore = crate::cost::global().lock().await;
-            cstore.reports_for_tenant(tenant)
+            cstore.reports_for_tenant(&tenant_id)
         };
         let sessions = crate::cost_attribution::session_burns_from_reports(&reports);
         crate::cost_attribution::stamp_token_burn(&mut execplan_items, &sessions);
@@ -394,7 +485,11 @@ pub(super) async fn get_work(
 
     // Apply the orchestrator filter so it intersects both kanban + execplan sources.
     if let Some(orc_id) = q.orchestrator.as_deref() {
-        items.retain(|w| w.orchestrator_id.as_deref() == Some(orc_id));
+        if let Some(member_ids) = requested_orchestrator_members.as_ref() {
+            items.retain(|work| member_ids.contains(&work.id));
+        } else {
+            items.retain(|work| work.orchestrator_id.as_deref() == Some(orc_id));
+        }
     }
 
     // agent-ux-05 — risk-tiered HITL projection. When the caller asks for
@@ -413,9 +508,13 @@ pub(super) async fn get_work(
     } else {
         Vec::new()
     };
-    if let Some(tenant) = q.tenant_id.as_deref() {
-        approval_entries.retain(|e| e.get("tenant_id").and_then(|v| v.as_str()) == Some(tenant));
-    }
+    approval_entries.retain(|entry| {
+        entry
+            .get("tenant_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("default")
+            == tenant_id
+    });
     let approval_count = approval_entries.len();
 
     // Ready-order projection. Narrow to open work, sort by `rank_open`, stamp
@@ -483,9 +582,16 @@ pub(super) async fn get_work(
 /// this endpoint returns. Two surfaces quoting different numbers for one daemon
 /// is a discrepancy an operator cannot diagnose from either one, and a
 /// duplicated source-merge is how that happens.
+///
+/// `tenant_id` is the **authenticated** tenant, resolved by the caller through
+/// `resolve_authorized_tenant`. It is deliberately a parameter rather than
+/// `q.tenant_id`: the query string is caller-supplied, so reading it here
+/// would let any reader enumerate another tenant's work items by asking. Every
+/// caller must therefore prove which tenant it is answering for.
 pub(super) fn kanban_items_for_query(
     store: &corecrux_memory::FactStore,
     q: &ListWorkQuery,
+    tenant_id: &str,
 ) -> Vec<crate::work::WorkItem> {
     if !matches!(q.source, WorkSource::Kanban | WorkSource::All) {
         return Vec::new();
@@ -494,7 +600,7 @@ pub(super) fn kanban_items_for_query(
         store,
         q.project_id.as_deref(),
         q.state.as_deref(),
-        q.tenant_id.as_deref(),
+        Some(tenant_id),
         q.assignee_passport.as_deref(),
     )
 }
@@ -526,6 +632,7 @@ pub(super) fn merge_work_sources(
 pub(super) fn execplan_items_for_query(
     store: &corecrux_memory::fact_store::FactStore,
     q: &ListWorkQuery,
+    tenant_id: &str,
 ) -> Vec<crate::work::WorkItem> {
     // No root configured = aggregator off. Return empty rather than 500.
     let Some(root) = crate::work_execplans::execplans_root_from_env() else {
@@ -550,7 +657,7 @@ pub(super) fn execplan_items_for_query(
         .into_iter()
         .filter(|w| {
             q.state.as_deref().is_none_or(|s| w.state == s)
-                && q.tenant_id.as_deref().is_none_or(|t| w.tenant_id.as_deref() == Some(t))
+                && crate::work::work_tenant_id(w) == tenant_id
                 && q.assignee_passport
                     .as_deref()
                     .is_none_or(|a| w.assignee_passport.as_deref() == Some(a))
@@ -564,11 +671,17 @@ pub(super) async fn get_work_item(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-        return problem.into_response();
-    }
+    let context = match work_scope_context(&state, &headers, "admin:read") {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
     let store = state.fact_store.read().await;
     let item = crate::work::get_work(&store, &id);
+    if let Some(item) = item.as_ref() {
+        if let Err(problem) = context.resolve_authorized_tenant(Some(crate::work::work_tenant_id(item))) {
+            return problem.into_response();
+        }
+    }
     drop(store);
     match item {
         Some(w) => (StatusCode::OK, Json(w)).into_response(),
@@ -582,10 +695,21 @@ pub(super) async fn post_work(
     headers: HeaderMap,
     Json(body): Json<CreateWorkBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["facts:write"]) {
-        return problem.into_response();
-    }
+    let actor = match resolve_work_actor(&state, &headers, body.created_by_passport.as_deref()) {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    let tenant_id = match actor.context.resolve_authorized_tenant(body.tenant_id.as_deref()) {
+        Ok(tenant_id) => tenant_id,
+        Err(problem) => return problem.into_response(),
+    };
     let mut store = state.fact_store.write().await;
+    if body.state.as_deref().is_some_and(|state| state != "planned") {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "work must be created in the planned state and transitioned separately",
+        );
+    }
     let result = crate::work::create_work(
         &mut store,
         crate::work::CreateWorkInput {
@@ -594,10 +718,10 @@ pub(super) async fn post_work(
             body: body.body,
             state: body.state,
             assignee_passport: body.assignee_passport,
-            tenant_id: body.tenant_id,
+            tenant_id: Some(tenant_id),
             linked_pr: body.linked_pr,
             linked_issue: body.linked_issue,
-            created_by_passport: body.created_by_passport,
+            created_by_passport: actor.actor_id,
         },
         now_unix_ms(),
     );
@@ -616,12 +740,27 @@ pub(super) async fn patch_work(
     headers: HeaderMap,
     Json(body): Json<UpdateWorkBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["facts:write"]) {
+    let actor = match resolve_work_actor(&state, &headers, body.by_passport.as_deref()) {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    // Target lookup, tenant authorization, gate-policy lookup, and mutation
+    // share one write guard so the authorization decision cannot race a rewrite.
+    let mut store = state.fact_store.write().await;
+    let Some(target) = crate::work::get_work(&store, &id) else {
+        return problem_response(StatusCode::NOT_FOUND, "work item not found");
+    };
+    if let Err(problem) = actor
+        .context
+        .resolve_authorized_tenant(Some(crate::work::work_tenant_id(&target)))
+    {
         return problem.into_response();
     }
-    // Look up the calling passport's gate flag to decide whether state moves are gated.
-    let mut store = state.fact_store.write().await;
-    let passport_gated = crate::passports::get_passport(&store, &body.by_passport).is_some_and(|p| p.agent_work_gate);
+    // Local auth-off/DevScopes identities are assertions, not principals.
+    // They may never select a known ungated passport to bypass review.
+    let passport_gated = actor.context.local_unverified_identity()
+        || crate::passports::get_passport(&store, &actor.passport_lookup_id)
+            .is_none_or(|passport| passport.agent_work_gate);
     let result = crate::work::update_work(
         &mut store,
         &id,
@@ -637,7 +776,7 @@ pub(super) async fn patch_work(
             blocker_kind: body.blocker_kind,
         },
         crate::work::UpdateWorkContext {
-            by_passport: body.by_passport,
+            by_passport: actor.actor_id,
             passport_gated,
             now_unix_ms: now_unix_ms(),
         },
@@ -653,6 +792,9 @@ pub(super) async fn patch_work(
         )
             .into_response(),
         Err(crate::work::WorkError::NotFound(_)) => problem_response(StatusCode::NOT_FOUND, "work item not found"),
+        Err(crate::work::WorkError::TenantImmutable) => {
+            problem_response(StatusCode::CONFLICT, "a work item's tenant is immutable")
+        }
         Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
     }
 }
@@ -664,14 +806,24 @@ pub(super) async fn post_comment(
     headers: HeaderMap,
     Json(body): Json<CommentBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["facts:write"]) {
-        return problem.into_response();
-    }
+    let actor = match resolve_work_actor(&state, &headers, body.author_passport.as_deref()) {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
     if body.body.trim().is_empty() {
         return problem_response(StatusCode::BAD_REQUEST, "comment body must not be empty");
     }
     let mut store = state.fact_store.write().await;
-    let result = crate::work::add_comment(&mut store, &id, &body.author_passport, &body.body, now_unix_ms());
+    let Some(target) = crate::work::get_work(&store, &id) else {
+        return problem_response(StatusCode::NOT_FOUND, "work item not found");
+    };
+    if let Err(problem) = actor
+        .context
+        .resolve_authorized_tenant(Some(crate::work::work_tenant_id(&target)))
+    {
+        return problem.into_response();
+    }
+    let result = crate::work::add_comment(&mut store, &id, &actor.actor_id, &body.body, now_unix_ms());
     drop(store);
     match result {
         Ok(c) => (StatusCode::CREATED, Json(c)).into_response(),
@@ -686,10 +838,17 @@ pub(super) async fn get_comments(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    let context = match work_scope_context(&state, &headers, "admin:read") {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    let store = state.fact_store.read().await;
+    let Some(target) = crate::work::get_work(&store, &id) else {
+        return problem_response(StatusCode::NOT_FOUND, "work item not found");
+    };
+    if let Err(problem) = context.resolve_authorized_tenant(Some(crate::work::work_tenant_id(&target))) {
         return problem.into_response();
     }
-    let store = state.fact_store.read().await;
     let comments = crate::work::list_comments(&store, &id);
     drop(store);
     (
@@ -705,10 +864,17 @@ pub(super) async fn get_transitions(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    let context = match work_scope_context(&state, &headers, "admin:read") {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    let store = state.fact_store.read().await;
+    let Some(target) = crate::work::get_work(&store, &id) else {
+        return problem_response(StatusCode::NOT_FOUND, "work item not found");
+    };
+    if let Err(problem) = context.resolve_authorized_tenant(Some(crate::work::work_tenant_id(&target))) {
         return problem.into_response();
     }
-    let store = state.fact_store.read().await;
     let txns = crate::work::list_transitions(&store, &id);
     drop(store);
     (
@@ -724,11 +890,16 @@ pub(super) async fn get_pending_gates(
     Query(q): Query<GateListQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-        return problem.into_response();
-    }
+    let context = match work_scope_context(&state, &headers, "admin:read") {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    let tenant_id = match context.resolve_authorized_tenant(q.tenant_id.as_deref()) {
+        Ok(tenant_id) => tenant_id,
+        Err(problem) => return problem.into_response(),
+    };
     let store = state.fact_store.read().await;
-    let pending = crate::work::list_pending_gates(&store, q.by_passport.as_deref());
+    let pending = crate::work::list_pending_gates(&store, Some(&tenant_id), q.by_passport.as_deref());
     drop(store);
     (
         StatusCode::OK,
@@ -771,15 +942,27 @@ async fn resolve_gate_http(
         Ok(context) => context,
         Err(problem) => return problem.into_response(),
     };
-    let (asserted_approver, approver_actor) = if context.auth_enforced() {
+    if !context.has_scope("facts:write") {
+        return problem_response(StatusCode::FORBIDDEN, "facts:write scope required for gate resolution");
+    }
+    let (asserted_approver, approver_actor) = if !context.local_unverified_identity() {
         if context.passport_override_used() {
             return problem_response(
                 StatusCode::FORBIDDEN,
                 "passport impersonation is not permitted for gate resolution",
             );
         }
-        if !context.has_scope("facts:write") {
-            return problem_response(StatusCode::FORBIDDEN, "facts:write scope required for gate resolution");
+        if context.credential_is_agent_token() {
+            return problem_response(
+                StatusCode::FORBIDDEN,
+                "an MCP agent token cannot satisfy a human gate decision",
+            );
+        }
+        if !context.canonical_passport_claim_verified() {
+            return problem_response(
+                StatusCode::FORBIDDEN,
+                "a canonical passport_id claim is required for gate resolution",
+            );
         }
         let Some(approver_passport) = context.passport_id.as_deref() else {
             return problem_response(
@@ -799,15 +982,24 @@ async fn resolve_gate_http(
         }
         (approver_passport.to_string(), approver_passport.to_string())
     } else {
-        let Some(approver_passport) = body
+        let body_hint = body
             .approver_passport
             .as_deref()
             .map(str::trim)
-            .filter(|claimed| !claimed.is_empty())
-        else {
+            .filter(|claimed| !claimed.is_empty());
+        let header_hint = context.passport_id.as_deref();
+        if let (Some(body_hint), Some(header_hint)) = (body_hint, header_hint) {
+            if body_hint != header_hint {
+                return problem_response(
+                    StatusCode::FORBIDDEN,
+                    "approver_passport does not match the local identity assertion header",
+                );
+            }
+        }
+        let Some(approver_passport) = body_hint.or(header_hint) else {
             return problem_response(
                 StatusCode::BAD_REQUEST,
-                "approver_passport is required in auth-off mode",
+                "an explicit approver identity assertion is required in local unverified mode",
             );
         };
         (
@@ -824,9 +1016,7 @@ async fn resolve_gate_http(
         Ok(target) => target,
         Err(err) => return gate_error_response(err),
     };
-    if let Err(problem) =
-        crate::auth::require_http_scopes_for_tenant(&state.auth, headers, &["facts:write"], &target.tenant_id)
-    {
+    if let Err(problem) = context.resolve_authorized_tenant(Some(&target.tenant_id)) {
         return problem.into_response();
     }
     if target.tenant_mismatch {
@@ -835,7 +1025,7 @@ async fn resolve_gate_http(
     if target.gate.status != "pending" {
         return gate_error_response(crate::work::WorkError::GateAlreadyResolved(action_id.to_string()));
     }
-    if target.gate.requested_by_passport == asserted_approver {
+    if target.gate.requested_by_passport == asserted_approver || target.gate.requested_by_passport == approver_actor {
         return problem_response(
             StatusCode::FORBIDDEN,
             "the requesting passport cannot resolve its own gate",
@@ -929,6 +1119,8 @@ fn mint_gate_receipt(
 pub(super) struct StatusFeedQuery {
     /// Optional single-work-item filter; omit to span every item.
     pub work_id: Option<String>,
+    /// Concrete tenant selector. Multi-tenant tokens must choose one.
+    pub tenant_id: Option<String>,
     /// Max events returned (most recent kept). Defaults to 200.
     pub limit: Option<usize>,
 }
@@ -944,9 +1136,14 @@ pub(super) async fn get_status_feed(
     Query(q): Query<StatusFeedQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-        return problem.into_response();
-    }
+    let context = match work_scope_context(&state, &headers, "admin:read") {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    let tenant_id = match context.resolve_authorized_tenant(q.tenant_id.as_deref()) {
+        Ok(tenant_id) => tenant_id,
+        Err(problem) => return problem.into_response(),
+    };
     if !crate::status_feed::status_feed_enabled() {
         return (
             StatusCode::OK,
@@ -964,7 +1161,38 @@ pub(super) async fn get_status_feed(
     }
     let limit = q.limit.unwrap_or(200).clamp(1, 2000);
     let store = state.fact_store.read().await;
-    let events = crate::status_feed::status_feed(&store, q.work_id.as_deref(), limit);
+    let visible_work_ids: std::collections::HashSet<String> =
+        crate::work::list_work(&store, None, None, Some(&tenant_id), None)
+            .into_iter()
+            .map(|work| work.id)
+            .collect();
+    if let Some(work_id) = q.work_id.as_deref() {
+        let Some(target) = crate::work::get_work(&store, work_id) else {
+            return problem_response(StatusCode::NOT_FOUND, "work item not found");
+        };
+        if crate::work::work_tenant_id(&target) != tenant_id {
+            return problem_response(StatusCode::FORBIDDEN, "work item belongs to another tenant");
+        }
+    }
+    // Project each visible work lane before applying the caller's global cap.
+    // Filtering a pre-truncated global feed lets a noisy foreign tenant starve
+    // this tenant's events even though no foreign row is returned.
+    let mut events = if let Some(work_id) = q.work_id.as_deref() {
+        crate::status_feed::status_feed(&store, Some(work_id), limit)
+    } else {
+        visible_work_ids
+            .iter()
+            .flat_map(|work_id| crate::status_feed::status_feed(&store, Some(work_id), limit))
+            .collect()
+    };
+    events.sort_by(|left, right| {
+        left.at_unix_ms
+            .cmp(&right.at_unix_ms)
+            .then_with(|| left.transition_id.cmp(&right.transition_id))
+    });
+    if events.len() > limit {
+        events = events.split_off(events.len() - limit);
+    }
     drop(store);
     (
         StatusCode::OK,

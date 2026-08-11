@@ -48,13 +48,19 @@ route template + method) and is controlled by `CORECRUXD_ROUTE_AUTH`, read once
 at startup:
 
 - `off` — pass-through.
-- `shadow` (default) — evaluate the contract and log a structured
-  `route_auth_shadow_mismatch` warning on any would-deny, but never block. Grep
-  the daemon logs for that marker to find routes that would be denied before you
-  flip to `enforce`.
+- `shadow` — evaluate the contract and log a structured
+  `route_auth_shadow_mismatch` warning on any would-deny, but never block. This
+  is the derived default only when authentication is off **and** the listener
+  is loopback-only. Set it explicitly as a temporary migration diagnostic.
 - `enforce` — public probes and the `/v1/auth/*` bootstrap rails pass without
   auth; every other route requires one of its contract scopes; a route with no
   contract entry fails closed with `403`.
+
+When the variable is unset, the daemon derives `enforce` whenever authentication
+is configured or the listener is non-loopback. Empty, misspelled, and
+non-Unicode explicit values fail safe to `enforce`. Shipped Compose,
+systemd/Homebrew/install-script, and Helm configurations set `enforce`
+explicitly.
 
 Handler-level scope checks remain in place as defence in depth. The gate
 authorizes scopes only — feature-flag gating for optional surfaces stays in the

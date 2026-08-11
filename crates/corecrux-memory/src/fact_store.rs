@@ -72,6 +72,16 @@ enum JournalEvent {
         superseded_fact_ids: Vec<String>,
         consolidated_at: String,
     },
+    /// Content-free consolidation provenance retained by journal compaction.
+    /// Replay accepts it only when the canonical and every source already form
+    /// the same-tenant supersession edges recorded here.
+    #[serde(rename = "consolidation_provenance")]
+    ConsolidationProvenance {
+        canonical_fact_id: String,
+        source_fact_ids: Vec<String>,
+        tenant_hash: String,
+        recorded_at: String,
+    },
     /// Atomic, reversible undo of a `Consolidate` (buyer-fit M2). Retires the
     /// generated canonical and restores (`superseded_by = None`) every source.
     /// One append ⇒ all-or-nothing; idempotent (re-undo of an already-undone
@@ -379,10 +389,16 @@ pub struct ConsolidationUndoReportV1 {
 pub enum ConsolidationErrorV1 {
     #[error("consolidation requires at least one target fact")]
     NoTargets,
+    #[error("consolidation_id must not be empty")]
+    MissingConsolidationId,
     #[error("target fact not found: {0}")]
     TargetNotFound(String),
     #[error("target fact is deleted: {0}")]
     TargetDeleted(String),
+    #[error("target fact is already superseded: {0}")]
+    TargetAlreadySuperseded(String),
+    #[error("duplicate target fact id: {0}")]
+    DuplicateTarget(String),
     #[error("target fact is protected by caller: {0}")]
     TargetPinned(String),
     #[error("target fact is private: {0}")]
@@ -395,6 +411,16 @@ pub enum ConsolidationErrorV1 {
     TargetHighConfidence { fact_id: String, confidence: String },
     #[error("target fact is outside requested entity/key: {0}")]
     TargetOutsideEntityKey(String),
+    #[error("current prior version must be an explicitly validated target: {0}")]
+    ImplicitPriorNotTarget(String),
+    #[error("consolidation undo requires a non-empty exact source set")]
+    NoUndoSources,
+    #[error("fact is not a consolidation canonical: {0}")]
+    NotConsolidationCanonical(String),
+    #[error("consolidation canonical has a newer successor and cannot be undone: {0}")]
+    CanonicalSuperseded(String),
+    #[error("consolidation undo source set does not match canonical edges: {0}")]
+    UndoSourceMismatch(String),
     #[error("fact journal append failed: {0}")]
     Journal(String),
 }
@@ -458,8 +484,15 @@ fn default_top_k() -> usize {
 pub struct FactStore {
     facts: HashMap<String, Fact>,
     entity_index: HashMap<String, Vec<String>>,
-    /// Index of (entity, key) → ordered list of fact_ids (version chain).
-    key_index: HashMap<(String, String), Vec<String>>,
+    /// Index of (tenant, entity, key) → ordered list of fact_ids (version chain).
+    ///
+    /// Tenant is part of the chain identity: a same-named write in tenant B
+    /// must never advance or retire tenant A's predecessor.
+    key_index: HashMap<(String, String, String), Vec<String>>,
+    /// Canonical fact id → exact source ids recorded by a durable
+    /// `JournalEvent::Consolidate`. This is provenance, not caller-controlled
+    /// fact content, and is rebuilt on replay.
+    consolidation_sources: HashMap<String, Vec<String>>,
     /// Path to the JSONL journal file. `None` for pure in-memory mode.
     journal_path: Option<PathBuf>,
     /// Optional event bus for real-time mutation notifications.
@@ -662,7 +695,10 @@ impl FactStore {
             let Some(other) = self.facts.get(other_id) else {
                 continue;
             };
-            if other.deleted || other.entity.starts_with("__") || (other.entity == fact.entity && other.key == fact.key)
+            if other.deleted
+                || other.tenant_hash != fact.tenant_hash
+                || other.entity.starts_with("__")
+                || (other.entity == fact.entity && other.key == fact.key)
             {
                 continue;
             }
@@ -749,6 +785,7 @@ impl FactStore {
             facts: HashMap::new(),
             entity_index: HashMap::new(),
             key_index: HashMap::new(),
+            consolidation_sources: HashMap::new(),
             journal_path: Some(journal_path.clone()),
             event_bus: None,
             embedder: None,
@@ -805,27 +842,64 @@ impl FactStore {
             }
             match serde_json::from_str::<JournalEvent>(trimmed) {
                 Ok(JournalEvent::Store { fact }) => {
-                    self.replay_journal_insert(fact);
+                    let _ = self.replay_journal_insert(fact);
                 }
                 Ok(JournalEvent::StoreBatch { facts }) => {
                     for fact in facts {
-                        self.replay_journal_insert(fact);
+                        let _ = self.replay_journal_insert(fact);
                     }
                 }
                 Ok(JournalEvent::Delete { fact_id, .. }) => {
-                    if let Some(fact) = self.facts.get_mut(&fact_id) {
+                    let source_tenant = self.facts.get(&fact_id).map(|fact| fact.tenant_hash.clone());
+                    let protected_source = source_tenant
+                        .as_deref()
+                        .is_some_and(|tenant| self.is_active_consolidation_source_for_tenant(&fact_id, tenant));
+                    if self.consolidation_sources.contains_key(&fact_id) || protected_source {
+                        tracing::warn!(
+                            %fact_id,
+                            "fact-journal-delete-active-consolidation-member-skip"
+                        );
+                    } else if let Some(fact) = self.facts.get_mut(&fact_id) {
                         fact.deleted = true;
                     }
                 }
                 Ok(JournalEvent::Supersede {
                     fact_id, by_fact_id, ..
                 }) => {
-                    if let Some(fact) = self.facts.get_mut(&fact_id) {
-                        fact.superseded_by = Some(by_fact_id);
+                    let same_tenant = self
+                        .facts
+                        .get(&fact_id)
+                        .zip(self.facts.get(&by_fact_id))
+                        .is_some_and(|(target, successor)| target.tenant_hash == successor.tenant_hash);
+                    let source_tenant = self.facts.get(&fact_id).map(|fact| fact.tenant_hash.clone());
+                    let protected_source = source_tenant
+                        .as_deref()
+                        .is_some_and(|tenant| self.is_active_consolidation_source_for_tenant(&fact_id, tenant));
+                    if same_tenant && !protected_source {
+                        if let Some(fact) = self.facts.get_mut(&fact_id) {
+                            fact.superseded_by = Some(by_fact_id);
+                        }
+                    } else if protected_source {
+                        tracing::warn!(
+                            %fact_id,
+                            %by_fact_id,
+                            "fact-journal-supersede-active-consolidation-source-skip"
+                        );
+                    } else {
+                        tracing::warn!(%fact_id, %by_fact_id, "fact-journal-cross-tenant-supersede-skip");
                     }
                 }
                 Ok(JournalEvent::ClearSupersede { fact_id, .. }) => {
-                    if let Some(fact) = self.facts.get_mut(&fact_id) {
+                    let source_tenant = self.facts.get(&fact_id).map(|fact| fact.tenant_hash.clone());
+                    let protected_source = source_tenant
+                        .as_deref()
+                        .is_some_and(|tenant| self.is_active_consolidation_source_for_tenant(&fact_id, tenant));
+                    if protected_source {
+                        tracing::warn!(
+                            %fact_id,
+                            "fact-journal-clear-active-consolidation-source-skip"
+                        );
+                    } else if let Some(fact) = self.facts.get_mut(&fact_id) {
                         fact.superseded_by = None;
                     }
                 }
@@ -841,16 +915,42 @@ impl FactStore {
                     }
                 }
                 Ok(JournalEvent::Consolidate {
-                    canonical,
+                    mut canonical,
                     superseded_fact_ids,
                     ..
                 }) => {
+                    if canonical.tenant_hash.trim().is_empty() {
+                        canonical.tenant_hash = default_tenant_hash();
+                    }
                     let canonical_id = canonical.fact_id.clone();
-                    self.replay_journal_insert(canonical);
-                    for id in superseded_fact_ids {
-                        if let Some(fact) = self.facts.get_mut(&id) {
-                            fact.superseded_by = Some(canonical_id.clone());
+                    let canonical_tenant = canonical.tenant_hash.clone();
+                    let unique_sources: std::collections::HashSet<&str> =
+                        superseded_fact_ids.iter().map(String::as_str).collect();
+                    let sources_valid = !superseded_fact_ids.is_empty()
+                        && unique_sources.len() == superseded_fact_ids.len()
+                        && canonical
+                            .supersedes
+                            .as_deref()
+                            .is_none_or(|prior| unique_sources.contains(prior))
+                        && superseded_fact_ids.iter().all(|id| {
+                            self.facts.get(id).is_some_and(|fact| {
+                                !fact.deleted && fact.tenant_hash == canonical_tenant && fact.superseded_by.is_none()
+                            })
+                        });
+                    let canonical_available = !canonical.deleted && !self.facts.contains_key(&canonical_id);
+                    if !canonical_available || !sources_valid {
+                        tracing::warn!(
+                            %canonical_id,
+                            %canonical_tenant,
+                            "fact-journal-invalid-consolidation-skip"
+                        );
+                    } else if self.replay_journal_insert(canonical) {
+                        for id in &superseded_fact_ids {
+                            if let Some(fact) = self.facts.get_mut(id) {
+                                fact.superseded_by = Some(canonical_id.clone());
+                            }
                         }
+                        self.consolidation_sources.insert(canonical_id, superseded_fact_ids);
                     }
                 }
                 Ok(JournalEvent::ConsolidateUndo {
@@ -858,13 +958,79 @@ impl FactStore {
                     restored_fact_ids,
                     ..
                 }) => {
-                    if let Some(fact) = self.facts.get_mut(&canonical_fact_id) {
-                        fact.deleted = true;
-                    }
-                    for id in restored_fact_ids {
-                        if let Some(fact) = self.facts.get_mut(&id) {
-                            fact.superseded_by = None;
+                    let canonical = self.facts.get(&canonical_fact_id);
+                    let recorded = self.consolidation_sources.get(&canonical_fact_id).cloned();
+                    let mut supplied = restored_fact_ids;
+                    supplied.sort();
+                    supplied.dedup();
+                    let mut expected = recorded.unwrap_or_default();
+                    expected.sort();
+                    let exact_sources = !expected.is_empty() && supplied == expected;
+                    let can_apply = canonical.is_some_and(|canonical| {
+                        !canonical.deleted
+                            && canonical.superseded_by.is_none()
+                            && exact_sources
+                            && expected.iter().all(|id| {
+                                self.facts.get(id).is_some_and(|fact| {
+                                    !fact.deleted
+                                        && fact.tenant_hash == canonical.tenant_hash
+                                        && fact.superseded_by.as_deref() == Some(canonical_fact_id.as_str())
+                                })
+                            })
+                    });
+                    let already_applied = canonical.is_some_and(|canonical| {
+                        canonical.deleted
+                            && exact_sources
+                            && expected.iter().all(|id| {
+                                self.facts.get(id).is_some_and(|fact| {
+                                    !fact.deleted
+                                        && fact.tenant_hash == canonical.tenant_hash
+                                        && fact.superseded_by.is_none()
+                                })
+                            })
+                    });
+                    if can_apply {
+                        if let Some(fact) = self.facts.get_mut(&canonical_fact_id) {
+                            fact.deleted = true;
                         }
+                        for id in expected {
+                            if let Some(fact) = self.facts.get_mut(&id) {
+                                fact.superseded_by = None;
+                            }
+                        }
+                    } else if !already_applied {
+                        tracing::warn!(
+                            %canonical_fact_id,
+                            "fact-journal-invalid-consolidation-undo-skip"
+                        );
+                    }
+                }
+                Ok(JournalEvent::ConsolidationProvenance {
+                    canonical_fact_id,
+                    source_fact_ids,
+                    tenant_hash,
+                    ..
+                }) => {
+                    let canonical_valid = self
+                        .facts
+                        .get(&canonical_fact_id)
+                        .is_some_and(|fact| !fact.deleted && fact.tenant_hash == tenant_hash);
+                    let sources_valid = !source_fact_ids.is_empty()
+                        && source_fact_ids.iter().all(|id| {
+                            self.facts.get(id).is_some_and(|fact| {
+                                !fact.deleted
+                                    && fact.tenant_hash == tenant_hash
+                                    && fact.superseded_by.as_deref() == Some(canonical_fact_id.as_str())
+                            })
+                        });
+                    if canonical_valid && sources_valid {
+                        self.consolidation_sources.insert(canonical_fact_id, source_fact_ids);
+                    } else {
+                        tracing::warn!(
+                            %canonical_fact_id,
+                            %tenant_hash,
+                            "fact-journal-invalid-consolidation-provenance-skip"
+                        );
                     }
                 }
                 Err(err) => {
@@ -872,33 +1038,98 @@ impl FactStore {
                 }
             }
         }
+        self.sanitize_replayed_links();
         Ok(())
+    }
+
+    /// Remove legacy/malicious cross-tenant chain edges after replay without
+    /// rewriting version numbers or historical delete tombstones.
+    fn sanitize_replayed_links(&mut self) {
+        let invalid_supersedes: Vec<String> = self
+            .facts
+            .values()
+            .filter(|fact| {
+                fact.supersedes.as_deref().is_some_and(|previous_id| {
+                    self.facts.get(previous_id).is_some_and(|previous| {
+                        previous.tenant_hash != fact.tenant_hash
+                            || previous.entity != fact.entity
+                            || previous.key != fact.key
+                    })
+                })
+            })
+            .map(|fact| fact.fact_id.clone())
+            .collect();
+        let invalid_superseded_by: Vec<String> = self
+            .facts
+            .values()
+            .filter(|fact| {
+                fact.superseded_by.as_deref().is_some_and(|successor_id| {
+                    self.facts
+                        .get(successor_id)
+                        .is_some_and(|successor| successor.tenant_hash != fact.tenant_hash)
+                })
+            })
+            .map(|fact| fact.fact_id.clone())
+            .collect();
+
+        for fact_id in invalid_supersedes {
+            if let Some(fact) = self.facts.get_mut(&fact_id) {
+                tracing::warn!(%fact_id, "fact-journal-invalid-version-link-cleared");
+                fact.supersedes = None;
+            }
+        }
+        for fact_id in invalid_superseded_by {
+            if let Some(fact) = self.facts.get_mut(&fact_id) {
+                tracing::warn!(%fact_id, "fact-journal-invalid-supersession-link-cleared");
+                fact.superseded_by = None;
+            }
+        }
     }
 
     /// Insert a fact directly into the HashMap and indexes WITHOUT appending
     /// to the journal. Used during replay to avoid re-writing events.
-    fn replay_journal_insert(&mut self, mut fact: Fact) {
+    fn replay_journal_insert(&mut self, mut fact: Fact) -> bool {
         // Upgrade hardening: rows written before a namespace became
         // born-private must acquire the current privacy classification during
         // replay. Otherwise a stale `private:false` control row can re-enter
         // sync, export, retention, and generic mutation surfaces after restart.
         crate::fact_privacy::enforce_global_fact(&mut fact);
+        if fact.tenant_hash.trim().is_empty() {
+            fact.tenant_hash = default_tenant_hash();
+        }
+        if let Some(existing) = self.facts.get(&fact.fact_id) {
+            tracing::warn!(
+                fact_id = %fact.fact_id,
+                existing_tenant = %existing.tenant_hash,
+                incoming_tenant = %fact.tenant_hash,
+                "fact-journal-duplicate-fact-id-skip"
+            );
+            return false;
+        }
         let fact_id = fact.fact_id.clone();
+        let tenant_hash = fact.tenant_hash.clone();
         let entity = fact.entity.clone();
         let key = fact.key.clone();
         self.entity_index
             .entry(entity.clone())
             .or_default()
             .push(fact_id.clone());
-        self.key_index.entry((entity, key)).or_default().push(fact_id.clone());
+        self.key_index
+            .entry((tenant_hash, entity, key))
+            .or_default()
+            .push(fact_id.clone());
         self.facts.insert(fact_id, fact);
+        true
     }
 
-    fn build_fact(&self, req: StoreFact) -> Fact {
+    fn build_fact(&self, mut req: StoreFact) -> Fact {
+        if req.tenant_hash.trim().is_empty() {
+            req.tenant_hash = default_tenant_hash();
+        }
         let fact_id = format!("f_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let tokens = estimate_tokens(&req.value);
 
-        let key_pair = (req.entity.clone(), req.key.clone());
+        let key_pair = (req.tenant_hash.clone(), req.entity.clone(), req.key.clone());
         let (version, supersedes) = match self.key_index.get(&key_pair) {
             Some(chain) => {
                 let prev = chain
@@ -962,6 +1193,24 @@ impl FactStore {
         }
     }
 
+    /// Tenant-authorized variant of [`Self::set_horizon`].
+    ///
+    /// Fact ids are globally unique identifiers, but they are not authority
+    /// tokens. Request-facing callers must use this method so possession of an
+    /// id from another tenant cannot mutate that tenant's fact.
+    pub fn set_horizon_for_tenant(&mut self, tenant_hash: &str, fact_id: &str, horizon_class: HorizonClass) -> bool {
+        if let Some(fact) = self
+            .facts
+            .get_mut(fact_id)
+            .filter(|fact| fact.tenant_hash == tenant_hash)
+        {
+            fact.horizon_class = horizon_class;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Bump the `reverified_at` anchor on a fact, recording that an
     /// agent (or operator) has re-confirmed the fact is still accurate.
     /// Re-anchors decay without rewriting the value.
@@ -976,6 +1225,20 @@ impl FactStore {
         }
     }
 
+    /// Tenant-authorized variant of [`Self::reverify`].
+    pub fn reverify_for_tenant(&mut self, tenant_hash: &str, fact_id: &str, now: DateTime<Utc>) -> bool {
+        if let Some(fact) = self
+            .facts
+            .get_mut(fact_id)
+            .filter(|fact| fact.tenant_hash == tenant_hash)
+        {
+            fact.reverified_at = Some(now);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Mark `target_fact_id` as explicitly superseded by `by_fact_id` (M6).
     ///
     /// This is the cross-entity retirement primitive: unlike the
@@ -983,12 +1246,22 @@ impl FactStore {
     /// superseding fact may live under a *different* entity. Reversible
     /// soft-state — never hard-deletes the target. The mutation is
     /// journaled (mirrors soft-delete's `try_delete`) so it survives a
-    /// restart. Returns `true` if the target existed.
+    /// restart. Returns `true` only when both facts exist in `tenant_hash`.
     ///
     /// Idempotent: re-marking with the same `by_fact_id` is a no-op write
     /// of the same value (still journaled for an explicit audit trail).
-    pub fn mark_superseded(&mut self, target_fact_id: &str, by_fact_id: &str) -> bool {
-        if !self.facts.contains_key(target_fact_id) {
+    pub fn mark_superseded(&mut self, tenant_hash: &str, target_fact_id: &str, by_fact_id: &str) -> bool {
+        if self.is_active_consolidation_source_for_tenant(target_fact_id, tenant_hash) {
+            return false;
+        }
+        let same_authorized_tenant = self
+            .facts
+            .get(target_fact_id)
+            .zip(self.facts.get(by_fact_id))
+            .is_some_and(|(target, successor)| {
+                target.tenant_hash == tenant_hash && successor.tenant_hash == tenant_hash
+            });
+        if !same_authorized_tenant {
             return false;
         }
         if let Err(err) = self.append_journal(&JournalEvent::Supersede {
@@ -1008,9 +1281,16 @@ impl FactStore {
 
     /// Reverse of [`Self::mark_superseded`] (M6): un-retire a fact by clearing
     /// its `superseded_by` marker. Journaled for restart-survival.
-    /// Returns `true` if the fact existed.
-    pub fn clear_superseded(&mut self, fact_id: &str) -> bool {
-        if !self.facts.contains_key(fact_id) {
+    /// Returns `true` if the fact existed in `tenant_hash`.
+    pub fn clear_superseded(&mut self, tenant_hash: &str, fact_id: &str) -> bool {
+        if self.is_active_consolidation_source_for_tenant(fact_id, tenant_hash) {
+            return false;
+        }
+        if self
+            .facts
+            .get(fact_id)
+            .is_none_or(|fact| fact.tenant_hash != tenant_hash)
+        {
             return false;
         }
         if let Err(err) = self.append_journal(&JournalEvent::ClearSupersede {
@@ -1091,7 +1371,7 @@ impl FactStore {
             .or_default()
             .push(fact.fact_id.clone());
         self.key_index
-            .entry((fact.entity.clone(), fact.key.clone()))
+            .entry((fact.tenant_hash.clone(), fact.entity.clone(), fact.key.clone()))
             .or_default()
             .push(fact.fact_id.clone());
         self.facts.insert(fact.fact_id.clone(), fact.clone());
@@ -1195,7 +1475,7 @@ impl FactStore {
     /// the same predecessor here is idempotent.
     fn supersede_prior_version(&mut self, fact: &Fact) {
         if let Some(prev_id) = fact.supersedes.clone() {
-            self.mark_superseded(&prev_id, &fact.fact_id);
+            self.mark_superseded(&fact.tenant_hash, &prev_id, &fact.fact_id);
         }
     }
 
@@ -1242,9 +1522,18 @@ impl FactStore {
         Ok(facts)
     }
 
-    /// Soft-delete a fact by ID. Returns true if the fact existed.
-    pub fn delete(&mut self, fact_id: &str) -> bool {
-        if let Some(fact) = self.facts.get_mut(fact_id) {
+    /// Soft-delete a fact by ID. Returns true if it existed in `tenant_hash`.
+    pub fn delete(&mut self, tenant_hash: &str, fact_id: &str) -> bool {
+        if self.is_consolidation_canonical_for_tenant(fact_id, tenant_hash)
+            || self.is_active_consolidation_source_for_tenant(fact_id, tenant_hash)
+        {
+            return false;
+        }
+        if let Some(fact) = self
+            .facts
+            .get_mut(fact_id)
+            .filter(|fact| fact.tenant_hash == tenant_hash)
+        {
             fact.deleted = true;
             if let Err(err) = self.append_journal(&JournalEvent::Delete {
                 fact_id: fact_id.to_string(),
@@ -1264,15 +1553,28 @@ impl FactStore {
     }
 
     /// Soft-delete a fact only after its tombstone has been durably appended.
-    pub fn try_delete(&mut self, fact_id: &str) -> std::io::Result<bool> {
-        if !self.facts.contains_key(fact_id) {
+    pub fn try_delete(&mut self, tenant_hash: &str, fact_id: &str) -> std::io::Result<bool> {
+        if self.is_consolidation_canonical_for_tenant(fact_id, tenant_hash)
+            || self.is_active_consolidation_source_for_tenant(fact_id, tenant_hash)
+        {
+            return Ok(false);
+        }
+        if self
+            .facts
+            .get(fact_id)
+            .is_none_or(|fact| fact.tenant_hash != tenant_hash)
+        {
             return Ok(false);
         }
         self.append_journal(&JournalEvent::Delete {
             fact_id: fact_id.to_string(),
             deleted_at: Utc::now().to_rfc3339(),
         })?;
-        if let Some(fact) = self.facts.get_mut(fact_id) {
+        if let Some(fact) = self
+            .facts
+            .get_mut(fact_id)
+            .filter(|fact| fact.tenant_hash == tenant_hash)
+        {
             fact.deleted = true;
             if let Some(bus) = &self.event_bus {
                 bus.emit(crate::events::CruxEvent::FactDeleted {
@@ -1293,6 +1595,44 @@ impl FactStore {
 
     pub fn get_for_tenant(&self, fact_id: &str, tenant_hash: &str) -> Option<&Fact> {
         self.get(fact_id).filter(|f| f.tenant_hash == tenant_hash)
+    }
+
+    /// Tenant-scoped audit lookup that retains soft-deleted rows.
+    pub fn get_for_tenant_including_deleted(&self, fact_id: &str, tenant_hash: &str) -> Option<&Fact> {
+        self.facts.get(fact_id).filter(|fact| fact.tenant_hash == tenant_hash)
+    }
+
+    /// Whether the id names a canonical created by a durable consolidation in
+    /// this tenant. Generic deletion must route such facts through undo.
+    pub fn is_consolidation_canonical_for_tenant(&self, fact_id: &str, tenant_hash: &str) -> bool {
+        self.consolidation_sources.contains_key(fact_id)
+            && self
+                .facts
+                .get(fact_id)
+                .is_some_and(|fact| fact.tenant_hash == tenant_hash)
+    }
+
+    /// Whether a fact is currently retired by a live consolidation canonical.
+    /// These edges are immutable until the dedicated undo commits.
+    pub fn is_active_consolidation_source_for_tenant(&self, fact_id: &str, tenant_hash: &str) -> bool {
+        self.active_consolidation_for_source(fact_id, Some(tenant_hash))
+            .is_some()
+    }
+
+    fn active_consolidation_for_source<'a>(
+        &'a self,
+        source_fact_id: &str,
+        tenant_hash: Option<&str>,
+    ) -> Option<&'a str> {
+        self.consolidation_sources
+            .iter()
+            .find(|(canonical_id, source_ids)| {
+                source_ids.iter().any(|id| id == source_fact_id)
+                    && self.facts.get(*canonical_id).is_some_and(|canonical| {
+                        !canonical.deleted && tenant_hash.is_none_or(|tenant| canonical.tenant_hash == tenant)
+                    })
+            })
+            .map(|(canonical_id, _)| canonical_id.as_str())
     }
 
     /// Get all facts for an entity.
@@ -1519,12 +1859,13 @@ impl FactStore {
     /// Pure arithmetic — no model call, ever. `token_budget`, when set, caps how
     /// many candidate facts are scanned (honest, bounded cost); the report says
     /// whether the answer was budget-truncated.
-    pub fn aggregate_v1(&self, req: &AggregateRequestV1) -> AggregateResultV1 {
+    pub fn aggregate_v1(&self, tenant_hash: &str, req: &AggregateRequestV1) -> AggregateResultV1 {
         // Candidate facts: visible latest rows matching the filter, in a stable
         // order (by fact_id) so the scan + any budget truncation is deterministic.
         let mut candidates: Vec<&Fact> = self
             .facts
             .values()
+            .filter(|f| f.tenant_hash == tenant_hash)
             .filter(|f| !f.deleted && f.superseded_by.is_none() && !f.private)
             .filter(|f| req.entity.as_deref().is_none_or(|e| f.entity == e))
             .filter(|f| req.key.as_deref().is_none_or(|k| f.key == k))
@@ -1569,7 +1910,7 @@ impl FactStore {
                 // Numeric change in an (entity,key)'s value between the value
                 // that was current at `as_of` and the current value. Requires
                 // entity+key; returns null if either endpoint is non-numeric.
-                return self.temporal_diff(req, tokens_scanned);
+                return self.temporal_diff(tenant_hash, req, tokens_scanned);
             }
         };
 
@@ -1583,7 +1924,7 @@ impl FactStore {
         }
     }
 
-    fn temporal_diff(&self, req: &AggregateRequestV1, tokens_scanned: usize) -> AggregateResultV1 {
+    fn temporal_diff(&self, tenant_hash: &str, req: &AggregateRequestV1, tokens_scanned: usize) -> AggregateResultV1 {
         let base = AggregateResultV1 {
             op: AggregateOp::TemporalDiff.as_str().to_string(),
             matched: 0,
@@ -1595,22 +1936,63 @@ impl FactStore {
         let (Some(entity), Some(key)) = (req.entity.as_deref(), req.key.as_deref()) else {
             return base;
         };
-        let history = self.fact_history(entity, key);
-        if history.is_empty() {
+        let current = self
+            .facts
+            .values()
+            .filter(|fact| {
+                fact.tenant_hash == tenant_hash
+                    && fact.entity == entity
+                    && fact.key == key
+                    && !fact.deleted
+                    && !fact.private
+                    && fact.superseded_by.is_none()
+            })
+            .filter(|fact| {
+                req.query
+                    .as_deref()
+                    .is_none_or(|query| fact.value.to_lowercase().contains(&query.to_lowercase()))
+            })
+            .max_by_key(|fact| fact.version);
+        let Some(current) = current else {
             return base;
+        };
+
+        // Walk the authenticated tenant's actual predecessor edges. A global
+        // `(entity,key)` scan would allow unrelated tenant/private/deleted rows
+        // to become a TemporalDiff endpoint.
+        let mut history = vec![current];
+        let mut child = current;
+        let mut seen = std::collections::BTreeSet::from([current.fact_id.as_str()]);
+        while let Some(previous_id) = child.supersedes.as_deref() {
+            if !seen.insert(previous_id) {
+                break;
+            }
+            let Some(previous) = self.facts.get(previous_id).filter(|previous| {
+                previous.tenant_hash == tenant_hash
+                    && previous.entity == entity
+                    && previous.key == key
+                    && !previous.deleted
+                    && !previous.private
+                    && previous.superseded_by.as_deref() == Some(child.fact_id.as_str())
+            }) else {
+                break;
+            };
+            history.push(previous);
+            child = previous;
         }
-        // Current value = latest by version.
-        let current = history.iter().max_by_key(|f| f.version);
-        // As-of value = the latest version whose stored_at <= as_of.
-        let as_of = req.as_of;
-        let asof = match as_of {
-            Some(ts) => history.iter().filter(|f| f.stored_at <= ts).max_by_key(|f| f.version),
-            None => history.iter().min_by_key(|f| f.version), // no as_of ⇒ diff vs oldest
+
+        let old = match req.as_of {
+            Some(ts) => history
+                .iter()
+                .copied()
+                .filter(|fact| fact.stored_at <= ts)
+                .max_by_key(|fact| fact.version),
+            None => history.last().copied(),
         };
-        let (Some(cur), Some(old)) = (current, asof) else {
+        let Some(old) = old else {
             return base;
         };
-        match (parse_leading_number(&cur.value), parse_leading_number(&old.value)) {
+        match (parse_leading_number(&current.value), parse_leading_number(&old.value)) {
             (Some(c), Some(o)) => AggregateResultV1 {
                 matched: history.len(),
                 value: serde_json::json!(c - o),
@@ -1647,9 +2029,37 @@ impl FactStore {
     /// was retired without ever seeing the original content
     /// (see `sync::offboard_tenant_mirror`).
     pub fn export(&self, since: Option<DateTime<Utc>>, cursor: Option<&str>, limit: usize) -> FactExportResult {
+        self.export_scoped(None, since, cursor, limit)
+    }
+
+    /// Tenant-scoped counterpart to [`Self::export`]. Tenant filtering happens
+    /// before sorting and pagination, so foreign rows cannot starve a page or
+    /// influence its cursor.
+    pub fn export_for_tenant(
+        &self,
+        tenant_hash: &str,
+        since: Option<DateTime<Utc>>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> FactExportResult {
+        self.export_scoped(Some(tenant_hash), since, cursor, limit)
+    }
+
+    fn export_scoped(
+        &self,
+        tenant_hash: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> FactExportResult {
         // 1. Collect facts, excluding private ones (never leave this node) AND
         //    deleted ones (their content must not leave the box — erasure).
-        let mut all: Vec<&Fact> = self.facts.values().filter(|f| !f.private && !f.deleted).collect();
+        let mut all: Vec<&Fact> = self
+            .facts
+            .values()
+            .filter(|fact| tenant_hash.is_none_or(|tenant| fact.tenant_hash == tenant))
+            .filter(|fact| !fact.private && !fact.deleted)
+            .collect();
 
         // 2. Sort by (stored_at, fact_id) ascending.
         all.sort_by(|a, b| a.stored_at.cmp(&b.stored_at).then_with(|| a.fact_id.cmp(&b.fact_id)));
@@ -1915,6 +2325,25 @@ impl FactStore {
                 }
             }
 
+            // Preserve consolidation authority separately from caller-writable
+            // fact fields. These events contain no fact values and replay only
+            // accepts them when the already-restored same-tenant edges match.
+            let mut consolidations: Vec<_> = self.consolidation_sources.iter().collect();
+            consolidations.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (canonical_fact_id, source_fact_ids) in consolidations {
+                let Some(canonical) = self.facts.get(canonical_fact_id).filter(|fact| !fact.deleted) else {
+                    continue;
+                };
+                let event = JournalEvent::ConsolidationProvenance {
+                    canonical_fact_id: canonical_fact_id.clone(),
+                    source_fact_ids: source_fact_ids.clone(),
+                    tenant_hash: canonical.tenant_hash.clone(),
+                    recorded_at: Utc::now().to_rfc3339(),
+                };
+                let line = serde_json::to_string(&event).map_err(std::io::Error::other)?;
+                writeln!(writer, "{}", line)?;
+            }
+
             // Value-free tombstones: replay still marks these fact_ids deleted,
             // but the original value never touches the rewritten journal. The
             // `Delete` arm is a no-op on replay if the fact_id is unknown, which
@@ -1970,18 +2399,18 @@ impl FactStore {
     /// explicitly.
     pub fn mark_retention_eligible(&mut self, cutoff: DateTime<Utc>) -> Vec<String> {
         let holds = self.active_legal_holds();
-        let to_delete: Vec<String> = self
+        let to_delete: Vec<(String, String)> = self
             .facts
             .values()
             .filter(|f| !f.deleted && !f.private && f.stored_at < cutoff)
             .filter(|f| !f.entity.starts_with("__sync_tombstone__::"))
             .filter(|f| crate::fact_privacy::daemon_owned_entity_prefix(&f.entity).is_none())
             .filter(|f| !holds.iter().any(|hold| hold.covers_fact(f)))
-            .map(|f| f.fact_id.clone())
+            .map(|f| (f.tenant_hash.clone(), f.fact_id.clone()))
             .collect();
         let mut deleted = Vec::with_capacity(to_delete.len());
-        for fact_id in &to_delete {
-            match self.try_delete(fact_id) {
+        for (tenant_hash, fact_id) in &to_delete {
+            match self.try_delete(tenant_hash, fact_id) {
                 Ok(true) => deleted.push(fact_id.clone()),
                 Ok(false) => {}
                 Err(err) => {
@@ -2000,10 +2429,23 @@ impl FactStore {
     /// `SyncClient::pull_tenant_mirror`) re-stamp `fact.tenant_hash` from the
     /// locally requested tenant before invoking this low-level primitive. Other
     /// callers remain responsible for supplying an authoritative tenant stamp.
-    pub fn store_synced(&mut self, mut fact: Fact) {
+    pub fn store_synced(&mut self, mut fact: Fact) -> bool {
         crate::fact_privacy::enforce_global_fact(&mut fact);
+        if fact.tenant_hash.trim().is_empty() {
+            fact.tenant_hash = default_tenant_hash();
+        }
 
         let fact_id = fact.fact_id.clone();
+        if let Some(existing) = self.facts.get(&fact_id) {
+            tracing::warn!(
+                %fact_id,
+                existing_tenant = %existing.tenant_hash,
+                incoming_tenant = %fact.tenant_hash,
+                "synced-fact-id-collision-rejected"
+            );
+            return false;
+        }
+        let tenant_hash = fact.tenant_hash.clone();
         let entity = fact.entity.clone();
         let key = fact.key.clone();
 
@@ -2011,18 +2453,33 @@ impl FactStore {
             .entry(entity.clone())
             .or_default()
             .push(fact_id.clone());
-        self.key_index.entry((entity, key)).or_default().push(fact_id.clone());
-        self.facts.insert(fact_id, fact.clone());
+        self.key_index
+            .entry((tenant_hash, entity, key))
+            .or_default()
+            .push(fact_id.clone());
+        self.facts.insert(fact_id.clone(), fact);
+
+        // A synced page may arrive in either chain order. Re-sanitize the
+        // complete graph after each insert so a previously unresolved link is
+        // checked as soon as its referenced id becomes live. This closes the
+        // runtime window where a cross-tenant or wrong-(entity,key) edge was
+        // visible until the next restart.
+        self.sanitize_replayed_links();
+        let Some(fact) = self.facts.get(&fact_id).cloned() else {
+            tracing::error!(%fact_id, "synced-fact-disappeared-after-link-sanitization");
+            return false;
+        };
 
         if let Err(err) = self.append_journal(&JournalEvent::Store { fact }) {
             tracing::warn!(?err, "fact-journal-append-failed");
         }
+        true
     }
 
     /// Return all versions of a fact for a given (entity, key) pair, ordered by
     /// version ascending. Includes deleted (superseded) versions for audit trail.
-    pub fn fact_history(&self, entity: &str, key: &str) -> Vec<&Fact> {
-        let key_pair = (entity.to_string(), key.to_string());
+    pub fn fact_history(&self, tenant_hash: &str, entity: &str, key: &str) -> Vec<&Fact> {
+        let key_pair = (tenant_hash.to_string(), entity.to_string(), key.to_string());
         match self.key_index.get(&key_pair) {
             Some(chain) => {
                 let mut facts: Vec<&Fact> = chain.iter().filter_map(|id| self.facts.get(id)).collect();
@@ -2039,10 +2496,10 @@ impl FactStore {
     /// active, non-superseded facts that share `(entity, key)` and carry
     /// opposite deterministic polarity classes (`true` vs `false`,
     /// `active` vs `inactive`, etc.). The pass never mutates memory.
-    pub fn contradiction_candidates_v1(&self, limit: usize) -> Vec<ContradictionCandidateV1> {
+    pub fn contradiction_candidates_v1(&self, tenant_hash: &str, limit: usize) -> Vec<ContradictionCandidateV1> {
         let mut groups: BTreeMap<(String, String), Vec<&Fact>> = BTreeMap::new();
         for fact in self.facts.values() {
-            if fact.deleted || fact.superseded_by.is_some() {
+            if fact.tenant_hash != tenant_hash || fact.deleted || fact.superseded_by.is_some() || fact.private {
                 continue;
             }
             if polarity_class_v1(&fact.value).is_none() {
@@ -2097,19 +2554,31 @@ impl FactStore {
     /// history; `fact_history` and `all_facts` remain replayable.
     pub fn consolidate_facts_v1(
         &mut self,
+        tenant_hash: &str,
         req: ConsolidationRequestV1,
     ) -> Result<ConsolidationPassReportV1, ConsolidationErrorV1> {
         if req.target_fact_ids.is_empty() {
             return Err(ConsolidationErrorV1::NoTargets);
         }
+        if req.consolidation_id.trim().is_empty() {
+            return Err(ConsolidationErrorV1::MissingConsolidationId);
+        }
 
+        let mut unique_targets = std::collections::HashSet::new();
         for fact_id in &req.target_fact_ids {
+            if !unique_targets.insert(fact_id.as_str()) {
+                return Err(ConsolidationErrorV1::DuplicateTarget(fact_id.clone()));
+            }
             let fact = self
                 .facts
                 .get(fact_id)
+                .filter(|fact| fact.tenant_hash == tenant_hash)
                 .ok_or_else(|| ConsolidationErrorV1::TargetNotFound(fact_id.clone()))?;
             if fact.deleted {
                 return Err(ConsolidationErrorV1::TargetDeleted(fact_id.clone()));
+            }
+            if fact.superseded_by.is_some() {
+                return Err(ConsolidationErrorV1::TargetAlreadySuperseded(fact_id.clone()));
             }
             if req.protected_fact_ids.iter().any(|id| id == fact_id) {
                 return Err(ConsolidationErrorV1::TargetPinned(fact_id.clone()));
@@ -2145,32 +2614,29 @@ impl FactStore {
             hex::encode(blake3::hash(canonical_value.as_bytes()).as_bytes())
         );
         let canonical = self.build_fact(StoreFact {
-            tenant_hash: default_tenant_hash(),
+            tenant_hash: tenant_hash.to_string(),
             entity: req.entity.clone(),
             key: req.key.clone(),
             value: canonical_value,
-            source_receipt: req.source_receipt.clone().or_else(|| {
-                if req.consolidation_id.trim().is_empty() {
-                    None
-                } else {
-                    Some(format!("consolidation:{}", req.consolidation_id))
-                }
-            }),
+            // A durable marker makes undo authorization structural rather than
+            // trusting a caller-supplied arbitrary canonical id.
+            source_receipt: Some(format!("consolidation:{}", req.consolidation_id)),
             confidence: req.confidence,
             private: false,
             horizon_class: req.horizon_class,
             actor: req.actor,
         });
 
-        // Superseded set = the consolidation targets PLUS the canonical's own
-        // prior (entity,key) version (what `try_store`/`supersede_prior_version`
-        // would retire). Deduplicated so the receipt is exact.
-        let mut superseded_fact_ids = req.target_fact_ids.clone();
+        // `build_fact` discovers the current prior version. It must have gone
+        // through the exact protection checks above; otherwise a caller could
+        // name one low-value target while implicitly retiring a private,
+        // receipt-linked, pinned, or high-confidence head.
         if let Some(prior) = canonical.supersedes.clone() {
-            if !superseded_fact_ids.contains(&prior) {
-                superseded_fact_ids.push(prior);
+            if !req.target_fact_ids.contains(&prior) {
+                return Err(ConsolidationErrorV1::ImplicitPriorNotTarget(prior));
             }
         }
+        let superseded_fact_ids = req.target_fact_ids.clone();
 
         // THE TRANSACTIONAL BOUNDARY: one journal append is the commit point.
         // On failure nothing is mutated (no half-applied consolidation); the
@@ -2184,12 +2650,14 @@ impl FactStore {
 
         // Durable: now apply in-memory (mirrors the replay handler exactly).
         let canonical_fact_id = canonical.fact_id.clone();
-        self.replay_journal_insert(canonical);
+        let _ = self.replay_journal_insert(canonical);
         for id in &superseded_fact_ids {
-            if let Some(fact) = self.facts.get_mut(id) {
+            if let Some(fact) = self.facts.get_mut(id).filter(|fact| fact.tenant_hash == tenant_hash) {
                 fact.superseded_by = Some(canonical_fact_id.clone());
             }
         }
+        self.consolidation_sources
+            .insert(canonical_fact_id.clone(), superseded_fact_ids.clone());
 
         Ok(ConsolidationPassReportV1 {
             status: "consolidated".to_string(),
@@ -2210,32 +2678,70 @@ impl FactStore {
     /// soft-deleted) is a no-op returning `status = "already_undone"`.
     pub fn consolidate_undo_v1(
         &mut self,
+        tenant_hash: &str,
         canonical_fact_id: &str,
         source_fact_ids: &[String],
     ) -> Result<ConsolidationUndoReportV1, ConsolidationErrorV1> {
+        // Existence (within the caller's tenant) is checked BEFORE the
+        // empty-sources guard. Both orders reject the request, but only this one
+        // distinguishes "no such canonical" (404) from "you named one but sent
+        // no sources" (400) — and an id that does not exist for this caller is
+        // the more useful answer of the two. Reversing these silently turned
+        // every unknown-canonical undo into a 400.
         let canonical = self
             .facts
             .get(canonical_fact_id)
+            .filter(|fact| fact.tenant_hash == tenant_hash)
             .ok_or_else(|| ConsolidationErrorV1::TargetNotFound(canonical_fact_id.to_string()))?;
+        if source_fact_ids.is_empty() {
+            return Err(ConsolidationErrorV1::NoUndoSources);
+        }
+        let Some(recorded_sources) = self.consolidation_sources.get(canonical_fact_id) else {
+            return Err(ConsolidationErrorV1::NotConsolidationCanonical(
+                canonical_fact_id.to_string(),
+            ));
+        };
+        if canonical.superseded_by.is_some() {
+            return Err(ConsolidationErrorV1::CanonicalSuperseded(canonical_fact_id.to_string()));
+        }
+        let mut expected = recorded_sources.clone();
+        expected.sort();
+        let mut supplied = source_fact_ids.to_vec();
+        supplied.sort();
+        supplied.dedup();
+        if expected.is_empty() || supplied != expected {
+            return Err(ConsolidationErrorV1::UndoSourceMismatch(canonical_fact_id.to_string()));
+        }
         if canonical.deleted {
-            return Ok(ConsolidationUndoReportV1 {
-                status: "already_undone".to_string(),
-                canonical_fact_id: canonical_fact_id.to_string(),
-                restored_fact_ids: Vec::new(),
+            let sources_restored = expected.iter().all(|id| {
+                self.facts.get(id).is_some_and(|fact| {
+                    !fact.deleted && fact.tenant_hash == tenant_hash && fact.superseded_by.is_none()
+                })
             });
+            if sources_restored {
+                return Ok(ConsolidationUndoReportV1 {
+                    status: "already_undone".to_string(),
+                    canonical_fact_id: canonical_fact_id.to_string(),
+                    restored_fact_ids: Vec::new(),
+                });
+            }
+            return Err(ConsolidationErrorV1::UndoSourceMismatch(canonical_fact_id.to_string()));
         }
 
-        // Only restore sources that are actually superseded by THIS canonical —
-        // never resurrect a fact retired by an unrelated consolidation.
-        let restored: Vec<String> = source_fact_ids
-            .iter()
-            .filter(|id| {
-                self.facts
-                    .get(*id)
-                    .is_some_and(|f| f.superseded_by.as_deref() == Some(canonical_fact_id))
+        // Require the exact non-empty edge set. Silently accepting unknown or
+        // omitted ids would let a caller delete an arbitrary tenant fact while
+        // restoring nothing (or only a chosen subset).
+        let edges_match = expected.iter().all(|id| {
+            self.facts.get(id).is_some_and(|fact| {
+                !fact.deleted
+                    && fact.tenant_hash == tenant_hash
+                    && fact.superseded_by.as_deref() == Some(canonical_fact_id)
             })
-            .cloned()
-            .collect();
+        });
+        if !edges_match {
+            return Err(ConsolidationErrorV1::UndoSourceMismatch(canonical_fact_id.to_string()));
+        }
+        let restored = expected;
 
         // Transactional boundary: single commit-point append.
         self.append_journal(&JournalEvent::ConsolidateUndo {
@@ -2459,16 +2965,16 @@ fn polarity_class_v1(value: &str) -> Option<&'static str> {
     }
 }
 
-/// Reduce `facts` to one row per (entity, key) — the row with the highest
+/// Reduce `facts` to one row per (tenant, entity, key) — the row with the highest
 /// `version` wins. Preserves Fact ordering otherwise (callers can re-sort).
 ///
 /// `FactStore::query()` returns all live versions of a fact — including
 /// superseded ones. Listing surfaces (passports, projects, work, engram
 /// overlays) want only the latest version per `(entity, key)`.
 pub fn dedup_latest(facts: Vec<Fact>) -> Vec<Fact> {
-    let mut by_key: std::collections::BTreeMap<(String, String), Fact> = std::collections::BTreeMap::new();
+    let mut by_key: std::collections::BTreeMap<(String, String, String), Fact> = std::collections::BTreeMap::new();
     for fact in facts {
-        let key = (fact.entity.clone(), fact.key.clone());
+        let key = (fact.tenant_hash.clone(), fact.entity.clone(), fact.key.clone());
         match by_key.get(&key) {
             Some(existing) if existing.version >= fact.version => {}
             _ => {
@@ -2506,6 +3012,20 @@ mod tests {
             valid_to: None,
             access_count: 0,
             last_accessed_at: None,
+        }
+    }
+
+    fn tenant_fact(tenant: &str, entity: &str, key: &str, value: &str) -> StoreFact {
+        StoreFact {
+            tenant_hash: tenant.to_string(),
+            entity: entity.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
         }
     }
 
@@ -2832,17 +3352,49 @@ mod tests {
             actor: None,
         });
         assert!(
-            store.clear_superseded(&first.fact_id),
+            store.clear_superseded("default", &first.fact_id),
             "simulate unresolved remote conflict"
         );
 
-        let candidates = store.contradiction_candidates_v1(10);
+        let candidates = store.contradiction_candidates_v1("default", 10);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].entity, "service:api");
         assert_eq!(candidates[0].key, "enabled");
         assert!(candidates[0].fact_ids.contains(&first.fact_id));
         assert!(candidates[0].fact_ids.contains(&second.fact_id));
         assert_eq!(candidates[0].reason, "opposite_polarity_same_entity_key");
+    }
+
+    #[test]
+    fn contradiction_candidates_v1_never_surface_private_values() {
+        let mut store = FactStore::new();
+        let first = store.store(StoreFact {
+            tenant_hash: "tenant-a".to_string(),
+            entity: "private-state".to_string(),
+            key: "enabled".to_string(),
+            value: "enabled".to_string(),
+            source_receipt: None,
+            confidence: 0.4,
+            private: true,
+            horizon_class: None,
+            actor: None,
+        });
+        store.store(StoreFact {
+            tenant_hash: "tenant-a".to_string(),
+            entity: "private-state".to_string(),
+            key: "enabled".to_string(),
+            value: "disabled".to_string(),
+            source_receipt: None,
+            confidence: 0.4,
+            private: true,
+            horizon_class: None,
+            actor: None,
+        });
+        assert!(store.clear_superseded("tenant-a", &first.fact_id));
+        assert!(
+            store.contradiction_candidates_v1("tenant-a", 10).is_empty(),
+            "private values must not ride the contradiction review surface"
+        );
     }
 
     #[test]
@@ -2871,22 +3423,28 @@ mod tests {
             horizon_class: None,
             actor: None,
         });
-        assert!(store.clear_superseded(&old.fact_id), "make both targets active");
+        assert!(
+            store.clear_superseded("default", &old.fact_id),
+            "make both targets active"
+        );
 
         let report = store
-            .consolidate_facts_v1(ConsolidationRequestV1 {
-                consolidation_id: "con-1".to_string(),
-                entity: "proj".to_string(),
-                key: "status".to_string(),
-                canonical_value: "active".to_string(),
-                target_fact_ids: vec![old.fact_id.clone(), newer.fact_id.clone()],
-                protected_fact_ids: vec![],
-                confidence: 0.8,
-                source_receipt: None,
-                actor: Some("agent:codex".to_string()),
-                horizon_class: Some(HorizonClass::Stable),
-                protected_confidence_floor: 0.99,
-            })
+            .consolidate_facts_v1(
+                "default",
+                ConsolidationRequestV1 {
+                    consolidation_id: "con-1".to_string(),
+                    entity: "proj".to_string(),
+                    key: "status".to_string(),
+                    canonical_value: "active".to_string(),
+                    target_fact_ids: vec![old.fact_id.clone(), newer.fact_id.clone()],
+                    protected_fact_ids: vec![],
+                    confidence: 0.8,
+                    source_receipt: None,
+                    actor: Some("agent:codex".to_string()),
+                    horizon_class: Some(HorizonClass::Stable),
+                    protected_confidence_floor: 0.99,
+                },
+            )
             .expect("consolidate");
 
         let canonical_id = report.receipt.canonical_fact_id;
@@ -2898,7 +3456,7 @@ mod tests {
             store.get(&newer.fact_id).unwrap().superseded_by.as_deref(),
             Some(canonical_id.as_str())
         );
-        let history = store.fact_history("proj", "status");
+        let history = store.fact_history("default", "proj", "status");
         assert_eq!(history.len(), 3, "consolidation must preserve version history");
         assert!(history.iter().any(|f| f.fact_id == old.fact_id));
         assert!(history.iter().any(|f| f.fact_id == newer.fact_id));
@@ -2921,22 +3479,155 @@ mod tests {
         });
 
         let err = store
-            .consolidate_facts_v1(ConsolidationRequestV1 {
-                consolidation_id: "con-guard".to_string(),
-                entity: "proj".to_string(),
-                key: "decision".to_string(),
-                canonical_value: "approved".to_string(),
-                target_fact_ids: vec![linked.fact_id.clone()],
-                protected_fact_ids: vec![],
-                confidence: 0.8,
-                source_receipt: None,
-                actor: None,
-                horizon_class: None,
-                protected_confidence_floor: 0.99,
-            })
+            .consolidate_facts_v1(
+                "default",
+                ConsolidationRequestV1 {
+                    consolidation_id: "con-guard".to_string(),
+                    entity: "proj".to_string(),
+                    key: "decision".to_string(),
+                    canonical_value: "approved".to_string(),
+                    target_fact_ids: vec![linked.fact_id.clone()],
+                    protected_fact_ids: vec![],
+                    confidence: 0.8,
+                    source_receipt: None,
+                    actor: None,
+                    horizon_class: None,
+                    protected_confidence_floor: 0.99,
+                },
+            )
             .expect_err("receipt-linked targets are protected");
         assert_eq!(err, ConsolidationErrorV1::TargetReceiptLinked(linked.fact_id.clone()));
         assert!(store.get(&linked.fact_id).unwrap().superseded_by.is_none());
+    }
+
+    #[test]
+    fn consolidate_facts_v1_rejects_unvalidated_implicit_prior() {
+        let mut store = FactStore::new();
+        let low = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "proj".to_string(),
+            key: "status".to_string(),
+            value: "blocked".to_string(),
+            source_receipt: None,
+            confidence: 0.2,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        let protected_head = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "proj".to_string(),
+            key: "status".to_string(),
+            value: "approved".to_string(),
+            source_receipt: Some("receipt:protected".to_string()),
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        assert!(store.clear_superseded("default", &low.fact_id));
+
+        let err = store
+            .consolidate_facts_v1(
+                "default",
+                ConsolidationRequestV1 {
+                    consolidation_id: "con-implicit".to_string(),
+                    entity: "proj".to_string(),
+                    key: "status".to_string(),
+                    canonical_value: "settled".to_string(),
+                    target_fact_ids: vec![low.fact_id.clone()],
+                    protected_fact_ids: vec![],
+                    confidence: 0.5,
+                    source_receipt: None,
+                    actor: Some("agent:codex".to_string()),
+                    horizon_class: None,
+                    protected_confidence_floor: 0.99,
+                },
+            )
+            .expect_err("implicit prior must be explicitly validated");
+        assert_eq!(
+            err,
+            ConsolidationErrorV1::ImplicitPriorNotTarget(protected_head.fact_id.clone())
+        );
+        assert!(store.get(&protected_head.fact_id).unwrap().superseded_by.is_none());
+        assert_eq!(store.fact_history("default", "proj", "status").len(), 2);
+    }
+
+    #[test]
+    fn consolidate_rejects_superseded_or_duplicate_targets_atomically() {
+        let mut store = FactStore::new();
+        let first = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "proj".to_string(),
+            key: "status".to_string(),
+            value: "blocked".to_string(),
+            source_receipt: None,
+            confidence: 0.2,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        let second = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "proj".to_string(),
+            key: "status".to_string(),
+            value: "active".to_string(),
+            source_receipt: None,
+            confidence: 0.3,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        let original_edge = first
+            .superseded_by
+            .clone()
+            .or_else(|| store.get(&first.fact_id).and_then(|fact| fact.superseded_by.clone()));
+        let err = store
+            .consolidate_facts_v1(
+                "default",
+                ConsolidationRequestV1 {
+                    consolidation_id: "con-retired".to_string(),
+                    entity: "proj".to_string(),
+                    key: "status".to_string(),
+                    canonical_value: "settled".to_string(),
+                    target_fact_ids: vec![first.fact_id.clone(), second.fact_id.clone()],
+                    protected_fact_ids: vec![],
+                    confidence: 0.5,
+                    source_receipt: None,
+                    actor: None,
+                    horizon_class: None,
+                    protected_confidence_floor: 0.99,
+                },
+            )
+            .expect_err("already-retired target must be rejected");
+        assert_eq!(
+            err,
+            ConsolidationErrorV1::TargetAlreadySuperseded(first.fact_id.clone())
+        );
+        assert_eq!(store.get(&first.fact_id).unwrap().superseded_by, original_edge);
+        assert_eq!(store.fact_history("default", "proj", "status").len(), 2);
+
+        assert!(store.clear_superseded("default", &first.fact_id));
+        let err = store
+            .consolidate_facts_v1(
+                "default",
+                ConsolidationRequestV1 {
+                    consolidation_id: "con-duplicate".to_string(),
+                    entity: "proj".to_string(),
+                    key: "status".to_string(),
+                    canonical_value: "settled".to_string(),
+                    target_fact_ids: vec![second.fact_id.clone(), second.fact_id.clone()],
+                    protected_fact_ids: vec![],
+                    confidence: 0.5,
+                    source_receipt: None,
+                    actor: None,
+                    horizon_class: None,
+                    protected_confidence_floor: 0.99,
+                },
+            )
+            .expect_err("duplicate target set must be rejected");
+        assert_eq!(err, ConsolidationErrorV1::DuplicateTarget(second.fact_id.clone()));
+        assert_eq!(store.fact_history("default", "proj", "status").len(), 2);
     }
 
     #[test]
@@ -2957,19 +3648,22 @@ mod tests {
         store.facts.get_mut(&control.fact_id).unwrap().private = false;
 
         let err = store
-            .consolidate_facts_v1(ConsolidationRequestV1 {
-                consolidation_id: "con-control-guard".to_string(),
-                entity: "__passport__::legacy".to_string(),
-                key: "record".to_string(),
-                canonical_value: r#"{"tier":"operator"}"#.to_string(),
-                target_fact_ids: vec![control.fact_id.clone()],
-                protected_fact_ids: vec![],
-                confidence: 0.2,
-                source_receipt: None,
-                actor: Some("operator".to_string()),
-                horizon_class: None,
-                protected_confidence_floor: 0.99,
-            })
+            .consolidate_facts_v1(
+                "default",
+                ConsolidationRequestV1 {
+                    consolidation_id: "con-control-guard".to_string(),
+                    entity: "__passport__::legacy".to_string(),
+                    key: "record".to_string(),
+                    canonical_value: r#"{"tier":"operator"}"#.to_string(),
+                    target_fact_ids: vec![control.fact_id.clone()],
+                    protected_fact_ids: vec![],
+                    confidence: 0.2,
+                    source_receipt: None,
+                    actor: Some("operator".to_string()),
+                    horizon_class: None,
+                    protected_confidence_floor: 0.99,
+                },
+            )
             .expect_err("daemon control targets are protected independently of privacy");
         assert_eq!(
             err,
@@ -3007,7 +3701,7 @@ mod tests {
             actor: None,
         });
         // storing b auto-superseded a via the version chain; reactivate it.
-        store.clear_superseded(&a.fact_id);
+        store.clear_superseded("default", &a.fact_id);
         (a.fact_id, b.fact_id)
     }
 
@@ -3032,7 +3726,7 @@ mod tests {
         let mut store = FactStore::new();
         let (a, b) = seed_two_active(&mut store);
         let report = store
-            .consolidate_facts_v1(consolidate_req(&a, &b))
+            .consolidate_facts_v1("default", consolidate_req(&a, &b))
             .expect("consolidate");
         let cid = report.receipt.canonical_fact_id.clone();
         // The receipt carries the after-side hash for the signed diff.
@@ -3042,7 +3736,7 @@ mod tests {
         assert_eq!(store.get(&a).unwrap().superseded_by.as_deref(), Some(cid.as_str()));
         assert_eq!(store.get(&b).unwrap().superseded_by.as_deref(), Some(cid.as_str()));
         // History preserved (nothing hard-deleted).
-        assert_eq!(store.fact_history("proj", "status").len(), 3);
+        assert_eq!(store.fact_history("default", "proj", "status").len(), 3);
     }
 
     #[test]
@@ -3053,7 +3747,7 @@ mod tests {
             let mut store = FactStore::with_persistence(dir.path()).unwrap();
             let (fa, fb) = seed_two_active(&mut store);
             let report = store
-                .consolidate_facts_v1(consolidate_req(&fa, &fb))
+                .consolidate_facts_v1("default", consolidate_req(&fa, &fb))
                 .expect("consolidate");
             (a, b, cid) = (fa, fb, report.receipt.canonical_fact_id);
         }
@@ -3069,11 +3763,42 @@ mod tests {
         let mut store = FactStore::new();
         let (a, b) = seed_two_active(&mut store);
         let report = store
-            .consolidate_facts_v1(consolidate_req(&a, &b))
+            .consolidate_facts_v1("default", consolidate_req(&a, &b))
             .expect("consolidate");
         let cid = report.receipt.canonical_fact_id.clone();
+        assert!(
+            !store.delete("default", &cid),
+            "generic delete must not strand consolidation sources"
+        );
+        assert!(
+            !store.try_delete("default", &cid).unwrap(),
+            "journaled generic delete must require dedicated undo"
+        );
+        assert!(store.get(&cid).is_some());
+        assert_eq!(store.get(&a).unwrap().superseded_by.as_deref(), Some(cid.as_str()));
+        assert_eq!(store.get(&b).unwrap().superseded_by.as_deref(), Some(cid.as_str()));
+        assert!(
+            !store.try_delete("default", &a).unwrap(),
+            "generic delete must not remove an active consolidation source"
+        );
+        let unrelated = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "other".to_string(),
+            key: "status".to_string(),
+            value: "new".to_string(),
+            source_receipt: None,
+            confidence: 0.2,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        assert!(
+            !store.mark_superseded("default", &a, &unrelated.fact_id),
+            "generic re-retirement must not rewrite consolidation provenance"
+        );
+        assert_eq!(store.get(&a).unwrap().superseded_by.as_deref(), Some(cid.as_str()));
         let undo = store
-            .consolidate_undo_v1(&cid, &report.receipt.source_fact_ids)
+            .consolidate_undo_v1("default", &cid, &report.receipt.source_fact_ids)
             .expect("undo");
         assert_eq!(undo.status, "undone");
         // Canonical retired, sources restored (active again).
@@ -3083,18 +3808,123 @@ mod tests {
     }
 
     #[test]
+    fn consolidate_undo_rejects_arbitrary_canonical_and_inexact_sources() {
+        let mut store = FactStore::new();
+        let ordinary = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "ordinary".to_string(),
+            key: "value".to_string(),
+            value: "keep".to_string(),
+            source_receipt: Some("consolidation:forged".to_string()),
+            confidence: 0.4,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        let empty_err = store
+            .consolidate_undo_v1("default", &ordinary.fact_id, &[])
+            .expect_err("empty source set must never delete a fact");
+        assert_eq!(empty_err, ConsolidationErrorV1::NoUndoSources);
+        let err = store
+            .consolidate_undo_v1("default", &ordinary.fact_id, &["f_bogus".to_string()])
+            .expect_err("ordinary fact is not an undo canonical");
+        assert_eq!(
+            err,
+            ConsolidationErrorV1::NotConsolidationCanonical(ordinary.fact_id.clone())
+        );
+        assert!(store.get(&ordinary.fact_id).is_some());
+
+        let (a, b) = seed_two_active(&mut store);
+        let report = store
+            .consolidate_facts_v1("default", consolidate_req(&a, &b))
+            .expect("consolidate");
+        let cid = report.receipt.canonical_fact_id;
+        let err = store
+            .consolidate_undo_v1("default", &cid, std::slice::from_ref(&a))
+            .expect_err("partial source set must not delete the canonical");
+        assert_eq!(err, ConsolidationErrorV1::UndoSourceMismatch(cid.clone()));
+        assert!(store.get(&cid).is_some());
+        assert_eq!(store.get(&a).unwrap().superseded_by.as_deref(), Some(cid.as_str()));
+        assert_eq!(store.get(&b).unwrap().superseded_by.as_deref(), Some(cid.as_str()));
+    }
+
+    #[test]
+    fn consolidate_undo_rejects_corrupt_deleted_or_superseded_canonical() {
+        let mut store = FactStore::new();
+        let (a, b) = seed_two_active(&mut store);
+        let report = store
+            .consolidate_facts_v1("default", consolidate_req(&a, &b))
+            .expect("consolidate");
+        let cid = report.receipt.canonical_fact_id.clone();
+        store.facts.get_mut(&cid).unwrap().deleted = true;
+        let err = store
+            .consolidate_undo_v1("default", &cid, &report.receipt.source_fact_ids)
+            .expect_err("deleted canonical with retired sources is not already undone");
+        assert_eq!(err, ConsolidationErrorV1::UndoSourceMismatch(cid.clone()));
+
+        // Restore the canonical only to model a later same-key write.
+        store.facts.get_mut(&cid).unwrap().deleted = false;
+        let successor = store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "proj".to_string(),
+            key: "status".to_string(),
+            value: "newer".to_string(),
+            source_receipt: None,
+            confidence: 0.5,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        let err = store
+            .consolidate_undo_v1("default", &cid, &report.receipt.source_fact_ids)
+            .expect_err("superseded canonical cannot be safely undone");
+        assert_eq!(err, ConsolidationErrorV1::CanonicalSuperseded(cid.clone()));
+        assert_eq!(
+            store.get(&cid).unwrap().superseded_by.as_deref(),
+            Some(successor.fact_id.as_str())
+        );
+        assert_eq!(store.get(&a).unwrap().superseded_by.as_deref(), Some(cid.as_str()));
+        assert_eq!(store.get(&b).unwrap().superseded_by.as_deref(), Some(cid.as_str()));
+    }
+
+    #[test]
+    fn consolidation_and_undo_reject_cross_tenant_ids() {
+        let mut store = FactStore::new();
+        let (a, b) = seed_two_active(&mut store);
+        let err = store
+            .consolidate_facts_v1("tenant-b", consolidate_req(&a, &b))
+            .expect_err("tenant-b cannot consolidate default facts");
+        assert_eq!(err, ConsolidationErrorV1::TargetNotFound(a.clone()));
+
+        let report = store
+            .consolidate_facts_v1("default", consolidate_req(&a, &b))
+            .expect("default consolidation");
+        let err = store
+            .consolidate_undo_v1(
+                "tenant-b",
+                &report.receipt.canonical_fact_id,
+                &report.receipt.source_fact_ids,
+            )
+            .expect_err("tenant-b cannot undo default consolidation");
+        assert_eq!(
+            err,
+            ConsolidationErrorV1::TargetNotFound(report.receipt.canonical_fact_id)
+        );
+    }
+
+    #[test]
     fn consolidate_undo_is_idempotent() {
         let mut store = FactStore::new();
         let (a, b) = seed_two_active(&mut store);
         let report = store
-            .consolidate_facts_v1(consolidate_req(&a, &b))
+            .consolidate_facts_v1("default", consolidate_req(&a, &b))
             .expect("consolidate");
         let cid = report.receipt.canonical_fact_id.clone();
         store
-            .consolidate_undo_v1(&cid, &report.receipt.source_fact_ids)
+            .consolidate_undo_v1("default", &cid, &report.receipt.source_fact_ids)
             .unwrap();
         let again = store
-            .consolidate_undo_v1(&cid, &report.receipt.source_fact_ids)
+            .consolidate_undo_v1("default", &cid, &report.receipt.source_fact_ids)
             .unwrap();
         assert_eq!(again.status, "already_undone");
         assert!(again.restored_fact_ids.is_empty());
@@ -3108,11 +3938,11 @@ mod tests {
             let mut store = FactStore::with_persistence(dir.path()).unwrap();
             let (fa, fb) = seed_two_active(&mut store);
             let report = store
-                .consolidate_facts_v1(consolidate_req(&fa, &fb))
+                .consolidate_facts_v1("default", consolidate_req(&fa, &fb))
                 .expect("consolidate");
             let c = report.receipt.canonical_fact_id.clone();
             store
-                .consolidate_undo_v1(&c, &report.receipt.source_fact_ids)
+                .consolidate_undo_v1("default", &c, &report.receipt.source_fact_ids)
                 .expect("undo");
             (a, b, cid) = (fa, fb, c);
         }
@@ -3123,6 +3953,120 @@ mod tests {
             "restore survives restart"
         );
         assert!(store.get(&b).unwrap().superseded_by.is_none());
+    }
+
+    #[test]
+    fn consolidation_provenance_survives_compaction_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, cid, sources);
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let (fa, fb) = seed_two_active(&mut store);
+            let report = store
+                .consolidate_facts_v1("default", consolidate_req(&fa, &fb))
+                .expect("consolidate");
+            cid = report.receipt.canonical_fact_id;
+            sources = report.receipt.source_fact_ids;
+            (a, b) = (fa, fb);
+            store.compact_journal().expect("compact");
+        }
+        let mut reopened = FactStore::with_persistence(dir.path()).unwrap();
+        let undo = reopened
+            .consolidate_undo_v1("default", &cid, &sources)
+            .expect("compacted provenance authorizes exact undo");
+        assert_eq!(undo.status, "undone");
+        assert!(reopened.get(&cid).is_none());
+        assert!(reopened.get(&a).unwrap().superseded_by.is_none());
+        assert!(reopened.get(&b).unwrap().superseded_by.is_none());
+    }
+
+    #[test]
+    fn replay_rejects_colliding_or_partial_consolidation_events_atomically() {
+        fn fixed_fact(id: &str, tenant: &str, value: &str) -> Fact {
+            let mut store = FactStore::new();
+            let mut fact = store.store(StoreFact {
+                tenant_hash: tenant.to_string(),
+                entity: "proj".to_string(),
+                key: "status".to_string(),
+                value: value.to_string(),
+                source_receipt: None,
+                confidence: 0.2,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+            fact.fact_id = id.to_string();
+            fact.version = 1;
+            fact.supersedes = None;
+            fact.superseded_by = None;
+            fact
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let writer = FactStore::with_persistence(dir.path()).unwrap();
+        let tenant_a = fixed_fact("f_collision", "tenant-a", "tenant-a");
+        let source = fixed_fact("f_source", "tenant-b", "source");
+        let mut colliding_canonical = fixed_fact("f_collision", "tenant-b", "canonical");
+        colliding_canonical.version = 2;
+        colliding_canonical.supersedes = Some(source.fact_id.clone());
+        writer
+            .append_journal(&JournalEvent::Store { fact: tenant_a.clone() })
+            .unwrap();
+        writer
+            .append_journal(&JournalEvent::Store { fact: source.clone() })
+            .unwrap();
+        writer
+            .append_journal(&JournalEvent::Consolidate {
+                canonical: colliding_canonical,
+                superseded_fact_ids: vec![source.fact_id.clone()],
+                consolidated_at: Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+
+        let partial_canonical = fixed_fact("f_partial_canonical", "tenant-b", "partial");
+        writer
+            .append_journal(&JournalEvent::Consolidate {
+                canonical: partial_canonical,
+                superseded_fact_ids: vec![source.fact_id.clone(), "f_missing".to_string()],
+                consolidated_at: Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        drop(writer);
+
+        let replayed = FactStore::with_persistence(dir.path()).unwrap();
+        assert_eq!(replayed.get("f_collision").unwrap().tenant_hash, "tenant-a");
+        assert!(replayed.get("f_partial_canonical").is_none());
+        assert!(replayed.get(&source.fact_id).unwrap().superseded_by.is_none());
+        assert!(
+            !replayed.consolidation_sources.contains_key("f_collision")
+                && !replayed.consolidation_sources.contains_key("f_partial_canonical")
+        );
+    }
+
+    #[test]
+    fn replay_rejects_partial_consolidation_undo_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, cid);
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let (fa, fb) = seed_two_active(&mut store);
+            let report = store
+                .consolidate_facts_v1("default", consolidate_req(&fa, &fb))
+                .unwrap();
+            cid = report.receipt.canonical_fact_id;
+            (a, b) = (fa, fb);
+            store
+                .append_journal(&JournalEvent::ConsolidateUndo {
+                    canonical_fact_id: cid.clone(),
+                    restored_fact_ids: vec![a.clone()],
+                    undone_at: Utc::now().to_rfc3339(),
+                })
+                .unwrap();
+        }
+        let replayed = FactStore::with_persistence(dir.path()).unwrap();
+        assert!(replayed.get(&cid).is_some());
+        assert_eq!(replayed.get(&a).unwrap().superseded_by.as_deref(), Some(cid.as_str()));
+        assert_eq!(replayed.get(&b).unwrap().superseded_by.as_deref(), Some(cid.as_str()));
     }
 
     #[test]
@@ -3142,7 +4086,7 @@ mod tests {
         });
 
         assert_eq!(store.count(), 1);
-        store.delete(&fact.fact_id);
+        store.delete("default", &fact.fact_id);
         assert_eq!(store.count(), 0);
         assert!(store.get(&fact.fact_id).is_none());
     }
@@ -3213,7 +4157,7 @@ mod tests {
             actor: None,
         });
 
-        store.delete(&f1.fact_id);
+        store.delete("default", &f1.fact_id);
         let results = store.get_by_entity("proj");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "status");
@@ -3441,7 +4385,7 @@ mod tests {
     #[test]
     fn delete_nonexistent_returns_false() {
         let mut store = FactStore::new();
-        assert!(!store.delete("nonexistent_id"));
+        assert!(!store.delete("default", "nonexistent_id"));
     }
 
     #[test]
@@ -3498,16 +4442,183 @@ mod tests {
             as_of: None,
             token_budget: None,
         };
-        let c = store.aggregate_v1(&req(AggregateOp::Count));
+        let c = store.aggregate_v1("default", &req(AggregateOp::Count));
         assert_eq!(c.value, serde_json::json!(4));
         assert_eq!(c.llm_calls, 0);
 
-        let s = store.aggregate_v1(&req(AggregateOp::SumNumeric));
+        let s = store.aggregate_v1("default", &req(AggregateOp::SumNumeric));
         assert_eq!(s.value, serde_json::json!(1550.5)); // 100 + 150.5 + 1200 + 100
         assert_eq!(s.llm_calls, 0);
 
-        let d = store.aggregate_v1(&req(AggregateOp::Distinct));
+        let d = store.aggregate_v1("default", &req(AggregateOp::Distinct));
         assert_eq!(d.value, serde_json::json!(3)); // {100, 150.5, 1200}
+    }
+
+    #[test]
+    fn tenant_version_chains_history_and_mutations_are_isolated() {
+        let mut store = FactStore::new();
+        let a1 = store.store(tenant_fact("tenant-a", "project", "status", "draft-a"));
+        let b1 = store.store(tenant_fact("tenant-b", "project", "status", "draft-b"));
+        let a2 = store.store(tenant_fact("tenant-a", "project", "status", "active-a"));
+
+        assert_eq!((a1.version, b1.version, a2.version), (1, 1, 2));
+        assert_eq!(a2.supersedes.as_deref(), Some(a1.fact_id.as_str()));
+        assert_eq!(
+            store.get(&a1.fact_id).and_then(|fact| fact.superseded_by.as_deref()),
+            Some(a2.fact_id.as_str())
+        );
+        assert!(store.get(&b1.fact_id).unwrap().superseded_by.is_none());
+
+        assert_eq!(store.fact_history("tenant-a", "project", "status").len(), 2);
+        assert_eq!(store.fact_history("tenant-b", "project", "status").len(), 1);
+        assert!(!store.mark_superseded("tenant-b", &b1.fact_id, &a2.fact_id));
+        assert!(!store.clear_superseded("tenant-b", &a1.fact_id));
+        assert!(!store.delete("tenant-b", &a1.fact_id));
+        assert!(!store.get(&a1.fact_id).unwrap().deleted);
+
+        let latest = dedup_latest(vec![a1, a2, b1]);
+        assert_eq!(latest.len(), 2, "dedup must retain one row per tenant");
+    }
+
+    #[test]
+    fn tenant_aggregate_count_sum_and_distinct_are_isolated() {
+        let mut store = FactStore::new();
+        for (tenant, entity, value) in [
+            ("tenant-a", "metric:a1", "10"),
+            ("tenant-a", "metric:a2", "20"),
+            ("tenant-a", "metric:a3", "10"),
+            ("tenant-b", "metric:b1", "999"),
+        ] {
+            store.store(tenant_fact(tenant, entity, "amount", value));
+        }
+        let request = |op| AggregateRequestV1 {
+            op,
+            entity: None,
+            key: Some("amount".to_string()),
+            query: None,
+            as_of: None,
+            token_budget: None,
+        };
+
+        assert_eq!(
+            store.aggregate_v1("tenant-a", &request(AggregateOp::Count)).value,
+            serde_json::json!(3)
+        );
+        assert_eq!(
+            store.aggregate_v1("tenant-a", &request(AggregateOp::SumNumeric)).value,
+            serde_json::json!(40.0)
+        );
+        assert_eq!(
+            store.aggregate_v1("tenant-a", &request(AggregateOp::Distinct)).value,
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            store.aggregate_v1("tenant-b", &request(AggregateOp::Count)).value,
+            serde_json::json!(1)
+        );
+    }
+
+    #[test]
+    fn temporal_diff_walks_only_public_live_structural_tenant_chain() {
+        let mut store = FactStore::new();
+        store.store(tenant_fact("tenant-a", "metric:price", "usd", "10"));
+        store.store(tenant_fact("tenant-a", "metric:price", "usd", "25"));
+        store.store(tenant_fact("tenant-b", "metric:price", "usd", "100"));
+        store.store(tenant_fact("tenant-b", "metric:price", "usd", "175"));
+        let request = AggregateRequestV1 {
+            op: AggregateOp::TemporalDiff,
+            entity: Some("metric:price".to_string()),
+            key: Some("usd".to_string()),
+            query: None,
+            as_of: None,
+            token_budget: None,
+        };
+
+        assert_eq!(store.aggregate_v1("tenant-a", &request).value, serde_json::json!(15.0));
+        assert_eq!(store.aggregate_v1("tenant-b", &request).value, serde_json::json!(75.0));
+
+        let private_head = store.store(StoreFact {
+            private: true,
+            ..tenant_fact("tenant-a", "metric:price", "usd", "1000")
+        });
+        assert!(private_head.private);
+        assert_eq!(
+            store.aggregate_v1("tenant-a", &request).value,
+            serde_json::Value::Null,
+            "a private current endpoint must not reveal its public predecessor"
+        );
+    }
+
+    #[test]
+    fn restart_rebuilds_partitioned_chains_and_sanitizes_cross_tenant_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a1_id, a2_id, b1_id, crafted_id) = {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let a1 = store.store(tenant_fact("tenant-a", "project", "status", "a1"));
+            let b1 = store.store(tenant_fact("tenant-b", "project", "status", "b1"));
+            let a2 = store.store(tenant_fact("tenant-a", "project", "status", "a2"));
+
+            store
+                .append_journal(&JournalEvent::Supersede {
+                    fact_id: a1.fact_id.clone(),
+                    by_fact_id: b1.fact_id.clone(),
+                    superseded_at: Utc::now().to_rfc3339(),
+                })
+                .unwrap();
+
+            let mut crafted = b1.clone();
+            crafted.fact_id = "f_cross_tenant_legacy_link".to_string();
+            crafted.version = 9;
+            crafted.supersedes = Some(a1.fact_id.clone());
+            crafted.superseded_by = Some(a2.fact_id.clone());
+            assert!(store.store_synced(crafted.clone()));
+            assert!(
+                store.get(&crafted.fact_id).unwrap().supersedes.is_none(),
+                "synced cross-tenant predecessor must be cleared immediately"
+            );
+            assert!(
+                store.get(&crafted.fact_id).unwrap().superseded_by.is_none(),
+                "synced cross-tenant successor must be cleared immediately"
+            );
+
+            (a1.fact_id, a2.fact_id, b1.fact_id, crafted.fact_id)
+        };
+
+        let store = FactStore::with_persistence(dir.path()).unwrap();
+        let a_history = store.fact_history("tenant-a", "project", "status");
+        let b_history = store.fact_history("tenant-b", "project", "status");
+        assert_eq!(
+            a_history.iter().map(|fact| fact.version).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            b_history.iter().map(|fact| fact.version).collect::<Vec<_>>(),
+            vec![1, 9],
+            "persisted versions are preserved, not renumbered"
+        );
+        assert_eq!(
+            store.get(&a1_id).unwrap().superseded_by.as_deref(),
+            Some(a2_id.as_str()),
+            "malicious later cross-tenant event must not replace the valid edge"
+        );
+        assert!(store.get(&b1_id).unwrap().superseded_by.is_none());
+        assert!(
+            store.get(&crafted_id).unwrap().supersedes.is_none(),
+            "legacy cross-tenant predecessor edge must be sanitized"
+        );
+    }
+
+    #[test]
+    fn synced_fact_id_collision_cannot_overwrite_another_tenant() {
+        let mut store = FactStore::new();
+        let original = store.store(tenant_fact("tenant-a", "project", "status", "a"));
+        let mut collision = original.clone();
+        collision.tenant_hash = "tenant-b".to_string();
+        collision.value = "attacker".to_string();
+
+        assert!(!store.store_synced(collision));
+        assert_eq!(store.get(&original.fact_id).unwrap().tenant_hash, "tenant-a");
+        assert_eq!(store.get(&original.fact_id).unwrap().value, "a");
     }
 
     #[test]
@@ -3515,14 +4626,17 @@ mod tests {
         let store = seed_aggregate_corpus();
         // A tiny budget scans only the first candidate(s); the count is bounded
         // and the result is flagged truncated (honest, bounded cost).
-        let r = store.aggregate_v1(&AggregateRequestV1 {
-            op: AggregateOp::Count,
-            entity: None,
-            key: Some("sales_amount".into()),
-            query: None,
-            as_of: None,
-            token_budget: Some(1),
-        });
+        let r = store.aggregate_v1(
+            "default",
+            &AggregateRequestV1 {
+                op: AggregateOp::Count,
+                entity: None,
+                key: Some("sales_amount".into()),
+                query: None,
+                as_of: None,
+                token_budget: Some(1),
+            },
+        );
         assert!(r.budget_truncated, "tiny budget must truncate the scan");
         assert!(r.matched < 4, "budget-limited count is below the full 4");
         assert!(r.tokens_scanned <= 1 + store.get_by_entity("metric:jan").first().map(|f| f.tokens).unwrap_or(0));
@@ -3544,14 +4658,17 @@ mod tests {
         };
         store.store(base("10"));
         store.store(base("25")); // v2 supersedes v1 in the chain; both in history
-        let r = store.aggregate_v1(&AggregateRequestV1 {
-            op: AggregateOp::TemporalDiff,
-            entity: Some("metric:price".into()),
-            key: Some("usd".into()),
-            query: None,
-            as_of: None, // diff current vs oldest
-            token_budget: None,
-        });
+        let r = store.aggregate_v1(
+            "default",
+            &AggregateRequestV1 {
+                op: AggregateOp::TemporalDiff,
+                entity: Some("metric:price".into()),
+                key: Some("usd".into()),
+                query: None,
+                as_of: None, // diff current vs oldest
+                token_budget: None,
+            },
+        );
         assert_eq!(r.value, serde_json::json!(15.0)); // 25 - 10
     }
 
@@ -3854,7 +4971,7 @@ mod tests {
                 actor: None,
             });
             fact_id = fact.fact_id;
-            store.delete(&fact_id);
+            store.delete("default", &fact_id);
             assert_eq!(store.count(), 0);
         }
 
@@ -3904,7 +5021,7 @@ mod tests {
             });
             deleted_id = to_delete.fact_id;
             live_id = to_keep.fact_id;
-            store.delete(&deleted_id);
+            store.delete("default", &deleted_id);
 
             // Pre-compaction: the deleted value IS still on disk (the leak).
             let raw = std::fs::read_to_string(&journal).unwrap();
@@ -3970,7 +5087,7 @@ mod tests {
         }
         {
             let store = FactStore::with_persistence(dir.path()).unwrap();
-            let history = store.fact_history("proj", "status");
+            let history = store.fact_history("default", "proj", "status");
             assert_eq!(history.len(), 2, "version chain lost after compaction");
             assert_eq!(history[0].version, 1);
             assert_eq!(history[1].version, 2);
@@ -4072,7 +5189,7 @@ mod tests {
 
         {
             let store = FactStore::with_persistence(dir.path()).unwrap();
-            let history = store.fact_history("proj", "status");
+            let history = store.fact_history("default", "proj", "status");
             assert_eq!(history.len(), 2);
             assert_eq!(history[0].version, 1);
             assert_eq!(history[0].value, "draft");
@@ -4235,7 +5352,7 @@ mod tests {
             horizon_class: None,
             actor: None,
         });
-        store.delete("nonexistent");
+        store.delete("default", "nonexistent");
 
         assert!(!journal_path.exists(), "in-memory mode should not create journal files");
     }
@@ -4315,6 +5432,31 @@ mod tests {
         assert_eq!(all_ids.len(), 5);
         let deduped: std::collections::HashSet<_> = all_ids.iter().collect();
         assert_eq!(deduped.len(), 5);
+    }
+
+    #[test]
+    fn tenant_export_filters_before_cursor_and_limit() {
+        let mut store = FactStore::new();
+        store.store(tenant_fact("tenant-b", "b1", "k", "foreign-first"));
+        let a1 = store.store(tenant_fact("tenant-a", "a1", "k", "a-first"));
+        store.store(tenant_fact("tenant-b", "b2", "k", "foreign-middle"));
+        let a2 = store.store(tenant_fact("tenant-a", "a2", "k", "a-second"));
+
+        let page1 = store.export_for_tenant("tenant-a", None, None, 1);
+        assert_eq!(
+            page1.facts.iter().map(|fact| &fact.fact_id).collect::<Vec<_>>(),
+            vec![&a1.fact_id]
+        );
+        assert!(page1.has_more);
+        assert_eq!(page1.next_cursor.as_deref(), Some(a1.fact_id.as_str()));
+
+        let page2 = store.export_for_tenant("tenant-a", None, page1.next_cursor.as_deref(), 1);
+        assert_eq!(
+            page2.facts.iter().map(|fact| &fact.fact_id).collect::<Vec<_>>(),
+            vec![&a2.fact_id]
+        );
+        assert!(!page2.has_more);
+        assert!(page2.next_cursor.is_none());
     }
 
     #[test]
@@ -4411,7 +5553,7 @@ mod tests {
             actor: None,
         });
 
-        store.delete(&f1.fact_id);
+        store.delete("default", &f1.fact_id);
 
         let result = store.export(None, None, 100);
 
@@ -4458,18 +5600,18 @@ mod tests {
 
         assert!(store.get(&old.fact_id).unwrap().superseded_by.is_none());
         // mark
-        assert!(store.mark_superseded(&old.fact_id, &new.fact_id));
+        assert!(store.mark_superseded("default", &old.fact_id, &new.fact_id));
         assert_eq!(
             store.get(&old.fact_id).unwrap().superseded_by.as_deref(),
             Some(new.fact_id.as_str())
         );
         // clear (reversible)
-        assert!(store.clear_superseded(&old.fact_id));
+        assert!(store.clear_superseded("default", &old.fact_id));
         assert!(store.get(&old.fact_id).unwrap().superseded_by.is_none());
 
         // nonexistent target -> false, no panic.
-        assert!(!store.mark_superseded("f_nope", &new.fact_id));
-        assert!(!store.clear_superseded("f_nope"));
+        assert!(!store.mark_superseded("default", "f_nope", &new.fact_id));
+        assert!(!store.clear_superseded("default", "f_nope"));
     }
 
     #[test]
@@ -4500,7 +5642,20 @@ mod tests {
                 horizon_class: None,
                 actor: None,
             });
-            assert!(store.mark_superseded(&old.fact_id, &new.fact_id));
+            assert!(store.mark_superseded("default", &old.fact_id, &new.fact_id));
+            let mut sync_trigger = new.clone();
+            sync_trigger.fact_id = "f_cross_entity_sync_sanitizer_trigger".to_string();
+            sync_trigger.entity = "sync-trigger".to_string();
+            sync_trigger.key = "k".to_string();
+            sync_trigger.version = 1;
+            sync_trigger.supersedes = None;
+            sync_trigger.superseded_by = None;
+            assert!(store.store_synced(sync_trigger));
+            assert_eq!(
+                store.get(&old.fact_id).unwrap().superseded_by.as_deref(),
+                Some(new.fact_id.as_str()),
+                "sync sanitization must preserve valid same-tenant cross-entity retirement"
+            );
             old_id = old.fact_id;
             new_id = new.fact_id;
         }
@@ -4543,9 +5698,9 @@ mod tests {
                 horizon_class: None,
                 actor: None,
             });
-            store.mark_superseded(&old.fact_id, &new.fact_id);
+            store.mark_superseded("default", &old.fact_id, &new.fact_id);
             // Now reverse it; the clear must also persist (not just the mark).
-            assert!(store.clear_superseded(&old.fact_id));
+            assert!(store.clear_superseded("default", &old.fact_id));
             old_id = old.fact_id;
         }
         {
@@ -4899,7 +6054,7 @@ mod tests {
             horizon_class: Some(HorizonClass::None),
             actor: None,
         });
-        store.delete(&f.fact_id);
+        store.delete("default", &f.fact_id);
         // A tombstoned fact is not a recall target.
         assert_eq!(store.record_access(&[f.fact_id.as_str()]), 0);
     }
@@ -5018,7 +6173,7 @@ mod tests {
         // Delete the cursor fact (v4). The cursor carries the ordering key, not
         // a position, so the next page must still resume at v3 with no dupe.
         let v4_id = page1.facts[1].fact_id.clone();
-        store.delete(&v4_id);
+        store.delete("default", &v4_id);
         let page2 = store.list_page(Some(&cursor), 2, true, |_| true);
         assert_eq!(page2.facts[0].value, "v3");
         assert_eq!(page2.facts[1].value, "v2");
@@ -5045,11 +6200,11 @@ mod tests {
         store.store(priv_req);
         // Deleted fact — never listed.
         let del_id = store_at(&mut store, "note", "gone", "deleted-value", 2000);
-        store.delete(&del_id);
+        store.delete("default", &del_id);
         // Superseded fact.
         let old_id = store_at(&mut store, "note", "retired", "old", 3000);
         let new_id = store_at(&mut store, "note", "current", "new", 4000);
-        store.mark_superseded(&old_id, &new_id);
+        store.mark_superseded("default", &old_id, &new_id);
 
         // Default (include_superseded=true): public + current + old(retired) = 3.
         let page = store.list_page(None, 100, true, |_| true);

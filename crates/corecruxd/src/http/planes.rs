@@ -7,8 +7,8 @@
 //! tenants, and layers.
 //!
 //! All routes scope under `/v1/projects/{id}/planes/...`. Reads need
-//! `admin:read`; mutations need `admin:read` for member/tenant changes (same
-//! posture as the parent project routes) and `facts:write` for layer writes.
+//! `admin:read`; structural mutations need `admin:write`, while layer writes
+//! use their dedicated `facts:write` contract.
 
 use super::{problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, State, StatusCode};
 
@@ -106,7 +106,7 @@ pub(super) async fn post_plane(
     headers: HeaderMap,
     Json(body): Json<CreatePlaneBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -138,7 +138,7 @@ pub(super) async fn delete_plane(
     Path((project_id, plane_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -158,7 +158,7 @@ pub(super) async fn post_plane_member(
     headers: HeaderMap,
     Json(body): Json<PlaneMemberBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -184,7 +184,7 @@ pub(super) async fn delete_plane_member(
     Path((project_id, plane_id, passport_id)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -203,7 +203,7 @@ pub(super) async fn post_plane_tenant(
     headers: HeaderMap,
     Json(body): Json<PlaneTenantBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -229,7 +229,7 @@ pub(super) async fn delete_plane_tenant(
     Path((project_id, plane_id, tenant_id)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;

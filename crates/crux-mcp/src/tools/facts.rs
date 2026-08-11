@@ -232,7 +232,7 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
     };
 
     let mut req = StoreFact {
-        tenant_hash: tenant_hash_for_write_context(ctx),
+        tenant_hash: ctx.scope_tenant(),
         entity,
         key: key.to_string(),
         value: value.to_string(),
@@ -284,11 +284,17 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
     // Validate every cross-entity retirement before the new fact is stored.
     // This keeps the operation atomic on bad references and prevents a generic
     // writer from retiring a legacy daemon control row by fact_id.
+    let tenant_hash = ctx.scope_tenant();
     let mut bad_refs = Vec::new();
     let mut reserved_refs = Vec::new();
+    let mut consolidation_refs = Vec::new();
     for fact_id in &supersedes_refs {
-        match store.get(fact_id) {
+        match store.get_for_tenant(fact_id, &tenant_hash) {
             Some(target) if scope::fact_visible_to_identity(target, scope_id_ref, &alias_refs) => {
+                if store.is_active_consolidation_source_for_tenant(fact_id, &tenant_hash) {
+                    consolidation_refs.push(fact_id.clone());
+                    continue;
+                }
                 let policy_entity = scope::visible_entity_for_identity(target, scope_id_ref, &alias_refs)
                     .unwrap_or_else(|| target.entity.clone());
                 if let Some(prefix) = corecrux_memory::fact_privacy::daemon_owned_entity_prefix(&policy_entity) {
@@ -301,6 +307,17 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
             }
             _ => bad_refs.push(fact_id.clone()),
         }
+    }
+    if !consolidation_refs.is_empty() {
+        return Err(JsonRpcError {
+            code: crate::dispatch::CAPABILITY_DENIED,
+            message: "active consolidation source edges are immutable until dedicated undo".to_string(),
+            data: Some(json!({
+                "error_code": "CONSOLIDATION_SOURCE_REQUIRES_UNDO",
+                "param": "supersedes",
+                "fact_ids": consolidation_refs,
+            })),
+        });
     }
     if !reserved_refs.is_empty() {
         return Err(JsonRpcError {
@@ -333,7 +350,7 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
     let mut superseded_ok: Vec<String> = Vec::new();
     if !supersedes_refs.is_empty() {
         for r in &supersedes_refs {
-            if store.mark_superseded(r, &fact.fact_id) {
+            if store.mark_superseded(&tenant_hash, r, &fact.fact_id) {
                 superseded_ok.push(r.clone());
             }
         }
@@ -370,14 +387,6 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
     }))
 }
 
-/// Resolve the trusted tenant stamp for an MCP write.
-///
-/// Authenticated MCP context has no tenant claim yet, so current deployments
-/// resolve to `default`. When one is added, only this helper needs to change.
-fn tenant_hash_for_write_context(_ctx: &McpContext) -> String {
-    corecrux_memory::fact_store::default_tenant_hash()
-}
-
 /// `fact_history` — return the full version chain for a given (entity, key) pair.
 pub async fn handle_fact_history(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let entity = require_str(args, "entity")?;
@@ -387,8 +396,9 @@ pub async fn handle_fact_history(args: &Value, ctx: &McpContext) -> Result<Value
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
 
     let store = ctx.fact_store.read().await;
+    let tenant_hash = ctx.scope_tenant();
     let mut history: Vec<&Fact> = store
-        .all_facts()
+        .all_facts_for_tenant(&tenant_hash)
         .filter(|fact| fact.key == key)
         .filter(|fact| scope::entity_matches_for_identity(fact, entity, id_ref, &alias_refs))
         .filter(|fact| scope::fact_visible_to_identity(fact, id_ref, &alias_refs))
@@ -487,7 +497,7 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     let reversible = !unshaped && token_budget.is_some() && crate::crc_v1::enabled(args);
     let q = FactQuery {
         min_effective_confidence,
-        tenant_hash: None,
+        tenant_hash: Some(ctx.scope_tenant()),
         // cloned so `query`/`entity` remain available for the CRC-v1 reshape below
         query: query.clone(),
         entity: entity.clone(),
@@ -626,7 +636,8 @@ pub async fn handle_delete_fact(args: &Value, ctx: &McpContext) -> Result<Value,
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
 
     let mut store = ctx.fact_store.write().await;
-    let existing = store.get(fact_id);
+    let tenant_hash = ctx.scope_tenant();
+    let existing = store.get_for_tenant(fact_id, &tenant_hash);
     let visible_fact = existing.filter(|fact| scope::fact_visible_to_identity(fact, id_ref, &alias_refs));
     let policy_entity = visible_fact.and_then(|fact| {
         if fact.entity.starts_with(crate::scope::AGENT_PRIVATE_ENTITY_PREFIX) {
@@ -649,8 +660,20 @@ pub async fn handle_delete_fact(args: &Value, ctx: &McpContext) -> Result<Value,
             })),
         });
     }
+    if visible_fact.is_some() && store.is_consolidation_canonical_for_tenant(fact_id, &tenant_hash) {
+        return Err(JsonRpcError {
+            code: crate::dispatch::CAPABILITY_DENIED,
+            message: format!(
+                "fact {fact_id} is a consolidation canonical; use the dedicated consolidation undo surface"
+            ),
+            data: Some(json!({
+                "error_code": "CONSOLIDATION_CANONICAL_REQUIRES_UNDO",
+                "fact_id": fact_id,
+            })),
+        });
+    }
     let deleted = visible_fact.is_some()
-        && store.try_delete(fact_id).map_err(|err| JsonRpcError {
+        && store.try_delete(&tenant_hash, fact_id).map_err(|err| JsonRpcError {
             code: INTERNAL_ERROR,
             message: "fact journal append failed".to_string(),
             data: Some(json!({"error": err.to_string()})),
@@ -681,7 +704,7 @@ pub async fn handle_list_entities(_args: &Value, ctx: &McpContext) -> Result<Val
     let id_ref = identity.as_deref();
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
     let entities: Vec<String> = store
-        .all_facts()
+        .all_facts_for_tenant(&ctx.scope_tenant())
         .filter(|fact| !fact.deleted)
         .filter_map(|fact| scope::visible_entity_for_identity(fact, id_ref, &alias_refs))
         .collect::<BTreeSet<_>>()
@@ -1321,13 +1344,12 @@ mod tests {
 
     // ── agent-passport M3: attribution surfaced on read ────────────────
 
-    /// Two distinct actors (claude-work, codex-work) write facts via the
-    /// flag-ON path; a third writes with the flag OFF (legacy actor=None).
-    /// `query_facts` rows must carry the correct `actor` per fact, and the
-    /// legacy fact must show `actor: null`. Shared visibility is intact —
-    /// all three non-private facts are visible from a single shared read.
+    /// Two distinct actors (claude-work, codex-work) write facts into their
+    /// shared `work` tenant via the flag-ON path; a third writes with the flag
+    /// OFF into `default` (legacy actor=None). `query_facts` rows must carry
+    /// the correct actor without crossing the tenant boundary.
     #[tokio::test]
-    async fn query_facts_rows_carry_actor_per_writer_and_null_for_legacy() {
+    async fn query_facts_rows_carry_actor_and_preserve_tenant_isolation() {
         let map = crate::agent_passport::AgentPassportMap::builtin_default();
 
         // Shared base context (single fact store, Arc-shared by every
@@ -1380,8 +1402,9 @@ mod tests {
         .await
         .unwrap();
 
-        // Single shared read sees all three (shared visibility intact).
-        let res = handle_query_facts(&json!({"query": "needle", "token_budget": 500}), &base)
+        // A work-tenant read sees both attributed collaborators, but not the
+        // legacy fact in `default`.
+        let res = handle_query_facts(&json!({"query": "needle", "token_budget": 500}), &claude)
             .await
             .unwrap();
         let rows = res["structuredContent"]["rows"].as_array().unwrap();
@@ -1395,11 +1418,17 @@ mod tests {
 
         assert_eq!(actor_for("needle-claude"), json!("claude-work"));
         assert_eq!(actor_for("needle-codex"), json!("codex-work"));
-        // Legacy fact: actor serialized as JSON null.
-        assert_eq!(actor_for("needle-legacy"), Value::Null);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row["value"] != "needle-legacy"));
 
-        // Shared visibility re-confirmed: all three present from one read.
-        assert_eq!(rows.len(), 3);
+        // The legacy/default read sees only its own fact, with actor null.
+        let res = handle_query_facts(&json!({"query": "needle", "token_budget": 500}), &base)
+            .await
+            .unwrap();
+        let rows = res["structuredContent"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["value"], "needle-legacy");
+        assert_eq!(rows[0]["actor"], Value::Null);
     }
 
     #[tokio::test]

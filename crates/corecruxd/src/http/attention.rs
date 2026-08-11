@@ -15,7 +15,7 @@
 //! `work::merge_work_sources` — the same helpers `GET /v1/work` uses — so this
 //! endpoint cannot come to disagree with the panel it summarises.
 
-use super::{require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Query, State, StatusCode};
+use super::{AppState, HeaderMap, IntoResponse, Json, Query, State, StatusCode};
 
 fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
@@ -48,9 +48,19 @@ pub(super) async fn get_attention_summary(
     Query(q): Query<SummaryQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-        return problem.into_response();
-    }
+    // Resolved through the same context `GET /v1/work` uses, not
+    // `require_http_scopes`: the counts below are derived from work items, and
+    // those are tenant-owned. Holding `admin:read` says you may read a summary,
+    // not whose summary — without a tenant to answer for, this endpoint counted
+    // every tenant's items into one roll-up.
+    let context = match super::work::work_scope_context(&state, &headers, "admin:read") {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    let tenant_id = match context.resolve_authorized_tenant(None) {
+        Ok(tenant_id) => tenant_id,
+        Err(problem) => return problem.into_response(),
+    };
     let now = now_unix_ms();
 
     let work_query = super::work::ListWorkQuery {
@@ -59,9 +69,9 @@ pub(super) async fn get_attention_summary(
     };
 
     let store = state.fact_store.read().await;
-    let kanban = super::work::kanban_items_for_query(&store, &work_query);
-    let execplans = super::work::execplan_items_for_query(&store, &work_query);
-    let gates = crate::work::list_pending_gates(&store, None);
+    let kanban = super::work::kanban_items_for_query(&store, &work_query, &tenant_id);
+    let execplans = super::work::execplan_items_for_query(&store, &work_query, &tenant_id);
+    let gates = crate::work::list_pending_gates(&store, Some(&tenant_id), None);
     let bindings = if state.coord_enabled {
         crate::session_bindings::list_bindings(&store)
     } else {

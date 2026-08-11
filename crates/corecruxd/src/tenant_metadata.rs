@@ -110,15 +110,15 @@ pub fn set_tenant_category_override(
 #[allow(dead_code)]
 pub fn delete_tenant_category_override(store: &mut FactStore, tenant_id: &str) -> bool {
     let entity = entity_for(tenant_id);
-    let ids: Vec<String> = store
+    let ids: Vec<(String, String)> = store
         .get_by_entity(&entity)
         .into_iter()
         .filter(|f| f.key == CATEGORY_KEY)
-        .map(|f| f.fact_id.clone())
+        .map(|f| (f.tenant_hash.clone(), f.fact_id.clone()))
         .collect();
     let mut removed = false;
-    for id in ids {
-        if store.delete(&id) {
+    for (tenant_hash, id) in ids {
+        if store.delete(&tenant_hash, &id) {
             removed = true;
         }
     }
