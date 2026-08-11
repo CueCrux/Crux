@@ -5521,6 +5521,70 @@ mod tests {
         );
     }
 
+    /// The seven platform lane companions (ExecPlan
+    /// `crux-companion-vocabulary-unification-2026-08-08` M5) must survive a reopen
+    /// for the same reason `.ccxprof` must — and with a sharper edge. The CE holds
+    /// **reader-only** ports of these formats (constraint C7), so a companion the
+    /// sweep quarantines cannot be rebuilt locally at all: it has to be re-requested
+    /// from the platform. Missing one of these from the allowlist is silent data loss,
+    /// not a rebuildable cache miss.
+    #[test]
+    fn platform_lane_companions_survive_reopen() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = seal_n_segments(1);
+        let shard_dir = dir.path().join("shard-0000");
+
+        let stem = std::fs::read_dir(shard_dir.join("segments"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_str().unwrap().to_string())
+            .find(|n| n.ends_with(".ccxseg"))
+            .expect("a sealed segment")
+            .trim_end_matches(".ccxseg")
+            .to_string();
+
+        const LANE_COMPANIONS: [&str; 8] = ["ccxs", "ccxse", "ccxdi", "ccxal", "ccxn", "ccxf", "ccxev", "ccxp"];
+        for ext in LANE_COMPANIONS {
+            std::fs::write(shard_dir.join("segments").join(format!("{stem}.{ext}")), b"companion").unwrap();
+        }
+
+        let reopened = ShardStorage::open(dir.path(), 0, 1, ShardStorageOptions::default());
+        assert!(reopened.is_ok(), "reopen must succeed");
+        drop(reopened);
+
+        for ext in LANE_COMPANIONS {
+            assert!(
+                shard_dir.join("segments").join(format!("{stem}.{ext}")).exists(),
+                ".{ext} companion of a live segment must not be quarantined"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(shard_dir.join("quarantine")).unwrap().count(),
+            0,
+            "nothing belonging to a referenced segment should be swept"
+        );
+    }
+
+    /// `.ccxse` ends with the same four characters as `.ccxs` does, and `.ccxprof`
+    /// starts with `.ccxp`. The allowlist matches by whole-suffix, so neither pair
+    /// aliases — but a future switch to `contains`/`starts_with` would make them, and
+    /// the failure would look like "some companions survive" rather than a hard error.
+    #[test]
+    fn lane_companion_extensions_do_not_alias_each_other() {
+        for (name, ext) in [
+            ("seg-0001.ccxse", ".ccxs"),
+            ("seg-0001.ccxprof", ".ccxp"),
+            ("seg-0001.ccxse", ".ccxe"),
+        ] {
+            assert!(
+                name.strip_suffix(ext).is_none(),
+                "{name} must not be matched by the {ext} allowlist entry"
+            );
+        }
+        assert_eq!("seg-0001.ccxs".strip_suffix(".ccxs"), Some("seg-0001"));
+        assert_eq!("seg-0001.ccxse".strip_suffix(".ccxse"), Some("seg-0001"));
+    }
+
     /// The companions of a *retired* segment are a different case: once the
     /// segment is gone they are genuine orphans and the sweep should take them.
     #[test]

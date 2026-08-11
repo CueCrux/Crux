@@ -1606,7 +1606,17 @@ impl ShardStorage {
                 // load-at-startup). Miss it and the file is quarantined on the
                 // next open. It is why the `.ccxv`→`.ccxe` / `.ccxp`→`.ccxprof`
                 // rename had to land here in the same commit as the writers.
-                let referenced_companion = [".ccxi", ".ccxe", ".ccxprof", ".ccxatt"].iter().any(|ext| {
+                //
+                // The seven platform lane companions were added at M5 of the
+                // companion-vocabulary ExecPlan. The CE only *reads* them, but a file
+                // it cannot author is exactly the file it must not sweep: quarantining
+                // a platform-supplied companion is unrecoverable locally.
+                let referenced_companion = [
+                    ".ccxi", ".ccxe", ".ccxprof", ".ccxatt", ".ccxs", ".ccxse", ".ccxdi", ".ccxal", ".ccxn", ".ccxf",
+                    ".ccxev", ".ccxp",
+                ]
+                .iter()
+                .any(|ext| {
                     name.strip_suffix(ext)
                         .is_some_and(|stem| referenced.contains(&format!("segments/{stem}.ccxseg")))
                 });
