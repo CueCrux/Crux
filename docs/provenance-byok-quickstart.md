@@ -91,14 +91,21 @@ different questions:
 
 - `ok` means the canonical envelope signature and supplied asset binding both
   verify;
-- `identity_trusted` means the exact, currently-valid leaf certificate is in
-  the operator's `CORECRUXD_PROVENANCE_TRUSTED_LEAF_SHA256` list;
-- `chain_validated` remains false in this beta because CA-chain/root
-  validation is not implemented.
+- `identity_trusted` means the signer identity satisfied operator-pinned
+  policy: either the exact, currently-valid leaf certificate is in the
+  operator's `CORECRUXD_PROVENANCE_TRUSTED_LEAF_SHA256` list, or the
+  presented certificate chain validated to a root pinned in
+  `CORECRUXD_PROVENANCE_TRUSTED_ROOT_SHA256`;
+- `chain_validated` is true only when the CA-chain trust mode is active
+  (at least one pinned root) and the presented x5chain cryptographically
+  validated to an operator-pinned root — per-link signatures, current
+  validity, BasicConstraints/KeyUsage/EKU profiles, path length, and
+  fail-closed handling of unsupported critical extensions. It stays false
+  for this disposable self-signed sample.
 
-An exact leaf pin is a narrow operator policy, not a claim that a public CA
-validated the signer. Malformed pin configuration fails closed and leaves the
-routes unmounted.
+Pins are narrow operator policy, not a claim that a public CA validated the
+signer; revocation and public C2PA trust-list membership are not evaluated.
+Malformed pin configuration fails closed and leaves the routes unmounted.
 
 ## Abuse-control layers
 

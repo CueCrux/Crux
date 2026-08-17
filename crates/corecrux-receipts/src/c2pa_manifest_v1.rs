@@ -929,6 +929,28 @@ impl C2paSigner for ByokP256Signer {
     }
 }
 
+/// Decode the presented `x5chain` of an ES256 envelope into raw DER
+/// certificates, leaf first, without assigning trust. Errors on a non-es256
+/// envelope, a missing/empty chain, or any undecodable PEM block — callers
+/// applying chain trust must treat every error as fail-closed.
+pub fn c2pa_x5chain_der_v1(parsed: &C2paSignedManifestV1) -> Result<Vec<Vec<u8>>, C2paManifestError> {
+    if parsed.signature_alg != "es256" {
+        return Err(C2paManifestError::Decode(format!(
+            "expected an es256 envelope, got alg {:?}",
+            parsed.signature_alg
+        )));
+    }
+    let chain_pem = parsed
+        .x5chain_pem
+        .as_deref()
+        .ok_or_else(|| C2paManifestError::Decode("es256 envelope is missing the x5chain".into()))?;
+    let chain = split_pem_certs(chain_pem);
+    if chain.is_empty() {
+        return Err(C2paManifestError::Decode("x5chain contains no certificates".into()));
+    }
+    chain.iter().map(|pem| pem_cert_to_der(pem)).collect()
+}
+
 /// Inspect the presented ES256 leaf without assigning trust. The SHA-256
 /// fingerprint is over the exact DER certificate bytes embedded in `x5chain`.
 pub fn inspect_c2pa_leaf_certificate_v1(

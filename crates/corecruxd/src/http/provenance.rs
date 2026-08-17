@@ -57,6 +57,23 @@ const TLS_TERMINATED_ENV: &str = "CORECRUXD_PROVENANCE_TLS_TERMINATED";
 /// only for a currently-valid exact leaf whose envelope signature verifies.
 const TRUSTED_LEAF_SHA256_ENV: &str = "CORECRUXD_PROVENANCE_TRUSTED_LEAF_SHA256";
 const MAX_TRUSTED_LEAF_PINS: usize = 1_024;
+/// Optional comma-separated SHA-256 pins over exact DER root certificates.
+/// Default OFF (unset = no CA-chain trust mode, behaviour unchanged). When
+/// set, an es256 envelope whose presented `x5chain` cryptographically
+/// validates to one of these operator-pinned self-signed roots under the
+/// shared CueCrux C2PA chain profile
+/// ([`corecrux_receipts::validate_c2pa_chain_to_anchor_v1`]: per-link
+/// signatures, current validity, BasicConstraints/KeyUsage/EKU, path length,
+/// fail-closed unsupported critical extensions) earns `chain_validated=true`
+/// and — with valid envelope integrity — `identity_trusted=true`. Malformed
+/// configuration fails closed before route mount, exactly like the leaf list.
+const TRUSTED_ROOT_SHA256_ENV: &str = "CORECRUXD_PROVENANCE_TRUSTED_ROOT_SHA256";
+const MAX_TRUSTED_ROOT_PINS: usize = 64;
+/// Upper bound on presented `x5chain` certificates considered for CA-chain
+/// validation. Defense-in-depth on top of the signer-side `MAX_X5CHAIN_CERTS`
+/// cap; longer presented chains fail closed rather than costing unbounded
+/// parse/verify work.
+const MAX_CHAIN_TRUST_CERTS: usize = 8;
 /// Optional verification-record retention window. Unset means no automatic
 /// deletion; an operator must choose an explicit 1..=3,650-day lifecycle.
 const RETENTION_DAYS_ENV: &str = "CORECRUXD_PROVENANCE_RETENTION_DAYS";
@@ -75,44 +92,61 @@ const RECORD_TENANT_LOCK_SHARDS: usize = 64;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ProvenanceTrustPolicy {
     trusted_leaf_sha256: HashSet<String>,
+    trusted_root_sha256: HashSet<String>,
+}
+
+fn parse_sha256_pin_set(raw: Option<&str>, env_name: &str, max_pins: usize) -> Result<HashSet<String>, String> {
+    let mut pins = HashSet::new();
+    let mut pin_count = 0usize;
+    for raw_pin in raw.unwrap_or_default().split(',') {
+        let raw_pin = raw_pin.trim();
+        if raw_pin.is_empty() {
+            continue;
+        }
+        pin_count += 1;
+        if pin_count > max_pins {
+            return Err(format!("{env_name} exceeds the {max_pins}-pin limit"));
+        }
+        let without_prefix = raw_pin
+            .strip_prefix("sha256:")
+            .or_else(|| raw_pin.strip_prefix("SHA256:"))
+            .unwrap_or(raw_pin);
+        let normalized = without_prefix.replace(':', "").to_ascii_lowercase();
+        if normalized.len() != 64 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!("{env_name} entries must be 64-hex SHA-256 fingerprints"));
+        }
+        pins.insert(normalized);
+    }
+    Ok(pins)
 }
 
 impl ProvenanceTrustPolicy {
     fn from_env() -> Result<Self, String> {
-        Self::parse(std::env::var(TRUSTED_LEAF_SHA256_ENV).ok().as_deref())
+        Self::parse(
+            std::env::var(TRUSTED_LEAF_SHA256_ENV).ok().as_deref(),
+            std::env::var(TRUSTED_ROOT_SHA256_ENV).ok().as_deref(),
+        )
     }
 
-    fn parse(raw: Option<&str>) -> Result<Self, String> {
-        let mut trusted_leaf_sha256 = HashSet::new();
-        let mut pin_count = 0usize;
-        for raw_pin in raw.unwrap_or_default().split(',') {
-            let raw_pin = raw_pin.trim();
-            if raw_pin.is_empty() {
-                continue;
-            }
-            pin_count += 1;
-            if pin_count > MAX_TRUSTED_LEAF_PINS {
-                return Err(format!(
-                    "{TRUSTED_LEAF_SHA256_ENV} exceeds the {MAX_TRUSTED_LEAF_PINS}-pin limit"
-                ));
-            }
-            let without_prefix = raw_pin
-                .strip_prefix("sha256:")
-                .or_else(|| raw_pin.strip_prefix("SHA256:"))
-                .unwrap_or(raw_pin);
-            let normalized = without_prefix.replace(':', "").to_ascii_lowercase();
-            if normalized.len() != 64 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return Err(format!(
-                    "{TRUSTED_LEAF_SHA256_ENV} entries must be 64-hex SHA-256 fingerprints"
-                ));
-            }
-            trusted_leaf_sha256.insert(normalized);
-        }
-        Ok(Self { trusted_leaf_sha256 })
+    fn parse(leaf_raw: Option<&str>, root_raw: Option<&str>) -> Result<Self, String> {
+        Ok(Self {
+            trusted_leaf_sha256: parse_sha256_pin_set(leaf_raw, TRUSTED_LEAF_SHA256_ENV, MAX_TRUSTED_LEAF_PINS)?,
+            trusted_root_sha256: parse_sha256_pin_set(root_raw, TRUSTED_ROOT_SHA256_ENV, MAX_TRUSTED_ROOT_PINS)?,
+        })
     }
 
     fn trusts_leaf(&self, fingerprint: &str) -> bool {
         self.trusted_leaf_sha256.contains(fingerprint)
+    }
+
+    fn trusts_root(&self, fingerprint: &str) -> bool {
+        self.trusted_root_sha256.contains(fingerprint)
+    }
+
+    /// The CA-chain trust mode is active only when the operator pinned at
+    /// least one root. Unset/empty keeps the exact-leaf-only beta behaviour.
+    fn chain_trust_enabled(&self) -> bool {
+        !self.trusted_root_sha256.is_empty()
     }
 }
 
@@ -534,20 +568,34 @@ pub(super) struct VerifyResponse {
     pub asset_binding_checked: bool,
     /// `None` when no content was supplied.
     pub content_hash_match: Option<bool>,
-    // ── Trust: NOT established by this BYOK skeleton ──
-    /// Machine-readable trust posture. An operator-pinned, currently-valid
-    /// exact leaf can be `"trusted_leaf_allowlist"`; CA-chain validation is
-    /// still absent. Otherwise `"untrusted_presented_leaf"`, `"unsigned"`,
-    /// or `"external_key_required"`.
+    // ── Trust: operator-pinned policy only, never presented material ──
+    /// Machine-readable trust posture. `"trusted_root_chain"` when the
+    /// presented `x5chain` cryptographically validated to an operator-pinned
+    /// root and envelope integrity holds; `"trusted_leaf_allowlist"` for an
+    /// operator-pinned, currently-valid exact leaf. Otherwise
+    /// `"untrusted_presented_leaf"`, `"root_chain_integrity_invalid"`,
+    /// `"unsigned"`, `"external_key_required"`, or one of the pinned-leaf
+    /// failure statuses.
     pub trust_status: String,
     /// SHA-256 of the exact DER leaf embedded in `x5chain`, when present.
     /// Safe to compare with an operator trust list; not a trust claim alone.
     #[serde(default)]
     pub signer_leaf_sha256: Option<String>,
-    /// Always false here — no chain-to-root validation.
+    /// SHA-256 of the exact DER terminal (root-candidate) certificate in the
+    /// presented `x5chain`. Populated only while the CA-chain trust mode is
+    /// active, as the audit aid for building the pin list; never a trust
+    /// claim alone.
+    #[serde(default)]
+    pub chain_root_sha256: Option<String>,
+    /// True only when the CA-chain trust mode is active and the presented
+    /// `x5chain` cryptographically validated to an operator-pinned root under
+    /// the shared CueCrux C2PA chain profile (per-link signatures, validity,
+    /// BC/KU/EKU, path length, fail-closed critical extensions). Always false
+    /// while the mode is off.
     pub chain_validated: bool,
-    /// True only for a valid exact leaf pinned by the operator and a valid
-    /// signature over the canonical envelope body.
+    /// True only for valid envelope integrity plus an operator-pinned
+    /// identity: either a validated chain to a pinned root, or a
+    /// currently-valid exact pinned leaf.
     pub identity_trusted: bool,
     // ── Overall ──
     /// True ONLY when the envelope is internally consistent AND asset bytes
@@ -704,6 +752,7 @@ fn verify_inner(req: &VerifyRequest, trust_policy: &ProvenanceTrustPolicy) -> Re
             content_hash_match: None,
             trust_status: "unsigned".to_string(),
             signer_leaf_sha256: None,
+            chain_root_sha256: None,
             chain_validated: false,
             identity_trusted: false,
             ok: false,
@@ -744,8 +793,62 @@ fn verify_inner(req: &VerifyRequest, trust_policy: &ProvenanceTrustPolicy) -> Re
         let now = current_unix_seconds();
         let leaf_current = now.is_some_and(|unix_seconds| leaf.valid_at(unix_seconds));
         let leaf_pinned = trust_policy.trusts_leaf(&leaf.sha256_hex);
-        let identity_trusted = leaf_pinned && leaf_current && integrity_valid;
-        let trust_status = if identity_trusted {
+        let leaf_identity_trusted = leaf_pinned && leaf_current && integrity_valid;
+
+        // ── CA-chain trust mode (default OFF; active only with pinned roots).
+        // Fail-closed throughout: any parse, pin, clock, or validation
+        // failure leaves chain_validated=false, never an error response —
+        // the envelope stays verifiable, it simply earns no identity trust.
+        let mut chain_validated = false;
+        let mut chain_root_sha256: Option<String> = None;
+        let mut chain_failure: Option<String> = None;
+        if trust_policy.chain_trust_enabled() {
+            match corecrux_receipts::c2pa_x5chain_der_v1(&parsed) {
+                Ok(chain_der) if chain_der.len() > MAX_CHAIN_TRUST_CERTS => {
+                    chain_failure = Some(format!(
+                        "presented x5chain exceeds the {MAX_CHAIN_TRUST_CERTS}-certificate chain-trust bound"
+                    ));
+                }
+                Ok(chain_der) if chain_der.len() < 2 => {
+                    chain_failure = Some(
+                        "presented x5chain carries no CA chain: a leaf alone cannot validate to a root".to_string(),
+                    );
+                }
+                Ok(chain_der) => {
+                    use sha2::{Digest as _, Sha256};
+                    // Terminal presented certificate is the root candidate.
+                    // `chain_der.len() >= 2` here, so the terminal exists.
+                    let root_der = &chain_der[chain_der.len() - 1];
+                    let root_fingerprint = hex::encode(Sha256::digest(root_der));
+                    chain_root_sha256 = Some(root_fingerprint.clone());
+                    if let Some(now_unix) = now {
+                        if trust_policy.trusts_root(&root_fingerprint) {
+                            match corecrux_receipts::validate_c2pa_chain_to_anchor_v1(&chain_der, root_der, now_unix) {
+                                Ok(()) => chain_validated = true,
+                                Err(error) => chain_failure = Some(format!("chain validation failed: {error}")),
+                            }
+                        } else {
+                            chain_failure =
+                                Some("the presented terminal certificate is not an operator-pinned root".to_string());
+                        }
+                    } else {
+                        chain_failure =
+                            Some("the system clock is before the Unix epoch; chain trust failed closed".to_string());
+                    }
+                }
+                Err(_) => {
+                    chain_failure = Some("presented x5chain did not decode into DER certificates".to_string());
+                }
+            }
+        }
+        let chain_identity_trusted = chain_validated && integrity_valid;
+        let identity_trusted = chain_identity_trusted || leaf_identity_trusted;
+
+        let trust_status = if chain_identity_trusted {
+            "trusted_root_chain"
+        } else if chain_validated {
+            "root_chain_integrity_invalid"
+        } else if leaf_identity_trusted {
             "trusted_leaf_allowlist"
         } else if now.is_none() && leaf_pinned {
             "system_clock_invalid"
@@ -756,7 +859,15 @@ fn verify_inner(req: &VerifyRequest, trust_policy: &ProvenanceTrustPolicy) -> Re
         } else {
             "untrusted_presented_leaf"
         };
-        let mut notes = if identity_trusted {
+        let mut notes = if chain_identity_trusted {
+            vec![
+                "the presented certificate chain cryptographically validates to an operator-pinned root \
+                 (per-link signatures, current validity, BasicConstraints, key usages, C2PA leaf EKU, path \
+                 length, critical extensions) and the envelope signature verifies; revocation and public \
+                 C2PA trust-list membership are not evaluated"
+                    .to_string(),
+            ]
+        } else if leaf_identity_trusted {
             vec![
                 "the exact currently-valid leaf certificate is operator-pinned and the envelope signature verifies; \
                  CA-chain validation is not performed"
@@ -765,10 +876,16 @@ fn verify_inner(req: &VerifyRequest, trust_policy: &ProvenanceTrustPolicy) -> Re
         } else {
             vec![
                 "integrity_valid checks the envelope against the PRESENTED leaf only; the leaf, its chain, \
-                 and all manifest_claims are UNTRUSTED unless trust_status says trusted_leaf_allowlist"
+                 and all manifest_claims are UNTRUSTED unless trust_status says trusted_root_chain or \
+                 trusted_leaf_allowlist"
                     .to_string(),
             ]
         };
+        if let Some(failure) = chain_failure {
+            notes.push(format!(
+                "CA-chain trust mode is active but did not grant trust: {failure}"
+            ));
+        }
         if now.is_none() {
             notes.push("the system clock is before the Unix epoch; exact-leaf trust failed closed".to_string());
         } else if !leaf_current {
@@ -791,7 +908,8 @@ fn verify_inner(req: &VerifyRequest, trust_policy: &ProvenanceTrustPolicy) -> Re
             content_hash_match,
             trust_status: trust_status.to_string(),
             signer_leaf_sha256: Some(leaf.sha256_hex),
-            chain_validated: false,
+            chain_root_sha256,
+            chain_validated,
             identity_trusted,
             ok,
             manifest_claims: Some(claims),
@@ -810,6 +928,7 @@ fn verify_inner(req: &VerifyRequest, trust_policy: &ProvenanceTrustPolicy) -> Re
             content_hash_match: None,
             trust_status: "external_key_required".to_string(),
             signer_leaf_sha256: None,
+            chain_root_sha256: None,
             chain_validated: false,
             identity_trusted: false,
             ok: false,
@@ -3607,7 +3726,7 @@ mod tests {
             .map(|chunk| std::str::from_utf8(chunk).unwrap())
             .collect::<Vec<_>>()
             .join(":");
-        let policy = ProvenanceTrustPolicy::parse(Some(&format!("SHA256:{colon_fingerprint}"))).unwrap();
+        let policy = ProvenanceTrustPolicy::parse(Some(&format!("SHA256:{colon_fingerprint}")), None).unwrap();
         let request = VerifyRequest {
             manifest_envelope_b64: Some(signed.manifest_envelope_b64),
             content_b64: Some(b64(content)),
@@ -3637,6 +3756,7 @@ mod tests {
         let expired_leaf = inspect_c2pa_leaf_certificate_v1(&expired_parsed).unwrap();
         let expired_policy = ProvenanceTrustPolicy {
             trusted_leaf_sha256: HashSet::from([expired_leaf.sha256_hex]),
+            trusted_root_sha256: HashSet::new(),
         };
         let expired_verified = do_verify_with_trust(
             &meter,
@@ -3657,11 +3777,11 @@ mod tests {
     #[test]
     fn exact_leaf_allowlist_parser_is_bounded_and_fail_closed() {
         assert_eq!(
-            ProvenanceTrustPolicy::parse(None).unwrap(),
+            ProvenanceTrustPolicy::parse(None, None).unwrap(),
             ProvenanceTrustPolicy::default()
         );
         assert_eq!(
-            ProvenanceTrustPolicy::parse(Some("not-a-fingerprint")).unwrap_err(),
+            ProvenanceTrustPolicy::parse(Some("not-a-fingerprint"), None).unwrap_err(),
             format!("{TRUSTED_LEAF_SHA256_ENV} entries must be 64-hex SHA-256 fingerprints")
         );
         let too_many = (0..=MAX_TRUSTED_LEAF_PINS)
@@ -3669,16 +3789,303 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         assert_eq!(
-            ProvenanceTrustPolicy::parse(Some(&too_many)).unwrap_err(),
+            ProvenanceTrustPolicy::parse(Some(&too_many), None).unwrap_err(),
             format!("{TRUSTED_LEAF_SHA256_ENV} exceeds the {MAX_TRUSTED_LEAF_PINS}-pin limit")
         );
         let duplicate_overflow = std::iter::repeat_n("0".repeat(64), MAX_TRUSTED_LEAF_PINS + 1)
             .collect::<Vec<_>>()
             .join(",");
         assert_eq!(
-            ProvenanceTrustPolicy::parse(Some(&duplicate_overflow)).unwrap_err(),
+            ProvenanceTrustPolicy::parse(Some(&duplicate_overflow), None).unwrap_err(),
             format!("{TRUSTED_LEAF_SHA256_ENV} exceeds the {MAX_TRUSTED_LEAF_PINS}-pin limit")
         );
+    }
+
+    // ── CA-chain trust mode (operator-pinned roots; M9 CA-chain) ───────────
+
+    /// Test CA that mirrors the Vault role's strict C2PA profile: a
+    /// self-signed root (CA=true, keyCertSign) issuing leaves with
+    /// CA=false + digitalSignature + the CueCrux emailProtection EKU.
+    struct ChainTestPki {
+        root_issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+        root_pem: String,
+        root_sha256_hex: String,
+    }
+
+    impl ChainTestPki {
+        fn new(common_name: &str) -> Self {
+            Self::with_validity(common_name, None)
+        }
+
+        /// `validity` = optional `(not_before_year, not_after_year)`.
+        fn with_validity(common_name: &str, validity: Option<(i32, i32)>) -> Self {
+            use rcgen::{date_time_ymd, CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+            use sha2::{Digest as _, Sha256};
+            let mut params = CertificateParams::new(vec![common_name.to_string()]).unwrap();
+            params.distinguished_name.push(rcgen::DnType::CommonName, common_name);
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign, rcgen::KeyUsagePurpose::CrlSign];
+            if let Some((not_before_year, not_after_year)) = validity {
+                params.not_before = date_time_ymd(not_before_year, 1, 1);
+                params.not_after = date_time_ymd(not_after_year, 1, 1);
+            }
+            let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+            let cert = params.self_signed(&kp).unwrap();
+            let root_pem = cert.pem();
+            let root_sha256_hex = hex::encode(Sha256::digest(cert.der()));
+            let root_issuer = rcgen::Issuer::new(params, kp);
+            Self {
+                root_issuer,
+                root_pem,
+                root_sha256_hex,
+            }
+        }
+
+        /// Issue a currently-valid C2PA-profile leaf. Returns
+        /// `(leaf_key_pem, leaf_cert_pem)`.
+        fn issue_leaf(&self, common_name: &str) -> (String, String) {
+            use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+            let mut params = CertificateParams::new(vec![common_name.to_string()]).unwrap();
+            params.distinguished_name.push(rcgen::DnType::CommonName, common_name);
+            params.is_ca = rcgen::IsCa::ExplicitNoCa;
+            params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+            params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::EmailProtection];
+            let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+            let cert = params.signed_by(&kp, &self.root_issuer).unwrap();
+            (kp.serialize_pem(), cert.pem())
+        }
+    }
+
+    fn chain_signed_envelope(pki: &ChainTestPki, content: &[u8]) -> String {
+        let (leaf_key_pem, leaf_cert_pem) = pki.issue_leaf("chain leaf TEST");
+        let req = SignRequest {
+            content_b64: b64(content),
+            content_type: Some("image/png".to_string()),
+            signing_key_pem: leaf_key_pem.into(),
+            cert_chain_pem: format!("{leaf_cert_pem}{}", pki.root_pem),
+            manifest: ManifestParams::default(),
+            tenant_id: None,
+            key_id: Some("chain-leaf".to_string()),
+        };
+        do_sign(&RecordingMeter::default(), "tenant-chain", &req)
+            .unwrap()
+            .manifest_envelope_b64
+    }
+
+    fn root_pinned_policy(root_sha256_hex: &str) -> ProvenanceTrustPolicy {
+        ProvenanceTrustPolicy::parse(None, Some(root_sha256_hex)).unwrap()
+    }
+
+    fn verify_with_policy(envelope_b64: String, content: &[u8], policy: &ProvenanceTrustPolicy) -> VerifyResponse {
+        do_verify_with_trust(
+            &RecordingMeter::default(),
+            "tenant-chain",
+            &VerifyRequest {
+                manifest_envelope_b64: Some(envelope_b64),
+                content_b64: Some(b64(content)),
+                tenant_id: None,
+            },
+            policy,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pinned_root_valid_chain_grants_chain_validated_identity_trust() {
+        let content = b"chain-trusted-content";
+        let pki = ChainTestPki::new("CueCrux Chain Root TEST");
+        let envelope = chain_signed_envelope(&pki, content);
+        let verified = verify_with_policy(envelope, content, &root_pinned_policy(&pki.root_sha256_hex));
+
+        assert!(verified.ok);
+        assert!(verified.integrity_valid);
+        assert!(verified.chain_validated, "notes: {:?}", verified.notes);
+        assert!(verified.identity_trusted);
+        assert_eq!(verified.trust_status, "trusted_root_chain");
+        assert_eq!(
+            verified.chain_root_sha256.as_deref(),
+            Some(pki.root_sha256_hex.as_str())
+        );
+        // Chain trust must not depend on any leaf pin.
+        assert!(!verified.notes.iter().any(|note| note.contains("did not grant trust")));
+    }
+
+    #[test]
+    fn chain_mode_off_keeps_prior_behaviour_for_chain_signed_envelopes() {
+        let content = b"chain-mode-off";
+        let pki = ChainTestPki::new("CueCrux Chain Root TEST");
+        let envelope = chain_signed_envelope(&pki, content);
+        let verified = verify_with_policy(envelope, content, &ProvenanceTrustPolicy::default());
+
+        assert!(verified.ok, "integrity + binding stay independent of trust");
+        assert!(!verified.chain_validated);
+        assert!(!verified.identity_trusted);
+        assert_eq!(verified.trust_status, "untrusted_presented_leaf");
+        assert_eq!(verified.chain_root_sha256, None, "no audit field while the mode is off");
+    }
+
+    #[test]
+    fn wrong_key_same_dn_root_fails_closed() {
+        let content = b"decoy-root-content";
+        let genuine = ChainTestPki::new("CueCrux Chain Root TEST");
+        let decoy = ChainTestPki::new("CueCrux Chain Root TEST");
+
+        // Leaf issued by the DECOY, presented with the GENUINE root cert:
+        // names link (same DN) but the link signature cannot verify.
+        let (leaf_key_pem, leaf_cert_pem) = decoy.issue_leaf("chain leaf TEST");
+        let req = SignRequest {
+            content_b64: b64(content),
+            content_type: Some("image/png".to_string()),
+            signing_key_pem: leaf_key_pem.into(),
+            cert_chain_pem: format!("{leaf_cert_pem}{}", genuine.root_pem),
+            manifest: ManifestParams::default(),
+            tenant_id: None,
+            key_id: Some("decoy-leaf".to_string()),
+        };
+        let envelope = do_sign(&RecordingMeter::default(), "tenant-chain", &req)
+            .unwrap()
+            .manifest_envelope_b64;
+        let verified = verify_with_policy(envelope, content, &root_pinned_policy(&genuine.root_sha256_hex));
+        assert!(verified.integrity_valid, "the envelope stays self-consistent");
+        assert!(!verified.chain_validated);
+        assert!(!verified.identity_trusted);
+        assert_eq!(verified.trust_status, "untrusted_presented_leaf");
+        assert!(
+            verified
+                .notes
+                .iter()
+                .any(|note| note.contains("signature verification failed")),
+            "unexpected notes: {:?}",
+            verified.notes
+        );
+
+        // Decoy root presented outright: its fingerprint is not pinned.
+        let envelope = chain_signed_envelope(&decoy, content);
+        let verified = verify_with_policy(envelope, content, &root_pinned_policy(&genuine.root_sha256_hex));
+        assert!(!verified.chain_validated);
+        assert!(!verified.identity_trusted);
+        assert_eq!(
+            verified.chain_root_sha256.as_deref(),
+            Some(decoy.root_sha256_hex.as_str()),
+            "audit field must expose the presented terminal certificate"
+        );
+        assert!(
+            verified
+                .notes
+                .iter()
+                .any(|note| note.contains("not an operator-pinned root")),
+            "unexpected notes: {:?}",
+            verified.notes
+        );
+    }
+
+    #[test]
+    fn missing_root_in_presented_chain_fails_closed() {
+        let content = b"leaf-only-content";
+        let pki = ChainTestPki::new("CueCrux Chain Root TEST");
+        let (leaf_key_pem, leaf_cert_pem) = pki.issue_leaf("chain leaf TEST");
+        let req = SignRequest {
+            content_b64: b64(content),
+            content_type: Some("image/png".to_string()),
+            signing_key_pem: leaf_key_pem.into(),
+            cert_chain_pem: leaf_cert_pem,
+            manifest: ManifestParams::default(),
+            tenant_id: None,
+            key_id: Some("rootless-leaf".to_string()),
+        };
+        let envelope = do_sign(&RecordingMeter::default(), "tenant-chain", &req)
+            .unwrap()
+            .manifest_envelope_b64;
+        let verified = verify_with_policy(envelope, content, &root_pinned_policy(&pki.root_sha256_hex));
+        assert!(!verified.chain_validated);
+        assert!(!verified.identity_trusted);
+        assert_eq!(verified.chain_root_sha256, None);
+        assert!(
+            verified.notes.iter().any(|note| note.contains("carries no CA chain")),
+            "unexpected notes: {:?}",
+            verified.notes
+        );
+    }
+
+    #[test]
+    fn expired_link_fails_closed_even_when_root_is_pinned() {
+        let content = b"expired-root-content";
+        let pki = ChainTestPki::with_validity("CueCrux Chain Root TEST", Some((2019, 2020)));
+        let envelope = chain_signed_envelope(&pki, content);
+        let verified = verify_with_policy(envelope, content, &root_pinned_policy(&pki.root_sha256_hex));
+        assert!(verified.integrity_valid);
+        assert!(!verified.chain_validated);
+        assert!(!verified.identity_trusted);
+        assert!(
+            verified.notes.iter().any(|note| note.contains("not currently valid")),
+            "unexpected notes: {:?}",
+            verified.notes
+        );
+    }
+
+    #[test]
+    fn root_pin_parser_is_bounded_and_fail_closed() {
+        assert!(
+            !ProvenanceTrustPolicy::parse(None, None).unwrap().chain_trust_enabled(),
+            "unset roots keep the CA-chain mode off"
+        );
+        // Prefixed/colon-separated fingerprints normalize like leaf pins.
+        let normalized = ProvenanceTrustPolicy::parse(None, Some(&format!("SHA256:{}AB", "AB:".repeat(31)))).unwrap();
+        assert!(normalized.chain_trust_enabled());
+        assert!(normalized.trusts_root(&"ab".repeat(32)));
+        assert_eq!(
+            ProvenanceTrustPolicy::parse(None, Some("not-a-fingerprint")).unwrap_err(),
+            format!("{TRUSTED_ROOT_SHA256_ENV} entries must be 64-hex SHA-256 fingerprints")
+        );
+        let too_many = (0..=MAX_TRUSTED_ROOT_PINS)
+            .map(|index| format!("{index:064x}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            ProvenanceTrustPolicy::parse(None, Some(&too_many)).unwrap_err(),
+            format!("{TRUSTED_ROOT_SHA256_ENV} exceeds the {MAX_TRUSTED_ROOT_PINS}-pin limit")
+        );
+    }
+
+    #[test]
+    fn retained_pre_chain_mode_records_stay_readable() {
+        // A record persisted before the CA-chain mode existed (and before the
+        // M9e signer_leaf_sha256 field) must still deserialize: the additive
+        // fields carry serde defaults, exactly like signer_leaf_sha256 did.
+        let legacy_verification = json!({
+            "present": true,
+            "signature_alg": "es256",
+            "canonical_hash_match": true,
+            "signature_valid": true,
+            "integrity_valid": true,
+            "asset_binding_checked": true,
+            "content_hash_match": true,
+            "trust_status": "untrusted_presented_leaf",
+            "chain_validated": false,
+            "identity_trusted": false,
+            "ok": true,
+            "manifest_claims": null,
+            "notes": []
+        });
+        let parsed: VerifyResponse = serde_json::from_value(legacy_verification.clone()).unwrap();
+        assert_eq!(parsed.signer_leaf_sha256, None);
+        assert_eq!(parsed.chain_root_sha256, None);
+        assert!(!parsed.chain_validated);
+
+        let stored_line = json!({
+            "record_id": "legacy-1",
+            "recorded_at": "2026-07-21T00:00:00Z",
+            "verification": legacy_verification,
+            "receipt": {
+                "alg": "ed25519",
+                "signed_by": "fpr",
+                "body_hash": "blake3:00",
+                "signature": "00"
+            }
+        });
+        let replayed = verification_response_from_stored_line(&stored_line).unwrap();
+        assert_eq!(replayed.record_id, "legacy-1");
+        assert_eq!(replayed.verification.chain_root_sha256, None);
     }
 
     #[test]
