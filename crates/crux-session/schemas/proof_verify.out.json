@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "/v1/session/schemas/proof_verify.out.json",
+  "title": "proof_verify output (VerifyResult)",
+  "description": "Verification result envelope (catalog shape `VerifyResult`; mirrors the `receipt_verify` tool result). Advertise-only per RCX Session-Handshake v1; the field set is open (additive).",
+  "type": "object",
+  "required": ["verified"],
+  "properties": {
+    "receipt_id": {
+      "type": "string",
+      "description": "The receipt that was re-verified."
+    },
+    "verified": {
+      "type": "boolean",
+      "description": "True when the receipt's hash chain and signature (if present) verify."
+    },
+    "signer_passport": {
+      "type": ["string", "null"],
+      "description": "Signer key id or public-key fingerprint, when a signature was verified."
+    },
+    "errors": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Machine-readable verification error codes, e.g. `BODY_HASH_MISMATCH`. Empty when verified."
+    },
+    "feature_enabled": {
+      "type": "boolean",
+      "description": "False when the daemon's receipt-verify feature flag is off; verification was skipped."
+    }
+  },
+  "additionalProperties": true
+}

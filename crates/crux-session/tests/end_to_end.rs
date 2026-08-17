@@ -183,3 +183,73 @@ fn ce_capability_graph_advertises_wave_ab_agent_ux_dimensions() {
         "dim 02 should not be advertised (scoped out of wave-A/B per source brief)"
     );
 }
+
+/// Capability-graph M2: the chosen high-value nodes surface non-null,
+/// hash-pinned `SchemaRef`s in a real handshake plan, and the refs survive
+/// the canonical-CBOR round trip byte-for-byte (M2 gate: "decode round-trips
+/// (`SessionPlan` CBOR <-> struct)").
+#[test]
+fn ce_capability_graph_advertises_hash_pinned_schema_refs() {
+    let (plan, canonical_cbor) = ce_handshake(&NullSigner);
+    let decoded = SessionPlan::from_canonical_cbor(&canonical_cbor).expect("decode");
+
+    for cap_name in [
+        "session_context",
+        "journal_append",
+        "proof_verify",
+        "output.verifiable_receipts",
+    ] {
+        let minted = plan
+            .capability_graph
+            .iter()
+            .find(|c| c.cap == cap_name)
+            .unwrap_or_else(|| panic!("`{cap_name}` missing from minted graph"));
+        let round_tripped = decoded
+            .capability_graph
+            .iter()
+            .find(|c| c.cap == cap_name)
+            .unwrap_or_else(|| panic!("`{cap_name}` missing from decoded graph"));
+
+        for (dir, minted_ref, decoded_ref) in [
+            ("in", &minted.input_schema, &round_tripped.input_schema),
+            ("out", &minted.output_schema, &round_tripped.output_schema),
+        ] {
+            let sref = minted_ref
+                .as_ref()
+                .unwrap_or_else(|| panic!("`{cap_name}` must surface a non-null {dir} schema"));
+            let file = format!("{cap_name}.{dir}.json");
+            assert_eq!(
+                sref.uri,
+                format!("/v1/session/schemas/{file}"),
+                "SchemaRef.uri must be the daemon schema route"
+            );
+            // The pinned hash is BLAKE3 of the exact bytes the daemon route
+            // serves (single-source: both come from the same CatalogSchema).
+            let doc = crux_session::catalog::schema_document(&file)
+                .unwrap_or_else(|| panic!("`{file}` must be a served document"));
+            assert_eq!(
+                sref.hash,
+                doc.to_schema_ref().hash,
+                "pinned hash must match served bytes"
+            );
+            assert_eq!(
+                decoded_ref.as_ref(),
+                Some(sref),
+                "`{cap_name}` {dir} SchemaRef must survive the CBOR round trip"
+            );
+        }
+    }
+
+    // M2 stays hash-stable: the graph hash of the minted plan equals the
+    // caps-only hash with schema refs stripped (folding them in is gated M3).
+    let mut stripped = plan.capability_graph.clone();
+    for cap in &mut stripped {
+        cap.input_schema = None;
+        cap.output_schema = None;
+    }
+    assert_eq!(
+        plan.capability_graph_hash,
+        crux_session::intent::hash_capability_graph_with_intent(&stripped, None),
+        "capability_graph_hash must be unchanged by schema advertisement (hash-stable until M3)"
+    );
+}

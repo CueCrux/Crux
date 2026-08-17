@@ -14,7 +14,104 @@
 //! When adding a new capability to the platform, add it here; the generator
 //! picks it up automatically on both Crux Daemon and hosted.
 
-use crate::plan::{Capability, ImplPath};
+use crate::plan::{Capability, ImplPath, SchemaRef};
+
+/// Schema kind advertised on every catalog [`SchemaRef`] (spec §v1.1).
+pub const SCHEMA_KIND_JSON_SCHEMA: &str = "json-schema";
+
+/// Route prefix under which the local daemon hosts advertised schema
+/// documents: `GET /v1/session/schemas/<cap>.(in|out).json`. `SchemaRef.uri`
+/// values are daemon-rooted paths under this prefix, resolvable against the
+/// origin that served the session plan. Hosting decision (M2): agent-proposed
+/// local-daemon route; the operator may later ratify or switch to
+/// `static.rcxprotocol.org` — cheap to change because schemas do not enter
+/// `capability_graph_hash` until the gated M3 binding.
+pub const SCHEMA_ROUTE_PREFIX: &str = "/v1/session/schemas/";
+
+/// Const-friendly schema advertisement attached to a [`CatalogEntry`]
+/// (M2, advertise-only — spec §v1.1; validation at invocation time is
+/// explicitly out of scope).
+///
+/// The embedded `bytes` are the single source of truth: [`Self::to_schema_ref`]
+/// hashes exactly these bytes and the daemon route serves exactly these bytes
+/// (via [`schema_document`]), so the pinned hash can never drift from the
+/// served document (plan R3).
+#[derive(Debug, Clone, Copy)]
+pub struct CatalogSchema {
+    /// Document file name under [`SCHEMA_ROUTE_PREFIX`],
+    /// e.g. `proof_verify.in.json`.
+    pub file: &'static str,
+    /// The embedded schema document — the exact bytes the daemon serves.
+    pub bytes: &'static [u8],
+}
+
+impl CatalogSchema {
+    /// Daemon-rooted URI at which [`schema_document`]-backed routes serve
+    /// this document.
+    pub fn uri(&self) -> String {
+        format!("{SCHEMA_ROUTE_PREFIX}{}", self.file)
+    }
+
+    /// Expand into the wire [`SchemaRef`], pinning `hash` = BLAKE3 of the
+    /// exact embedded (= served) bytes.
+    pub fn to_schema_ref(&self) -> SchemaRef {
+        SchemaRef {
+            kind: SCHEMA_KIND_JSON_SCHEMA.to_string(),
+            uri: self.uri(),
+            hash: *blake3::hash(self.bytes).as_bytes(),
+        }
+    }
+}
+
+/// Embedded schema documents for the M2 high-value nodes (receipt/snapshot
+/// shapes). Each document is advertise-only and mirrors a real wire shape —
+/// see the per-file `description` for the grounding source.
+pub const SCHEMA_SESSION_CONTEXT_IN: CatalogSchema = CatalogSchema {
+    file: "session_context.in.json",
+    bytes: include_bytes!("../schemas/session_context.in.json"),
+};
+pub const SCHEMA_SESSION_CONTEXT_OUT: CatalogSchema = CatalogSchema {
+    file: "session_context.out.json",
+    bytes: include_bytes!("../schemas/session_context.out.json"),
+};
+pub const SCHEMA_JOURNAL_APPEND_IN: CatalogSchema = CatalogSchema {
+    file: "journal_append.in.json",
+    bytes: include_bytes!("../schemas/journal_append.in.json"),
+};
+pub const SCHEMA_JOURNAL_APPEND_OUT: CatalogSchema = CatalogSchema {
+    file: "journal_append.out.json",
+    bytes: include_bytes!("../schemas/journal_append.out.json"),
+};
+pub const SCHEMA_PROOF_VERIFY_IN: CatalogSchema = CatalogSchema {
+    file: "proof_verify.in.json",
+    bytes: include_bytes!("../schemas/proof_verify.in.json"),
+};
+pub const SCHEMA_PROOF_VERIFY_OUT: CatalogSchema = CatalogSchema {
+    file: "proof_verify.out.json",
+    bytes: include_bytes!("../schemas/proof_verify.out.json"),
+};
+pub const SCHEMA_OUTPUT_VERIFIABLE_RECEIPTS_IN: CatalogSchema = CatalogSchema {
+    file: "output.verifiable_receipts.in.json",
+    bytes: include_bytes!("../schemas/output.verifiable_receipts.in.json"),
+};
+pub const SCHEMA_OUTPUT_VERIFIABLE_RECEIPTS_OUT: CatalogSchema = CatalogSchema {
+    file: "output.verifiable_receipts.out.json",
+    bytes: include_bytes!("../schemas/output.verifiable_receipts.out.json"),
+};
+
+/// Look up an advertised schema document by its file name (the last path
+/// segment of the daemon route, e.g. `proof_verify.in.json`).
+///
+/// The daemon's `GET /v1/session/schemas/{file}` handler serves the bytes
+/// returned here — the same bytes [`CatalogSchema::to_schema_ref`] hashes —
+/// so served bytes and pinned hash cannot diverge (plan R3).
+pub fn schema_document(file: &str) -> Option<CatalogSchema> {
+    DEFAULT_CATALOG
+        .iter()
+        .flat_map(|entry| [entry.input_schema, entry.output_schema])
+        .flatten()
+        .find(|schema| schema.file == file)
+}
 
 /// Static description of a catalog entry. Expanded into a [`Capability`] by
 /// the generator after per-passport filtering.
@@ -31,6 +128,10 @@ pub struct CatalogEntry {
     /// Feature flag that must be enabled for this capability to be surfaced.
     /// `None` = always enabled.
     pub feature_flag: Option<&'static str>,
+    /// Advertised input schema (M2, advertise-only). `None` = not advertised.
+    pub input_schema: Option<CatalogSchema>,
+    /// Advertised output schema (M2, advertise-only). `None` = not advertised.
+    pub output_schema: Option<CatalogSchema>,
 }
 
 impl CatalogEntry {
@@ -41,7 +142,7 @@ impl CatalogEntry {
             "mcp"
         };
         let required_affinity = (self.cap != "session_context").then(|| self.affinity.to_string());
-        Capability::v2(
+        let mut capability = Capability::v2(
             self.cap,
             prefer,
             self.shape,
@@ -52,7 +153,10 @@ impl CatalogEntry {
                 ce: self.ce_path.map(String::from),
                 core: self.core_path.map(String::from),
             },
-        )
+        );
+        capability.input_schema = self.input_schema.as_ref().map(CatalogSchema::to_schema_ref);
+        capability.output_schema = self.output_schema.as_ref().map(CatalogSchema::to_schema_ref);
+        capability
     }
 }
 
@@ -71,6 +175,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: Some("retrieve_local"),
         core_path: Some("/v2/retrieve"),
         feature_flag: None,
+        input_schema: None,
+        output_schema: None,
     },
     CatalogEntry {
         cap: "session_context",
@@ -82,6 +188,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: Some("session_ctx_local"),
         core_path: Some("/v2/session/context"),
         feature_flag: None,
+        input_schema: Some(SCHEMA_SESSION_CONTEXT_IN),
+        output_schema: Some(SCHEMA_SESSION_CONTEXT_OUT),
     },
     CatalogEntry {
         cap: "journal_append",
@@ -93,6 +201,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: Some("journal_local"),
         core_path: Some("/mcp/vault#journal_append"),
         feature_flag: None,
+        input_schema: Some(SCHEMA_JOURNAL_APPEND_IN),
+        output_schema: Some(SCHEMA_JOURNAL_APPEND_OUT),
     },
     CatalogEntry {
         cap: "journal_stream",
@@ -104,6 +214,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: Some("journal_stream_local"),
         core_path: Some("/v2/journal/stream"),
         feature_flag: None,
+        input_schema: None,
+        output_schema: None,
     },
     CatalogEntry {
         cap: "proof_document",
@@ -115,6 +227,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: Some("proof_local"),
         core_path: Some("/v2/proof"),
         feature_flag: None,
+        input_schema: None,
+        output_schema: None,
     },
     CatalogEntry {
         cap: "proof_verify",
@@ -126,6 +240,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: Some("proof_verify_local"),
         core_path: Some("/mcp/vault#proof_verify"),
         feature_flag: None,
+        input_schema: Some(SCHEMA_PROOF_VERIFY_IN),
+        output_schema: Some(SCHEMA_PROOF_VERIFY_OUT),
     },
     CatalogEntry {
         cap: "annotation_add",
@@ -137,6 +253,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: Some("annotation_local"),
         core_path: Some("/mcp/vault#annotation_add"),
         feature_flag: None,
+        input_schema: None,
+        output_schema: None,
     },
     CatalogEntry {
         cap: "memory_get",
@@ -148,6 +266,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: Some("memory_get_local"),
         core_path: Some("/v2/memory/get"),
         feature_flag: None,
+        input_schema: None,
+        output_schema: None,
     },
     CatalogEntry {
         cap: "memory_put",
@@ -159,6 +279,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: Some("memory_put_local"),
         core_path: Some("/mcp/memory#put"),
         feature_flag: None,
+        input_schema: None,
+        output_schema: None,
     },
     CatalogEntry {
         cap: "audit_replay",
@@ -170,6 +292,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: Some("audit_replay_local"),
         core_path: Some("/v2/audit/replay"),
         feature_flag: None,
+        input_schema: None,
+        output_schema: None,
     },
     CatalogEntry {
         cap: "get_counterfactual_summary",
@@ -181,6 +305,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: None,
         core_path: Some("/mcp/audit#get_counterfactual_summary"),
         feature_flag: None,
+        input_schema: None,
+        output_schema: None,
     },
     CatalogEntry {
         cap: "economy_quote",
@@ -192,6 +318,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: None,
         core_path: Some("/mcp/economy#quote"),
         feature_flag: None,
+        input_schema: None,
+        output_schema: None,
     },
     CatalogEntry {
         cap: "economy_spend",
@@ -203,6 +331,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: None,
         core_path: Some("/mcp/economy#spend"),
         feature_flag: None,
+        input_schema: None,
+        output_schema: None,
     },
     // ── Wave-A/B agent-UX dimensions (shipped 2026-05-28) ────────────────
     //
@@ -230,6 +360,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: None,
         core_path: Some("/mcp/memory#view"),
         feature_flag: None,
+        input_schema: None,
+        output_schema: None,
     },
     CatalogEntry {
         // Dim 03 — freshness / decay.
@@ -245,6 +377,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: None,
         core_path: Some("/mcp/memory#freshness"),
         feature_flag: None,
+        input_schema: None,
+        output_schema: None,
     },
     CatalogEntry {
         // Dim 04 — source-linked traceability.
@@ -259,6 +393,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: None,
         core_path: Some("/mcp/trace#source_linked"),
         feature_flag: None,
+        input_schema: None,
+        output_schema: None,
     },
     CatalogEntry {
         // Dim 05 — risk-tiered HITL.
@@ -273,6 +409,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: None,
         core_path: Some("/mcp/approval#request"),
         feature_flag: None,
+        input_schema: None,
+        output_schema: None,
     },
     CatalogEntry {
         // Dim 06 — typed action traces.
@@ -286,6 +424,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: None,
         core_path: Some("/mcp/trace#typed_actions"),
         feature_flag: None,
+        input_schema: None,
+        output_schema: None,
     },
     CatalogEntry {
         // Dim 07 — verifiable output receipts.
@@ -300,6 +440,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: None,
         core_path: Some("/mcp/output#attest"),
         feature_flag: None,
+        input_schema: Some(SCHEMA_OUTPUT_VERIFIABLE_RECEIPTS_IN),
+        output_schema: Some(SCHEMA_OUTPUT_VERIFIABLE_RECEIPTS_OUT),
     },
     CatalogEntry {
         // Dim 08 — identity continuity.
@@ -316,6 +458,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: None,
         core_path: Some("/mcp/identity#continuity"),
         feature_flag: None,
+        input_schema: None,
+        output_schema: None,
     },
     CatalogEntry {
         // Dim 09 — scoped forget.
@@ -330,6 +474,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: None,
         core_path: Some("/mcp/memory#forget"),
         feature_flag: None,
+        input_schema: None,
+        output_schema: None,
     },
     CatalogEntry {
         // Dim 10 — visible autonomy contract.
@@ -343,6 +489,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: None,
         core_path: Some("/mcp/autonomy#contract"),
         feature_flag: None,
+        input_schema: None,
+        output_schema: None,
     },
     CatalogEntry {
         // Dim 11 — BYO audit trail.
@@ -357,6 +505,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: None,
         core_path: Some("/mcp/audit#byo_trail"),
         feature_flag: None,
+        input_schema: None,
+        output_schema: None,
     },
     CatalogEntry {
         // Dim 12 — calm / deferred output.
@@ -370,6 +520,8 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
         ce_path: None,
         core_path: Some("/mcp/output#calm_deferred"),
         feature_flag: None,
+        input_schema: None,
+        output_schema: None,
     },
 ];
 
@@ -682,5 +834,92 @@ mod tests {
             visible.contains(&"autonomy.contract"),
             "autonomy.contract (dim 10) must be local-tier-visible to clear the scorecard floor"
         );
+    }
+
+    // ── M2: node schemas (advertise-only, hash-pinned) ──────────────────────
+
+    /// The M2 high-value nodes (receipt/snapshot shapes) that advertise
+    /// schema documents. All four are local-tier-visible (`min_tier: None`).
+    const SCHEMA_ADVERTISED_CAPS: &[&str] = &[
+        "session_context",
+        "journal_append",
+        "proof_verify",
+        "output.verifiable_receipts",
+    ];
+
+    /// Every advertised schema document is valid JSON, is named after its
+    /// cap + direction (`<cap>.(in|out).json`), and expands to a `SchemaRef`
+    /// whose hash is BLAKE3 of the exact embedded bytes.
+    #[test]
+    fn schema_documents_are_valid_json_and_hash_pinned() {
+        for entry in DEFAULT_CATALOG {
+            for (direction, schema) in [("in", entry.input_schema), ("out", entry.output_schema)] {
+                let Some(schema) = schema else { continue };
+                let doc: serde_json::Value = serde_json::from_slice(schema.bytes)
+                    .unwrap_or_else(|e| panic!("schema `{}` is not valid JSON: {e}", schema.file));
+                assert!(doc.is_object(), "schema `{}` must be a JSON object", schema.file);
+                assert_eq!(
+                    schema.file,
+                    format!("{}.{}.json", entry.cap, direction),
+                    "schema file name must bind the document to its cap + direction"
+                );
+                let sref = schema.to_schema_ref();
+                assert_eq!(sref.kind, SCHEMA_KIND_JSON_SCHEMA);
+                assert_eq!(sref.uri, format!("{SCHEMA_ROUTE_PREFIX}{}", schema.file));
+                assert_eq!(
+                    sref.hash,
+                    *blake3::hash(schema.bytes).as_bytes(),
+                    "SchemaRef.hash must be BLAKE3 of the embedded bytes for `{}`",
+                    schema.file
+                );
+            }
+        }
+    }
+
+    /// The four chosen high-value nodes advertise BOTH directions (M2 gate:
+    /// "chosen nodes surface non-null input_schema/output_schema").
+    #[test]
+    fn chosen_high_value_nodes_advertise_both_schema_directions() {
+        for cap in SCHEMA_ADVERTISED_CAPS {
+            let entry = DEFAULT_CATALOG
+                .iter()
+                .find(|e| e.cap == *cap)
+                .unwrap_or_else(|| panic!("`{cap}` missing from DEFAULT_CATALOG"));
+            assert!(entry.input_schema.is_some(), "`{cap}` must advertise an input schema");
+            assert!(entry.output_schema.is_some(), "`{cap}` must advertise an output schema");
+            assert!(
+                entry.min_tier.is_none(),
+                "`{cap}` must stay local-tier-visible so the local daemon surfaces its schemas"
+            );
+        }
+    }
+
+    /// `schema_document` (the lookup behind the daemon's
+    /// `GET /v1/session/schemas/{file}` route) serves exactly the bytes the
+    /// pinned `SchemaRef.hash` covers — served-bytes/hash drift is impossible
+    /// by construction (plan R3). Unknown files resolve to nothing.
+    #[test]
+    fn schema_document_lookup_serves_the_pinned_bytes() {
+        let mut advertised = 0;
+        for entry in DEFAULT_CATALOG {
+            for schema in [entry.input_schema, entry.output_schema].into_iter().flatten() {
+                let served = schema_document(schema.file)
+                    .unwrap_or_else(|| panic!("advertised schema `{}` must be resolvable", schema.file));
+                assert_eq!(served.bytes, schema.bytes, "served bytes must be the embedded bytes");
+                assert_eq!(
+                    *blake3::hash(served.bytes).as_bytes(),
+                    schema.to_schema_ref().hash,
+                    "served bytes must BLAKE3-match the pinned hash for `{}`",
+                    schema.file
+                );
+                advertised += 1;
+            }
+        }
+        assert_eq!(
+            advertised, 8,
+            "expected 4 caps x (in + out) advertised schema documents"
+        );
+        assert!(schema_document("nonexistent.in.json").is_none());
+        assert!(schema_document("").is_none());
     }
 }

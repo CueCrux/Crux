@@ -353,6 +353,44 @@ pub async fn get_session_plan(
     response
 }
 
+/// `GET /v1/session/schemas/{file}` — serve an advertised capability schema
+/// document (capability-graph M2, advertise-only).
+///
+/// The bytes served here are the exact embedded bytes whose BLAKE3 is pinned
+/// into the corresponding `SchemaRef.hash` in the capability graph
+/// ([`crux_session::catalog::CatalogSchema::to_schema_ref`] — both read the
+/// same `CatalogSchema.bytes`), so a client can resolve `SchemaRef.uri`
+/// against the daemon origin and verify the pin. Public for the same reason
+/// `/session` is (master-plan §5.3): schema documents are static
+/// advertisements carrying no tenant or session state.
+#[allow(clippy::unused_async)] // axum handler signature; lookup is in-memory
+pub async fn get_session_schema(Path(file): Path<String>) -> Response {
+    let Some(doc) = crux_session::catalog::schema_document(&file) else {
+        return problem(
+            StatusCode::NOT_FOUND,
+            "unknown schema document",
+            format!(
+                "no advertised capability schema `{file}`; resolvable documents are \
+                 exactly the `SchemaRef.uri` values in the capability graph"
+            ),
+        );
+    };
+    let mut response = (StatusCode::OK, doc.bytes).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/schema+json"),
+    );
+    // Strong ETag = the pinned BLAKE3 (hex) — lets clients revalidate the pin
+    // without re-downloading, and makes hash drift observable with curl alone.
+    if let Ok(value) = HeaderValue::from_str(&format!("\"{}\"", blake3::hash(doc.bytes).to_hex())) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=3600"));
+    response
+}
+
 /// `POST /session` — mint a session plan.
 #[tracing::instrument(level = "info", skip(state, headers, body))]
 pub async fn post_session(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {

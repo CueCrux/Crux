@@ -13313,6 +13313,49 @@ async fn active_sessions_requires_admin_read() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// Capability-graph M2: `GET /v1/session/schemas/{file}` serves the exact
+/// embedded bytes whose BLAKE3 is pinned into the corresponding
+/// `SchemaRef.hash` in the capability graph, with a schema+json content type
+/// and the hash as a strong ETag. Unknown documents 404.
+#[tokio::test]
+async fn session_schema_route_serves_hash_pinned_bytes() {
+    for file in [
+        "session_context.in.json",
+        "journal_append.out.json",
+        "proof_verify.in.json",
+        "output.verifiable_receipts.out.json",
+    ] {
+        let resp = super::session::get_session_schema(axum::extract::Path(file.to_string())).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{file} must be served");
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/schema+json"),
+            "{file} content type"
+        );
+        let expected = crux_session::catalog::schema_document(file).expect("advertised document");
+        let pinned_hash = expected.to_schema_ref().hash;
+        assert_eq!(
+            resp.headers().get(header::ETAG).and_then(|v| v.to_str().ok()),
+            Some(format!("\"{}\"", blake3::Hash::from(pinned_hash).to_hex()).as_str()),
+            "{file} ETag must be the pinned BLAKE3 hex"
+        );
+        let body = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        assert_eq!(
+            body.as_ref(),
+            expected.bytes,
+            "{file} served bytes must be the embedded bytes"
+        );
+        assert_eq!(
+            *blake3::hash(&body).as_bytes(),
+            pinned_hash,
+            "{file} served bytes must BLAKE3-match the SchemaRef.hash pinned in the graph"
+        );
+    }
+
+    let missing = super::session::get_session_schema(axum::extract::Path("nope.in.json".to_string())).await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn session_plan_read_through_returns_sealed_v1_plan() {
     let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "/v1/session/schemas/output.verifiable_receipts.out.json",
+  "title": "output.verifiable_receipts output (Receipt)",
+  "description": "Signed output-attestation receipt (catalog shape `Receipt`; mirrors the `output_attest` tool result's `manifest` object). Advertise-only per RCX Session-Handshake v1; the field set is open (additive).",
+  "type": "object",
+  "required": ["manifest_id", "content_hash_blake3_hex"],
+  "properties": {
+    "manifest_id": {
+      "type": "string",
+      "description": "Identifier of the signed manifest."
+    },
+    "spec_version": {
+      "type": "string",
+      "description": "C2PA spec version the manifest targets."
+    },
+    "manifest_jumbf_base64": {
+      "type": "string",
+      "description": "The signed manifest envelope, base64-encoded JUMBF."
+    },
+    "content_hash_blake3_hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase hex of the 32-byte BLAKE3 hash of the attested content bytes."
+    },
+    "crown_receipt_id": {
+      "type": "string",
+      "description": "Id of the CROWN receipt anchoring this attestation."
+    },
+    "signer_key_id": {
+      "type": "string",
+      "description": "Key id the manifest was signed with."
+    },
+    "signer_alg": {
+      "type": "string",
+      "description": "Signature algorithm, e.g. ed25519 or ES256."
+    },
+    "verify_url": {
+      "type": ["string", "null"],
+      "description": "Best-effort URL for re-verifying the manifest against the issuing daemon."
+    }
+  },
+  "additionalProperties": true
+}

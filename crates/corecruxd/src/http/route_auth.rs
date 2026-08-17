@@ -84,6 +84,10 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
             | "/readyz"
             | "/metrics"
             | "/session"
+            // Advertised capability-schema documents (capability-graph M2):
+            // static, hash-pinned advertisements with no tenant/session state —
+            // public for the same §5.3 reason `/session` is.
+            | "/v1/session/schemas/{file}"
             | "/invocation/verify"
             | "/v1/openapi.json"
             | "/v1/version"
@@ -1048,6 +1052,7 @@ mod tests {
     fn route_auth_scope_contracts() {
         let cases = [
             ("POST", "/v1/sync/handshake/nonce", RouteAuthClass::Public, &[][..]),
+            ("GET", "/v1/session/schemas/{file}", RouteAuthClass::Public, &[][..]),
             (
                 "GET",
                 "/v1/admin/version",

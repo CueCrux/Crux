@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "/v1/session/schemas/session_context.out.json",
+  "title": "session_context output (Snapshot)",
+  "description": "Session-context snapshot envelope (catalog shape `Snapshot`). Advertise-only per RCX Session-Handshake v1; the field set is open (additive).",
+  "type": "object",
+  "required": ["session_id"],
+  "properties": {
+    "session_id": {
+      "type": "string",
+      "description": "The session this snapshot describes."
+    },
+    "minted_at": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix epoch milliseconds at which the snapshot was taken."
+    },
+    "context": {
+      "type": "object",
+      "description": "Scoped session state. Keys are surface-defined; values are JSON.",
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

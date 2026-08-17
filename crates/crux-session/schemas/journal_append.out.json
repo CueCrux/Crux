@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "/v1/session/schemas/journal_append.out.json",
+  "title": "journal_append output (Receipt)",
+  "description": "Receipt envelope returned by an append (catalog shape `Receipt`), mirroring the RCX receipt envelope: BLAKE3 content hash, optional ed25519 signature, optional signer key id. Advertise-only per RCX Session-Handshake v1; the field set is open (additive).",
+  "type": "object",
+  "required": ["hash"],
+  "properties": {
+    "mode": {
+      "type": "string",
+      "description": "Receipt mode, e.g. `hash-only` or `verified` (signed)."
+    },
+    "hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase hex of the 32-byte BLAKE3 hash over the appended entry's canonical bytes."
+    },
+    "signature": {
+      "type": ["string", "null"],
+      "description": "Lowercase hex of the 64-byte ed25519 signature, when the journal signer is configured."
+    },
+    "signer_kid": {
+      "type": ["string", "null"],
+      "description": "Key id of the signing key, when signed."
+    }
+  },
+  "additionalProperties": true
+}

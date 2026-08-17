@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "/v1/session/schemas/proof_verify.in.json",
+  "title": "proof_verify input",
+  "description": "Request envelope for re-verifying a receipt (catalog shape `VerifyResult`; mirrors the `receipt_verify` tool arguments). Advertise-only per RCX Session-Handshake v1; the field set is open (additive).",
+  "type": "object",
+  "required": ["receipt_id"],
+  "properties": {
+    "receipt_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Identifier of the receipt to re-verify."
+    },
+    "tenant_id": {
+      "type": "string",
+      "description": "Tenant scope of the receipt. Defaults to the daemon's default tenant."
+    }
+  },
+  "additionalProperties": true
+}
