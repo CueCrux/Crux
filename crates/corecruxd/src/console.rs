@@ -1,19 +1,20 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Embedded console HTML asset server — small static-file router for the in-process console.
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
-use axum::extract::Path as AxumPath;
-use axum::http::header;
+use axum::extract::{Path as AxumPath, Request};
+use axum::http::{header, HeaderName, HeaderValue, Method};
+use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::Router;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 // Unified Shell Console v2 (ExecPlan unified-shell-console-2026-07-03). The
 // self-contained, no-build shell served unconditionally at `/console` — the
@@ -30,6 +31,12 @@ const CONSOLE_V2_RENDER_JS: &str = include_str!("../console/v2/render.js");
 // `cargo test -p corecruxd --test route_spec_drift -- --ignored regen_api_js`.
 // GET routes only — the customer-safe posture holds at the client layer too.
 const CONSOLE_V2_API_JS: &str = include_str!("../console/v2/api.js");
+// Link-graph pane WebGL renderer (ExecPlan wikicrux-link-graph-explorer M4). A
+// client-only ESM module (custom three.js r165) served at
+// `/console-v2/linkgraph-renderer.mjs`; render.js dynamically imports it when the
+// Link graph pane opens. `three` resolves via the shell import map to the vendored
+// r165 — zero new vendored files (T.5). Same embedded, dev-overridable posture.
+const CONSOLE_V2_LINKGRAPH_MJS: &str = include_str!("../console/v2/linkgraph-renderer.mjs");
 // PWA app-shell assets (M5). Served same-origin at `/console-v2/{name}` alongside
 // the JS modules. `sw.js` is the app-shell service worker (never caches `/v1/*`);
 // `manifest.webmanifest` is the install manifest; `icon.svg` is the app icon.
@@ -39,6 +46,38 @@ const CONSOLE_V2_SW_JS: &str = include_str!("../console/v2/sw.js");
 const CONSOLE_V2_MANIFEST: &str = include_str!("../console/v2/manifest.webmanifest");
 const CONSOLE_V2_ICON_SVG: &str = include_str!("../console/v2/icon.svg");
 const CONSOLE_DEV_PATH_ENV: &str = "CORECRUXD_CONSOLE_DEV_PATH";
+
+// CORS allowlist for the console asset routes (ExecPlan
+// crux-console-public-exposure-2026-05-17, M5). The console is publicly exposed
+// behind oauth2-proxy, so the daemon must not answer cross-origin requests with
+// a wildcard `Access-Control-Allow-Origin`. Origins are configured via
+// `CORECRUXD_CONSOLE_ALLOWED_ORIGINS` (comma-separated); when unset (or empty
+// after trimming) the production defaults below apply.
+const CONSOLE_ALLOWED_ORIGINS_ENV: &str = "CORECRUXD_CONSOLE_ALLOWED_ORIGINS";
+
+// Browser hardening for every document and static asset served by the daemon.
+// The console intentionally uses same-origin frames for its 3D view and Studio
+// web tiles, so frame-src/frame-ancestors and X-Frame-Options permit only that
+// same origin rather than denying framing outright. Inline script/style remain
+// necessary for the embedded, no-build shell and `/activate`; eval is not.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-src 'self'; frame-ancestors 'self'; form-action 'self'; connect-src 'self'; img-src 'self' data: blob:; font-src 'self' data:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; worker-src 'self'; manifest-src 'self'";
+const BROWSER_SECURITY_HEADERS: [(&str, &str); 7] = [
+    ("content-security-policy", CONTENT_SECURITY_POLICY),
+    ("x-content-type-options", "nosniff"),
+    ("x-frame-options", "SAMEORIGIN"),
+    ("referrer-policy", "no-referrer"),
+    (
+        "permissions-policy",
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=()",
+    ),
+    ("cross-origin-opener-policy", "same-origin"),
+    ("cross-origin-resource-policy", "same-origin"),
+];
+
+// Default allowlist when `CORECRUXD_CONSOLE_ALLOWED_ORIGINS` is unset: the
+// public console origin plus the two Tailnet-facing origins the daemon is
+// reachable on (host `crux` / its Tailscale IP). Matches the M5 plan intent.
+const DEFAULT_CONSOLE_ALLOWED_ORIGINS: &[&str] = &["https://crux.cuecrux.com", "http://100.70.12.73", "http://crux"];
 
 // Bundled PNG assets — embedded so the binary can serve them with no on-disk
 // dependency. Dev override (CORECRUXD_CONSOLE_DEV_PATH) falls back to reading
@@ -58,10 +97,24 @@ const CONSOLE3D_VENDOR_THREE: &str = include_str!("../console/console-3d/vendor/
 const CONSOLE3D_VENDOR_ORBIT: &str = include_str!("../console/console-3d/vendor/OrbitControls.js");
 const CONSOLE3D_VENDOR_ROUNDED: &str = include_str!("../console/console-3d/vendor/RoundedBoxGeometry.js");
 
+// Claude Desktop connector bundle, offered as a one-click download from the
+// console's Connections page. An `.mcpb` is a zip of `manifest.json` plus the
+// server it runs; Desktop's `server.type` accepts only node/python/binary, so a
+// remote HTTP daemon has to ship a local stdio shim — here a pinned, vendored
+// `mcp-remote`. The artifact is PREBUILT and committed (rebuild with
+// `console/mcpb/build.sh`) so a `cargo build` never needs npm and can never
+// resolve a different dependency version.
+//
+// It carries no per-install state: the endpoint URL and agent token are mcpb
+// `user_config` fields that Desktop prompts for at install time, so every
+// operator downloads identical bytes.
+const ASSET_CLAUDE_DESKTOP_MCPB: &[u8] = include_bytes!("../console/assets/crux.mcpb");
+
 fn embedded_asset(name: &str) -> Option<&'static [u8]> {
     match name {
         "CueCrux-Arc-Loop.png" => Some(ASSET_LOGO_DARK),
         "CueCrux-Arc-Loop-White.png" => Some(ASSET_LOGO_WHITE),
+        "crux.mcpb" => Some(ASSET_CLAUDE_DESKTOP_MCPB),
         _ => None,
     }
 }
@@ -91,6 +144,7 @@ async fn serve_console_v2_asset(AxumPath(name): AxumPath<String>) -> Response {
         "pages.js" => (CONSOLE_V2_PAGES_JS, "text/javascript; charset=utf-8"),
         "render.js" => (CONSOLE_V2_RENDER_JS, "text/javascript; charset=utf-8"),
         "api.js" => (CONSOLE_V2_API_JS, "text/javascript; charset=utf-8"),
+        "linkgraph-renderer.mjs" => (CONSOLE_V2_LINKGRAPH_MJS, "text/javascript; charset=utf-8"),
         "sw.js" => (CONSOLE_V2_SW_JS, "application/javascript; charset=utf-8"),
         "manifest.webmanifest" => (CONSOLE_V2_MANIFEST, "application/manifest+json; charset=utf-8"),
         "icon.svg" => (CONSOLE_V2_ICON_SVG, "image/svg+xml; charset=utf-8"),
@@ -173,14 +227,24 @@ fn asset_response(name: &str, bytes: Vec<u8>) -> Response {
     } else {
         "application/octet-stream"
     };
-    (
+    let mut response = (
         [
             (header::CONTENT_TYPE, content_type),
             (header::CACHE_CONTROL, "public, max-age=86400"),
         ],
         bytes,
     )
-        .into_response()
+        .into_response();
+    // Connector bundles are downloads, not things to render. Without an
+    // attachment disposition a browser hands the octet-stream to its own
+    // save-file guesswork and the operator ends up with `download` or
+    // `crux.mcpb.zip` — Claude Desktop only accepts the `.mcpb` extension.
+    if ext_eq("mcpb") {
+        if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{name}\"")) {
+            response.headers_mut().insert(header::CONTENT_DISPOSITION, value);
+        }
+    }
+    response
 }
 
 /// Embedded 3D substrate assets, keyed by their path under `/console-3d/`.
@@ -206,6 +270,84 @@ async fn serve_console3d(AxumPath(path): AxumPath<String>) -> Response {
         .into_response()
 }
 
+/// An allowlist entry is only accepted if it looks like a browser Origin: an
+/// `http`/`https` scheme (case-insensitive) followed by a non-empty host. This
+/// is deliberately strict — it drops `*`, `null`, and non-web schemes so a
+/// misconfigured env var cannot re-introduce a permissive or opaque-origin match.
+fn is_allowlistable_origin(entry: &str) -> bool {
+    let lower = entry.to_ascii_lowercase();
+    ["https://", "http://"]
+        .into_iter()
+        .find_map(|scheme| lower.strip_prefix(scheme))
+        .is_some_and(|host| !host.is_empty())
+}
+
+/// Parse the comma-separated `CORECRUXD_CONSOLE_ALLOWED_ORIGINS` value into a
+/// validated list of allowed origins. Entries are trimmed; empty entries (so a
+/// trailing comma or `"a, ,b"`) are dropped; entries that are not a valid HTTP
+/// header value (control chars, etc.) are skipped rather than aborting startup.
+/// When the input yields no usable origins, the production defaults apply — the
+/// console is never left with an empty allowlist by accident, and never falls
+/// back to a permissive wildcard.
+fn resolve_allowed_origins(raw: &str) -> Vec<HeaderValue> {
+    let parsed: Vec<HeaderValue> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        // Only accept real `http(s)://<host>` origins. This rejects a literal
+        // wildcard (`*` would defeat the allowlist and panics `AllowOrigin::list`)
+        // AND opaque-origin values like `null`, `file:` or `data:` — a configured
+        // `null` would otherwise match the `Origin: null` that sandboxed iframes
+        // and local-file contexts send, silently re-opening the hole M5 closes.
+        .filter(|entry| is_allowlistable_origin(entry))
+        .filter_map(|entry| HeaderValue::from_str(entry).ok())
+        .collect();
+    if parsed.is_empty() {
+        DEFAULT_CONSOLE_ALLOWED_ORIGINS
+            .iter()
+            .filter_map(|origin| HeaderValue::from_str(origin).ok())
+            .collect()
+    } else {
+        parsed
+    }
+}
+
+/// Resolve the console CORS allowlist from the environment (or the defaults).
+fn console_allowed_origins() -> Vec<HeaderValue> {
+    let raw = std::env::var(CONSOLE_ALLOWED_ORIGINS_ENV).unwrap_or_default();
+    resolve_allowed_origins(&raw)
+}
+
+/// Build the explicit-allowlist CORS layer for the console asset routes. Replaces
+/// the previous `CorsLayer::permissive()` (which reflected any origin with a
+/// wildcard `Access-Control-Allow-Origin`) now that the console is publicly
+/// exposed. Origins come from `console_allowed_origins`; methods are restricted
+/// to the read-only verbs these static-asset routes actually serve. Request
+/// headers are named explicitly rather than `Any`: the CORS spec's `*` header
+/// wildcard does NOT cover `Authorization`, so it must be listed by name for the
+/// console's localStorage-JWT (`Authorization` header) flow to survive preflight.
+/// Credentials are intentionally NOT allowed — the JWT rides an `Authorization`
+/// header, never a cookie, so cookie/credential mode stays off.
+fn console_cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(console_allowed_origins()))
+        .allow_methods([Method::GET, Method::HEAD, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT])
+}
+
+/// Replace any route-local browser policy with the daemon's canonical policy.
+/// This layer sits outside CORS so its headers also cover CORS-generated
+/// preflight responses.
+async fn add_browser_security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    for (name, value) in BROWSER_SECURITY_HEADERS {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static(name), HeaderValue::from_static(value));
+    }
+    response
+}
+
 pub fn routes(enabled: bool) -> Router {
     if !enabled {
         return Router::new();
@@ -219,7 +361,8 @@ pub fn routes(enabled: bool) -> Router {
         .route("/console-3d/{*path}", get(serve_console3d))
         // Device-grant approval page (ExecPlan crux-unified-login-rails, M3).
         .route("/activate", get(serve_activate))
-        .layer(CorsLayer::permissive())
+        .layer(console_cors_layer())
+        .layer(axum::middleware::from_fn(add_browser_security_headers))
 }
 
 /// `/activate` — operator approval page for the device-authorization grant.
@@ -476,10 +619,13 @@ fn resolve_dev_html_path(base: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_console_body, CONSOLE_DEV_PATH_ENV, CONSOLE_V2_API_JS, CONSOLE_V2_HTML, CONSOLE_V2_ICON_SVG,
-        CONSOLE_V2_MANIFEST, CONSOLE_V2_PAGES_JS, CONSOLE_V2_RENDER_JS, CONSOLE_V2_SW_JS,
+        resolve_console_body, BROWSER_SECURITY_HEADERS, CONSOLE_DEV_PATH_ENV, CONSOLE_V2_API_JS, CONSOLE_V2_HTML,
+        CONSOLE_V2_ICON_SVG, CONSOLE_V2_LINKGRAPH_MJS, CONSOLE_V2_MANIFEST, CONSOLE_V2_PAGES_JS, CONSOLE_V2_RENDER_JS,
+        CONSOLE_V2_SW_JS, CONTENT_SECURITY_POLICY,
     };
     use std::sync::Mutex;
+
+    const DESKTOP_PROXY_SOURCE: &str = include_str!("../../../shells/desktop/connection/src/proxy.rs");
 
     // The dev-path / v2 flag env vars are process-global; serialise tests that
     // mutate either of them. Recover a poisoned lock so one failing env test
@@ -487,6 +633,148 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn assert_browser_security_headers(headers: &axum::http::HeaderMap) {
+        for (name, expected) in BROWSER_SECURITY_HEADERS {
+            assert_eq!(
+                headers.get_all(name).iter().count(),
+                1,
+                "{name} must occur exactly once"
+            );
+            assert_eq!(
+                headers.get(name).and_then(|value| value.to_str().ok()),
+                Some(expected),
+                "{name} must match the canonical browser policy"
+            );
+        }
+        assert!(CONTENT_SECURITY_POLICY.contains("frame-src 'self'"));
+        assert!(CONTENT_SECURITY_POLICY.contains("frame-ancestors 'self'"));
+        assert!(!CONTENT_SECURITY_POLICY.contains("'unsafe-eval'"));
+        assert!(!CONTENT_SECURITY_POLICY.contains("'wasm-unsafe-eval'"));
+    }
+
+    #[tokio::test]
+    async fn browser_security_headers_cover_all_console_responses() {
+        use tower::ServiceExt;
+
+        let _guard = env_lock();
+        std::env::remove_var(CONSOLE_DEV_PATH_ENV);
+        std::env::remove_var(super::CONSOLE_ALLOWED_ORIGINS_ENV);
+
+        for (method, uri, expected_status) in [
+            (axum::http::Method::GET, "/", axum::http::StatusCode::SEE_OTHER),
+            (axum::http::Method::GET, "/console", axum::http::StatusCode::OK),
+            (axum::http::Method::HEAD, "/console", axum::http::StatusCode::OK),
+            (
+                axum::http::Method::GET,
+                "/console-assets/CueCrux-Arc-Loop.png",
+                axum::http::StatusCode::OK,
+            ),
+            (
+                axum::http::Method::GET,
+                "/console-assets/missing.png",
+                axum::http::StatusCode::NOT_FOUND,
+            ),
+            (axum::http::Method::GET, "/console-v2/sw.js", axum::http::StatusCode::OK),
+            (
+                axum::http::Method::GET,
+                "/console-v2/missing.js",
+                axum::http::StatusCode::NOT_FOUND,
+            ),
+            (
+                axum::http::Method::GET,
+                "/console-v2/%2E%2E",
+                axum::http::StatusCode::BAD_REQUEST,
+            ),
+            (
+                axum::http::Method::GET,
+                "/console-3d/index.html",
+                axum::http::StatusCode::OK,
+            ),
+            (
+                axum::http::Method::GET,
+                "/console-3d/missing.js",
+                axum::http::StatusCode::NOT_FOUND,
+            ),
+            (axum::http::Method::GET, "/activate", axum::http::StatusCode::OK),
+        ] {
+            let response = super::routes(true)
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .expect("build request"),
+                )
+                .await
+                .expect("router response");
+            assert_eq!(response.status(), expected_status, "unexpected status for {uri}");
+            assert_browser_security_headers(response.headers());
+        }
+
+        let preflight = super::routes(true)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("OPTIONS")
+                    .uri("/console")
+                    .header(axum::http::header::ORIGIN, "https://crux.cuecrux.com")
+                    .header(axum::http::header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .header(axum::http::header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+                    .body(axum::body::Body::empty())
+                    .expect("build preflight request"),
+            )
+            .await
+            .expect("preflight response");
+        assert_eq!(preflight.status(), axum::http::StatusCode::OK);
+        assert_browser_security_headers(preflight.headers());
+        assert_eq!(
+            preflight
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("https://crux.cuecrux.com"),
+            "security middleware must preserve CORS preflight headers"
+        );
+    }
+
+    #[test]
+    fn desktop_proxy_browser_security_policy_matches_daemon() {
+        let normalized_desktop = DESKTOP_PROXY_SOURCE
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let normalized_csp = CONTENT_SECURITY_POLICY
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        assert!(
+            normalized_desktop.contains(&format!("constcontent_security_policy:&str=\"{normalized_csp}\";")),
+            "desktop proxy CSP must match the daemon policy byte-for-byte"
+        );
+        assert!(
+            normalized_desktop.contains("constbrowser_security_headers:[(&str,&str);7]"),
+            "desktop proxy must expose the same seven canonical headers"
+        );
+        assert!(
+            normalized_desktop.contains("(\"content-security-policy\",content_security_policy)"),
+            "desktop proxy must source CSP from its parity-checked constant"
+        );
+        for (name, value) in BROWSER_SECURITY_HEADERS.into_iter().skip(1) {
+            let normalized_value = value
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            let compact = format!("(\"{name}\",\"{normalized_value}\")");
+            let compact_with_trailing_comma = format!("(\"{name}\",\"{normalized_value}\",)");
+            assert!(
+                normalized_desktop.contains(&compact) || normalized_desktop.contains(&compact_with_trailing_comma),
+                "desktop proxy header {name} must match the daemon value"
+            );
+        }
     }
 
     #[test]
@@ -555,10 +843,10 @@ mod tests {
 
     #[test]
     fn console_v2_shell_has_licence_header_and_no_external_runtime_deps() {
-        // CCL licence header carried in the leading HTML comment.
+        // Apache-2.0 licence header carried in the leading HTML comment.
         assert!(
-            CONSOLE_V2_HTML.contains("CueCrux Community Licence (CCL v1.0)"),
-            "v2 shell must carry the CCL licence header"
+            CONSOLE_V2_HTML.contains("Licensed under the Apache License, Version 2.0."),
+            "v2 shell must carry the Apache-2.0 licence header"
         );
         // Same no-external-runtime-deps posture as the console shell.
         for blocked in [
@@ -613,15 +901,15 @@ mod tests {
 
     #[test]
     fn console_v2_modules_carry_licence_and_no_external_runtime_deps() {
-        // Every v2 file keeps the CCL header + the no-external-runtime-deps posture.
+        // Every v2 file keeps the Apache-2.0 header + the no-external-runtime-deps posture.
         for (name, body) in [
             ("pages.js", CONSOLE_V2_PAGES_JS),
             ("render.js", CONSOLE_V2_RENDER_JS),
             ("api.js", CONSOLE_V2_API_JS),
         ] {
             assert!(
-                body.contains("CueCrux Community Licence (CCL v1.0)"),
-                "{name} must carry the CCL licence header"
+                body.contains("Licensed under the Apache License, Version 2.0."),
+                "{name} must carry the Apache-2.0 licence header"
             );
             // Block remote loaders + CDN hosts. Bare http(s) literals are NOT
             // blocked — the embedding-endpoint placeholder (`http://localhost:…`)
@@ -692,6 +980,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn console_v2_linkgraph_renderer_module_is_self_contained() {
+        // ExecPlan wikicrux-link-graph-explorer M4: the renderer is a client-only
+        // ESM module (custom three.js r165). Apache-2.0 header + public API + the vendored
+        // three specifier + zero external runtime deps (T.5).
+        assert!(
+            CONSOLE_V2_LINKGRAPH_MJS.contains("Licensed under the Apache License, Version 2.0."),
+            "linkgraph-renderer.mjs must carry the Apache-2.0 licence header"
+        );
+        assert!(
+            CONSOLE_V2_LINKGRAPH_MJS.contains("import * as THREE from 'three'"),
+            "renderer must import the bare `three` specifier (resolved by the shell import map to the vendored r165)"
+        );
+        for api in ["mount", "setData", "expandData", "setTheme", "onNodeClick", "destroy"] {
+            assert!(
+                CONSOLE_V2_LINKGRAPH_MJS.contains(api),
+                "renderer must expose the shared public API method: {api}"
+            );
+        }
+        // No external runtime deps: no remote loader / CDN host / http(s) import.
+        for blocked in [
+            "from \"http",
+            "from 'http",
+            "import(\"http",
+            "import('http",
+            "unpkg.com",
+            "jsdelivr.net",
+            "cdnjs.cloudflare",
+            "cdn.jsdelivr",
+            "fonts.googleapis",
+        ] {
+            assert!(
+                !CONSOLE_V2_LINKGRAPH_MJS.contains(blocked),
+                "linkgraph-renderer.mjs has an external runtime dependency marker: {blocked}"
+            );
+        }
+    }
+
+    #[test]
+    fn console_v2_shell_wires_the_link_graph_import_map() {
+        // The import map maps `three` to the already-vendored r165 (same-origin,
+        // no CDN) and must precede any module load (it lives in <head>).
+        assert!(
+            CONSOLE_V2_HTML.contains(r#"<script type="importmap">"#),
+            "shell must carry an import map for the link-graph renderer"
+        );
+        assert!(
+            CONSOLE_V2_HTML.contains("/console-3d/vendor/three.module.min.js"),
+            "shell import map must point `three` at the vendored r165"
+        );
+        assert!(
+            CONSOLE_V2_HTML.contains("destId === 'linkgraph'") && CONSOLE_V2_HTML.contains("renderLinkGraph"),
+            "shell must route the linkgraph destination to render.renderLinkGraph"
+        );
+    }
+
     #[tokio::test]
     async fn console_v2_asset_route_serves_the_modules() {
         use tower::ServiceExt;
@@ -700,6 +1044,7 @@ mod tests {
         for (uri, needle) in [
             ("/console-v2/pages.js", "MUTATING_ACTIONS"),
             ("/console-v2/render.js", "CONTROL_TYPES"),
+            ("/console-v2/linkgraph-renderer.mjs", "createLinkGraphRenderer"),
         ] {
             let resp = super::routes(true)
                 .oneshot(
@@ -736,13 +1081,13 @@ mod tests {
 
     #[test]
     fn console_v2_pwa_assets_carry_licence_and_markers() {
-        // sw.js + icon.svg can carry the CCL header as a comment; assert it plus
+        // sw.js + icon.svg can carry the Apache-2.0 header as a comment; assert it plus
         // their structural markers. (manifest.webmanifest is pure JSON — no
         // comments — so its header is intentionally absent; markers checked below.)
         for (name, body) in [("sw.js", CONSOLE_V2_SW_JS), ("icon.svg", CONSOLE_V2_ICON_SVG)] {
             assert!(
-                body.contains("CueCrux Community Licence (CCL v1.0)"),
-                "{name} must carry the CCL licence header"
+                body.contains("Licensed under the Apache License, Version 2.0."),
+                "{name} must carry the Apache-2.0 licence header"
             );
         }
         for required in [
@@ -862,5 +1207,254 @@ mod tests {
                 "{uri} body should contain {needle}"
             );
         }
+    }
+
+    // ---- CORS allowlist (ExecPlan crux-console-public-exposure, M5) --------
+
+    // Render a `Vec<HeaderValue>` origin list back to comparable strings.
+    fn origin_strings(origins: &[axum::http::HeaderValue]) -> Vec<String> {
+        origins
+            .iter()
+            .map(|v| v.to_str().expect("origin is ascii").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn claude_desktop_bundle_is_embedded_and_is_a_zip() {
+        // The bundle is a committed build artifact, so a truncated or
+        // LFS-pointer-shaped checkout would otherwise only surface as a
+        // Claude Desktop install failure on someone's laptop.
+        let bytes = super::embedded_asset("crux.mcpb").expect("crux.mcpb is embedded");
+        assert_eq!(
+            &bytes[..4],
+            b"PK\x03\x04",
+            "an .mcpb is a zip archive; got magic {:?}",
+            &bytes[..4]
+        );
+        assert!(
+            bytes.len() > 500_000,
+            "bundle vendors mcp-remote and should be ~1.5MB, got {} bytes",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn mcpb_asset_is_served_as_a_named_download() {
+        // Desktop only accepts the `.mcpb` extension, so the filename has to
+        // survive the download — an octet-stream with no disposition leaves the
+        // browser to guess and it guesses wrong.
+        let response = super::asset_response("crux.mcpb", vec![b'P', b'K', 3, 4]);
+        let headers = response.headers();
+        assert_eq!(
+            headers.get(super::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            headers
+                .get(super::header::CONTENT_DISPOSITION)
+                .and_then(|v| v.to_str().ok()),
+            Some("attachment; filename=\"crux.mcpb\"")
+        );
+        // Images keep rendering inline — the disposition is mcpb-only.
+        let png = super::asset_response("CueCrux-Arc-Loop.png", vec![0x89, b'P', b'N', b'G']);
+        assert!(png.headers().get(super::header::CONTENT_DISPOSITION).is_none());
+    }
+
+    #[test]
+    fn allowed_origins_empty_input_falls_back_to_defaults() {
+        // Unset / blank / comma-and-whitespace-only all resolve to the
+        // production defaults — never an empty (deny-all) or wildcard list.
+        for raw in ["", "   ", ",", " , , ", "\t,\n"] {
+            let origins = origin_strings(&super::resolve_allowed_origins(raw));
+            assert_eq!(
+                origins,
+                vec![
+                    "https://crux.cuecrux.com".to_string(),
+                    "http://100.70.12.73".to_string(),
+                    "http://crux".to_string(),
+                ],
+                "input {raw:?} should fall back to the default allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_origins_parses_and_trims_a_custom_list() {
+        // Trimming, dropped empty entries (leading/trailing/interior commas),
+        // and order preservation.
+        let origins = origin_strings(&super::resolve_allowed_origins(
+            "  https://a.example.com ,http://localhost:5173, ,https://b.example.com,",
+        ));
+        assert_eq!(
+            origins,
+            vec![
+                "https://a.example.com".to_string(),
+                "http://localhost:5173".to_string(),
+                "https://b.example.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn allowed_origins_skips_invalid_entries_but_keeps_valid_ones() {
+        // A control char makes an invalid HeaderValue; it is dropped, the valid
+        // neighbour survives, and the list does not collapse to the defaults.
+        let origins = origin_strings(&super::resolve_allowed_origins(
+            "https://ok.example.com,bad\u{7f}origin",
+        ));
+        assert_eq!(origins, vec!["https://ok.example.com".to_string()]);
+    }
+
+    #[test]
+    fn allowed_origins_never_contains_wildcard() {
+        // The whole point of M5: the resolver must never emit a `*` origin,
+        // whatever the input.
+        for raw in ["", "*", "https://x.example.com,*", "  *  "] {
+            let origins = origin_strings(&super::resolve_allowed_origins(raw));
+            assert!(
+                !origins.iter().any(|o| o == "*"),
+                "input {raw:?} must not yield a wildcard origin (got {origins:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_origins_rejects_opaque_and_non_web_schemes() {
+        // `null`, `file:`, `data:`, bare hosts, and scheme-only strings are all
+        // dropped — a configured `null` would otherwise match `Origin: null`
+        // from sandboxed iframes / local-file contexts. A well-formed http(s)
+        // neighbour in the same list survives.
+        for bad in [
+            "null",
+            "file://x",
+            "data:text/html",
+            "example.com",
+            "https://",
+            "ftp://x.example.com",
+        ] {
+            let origins = origin_strings(&super::resolve_allowed_origins(bad));
+            // Sole bad entry => empty parse => defaults; assert the bad token
+            // itself never appears.
+            assert!(
+                !origins.iter().any(|o| o == bad),
+                "input {bad:?} must not appear in the resolved allowlist (got {origins:?})"
+            );
+        }
+        // Bad entry dropped, good neighbour kept (no collapse to defaults).
+        let mixed = origin_strings(&super::resolve_allowed_origins("null, https://ok.example.com"));
+        assert_eq!(mixed, vec!["https://ok.example.com".to_string()]);
+    }
+
+    // Parses the configured list directly instead of round-tripping through the
+    // process environment.
+    //
+    // This test used to `set_var` the allowlist and read it back through
+    // `console_allowed_origins()`, and flaked: it observed the built-in defaults
+    // instead of the value it had just set, *while holding `env_lock()`*. The
+    // mutex is not the problem. `setenv` may reallocate the environment block, and
+    // a concurrent `getenv` anywhere in this 2000-plus-test binary can then read a
+    // stale pointer — a hazard no Rust-level lock can fence, and precisely why
+    // `std::env::set_var` is `unsafe` from the 2024 edition. Serialising the
+    // handful of tests that opt into `env_lock()` never covered the other
+    // thousands that merely read env vars of their own.
+    //
+    // `console_allowed_origins()` is a one-line wrapper — `std::env::var(..)
+    // .unwrap_or_default()` feeding this parser — so the parsing contract is fully
+    // covered here, and the wrapper carries no logic worth a flaky test.
+    #[test]
+    fn allowed_origins_parses_a_configured_list() {
+        let origins = origin_strings(&super::resolve_allowed_origins(
+            "https://console.example.test, http://localhost:3000",
+        ));
+        assert_eq!(
+            origins,
+            vec![
+                "https://console.example.test".to_string(),
+                "http://localhost:3000".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_reflects_allowlisted_origin_and_rejects_others() {
+        use tower::ServiceExt;
+        let _guard = env_lock();
+        // Use the built-in defaults for a deterministic allowlist.
+        std::env::remove_var(super::CONSOLE_ALLOWED_ORIGINS_ENV);
+
+        // An allowlisted origin is reflected in Access-Control-Allow-Origin...
+        let resp = super::routes(true)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/console")
+                    .header(axum::http::header::ORIGIN, "https://crux.cuecrux.com")
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://crux.cuecrux.com"),
+            "an allowlisted origin must be reflected exactly (never a wildcard)"
+        );
+
+        // ...and a non-allowlisted origin gets NO allow-origin header at all,
+        // and certainly not a wildcard.
+        let resp = super::routes(true)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/console")
+                    .header(axum::http::header::ORIGIN, "https://evil.example.com")
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router response");
+        let allow_origin = resp
+            .headers()
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok());
+        assert!(
+            allow_origin.is_none(),
+            "a non-allowlisted origin must not receive an Access-Control-Allow-Origin header (got {allow_origin:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_names_authorization_header() {
+        use tower::ServiceExt;
+        let _guard = env_lock();
+        std::env::remove_var(super::CONSOLE_ALLOWED_ORIGINS_ENV);
+        // Preflight from an allowlisted origin requesting an Authorization header:
+        // the `*` header wildcard would NOT satisfy the browser here, so assert
+        // `Authorization` is named explicitly in Access-Control-Allow-Headers.
+        let resp = super::routes(true)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("OPTIONS")
+                    .uri("/console")
+                    .header(axum::http::header::ORIGIN, "https://crux.cuecrux.com")
+                    .header(axum::http::header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .header(axum::http::header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router response");
+        let allow_headers = resp
+            .headers()
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(
+            allow_headers.contains("authorization"),
+            "preflight must name `authorization` explicitly (got {allow_headers:?})"
+        );
     }
 }

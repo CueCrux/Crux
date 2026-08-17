@@ -1,9 +1,54 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 use std::net::{IpAddr, Ipv6Addr};
+
+const RCX_REGISTRY_ORIGIN: &str = "https://registry.rcxprotocol.org";
+const WIKICRUX_ORIGIN: &str = "https://wiki.cuecrux.com";
+
+/// A public product surface that may open in an isolated shell webview.
+///
+/// These tabs never join the daemon-origin allow-list. Keeping the decision as
+/// a closed enum prevents a caller from turning an arbitrary public URL into a
+/// native shell tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellTab {
+    RcxRegistry,
+    WikiCrux,
+}
+
+impl ShellTab {
+    /// Stable dynamic-window label used by the Tauri capability audit.
+    pub const fn window_label(self) -> &'static str {
+        match self {
+            Self::RcxRegistry => "shell-tab-registry",
+            Self::WikiCrux => "shell-tab-wikicrux",
+        }
+    }
+
+    /// Operator-facing window title.
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::RcxRegistry => "Crux — RCX Registry",
+            Self::WikiCrux => "Crux — WikiCrux",
+        }
+    }
+
+    /// Canonical HTTPS origin for the tab.
+    pub const fn origin(self) -> &'static str {
+        match self {
+            Self::RcxRegistry => RCX_REGISTRY_ORIGIN,
+            Self::WikiCrux => WIKICRUX_ORIGIN,
+        }
+    }
+
+    /// Return whether `value` remains on this tab's exact origin.
+    pub fn allows(self, value: &str) -> bool {
+        shell_tab_for_url(value) == Some(self)
+    }
+}
 
 /// A normalized HTTP(S) origin used by the native navigation allow-list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +112,32 @@ pub fn is_public_http_link(value: &str) -> bool {
             .parse::<IpAddr>()
             .ok()
             .is_none_or(|address| !address.is_loopback())
+}
+
+/// Resolve the two exact public origins that may stay inside the desktop shell.
+///
+/// HTTPS on effective port 443 is mandatory. User information, lookalike
+/// hosts, non-default ports, and non-HTTP schemes are rejected by the shared
+/// parser before this closed allow-list is considered.
+pub fn shell_tab_for_url(value: &str) -> Option<ShellTab> {
+    let parsed = ParsedHttpUrl::parse(value)?;
+    if parsed.scheme != "https" || parsed.port != 443 {
+        return None;
+    }
+    if parsed.host.eq_ignore_ascii_case("registry.rcxprotocol.org") {
+        Some(ShellTab::RcxRegistry)
+    } else if parsed.host.eq_ignore_ascii_case("wiki.cuecrux.com") {
+        Some(ShellTab::WikiCrux)
+    } else {
+        None
+    }
+}
+
+/// Resolve a dynamic window label without accepting prefix lookalikes.
+pub fn shell_tab_for_window_label(value: &str) -> Option<ShellTab> {
+    [ShellTab::RcxRegistry, ShellTab::WikiCrux]
+        .into_iter()
+        .find(|tab| tab.window_label() == value)
 }
 
 /// Reserve the generation after `current` without wrapping to an older value.
@@ -150,7 +221,8 @@ fn parse_port(raw: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        generation_is_current, is_public_http_link, next_generation, origin_is_allowed, OriginKey, OriginPolicy,
+        generation_is_current, is_public_http_link, next_generation, origin_is_allowed, shell_tab_for_url,
+        shell_tab_for_window_label, OriginKey, OriginPolicy, ShellTab,
     };
 
     fn policy() -> OriginPolicy {
@@ -223,6 +295,52 @@ mod tests {
             "https:///missing-host",
         ] {
             assert!(!is_public_http_link(value), "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn allows_only_exact_registry_and_wikicrux_shell_tab_origins() {
+        for (value, expected) in [
+            ("https://registry.rcxprotocol.org", ShellTab::RcxRegistry),
+            (
+                "https://REGISTRY.RCXPROTOCOL.ORG:443/v0/receipts/blake3%3Aabc?format=json#proof",
+                ShellTab::RcxRegistry,
+            ),
+            ("https://wiki.cuecrux.com/code/repository", ShellTab::WikiCrux),
+        ] {
+            assert_eq!(shell_tab_for_url(value), Some(expected), "rejected {value}");
+            assert!(expected.allows(value));
+        }
+    }
+
+    #[test]
+    fn rejects_shell_tab_origin_lookalikes_credentials_and_port_changes() {
+        for value in [
+            "http://registry.rcxprotocol.org/",
+            "https://registry.rcxprotocol.org:444/",
+            "https://registry.rcxprotocol.org.evil.invalid/",
+            "https://registry-rcxprotocol.org/",
+            "https://operator@registry.rcxprotocol.org/",
+            "https://wiki.cuecrux.com.evil.invalid/",
+            "https://wiki.cuecrux.com./",
+            "data:text/html,hello",
+        ] {
+            assert_eq!(shell_tab_for_url(value), None, "allowed {value}");
+        }
+    }
+
+    #[test]
+    fn shell_tab_labels_are_closed_and_stable() {
+        assert_eq!(
+            shell_tab_for_window_label(ShellTab::RcxRegistry.window_label()),
+            Some(ShellTab::RcxRegistry)
+        );
+        assert_eq!(
+            shell_tab_for_window_label(ShellTab::WikiCrux.window_label()),
+            Some(ShellTab::WikiCrux)
+        );
+        for value in ["shell-tab-registry-copy", "shell-tab-wiki", "main", ""] {
+            assert_eq!(shell_tab_for_window_label(value), None, "accepted {value}");
         }
     }
 

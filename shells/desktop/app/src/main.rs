@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 // Hide the extra console window on Windows release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -27,8 +27,9 @@ use std::thread;
 use crux_shell_connection::{
     authorize_local_plan_path, compute_local_plan_hashes, generation_is_current as generation_matches,
     is_public_http_link, local_plan_hashes_initialization_script, next_generation, origin_is_allowed, probe_health,
-    Backoff, HealthReport, HealthState, NativeCredentialBroker, OriginKey, OriginPolicy, Profile, ProfileMode,
-    ProfileSet, ProfileStore, ProxyControl, ProxyHandle, ProxyServer, RuntimeCapabilitiesSummary, StatusPage, Upstream,
+    shell_tab_for_url, shell_tab_for_window_label, Backoff, HealthReport, HealthState, NativeCredentialBroker,
+    OriginKey, OriginPolicy, Profile, ProfileMode, ProfileSet, ProfileStore, ProxyControl, ProxyHandle, ProxyServer,
+    RuntimeCapabilitiesSummary, ShellTab, StatusPage, Upstream,
 };
 use crux_shell_lifecycle::{spawn_sidecar, SidecarConfig, SidecarHandle};
 use tauri::menu::{CheckMenuItem, Menu, MenuItem};
@@ -122,6 +123,11 @@ fn main() {
         })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { .. } = event {
+                // Isolated public shell tabs are disposable child windows.
+                // Closing one must not stop the daemon or exit the application.
+                if shell_tab_for_window_label(window.label()).is_some() {
+                    return;
+                }
                 shutdown_owned_resources(window.app_handle());
                 window.app_handle().exit(0);
             }
@@ -323,8 +329,9 @@ fn build_main_window<M: Manager<Wry>>(
         .initialization_script(local_plan_script)
         // Rule 1: in-webview navigation is limited to the current proxy and,
         // while bundled mode is live, that one shell-owned sidecar origin.
-        // An allowlisted local plan and a public HTTP(S) target can only queue
-        // a native tray approval; page script never launches a handler.
+        // An allowlisted public product origin opens in a separate zero-IPC
+        // webview; a local plan or any other public target can only queue a
+        // native tray approval. Page script never launches a handler.
         .on_navigation(move |url| {
             if handle_local_plan_navigation(
                 &navigation_app,
@@ -335,6 +342,9 @@ fn build_main_window<M: Manager<Wry>>(
                 false
             } else if shared_origin_is_allowed(&navigation_origins, url) {
                 true
+            } else if shell_tab_for_url(url.as_str()).is_some() {
+                open_shell_tab(&navigation_app, window_generation, url);
+                false
             } else {
                 if is_public_http_link(url.as_str()) {
                     queue_external_link(&navigation_app, window_generation, url);
@@ -342,15 +352,19 @@ fn build_main_window<M: Manager<Wry>>(
                 false
             }
         })
-        // Rule 2: a requested new webview is never created; allowlisted local
-        // plans and public HTTP(S) targets enter the same one-item approval
-        // queue. Loopback and all other schemes are denied.
+        // Rule 2: page-requested webviews are never accepted. Exact product-tab
+        // origins are opened through the native isolated-window builder;
+        // allowlisted local plans and all other public HTTP(S) targets enter the
+        // one-item approval queue. Loopback and all other schemes are denied.
         .on_new_window(move |url, _features| {
             if !handle_local_plan_navigation(&new_window_app, &new_window_label, window_generation, &url)
                 && !shared_origin_is_allowed(&new_window_origins, &url)
-                && is_public_http_link(url.as_str())
             {
-                queue_external_link(&new_window_app, window_generation, &url);
+                if shell_tab_for_url(url.as_str()).is_some() {
+                    open_shell_tab(&new_window_app, window_generation, &url);
+                } else if is_public_http_link(url.as_str()) {
+                    queue_external_link(&new_window_app, window_generation, &url);
+                }
             }
             NewWindowResponse::Deny
         })
@@ -358,6 +372,71 @@ fn build_main_window<M: Manager<Wry>>(
         .on_download(|_webview, _event| false)
         .build()
         .map_err(|_| "could not build the Crux console window".to_string())
+}
+
+/// Open or focus one of the two public product tabs after re-checking the
+/// active profile generation on the UI thread.
+fn open_shell_tab(app: &AppHandle, window_generation: u64, target: &Url) {
+    let Some(tab) = shell_tab_for_url(target.as_str()) else {
+        return;
+    };
+    let Some(managed) = app.try_state::<ManagedState>() else {
+        return;
+    };
+    let runtime = Arc::clone(&managed.0);
+    if !runtime_generation_is_current(&runtime, window_generation) {
+        return;
+    }
+    let target = target.clone();
+    let scheduler = app.clone();
+    let ui = app.clone();
+    let _ = scheduler.run_on_main_thread(move || {
+        if !runtime_generation_is_current(&runtime, window_generation) || !tab.allows(target.as_str()) {
+            return;
+        }
+        if let Some(window) = ui.get_webview_window(tab.window_label()) {
+            let _ = window.navigate(target);
+            let _ = window.show();
+            let _ = window.set_focus();
+            return;
+        }
+        let _ = build_shell_tab_window(&ui, tab, target);
+    });
+}
+
+/// Build a remote product viewport with no initialization script, no accepted
+/// popups/downloads, and an exact-origin top-level navigation policy.
+///
+/// The app registers no invoke handler, and `capabilities/default.json` has no
+/// remote URL grant or command permissions. Consequently remote page script
+/// has no Tauri IPC, filesystem, keychain, updater, or lifecycle capability.
+fn build_shell_tab_window(app: &AppHandle, tab: ShellTab, initial_url: Url) -> Result<WebviewWindow<Wry>, String> {
+    if !tab.allows(initial_url.as_str()) {
+        return Err("the public shell-tab URL was outside its allow-list".to_string());
+    }
+    let navigation_tab = tab;
+    WebviewWindowBuilder::new(app, tab.window_label(), WebviewUrl::External(initial_url))
+        .title(tab.title())
+        // Product tabs share the platform webview's external-origin cookie
+        // store so the eventual SSO flow can span Registry and WikiCrux. They
+        // receive no daemon bearer or proxy cookie: those remain bound to the
+        // main webview's distinct loopback origin and HttpOnly session.
+        .incognito(false)
+        .inner_size(1180.0, 820.0)
+        .min_inner_size(760.0, 520.0)
+        .on_navigation(move |url| navigation_tab.allows(url.as_str()))
+        .on_new_window(|_url, _features| NewWindowResponse::Deny)
+        .on_download(|_webview, _event| false)
+        .build()
+        .map_err(|_| "could not build the isolated public shell tab".to_string())
+}
+
+fn close_shell_tabs(app: &AppHandle) {
+    for tab in [ShellTab::RcxRegistry, ShellTab::WikiCrux] {
+        if let Some(window) = app.get_webview_window(tab.window_label()) {
+            let _ = window.destroy();
+        }
+    }
 }
 
 fn replace_main_window(
@@ -589,6 +668,10 @@ fn request_switch(app: &AppHandle, runtime: Arc<Mutex<RuntimeState>>, target: &s
     };
 
     let (snapshot_generation, mut profiles, store, profile, external_item) = snapshot;
+    // A profile boundary must not leave remote content visible under stale
+    // account/tenant context. The external cookie-engine matrix remains an M9
+    // operator gate, but the native lifecycle closes every product tab now.
+    close_shell_tabs(app);
     let local_plan_script = match local_plan_hashes_for_profile(&profile) {
         Ok(hashes) => local_plan_hashes_initialization_script(hashes.as_ref()),
         Err(reason) => {

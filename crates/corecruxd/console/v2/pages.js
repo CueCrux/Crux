@@ -1,13 +1,13 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 //
 // Unified Shell Console v2 — page registry (ExecPlan unified-shell-console-2026-07-03, M1).
 // A no-build, dependency-free module (UMD: window.CruxPages in the browser,
 // module.exports under node for the static-analysis smoke). It carries all 26
 // legacy CX pages ported into the v2 IA — each page keeps the legacy control DSL
 // (t:'search'|'input'|'textarea'|'select'|'toggle'|'btn'|'info'|'exp'|'rpcout'|
-// 'bar'|'theme'). Rendering lives in render.js; this file is pure data + pure
+// 'bar'|'theme'|'approver'). Rendering lives in render.js; this file is pure data + pure
 // build() transforms (no DOM, no fetch) so it can be required and audited.
 //
 // Customer-safe posture: any control that WRITES carries `mut:true`; render.js
@@ -41,6 +41,13 @@
     if (extra) { for (var k in extra) { c[k] = extra[k]; } }
     return c;
   }
+  // crux-integrations I1: the single actionable integrations home. The cx-*
+  // integration pages are read/audit surfaces; connect, install, grant, invoke
+  // and revoke all live in Studio › Integrations, so every one of them links
+  // through rather than restating a flow it cannot run.
+  var STUDIO_INTEGRATIONS_HREF = '#/canvas/studio?sub=integrations';
+  var STUDIO_INTEGRATIONS_LINK = link('Manage in Studio › Integrations', STUDIO_INTEGRATIONS_HREF,
+    { hint: 'connect · install · grant · invoke · revoke — the operator-gated controls live there' });
 
   // Runtime capability contract for rendered controls. Keys are stable control
   // ids; values name the /v1/version capability and every route that control can
@@ -279,15 +286,19 @@
     return String(n);
   }
   function buildSessions(res) {
+    // NOTE: cx-sessions is custom-rendered by render.js renderSessionsBrowser
+    // (M3) — this builder is the graceful section-model fallback. It reads
+    // `session_rows` (rich objects), NOT `.sessions` (bare id strings) — the
+    // M0-diagnosed bug that painted 49 blank "session" cards.
     // Demo mode: real saved sessions are bare id rows locally, so a demoOn()-guarded
     // fixture paints richer resume/audit detail (execplan · passport · turns · token/progress bars).
-    if (typeof window !== 'undefined' && window.CRUX_DEMO && CruxDemo.sessions) { res = { ok: true, data: { sessions: CruxDemo.sessions } }; }
+    if (typeof window !== 'undefined' && window.CRUX_DEMO && CruxDemo.sessions) { res = { ok: true, data: { session_rows: CruxDemo.sessions } }; }
     if (!res.ok || !res.data) { return [{ h: 'Sessions', wide: true, controls: [{ t: 'search', ph: 'Filter sessions…' }].concat(degraded(res.status, 'Sessions unavailable — GET /v1/console/sessions')) }]; }
-    var list = arr(res.data.sessions || res.data.items || res.data);
+    var list = arr(res.data.session_rows || res.data.sessions || res.data.items || res.data);
     var live = list.filter(function (s) { return !s.archived; });
     var arch = list.filter(function (s) { return s.archived; });
     // A session renders as a rich card: id + status, the execplan + passport it
-    // carries, and two horizontal gradient bars — token usage and progress.
+    // carries, its total-token estimate, and (when present) a live-milestone tag.
     var row = function (s) {
       var used = (typeof s.token_used === 'number') ? s.token_used : null;
       var lim = (typeof s.token_limit === 'number') ? s.token_limit : null;
@@ -295,12 +306,13 @@
       var mDone = s.milestones_done, mTot = s.milestones_total;
       var progPct = (typeof s.progress === 'number') ? Math.round(s.progress * 100)
         : (mTot ? Math.round(((mDone || 0) / mTot) * 100) : null);
-      var progLabel = progPct != null ? (progPct + '%' + (mTot ? (' · M' + (mDone || 0) + '/' + mTot) : '')) : null;
+      var progLabel = progPct != null ? (progPct + '%' + (mTot ? (' · M' + (mDone || 0) + '/' + mTot) : null))
+        : (s.milestone || null);
       return { t: 'sesscard', id: s.session_id || s.id || s.label || 'session',
-        status: s.archived ? 'archived' : (s.status || 'session'),
+        status: s.archived ? ('archived' + (s.archive_reason ? (': ' + s.archive_reason) : '')) : (s.state || s.status || 'session'),
         execplan: s.execplan_slug || null, passport: s.passport_id || null, tenant: s.tenant_id || null,
         turns: (s.turn_count != null) ? s.turn_count : null, updated: s.updated_at || s.last_active || null,
-        tokPct: tokPct, tokLabel: (used != null && lim) ? (fmtK(used) + ' / ' + fmtK(lim)) : null,
+        tokPct: tokPct, tokLabel: (used != null && lim) ? (fmtK(used) + ' / ' + fmtK(lim)) : (typeof s.total_tokens === 'number' ? (fmtK(s.total_tokens) + ' tok') : null),
         progPct: progPct, progLabel: progLabel,
         focusId: s.session_id || s.id || null };
     };
@@ -322,7 +334,11 @@
   function projectAddRepos(p) {
     return { t: 'disclose', label: '＋ Add repos', requires: 'operator',
       controls: [
-        info('github', 'not connected — connect under Integrations to add repos'),
+        // Names the ONE surface that can actually connect GitHub. Before I1 this
+        // said "connect under Integrations", which was a dead end: no console
+        // surface carried a connect flow.
+        info('github', 'not connected — connect it in Studio › Integrations, then repos appear here'),
+        STUDIO_INTEGRATIONS_LINK,
         { t: 'select', k: 'gh_addrepo_' + p.id, label: 'repo', options: ['— connect GitHub first —'], v: '— connect GitHub first —', mut: true },
         mbtn('Add repo', { hint: 'POST /v1/projects/' + p.id + '/repos' }),
         mbtn('Set as planning repo', { hint: 'designates where ExecPlans live' })
@@ -384,12 +400,107 @@
       return { strip: stage, risk: w.risk_class || null, slug: planSlug(w), title: w.title || w.id,
         milestone: w.current_milestone || null, pct: pct, prog: total ? (done + '/' + total) : null,
         passport: w.assignee_passport || null, note: w.linked_pr || null,
+        // M21 — sort keys carried onto the card so the board's sort control has
+        // real values to order by. `hasProg` is the honesty flag: only plans that
+        // report milestones_total can be ordered by completion (see the sort note).
+        updated: Number(w.updated_at_unix_ms) || 0, created: Number(w.created_at_unix_ms) || 0,
+        pctSort: pct, hasProg: !!total,
         graph: graphLink('work', w.id) };   // cross-feature launch → the relation graph, focused on this plan
     };
     var columns = KANBAN_COLS.map(function (st) {
       return { key: st[0], title: st[1], cards: items.filter(function (w) { return workStageOf(w) === st[0]; }).map(card) };
     });
-    return [{ h: 'ExecPlans', sub: head.sub, wide: true, controls: [{ t: 'search', ph: 'Filter plans…' }, { t: 'kanban', columns: columns }] }];
+    var withProg = items.filter(function (w) { return !!w.milestones_total; }).length;
+    return [{ h: 'ExecPlans', sub: head.sub, wide: true, controls: [
+      { t: 'search', ph: 'Filter plans…' },
+      // M21 — `board: 'work'` opts this kanban into the state-chip + sort toolbar,
+      // persisted under crux.console.board.work.*.
+      { t: 'kanban', board: 'work', columns: columns, total: items.length, withProgress: withProg }
+    ] }];
+  }
+
+  // Work order — the ranked ready-list. The kanban next door shows *everything*
+  // grouped by state; this shows only open work, in the order the daemon
+  // recommends working through it (unblocked first, in_progress before planned,
+  // foundations before dependents). Fed by /v1/work?source=all&ranked=1, so the
+  // ordering is the daemon's `rank_open`, never re-derived here — one
+  // implementation, no drift.
+  function buildWorkOrder(res) {
+    var sub = 'recommended order · /v1/work?source=all&ranked=1';
+    if (!res.ok || !res.data) {
+      return [{ h: 'Work order', sub: sub, wide: true,
+        controls: degraded(res.status, 'Work order unavailable — GET /v1/work?source=all&ranked=1') }];
+    }
+    var items = arr(res.data.work);
+    if (!items.length) {
+      return [{ h: 'Work order', sub: sub, wide: true, controls: [info('none', 'no open work — the board is clear')] }];
+    }
+
+    // A cycle makes "foundations first" undefined for the plans involved. Surface
+    // it above the list rather than letting the order silently lie.
+    var head = [];
+    var cyc = arr(res.data.dependency_cycles);
+    var inv = arr(res.data.inverted_orchestrator_edges);
+    if (cyc.length) {
+      head.push({ t: 'exp', label: '⚠ dependency cycle — ' + cyc.length + ' plan' + (cyc.length === 1 ? '' : 's'),
+        sub: inv.length
+          ? 'an orchestrator is a parent — flip its `Depends on` to `Extended by` to break this'
+          : 'these plans declare Depends on each other; their relative order is undefined',
+        badge: 'cycle',
+        controls: cyc.map(function (s) {
+          // Name the one to change, rather than leaving the reader to work it out.
+          return info(s, inv.indexOf(s) >= 0 ? 'FIX HERE — orchestrator depending outward' : 'in cycle');
+        }) });
+    }
+
+    var ready = items.filter(function (w) { return !arr(w.blocked_by).length; });
+    var blocked = items.filter(function (w) { return arr(w.blocked_by).length; });
+
+    // Orchestration is the parent, so the ready-list says whose work this is.
+    // Every item resolves to one (unclaimed work lands on the default), which is
+    // what makes a count here honest rather than a partial tally.
+    var byOrc = {};
+    items.forEach(function (w) { var o = w.orchestrator_id || '—'; byOrc[o] = (byOrc[o] || 0) + 1; });
+    var orcKeys = Object.keys(byOrc).sort(function (a, b) { return byOrc[b] - byOrc[a]; });
+    if (orcKeys.length > 1) {
+      head.push({ t: 'exp', label: 'Orchestrators · ' + orcKeys.length, badge: 'scope',
+        sub: 'open work by parent — append &orchestrator=<id> to scope the list',
+        controls: orcKeys.map(function (k) { return info(k, byOrc[k] + ' open'); }) });
+    }
+
+    function row(w, n) {
+      var slug = planSlug(w);
+      var done = w.milestones_done || 0, total = w.milestones_total || 0;
+      var bits = [w.state];
+      if (w.current_milestone) { bits.push(w.current_milestone); }
+      if (total) { bits.push(done + '/' + total); }
+      if (w.stale) { bits.push('stale'); }
+      var blockers = arr(w.blocked_by);
+      if (blockers.length) { bits.push('blocked by ' + blockers.join(', ')); }
+      return { t: 'exp', label: n + '. ' + slug, sub: bits.join(' · '),
+        badge: blockers.length ? 'blocked' : (w.state === 'in_progress' ? 'active' : 'ready'),
+        controls: [
+          info('state', w.state),
+          info('milestone', w.current_milestone || '—'),
+          info('progress', total ? (done + '/' + total) : '—'),
+          info('blocked by', blockers.length ? blockers.join(', ') : 'nothing — ready to start'),
+          graphLink('work', w.id)
+        ] };
+    }
+
+    var n = 0;
+    var readyRows = ready.map(function (w) { n += 1; return row(w, n); });
+    var blockedRows = blocked.map(function (w) { n += 1; return row(w, n); });
+
+    var sections = head.concat([{ h: 'Ready now', wide: true,
+      sub: ready.length + ' unblocked · start at the top',
+      controls: [{ t: 'search', ph: 'Filter plans…' }].concat(readyRows.length ? readyRows : [info('none', 'everything open is blocked')]) }]);
+    if (blockedRows.length) {
+      sections.push({ h: 'Blocked', wide: true,
+        sub: blocked.length + ' waiting on an open dependency',
+        controls: blockedRows });
+    }
+    return sections;
   }
 
   function buildGates(res) {
@@ -425,14 +536,15 @@
   // this transform stays pure data + formatting and degrades feature-off 404s
   // to an honest empty state.
   function buildMints(res) {
+    var approver = { t: 'approver' };
     if (!res.ok || !res.data) {
       var message = res.status === 404
         ? 'Feature disabled — passport mint requests are not enabled on this daemon.'
         : 'Mint requests unavailable — GET /v1/passport/mint-requests/pending';
-      return [{ h: 'Awaiting approval', wide: true, controls: degraded(res.status, message) }];
+      return [{ h: 'Awaiting approval', wide: true, controls: [approver].concat(degraded(res.status, message)) }];
     }
     var pending = arr(res.data.pending).filter(function (p) { return (p.status || 'pending') === 'pending'; });
-    var controls = [{ t: 'search', ph: 'Filter pending mint requests…' }];
+    var controls = [approver, { t: 'search', ph: 'Filter pending mint requests…' }];
     pending.slice(0, 50).forEach(function (p) {
       var requested = ['personal', 'work', 'public'].indexOf(p.requested_category) >= 0 ? p.requested_category : '';
       controls.push({ t: 'mintcard', request: p, category: requested, age: requestAge(p.requested_at_unix_ms) });
@@ -512,7 +624,76 @@
     return liveSec ? [candSec, liveSec, consSec] : [candSec, consSec];
   }
 
+  // How a client connects to THIS daemon: endpoint URLs, the agent-token state,
+  // and the one-click Claude Desktop bundle. The token's raw value arrives only
+  // when the daemon sets CORECRUXD_CONSOLE_REVEAL_AGENT_TOKEN=1 — the console
+  // renders whatever the server chose to disclose and never reconstructs it.
+  function buildConnections(res) {
+    if (!res.ok || !res.data) {
+      return [{ h: 'Connections', wide: true,
+        controls: degraded(res.status, 'Connections unavailable — GET /v1/console/connections') }];
+    }
+    var d = res.data;
+    var mcp = d.mcp || {};
+    var tok = d.agent_token || {};
+    var desk = d.claude_desktop || {};
+
+    var endpointSec = { h: 'MCP endpoint', sub: mcp.note || 'point an MCP client here', wide: true,
+      controls: [
+        info('path', mcp.path || '/mcp'),
+        info('same machine', mcp.local_url || '—'),
+        info('published', 'whatever host proxies ' + (mcp.path || '/mcp') + ' on 443 — the MCP port is not usually exposed directly')
+      ] };
+
+    var tokRows;
+    if (!tok.configured) {
+      tokRows = [
+        info('status', 'not configured'),
+        info('what that means', tok.hint || 'this daemon accepts MCP requests without a bearer token')
+      ];
+    } else if (tok.token) {
+      tokRows = [
+        info('status', 'configured · revealed'),
+        info('source', tok.source_env || '—'),
+        info('token', tok.token),
+        info('fingerprint', tok.fingerprint || '—')
+      ];
+    } else {
+      tokRows = [
+        info('status', 'configured · hidden'),
+        info('source', tok.source_env || '—'),
+        info('fingerprint', tok.fingerprint || '—'),
+        info('length', tok.length ? String(tok.length) + ' characters' : '—'),
+        info('to reveal', tok.hint || 'set CORECRUXD_CONSOLE_REVEAL_AGENT_TOKEN=1 on this daemon')
+      ];
+      if (tok.agent_names) { tokRows.splice(2, 0, info('agents', tok.agent_names)); }
+    }
+    var tokenSec = { h: 'Agent token', wide: true,
+      sub: 'the bearer an MCP client sends; read from the daemon environment at startup, never stored by the console',
+      controls: tokRows };
+
+    var deskSec = { h: 'Claude Desktop', wide: true,
+      sub: 'download, then drag the file onto Claude Desktop → Settings → Extensions',
+      controls: [
+        link('Download ' + (desk.filename || 'crux.mcpb'), desk.bundle_url || '/console-assets/crux.mcpb',
+          { hint: 'MCP bundle — installs Crux as a Desktop extension' }),
+        info('Desktop will ask for', 'the endpoint URL above, and the agent token'),
+        info('token field', 'paste the raw token — the "Bearer " prefix is added for you')
+      ] };
+
+    return [endpointSec, tokenSec, deskSec];
+  }
+
   function buildIntegrations(res) {
+    // I1 — this page reads the plane; the Studio operates it. The link-through
+    // leads so nobody hunts for a connect flow that was never here.
+    var home = { h: 'Where integrations are set up', wide: true,
+      sub: 'Studio › Integrations is the actionable home: connectors, packs, extensions + catalog, and trusted keys',
+      controls: [
+        info('this page', 'read + audit — live plane posture, packs, grants'),
+        info('studio', 'connect GitHub / OpenAI · install, grant, disable packs · install from the signed catalog · issue and revoke grants · manage trusted keys'),
+        STUDIO_INTEGRATIONS_LINK
+      ] };
     var cat = { h: 'Catalog', sub: 'toggle = install / disable · grants are separate', wide: true,
       controls: [{ t: 'search', ph: 'Filter integrations…' }] };
     if (res.ok && res.data) {
@@ -530,14 +711,16 @@
     }
     // Source connectors (secrets held daemon-side; connect flows are mutating).
     cat.controls.push({ t: 'exp', label: 'GitHub', sub: 'repos · PRs · issues → facts', badge: 'source',
-      desc: 'Sync GitHub into the fact store. The PAT is held encrypted by the daemon — never in browser storage.',
+      desc: 'Sync GitHub into the fact store. The PAT is held encrypted by the daemon — never in browser storage. Disconnect and sync-now live in Studio › Integrations.',
       controls: [info('status', 'not connected'),
+        STUDIO_INTEGRATIONS_LINK,
         { t: 'input', k: 'gh_pat', label: 'personal access token', ph: 'ghp_…', mono: true, secret: true, mut: true },
         { t: 'toggle', k: 'gh_skiptls', label: 'skip TLS verify (dev only)', v: false, mut: true },
         mbtn('Verify connection')] });
     cat.controls.push({ t: 'exp', label: 'OpenAI-compatible LLM', sub: 'embeddings · chat · model discovery', badge: 'source',
-      desc: 'Connect any OpenAI-compatible endpoint. The API key is held encrypted by the daemon.',
+      desc: 'Connect any OpenAI-compatible endpoint. The API key is held encrypted by the daemon. Connect and disconnect live in Studio › Integrations; this page only tests a connected one.',
       controls: [info('status', 'not connected'),
+        STUDIO_INTEGRATIONS_LINK,
         { t: 'select', k: 'oa_model', label: 'default model', options: ['none', 'gpt-5.5', 'gpt-4o'], v: 'none', mut: true },
         { t: 'input', k: 'oa_key', label: 'API key', ph: 'sk-…', mono: true, secret: true, mut: true },
         { t: 'input', k: 'oa_org', label: 'organisation', ph: 'org-…', mono: true, mut: true },
@@ -547,10 +730,20 @@
       var n = Array.isArray(res.data.grants) ? res.data.grants.length : (res.data.grants && res.data.grants.count);
       if (n != null) { grants.controls[0].v = n + ' active'; }
     }
-    return [cat, grants];
+    grants.controls.push(STUDIO_INTEGRATIONS_LINK);
+    return [home, cat, grants];
   }
 
   function buildExtensions(res) {
+    // I2 — same split as cx-integrations: read here, operate in the Studio, which
+    // also carries the catalog browser and the per-entry safety scorecard.
+    var home = { h: 'Where extensions are managed', wide: true,
+      sub: 'Studio › Integrations owns install-from-catalog, invoke, grants and uninstall',
+      controls: [
+        info('this page', 'read + audit — installed manifests, trusted keyring'),
+        info('studio', 'browse the curator-signed catalog with a safety scorecard · install · invoke a tool under a grant · issue and revoke grants · uninstall · add and remove trusted keys'),
+        STUDIO_INTEGRATIONS_LINK
+      ] };
     var installed = { h: 'Installed', wide: true, controls: [{ t: 'search', ph: 'Filter extensions…' }] };
     if (res.ok && res.data) {
       var list = arr(res.data.extensions);
@@ -570,9 +763,15 @@
         { t: 'input', k: 'key_pub', label: 'public key', ph: 'ed25519:…', mono: true, mut: true },
         mbtn('Add key')
       ] };
+    keys.controls.push(STUDIO_INTEGRATIONS_LINK);
     var install = { h: 'Install manifest', wide: true,
-      controls: [{ t: 'input', k: 'manifest_url', label: 'manifest URL / path', ph: 'https://… or ./ext.json', mono: true, mut: true }, mbtn('Install')] };
-    return [installed, keys, install];
+      sub: 'a raw manifest URL has no groundable body here — install from the signed catalog in the Studio instead',
+      controls: [
+        { t: 'input', k: 'manifest_url', label: 'manifest URL / path', ph: 'https://… or ./ext.json', mono: true, mut: true },
+        mbtn('Install'),
+        STUDIO_INTEGRATIONS_LINK
+      ] };
+    return [home, installed, keys, install];
   }
 
   function buildIdentity(res) {
@@ -678,7 +877,7 @@
     var a = s.auth || {}, e = s.embedding || {};
     // The status pill dropped the origin + node id (item 3); they land here.
     var origin = (typeof window !== 'undefined' && window.location && window.location.origin) ? window.location.origin : '—';
-    return [
+    var out = [
       { h: 'Node', sub: 'this daemon origin + identity',
         controls: [
           info('origin', origin),
@@ -722,9 +921,26 @@
         controls: [
           info('build', s && s.daemon ? [get(s, ['daemon', 'build', 'version']), ':14800'].filter(Boolean).join(' · ') : ':14800'),
           mbtn('Restart daemon', { danger: true, hint: 'needs restart: unless-stopped policy' })
-        ] },
-      { h: 'Appearance', sub: 'applies immediately', controls: [{ t: 'theme' }, info('canvas', '2D | 3D toolbar switch')] }
+        ] }
+      // NB: no "Appearance" section — the console theme has its own dedicated card
+      // (shell buildThemeCard), and the old "canvas 2D | 3D toolbar switch" row was
+      // stale (no such control). Removed in M17 to de-duplicate + drop stale copy.
     ];
+    // M17 honesty pass: Settings sits well past M3, and its gated writes are daemon
+    // config / host actions that the console deliberately never performs. Render
+    // them disabled with an honest, non-milestone reason instead of the stale
+    // "wired in M3+" promise (the M6 honesty standard, applied to a page that was
+    // outside the original 11-surface sweep). The generic gate stays for the rest.
+    return stampSettingsGate(out);
+  }
+  var SETTINGS_GATE_REASON = 'read-only in the console — set on the daemon host';
+  function stampSettingsGate(sections) {
+    (sections || []).forEach(function (sec) {
+      (sec && sec.controls || []).forEach(function (c) {
+        if (c && c.mut && !c.gateReason) { c.gateReason = SETTINGS_GATE_REASON; }
+      });
+    });
+    return sections;
   }
 
   // A full-width trend card (item 5). No real time-series endpoint exists for
@@ -764,7 +980,60 @@
       return { t: 'exp', label: (lv.severity ? '● ' + String(lv.severity).toUpperCase() + '  ' : '') + lv.title, sub: lv.est_pct ? ('addresses ~' + Math.round(lv.est_pct) + '% of carried cost') : '', badge: lv.severity || 'lever', controls: [info('how', lv.detail || '')] };
     }) };
     if (!levers.controls.length) { levers.controls = [info('—', 'already lean')]; }
-    return [sel, head, where, levers, costTrend()];
+    var axis = costModelAxis(r);
+    return axis ? [sel, head, axis, where, levers, costTrend()] : [sel, head, where, levers, costTrend()];
+  }
+
+  // ---- The model/effort axis (cost-capture-repair plan, M1) ----------------
+  // Which model, at which effort setting, burned the context. Rendered from
+  // report.breakdown, which reconciles exactly to headline.measured_context_total.
+  //
+  // TWO RULES, and they are the point of the card rather than decoration:
+  //
+  //  1. Every effort figure is rendered WITH that model's effort coverage.
+  //     `effort` is absent on 61% of the measured corpus and its absence
+  //     correlates with model (100% / 100% / 22.5% / 9.4% on 2026-07-30), so a
+  //     bare per-effort number invites a cross-model comparison that is
+  //     confounded at source and that no sample size fixes.
+  //  2. `<synthetic>` is not a model. It is shown on its own row, never ranked
+  //     with real ones — neither charted nor silently dropped.
+  //
+  // Neither rule can be enforced by a test on this file, which is exactly why
+  // they are written here next to the code that would break them.
+  function costModelAxis(r) {
+    var b = r && r.breakdown;
+    if (!b || (!arr(b.models).length && !b.synthetic)) { return null; }
+    var total = (r.headline && r.headline.measured_context_total) || 0;
+    var pctOf = function (n) { return total > 0 ? (100 * n / total) : 0; };
+    var controls = [];
+    arr(b.models).forEach(function (m) {
+      var pct = pctOf(m.context_total || 0);
+      var cov = Math.round(m.effort_coverage_pct || 0);
+      var efforts = arr(m.efforts);
+      var covered = efforts.reduce(function (a, e) { return a + (e.context_total || 0); }, 0);
+      var sub = efforts.length
+        ? efforts.map(function (e) { return e.effort + ' ' + fmtNum(e.context_total) + ' (' + (e.turns || 0) + ')'; }).join('  ·  ')
+        : 'effort not recorded on any of these turns';
+      var kids = [
+        info('burn', fmtNum(m.context_total) + ' carried context · ' + (m.turns || 0) + ' turn(s) · ' + Math.round(pct) + '% of session'),
+        info('output', fmtNum(m.measured && m.measured.output) + ' tokens generated'),
+        info('by effort', sub),
+        // The coverage line is a sibling of the effort line, never a footnote:
+        // it says how much of this model's burn the effort rows account for.
+        info('effort coverage', cov + '% of this model’s turns carry an effort value — the rows above cover '
+          + fmtNum(covered) + ' of ' + fmtNum(m.context_total)
+          + (cov < 100 ? '. Do not compare this against another model’s effort: coverage is model-correlated, so the comparison is confounded at source.' : '.'))
+      ];
+      controls.push({ t: 'exp', label: m.model, sub: Math.round(pct) + '% · ' + fmtNum(m.context_total) + ' · effort coverage ' + cov + '%', badge: cov + '%', controls: kids });
+    });
+    if (b.synthetic) {
+      controls.push(info('<synthetic>', (b.synthetic.turns || 0) + ' generated records · ' + fmtNum(b.synthetic.context_total)
+        + ' — not a model, excluded from the ranking above'));
+    }
+    if (b.unattributed_context) {
+      controls.push(info('(unattributed)', fmtNum(b.unattributed_context) + ' — records carrying usage but no model id'));
+    }
+    return { h: 'Which model burned it', sub: 'per-model, and per-effort within a model — every effort figure carries its coverage', wide: true, controls: controls };
   }
 
   // ---- Engine mediation (M4) — read-only, daemon-mediated summary card ----
@@ -792,15 +1061,151 @@
     ];
     return sec;
   }
-  // cx-usage gets a full-width trend card too (item 5). Same posture as the cost
-  // trend: demo fixture when demo mode is on, else an honest empty state.
-  function usageTrend() {
-    return { h: 'Call volume over time', wide: true, controls: [
-      { t: 'chart', title: 'Tokens in / period', sub: 'aggregate call volume', demoKey: 'usageSeries', fmt: 'compact', range: 'week',
-        hint: '/v1/observations/aggregate has no bucketed series yet — enable demo mode (?demo=1) to preview' }
-    ] };
+  // ---- M24: "Average Token Usage", made live ------------------------------
+  // FINDING (operator round 13): this page was STATIC. Every number on it was a
+  // literal in STATIC['cx-usage'] — "~83k in · 11k out", "517k in · 67k out ·
+  // 75 turns", "2.22M in · 288k out · 13 sessions" — and the "Savings vs
+  // standard session" card asserted a −31% saving against an invented 750k/wk
+  // baseline. Its declared feed, /v1/observations/aggregate, was named in the
+  // strapline but never called; the page actually loaded
+  // /v1/console/engine/summary (mediation status, unrelated to token usage,
+  // and "engine mediation not configured" on a plain daemon), and its trend
+  // chart was a demo fixture.
+  //
+  // A real feed DOES exist: /v1/cost/report — the same posted session cost
+  // reports the Token Burn lens renders, carrying context_tokens,
+  // output_tokens, assistant_turns and a session window each. The page is now
+  // computed from those rows and nothing else.
+  //
+  // Deliberately NOT carried over: the savings card. The daemon measures no
+  // counterfactual "standard session", so any savings figure would be invented.
+  // It is replaced by a card that states that in as many words.
+  function usageSessions(res) {
+    var d = res && res.ok && res.data ? res.data : null;
+    return (d && Array.isArray(d.sessions)) ? d.sessions : [];
   }
-  function buildUsageEngine(res) { return STATIC['cx-usage'].concat([usageTrend(), engineMediatedSection(res)]); }
+  function usageNum(n) {
+    if (typeof n !== 'number' || !isFinite(n)) { return '—'; }
+    if (Math.abs(n) >= 1e6) { return (n / 1e6).toFixed(1) + 'M'; }
+    if (Math.abs(n) >= 1e3) { return (n / 1e3).toFixed(1) + 'k'; }
+    return String(Math.round(n));
+  }
+  function usageWhen(s) {
+    var t = Date.parse(s.ended_at || s.started_at || s.received_at || s.generated_at || '');
+    return isFinite(t) ? t : null;
+  }
+  function usageAgg(rows) {
+    // ctxOnTurns / outOnTurns accumulate ONLY over reports that carry a turn
+    // count, so the per-turn average divides like by like — folding the
+    // turn-less reports' tokens into the numerator would deflate it silently.
+    var a = { n: rows.length, ctx: 0, out: 0, turns: 0, turnRows: 0, ctxOnTurns: 0, outOnTurns: 0, first: null, last: null, totals: [], outs: [] };
+    rows.forEach(function (s) {
+      var c = Number(s.context_tokens) || 0, o = Number(s.output_tokens) || 0, t = Number(s.assistant_turns) || 0;
+      a.ctx += c; a.out += o;
+      if (t > 0) { a.turns += t; a.turnRows++; a.ctxOnTurns += c; a.outOnTurns += o; }
+      a.totals.push(c + o); a.outs.push(o);
+      var w = usageWhen(s);
+      if (w != null) { if (a.first == null || w < a.first) { a.first = w; } if (a.last == null || w > a.last) { a.last = w; } }
+    });
+    a.totals.sort(function (x, y) { return x - y; });
+    a.outs.sort(function (x, y) { return x - y; });
+    return a;
+  }
+  function usageSince(rows, days) {
+    var cut = Date.now() - days * 86400000;
+    return rows.filter(function (s) { var w = usageWhen(s); return w != null && w >= cut; });
+  }
+  function usagePeriodLine(rows) {
+    if (!rows.length) { return 'no reports in this window'; }
+    var a = usageAgg(rows);
+    return usageNum(a.ctx) + ' in · ' + usageNum(a.out) + ' out · '
+      + (a.turnRows ? (a.turns + ' turns · ') : 'turns unavailable · ')
+      + a.n + ' session' + (a.n === 1 ? '' : 's');
+  }
+  // Per-day / per-week / per-month output-token buckets over the session
+  // windows — a REAL series, so the trend card stops needing a demo fixture.
+  function usageSeriesFrom(rows) {
+    function bucket(spanMs, count) {
+      var now = Date.now(), out = new Array(count).fill(0), any = false;
+      rows.forEach(function (s) {
+        var w = usageWhen(s); if (w == null) { return; }
+        var i = count - 1 - Math.floor((now - w) / spanMs);
+        if (i >= 0 && i < count) { out[i] += (Number(s.output_tokens) || 0); any = true; }
+      });
+      return any ? out : [];
+    }
+    return { day: bucket(86400000, 14), week: bucket(7 * 86400000, 12), month: bucket(30 * 86400000, 12) };
+  }
+  // A bar on the SAME fixed 2,000,000-token scale (and the same gradient ramp)
+  // the Token Burn lens uses, so a bar length/colour means one thing console-wide.
+  //
+  // These bars measure OUTPUT tokens, matching the Token Burn CHART exactly —
+  // measured, not chosen for looks: on the review corpus context is 99% of all
+  // tokens, so context+output per session runs 3.2M (median) to 613M (max) and
+  // every such bar pins at the 2M ceiling, conveying nothing. Output per session
+  // spans 0 → 1.4M and never reaches the ceiling, so the same scale that is
+  // saturated for totals discriminates cleanly for output. Context is not
+  // dropped — it is stated as a share, in numbers, in the row beneath.
+  var USAGE_BAR_MAX = 2000000;
+  function usageBar(label, tokens) {
+    return { t: 'bar', label: label, ramp: true,
+      pct: Math.max(0, Math.min(100, (tokens / USAGE_BAR_MAX) * 100)),
+      v: usageNum(tokens) + (tokens > USAGE_BAR_MAX ? ' · over 2M' : ' / 2M') };
+  }
+  function buildUsageLive(res) {
+    var rows = usageSessions(res);
+    if (!res || !res.ok) {
+      return [{ h: 'Measured usage', wide: true, controls: [
+        info('feed', '/v1/cost/report'),
+        info('status', res && res.status === 404
+          ? 'cost lens off — set CORECRUXD_FEATURE_COST_LENS=1 on the daemon'
+          : ('unavailable — ' + (res && res.status === 0 ? 'daemon unreachable' : 'HTTP ' + (res && res.status)))),
+        info('note', 'This page shows measured numbers only; with no feed it shows none.')
+      ] }];
+    }
+    if (!rows.length) {
+      return [{ h: 'Measured usage', wide: true, controls: [
+        info('feed', '/v1/cost/report — reachable, empty'),
+        info('producer', 'corecruxctl session cost --post (parses a local Claude Code transcript and posts the report)'),
+        info('note', 'No session cost reports have been posted for this tenant, so there are no averages to compute. Nothing here is estimated.')
+      ] }];
+    }
+    var all = usageAgg(rows), d7 = usageSince(rows, 7), d30 = usageSince(rows, 30);
+    var spanDays = (all.first != null && all.last != null) ? Math.max(1, Math.round((all.last - all.first) / 86400000)) : null;
+    var medOut = all.outs.length ? all.outs[Math.floor(all.outs.length / 2)] : 0;
+    var meanOut = all.n ? all.out / all.n : 0;
+    var maxOut = all.outs.length ? all.outs[all.outs.length - 1] : 0;
+    var medTot = all.totals.length ? all.totals[Math.floor(all.totals.length / 2)] : 0;
+    return [
+      { h: 'Measured usage', sub: 'computed from posted session cost reports · /v1/cost/report', wide: true, controls: [
+        info('reports counted', all.n + ' session' + (all.n === 1 ? '' : 's') + (spanDays ? (' over ' + spanDays + ' day' + (spanDays === 1 ? '' : 's')) : '')),
+        info('last 7 days', usagePeriodLine(d7)),
+        info('last 30 days', usagePeriodLine(d30)),
+        info('all reports', usagePeriodLine(rows)),
+        info('daily average', spanDays ? (usageNum(all.ctx / spanDays) + ' in · ' + usageNum(all.out / spanDays) + ' out per day') : '—'),
+        info('average per session', usageNum(all.ctx / all.n) + ' in · ' + usageNum(all.out / all.n) + ' out'),
+        info('average per turn', all.turnRows
+          ? (usageNum(all.ctxOnTurns / all.turns) + ' in · ' + usageNum(all.outOnTurns / all.turns) + ' out  (over ' + all.turns + ' assistant turns in ' + all.turnRows + ' of ' + all.n + ' reports — turn-less reports are excluded from this average, not counted as zero)')
+          : 'turns unavailable — no report in this set carries an assistant_turns count')
+      ] },
+      { h: 'Output per session on the token-burn scale', sub: 'same fixed 2,000,000-token ceiling and gradient as the Token Burn chart', wide: true, controls: [
+        usageBar('median session', medOut),
+        usageBar('mean session', meanOut),
+        usageBar('largest session', maxOut),
+        info('context share', all.ctx + all.out ? (Math.round(100 * all.ctx / (all.ctx + all.out)) + '% of all measured tokens are context, ' + Math.round(100 * all.out / (all.ctx + all.out)) + '% output') : '—'),
+        info('why output', 'These bars measure OUTPUT because context dominates: the median session carries ' + usageNum(medTot) + ' context+output tokens, so a context+output bar would sit at the 2M ceiling for most sessions and say nothing. Output shares the same scale as the Token Burn chart and stays under it.')
+      ] },
+      { h: 'Output tokens over time', wide: true, controls: [
+        { t: 'chart', title: 'Output tokens / period', sub: 'bucketed from the session windows in /v1/cost/report', fmt: 'compact', range: 'week',
+          series: usageSeriesFrom(rows),
+          hint: 'no session in this set carries a usable window timestamp' }
+      ] },
+      { h: 'Savings', wide: true, controls: [
+        info('measured saving', 'none — the daemon records no counterfactual'),
+        info('why', 'A "saved vs a standard session" figure needs a baseline run of the same work WITHOUT the daemon. Nothing measures that, so this page states no percentage. Per-session, actionable reductions are computed from real numbers on Token Burn (Session) → "how to cut it".')
+      ] }
+    ];
+  }
   function buildMediationEngine(res) { return STATIC['cx-mediation'].concat([engineMediatedSection(res)]); }
 
   // =======================================================================
@@ -882,23 +1287,54 @@
     return [engrams, bench, sites, factstore];
   }
 
-  // AX / Agent — the agent-side cockpit. MCP tools load live (/v1/mcp/tools,
-  // allowlisted); activity / memory / snapshots already have v2 homes; graph
-  // opens on the Pro 3D substrate; bulk / handoff / storybook / story / dossiers
-  // have no daemon read endpoint (deferred, honest notes).
+  // AX / Agent — the agent-side cockpit. MCP tools load live with their
+  // 30-day call rollup (/v1/mcp/tools/usage — catalog joined against the
+  // agent.tool_invocation.v1 ledger, sorted by calls desc, zeros included);
+  // activity / memory / snapshots already have v2 homes; graph opens on the
+  // Pro 3D substrate; bulk / handoff / storybook / story / dossiers have no
+  // daemon read endpoint (deferred, honest notes).
   function buildAgent(res) {
+    var sections = [];
     var tools;
     if (!res.ok || !res.data) {
-      tools = { h: 'MCP tools', sub: 'the agent tool surface · /v1/mcp/tools', wide: true, controls: [{ t: 'search', ph: 'Filter tools…' }].concat(degraded(res.status, 'MCP tools unavailable — GET /v1/mcp/tools')) };
+      tools = { h: 'MCP tools', sub: 'catalog × call ledger · /v1/mcp/tools/usage', wide: true, controls: [{ t: 'search', ph: 'Filter tools…' }].concat(degraded(res.status, 'Tool usage unavailable — GET /v1/mcp/tools/usage')) };
     } else {
-      var list = arr(res.data.tools || res.data.items || res.data);
-      tools = { h: 'MCP tools', sub: list.length + ' tool' + (list.length === 1 ? '' : 's') + ' loaded at session bind · /v1/mcp/tools', wide: true,
-        controls: [{ t: 'search', ph: 'Filter tools…' }].concat(list.length ? list.map(function (tl) {
-          var name = tl.name || tl.tool || tl.id || 'tool';
-          return { t: 'exp', label: name, sub: clip(tl.description || tl.summary || '', 90) || 'mcp tool', badge: tl.scope || 'tool',
-            meta: (arr(tl.scopes).length ? arr(tl.scopes).join(' · ') : str(tl.scope)),
-            controls: [info('description', clip(tl.description || tl.summary || '—', 200))] };
-        }) : [info('none', 'no MCP tools reported')]) };
+      var d = res.data;
+      var list = arr(d.tools);
+      var errPct = d.calls_total > 0 ? Math.round((d.errors_total / d.calls_total) * 1000) / 10 : 0;
+      sections.push({ h: 'Tool surface health', sub: 'window ' + str(d.window) + ' · ledger agent.tool_invocation.v1 · /v1/mcp/tools/usage', wide: true, controls: [
+        info('calls', String(d.calls_total || 0) + ' calls · ' + String(d.passports_total || 0) + ' passports · ' + errPct + '% errors'),
+        info('catalog', String(d.tools_in_catalog || 0) + ' tools · ' + String(d.tools_called || 0) + ' called · ' + String(d.tools_never_called || 0) + ' never called in window'),
+        info('triage', 'unused = demote-from-surface candidates · high err% = friction to fix · filter "unused" or "errors" below')
+      ] });
+      tools = { h: 'MCP tools', sub: list.length + ' tool' + (list.length === 1 ? '' : 's') + ' · sorted by calls (' + str(d.window) + ') · zeros = never called in window', wide: true,
+        controls: [{ t: 'search', ph: 'Filter tools… (try: unused · errors · uncataloged)' }].concat(list.length ? list.map(function (tl) {
+          var name = tl.tool || tl.name || 'tool';
+          var calls = tl.calls || 0;
+          var toolErrPct = calls > 0 ? Math.round(((tl.errors || 0) / calls) * 1000) / 10 : 0;
+          // agent.tools_offered.v1 split: 'ignored' = offered to sessions but
+          // never called; 'never offered' = absent from every session surface;
+          // plain 'unused' = no offered data accrued yet (honest default).
+          var unusedBadge = tl.classification === 'never_offered' ? 'never offered'
+            : tl.classification === 'offered_never_called' ? 'ignored' : 'unused';
+          var badge = calls > 0 ? (String(calls) + '×' + (tl.errors ? ' · errors' : '')) : unusedBadge;
+          var meta = calls > 0
+            ? (String(tl.passports || 0) + ' passports · p50 ' + str(tl.p50_ms) + 'ms · ~' + String(tl.avg_tokens || 0) + ' tok · last ' + clip(str(tl.last_called), 10))
+            : (tl.in_catalog === false ? 'uncataloged (removed/renamed?)'
+              : tl.classification === 'never_offered' ? 'in catalog but absent from every session surface'
+              : tl.classification === 'offered_never_called' ? ('offered to ' + String(tl.offered_passports || 0) + ' passport(s), never called')
+              : 'never called in window');
+          return { t: 'exp', label: name, sub: clip(tl.description || '', 90) || (tl.in_catalog === false ? 'not in the current catalog' : 'mcp tool'), badge: badge,
+            meta: meta,
+            controls: [
+              info('description', clip(tl.description || '—', 300)),
+              info('calls', String(calls) + (calls > 0 ? ' · ' + String(tl.errors || 0) + ' errors (' + toolErrPct + '%)' : '')),
+              info('reach', String(tl.passports || 0) + ' distinct passports'),
+              info('cost', 'avg ~' + String(tl.avg_tokens || 0) + ' tokens · p50 ' + str(tl.p50_ms) + ' ms'),
+              info('last called', str(tl.last_called)),
+              info('in catalog', tl.in_catalog === false ? 'no — called historically but absent from tools/list now' : 'yes')
+            ] };
+        }) : [info('none', 'no tools reported')]) };
     }
     var cockpit = { h: 'Agent cockpit', sub: 'agent observability — where each legacy AX surface lives now', wide: true, controls: [
       info('activity', 'live tool stream → Overwatch › Activity'),
@@ -910,11 +1346,19 @@
     var deferred = { h: 'Not yet ported', sub: 'surfaces with no read endpoint on this daemon', wide: true, controls: [
       info('bulk ops', 'batch import / sweep are mutations — no read surface'),
       info('handoff', 'create_handoff is MCP-only — no list endpoint'),
-      info('storybook', 'tile/pattern catalog is a design artifact, not a data feed'),
-      info('story', 'call-tree story view stays on the Pro / 3D canvas'),
-      info('dossiers', 'per-project — see Work › Projects (/v1/projects/{id}/dossiers)')
+      info('story', 'call-tree story view stays on the Pro / 3D canvas')
     ] };
-    return [tools, cockpit, deferred];
+    // storybook + dossiers now have a home. They were listed above as deferred
+    // on a mis-reading of the name; both are live daemon surfaces with eight MCP
+    // tools and a console page of their own.
+    var contextGraph = { h: 'Context graph', sub: 'the project readout + what each agent believes · phases 3 and 4', wide: true, controls: [
+      info('storybook', 'per-project narrative readout → Work › Storybook'),
+      info('dossiers', 'agent belief snapshots + cross-agent reconciliation → Work › Storybook'),
+      link('Open Storybook & dossiers', '#/work/cx-storybook', { hint: '/v1/projects/{id}/storybook · .../dossiers' }),
+      info('mcp', 'get_project_storybook · diff_project_storybook · get_project_dossiers · reconcile_project_dossiers · publish_project_dossier (+3)')
+    ] };
+    sections.push(tools, cockpit, contextGraph, deferred);
+    return sections;
   }
 
   // CX / Workbench (M13a) — the operator deep-machinery surface, ported native
@@ -946,7 +1390,6 @@
     var readsSec = { h: 'Live read tools', sub: 'GET /v1/workbench/* — pro capabilities gate the payload; nothing here writes', wide: true,
       controls: [
         { t: 'wbread', label: 'API drift', api: 'workbenchApiDrift', query: { tenant_id: 'default' }, hint: 'GET /v1/workbench/api-drift' },
-        { t: 'wbread', label: 'Command ledger', api: 'workbenchCommandLedger', query: { tenant_id: 'default' }, hint: 'GET /v1/workbench/command-ledger' },
         { t: 'wbread', label: 'Reasoning timeline', api: 'workbenchReasoningTimeline', query: { tenant_id: 'default' }, hint: 'GET /v1/workbench/reasoning-timeline' },
         { t: 'wbread', label: 'Audit triage', api: 'workbenchAuditTriage', query: { tenant_id: 'default' }, hint: 'GET /v1/workbench/audit-triage' },
         { t: 'wbread', label: 'Agent brief', api: 'workbenchBrief', query: { tenant_id: 'default' }, hint: 'GET /v1/workbench/brief' }
@@ -966,22 +1409,12 @@
           info('note', 'the full receipt-cross-walked activity log is the Work › Activity surface in this console — no separate page')
         ] }
     ],
-    'cx-usage': [
-      { h: 'Periods', sub: 'derived from save_session / pre-compact hooks · /v1/observations/aggregate', wide: true,
-        controls: [
-          { t: 'select', k: 'win', label: 'window', options: ['7d', '30d', '90d'], v: '7d' },
-          { t: 'search', ph: 'Filter sessions / plans…' },
-          info('daily avg', '~83k in · 11k out'),
-          info('this week', '517k in · 67k out · 75 turns'),
-          info('this month', '2.22M in · 288k out · 13 sessions')
-        ] },
-      { h: 'Savings vs standard session', sub: 'estimate — boot banner + injected facts replace context re-reads', wide: true,
-        controls: [
-          { t: 'bar', label: 'standard session (est.)', pct: 100, v: '750k in/wk', tone: 'err' },
-          { t: 'bar', label: 'with Crux Daemon', pct: 69, v: '517k in/wk', tone: 'ok' },
-          info('saved', '≈233k in tokens/week · −31%')
-        ] }
-    ],
+    // M24 — STATIC['cx-usage'] is DELETED, not edited. `page()` uses a STATIC
+    // entry as the pre-load skeleton, so those literal "~83k in · 11k out" /
+    // "−31% saved" figures painted first on every visit and were the page most
+    // operators saw. cx-usage now has no static sections at all: its first paint
+    // is the generic loading skeleton, and every number it shows afterwards is
+    // computed by buildUsageLive from /v1/cost/report.
     'cx-documents': [
       { h: 'Tenants & documents', sub: '/v1/console/tenants · click a tenant to expand its documents', wide: true,
         controls: [
@@ -1041,7 +1474,6 @@
       { h: 'Briefing & context', sub: 'agent brief + command ledger (reads) · context pack (write, live)', wide: true,
         controls: [
           info('agent brief', 'GET /v1/workbench/brief — tenant memory, sessions, constraints, open work'),
-          info('command ledger', 'GET /v1/workbench/command-ledger — recorded command metadata'),
           { t: 'input', k: 'wb_ctx_tenant', label: 'pack tenant', v: 'default', mono: true, mut: true },
           { t: 'input', k: 'wb_ctx_query', label: 'pack query', ph: 'what to assemble context for', mut: true },
           mbtn('Build context pack', { hint: 'POST /v1/workbench/context-pack — writes a receipted pack fact' })
@@ -1080,7 +1512,7 @@
           rbtn('Graph expand', { hint: 'POST /v1/query/graph-expand — curated read-POST' }),
           { t: 'select', k: 'wbq_window', label: 'time window', options: ['24h', '7d', '30d'], v: '24h' },
           rbtn('Time range', { hint: 'POST /v1/query/time-range — curated read-POST' }),
-          rbtn('Browse results as graph', { hint: 'opens the Canvas relation graph' })
+          rbtn('Browse results as graph', { hint: 'opens the Rings relation graph' })
         ] },
       { h: 'Entities', sub: '/v1/entities/{kind}/{id} + /history (read)', wide: true,
         controls: [
@@ -1118,7 +1550,7 @@
         controls: [
           info('build', 'cargo build --release (CPU-only)'),
           info('architecture', 'axum HTTP :14800 + tonic gRPC · append-only shard store · Ed25519 CROWN receipts'),
-          info('key rules', 'no GPU/CUDA · CCL licence · port 14800 fixed')
+          info('key rules', 'no GPU/CUDA · Apache-2.0 licence · port 14800 fixed')
         ] },
       { h: 'External docs', sub: 'platform surfaces (open in a browser tab)', wide: true,
         controls: [
@@ -1164,14 +1596,31 @@
     'cx-punchcards': page('cx-punchcards', 'overwatch', 'Punchcards', 'advisory path leases grouped by session · /v1/punchcards', { load: { endpoint: '/v1/punchcards', build: buildPunchcards } }),
     // ---- Work ------------------------------------------------------------
     'cx-work': page('cx-work', 'work', 'ExecPlans', 'read-time projection over .agent/execplans/*.md · /v1/work', { load: { endpoint: '/v1/work?source=all', build: buildWork } }),
+    // The ranked ready-list. Sits next to the kanban: that one answers "what is
+    // there", this one answers "what do I do next".
+    'cx-work-order': page('cx-work-order', 'work', 'Work order', 'open work in recommended order · /v1/work?ranked=1', { load: { endpoint: '/v1/work?source=all&ranked=1', build: buildWorkOrder } }),
     // Activity — the human-lane rolling activity log (ported from /console/activity
     // into the v2 theme). Custom-rendered by render.js renderActivityLog (see the
     // renderPage id switch); no section build.
     'cx-activity-log': page('cx-activity-log', 'work', 'Activity', 'live rolling activity log — streaming events + receipt cross-walk'),
     'cx-projects': page('cx-projects', 'work', 'Projects', 'repos to track + search, a planning repo, passports and working tenants', { load: { endpoint: '/v1/projects', build: buildProjects } }),
+    // Storybook & dossiers — phases 3 and 4 of the context graph, and the ONE
+    // surface that shows where two agents disagree about the same project.
+    // Custom-rendered by render.js renderContextGraph (see the renderPage id
+    // switch): a project picker driving the storybook readout (sections, version
+    // list, two-version diff) and the dossier board (claims by kind with
+    // confidence + evidence, and the cross-agent reconciliation). No section
+    // build — the readout is markdown and the dossiers are a nested shape
+    // neither of which the control model can express.
+    'cx-storybook': page('cx-storybook', 'work', 'Storybook', 'where each project is + what every agent believes about it · /v1/projects/{id}/storybook · .../dossiers'),
     'cx-sessions': page('cx-sessions', 'work', 'Sessions', 'saved session snapshots for resume + audit · /v1/console/sessions', { load: { endpoint: '/v1/console/sessions', build: buildSessions } }),
     // ---- Memory ----------------------------------------------------------
-    'cx-facts': page('cx-facts', 'memory', 'Facts', 'the durable record — grouped by entity prefix', { load: { endpoint: '/v1/console/facts?top_k=100', build: buildFacts } }),
+    // cx-facts is custom-rendered by render.js renderFactsBrowser (see the
+    // renderPage id switch): a paged, searchable browser over GET /v1/facts/list
+    // (the whole visible store, not a recent window). The load below is the
+    // static/degradation section builder the smoke walk exercises + the honest
+    // fallback shape; the interactive surface supersedes it at runtime.
+    'cx-facts': page('cx-facts', 'memory', 'Facts', 'the durable record — the whole visible store, paged and searchable', { load: { endpoint: '/v1/facts/list?limit=100', build: buildFacts } }),
     'cx-memory': page('cx-memory', 'memory', 'Memory', 'recent facts per tenant — system tenants hidden by default', { load: { endpoint: '/v1/console/facts?top_k=50', build: buildMemory } }),
     'cx-tenants': page('cx-tenants', 'memory', 'Tenants', 'memory stores · AMR lane routing', { load: { endpoint: '/v1/console/tenants', build: buildTenants } }),
     'cx-documents': page('cx-documents', 'memory', 'Documents', 'what the daemon has read, per tenant — and how to feed it more'),
@@ -1186,9 +1635,12 @@
     'cx-mediation': page('cx-mediation', 'trust', 'Mediation', 'the gateway plane — identity, capability ladder, foresight', { load: { endpoint: '/v1/console/engine/summary', build: buildMediationEngine } }),
     // ---- Meters ----------------------------------------------------------
     'cx-cost': page('cx-cost', 'meters', 'Token Burn (Session)', 'ground-truth cost lens — what each session cost + how to cut it', { load: { endpoint: '/v1/cost/report?tenant_id=default&token_budget=4000', build: buildCost } }),
-    'cx-usage': page('cx-usage', 'meters', 'Average Token Usage', 'aggregate call volume and spend · /v1/observations/aggregate', { load: { endpoint: '/v1/console/engine/summary', build: buildUsageEngine } }),
+    // M24 — was static/demo (see buildUsageLive). Now computed from the same
+    // posted session cost reports the Token Burn lens renders.
+    'cx-usage': page('cx-usage', 'meters', 'Average Token Usage', 'measured per-period and per-turn averages · /v1/cost/report', { load: { endpoint: '/v1/cost/report?tenant_id=default&token_budget=4000', build: buildUsageLive } }),
     // ---- System ----------------------------------------------------------
     'cx-settings': page('cx-settings', 'system', 'Settings', 'daemon configuration and console preferences', { load: { endpoint: '/v1/console/settings', build: buildSettings } }),
+    'cx-connections': page('cx-connections', 'system', 'Connections', 'endpoints, agent token, and the Claude Desktop bundle', { load: { endpoint: '/v1/console/connections', build: buildConnections } }),
     'cx-integrations': page('cx-integrations', 'system', 'Integrations', 'installed packs and their grants', { load: { endpoint: '/v1/console/integrations', build: buildIntegrations } }),
     'cx-extensions': page('cx-extensions', 'system', 'Extensions', 'signed third-party manifests · per-passport grants', { load: { endpoint: '/v1/extensions', build: buildExtensions } }),
     'cx-workbench': page('cx-workbench', 'system', 'Workbench', 'operator tooling over /v1/workbench/* — read tools live, writes gated (M13b)', { load: { endpoint: '/v1/workbench/contract', build: buildWorkbench } }),
@@ -1201,7 +1653,7 @@
     'ix-infra': page('ix-infra', 'system', 'Infra', 'machines, auth rails, config + session sync · /v1/console/infra/summary', { pro: true, load: { endpoint: '/v1/console/infra/summary', build: buildInfra } }),
     'dx-docs': page('dx-docs', 'system', 'Docs', 'daemon reference + platform docs', { pro: true }),
     'gx-global': page('gx-global', 'memory', 'Global', 'shared surfaces that outlive a session — engrams, bench, sites, fact store', { pro: true, load: { endpoint: '/v1/engrams', build: buildGlobal } }),
-    'ax-agent': page('ax-agent', 'overwatch', 'Agent', 'agent-side cockpit — MCP tools, graph, and where each surface lives', { pro: true, load: { endpoint: '/v1/mcp/tools', build: buildAgent } })
+    'ax-agent': page('ax-agent', 'overwatch', 'Agent', 'agent-side cockpit — MCP tool usage, graph, and where each surface lives', { pro: true, load: { endpoint: '/v1/mcp/tools/usage?window_hours=720', build: buildAgent } })
   };
 
   // ---- Pro-ported page ids (the DX/GX/AX/IX pages above) ----------------
@@ -1211,7 +1663,29 @@
 
   // ---- Destinations (rail order + pill grouping) ------------------------
   var DESTS = [
-    { id: 'overwatch', label: 'Overwatch', icon: 'overwatch', key: '1', sub: 'Needs-you queue, fleet, and live activity.' },
+    // Rings (M20) — THE CONSOLE INDEX. It is the default route (DESTS[0] drives
+    // currentRoute's fallback + the boot landing) and sits at the top of the rail.
+    // Its nine views (Ring · Activity · Live board · Orchestrators · Punchcards ·
+    // Agent · Board · Graph · Tree) are the rail's accordion group for this
+    // destination — deep-linked as #/rings/<slug> (see RINGS_TAB_SLUGS below).
+    // Rendered NATIVELY by render.js renderRings (canvas "clock of work"; no
+    // iframe, no base64 blob): the real work board, daemon glance and visible fact
+    // store, replayed as an animated ring, live-wired through the console's CruxApi
+    // client with snapshot fallbacks. Reads only, so it shows in every posture.
+    { id: 'rings', label: 'Rings', icon: 'rings', key: '1', sub: 'The clock of work — the live work board, facts and glance as an animated ring.' },
+    // Patchbay — the board laid out in SPACE rather than in a list. Every open
+    // ExecPlan is a card, grouped into a ring per system with the system name in
+    // the middle, wired to the shared services it touches. Sits directly under
+    // Rings because it answers the same question ("what is in flight?") from the
+    // other direction: Rings orders work in time, Patchbay places it in the
+    // estate. Rail position is this array index; `key` is only the keyboard
+    // shortcut, and '6' was the free slot — so no existing shortcut moves.
+    // Reads through the generated CruxApi.workGraph() (GET /v1/work/graph), so
+    // it shows in every posture. Deliberately NOT capability-gated: the route is
+    // always mounted and returns an empty graph when the ExecPlan root is unset,
+    // so the page degrades honestly on its own. Delegates to render.js
+    // renderPatchbay.
+    { id: 'patchbay', label: 'Patchbay', icon: 'patchbay', key: '6', sub: 'The board in space — every open plan as a card, grouped by system. Solid wires are declared dependencies (Depends on / Extended by); dashed are prose mentions. Click a system or a service to isolate it.' },
     { id: 'work', label: 'Work', icon: 'work', key: '2', sub: 'ExecPlans, projects, and sessions.' },
     { id: 'memory', label: 'Memory', icon: 'memory', key: '3', sub: 'Facts, tenants, documents, and retrieval tuning.' },
     { id: 'trust', label: 'Trust', icon: 'trust', key: '4', sub: 'Receipts, gates, identity, and posture.' },
@@ -1219,11 +1693,20 @@
     // railHidden — System lives in the bottom account roll-up menu (Settings ·
     // Language · Log out), not the Command rail; still routable at #/system/*.
     { id: 'system', label: 'System', icon: 'settings', railHidden: true, sub: 'Settings, integrations, and developer tools.' },
-    // Canvas (M9) — a destination with no sub-pills: it IS the page. A
-    // size-adaptive Board plus a real-edge relation Graph, switched by a
-    // nav-family segmented control (deep-linkable #/canvas/board · #/canvas/graph).
-    // Phone tier: lives in the "More" sheet (not one of the three direct tabs).
-    { id: 'canvas', label: 'Canvas', icon: 'canvas', key: '6', sub: 'Size-adaptive dashboard + relation graph.' },
+    // Canvas (M19) — the destination is RETIRED from the rail/sitemap/workspace
+    // builtins: Board, Graph and Tree are now tabs 7-9 of the Rings tab hub, and
+    // Studio moved to the account menu + the expanded-rail head. `railHidden` (no
+    // key) keeps ONLY the route alive so #/canvas/studio stays Studio's stable home
+    // and existing #/canvas/board|graph|tree deep links redirect to #/rings/<view>
+    // (route()). It is intentionally absent from the rail, the sitemap and the
+    // Command workspace builtin (siteMapSections + cwsRegistryDests skip it).
+    // The dest id stays 'canvas' — #/canvas/studio is Studio's stable home and
+    // every existing deep link, workspace page type (canvas/board|graph|tree)
+    // and redirect keys off it. Only the LABEL changes: it is the topbar
+    // heading for #/canvas/studio, and the surface it heads has been the Studio
+    // since M19 moved Board/Graph/Tree to Rings. "Canvas" as a heading named a
+    // destination that no longer exists.
+    { id: 'canvas', label: 'Studio', icon: 'canvas', railHidden: true, sub: 'Studio — route-only home (Board/Graph/Tree are Rings tabs).' },
     // Explorer (M11) — a destination with no sub-pills: it IS a search surface.
     // A query box + a Local | WikiCrux backend toggle (nav-family, aria-pressed) +
     // a budget/top_k control; results as cards (title/snippet · source · score ·
@@ -1234,11 +1717,51 @@
     // railHidden — Explorer is NOT in the Command rail; it's reached via the
     // top-right search field and from the top of the Explore (documents) menu.
     { id: 'explorer', label: 'Explorer', icon: 'search', railHidden: true, sub: 'Search the corpus — local retrieval or mediated WikiCrux.' },
-    // Site map — a destination with no sub-pills: it IS a static reference page
-    // (the flat rail rearranged into 5 destinations + System). Delegates to
-    // render.js renderSiteMap; reads nothing, so it shows in every posture.
-    { id: 'sitemap', label: 'Site map', icon: 'map', key: '7', sub: "the 26-item rail, rearranged into 5 destinations + System" }
+    // Site map — a destination with no sub-pills: it IS the page. A real,
+    // click-through map of every destination + surface, each node an <a href="#/…">
+    // to a registered route derived from this registry (render.js renderSiteMap,
+    // M8) — so it cannot drift from the nav. Reads nothing; shows in every posture.
+    { id: 'sitemap', label: 'Site map', icon: 'map', key: '7', sub: 'Every surface, one click away — with what each is for' },
+    // Link graph (ExecPlan wikicrux-link-graph-explorer M4) — a destination with
+    // no sub-pills: it IS a WebGL six-degrees explorer over the enwiki-prose link
+    // graph, served through the Crux daemon's read-only CoreCrux mediation proxy
+    // (/v1/console/corecrux/graph/*). `capability` gates VISIBILITY on the daemon's
+    // runtime capability plan (render from the plan, never the route registry —
+    // unified-shell rule): the pane is dark until the proxy env is configured. No
+    // key + capability-gated, so it never appears in the rail on a daemon without
+    // the proxy. Delegates to render.js renderLinkGraph (custom three.js r165).
+    { id: 'linkgraph', label: 'Link graph', icon: 'linkgraph', capability: 'console_link_graph', sub: 'Six-degrees explorer over the enwiki-prose link graph (CoreCrux mediation proxy).' },
+    // Overwatch (M20) — RETIRED as a destination. Its five views ARE Rings tabs
+    // 2-6 (they always were: the Rings hub calls the SHARED owRenderTab), so the
+    // landing duplicated the index. `railHidden` + no key keeps the page registry
+    // coherent (cx-activity / cx-coord / cx-orchestrators / cx-punchcards /
+    // ax-agent / cx-overview still hang off this dest and still power the tabs)
+    // while removing it from the rail, the site map, the Command workspace
+    // builtin, the phone tab bar and the keyboard shortcuts. Every #/overwatch
+    // route REDIRECTS to its Rings equivalent (shell.html route()).
+    { id: 'overwatch', label: 'Overwatch', icon: 'overwatch', railHidden: true, sub: 'Retired — its views are Rings tabs (#/overwatch redirects).' }
   ];
+
+  // ---- Rings tab slugs (M20) --------------------------------------------
+  // The nine Rings views, as the hash grammar (#/rings/<slug>) AND the rail
+  // accordion group for the Rings destination. ONE source of truth shared by the
+  // shell (rail accordion + route parsing + #/overwatch redirects) and render.js
+  // (the tab hub). `page` names the Overwatch page id a tab renders through
+  // owRenderTab (null = the ring canvas or an absorbed Canvas view).
+  var RINGS_TAB_SLUGS = [
+    { slug: 'ring', tab: 'ring', title: 'Ring', page: null },
+    { slug: 'activity', tab: 'cx-activity', title: 'Activity', page: 'cx-activity' },
+    { slug: 'live-board', tab: 'cx-coord', title: 'Live board', page: 'cx-coord' },
+    { slug: 'orchestrators', tab: 'cx-orchestrators', title: 'Orchestrators', page: 'cx-orchestrators' },
+    { slug: 'punchcards', tab: 'cx-punchcards', title: 'Punchcards', page: 'cx-punchcards' },
+    { slug: 'agent', tab: 'ax-agent', title: 'Agent', page: 'ax-agent' },
+    { slug: 'board', tab: 'cv-board', title: 'Board', page: null },
+    { slug: 'graph', tab: 'cv-graph', title: 'Graph', page: null },
+    { slug: 'tree', tab: 'cv-tree', title: 'Tree', page: null }
+  ];
+  // #/overwatch/<pageId> → #/rings/<slug>. A bare #/overwatch (or cx-overview,
+  // whose tiles the ring itself supersedes) lands on the ring.
+  var OVERWATCH_TO_RINGS = { 'cx-overview': 'ring', 'cx-activity': 'activity', 'cx-coord': 'live-board', 'cx-orchestrators': 'orchestrators', 'cx-punchcards': 'punchcards', 'ax-agent': 'agent' };
 
   // ---- Legacy id inventory (the 26 CX pages this plan must keep reachable)
   var LEGACY_IDS = [
@@ -1289,9 +1812,17 @@
     'ax-activity': 'home:cx-activity', 'ax-memory': 'home:cx-memory', 'ax-snapshots': 'home:cx-sessions',
     'ax-bulk': 'deferred:batch ops are mutations — no read surface',
     'ax-handoff': 'deferred:create_handoff is MCP-only — no list endpoint',
-    'ax-storybook': 'deferred:tile/pattern catalog is a design artifact, not a data feed',
+    // Corrected 2026-07-28: this was NEVER the JS component-gallery tool. It sits
+    // in the legacy AX (Agent) scope beside ax-handoff / ax-story / ax-dossiers,
+    // and it is the project storybook readout — five live daemon routes under
+    // /v1/projects/{id}/storybook. Filing a live endpoint as a design artifact
+    // put a real surface out of reach and locked the claim in via check 24.
+    'ax-storybook': 'home:cx-storybook',
     'ax-story': 'deferred:call-tree story view stays on the Pro / 3D canvas',
-    'ax-dossiers': 'deferred:per-project — /v1/projects/{id}/dossiers is per-project (see Work › Projects)',
+    // Corrected 2026-07-28: per-project, yes — but Work › Projects never rendered
+    // them, so the pointer led nowhere. cx-storybook carries the project picker
+    // both phases need.
+    'ax-dossiers': 'home:cx-storybook',
     // ── IX (Infra) — all five panels fed by one live endpoint → one Pro page ──
     'ix-index': 'ported-pro:ix-infra', 'ix-machines': 'ported-pro:ix-infra', 'ix-rails': 'ported-pro:ix-infra',
     'ix-config': 'ported-pro:ix-infra', 'ix-sync': 'ported-pro:ix-infra',
@@ -1373,7 +1904,7 @@
       'Add repo': 'GATED — POST /v1/projects/{id}/repos (projects.rs:324) needs a project id + a real repo; the ＋Add repos disclosure has neither (GitHub unconnected, placeholder select). No groundable body.',
       'Set as planning repo': 'GATED — same as Add repo: the disclosure form carries no project id / repo to target PATCH /v1/projects/{id} (projects.rs:133).',
       'Queue ingest': 'GATED — the only real route (POST /v1/local/ingest, local_ingest.rs:183) is a SYNCHRONOUS ingest needing a documents[] payload; the control models "queue a path fact for the agent". Shape mismatch — no path→documents bridge to ground.',
-      'Install': 'GATED — POST /v1/extensions/register (extensions.rs:117) wants a full IntegrationManifest object and install-from-registry wants {id,index_path}; the form supplies only a URL/path. No groundable body.',
+      'Install': 'GATED — POST /v1/extensions/register (extensions.rs:118) wants a full IntegrationManifest object; the form supplies only a URL/path, so there is still no groundable body HERE. install-from-registry {id} IS wired (crux-integrations I2), in the Studio catalog browser where the entry id and its curator-pinned sha256 are known — this control links through to it.',
       'Apply defaults to all tenants': 'GATED — no bulk route; only per-tenant PATCH /v1/console/tenants/{id}/category (console.rs:1953). "All" would be an unbounded client loop over every tenant — out of scope for a curated single-call mutation.',
       'Run sweep now': 'GATED — no HTTP route: memory_sweep_candidates is an MCP tool (dry-run) and the real sweep is a background timer (ephemeral_gc::run_sweep_once) with no daemon endpoint.',
       'Export audit bundle': 'GATED — GET /v1/observe/sessions/{id}/audit/export (observe_audit.rs:481) is a READ needing a session id + CORECRUXD_OBSERVE; not a write, and no unparameterised console trigger.',
@@ -1385,7 +1916,9 @@
     'cx-cost':          { legacy: { select: 1, info: 1 }, v2_present: ['live /v1/cost/report', 'D/W/M chart', 'window select'], v2_missing_read: [], v2_gated_write: [] },
     'cx-projects':      { legacy: { search: 1, btn: 8, exp: 1, select: 6, toggle: 8, input: 5, info: 1 }, v2_present: ['live /v1/projects', 'repo grid', 'search', 'disclosure'], v2_missing_read: ['per-repo role/plane display selects'], v2_gated_write: ['Create project', 'Add repo', 'Set as planning repo'] },
     'cx-work':          { legacy: { projection: 'kanban' }, v2_present: ['live /v1/work?source=all', 'state strips', 'graph link'], v2_missing_read: [], v2_gated_write: [] },
-    'cx-usage':         { legacy: { select: 1, search: 1, info: 7, bar: 12, exp: 10 }, v2_present: ['window select', 'search', 'info rows', 'savings bars', 'D/W/M chart'], v2_missing_read: [], v2_gated_write: [] },
+    // M24 — the mocked "window select / search / savings bars" are gone with the
+    // static page; what replaced them is measured, so the manifest says so.
+    'cx-usage':         { legacy: { select: 1, search: 1, info: 7, bar: 12, exp: 10 }, v2_present: ['live /v1/cost/report', 'measured period + per-turn averages', '2M-scale session-size bars', 'real D/W/M output series'], v2_missing_read: ['window select (the periods are computed and shown together)', 'savings estimate (no counterfactual is measured — stated on the page)'], v2_gated_write: [] },
     'cx-documents':     { legacy: { search: 1, exp: 3, info: 9, btn: 5, input: 2, select: 2, toggle: 3 }, v2_present: ['live /v1/console/tenants', 'search', 'ingest inputs/selects (read)'], v2_missing_read: ['per-tenant chunk/doc counts display'], v2_gated_write: ['Queue ingest', 'Scan path'] },
     'cx-gates':         { legacy: { search: 1, exp: 2, info: 3, btn: 5 }, v2_present: ['live /v1/work/gate/pending', 'search', 'approve/reject (operator-gated, wired)'], v2_missing_read: [], v2_gated_write: ['Withhold all'] },
     'cx-review':        { legacy: { search: 1, info: 3, btn: 6, input: 6, textarea: 3, select: 2, toggle: 1 }, v2_present: ['live /v1/console/review/contradictions', 'search'], v2_missing_read: ['side-by-side contradiction display rows'], v2_gated_write: ['Consolidate facts'] },
@@ -1397,10 +1930,13 @@
     'cx-identity':      { legacy: { projection: 'list' }, v2_present: ['live /v1/identity/candidates'], v2_missing_read: [], v2_gated_write: ['Confirm candidate'] },
     'cx-receipts':      { legacy: { projection: 'list' }, v2_present: ['browser-local lookup', 'search', 'verify dock (read)'], v2_missing_read: [], v2_gated_write: [] },
     'cx-mediation':     { legacy: { search: 1, exp: 4, info: 7, btn: 4, input: 1 }, v2_present: ['live /v1/console/engine/summary', 'principal/ladder/foresight info', 'search'], v2_missing_read: [], v2_gated_write: [] },
-    'cx-workbench':     { legacy: { btn: 11, info: 5, input: 5, select: 3 }, v2_present: ['live /v1/workbench/contract', 'api-drift (read)', 'command-ledger (read)', 'reasoning-timeline (read)', 'audit-triage (read)', 'brief (read)', 'tenant filter', 'search', 'query inputs/selects'], v2_missing_read: ['live text-search/graph-expand/time-range in-page (available in Explorer)', 'live entity loader'], v2_gated_write: ['Build context pack', 'Run impact preflight', 'Simulate policy', 'Probe route', 'Record capability audit'] },
-    'cx-integrations':  { legacy: { search: 1, exp: 14, info: 18, input: 3, toggle: 1, btn: 4, select: 1 }, v2_present: ['live /v1/console/integrations', 'pack expanders', 'grants (read)', 'search'], v2_missing_read: ['per-pack capability display rows'], v2_gated_write: ['Verify connection', 'Test call'] },
-    'cx-extensions':    { legacy: { search: 1, exp: 2, info: 5, input: 3, select: 1, btn: 2 }, v2_present: ['live /v1/extensions', 'manifest expanders', 'search'], v2_missing_read: ['per-grant scope display'], v2_gated_write: ['Add key', 'Install'] },
-    'cx-facts':         { legacy: { projection: 'cascade' }, v2_present: ['live /v1/console/facts', 'entity-prefix groups', 'search'], v2_missing_read: [], v2_gated_write: [] },
+    'cx-workbench':     { legacy: { btn: 11, info: 5, input: 5, select: 3 }, v2_present: ['live /v1/workbench/contract', 'api-drift (read)', 'reasoning-timeline (read)', 'audit-triage (read)', 'brief (read)', 'tenant filter', 'search', 'query inputs/selects'], v2_missing_read: ['live text-search/graph-expand/time-range in-page (available in Explorer)', 'live entity loader'], v2_gated_write: ['Build context pack', 'Run impact preflight', 'Simulate policy', 'Probe route', 'Record capability audit'] },
+    // crux-integrations I1+I2 — the writes these two pages could not run now exist,
+    // in Studio › Integrations, which both pages link through to. Listed here as
+    // present (the console CAN do them) rather than pretended-on-page.
+    'cx-integrations':  { legacy: { search: 1, exp: 14, info: 18, input: 3, toggle: 1, btn: 4, select: 1 }, v2_present: ['live /v1/console/integrations', 'pack expanders', 'grants (read)', 'search', 'link-through to Studio › Integrations, where pack install/grant/disable + the GitHub and OpenAI connect/disconnect/sync lifecycle are wired'], v2_missing_read: ['per-pack capability display rows (shown in the Studio)'], v2_gated_write: ['Verify connection', 'Test call'] },
+    'cx-extensions':    { legacy: { search: 1, exp: 2, info: 5, input: 3, select: 1, btn: 2 }, v2_present: ['live /v1/extensions', 'manifest expanders', 'search', 'link-through to Studio › Integrations, where catalog install, tool invoke, grant issue/revoke, uninstall and trusted-key removal are wired'], v2_missing_read: ['per-grant scope display (shown in the Studio)'], v2_gated_write: ['Add key', 'Install'] },
+    'cx-facts':         { legacy: { projection: 'cascade' }, v2_present: ['live /v1/facts/list (paged full store)', 'entity-prefix groups + quick-filter chips', 'server-side search (q=)', 'as_of time-machine (as_of_unix_ms)', 'superseded + reserved toggles', 'row detail (full value by id)'], v2_missing_read: [], v2_gated_write: [] },
     'cx-memory':        { legacy: { search: 1, toggle: 1, exp: 2, info: 4, btn: 1 }, v2_present: ['live /v1/console/facts', 'per-tenant groups', 'hide-system toggle (display)', 'search'], v2_missing_read: [], v2_gated_write: [] },
     'cx-tenants':       { legacy: { info: 1, btn: 2, search: 1, toggle: 1 }, v2_present: ['live /v1/console/tenants', 'AMR lane toggles (display)', 'search'], v2_missing_read: [], v2_gated_write: ['Apply defaults to all tenants'] },
     'cx-lane-weights':  { legacy: { projection: 'panel' }, v2_present: ['live /v1/console/corecrux/lane-weights', 'weight inputs (display)'], v2_missing_read: [], v2_gated_write: ['Apply lane weights', 'Reset lane weights'] },
@@ -1772,9 +2308,12 @@
     reverse: { source_line: 2781, status: 'demo-surface', component: 'renderDocSurface_reverse' }
   };
 
+
   return {
     PAGES: PAGES,
     DESTS: DESTS,
+    RINGS_TAB_SLUGS: RINGS_TAB_SLUGS,
+    OVERWATCH_TO_RINGS: OVERWATCH_TO_RINGS,
     LEGACY_IDS: LEGACY_IDS,
     PRO_PORTED_IDS: PRO_PORTED_IDS,
     LEGACY_PORT: LEGACY_PORT,

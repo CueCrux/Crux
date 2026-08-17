@@ -28,6 +28,59 @@ Crux Daemon exposes three network surfaces by default:
 
 \* Requires a dataplane-enabled deployment. Returns 501 in Crux Daemon.
 
+#### Segment coordinates on a result
+
+Each `/v1/query/text-search` result (and each `/expand` chunk) carries two
+segment coordinates, which are **not the same number**:
+
+| Field | Meaning |
+|---|---|
+| `segment_index` | Position in the loaded-reader list, ascending by sequence. **0-based, global, and mutable** — see the warning below. Pairs with `doc_id` to form `result_id`, and is the value `/expand` takes back. |
+| `segment_seq` | The sealed segment's own sequence — the `segment_seq` the `/v1/local/ingest` receipt returned. **1-based and stable for the life of the segment.** |
+
+To join a query result back to the ingest that produced it, **join on
+`segment_seq`**.
+
+**Never derive one from the other.** `segment_index` is a position in the
+daemon's loaded-reader list, so it moves when *any* segment is loaded, sealed or
+erased — including segments belonging to other tenants, written by someone else,
+while your query runs. Measured on one host on 2026-08-07: `segment_seq -
+segment_index` was **1** in the morning, **18** that afternoon and **17** minutes
+later, uniformly across every tenant. There is no offset to store, not even a
+freshly measured one.
+
+A consumer that translates between them scores a plausible, uniform **0%**
+instead of erroring, because every hit unmaps at once and nothing raises. That is
+how the BEAM-100K mapping was wrong for a full run before anyone noticed. If you
+are on a daemon old enough not to return `segment_seq`, do not guess the offset:
+discover the tenant's live segment ids through the same query path you score
+with, and pair them in ascending order with your ingest batches — segment
+sequences are allocated monotonically, so ascending live order matches ingest
+order whatever the absolute numbers have become.
+
+### Local prose ingest
+
+| Method | Path | Description | Auth Scope |
+|--------|------|-------------|------------|
+| POST | `/v1/local/ingest` | Seal pre-chunked prose into a local segment (BM25 + optional dense) | `admin:write` (tenant-scoped) |
+
+The 202 response reports the dense lane explicitly, because a corpus that failed
+to embed still indexes over BM25 and otherwise looks healthy:
+
+| Field | Meaning |
+|---|---|
+| `dense_vectors` | Vectors actually persisted to the segment's `.ccxv` companion |
+| `dense_expected` | Vectors this ingest expected — every chunk when the node embeds server-side, the caller-vectored subset otherwise |
+| `dense_status` | `ok`, `partial`, `skipped`, `not_configured` (no vectors expected — BM25-only by configuration), or `not_applicable` (idempotent re-ingest, nothing sealed) |
+
+**Assert `dense_status == "ok"`** (or `dense_vectors == dense_expected`) after
+every ingest that expects semantic recall. `skipped` means the embed step failed
+and the segment sealed lexical-only; the daemon logs
+`local-ingest-dense-gap-sealed` at WARN with the segment sequence, and the cause
+in the preceding `local-ingest-embedding-failed` line. Both fields are additive —
+a client that ignores them sees the response shape it saw before
+([local_ingest.rs](../crates/corecruxd/src/http/local_ingest.rs)).
+
 ### Fact Store
 
 | Method | Path | Description | Auth Scope |
@@ -41,6 +94,27 @@ Crux Daemon exposes three network surfaces by default:
 
 HTTP fact writes do not support `private=true`. Private facts and per-agent
 visibility are MCP-only features.
+
+### Work and Orchestrators
+
+Work and orchestrator records are authority-sensitive, tenant-scoped surfaces.
+In JWT modes, creator/updater/commenter identity and tenant come from verified
+claims; matching body fields are compatibility constraints, not an
+impersonation mechanism. A caller cannot list, read, mutate, comment on, attach
+members to, or resolve gates for another tenant.
+
+In local `off`/`dev_scopes` mode, an explicit passport header or matching body
+assertion is recorded as `operator:unverified:<id>`. It is not a verified human
+identity: work state changes always queue for review. Human gate decisions in
+authenticated modes require `facts:write`, a canonical JWT `passport_id`, and
+the work tenant; MCP agent tokens and `sub`-only JWTs cannot approve or reject.
+An unmapped MCP agent token is attributed as `agent:<token-name>` and is gated
+as automation; only an explicit `CRUX_AGENT_PASSPORTS` mapping may resolve it
+to a real passport id.
+
+The generic `/v1/entities/{kind}/{id}` and MCP `entity_*` APIs reject governed
+`orchestrator` records and omit them from unfiltered listings. Use the typed
+`/v1/orchestrators` routes so tenant and actor checks cannot be bypassed.
 
 ### Session Store
 
@@ -159,7 +233,7 @@ understanding back to agents.
 | GET | `/v1/repos/{repoId}?tenant_id=…` | One registration | `admin:read` |
 | DELETE | `/v1/repos/{repoId}?tenant_id=…` | Unregister (stops watch) | `admin:write` |
 | GET | `/v1/repos/{repoId}/codemap?tenant_id=…&format=summary\|full` | AST code map: `summary` = stats + per-crate rollup; `full` = files, symbols, deps, routes | `admin:read` |
-| POST | `/v1/workspace/scan` | Scan the daemon's own workspace (`CORECRUXD_WORKSPACE_PATH`) | `admin:read` |
+| POST | `/v1/workspace/scan` | Scan the daemon's own workspace (`CORECRUXD_WORKSPACE_PATH`) | `admin:write` |
 | GET | `/v1/workspace/scan` | Latest self-scan in full | `admin:read` |
 | GET | `/v1/workspace/storyline?format=tree\|json` | Per-route call trees from the self-scan | `admin:read` |
 
@@ -189,9 +263,51 @@ understanding back to agents.
 | POST | `/v1/admin/actions` | Submit admin action (seal, scrub, verify, rebalance) | `admin:write` |
 | GET | `/v1/admin/actions/{actionId}` | Get admin action status | `admin:read` |
 | POST | `/v1/admin/stream-meta` | Update stream metadata | `admin:write` * |
+| GET | `/v1/admin/tenants/{tenantId}/footprint` | Segments, docs and bytes a tenant occupies in the retrieval corpus | `admin:read` † |
+| POST | `/v1/admin/forget-tenants` | Erase the named tenants' retrieval corpora (`/v1/admin/forget-tenant` is the singular alias) | `admin:write` † |
+| DELETE | `/v1/admin/forget-tenants/{tenantId}` | Lift a mask-only erasure | `admin:write` † |
 | POST | `/v1/internal/replication/segments` | Receive replicated segments | `replication:write` * |
 
 \* Requires a dataplane-enabled deployment. Returns 501 in Crux Daemon.
+
+† Requires `CORECRUXD_TENANT_ERASURE=1`; the routes 404 while it is unset.
+
+#### Tenant corpus erasure
+
+`POST /v1/admin/forget-tenants` takes `{"tenant_ids": ["…"], "reclaim": false}`.
+Empty ids are dropped and duplicates collapsed in first-seen order; the batch is
+capped at 4096, `__`-prefixed (reserved) tenant ids are refused, and `admin:write`
+is checked for **every** named tenant before anything is mutated — a partially
+authorised batch is `403` and erases nothing.
+
+Two layers:
+
+- **Layer 1 (default).** Segments sealed up to the current `watermark_segment_seq`
+  become invisible to that tenant, and the mask is persisted to
+  `<data_dir>/forgotten-tenants.json` before the response returns. Reversible via
+  the `DELETE` route. Anything ingested afterwards is served normally, so a corpus
+  can be erased and re-paved under the same tenant id.
+- **Layer 2 (`"reclaim": true`).** Additionally deletes the file group of every
+  segment whose documents all belong to that tenant. **Irreversible** — recovery is
+  restore-from-backup only. Segments shared with another tenant are never deleted;
+  they stay masked and are reported as `mixed_segments_retained`.
+
+Both routes re-read the shard directories from disk before answering, so a
+segment sealed since the last scan is inside the blast radius rather than
+silently outside it. Segments are found by their `.ccxseg` file, not by a
+companion: a segment holding fact records has no `.ccxi` to key off, and it is
+still erasable. Tenant membership comes from the `.ccxi` doc table where one
+exists and from the segment's own frame headers where it does not.
+
+A segment that is on disk but cannot be read at all is reported as
+`unattributable_segments` on both routes, and is neither masked nor reclaimed —
+deleting a segment whose owner cannot be established risks a co-tenant's data.
+A non-zero count means an erasure is incomplete and needs an operator.
+
+Scope is the **retrieval corpus only**. A tenant's facts, sessions and activity
+rows are untouched, so the response says `corpus_erased`, not `tenant_forgotten`.
+Each tenant's erasure mints a signed governance receipt carrying counts, the
+watermark and the scope — never document content.
 
 ---
 
@@ -274,6 +390,8 @@ Configured via `CORECRUXD_AUTH_MODE`:
 | `jwt_jwks` | JWT with JWKS key rotation | Production with key management |
 
 Scopes are passed via `Authorization: Bearer <token>` header. Required scopes are listed per endpoint above.
+`X-Corecrux-Passport-Id` is only an unverified local assertion in `off` and
+`dev_scopes`; production authority must come from verified token claims.
 
 ### Route authorization gate (`CORECRUXD_ROUTE_AUTH`)
 
@@ -286,8 +404,12 @@ controlled by `CORECRUXD_ROUTE_AUTH` (read once at startup):
 | Value | Behaviour |
 |-------|-----------|
 | `off` | Pass-through; the middleware does nothing. |
-| `shadow` (default) | Evaluates the contract and logs a structured `route_auth_shadow_mismatch` warning on any would-deny, but never blocks. Use it to observe coverage before switching to `enforce`. |
+| `shadow` | Evaluates the contract and logs a structured `route_auth_shadow_mismatch` warning on any would-deny, but never blocks. It is the derived default only for auth-off, loopback-only operation; otherwise it is an explicit migration override. |
 | `enforce` | Public routes (`/healthz`, `/readyz`, `/metrics`, `/session`, `/invocation/verify`, `/v1/openapi.json`, `/v1/version`, `/v1/witness/smoke`, and the `/v1/auth/*` bootstrap rails) pass with no auth headers. Every other route requires one of its contract scopes via the same primitive the handlers use. A route with **no** contract entry — or a request axum could not match to a route template — **fails closed with `403`**. |
+
+With the variable unset, authentication enabled or a non-loopback listener
+selects `enforce`; only auth-off plus loopback derives `shadow`. An empty or
+unknown explicit value also selects `enforce` and emits a startup warning.
 
 The gate authorizes scopes only; feature-flag gating for optional surfaces stays
 in the handler. When `CORECRUXD_AUTH_MODE=off`, the scope check is a no-op (there

@@ -8,7 +8,10 @@ extend-exclude = ["**/console-3d/vendor/"]
 metalness = "metalness"
 ccxi = "ccxi"
 ccxseg = "ccxseg"
-ccxs = "ccxs"
+# Projections snapshot companion. Was `ccxs`, renamed so that `ccx<lane>` stays
+# the CoreCrux segment-companion namespace (a snapshot is not a lane).
+ccxsnap = "ccxsnap"
+CSNP = "CSNP"
 corecrux = "corecrux"
 corecruxd = "corecruxd"
 corecruxctl = "corecruxctl"
@@ -23,6 +26,14 @@ Cose = "Cose"
 ment = "ment"
 ful = "ful"
 runn = "runn"
+# Canvas/rings level-of-detail acronym (console v2 + rings prototype)
+LOD = "LOD"
+lod = "lod"
+# Threshold variable shorthand in the rings prototype (G_THR / const thr)
+thr = "thr"
+THR = "THR"
+# Hyphenated "mis-rendering" (console v2 comment)
+mis = "mis"
 numer = "numer"
 RTO = "RTO"
 ba = "ba"

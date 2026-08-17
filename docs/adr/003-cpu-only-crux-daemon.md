@@ -5,7 +5,7 @@
 
 ## Context
 
-CoreCrux has dataplane-enabled distributions with GPU-accelerated operations (append, read, replay) via CUDA. The Crux Daemon is source-available under CCL v1.0 and must be fully functional without GPU hardware or CUDA dependencies.
+CoreCrux has dataplane-enabled distributions with GPU-accelerated operations (append, read, replay) via CUDA. The Crux Daemon is open source under Apache-2.0 and must be fully functional without GPU hardware or CUDA dependencies.
 
 ## Decision
 

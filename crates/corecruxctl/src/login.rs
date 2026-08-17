@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! `corecruxctl login` — unified, auto-selected auth rails for the Crux Daemon.
 //!
@@ -555,9 +555,54 @@ fn probe_posture(agent: &ureq::Agent, http_base: &str, bearer: Option<&str>) -> 
     }
 }
 
+/// Why a login self-check did not report success.
+///
+/// D-28: both self-checks used to collapse into a bare `DynErr`, and the
+/// caller printed every one as `"skipped"` — so a daemon that answered
+/// `PUT /v1/facts` with a 500, or returned no fact at all, read exactly like
+/// a daemon that was not running. A check that RAN AND FAILED must not report
+/// the same word as a check that could not run.
+#[derive(Debug)]
+enum VerifyOutcome {
+    /// The check could not run — nothing was reachable to check. Legitimately
+    /// skipped: `corecruxctl login` is expected to work offline.
+    Unreachable(String),
+    /// The check ran against a live daemon and the daemon failed it.
+    Failed(String),
+}
+
+impl std::fmt::Display for VerifyOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreachable(msg) | Self::Failed(msg) => f.write_str(msg),
+        }
+    }
+}
+
+/// Classify a `ureq` transport error.
+///
+/// NOTE: `http_agent` sets `http_status_as_error(false)` so the device-grant
+/// poll can read its status code out of a 400 body. That means
+/// `ureq::Error::StatusCode` is **never produced by this agent** — a non-2xx
+/// arrives as `Ok(resp)`. Every caller here must therefore check
+/// `resp.status()` itself (see `status_outcome`); reaching this function at all
+/// means the request never got an HTTP response. The `StatusCode` arm is kept
+/// only so this stays correct if the agent config changes.
+fn transport_outcome(err: &ureq::Error, what: &str) -> VerifyOutcome {
+    match err {
+        ureq::Error::StatusCode(code) => VerifyOutcome::Failed(format!("{what} returned HTTP {code}")),
+        other => VerifyOutcome::Unreachable(format!("{what}: {other}")),
+    }
+}
+
+/// The daemon answered — a non-2xx is a live refusal, never a skip.
+fn status_outcome(status: u16, what: &str) -> Option<VerifyOutcome> {
+    (!(200..300).contains(&status)).then(|| VerifyOutcome::Failed(format!("{what} returned HTTP {status}")))
+}
+
 /// Best-effort verification that the resolved daemon answers MCP `tools/list`.
 /// Returns the advertised tool count. Non-fatal on the caller's side.
-fn verify_mcp_tools_list(agent: &ureq::Agent, mcp_url: &str, bearer: Option<&str>) -> Result<usize, DynErr> {
+fn verify_mcp_tools_list(agent: &ureq::Agent, mcp_url: &str, bearer: Option<&str>) -> Result<usize, VerifyOutcome> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -572,28 +617,37 @@ fn verify_mcp_tools_list(agent: &ureq::Agent, mcp_url: &str, bearer: Option<&str
         req = req.header("authorization", format!("Bearer {t}"));
     }
     let text = match req.send_json(body) {
-        Ok(resp) => resp.into_body().read_to_string()?,
-        Err(ureq::Error::StatusCode(code)) => return Err(format!("MCP tools/list returned HTTP {code}").into()),
-        Err(other) => return Err(Box::new(other)),
+        Ok(mut resp) => {
+            if let Some(failure) = status_outcome(resp.status().as_u16(), "MCP tools/list") {
+                return Err(failure);
+            }
+            resp.body_mut()
+                .read_to_string()
+                .map_err(|err| VerifyOutcome::Failed(format!("MCP tools/list body unreadable: {err}")))?
+        }
+        Err(err) => return Err(transport_outcome(&err, "MCP tools/list")),
     };
     // The MCP endpoint may answer as JSON or as an SSE `data:` frame.
     let json_text = text
         .lines()
         .find_map(|l| l.trim().strip_prefix("data:").map(str::trim))
         .unwrap_or(text.as_str());
-    let parsed: serde_json::Value = serde_json::from_str(json_text)?;
+    // Past this point the daemon answered: every remaining failure is a real
+    // failure, never a skip.
+    let parsed: serde_json::Value = serde_json::from_str(json_text)
+        .map_err(|err| VerifyOutcome::Failed(format!("MCP tools/list response is not JSON: {err}")))?;
     let count = parsed
         .get("result")
         .and_then(|r| r.get("tools"))
         .and_then(|t| t.as_array())
         .map(|a| a.len())
-        .ok_or("MCP tools/list response missing result.tools")?;
+        .ok_or_else(|| VerifyOutcome::Failed("MCP tools/list response missing result.tools".to_string()))?;
     Ok(count)
 }
 
 /// Best-effort end-to-end memory check: `store_fact` (PUT /v1/facts) then read
 /// it back (GET /v1/facts?query=). Returns Ok on a successful round-trip.
-fn verify_fact_roundtrip(agent: &ureq::Agent, http_base: &str, bearer: Option<&str>) -> Result<(), DynErr> {
+fn verify_fact_roundtrip(agent: &ureq::Agent, http_base: &str, bearer: Option<&str>) -> Result<(), VerifyOutcome> {
     let entity = "__crux_login_selfcheck";
     let key = "last_login_probe";
     let value = "ok";
@@ -611,9 +665,15 @@ fn verify_fact_roundtrip(agent: &ureq::Agent, http_base: &str, bearer: Option<&s
         put = put.header("x-corecrux-scopes", "facts:write");
     }
     match put.send_json(put_body) {
-        Ok(_) => {}
-        Err(ureq::Error::StatusCode(code)) => return Err(format!("store_fact returned HTTP {code}").into()),
-        Err(other) => return Err(Box::new(other)),
+        Ok(resp) => {
+            // The write leg's whole point is to prove the daemon accepts a
+            // fact. Without this check a 500 arrived as `Ok` and the round-trip
+            // carried on to the read leg as though the write had landed.
+            if let Some(failure) = status_outcome(resp.status().as_u16(), "store_fact") {
+                return Err(failure);
+            }
+        }
+        Err(err) => return Err(transport_outcome(&err, "store_fact")),
     }
 
     let get_url = format!("{http_base}/v1/facts");
@@ -628,12 +688,25 @@ fn verify_fact_roundtrip(agent: &ureq::Agent, http_base: &str, bearer: Option<&s
     } else {
         get = get.header("x-corecrux-scopes", "query:read");
     }
+    // The write already succeeded, so the daemon is demonstrably up: from here
+    // every failure is a real failure, never a skip.
     let text = match get.call() {
-        Ok(resp) => resp.into_body().read_to_string()?,
-        Err(ureq::Error::StatusCode(code)) => return Err(format!("query_facts returned HTTP {code}").into()),
-        Err(other) => return Err(Box::new(other)),
+        Ok(mut resp) => {
+            if let Some(failure) = status_outcome(resp.status().as_u16(), "query_facts") {
+                return Err(failure);
+            }
+            resp.body_mut()
+                .read_to_string()
+                .map_err(|err| VerifyOutcome::Failed(format!("query_facts body unreadable: {err}")))?
+        }
+        Err(other) => {
+            return Err(VerifyOutcome::Failed(format!(
+                "query_facts failed after a successful write: {other}"
+            )))
+        }
     };
-    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    let parsed: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|err| VerifyOutcome::Failed(format!("query_facts response is not JSON: {err}")))?;
     let found = parsed
         .get("facts")
         .and_then(|f| f.as_array())
@@ -641,7 +714,9 @@ fn verify_fact_roundtrip(agent: &ureq::Agent, http_base: &str, bearer: Option<&s
     if found {
         Ok(())
     } else {
-        Err("query_facts did not return the just-written fact".into())
+        Err(VerifyOutcome::Failed(
+            "query_facts did not return the just-written fact".to_string(),
+        ))
     }
 }
 
@@ -836,6 +911,16 @@ pub struct LoginArgs {
     pub device: bool,
     /// Skip the post-login `tools/list` + fact round-trip verification.
     pub no_verify: bool,
+    /// Exit non-zero when a self-check RAN and FAILED.
+    ///
+    /// Off by default: login itself succeeded — the credential is stored and
+    /// usable — so failing the command would break `corecruxctl login && …`
+    /// over a transient daemon fault. On for CI and provisioning, which need
+    /// every requested check to have actually passed. Same shape as the
+    /// evidence plane's `--strict` (see ExecPlan
+    /// `crux-pinned-defect-remediation-2026-07-31`, M5): an *unreachable*
+    /// daemon is still tolerated, because that check could not run.
+    pub strict_verify: bool,
     /// Skip installing the Claude Code hooks (banner + observe capture).
     pub no_hooks: bool,
     /// Skip registering this machine with the daemon.
@@ -941,19 +1026,32 @@ pub fn run(args: LoginArgs) -> Result<(), DynErr> {
     register_mcp(&cfg_dir, &http_base, &mcp_url, mcp_agent_token.as_deref())?;
     println!("registered MCP endpoint {mcp_url} → {}", env_file.display());
 
+    let mut verification_failed = false;
     if args.no_verify {
         println!("verification skipped (--no-verify)");
     } else {
         // MCP authenticates with the agent token (ambient `CRUX_AGENT_TOKEN`),
         // not the HTTP bearer — verify with that.
         let mcp_bearer = mcp_agent_token.or_else(|| ambient_token.clone());
+        // D-28: every outcome used to print as "skipped", so a daemon that
+        // answered with a 500 — or returned no fact at all — read exactly like
+        // a daemon that was not running. Failures now say FAILED and go to
+        // stderr; only a genuinely unreachable daemon is "skipped".
         match verify_mcp_tools_list(&agent, &mcp_url, mcp_bearer.as_deref()) {
             Ok(n) => println!("verify: MCP tools/list ok ({n} tools)"),
-            Err(e) => println!("verify: MCP tools/list skipped ({e})"),
+            Err(VerifyOutcome::Unreachable(e)) => println!("verify: MCP tools/list skipped ({e})"),
+            Err(VerifyOutcome::Failed(e)) => {
+                verification_failed = true;
+                eprintln!("verify: MCP tools/list FAILED ({e})");
+            }
         }
         match verify_fact_roundtrip(&agent, &http_base, effective_bearer.as_deref()) {
             Ok(()) => println!("verify: store_fact → query_facts round-trip ok"),
-            Err(e) => println!("verify: fact round-trip skipped ({e})"),
+            Err(VerifyOutcome::Unreachable(e)) => println!("verify: fact round-trip skipped ({e})"),
+            Err(VerifyOutcome::Failed(e)) => {
+                verification_failed = true;
+                eprintln!("verify: store_fact → query_facts round-trip FAILED ({e})");
+            }
         }
     }
 
@@ -978,6 +1076,19 @@ pub fn run(args: LoginArgs) -> Result<(), DynErr> {
 
     println!();
     println!("logged in to {http_base} via the {} rail.", rail.as_str());
+    // D-28: login itself succeeded — the credential is stored and usable — so
+    // this is not an error. But a self-check that RAN AND FAILED is a live
+    // daemon problem the operator must not have to notice in the scrollback.
+    if verification_failed {
+        eprintln!();
+        eprintln!(
+            "WARNING: login succeeded but one or more self-checks FAILED against the live daemon (see the FAILED lines above). \
+             This is not the same as a skipped check: the daemon answered and did not behave."
+        );
+        if args.strict_verify {
+            return Err("post-login self-check failed against the live daemon (--strict-verify)".into());
+        }
+    }
     Ok(())
 }
 
@@ -1195,9 +1306,54 @@ fn register_mcp(cfg_dir: &Path, http_url: &str, mcp_url: &str, token: Option<&st
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    use crate::test_support::serve_responses;
+
+    // ── shared helpers ──
+
+    /// A port with nothing listening on it: bind an ephemeral port, read it back,
+    /// then drop the listener. Used to drive the transport-error arms.
+    fn closed_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    }
+
+    /// Point `$HOME` at a fresh tempdir. The returned guard must stay alive for
+    /// the duration of the test; every caller is `#[serial_test::serial]` because
+    /// `HOME` is process-global.
+    fn temp_home() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", dir.path());
+        dir
+    }
+
+    /// A credential with only the fields a test cares about set.
+    fn test_cred(rail: &str, http_url: &str) -> DaemonCredential {
+        DaemonCredential {
+            rail: rail.to_string(),
+            access_token: None,
+            refresh_token: None,
+            expiry: None,
+            scopes: vec![],
+            mcp_url: derive_mcp_url(http_url).unwrap_or_else(|_| "http://x:14801/mcp".to_string()),
+            http_url: http_url.to_string(),
+        }
+    }
+
+    fn write_store(cred_url: &str, cred: DaemonCredential) {
+        let mut store = CredentialStore::default();
+        store.upsert(cred_url, cred);
+        save_store(&credentials_path(&config_dir().unwrap()), &store).unwrap();
+    }
+
+    fn read_store() -> CredentialStore {
+        load_store(&credentials_path(&config_dir().unwrap())).unwrap()
+    }
 
     // ── rail selection table (matrix cell → expected rail) ──
 
@@ -1531,5 +1687,1182 @@ mod tests {
         save_store(&path, &CredentialStore::default()).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "rewrite must tighten perms to 0600");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_store_creates_a_private_parent_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("deep").join("cuecrux");
+        let path = credentials_path(&nested);
+        save_store(&path, &CredentialStore::default()).unwrap();
+        let mode = std::fs::metadata(&nested).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "credential dir must be owner-only");
+    }
+
+    // ── malformed / partial stored credentials ──
+
+    #[test]
+    fn load_store_rejects_malformed_json() {
+        // Regression: a corrupt store must be an error, not silently treated as
+        // "no credentials" — that would downgrade an authenticated client to an
+        // anonymous one without telling anybody.
+        let dir = tempfile::tempdir().unwrap();
+        let path = credentials_path(dir.path());
+        std::fs::write(&path, "{ this is not json").unwrap();
+        assert!(load_store(&path).is_err());
+    }
+
+    #[test]
+    fn load_store_treats_a_whitespace_only_file_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = credentials_path(dir.path());
+        std::fs::write(&path, "   \n\t\n").unwrap();
+        assert!(load_store(&path).unwrap().daemons.is_empty());
+    }
+
+    #[test]
+    fn credential_omits_absent_optional_fields_on_disk() {
+        // A loopback credential must not serialise `access_token: null` — the
+        // store should contain no token key at all.
+        let dir = tempfile::tempdir().unwrap();
+        let path = credentials_path(dir.path());
+        let mut store = CredentialStore::default();
+        store.upsert(
+            "http://127.0.0.1:14800",
+            test_cred("loopback", "http://127.0.0.1:14800"),
+        );
+        save_store(&path, &store).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("access_token"), "loopback store leaked a token field");
+        assert!(!raw.contains("refresh_token"));
+        assert!(!raw.contains("expiry"));
+    }
+
+    #[test]
+    fn credential_deserializes_with_only_the_required_fields() {
+        // Forward/backward compatibility: a store written by an older build (no
+        // version, no optional token fields) must still load.
+        let dir = tempfile::tempdir().unwrap();
+        let path = credentials_path(dir.path());
+        std::fs::write(
+            &path,
+            r#"{"daemons":{"http://h:14800":{"rail":"loopback","mcp_url":"http://h:14801/mcp","http_url":"http://h:14800"}}}"#,
+        )
+        .unwrap();
+        let store = load_store(&path).unwrap();
+        assert_eq!(store.version, STORE_SCHEMA_VERSION);
+        let c = &store.daemons["http://h:14800"];
+        assert!(c.access_token.is_none());
+        assert!(c.refresh_token.is_none());
+        assert!(c.scopes.is_empty());
+    }
+
+    // ── URL + env-file edge cases ──
+
+    #[test]
+    fn normalize_rejects_unparsable_and_hostless_urls() {
+        assert!(normalize_http_base("http://[oops").is_err());
+        let err = normalize_http_base("file:///tmp/daemon").unwrap_err();
+        assert!(err.contains("no host"), "{err}");
+    }
+
+    #[test]
+    fn derive_mcp_url_rejects_unparsable_and_hostless_bases() {
+        assert!(derive_mcp_url("not a url").is_err());
+        let err = derive_mcp_url("file:///tmp/daemon").unwrap_err();
+        assert!(err.contains("no host"), "{err}");
+    }
+
+    #[test]
+    fn loopback_detection_is_false_for_unparsable_and_hostless_input() {
+        assert!(!is_loopback_url("not a url"));
+        assert!(!is_loopback_url("file:///tmp/daemon"));
+        assert!(!is_loopback_url("http://127.0.0.1.example.com"));
+    }
+
+    #[test]
+    fn parse_env_skips_lines_without_a_key() {
+        let parsed = parse_env_file("NOEQUALS\n=novalue\n  \nexport 'Q'='v'\n");
+        assert!(!parsed.contains_key("NOEQUALS"));
+        assert!(!parsed.contains_key(""));
+        assert_eq!(parsed.get("'Q'").map(String::as_str), Some("v"));
+    }
+
+    #[test]
+    fn render_env_replaces_an_exported_key_in_place() {
+        let mut updates = BTreeMap::new();
+        updates.insert("CRUX_HTTP_URL".to_string(), "http://new:14800".to_string());
+        let out = render_env_file("export CRUX_HTTP_URL=http://old:14800\n", &updates);
+        assert_eq!(out, "CRUX_HTTP_URL=http://new:14800\n");
+    }
+
+    #[test]
+    fn discover_drops_blank_and_unparsable_entries() {
+        let mut env = BTreeMap::new();
+        env.insert("CRUX_HTTP_URL".to_string(), "   ".to_string());
+        env.insert("CORECRUXD_HTTP_URL".to_string(), "http://other:14800".to_string());
+        env.insert("CRUX_MCP_URL".to_string(), "not a url".to_string());
+        let c = discover_candidates(None, &env);
+        assert_eq!(c, vec!["http://other:14800".to_string(), DEFAULT_HTTP_BASE.to_string()]);
+    }
+
+    #[test]
+    fn select_rail_error_names_the_transport_constraint_only_when_off_host() {
+        let remote = select_rail(inputs(false, false, false, false, AuthPosture::Required)).unwrap_err();
+        assert!(remote.contains("encrypted transport"), "{remote}");
+        let local = select_rail(inputs(true, false, false, false, AuthPosture::Required)).unwrap_err();
+        assert!(!local.contains("encrypted transport"), "{local}");
+    }
+
+    #[test]
+    fn rail_labels_are_stable() {
+        // The `as_str` form is persisted in credentials.json and matched on in
+        // refresh/logout — renaming a variant silently breaks stored creds.
+        for (rail, s) in [
+            (Rail::Loopback, "loopback"),
+            (Rail::Tailscale, "tailscale"),
+            (Rail::Device, "device"),
+            (Rail::StaticToken, "static_token"),
+        ] {
+            assert_eq!(rail.as_str(), s);
+            assert!(!rail_description(rail).is_empty());
+        }
+    }
+
+    // ── HTTP probes ──
+
+    #[test]
+    fn get_status_returns_the_code_and_sends_the_bearer() {
+        let (port, handle) = serve_responses(vec![(403, "{}".to_string())]);
+        let agent = http_agent();
+        let status = get_status(&agent, &format!("http://127.0.0.1:{port}/x"), Some("test-bearer")).unwrap();
+        assert_eq!(status, 403);
+        let captured = handle.join().unwrap();
+        assert!(captured[0]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer test-bearer"));
+    }
+
+    #[test]
+    fn get_status_reports_transport_failure_as_an_error() {
+        let agent = http_agent();
+        let url = format!("http://127.0.0.1:{}/x", closed_port());
+        assert!(get_status(&agent, &url, None).is_err());
+    }
+
+    #[test]
+    fn probe_reachability_reads_the_daemon_version() {
+        let (port, handle) = serve_responses(vec![
+            (200, "{}".to_string()),
+            (200, r#"{"version":"0.9.9"}"#.to_string()),
+        ]);
+        let agent = http_agent();
+        let probe = probe_reachability(&agent, &format!("http://127.0.0.1:{port}")).unwrap();
+        assert_eq!(probe.version, "0.9.9");
+        let captured = handle.join().unwrap();
+        assert!(captured[0].contains("GET /readyz"));
+        assert!(captured[1].contains("GET /v1/version"));
+    }
+
+    #[test]
+    fn probe_reachability_accepts_a_warming_daemon_and_a_versionless_body() {
+        // 503 on /readyz still proves the socket is live, and a /v1/version body
+        // without the field must degrade to "unknown" rather than fail login.
+        let (port, handle) = serve_responses(vec![(503, "{}".to_string()), (200, "{}".to_string())]);
+        let agent = http_agent();
+        let probe = probe_reachability(&agent, &format!("http://127.0.0.1:{port}")).unwrap();
+        assert_eq!(probe.version, "unknown");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn probe_reachability_fails_on_a_non_json_version_body() {
+        // NOTE: the agent sets `http_status_as_error(false)`, so a 500 arrives as
+        // a normal response and is parsed as a body — the `Error::StatusCode` arm
+        // in `probe_reachability` is unreachable. The failure still surfaces, but
+        // as a JSON parse error rather than "/v1/version returned HTTP 500".
+        let (port, handle) = serve_responses(vec![(200, "{}".to_string()), (500, "upstream boom".to_string())]);
+        let agent = http_agent();
+        assert!(probe_reachability(&agent, &format!("http://127.0.0.1:{port}")).is_err());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn probe_reachability_fails_when_the_host_is_unreachable() {
+        let agent = http_agent();
+        assert!(probe_reachability(&agent, &format!("http://127.0.0.1:{}", closed_port())).is_err());
+    }
+
+    #[test]
+    fn probe_posture_maps_401_and_403_to_required() {
+        for code in [401u16, 403] {
+            let (port, handle) = serve_responses(vec![(code, "{}".to_string())]);
+            let agent = http_agent();
+            let posture = probe_posture(&agent, &format!("http://127.0.0.1:{port}"), None).unwrap();
+            assert_eq!(posture, AuthPosture::Required, "HTTP {code}");
+            let captured = handle.join().unwrap();
+            assert!(captured[0].contains("GET /v1/projections/entity/count"));
+        }
+    }
+
+    #[test]
+    fn probe_posture_maps_200_to_off_and_forwards_the_bearer() {
+        let (port, handle) = serve_responses(vec![(200, "{}".to_string())]);
+        let agent = http_agent();
+        let posture = probe_posture(&agent, &format!("http://127.0.0.1:{port}"), Some("test-bearer")).unwrap();
+        assert_eq!(posture, AuthPosture::Off);
+        let captured = handle.join().unwrap();
+        assert!(captured[0]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer test-bearer"));
+    }
+
+    // ── MCP + fact verification ──
+
+    #[test]
+    fn mcp_tools_list_counts_tools_from_a_json_response() {
+        let (port, handle) = serve_responses(vec![(
+            200,
+            r#"{"result":{"tools":[{"name":"a"},{"name":"b"}]}}"#.to_string(),
+        )]);
+        let agent = http_agent();
+        let n = verify_mcp_tools_list(&agent, &format!("http://127.0.0.1:{port}/mcp"), Some("test-bearer")).unwrap();
+        assert_eq!(n, 2);
+        let captured = handle.join().unwrap();
+        assert!(captured[0].contains("tools/list"));
+        assert!(captured[0]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer test-bearer"));
+    }
+
+    /// D-28: both self-checks collapsed every outcome into a bare error and
+    /// the caller printed all of them as `"skipped"`, so a daemon that
+    /// answered `PUT /v1/facts` with a 500 — or returned no fact at all — read
+    /// exactly like a daemon that was not running. A check that RAN AND FAILED
+    /// must be distinguishable from one that could not run.
+    #[test]
+    fn a_live_daemon_failure_is_not_reported_as_a_skip() {
+        let agent = http_agent();
+
+        // Daemon answers and refuses the write: ran, failed.
+        let (port, handle) = serve_responses(vec![(500, "boom".to_string())]);
+        let outcome = verify_fact_roundtrip(&agent, &format!("http://127.0.0.1:{port}"), None).unwrap_err();
+        assert!(
+            matches!(outcome, VerifyOutcome::Failed(_)),
+            "a 500 on the write leg is a failure, not a skip: {outcome:?}"
+        );
+        assert!(outcome.to_string().contains("HTTP 500"), "{outcome}");
+        handle.join().unwrap();
+
+        // Write succeeds, read-back returns no matching fact: ran, failed.
+        let (port, handle) = serve_responses(vec![
+            (200, r#"{"ok":true}"#.to_string()),
+            (200, r#"{"facts":[]}"#.to_string()),
+        ]);
+        let outcome = verify_fact_roundtrip(&agent, &format!("http://127.0.0.1:{port}"), None).unwrap_err();
+        assert!(
+            matches!(outcome, VerifyOutcome::Failed(_)),
+            "a silent read-back miss is a failure, not a skip: {outcome:?}"
+        );
+        handle.join().unwrap();
+
+        // Nothing listening at all: could not run. `corecruxctl login` is
+        // expected to work offline, so this one really is a skip.
+        let outcome = verify_fact_roundtrip(&agent, "http://127.0.0.1:9", None).unwrap_err();
+        assert!(
+            matches!(outcome, VerifyOutcome::Unreachable(_)),
+            "an unreachable daemon is a skip, not a failure: {outcome:?}"
+        );
+    }
+
+    /// OD-4: `--strict-verify` turns a self-check that RAN AND FAILED into a
+    /// non-zero exit, while still tolerating one that COULD NOT RUN. That
+    /// asymmetry is the whole point — `corecruxctl login` is expected to work
+    /// offline, so an unreachable daemon must not fail the command even under
+    /// strict. Same shape as the evidence plane's `--strict`.
+    #[test]
+    fn strict_verify_separates_a_live_failure_from_an_unreachable_daemon() {
+        let agent = http_agent();
+
+        // Ran and failed: the daemon answered 500 on the write leg.
+        let (port, handle) = serve_responses(vec![(500, "boom".to_string())]);
+        let outcome = verify_fact_roundtrip(&agent, &format!("http://127.0.0.1:{port}"), None).unwrap_err();
+        assert!(
+            matches!(outcome, VerifyOutcome::Failed(_)),
+            "--strict-verify must be able to see this as a failure: {outcome:?}"
+        );
+        handle.join().unwrap();
+
+        // Could not run: nothing listening. Even under strict this is tolerated.
+        let outcome = verify_fact_roundtrip(&agent, "http://127.0.0.1:9", None).unwrap_err();
+        assert!(
+            matches!(outcome, VerifyOutcome::Unreachable(_)),
+            "an offline login must stay green even with --strict-verify: {outcome:?}"
+        );
+    }
+
+    /// Same split on the MCP check.
+    #[test]
+    fn mcp_tools_list_separates_a_refusal_from_an_unreachable_daemon() {
+        let agent = http_agent();
+
+        let (port, handle) = serve_responses(vec![(500, "boom".to_string())]);
+        let outcome = verify_mcp_tools_list(&agent, &format!("http://127.0.0.1:{port}/mcp"), None).unwrap_err();
+        assert!(matches!(outcome, VerifyOutcome::Failed(_)), "{outcome:?}");
+        handle.join().unwrap();
+
+        let (port, handle) = serve_responses(vec![(200, r#"{"error":{"code":-32601}}"#.to_string())]);
+        let outcome = verify_mcp_tools_list(&agent, &format!("http://127.0.0.1:{port}/mcp"), None).unwrap_err();
+        assert!(
+            matches!(outcome, VerifyOutcome::Failed(_)),
+            "a daemon that answered without result.tools ran and failed: {outcome:?}"
+        );
+        handle.join().unwrap();
+
+        let outcome = verify_mcp_tools_list(&agent, "http://127.0.0.1:9/mcp", None).unwrap_err();
+        assert!(matches!(outcome, VerifyOutcome::Unreachable(_)), "{outcome:?}");
+    }
+
+    #[test]
+    fn mcp_tools_list_understands_an_sse_data_frame() {
+        // The MCP endpoint may answer as `text/event-stream`; the JSON payload
+        // then arrives on a `data:` line rather than as the whole body.
+        let (port, handle) = serve_responses(vec![(
+            200,
+            "event: message\ndata: {\"result\":{\"tools\":[{\"name\":\"a\"}]}}\n\n".to_string(),
+        )]);
+        let agent = http_agent();
+        let n = verify_mcp_tools_list(&agent, &format!("http://127.0.0.1:{port}/mcp"), None).unwrap();
+        assert_eq!(n, 1);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn mcp_tools_list_rejects_a_response_without_result_tools() {
+        let (port, handle) = serve_responses(vec![(200, r#"{"error":{"code":-32601}}"#.to_string())]);
+        let agent = http_agent();
+        let err = verify_mcp_tools_list(&agent, &format!("http://127.0.0.1:{port}/mcp"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing result.tools"), "{err}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn mcp_tools_list_fails_when_unreachable() {
+        let agent = http_agent();
+        let url = format!("http://127.0.0.1:{}/mcp", closed_port());
+        assert!(verify_mcp_tools_list(&agent, &url, None).is_err());
+    }
+
+    #[test]
+    fn fact_roundtrip_with_a_bearer_uses_authorization_not_dev_scopes() {
+        // Regression: when a real credential exists the self-check must exercise
+        // it, not fall back to the dev-scope headers (which would make the probe
+        // pass against a daemon the credential cannot actually reach).
+        let (port, handle) = serve_responses(vec![
+            (200, "{}".to_string()),
+            (200, r#"{"facts":[{"key":"last_login_probe"}]}"#.to_string()),
+        ]);
+        let agent = http_agent();
+        verify_fact_roundtrip(&agent, &format!("http://127.0.0.1:{port}"), Some("test-bearer")).unwrap();
+        let captured = handle.join().unwrap();
+        for req in &captured {
+            let lower = req.to_ascii_lowercase();
+            assert!(lower.contains("authorization: bearer test-bearer"));
+            assert!(!lower.contains("x-corecrux-scopes"), "dev-scope header leaked: {req}");
+        }
+    }
+
+    #[test]
+    fn fact_roundtrip_fails_when_the_written_fact_is_not_returned() {
+        let (port, handle) = serve_responses(vec![
+            (200, "{}".to_string()),
+            (200, r#"{"facts":[{"key":"something_else"}]}"#.to_string()),
+        ]);
+        let agent = http_agent();
+        let err = verify_fact_roundtrip(&agent, &format!("http://127.0.0.1:{port}"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("did not return the just-written fact"), "{err}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fact_roundtrip_fails_on_a_non_json_query_body() {
+        let (port, handle) = serve_responses(vec![(200, "{}".to_string()), (200, "<html/>".to_string())]);
+        let agent = http_agent();
+        assert!(verify_fact_roundtrip(&agent, &format!("http://127.0.0.1:{port}"), None).is_err());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fact_roundtrip_fails_when_unreachable() {
+        let agent = http_agent();
+        let base = format!("http://127.0.0.1:{}", closed_port());
+        assert!(verify_fact_roundtrip(&agent, &base, None).is_err());
+    }
+
+    // ── issuance parsing ──
+
+    #[test]
+    fn parse_issued_token_reads_every_field() {
+        let issued = parse_issued_token(
+            r#"{"access_token":"test-jwt","refresh_token":"test-refresh","expires_in":900,
+                "scopes":["facts:read","facts:write"],"tenant_id":"tenant-a"}"#,
+        )
+        .unwrap();
+        assert_eq!(issued.access_token, "test-jwt");
+        assert_eq!(issued.refresh_token.as_deref(), Some("test-refresh"));
+        assert_eq!(issued.expires_in, 900);
+        assert_eq!(issued.scopes, vec!["facts:read", "facts:write"]);
+        assert_eq!(issued.tenant_id.as_deref(), Some("tenant-a"));
+    }
+
+    #[test]
+    fn parse_issued_token_defaults_a_missing_ttl_to_five_minutes() {
+        // A daemon that omits `expires_in` must not yield a credential that is
+        // treated as never-expiring; the conservative 300 s default forces a
+        // refresh instead.
+        let issued = parse_issued_token(r#"{"access_token":"test-jwt"}"#).unwrap();
+        assert_eq!(issued.expires_in, 300);
+        assert!(issued.refresh_token.is_none());
+        assert!(issued.scopes.is_empty());
+        assert!(issued.tenant_id.is_none());
+    }
+
+    #[test]
+    fn parse_issued_token_requires_an_access_token() {
+        let err = parse_issued_token(r#"{"expires_in":60}"#).unwrap_err().to_string();
+        assert!(err.contains("missing access_token"), "{err}");
+        assert!(parse_issued_token("not json").is_err());
+    }
+
+    #[test]
+    fn print_issued_handles_a_missing_tenant() {
+        print_issued("test", &parse_issued_token(r#"{"access_token":"test-jwt"}"#).unwrap());
+        print_issued(
+            "test",
+            &parse_issued_token(r#"{"access_token":"test-jwt","tenant_id":"t"}"#).unwrap(),
+        );
+    }
+
+    #[test]
+    fn post_json_capture_returns_status_and_body() {
+        let (port, handle) = serve_responses(vec![(418, r#"{"error":"nope"}"#.to_string())]);
+        let agent = http_agent();
+        let (status, body) = post_json_capture(
+            &agent,
+            &format!("http://127.0.0.1:{port}/x"),
+            serde_json::json!({"a": 1}),
+        )
+        .unwrap();
+        assert_eq!(status, 418);
+        assert_eq!(body, r#"{"error":"nope"}"#);
+        let captured = handle.join().unwrap();
+        assert!(captured[0].contains("POST /x"));
+        assert!(captured[0]
+            .to_ascii_lowercase()
+            .contains("content-type: application/json"));
+        assert!(
+            captured[0].contains("\"a\""),
+            "request body not captured: {}",
+            captured[0]
+        );
+    }
+
+    #[test]
+    fn post_json_capture_fails_when_unreachable() {
+        let agent = http_agent();
+        let url = format!("http://127.0.0.1:{}/x", closed_port());
+        assert!(post_json_capture(&agent, &url, serde_json::json!({})).is_err());
+    }
+
+    // ── whoami / tailnet rail ──
+
+    #[test]
+    fn whoami_reads_the_tailnet_identity() {
+        let (port, handle) = serve_responses(vec![(
+            200,
+            r#"{"trusted":true,"login":"user@example.com","allowlisted":true}"#.to_string(),
+        )]);
+        let agent = http_agent();
+        let who = probe_whoami(&agent, &format!("http://127.0.0.1:{port}")).unwrap();
+        assert!(who.trusted && who.allowlisted);
+        assert_eq!(who.login.as_deref(), Some("user@example.com"));
+        let captured = handle.join().unwrap();
+        assert!(captured[0].contains("GET /v1/auth/whoami"));
+    }
+
+    #[test]
+    fn whoami_defaults_to_untrusted_when_fields_are_absent() {
+        // Fail closed: a daemon that answers 200 with an empty body must not be
+        // read as a trusted, allowlisted identity.
+        let (port, handle) = serve_responses(vec![(200, "{}".to_string())]);
+        let agent = http_agent();
+        let who = probe_whoami(&agent, &format!("http://127.0.0.1:{port}")).unwrap();
+        assert!(!who.trusted);
+        assert!(!who.allowlisted);
+        assert!(who.login.is_none());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn whoami_is_none_when_the_rail_is_disabled_or_unreachable() {
+        let (port, handle) = serve_responses(vec![(404, "{}".to_string())]);
+        let agent = http_agent();
+        assert!(probe_whoami(&agent, &format!("http://127.0.0.1:{port}")).is_none());
+        handle.join().unwrap();
+
+        let (port, handle) = serve_responses(vec![(200, "<html/>".to_string())]);
+        assert!(probe_whoami(&agent, &format!("http://127.0.0.1:{port}")).is_none());
+        handle.join().unwrap();
+
+        assert!(probe_whoami(&agent, &format!("http://127.0.0.1:{}", closed_port())).is_none());
+    }
+
+    #[test]
+    fn mint_tailscale_parses_the_issued_token() {
+        let (port, handle) = serve_responses(vec![(
+            200,
+            r#"{"access_token":"test-minted","expires_in":120,"scopes":["facts:read"]}"#.to_string(),
+        )]);
+        let agent = http_agent();
+        let issued = mint_tailscale(&agent, &format!("http://127.0.0.1:{port}")).unwrap();
+        assert_eq!(issued.access_token, "test-minted");
+        let captured = handle.join().unwrap();
+        assert!(captured[0].contains("POST /v1/auth/tailscale/token"));
+    }
+
+    #[test]
+    fn mint_tailscale_surfaces_a_rejection() {
+        let (port, handle) = serve_responses(vec![(403, r#"{"error":"not allowlisted"}"#.to_string())]);
+        let agent = http_agent();
+        let err = mint_tailscale(&agent, &format!("http://127.0.0.1:{port}"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("HTTP 403"), "{err}");
+        handle.join().unwrap();
+    }
+
+    // ── device-authorization grant ──
+
+    #[test]
+    fn device_flow_rejects_a_failed_start() {
+        let (port, handle) = serve_responses(vec![(500, "boom".to_string())]);
+        let agent = http_agent();
+        let err = run_device_flow(&agent, &format!("http://127.0.0.1:{port}"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("device/start failed (HTTP 500)"), "{err}");
+        let captured = handle.join().unwrap();
+        assert!(captured[0].contains("POST /v1/auth/device/start"));
+    }
+
+    #[test]
+    fn device_flow_requires_a_device_code() {
+        let (port, handle) = serve_responses(vec![(200, r#"{"user_code":"ABCD-EFGH"}"#.to_string())]);
+        let agent = http_agent();
+        let err = run_device_flow(&agent, &format!("http://127.0.0.1:{port}"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing device_code"), "{err}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn device_flow_rejects_a_non_json_start_body() {
+        let (port, handle) = serve_responses(vec![(200, "<html/>".to_string())]);
+        let agent = http_agent();
+        assert!(run_device_flow(&agent, &format!("http://127.0.0.1:{port}")).is_err());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn device_flow_stops_at_the_expiry_deadline() {
+        // `expires_in: 0` puts the deadline in the past, so the flow must abort
+        // before its first poll rather than loop forever.
+        let (port, handle) = serve_responses(vec![(200, r#"{"device_code":"dc","expires_in":0}"#.to_string())]);
+        let agent = http_agent();
+        let err = run_device_flow(&agent, &format!("http://127.0.0.1:{port}"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("timed out before approval"), "{err}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn device_flow_surfaces_each_poll_error_code() {
+        for (body, needle) in [
+            (r#"{"error":"access_denied"}"#, "denied by the approver"),
+            (r#"{"error":"expired_token"}"#, "device code expired"),
+            (r#"{"error":"unknown_thing"}"#, "device/token error: unknown_thing"),
+            ("<html/>", "device/token error (HTTP 400)"),
+        ] {
+            let (port, handle) = serve_responses(vec![
+                (200, r#"{"device_code":"dc","interval":1,"expires_in":600}"#.to_string()),
+                (400, body.to_string()),
+            ]);
+            let agent = http_agent();
+            let err = run_device_flow(&agent, &format!("http://127.0.0.1:{port}"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "body {body} → {err}");
+            let captured = handle.join().unwrap();
+            assert!(captured[1].contains("POST /v1/auth/device/token"));
+            assert!(captured[1].contains("dc"));
+        }
+    }
+
+    #[test]
+    fn device_flow_backs_off_on_slow_down() {
+        // `slow_down` must widen the poll interval rather than abort. With a 1 s
+        // budget the next loop iteration hits the deadline, so the observable
+        // outcome is the timeout — proving the back-off arm did not error out.
+        let (port, _handle) = serve_responses(vec![
+            (200, r#"{"device_code":"dc","interval":1,"expires_in":1}"#.to_string()),
+            (400, r#"{"error":"slow_down"}"#.to_string()),
+        ]);
+        let agent = http_agent();
+        let err = run_device_flow(&agent, &format!("http://127.0.0.1:{port}"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("timed out before approval"), "{err}");
+    }
+
+    // ── credential construction per rail ──
+
+    #[test]
+    fn build_credential_loopback_never_persists_a_token() {
+        // Even when a static token is available, the loopback rail must store no
+        // credential — otherwise a token leaks into an auth=off store.
+        let agent = http_agent();
+        let (cred, bearer) = build_credential(
+            &agent,
+            Rail::Loopback,
+            "http://127.0.0.1:14800",
+            "http://127.0.0.1:14801/mcp",
+            Some("test-static-token".to_string()),
+        )
+        .unwrap();
+        assert_eq!(cred.rail, "loopback");
+        assert!(cred.access_token.is_none());
+        assert!(cred.expiry.is_none());
+        assert!(bearer.is_none());
+    }
+
+    #[test]
+    fn build_credential_static_token_stores_the_token_without_expiry() {
+        let agent = http_agent();
+        let (cred, bearer) = build_credential(
+            &agent,
+            Rail::StaticToken,
+            "http://h:14800",
+            "http://h:14801/mcp",
+            Some("test-static-token".to_string()),
+        )
+        .unwrap();
+        assert_eq!(cred.rail, "static_token");
+        assert_eq!(cred.access_token.as_deref(), Some("test-static-token"));
+        assert!(cred.expiry.is_none(), "a static named token must not carry an expiry");
+        assert_eq!(bearer.as_deref(), Some("test-static-token"));
+    }
+
+    #[test]
+    fn build_credential_tailscale_mints_and_dates_the_token() {
+        let (port, handle) = serve_responses(vec![(
+            200,
+            r#"{"access_token":"test-minted","expires_in":600,"scopes":["facts:read"],"tenant_id":"t"}"#.to_string(),
+        )]);
+        let base = format!("http://127.0.0.1:{port}");
+        let agent = http_agent();
+        let (cred, bearer) = build_credential(&agent, Rail::Tailscale, &base, "http://h:14801/mcp", None).unwrap();
+        assert_eq!(cred.rail, "tailscale");
+        assert_eq!(bearer.as_deref(), Some("test-minted"));
+        assert!(cred.refresh_token.is_none(), "tailnet rail re-mints, never refreshes");
+        assert!(cred.expiry.unwrap() > now_unix() + 500);
+        assert_eq!(cred.scopes, vec!["facts:read"]);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn build_credential_propagates_a_mint_failure() {
+        let (port, handle) = serve_responses(vec![(500, "boom".to_string())]);
+        let agent = http_agent();
+        let base = format!("http://127.0.0.1:{port}");
+        assert!(build_credential(&agent, Rail::Tailscale, &base, "http://h:14801/mcp", None).is_err());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn build_credential_device_keeps_the_refresh_credential() {
+        let (port, handle) = serve_responses(vec![
+            (200, r#"{"device_code":"dc","interval":1,"expires_in":600}"#.to_string()),
+            (
+                200,
+                r#"{"access_token":"test-jwt","refresh_token":"test-refresh","expires_in":300,"scopes":["facts:read"]}"#
+                    .to_string(),
+            ),
+        ]);
+        let base = format!("http://127.0.0.1:{port}");
+        let agent = http_agent();
+        let (cred, bearer) = build_credential(&agent, Rail::Device, &base, "http://h:14801/mcp", None).unwrap();
+        assert_eq!(cred.rail, "device");
+        assert_eq!(bearer.as_deref(), Some("test-jwt"));
+        assert_eq!(cred.refresh_token.as_deref(), Some("test-refresh"));
+        assert!(cred.expiry.unwrap() > now_unix() + 200);
+        handle.join().unwrap();
+    }
+
+    // ── refresh ──
+
+    #[test]
+    fn refresh_is_skipped_when_the_token_is_not_near_expiry() {
+        let agent = http_agent();
+        let mut cred = test_cred("device", "http://127.0.0.1:1");
+        assert!(refresh_credential(&agent, &cred).unwrap().is_none(), "no expiry");
+        cred.expiry = Some(now_unix() + 3600);
+        assert!(refresh_credential(&agent, &cred).unwrap().is_none(), "far from expiry");
+    }
+
+    #[test]
+    fn refresh_is_a_no_op_for_rails_without_a_refresh_path() {
+        // Static tokens and loopback have nothing to refresh; a device credential
+        // that lost its refresh token must degrade quietly, not hit the network.
+        let agent = http_agent();
+        for rail in ["static_token", "loopback", "device"] {
+            let mut cred = test_cred(rail, "http://127.0.0.1:1");
+            cred.expiry = Some(now_unix() + 5); // inside the 60 s safety lead
+            assert!(refresh_credential(&agent, &cred).unwrap().is_none(), "{rail}");
+        }
+    }
+
+    #[test]
+    fn refresh_uses_the_safety_lead_before_the_token_actually_expires() {
+        // A token expiring in 30 s is refreshed now, so an in-flight request can
+        // never race the expiry.
+        let (port, handle) = serve_responses(vec![(
+            200,
+            r#"{"access_token":"test-new","expires_in":900,"scopes":["facts:read"]}"#.to_string(),
+        )]);
+        let base = format!("http://127.0.0.1:{port}");
+        let mut cred = test_cred("device", &base);
+        cred.access_token = Some("test-old".to_string());
+        cred.refresh_token = Some("test-refresh-1".to_string());
+        cred.scopes = vec!["stale:scope".to_string()];
+        cred.expiry = Some(now_unix() + 30);
+        let agent = http_agent();
+        let updated = refresh_credential(&agent, &cred).unwrap().unwrap();
+        assert_eq!(updated.access_token.as_deref(), Some("test-new"));
+        assert_eq!(
+            updated.refresh_token.as_deref(),
+            Some("test-refresh-1"),
+            "a response without a new refresh token must keep the old one"
+        );
+        assert_eq!(updated.scopes, vec!["facts:read"]);
+        assert!(updated.expiry.unwrap() > now_unix() + 800);
+        let captured = handle.join().unwrap();
+        assert!(captured[0].contains("POST /v1/auth/device/refresh"));
+        assert!(captured[0].contains("test-refresh-1"));
+    }
+
+    #[test]
+    fn refresh_keeps_existing_scopes_when_the_daemon_returns_none() {
+        let (port, handle) = serve_responses(vec![(200, r#"{"access_token":"test-new"}"#.to_string())]);
+        let base = format!("http://127.0.0.1:{port}");
+        let mut cred = test_cred("device", &base);
+        cred.refresh_token = Some("test-refresh-1".to_string());
+        cred.scopes = vec!["facts:read".to_string()];
+        cred.expiry = Some(now_unix());
+        let agent = http_agent();
+        let updated = refresh_credential(&agent, &cred).unwrap().unwrap();
+        assert_eq!(updated.scopes, vec!["facts:read"]);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn refresh_surfaces_a_rejected_refresh_token() {
+        // A revoked refresh credential must be an error, not a silent fallthrough
+        // to the stale (expired) access token.
+        let (port, handle) = serve_responses(vec![(401, r#"{"error":"revoked"}"#.to_string())]);
+        let base = format!("http://127.0.0.1:{port}");
+        let mut cred = test_cred("device", &base);
+        cred.refresh_token = Some("test-refresh-1".to_string());
+        cred.expiry = Some(now_unix());
+        let agent = http_agent();
+        let err = refresh_credential(&agent, &cred).unwrap_err().to_string();
+        assert!(err.contains("device refresh failed (HTTP 401)"), "{err}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn refresh_re_mints_the_tailnet_rail() {
+        let (port, handle) = serve_responses(vec![(
+            200,
+            r#"{"access_token":"test-reminted","expires_in":600}"#.to_string(),
+        )]);
+        let base = format!("http://127.0.0.1:{port}");
+        let mut cred = test_cred("tailscale", &base);
+        cred.expiry = Some(now_unix());
+        let agent = http_agent();
+        let updated = refresh_credential(&agent, &cred).unwrap().unwrap();
+        assert_eq!(updated.access_token.as_deref(), Some("test-reminted"));
+        let captured = handle.join().unwrap();
+        assert!(captured[0].contains("POST /v1/auth/tailscale/token"));
+    }
+
+    // ── HOME-dependent CLI entry points (process-global env → serial) ──
+
+    #[test]
+    #[serial_test::serial]
+    fn every_entry_point_fails_clearly_without_home() {
+        let previous = std::env::var_os("HOME");
+        std::env::remove_var("HOME");
+        assert!(config_dir().is_none());
+        assert!(configured_endpoint().is_none());
+        assert!(run(LoginArgs::default()).is_err());
+        assert!(run_logout(LogoutArgs::default()).is_err());
+        assert!(run_whoami(WhoamiArgs::default()).is_err());
+        assert!(resolve_fresh_bearer("http://127.0.0.1:14800").is_err());
+        assert!(save_endpoint("http://127.0.0.1:14800").is_err());
+        if let Some(home) = previous {
+            std::env::set_var("HOME", home);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn save_endpoint_rejects_an_empty_url() {
+        let _home = temp_home();
+        assert!(save_endpoint("   ").is_err());
+        assert!(configured_endpoint().is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn configured_endpoint_is_none_without_the_key() {
+        let _home = temp_home();
+        let cfg = config_dir().unwrap();
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(env_path(&cfg), "CRUX_AGENT_TOKEN=test-token\n").unwrap();
+        assert!(configured_endpoint().is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn login_loopback_rail_stores_no_token_and_registers_the_endpoint() {
+        let _home = temp_home();
+        let (port, handle) = serve_responses(vec![
+            (200, "{}".to_string()),                     // /readyz
+            (200, r#"{"version":"9.9.9"}"#.to_string()), // /v1/version
+            (200, "{}".to_string()),                     // posture → auth=off
+            (404, "{}".to_string()),                     // whoami → rail disabled
+        ]);
+        let base = format!("http://127.0.0.1:{port}");
+        run(LoginArgs {
+            url: Some(base.clone()),
+            no_verify: true,
+            strict_verify: false,
+            no_hooks: true,
+            no_register: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let captured = handle.join().unwrap();
+        assert!(captured[0].contains("GET /readyz"));
+        assert!(captured[2].contains("GET /v1/projections/entity/count"));
+        assert!(
+            !captured[2].to_ascii_lowercase().contains("authorization:"),
+            "posture must be probed unauthenticated"
+        );
+
+        let cred = read_store().daemons.remove(&base).expect("credential stored");
+        assert_eq!(cred.rail, "loopback");
+        assert!(cred.access_token.is_none());
+        assert_eq!(cred.mcp_url, format!("http://127.0.0.1:{MCP_PORT}/mcp"));
+
+        let env = parse_env_file(&std::fs::read_to_string(env_path(&config_dir().unwrap())).unwrap());
+        assert_eq!(env.get("CRUX_HTTP_URL").map(String::as_str), Some(base.as_str()));
+        assert!(
+            !env.contains_key("CRUX_AGENT_TOKEN"),
+            "the loopback rail has no token to register"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn login_static_token_rail_trims_the_token_and_registers_it_for_mcp() {
+        let _home = temp_home();
+        let (port, handle) = serve_responses(vec![
+            (200, "{}".to_string()),
+            (200, r#"{"version":"1.0.0"}"#.to_string()),
+            (401, "{}".to_string()), // posture → credential required
+            (404, "{}".to_string()), // whoami → rail disabled
+        ]);
+        let base = format!("http://127.0.0.1:{port}");
+        run(LoginArgs {
+            url: Some(base.clone()),
+            token: Some("  test-static-token  ".to_string()),
+            no_verify: true,
+            strict_verify: false,
+            no_hooks: true,
+            no_register: true,
+            ..Default::default()
+        })
+        .unwrap();
+        handle.join().unwrap();
+
+        let cred = read_store().daemons.remove(&base).expect("credential stored");
+        assert_eq!(cred.rail, "static_token");
+        assert_eq!(cred.access_token.as_deref(), Some("test-static-token"));
+
+        let env = parse_env_file(&std::fs::read_to_string(env_path(&config_dir().unwrap())).unwrap());
+        assert_eq!(
+            env.get("CRUX_AGENT_TOKEN").map(String::as_str),
+            Some("test-static-token")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn login_tailnet_rail_does_not_overwrite_the_mcp_agent_token() {
+        // Regression: the tailnet/device rails issue *HTTP* JWTs. Writing one to
+        // CRUX_AGENT_TOKEN would clobber the separate MCP agent token and break
+        // every MCP client on the machine.
+        let _home = temp_home();
+        let cfg = config_dir().unwrap();
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(env_path(&cfg), "CRUX_AGENT_TOKEN=test-preexisting-mcp-token\n").unwrap();
+
+        let (port, handle) = serve_responses(vec![
+            (200, "{}".to_string()),
+            (200, r#"{"version":"1.2.3"}"#.to_string()),
+            (401, "{}".to_string()),
+            (
+                200,
+                r#"{"trusted":true,"login":"user@example.com","allowlisted":true}"#.to_string(),
+            ),
+            (
+                200,
+                r#"{"access_token":"test-minted-jwt","expires_in":600,"scopes":["facts:read"],"tenant_id":"t"}"#
+                    .to_string(),
+            ),
+        ]);
+        let base = format!("http://127.0.0.1:{port}");
+        run(LoginArgs {
+            url: Some(base.clone()),
+            no_verify: true,
+            strict_verify: false,
+            no_hooks: true,
+            no_register: true,
+            ..Default::default()
+        })
+        .unwrap();
+        handle.join().unwrap();
+
+        let cred = read_store().daemons.remove(&base).expect("credential stored");
+        assert_eq!(cred.rail, "tailscale");
+        assert_eq!(cred.access_token.as_deref(), Some("test-minted-jwt"));
+        assert!(cred.expiry.is_some());
+
+        let env = parse_env_file(&std::fs::read_to_string(env_path(&cfg)).unwrap());
+        assert_eq!(
+            env.get("CRUX_AGENT_TOKEN").map(String::as_str),
+            Some("test-preexisting-mcp-token"),
+            "an HTTP JWT must never be written over the MCP agent token"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn login_refuses_when_auth_is_required_and_no_rail_is_available() {
+        // The refusal must happen *before* anything is written to disk.
+        let _home = temp_home();
+        let (port, handle) = serve_responses(vec![
+            (200, "{}".to_string()),
+            (200, r#"{"version":"1.0.0"}"#.to_string()),
+            (401, "{}".to_string()),
+            (404, "{}".to_string()),
+        ]);
+        let base = format!("http://127.0.0.1:{port}");
+        let err = run(LoginArgs {
+            url: Some(base),
+            no_verify: true,
+            strict_verify: false,
+            no_hooks: true,
+            no_register: true,
+            ..Default::default()
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--token"), "{err}");
+        handle.join().unwrap();
+        assert!(read_store().daemons.is_empty(), "a failed login must store nothing");
+        assert!(!env_path(&config_dir().unwrap()).exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn whoami_reports_the_empty_store_and_every_credential_shape() {
+        let _home = temp_home();
+        run_whoami(WhoamiArgs::default()).unwrap();
+
+        let mut store = CredentialStore::default();
+        let mut expired = test_cred("device", "http://a.test:14800");
+        expired.access_token = Some("test-jwt".to_string());
+        expired.expiry = Some(now_unix().saturating_sub(60));
+        expired.scopes = vec!["facts:read".to_string()];
+        store.upsert("http://a.test:14800", expired);
+        let mut live = test_cred("tailscale", "http://b.test:14800");
+        live.access_token = Some("test-jwt".to_string());
+        live.expiry = Some(now_unix() + 600);
+        store.upsert("http://b.test:14800", live);
+        store.upsert("http://c.test:14800", test_cred("loopback", "http://c.test:14800"));
+        save_store(&credentials_path(&config_dir().unwrap()), &store).unwrap();
+
+        run_whoami(WhoamiArgs::default()).unwrap();
+        run_whoami(WhoamiArgs {
+            url: Some("b.test:14800".to_string()),
+        })
+        .unwrap();
+        assert!(run_whoami(WhoamiArgs {
+            url: Some("http://[oops".to_string()),
+        })
+        .is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn logout_requires_a_target() {
+        let _home = temp_home();
+        let err = run_logout(LogoutArgs::default()).unwrap_err().to_string();
+        assert!(err.contains("--url"), "{err}");
+        // `--all` against an empty store is a no-op, not an error.
+        run_logout(LogoutArgs {
+            all: true,
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn logout_of_an_unknown_daemon_is_not_an_error() {
+        let _home = temp_home();
+        write_store("http://a.test:14800", test_cred("loopback", "http://a.test:14800"));
+        run_logout(LogoutArgs {
+            url: Some("http://b.test:14800".to_string()),
+            all: false,
+        })
+        .unwrap();
+        assert_eq!(read_store().daemons.len(), 1, "an unrelated credential must survive");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn logout_revokes_the_device_refresh_credential_then_clears_it() {
+        let _home = temp_home();
+        let (port, handle) = serve_responses(vec![(200, "{}".to_string())]);
+        let base = format!("http://127.0.0.1:{port}");
+        let mut cred = test_cred("device", &base);
+        cred.access_token = Some("test-jwt".to_string());
+        cred.refresh_token = Some("test-refresh-1".to_string());
+        write_store(&base, cred);
+
+        run_logout(LogoutArgs {
+            url: Some(base.clone()),
+            all: false,
+        })
+        .unwrap();
+        let captured = handle.join().unwrap();
+        assert!(captured[0].contains("POST /v1/auth/device/revoke"));
+        assert!(captured[0].contains("test-refresh-1"));
+        assert!(read_store().daemons.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn logout_clears_locally_even_when_revocation_fails() {
+        // Regression: an unreachable or rejecting daemon must not strand a device
+        // credential on disk — `logout` is a local guarantee.
+        let _home = temp_home();
+        let (port, handle) = serve_responses(vec![(500, "boom".to_string())]);
+        let rejecting = format!("http://127.0.0.1:{port}");
+        let unreachable = format!("http://127.0.0.1:{}", closed_port());
+
+        let mut store = CredentialStore::default();
+        for url in [&rejecting, &unreachable] {
+            let mut cred = test_cred("device", url);
+            cred.refresh_token = Some("test-refresh-1".to_string());
+            store.upsert(url, cred);
+        }
+        save_store(&credentials_path(&config_dir().unwrap()), &store).unwrap();
+
+        run_logout(LogoutArgs { url: None, all: true }).unwrap();
+        handle.join().unwrap();
+        assert!(read_store().daemons.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_fresh_bearer_is_none_without_a_stored_credential() {
+        let _home = temp_home();
+        assert!(resolve_fresh_bearer("http://127.0.0.1:14800").unwrap().is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_fresh_bearer_normalizes_the_lookup_key() {
+        // The store is keyed by normalised URL; a bare `host:port` from a caller
+        // must still find the credential rather than silently return `None`.
+        let _home = temp_home();
+        let mut cred = test_cred("static_token", "http://a.test:14800");
+        cred.access_token = Some("test-static-token".to_string());
+        write_store("http://a.test:14800", cred);
+        assert_eq!(
+            resolve_fresh_bearer("a.test:14800/").unwrap().as_deref(),
+            Some("test-static-token")
+        );
+        assert!(resolve_fresh_bearer("http://[oops").is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_fresh_bearer_refreshes_and_persists_an_expiring_token() {
+        let _home = temp_home();
+        let (port, handle) = serve_responses(vec![(
+            200,
+            r#"{"access_token":"test-refreshed","refresh_token":"test-refresh-2","expires_in":900,"scopes":["facts:read"]}"#
+                .to_string(),
+        )]);
+        let base = format!("http://127.0.0.1:{port}");
+        let mut cred = test_cred("device", &base);
+        cred.access_token = Some("test-stale".to_string());
+        cred.refresh_token = Some("test-refresh-1".to_string());
+        cred.expiry = Some(now_unix() + 10);
+        write_store(&base, cred);
+
+        let bearer = resolve_fresh_bearer(&base).unwrap();
+        assert_eq!(bearer.as_deref(), Some("test-refreshed"));
+        handle.join().unwrap();
+
+        // The rotated refresh credential must be written back, or the next
+        // refresh would replay a token the daemon has already rotated away.
+        let stored = read_store().daemons.remove(&base).unwrap();
+        assert_eq!(stored.access_token.as_deref(), Some("test-refreshed"));
+        assert_eq!(stored.refresh_token.as_deref(), Some("test-refresh-2"));
+        assert!(stored.expiry.unwrap() > now_unix() + 800);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_fresh_bearer_surfaces_a_corrupt_store() {
+        let _home = temp_home();
+        let cfg = config_dir().unwrap();
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(credentials_path(&cfg), "{ not json").unwrap();
+        assert!(resolve_fresh_bearer("http://127.0.0.1:14800").is_err());
     }
 }

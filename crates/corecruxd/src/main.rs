@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 // The daemon must never panic on untrusted input. Escalate workspace-level
 // warn lints to deny for the corecruxd binary. Individual call sites may
@@ -26,8 +26,11 @@
 
 mod activity;
 mod agentgraph_kinds;
+mod attention;
 mod auth;
+mod code_intel;
 mod codegraph_fusion;
+mod companion_attestation;
 mod config;
 mod console_index;
 mod consolidation_scheduler;
@@ -38,16 +41,26 @@ mod cost_attribution;
 // Default-off, append-only comped-wallet meter shared by the explicit spend
 // rail and metered capability paths.
 #[allow(dead_code)]
-mod credit_meter;
+// Extracted to the `corecrux-billing` crate; aliased so existing
+// `crate::credit_meter::…` call sites compile unchanged. The fail-closed
+// response to a poisoned meter lock stays in `http/credit_meter.rs` — the
+// ledger crate holds state, the handler owns the policy.
+use corecrux_billing::credit_meter;
+mod enrich_budget;
 // Dataplane store stubs: proprietary edition provides the real implementation.
 #[allow(dead_code)]
 mod dataplane_store;
+mod entitlement;
+mod pairing;
 // gRPC service stubs: dataplane-enabled distributions implement full RPCs;
 // Crux Daemon keeps the server skeleton. Suppress dead_code for stub internals.
 #[allow(dead_code)]
 mod grpc;
+mod hosted_token;
 mod http;
 mod local_ingest;
+mod relay_client;
+mod relay_device;
 // Candidate proposers are staged behind the identity-candidates rollout path; tests
 // exercise creation/proposal before daemon startup wires automatic proposer runs.
 #[allow(dead_code)]
@@ -55,17 +68,26 @@ mod candidate_links;
 mod candidate_store;
 mod context_graph;
 mod dossier;
-mod encrypted_secrets;
+// Extracted to the `corecrux-secrets` leaf crate; aliased so existing
+// `crate::encrypted_secrets::…` call sites (7 of them, incl. wasm_host and
+// http/extensions) compile unchanged.
+use corecrux_secrets as encrypted_secrets;
 mod ephemeral_gc;
+// Git-backed ExecPlan projection root: clone + fast-forward only, so the
+// replica can never hold state git does not already have.
+mod execplan_git;
 mod extension_grants;
 mod extension_outbound;
 mod extension_registry;
 mod fact_helpers;
 mod fact_privacy;
 mod identity_links;
-mod integrations_github;
-mod integrations_github_sync;
-mod integrations_openai;
+// Extracted to the `corecrux-providers` crate (provider credentials + GitHub
+// sync); aliased so existing `crate::integrations_*::…` call sites in
+// http/integrations_{github,openai}.rs compile unchanged.
+use corecrux_providers::github as integrations_github;
+use corecrux_providers::github_sync as integrations_github_sync;
+use corecrux_providers::openai as integrations_openai;
 mod mcp_stdio;
 mod memory_extract;
 pub mod mint_requests;
@@ -90,6 +112,8 @@ mod projects;
 mod protocol_posture;
 mod redaction;
 mod relations;
+mod repo_aggregate;
+mod repo_allowance;
 mod repo_codegraph;
 mod repo_registry;
 mod repo_watch;
@@ -99,11 +123,15 @@ mod shard_map;
 mod status_feed;
 mod storybook;
 mod structured_log;
+mod symbol_resolve;
+mod sync_scheduler;
 mod tenant_metadata;
 #[cfg(test)]
 mod test_support;
+mod trace_store;
 mod update;
 mod usage_submit;
+mod vault_watcher;
 #[cfg(feature = "wasm-extensions")]
 mod wasm_dispatcher;
 #[cfg(feature = "wasm-extensions")]
@@ -113,10 +141,16 @@ mod witness_proofs;
 mod witness_submit;
 mod work;
 mod work_execplans;
-mod workspace_scan;
-mod workspace_scan_ast;
-mod workspace_scan_manifests;
-mod workspace_scan_polyglot;
+mod work_graph;
+// Extracted to the `corecrux-workspace-scan` crate; aliased so the 16 consumer
+// modules here (http/repos, http/workspace, code_intel, repo_codegraph,
+// symbol_resolve, dossier, …) keep their existing `crate::workspace_scan*::`
+// paths. Module names kept their prefix inside the new crate so the ~15k lines
+// of intra-group paths needed no rewriting.
+use corecrux_workspace_scan::workspace_scan;
+use corecrux_workspace_scan::workspace_scan_ast;
+use corecrux_workspace_scan::workspace_scan_manifests;
+use corecrux_workspace_scan::workspace_scan_polyglot;
 
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
@@ -130,7 +164,7 @@ use fs2::{available_space, total_space, FileExt};
 use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use corecrux_types::{
     BuildInfo, CapacityThresholdBreachedV1, CompatContract, ControlCheckpointMaterializedV1, ControlStateMutationV1,
@@ -258,7 +292,8 @@ The only recognised flags are:\n\
   mcp-stdio        run the bundled stdio\u{21c4}HTTP MCP bridge (not the daemon);\n\
                    env: CRUX_MCP_URL (default http://127.0.0.1:14801/mcp),\n\
                    CRUX_AGENT_TOKEN (optional bearer)\n\
-  self update      download, verify (sha256) and install the latest release;\n\
+  self update      update a standalone daemon binary; packaged installs use\n\
+                   their installer/package manager to keep companions aligned;\n\
                    append --check to only report whether a newer one exists\n",
         line = version_line()
     )
@@ -336,10 +371,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         replication_auth_bearer_configured(),
     )
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let mcp_auth_configured =
+        crux_mcp::agent::mcp_authentication_configured(&mcp_agent_registry, crux_mcp::oauth::introspection_enabled());
     validate_mcp_bind_posture(
         config.mcp_enabled,
         config.mcp_addr,
-        mcp_agent_registry.is_empty(),
+        mcp_auth_configured,
         insecure_dev_auth_bind_allowed(),
     )
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -519,7 +556,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         |hash| rcx_passport_key.sign_hash(hash),
     );
     let rcx_token_hash = rcx_token.token_hash_hex();
-    let rcx_router = Arc::new(crux_router::RcxRouter::new(rcx_token));
+    let rcx_router = Arc::new(crux_router::RcxRouter::new_with_trusted_issuer_pubkey(
+        rcx_token,
+        rcx_passport_key.verifying_key_bytes(),
+    ));
     info!(
         passport_fpr = %rcx_passport_key.passport_fpr(),
         public_key_hex = %rcx_passport_key.public_key_hex(),
@@ -648,6 +688,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         corecrux_memory::FactStore::new()
     }));
+
+    // Cost-report persistence (console-surfaces-remediation M5): replay any
+    // journalled `/v1/cost/report` posts into the in-memory cost store so cost
+    // attribution (cx-cost page + per-ExecPlan token_burn) survives a restart.
+    // No-op unless CORECRUXD_FEATURE_COST_LENS is enabled.
+    crate::cost::init_persistence(&config.data_dir).await;
     let projection_state = {
         let mut ps = corecrux_projections::ProjectionState::default();
         match crate::relations::load_into_state(&config.data_dir, &mut ps) {
@@ -680,6 +726,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         data_dir: config.data_dir.clone(),
         sync_mutual_auth: config.sync_mutual_auth,
         sync_peer_trust_root: config.sync_peer_trust_root.clone(),
+        sync_delegation_enforce: config.sync_delegation_enforce,
         sync_handshake_nonces: Arc::new(std::sync::Mutex::new(crux_sync::peer_handshake::NonceCache::new(
             SYNC_HANDSHAKE_NONCE_TTL_SECONDS,
         ))),
@@ -701,6 +748,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         consolidation_scheduler_enabled: config.consolidation_scheduler_enabled,
         coord_presence_ttl_secs: config.coord_presence_ttl_secs,
         context_surface_enabled: config.context_surface_enabled,
+        tenant_erasure_enabled: config.tenant_erasure_enabled,
         auto_capture_enabled: config.auto_capture_enabled,
         local_ingest_enabled: config.local_ingest_enabled,
         compute_provider_enabled: config.compute_provider_enabled,
@@ -720,6 +768,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         quota_hosted_surfaces: Arc::new(config.quota_hosted_surfaces.clone()),
         quota_ledger: Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
         credit_meter,
+        enrich_budgets: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
         openai_shim_enabled: config.openai_shim_enabled,
         memory_import_enabled: config.memory_import_enabled,
         identity_links_enabled: config.identity_links_enabled,
@@ -730,6 +779,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         operating_mode: config.operating_mode,
         enabled_pro_services: config.enabled_pro_services.clone(),
         read_retry_failed_readyz_threshold: config.read_retry_failed_readyz_threshold,
+        seal_failed_readyz_threshold: config.seal_failed_readyz_threshold,
+        seal_failed_streak: Arc::new(RwLock::new((0, None))),
         commit_level: config.commit_level,
         metrics: metrics.clone(),
         node_id: node_id.clone(),
@@ -760,6 +811,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         retention_days: config.retention_days,
         retrieval_index: {
             let mut idx = corecrux_retrieval::IndexManager::new();
+            // Companion provenance must be installed BEFORE the first scan: it
+            // governs what those segments are permitted to serve, and a scan
+            // that ran without it has already decided.
+            let attestation_mode = crate::companion_attestation::install_policy(&mut idx, &config.data_dir);
             // Load-at-startup wiring: reload sealed `.ccxi` companions when the
             // storage layer builds them (`build_ccxi`) OR when the local
             // prose-ingest door is enabled — otherwise local-ingest segments
@@ -779,6 +834,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }
                 tracing::info!(total, "ccxi-indexes-loaded-at-startup");
+                // Surface 1 of 4: a per-segment WARN is not enough on its own,
+                // because a long boot scrolls. One ERROR-level summary names the
+                // count so an operator sees it without reading every line.
+                crate::companion_attestation::log_startup_summary(&idx, attestation_mode);
+            }
+            // Load-at-startup wiring for the tenant erasure mask: without it a
+            // restart would silently re-serve a corpus the operator erased.
+            // Loaded unconditionally — a mask must outlive the flag that made it.
+            let forgotten_path = config
+                .data_dir
+                .join(corecrux_retrieval::index_manager::FORGOTTEN_TENANTS_FILE);
+            // An unreadable mask fails the boot rather than degrading to
+            // "serve it anyway": the whole point of the mask is that erased
+            // documents stay unreachable.
+            let forgotten = idx.load_forgotten(&forgotten_path).map_err(|err| {
+                std::io::Error::other(format!(
+                    "tenant erasure mask at {} is unreadable ({err}); refusing to serve a corpus that may include erased documents",
+                    forgotten_path.display()
+                ))
+            })?;
+            if forgotten > 0 {
+                tracing::info!(forgotten_tenants = forgotten, "tenant-erasure-mask-loaded");
             }
             Arc::new(RwLock::new(idx))
         },
@@ -856,6 +933,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Wire the shared event bus into both stores so mutations emit SSE events.
     state.fact_store.write().await.set_event_bus(state.event_bus.clone());
     state.session_store.write().await.set_event_bus(state.event_bus.clone());
+
+    // Load-at-startup: rehydrate paired-device refresh credentials, so a daemon
+    // restart no longer silently unpairs every device (ExecPlan
+    // crux-hosted-relay-gateway-2026-07-30, M1).
+    crate::http::auth_device::hydrate_refresh_credentials(&state).await;
+
+    // Load-at-startup: the externally-minted hosted token, if the operator
+    // configured one (M4a). Held to one side and NOT given to `rcx_router` — a
+    // delegation-bearing token makes `requires_contextual_verification()` true,
+    // and the router then refuses every capability on it. M4b's relay client is
+    // the consumer.
+    // The verified grant is intentionally not retained yet: M4b's relay client
+    // is the first consumer and will own the storage. Loading here still earns
+    // its keep — an operator sees at boot whether the grant is usable, rather
+    // than discovering it at the first connect attempt.
+    //
+    // M1 extends that: the device identity is surfaced (the operator needs the
+    // fingerprint to register the device) and, when a relay grant is present,
+    // the delegation envelope is minted once as a **boot-time rehearsal**. It is
+    // dropped rather than kept — M4b owns the storage — but minting it here
+    // means a daemon that cannot produce a valid envelope says so at boot,
+    // beside the grant it belongs to, instead of failing at the first connect.
+    {
+        let now_seconds = now_unix_ms() / 1000;
+        let hosted = crate::hosted_token::load_from_env(now_seconds);
+        let device = crate::relay_device::DeviceIdentity::derive(&rcx_passport_key);
+        info!(
+            device_fpr = %device.fpr(),
+            "relay device identity derived; register this fingerprint to pair this daemon"
+        );
+        if let Some(hosted) = hosted.as_ref() {
+            if hosted.relay.is_some() {
+                match crate::relay_device::attenuate_for_relay(
+                    hosted,
+                    &rcx_passport_key,
+                    &device,
+                    "boot-rehearsal",
+                    now_seconds,
+                    crate::relay_device::DEFAULT_ENVELOPE_TTL_SECONDS,
+                ) {
+                    Ok(_) => info!(
+                        device_fpr = %device.fpr(),
+                        "relay delegation envelope mints cleanly"
+                    ),
+                    // Not fatal: the daemon serves local capability with or
+                    // without a relay. Warn loudly and carry on, rather than
+                    // refusing to boot over a hosted feature.
+                    Err(error) => warn!(
+                        device_fpr = %device.fpr(),
+                        %error,
+                        "relay grant present but the delegation envelope cannot be minted; \
+                         the relay session will not establish until this is resolved"
+                    ),
+                }
+            }
+        }
+    }
     {
         let mut store = state.fact_store.write().await;
         match crate::repo_registry::fail_incomplete_scans(
@@ -1055,6 +1189,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         state.clone(),
         shutdown_tx.subscribe(),
     );
+    // ExecPlan projection root, git-backed. A boot refresh runs first so the
+    // board is current before the first request rather than up to one interval
+    // stale; the periodic task then keeps it so. Both are no-ops unless
+    // CRUX_EXECPLANS_GIT_REMOTE is set, which keeps plain-directory deployments
+    // byte-identical. A failed refresh is logged and never fatal — the daemon
+    // serves whatever the replica already holds.
+    if let Some((root, outcome)) = execplan_git::refresh_from_env() {
+        match outcome.error {
+            Some(err) => tracing::warn!(root = %root.display(), error = %err, "execplan-git-boot-refresh-failed"),
+            None => tracing::info!(
+                root = %root.display(), action = %outcome.action, head = ?outcome.head_sha,
+                "execplan-git-boot-refresh"
+            ),
+        }
+    }
+    execplan_git::spawn_refresh_task();
     // Consolidation review scheduler (Audit II M4). Gated at spawn by
     // CORECRUXD_CONSOLIDATION_SCHEDULER (default OFF); interval config-driven.
     // Detect+surface only: each tick runs the read-only contradiction pass and
@@ -1074,6 +1224,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // handlers route inline (immediate); this sweep is the catch-all so a flag
     // from a non-HTTP path never sits unrouted. Gated: with dedup off, no flags
     // are ever produced, so the task is not spawned.
+    // Runtime trace flusher (ExecPlan crux-runtime-codemap M4). Drains the M2
+    // ring, resolves each span to a stable symbol_id, and appends JSONL. Spawned
+    // only when BOTH capture and persistence are on — capture alone is a valid
+    // configuration for live inspection with nothing written to disk.
+    if crate::trace_store::persist_enabled() {
+        if let Some(ring) = crate::trace_span_ring() {
+            let ring = std::sync::Arc::clone(ring);
+            let fact_store = state.fact_store.clone();
+            let path = config.data_dir.join("traces").join("spans.jsonl");
+            let interval_secs = crate::trace_store::flush_interval_secs();
+            let max_records = crate::trace_store::max_records();
+            let repo_id = std::env::var("CORECRUXD_TRACE_REPO_ID").unwrap_or_else(|_| "crux".to_string());
+            let tenant_id = std::env::var("CORECRUXD_TRACE_TENANT_ID").unwrap_or_else(|_| "local".to_string());
+            let mut rx = shutdown_tx.subscribe();
+            match crate::trace_store::TraceStore::open(path.clone(), max_records) {
+                Ok(store) => {
+                    info!(path = %path.display(), interval_secs, "trace-flusher-started");
+                    tokio::spawn(async move {
+                        let mut cache = crate::trace_store::ResolverCache::default();
+                        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+                        loop {
+                            tokio::select! {
+                                _ = interval.tick() => {
+                                    let spans = ring.drain();
+                                    if spans.is_empty() { continue; }
+                                    let resolver = {
+                                        let store_guard = fact_store.read().await;
+                                        cache.get(&store_guard, &tenant_id, &repo_id)
+                                    };
+                                    // M6: enforce the retention window on every flush.
+                                    // A window nothing applies is not retention — it is a
+                                    // documented intention, and the store grows anyway.
+                                    match store.prune_expired(
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+                                    ) {
+                                        Ok(0) => {}
+                                        Ok(n) => info!(pruned = n, "trace-retention-pruned"),
+                                        Err(err) => tracing::warn!(?err, "trace-retention-prune-failed"),
+                                    }
+                                    match store.append_resolved(spans, resolver.as_deref(), &tenant_id) {
+                                        Ok(r) => info!(
+                                            drained = r.spans_drained, resolved = r.resolved,
+                                            ambiguous = r.ambiguous, missed = r.missed,
+                                            no_location = r.no_location, "trace-flush"
+                                        ),
+                                        // Never fail loudly: a full disk must not
+                                        // take down the daemon over telemetry.
+                                        Err(err) => tracing::warn!(error = %err, "trace-flush-failed"),
+                                    }
+                                }
+                                _ = rx.recv() => {
+                                    // Final drain so a clean shutdown does not
+                                    // discard the last interval's spans.
+                                    let spans = ring.drain();
+                                    if !spans.is_empty() {
+                                        let resolver = {
+                                            let store_guard = fact_store.read().await;
+                                            cache.get(&store_guard, &tenant_id, &repo_id)
+                                        };
+                                        let _ = store.append_resolved(spans, resolver.as_deref(), &tenant_id);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(err) => tracing::warn!(error = %err, "trace-store-open-failed; persistence disabled"),
+            }
+        }
+    }
+
     if config.semantic_dedup_threshold.is_some() {
         let fact_store = state.fact_store.clone();
         let mut rx = shutdown_tx.subscribe();
@@ -1099,6 +1323,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let github_fact_store_handle = state.fact_store.clone();
     let github_encryption_key = state.integration_encryption_key.clone();
+    // Handles the periodic-job scheduler needs; cloned here because `state` is
+    // moved into the router well before the scheduler is built.
+    let scheduler_fact_store = state.fact_store.clone();
+    let vault_ingest_handles = crate::local_ingest::LocalIngestHandles {
+        data_dir: state.data_dir.clone(),
+        ingest_lock: state.local_ingest_lock.clone(),
+        retrieval_index: state.retrieval_index.clone(),
+    };
     // Build the MCP dispatch context once and share it between the MCP
     // server (:14801) and the HTTP OpenAI tools shim (`/v1/openai/*`,
     // provider-integration-surfaces M2) — single source for the tool surface.
@@ -1141,7 +1373,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 state.edge_store.clone(),
                 state.kind_registry.clone(),
             )
-            .with_artefact_store(state.artefact_store.clone()),
+            .with_artefact_store(state.artefact_store.clone())
+            // Dense re-rank on the MCP `query` tool (parity with the REST
+            // text-search lane): the `.ccxe` companion readers live in this
+            // crate, so hand crux-mcp a constructor instead of the readers.
+            .with_dense_provider_factory({
+                let data_dir = state.data_dir.clone();
+                std::sync::Arc::new(move |index_mgr: &corecrux_retrieval::IndexManager,
+                                          query_embedding: &[f32],
+                                          expected_fingerprint: Option<&str>,
+                                          query_model_id: Option<&str>| {
+                    crate::local_ingest::build_dense_provider(
+                        index_mgr,
+                        &data_dir,
+                        query_embedding,
+                        expected_fingerprint,
+                        query_model_id,
+                    )
+                })
+            }),
         )
     } else {
         None
@@ -1337,13 +1587,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             tracing::warn!("witness: CORECRUXD_REKOR_URL unset; heads remain pending");
                             continue;
                         };
-                        let Some(signing_key) = crate::witness_submit::load_witness_signing_key() else {
+                        let Some(signer) = crate::witness_submit::select_witness_signer(timeout) else {
                             tracing::warn!(
-                                "witness: no witness signing key (CORECRUXD_WITNESS_SIGNING_KEY); heads remain pending"
+                                "witness: no signer configured (Vault Transit or CORECRUXD_WITNESS_SIGNING_KEY); heads remain pending"
                             );
                             continue;
                         };
-                        let witness = crate::witness_submit::RekorWitness::new(url, signing_key, timeout);
+                        let witness = crate::witness_submit::RekorWitness::with_signer(url, signer, timeout);
                         let n_pending = pending.len();
                         tracing::debug!(provider = %provider, pending = n_pending, "witness: draining heads");
                         // Network I/O off the async runtime and without the store lock.
@@ -1456,58 +1706,101 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
     };
 
-    // GitHub indexer polling loop (Plan B G3) — spawned unconditionally; skips
-    // its own work when GitHub isn't connected. Configurable via
-    // `CORECRUXD_GITHUB_SYNC_INTERVAL_SECS` (default 900s = 15 min). The
-    // manual `POST /v1/integrations/github/sync` runs the same code path.
+    // Periodic integration jobs (ExecPlan `crux-integrations-and-template-library`
+    // I4). One driver task for all of them; per-job status lands under
+    // `__sync__::<job_id>` key `status` and is readable through `GET /v1/facts`.
+    // See `crate::sync_scheduler`.
     {
-        let interval_secs = std::env::var("CORECRUXD_GITHUB_SYNC_INTERVAL_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(900);
-        let data_dir = config.data_dir.clone();
-        let key = github_encryption_key.clone();
-        let fact_store = github_fact_store_handle.clone();
-        let mut rx = shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-            tick.tick().await; // burn the immediate tick — wait one full interval before first poll
-            loop {
-                tokio::select! {
-                    _ = rx.recv() => break,
-                    _ = tick.tick() => {
-                        let dd = data_dir.clone();
-                        let k = key.clone();
-                        let fs = fact_store.clone();
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_millis() as u64);
+        let mut scheduler = sync_scheduler::SyncScheduler::new(scheduler_fact_store.clone());
+
+        // GitHub indexer poll (Plan B G3) — registered unconditionally; the job
+        // itself skips (writing nothing) when GitHub isn't connected. Interval
+        // via `CORECRUXD_GITHUB_SYNC_INTERVAL_SECS` (default 900s = 15 min);
+        // first poll one full interval after boot, as before. The manual
+        // `POST /v1/integrations/github/sync` runs the same code path.
+        {
+            let interval_secs = std::env::var("CORECRUXD_GITHUB_SYNC_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(900);
+            let data_dir = config.data_dir.clone();
+            let key = github_encryption_key.clone();
+            let fact_store = github_fact_store_handle.clone();
+            scheduler.register(
+                "github-sync",
+                std::time::Duration::from_secs(interval_secs),
+                move || {
+                    let dd = data_dir.clone();
+                    let k = key.clone();
+                    let fs = fact_store.clone();
+                    async move {
+                        let now_ms = crate::ops_events::now_unix_ms();
                         let result = tokio::task::spawn_blocking(move || {
                             let mut store = match fs.try_write() {
                                 Ok(g) => g,
-                                Err(_) => return Err(crate::integrations_github::GithubIntegrationError::Network(
-                                    "fact store busy".to_string(),
-                                )),
+                                Err(_) => {
+                                    return Err(crate::integrations_github::GithubIntegrationError::Network(
+                                        "fact store busy".to_string(),
+                                    ))
+                                }
                             };
                             crate::integrations_github_sync::run_sync_with_key(&dd, &mut store, k.as_ref(), now_ms)
-                        }).await;
+                        })
+                        .await;
                         match result {
                             Ok(Ok(run)) => {
                                 let total_added: usize = run.repos.iter().map(|r| r.commits_added).sum();
                                 if !run.repos.is_empty() {
                                     info!(repos = run.repos.len(), commits_added = total_added, "github-sync-tick");
                                 }
+                                Ok(sync_scheduler::JobOutcome::Ran(Some(serde_json::json!({
+                                    "repos": run.repos.len(),
+                                    "commits_added": total_added,
+                                }))))
                             }
+                            // Not connected is the unconfigured default, not a
+                            // failure: skip silently and don't arm backoff.
                             Ok(Err(crate::integrations_github::GithubIntegrationError::NotConnected)) => {
-                                tracing::trace!("github not connected; skipping sync tick");
+                                Ok(sync_scheduler::JobOutcome::Skipped("github not connected".to_string()))
                             }
-                            Ok(Err(err)) => tracing::warn!(?err, "github-sync-tick-failed"),
-                            Err(err) => tracing::warn!(?err, "github-sync-task-join-error"),
+                            Ok(Err(err)) => Err(format!("{err:?}")),
+                            Err(err) => Err(format!("sync task join error: {err}")),
                         }
                     }
-                }
+                },
+            );
+        }
+
+        // Markdown vault watcher — the `EntryKind::FileWatcher` runtime. Double
+        // gated: a file-watcher pack must be installed AND granted, and
+        // `CORECRUXD_VAULT_WATCH_ROOTS` must name at least one absolute
+        // directory. See `crate::vault_watcher`.
+        match vault_watcher::activation(&config.data_dir) {
+            (vault_watcher::Activation::Active { pack_ids, roots }, Some(vault_config)) => {
+                let watcher = std::sync::Arc::new(vault_watcher::VaultWatcher::new(
+                    vault_config,
+                    scheduler_fact_store.clone(),
+                    vault_ingest_handles.clone(),
+                ));
+                let interval = watcher.interval();
+                info!(
+                    packs = ?pack_ids,
+                    roots,
+                    interval_secs = interval.as_secs(),
+                    "vault-watcher enabled"
+                );
+                scheduler.register(vault_watcher::JOB_ID, interval, move || {
+                    let watcher = watcher.clone();
+                    async move { watcher.run_cycle().await }
+                });
             }
-        });
+            (vault_watcher::Activation::HalfConfigured(reason), _) => {
+                info!(reason = %reason, "vault-watcher inactive");
+            }
+            _ => {}
+        }
+
+        scheduler.spawn(shutdown_tx.subscribe());
     }
 
     let mcp_task = mcp_app.map(|mcp_app| {
@@ -1980,22 +2273,41 @@ fn validate_network_auth_posture(
 fn validate_mcp_bind_posture(
     mcp_enabled: bool,
     mcp_addr: SocketAddr,
-    agent_registry_empty: bool,
+    authentication_configured: bool,
     allow_insecure_dev_auth_bind: bool,
 ) -> Result<(), String> {
-    if !mcp_enabled || mcp_addr.ip().is_loopback() || !agent_registry_empty || allow_insecure_dev_auth_bind {
+    if !mcp_enabled || mcp_addr.ip().is_loopback() || authentication_configured || allow_insecure_dev_auth_bind {
         return Ok(());
     }
 
     Err(format!(
-        "MCP may not bind to non-loopback address ({mcp_addr}) without CRUX_AGENT_TOKEN/CRUX_AGENT_TOKENS or CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND=1"
+        "MCP may not bind to non-loopback address ({mcp_addr}) without CRUX_AGENT_TOKEN/CRUX_AGENT_TOKENS, OAuth introspection, or CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND=1"
     ))
+}
+
+/// The process-wide span ring, present only when `CORECRUXD_TRACE_CAPTURE` is on.
+///
+/// Held in a `OnceLock` because the layer is installed inside `init_tracing`,
+/// long before `AppState` exists, and the HTTP surface needs to read it later.
+static TRACE_SPAN_RING: std::sync::OnceLock<std::sync::Arc<crux_observe::span_layer::SpanRing>> =
+    std::sync::OnceLock::new();
+
+/// Runtime span capture ring, or `None` when trace capture is disabled.
+pub(crate) fn trace_span_ring() -> Option<&'static std::sync::Arc<crux_observe::span_layer::SpanRing>> {
+    TRACE_SPAN_RING.get()
 }
 
 fn init_tracing(level: &str) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
     let log_format = std::env::var("LOG_FORMAT").unwrap_or_default();
+    // Runtime code-map capture (ExecPlan crux-runtime-codemap M2). `from_env`
+    // yields None unless CORECRUXD_TRACE_CAPTURE is set, so the disabled path
+    // installs no layer at all rather than an inert one.
+    let span_layer = crux_observe::span_layer::CruxSpanLayer::from_env().map(|(layer, ring)| {
+        let _ = TRACE_SPAN_RING.set(ring);
+        layer
+    });
     // Sink-boundary redaction (ExecPlan crux-log-redaction-2026-06-11 M2):
     // every formatted event is scrubbed before reaching stdout. Mode is
     // CORECRUXD_REDACT=on|off|audit (default audit: count, don't mutate).
@@ -2050,22 +2362,34 @@ fn init_tracing(level: &str) {
                     .with(filter)
                     .with(fmt_layer)
                     .with(otel_layer)
+                    .with(span_layer)
                     .init();
                 return;
             }
         }
     }
 
-    if log_format.eq_ignore_ascii_case("json") {
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(filter)
-            .with_writer(redacting_writer)
-            .init();
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(redacting_writer)
+    // Registry-based rather than the `fmt()` builder so the span layer can
+    // compose. `Layer` is implemented for `Option<L>`, so a `None` span layer
+    // adds no runtime work.
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        use tracing_subscriber::Layer as _;
+
+        let fmt_layer = if log_format.eq_ignore_ascii_case("json") {
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(redacting_writer)
+                .boxed()
+        } else {
+            tracing_subscriber::fmt::layer().with_writer(redacting_writer).boxed()
+        };
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .with(span_layer)
             .init();
     }
 }
@@ -2990,10 +3314,10 @@ mod tests {
         let err = validate_mcp_bind_posture(
             true,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 14801),
-            true,
+            false,
             false,
         )
-        .expect_err("non-loopback MCP without tokens should fail");
+        .expect_err("non-loopback MCP without authentication should fail");
         assert!(err.contains("CRUX_AGENT_TOKEN"));
     }
 
@@ -3002,10 +3326,21 @@ mod tests {
         validate_mcp_bind_posture(
             true,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 14801),
-            false,
+            true,
             false,
         )
-        .expect("configured MCP tokens should allow non-loopback bind");
+        .expect("configured MCP authentication should allow non-loopback bind");
+    }
+
+    #[test]
+    fn mcp_non_loopback_with_oauth_is_ok() {
+        validate_mcp_bind_posture(
+            true,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 14801),
+            true,
+            false,
+        )
+        .expect("configured OAuth introspection should allow non-loopback bind");
     }
 
     #[test]
@@ -3013,7 +3348,7 @@ mod tests {
         validate_mcp_bind_posture(
             false,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 14801),
-            true,
+            false,
             false,
         )
         .expect("disabled MCP should skip validation");
@@ -4434,6 +4769,7 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             sync_mutual_auth: false,
             sync_peer_trust_root: None,
+            sync_delegation_enforce: false,
             sync_handshake_nonces: std::sync::Arc::new(std::sync::Mutex::new(
                 crux_sync::peer_handshake::NonceCache::new(crate::http::SYNC_HANDSHAKE_NONCE_TTL_SECONDS),
             )),
@@ -4449,6 +4785,7 @@ mod tests {
             consolidation_scheduler_enabled: false,
             coord_presence_ttl_secs: crate::coord::DEFAULT_PRESENCE_TTL_SECS,
             context_surface_enabled: false,
+            tenant_erasure_enabled: false,
             auto_capture_enabled: false,
             local_ingest_enabled: false,
             compute_provider_enabled: false,
@@ -4462,6 +4799,7 @@ mod tests {
             quota_hosted_surfaces: std::sync::Arc::new(Vec::new()),
             quota_ledger: std::sync::Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
             credit_meter: None,
+            enrich_budgets: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
             openai_shim_enabled: false,
             memory_import_enabled: false,
             identity_links_enabled: false,
@@ -4472,6 +4810,8 @@ mod tests {
             operating_mode: crate::product::OperatingMode::FreeLocal,
             enabled_pro_services: Vec::new(),
             read_retry_failed_readyz_threshold: 0,
+            seal_failed_readyz_threshold: 0,
+            seal_failed_streak: std::sync::Arc::new(tokio::sync::RwLock::new((0, None))),
             commit_level: crate::config::CommitLevel::LocalCommit,
             metrics: metrics.clone(),
             node_id: "node-test".to_string(),

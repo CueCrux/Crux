@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 #
 # Render packaging/homebrew/crux.rb from a release's signed RELEASE-MANIFEST
 # files. Run after the release workflow has published artifacts:
@@ -41,7 +41,8 @@ sha_for() {
       --certificate-oidc-issuer "${OIDC_ISSUER}" \
       "${WORK}/${manifest}" >/dev/null
   fi
-  # RELEASE-MANIFEST paths are ./-prefixed (sha256sum run in the package dir).
+  # Current manifests use public flat basenames. Keep the ./ match for releases
+  # produced before the basename collision hardening.
   awk -v f="$2" '$2 == f || $2 == "*"f || $2 == "./"f {print $1; found=1} END {exit !found}' \
     "${WORK}/${manifest}" \
     || { echo "ERROR: $2 not in ${manifest}" >&2; exit 1; }
@@ -56,6 +57,9 @@ sha_crux_linux_amd64="$(sha_for linux-amd64 "crux-linux-amd64")"
 sha_ctl_darwin_arm64="$(sha_for darwin-arm64 "corecruxctl-darwin-arm64")"
 sha_ctl_darwin_amd64="$(sha_for darwin-amd64 "corecruxctl-darwin-amd64")"
 sha_ctl_linux_amd64="$(sha_for linux-amd64 "corecruxctl-linux-amd64")"
+sha_hook_darwin_arm64="$(sha_for darwin-arm64 "crux-hook-darwin-arm64")"
+sha_hook_darwin_amd64="$(sha_for darwin-amd64 "crux-hook-darwin-amd64")"
+sha_hook_linux_amd64="$(sha_for linux-amd64 "crux-hook-linux-amd64")"
 
 sed \
   -e "s|{{VERSION}}|${VERSION}|g" \
@@ -65,4 +69,7 @@ sed \
   -e "s|{{SHA256_CTL_DARWIN_ARM64}}|${sha_ctl_darwin_arm64}|" \
   -e "s|{{SHA256_CTL_DARWIN_AMD64}}|${sha_ctl_darwin_amd64}|" \
   -e "s|{{SHA256_CTL_LINUX_AMD64}}|${sha_ctl_linux_amd64}|" \
+  -e "s|{{SHA256_HOOK_DARWIN_ARM64}}|${sha_hook_darwin_arm64}|" \
+  -e "s|{{SHA256_HOOK_DARWIN_AMD64}}|${sha_hook_darwin_amd64}|" \
+  -e "s|{{SHA256_HOOK_LINUX_AMD64}}|${sha_hook_linux_amd64}|" \
   "$TEMPLATE"

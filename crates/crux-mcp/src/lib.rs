@@ -1,9 +1,12 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
-#![recursion_limit = "256"]
+// The `json!` literal behind `tool_output_catalogue` has one element per tool
+// and expands recursively, so this tracks the tool count rather than any
+// pathological nesting. Raise it when adding tools tips it over again.
+#![recursion_limit = "512"]
 
 //! `crux-mcp` — MCP server for agent integration with Crux Daemon.
 //!
@@ -20,8 +23,10 @@
 //!
 //! ## Authentication
 //!
-//! Agents authenticate via `CRUX_AGENT_TOKEN` (Bearer token). The token is
-//! validated in the [`agent`] module before any tool dispatch.
+//! Agents authenticate with registered bearer tokens (`CRUX_AGENT_TOKEN` /
+//! `CRUX_AGENT_TOKENS`) or hosted-client OAuth bearer introspection. When
+//! either rail is configured, missing and unknown credentials fail closed
+//! before any tool dispatch.
 
 #![deny(clippy::unwrap_used)]
 

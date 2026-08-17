@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 #
 # Fail when a crate adds non-test unwrap()/expect() lines above its recorded
 # baseline. The awk scan intentionally matches scripts/unwrap-baseline.txt.
@@ -30,15 +30,65 @@ done < "$baseline_file"
 count_sites() {
   local crate_dir="$1"
 
+  # tests.rs is test-only but gated from its parent mod (out-of-file #[path]
+  # decl), so it carries no in-file #[cfg(test)] for the scan to key on.
+  # mutants_tests_*.rs are the same case: one per-source-file mutation-killing
+  # module, each declared `#[cfg(test)] mod ...` from its crate root, so the
+  # gate is out-of-file and invisible to this scan. Excluded by name rather than
+  # absorbed into the baselines — inflating a baseline to cover test expects
+  # would permanently license that many new PRODUCTION unwrap sites.
+  # metrics.rs is the allowlisted Prometheus register!() surface (docs/unwrap-triage.md).
+  # All are excluded by name so the count reflects production code only.
   find "$crate_dir" -type f -name '*.rs' ! -path '*/tests/*' \
+    ! -name 'tests.rs' ! -name 'metrics.rs' ! -name 'mutants_tests_*.rs' \
     -exec awk '
-      FNR == 1 { intest=0 }
-      /#\[cfg\(test\)\]/ { intest=1 }
-      !intest && (/\.unwrap\(\)/ || /\.expect\(/) { count++ }
+      # Track brace depth so an inline #[cfg(test)] exempts only its own item,
+      # not the rest of the file. Counting happens on the line-entry state so a
+      # single-line test module does not leak its own body into the count.
+      FNR == 1 { intest=0; depth=0; testdepth=-1 }
+      { was = intest }
+      /#\[cfg\(test\)\]/ && !intest { intest=1; testdepth=depth; was=1 }
+      !was && $0 !~ /^[ \t]*\/\// && ($0 ~ /\.unwrap\(\)/ || $0 ~ /\.expect\(/) { count++ }
+      {
+        l = $0; opens = gsub(/\{/, "", l)
+        l = $0; closes = gsub(/\}/, "", l)
+        depth += opens - closes
+        if (intest && (opens || closes) && depth <= testdepth) intest=0
+      }
       END { print count+0 }
     ' {} + \
     | awk '{ total += $1 } END { print total+0 }'
 }
+
+# Regression fixture for the mid-file #[cfg(test)] blind spot: before the
+# brace-depth fix, a #[cfg(test)] anywhere in a file exempted every line after
+# it, so production code below a test module was silently outside the gate.
+if [[ "${1:-}" == "--self-test" ]]; then
+  fixture_dir="$(mktemp -d)"
+  trap 'rm -rf "$fixture_dir"' EXIT
+  cat > "$fixture_dir/fixture.rs" <<'FIXTURE'
+fn prod_before() { let a = x.unwrap(); }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn t() { let b = y.unwrap(); let c = z.expect("no"); }
+}
+fn prod_after() { let d = w.unwrap(); }
+mod inner {
+    #[cfg(test)]
+    mod nested { fn t2() { let e = q.unwrap(); } }
+    fn prod_nested() { let f = r.expect("yes"); }
+    // a full-line comment mentioning .unwrap() is not a site
+}
+FIXTURE
+  got="$(count_sites "$fixture_dir")"
+  if [[ "$got" != "3" ]]; then
+    echo "unwrap ratchet SELF-TEST FAILED: expected 3 production sites, got $got" >&2
+    exit 1
+  fi
+  echo "unwrap ratchet self-test OK: mid-file #[cfg(test)] does not exempt following code"
+  exit 0
+fi
 
 checked=0
 failures=0

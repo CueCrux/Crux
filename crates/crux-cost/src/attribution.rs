@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Carried-context attribution.
 //!
@@ -164,6 +164,13 @@ pub fn analyze(events: &[Event]) -> CostReport {
     let branch_leaf = branch.as_deref().map(branch_leaf_of);
     let execplan_slugs = rank_execplan_slugs(&signals, branch_leaf, MAX_EXECPLAN_SLUGS);
 
+    // The model/effort axis. `model`/`effort` are the dominant pair, for callers
+    // that want one label per session; `breakdown` is the whole distribution and
+    // reconciles to `measured_context_total`.
+    let breakdown = crate::models::breakdown(events);
+    let (model, effort) = breakdown.as_ref().map_or((None, None), crate::models::primary);
+    let cwd = crate::models::most_common(events, |e| e.cwd.as_deref());
+
     CostReport {
         schema: COST_REPORT_SCHEMA.to_owned(),
         session_id,
@@ -172,6 +179,11 @@ pub fn analyze(events: &[Event]) -> CostReport {
         started_at: started_at.map(str::to_owned),
         ended_at: ended_at.map(str::to_owned),
         execplan_slugs,
+        model,
+        effort,
+        cwd,
+        git_branch: branch,
+        breakdown,
         headline,
         measured,
         buckets,

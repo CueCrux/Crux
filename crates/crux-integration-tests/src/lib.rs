@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Integration test harness for Crux Daemon.
 
@@ -15,9 +15,135 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
-const REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
+/// Default per-attempt boot budget. A healthy corecruxd — even a cold boot that
+/// builds/loads the `.ccxi` index and clears the `/readyz` gates (routing_loaded,
+/// data_dir_capacity, control_evidence, …) — is serve-ready in well under a
+/// second, so 10s is already generous. The failures this was once raised to
+/// paper over were not slow boots: they were a `/readyz` gate hard-failing (a
+/// full `/srv/data` tripping `data_dir_capacity`), which no timeout can wait
+/// out — a longer default only makes each of those failing tests take longer to
+/// give up. `wait_healthy` now names the failing gate, so a genuine timeout is
+/// diagnosable rather than guessed at. Runners that genuinely need more headroom
+/// (e.g. heavy `cargo llvm-cov` instrumentation) override without a rebuild via
+/// `CORECRUXD_STARTUP_TIMEOUT_SECS`.
+const STARTUP_TIMEOUT_SECS_DEFAULT: u64 = 10;
+/// Timeout for the **startup liveness probes** only (`/readyz`, the gRPC port
+/// check). These run in a poll loop *inside* the [`startup_timeout`] budget, so
+/// they must stay short: a long probe timeout would blow the boot budget on the
+/// first closed-port poll rather than retrying.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(750);
+/// Default ceiling for a **test request** to a daemon that is already healthy.
+///
+/// This is a hang guard, not a latency assertion. Its only job is to stop a
+/// wedged request hanging the suite forever; it is not evidence about how fast
+/// the daemon is, and it must never be the thing that fails a test on a busy
+/// machine.
+///
+/// It used to be 750ms — shared with the startup probes above — which put it
+/// roughly 6× above the healthy path (`tools/list`, the heaviest MCP call,
+/// measures 80–120ms warm). One shared `OnceLock` daemon serves all 43 tests in
+/// `tests/daemon.rs` concurrently, so under runner contention that ceiling was
+/// reachable, and it duly failed a release PR with `Timeout(RecvResponse)` on
+/// `mcp_tools_list` — a PR whose diff contained no code at all.
+///
+/// That is the same load-dependence PR #574 removed when it deleted the
+/// workspace's only explicit wall-clock assertion; this one survived because it
+/// was expressed as client config rather than an `assert!`. A hang guard belongs
+/// ~100× above the healthy path, not ~6×. Override without a rebuild via
+/// `CRUX_TEST_REQUEST_TIMEOUT_SECS`, mirroring `CORECRUXD_STARTUP_TIMEOUT_SECS`.
+const REQUEST_TIMEOUT_SECS_DEFAULT: u64 = 15;
 const START_ATTEMPTS: usize = 3;
+/// Cap on the `/readyz` body echoed into a startup-failure message — enough for
+/// the failing-check breakdown, short of dumping an unbounded payload into the
+/// panic text of every test in the binary.
+const READYZ_BODY_LIMIT: usize = 800;
+
+/// The last poll of the startup probes, retained so a `wait_healthy` timeout can
+/// report *which* probe was still failing instead of a bare "not healthy in 10s".
+///
+/// This matters because the interesting failure mode is silent: a daemon that
+/// binds all three ports but never passes a `/readyz` gate (`capacity`,
+/// `lock_held`, `routing_loaded`, `control_evidence`, …) logs nothing at
+/// `warn`, so `failure_message` finds an empty stderr log and the only signal
+/// left is the timeout itself. A full CI disk trips the `capacity` gate exactly
+/// this way, and without the probe detail it presents as every integration test
+/// in the workspace failing identically for no stated reason.
+#[derive(Default)]
+struct ProbeSnapshot {
+    healthz: String,
+    mcp: String,
+    grpc: String,
+    readyz: String,
+}
+
+impl ProbeSnapshot {
+    fn describe(&self) -> String {
+        let unknown = |s: &String| if s.is_empty() { "unknown".to_string() } else { s.clone() };
+        format!(
+            "healthz={}, mcp={}, grpc={}, readyz={}",
+            unknown(&self.healthz),
+            unknown(&self.mcp),
+            unknown(&self.grpc),
+            unknown(&self.readyz)
+        )
+    }
+}
+
+/// Reduce an HTTP probe to (is_200, short description) for the snapshot.
+fn describe_probe(result: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> (bool, String) {
+    match result {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            (status == 200, status.to_string())
+        }
+        Err(err) => (false, format!("error({err})")),
+    }
+}
+
+/// Liveness variant of [`describe_probe`]: any HTTP answer means the transport
+/// is up. Used for the MCP port, where an authenticated daemon answers an
+/// unauthenticated probe with `401` — a live, correct response.
+fn describe_liveness_probe(result: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> (bool, String) {
+    match result {
+        Ok(resp) => (true, resp.status().as_u16().to_string()),
+        // ureq surfaces non-2xx as StatusCode errors; a status at all is proof
+        // of life. Only a transport failure means "not up".
+        Err(ureq::Error::StatusCode(code)) => (true, code.to_string()),
+        Err(err) => (false, format!("error({err})")),
+    }
+}
+
+/// Truncate on a char boundary so a multi-byte body can never panic the harness.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max).collect();
+    format!("{kept}… (truncated)")
+}
+
+/// Per-attempt daemon boot timeout, honouring `CORECRUXD_STARTUP_TIMEOUT_SECS`
+/// (falling back to [`STARTUP_TIMEOUT_SECS_DEFAULT`] when unset or unparseable).
+fn startup_timeout() -> Duration {
+    let secs = std::env::var("CORECRUXD_STARTUP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(STARTUP_TIMEOUT_SECS_DEFAULT);
+    Duration::from_secs(secs)
+}
+
+/// Per-request hang guard for tests against an already-healthy daemon,
+/// honouring `CRUX_TEST_REQUEST_TIMEOUT_SECS` (falling back to
+/// [`REQUEST_TIMEOUT_SECS_DEFAULT`] when unset or unparseable).
+fn request_timeout() -> Duration {
+    let secs = std::env::var("CRUX_TEST_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(REQUEST_TIMEOUT_SECS_DEFAULT);
+    Duration::from_secs(secs)
+}
 
 fn repo_root() -> PathBuf {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -137,6 +263,10 @@ pub struct TestDaemon {
     pub base_url: String,
     pub mcp_base_url: String,
     stderr_log_path: PathBuf,
+    /// Remembered so [`TestDaemon::restart`] can bring the same daemon back up
+    /// against the same data dir and ports.
+    agent_token: Option<String>,
+    extra_env: Vec<(String, String)>,
 }
 
 impl TestDaemon {
@@ -145,19 +275,53 @@ impl TestDaemon {
     /// Set `CORECRUXD_BINARY` to override the daemon binary path (useful when
     /// `cargo llvm-cov` or other tools use a non-standard target directory).
     pub fn start() -> Self {
-        Self::start_with_retry(None)
+        Self::start_with_retry(None, &[])
     }
 
     /// Start a corecruxd instance that requires an MCP bearer token.
     pub fn start_with_agent_token(token: &str) -> Self {
-        Self::start_with_retry(Some(token))
+        Self::start_with_retry(Some(token), &[])
     }
 
-    fn start_with_retry(agent_token: Option<&str>) -> Self {
+    /// Start a corecruxd instance with extra environment variables — for
+    /// surfaces that are flag-gated off by default.
+    pub fn start_with_env(env: &[(&str, &str)]) -> Self {
+        Self::start_with_retry(None, env)
+    }
+
+    /// Stop the daemon and bring it back up on the same data dir, ports and
+    /// environment. Restart-survival tests need the on-disk state to be the
+    /// only thing carried across.
+    pub fn restart(&mut self) {
+        self.stop();
+        let outcome = Self::binary_path()
+            .and_then(|binary| {
+                Self::build_command(
+                    &binary,
+                    self.data_dir.path(),
+                    &self.stderr_log_path,
+                    self.http_port,
+                    self.grpc_port,
+                    self.mcp_port,
+                    self.agent_token.as_deref(),
+                    &self.extra_env,
+                )
+            })
+            .and_then(|mut command| command.spawn().map_err(|err| format!("respawn corecruxd: {err}")))
+            .and_then(|process| {
+                self.process = process;
+                self.wait_healthy(startup_timeout())
+            });
+        if let Err(err) = outcome {
+            panic!("daemon did not come back after restart: {err}");
+        }
+    }
+
+    fn start_with_retry(agent_token: Option<&str>, extra_env: &[(&str, &str)]) -> Self {
         let mut failures = Vec::new();
         for attempt in 1..=START_ATTEMPTS {
-            match Self::spawn_once(agent_token) {
-                Ok(mut daemon) => match daemon.wait_healthy(STARTUP_TIMEOUT) {
+            match Self::spawn_once(agent_token, extra_env) {
+                Ok(mut daemon) => match daemon.wait_healthy(startup_timeout()) {
                     Ok(()) => return daemon,
                     Err(err) => {
                         failures.push(format!("attempt {attempt}: {err}"));
@@ -174,33 +338,34 @@ impl TestDaemon {
         );
     }
 
-    fn spawn_once(agent_token: Option<&str>) -> Result<Self, String> {
-        let data_dir = tempfile::tempdir().expect("create tempdir");
-        let mut ports = std::collections::BTreeSet::new();
-        while ports.len() < 3 {
-            ports.insert(portpicker::pick_unused_port().expect("pick unused port"));
-        }
-        let mut ports = ports.into_iter();
-        let http_port = ports.next().expect("pick HTTP port");
-        let grpc_port = ports.next().expect("pick gRPC port");
-        let mcp_port = ports.next().expect("pick MCP port");
-
-        let binary = if let Ok(path) = std::env::var("CORECRUXD_BINARY") {
-            std::path::PathBuf::from(path)
+    fn binary_path() -> Result<std::path::PathBuf, String> {
+        if let Ok(path) = std::env::var("CORECRUXD_BINARY") {
+            Ok(std::path::PathBuf::from(path))
         } else {
-            default_binary_path()?
-        };
-        let stderr_log_path = data_dir.path().join("corecruxd.stderr.log");
+            default_binary_path()
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)] // one cohesive spawn recipe; splitting it just moves the args
+    fn build_command(
+        binary: &std::path::Path,
+        data_dir: &std::path::Path,
+        stderr_log_path: &std::path::Path,
+        http_port: u16,
+        grpc_port: u16,
+        mcp_port: u16,
+        agent_token: Option<&str>,
+        extra_env: &[(String, String)],
+    ) -> Result<Command, String> {
         let stderr_log = OpenOptions::new()
             .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&stderr_log_path)
+            .append(true)
+            .open(stderr_log_path)
             .map_err(|err| format!("open stderr log {}: {err}", stderr_log_path.display()))?;
 
-        let mut command = Command::new(&binary);
+        let mut command = Command::new(binary);
         command
-            .env("CORECRUXD_DATA_DIR", data_dir.path())
+            .env("CORECRUXD_DATA_DIR", data_dir)
             .env("CORECRUXD_HTTP_PORT", http_port.to_string())
             .env("CORECRUXD_HTTP_HOST", "127.0.0.1")
             .env("CORECRUXD_GRPC_PORT", grpc_port.to_string())
@@ -218,10 +383,43 @@ impl TestDaemon {
             .env_remove("CRUX_AGENT_TOKENS")
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_log));
-
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
         if let Some(token) = agent_token {
             command.env("CRUX_AGENT_TOKEN", token);
         }
+        Ok(command)
+    }
+
+    fn spawn_once(agent_token: Option<&str>, extra_env: &[(&str, &str)]) -> Result<Self, String> {
+        let data_dir = tempfile::tempdir().expect("create tempdir");
+        let mut ports = std::collections::BTreeSet::new();
+        while ports.len() < 3 {
+            ports.insert(portpicker::pick_unused_port().expect("pick unused port"));
+        }
+        let mut ports = ports.into_iter();
+        let http_port = ports.next().expect("pick HTTP port");
+        let grpc_port = ports.next().expect("pick gRPC port");
+        let mcp_port = ports.next().expect("pick MCP port");
+
+        let binary = Self::binary_path()?;
+        let stderr_log_path = data_dir.path().join("corecruxd.stderr.log");
+        let extra_env: Vec<(String, String)> = extra_env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+
+        let mut command = Self::build_command(
+            &binary,
+            data_dir.path(),
+            &stderr_log_path,
+            http_port,
+            grpc_port,
+            mcp_port,
+            agent_token,
+            &extra_env,
+        )?;
 
         let process = command
             .spawn()
@@ -238,14 +436,20 @@ impl TestDaemon {
             base_url,
             mcp_base_url,
             stderr_log_path,
+            agent_token: agent_token.map(str::to_string),
+            extra_env,
         })
     }
 
     fn wait_healthy(&mut self, timeout: Duration) -> Result<(), String> {
         let start = Instant::now();
+        let mut probes = ProbeSnapshot::default();
         loop {
             if start.elapsed() > timeout {
-                return Err(self.failure_message(format!("not healthy in {timeout:?}")));
+                return Err(self.failure_message(format!(
+                    "not healthy in {timeout:?} (last probe: {})",
+                    probes.describe()
+                )));
             }
             match self.process.try_wait() {
                 Ok(Some(status)) => {
@@ -262,16 +466,56 @@ impl TestDaemon {
             // instrumentation the daemon's boot path is slower, so tests
             // racing `/readyz` against `start()` flake. Wait here until the
             // daemon is *actually* serve-ready, not just port-bound.
-            let healthy = self.get("/healthz").is_ok() && self.mcp_get().is_ok() && self.grpc_listening();
-            let ready = healthy
-                && self
-                    .get("/readyz")
-                    .map(|resp| resp.status().as_u16() == 200)
-                    .unwrap_or(false);
-            if ready {
-                return Ok(());
+            let (healthz_ok, healthz) = describe_probe(self.get("/healthz"));
+            // The MCP probe is a LIVENESS check, not an authorization check: a
+            // `401` proves the listener is up, speaking HTTP, and enforcing auth
+            // — which is exactly what a token-configured daemon should answer an
+            // unauthenticated `GET /mcp`. Treating only `200` as healthy meant a
+            // daemon that correctly challenges never looked ready.
+            let (mcp_ok, mcp) = describe_liveness_probe(self.mcp_get());
+            let grpc_ok = self.grpc_listening();
+            probes.healthz = healthz;
+            probes.mcp = mcp;
+            probes.grpc = if grpc_ok { "listening" } else { "not-listening" }.to_string();
+
+            if healthz_ok && mcp_ok && grpc_ok {
+                let (ready, readyz) = self.probe_readyz();
+                probes.readyz = readyz;
+                if ready {
+                    return Ok(());
+                }
+            } else {
+                probes.readyz = "not-probed (transport not up)".to_string();
             }
             std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// `/readyz` probe that also captures the response body. A 503 body is the
+    /// `{"ok":false,"checks":[…]}` breakdown naming the gate that is failing,
+    /// which is the single most useful thing a startup timeout can report.
+    ///
+    /// Uses its own agent with `http_status_as_error(false)`: the default agent
+    /// turns a 503 into `Err`, which would discard the very body we are here to
+    /// read and leave only "http status: 503".
+    fn probe_readyz(&self) -> (bool, String) {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(PROBE_TIMEOUT))
+            .timeout_recv_response(Some(PROBE_TIMEOUT))
+            .timeout_recv_body(Some(PROBE_TIMEOUT))
+            .http_status_as_error(false)
+            .build()
+            .into();
+        match agent.get(&format!("{}/readyz", self.base_url)).call() {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if status == 200 {
+                    return (true, "200".to_string());
+                }
+                let body = resp.into_body().read_to_string().unwrap_or_default();
+                (false, format!("{status} {}", truncate(body.trim(), READYZ_BODY_LIMIT)))
+            }
+            Err(err) => (false, format!("error({err})")),
         }
     }
 
@@ -291,14 +535,15 @@ impl TestDaemon {
 
     fn grpc_listening(&self) -> bool {
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, self.grpc_port));
-        TcpStream::connect_timeout(&addr, REQUEST_TIMEOUT).is_ok()
+        TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok()
     }
 
     fn agent() -> ureq::Agent {
+        let guard = request_timeout();
         ureq::Agent::config_builder()
-            .timeout_connect(Some(REQUEST_TIMEOUT))
-            .timeout_recv_response(Some(REQUEST_TIMEOUT))
-            .timeout_recv_body(Some(REQUEST_TIMEOUT))
+            .timeout_connect(Some(guard))
+            .timeout_recv_response(Some(guard))
+            .timeout_recv_body(Some(guard))
             .build()
             .into()
     }
@@ -360,5 +605,77 @@ impl TestDaemon {
 impl Drop for TestDaemon {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{startup_timeout, truncate, ProbeSnapshot, READYZ_BODY_LIMIT, STARTUP_TIMEOUT_SECS_DEFAULT};
+
+    #[test]
+    fn startup_timeout_default_is_ten_seconds() {
+        // Locks the decision to keep the default tight: a healthy daemon is
+        // ready in <1s, and a longer default only delays failure when a
+        // `/readyz` gate is hard-failing (e.g. data_dir_capacity on a full
+        // disk). Runners that need more headroom set CORECRUXD_STARTUP_TIMEOUT_SECS.
+        assert_eq!(STARTUP_TIMEOUT_SECS_DEFAULT, 10);
+        // With the override unset the resolved budget is the default. (CI does
+        // not set this var; the daemon-boot tests that would are #[ignore]/serial.)
+        if std::env::var_os("CORECRUXD_STARTUP_TIMEOUT_SECS").is_none() {
+            assert_eq!(startup_timeout(), std::time::Duration::from_secs(10));
+        }
+    }
+
+    #[test]
+    fn probe_snapshot_reports_unfilled_probes_as_unknown() {
+        // A timeout before the first poll completes must still produce a
+        // readable line rather than empty `foo=, bar=` fields.
+        assert_eq!(
+            ProbeSnapshot::default().describe(),
+            "healthz=unknown, mcp=unknown, grpc=unknown, readyz=unknown"
+        );
+    }
+
+    #[test]
+    fn probe_snapshot_surfaces_the_failing_readyz_gate() {
+        // The capacity-gate case: transport is fully up and only `/readyz`
+        // fails, so the description must carry the check breakdown — that is
+        // the whole point of retaining the body.
+        // Verbatim shape of a real 503 from the daemon's readiness handler,
+        // captured by forcing CORECRUXD_CAPACITY_EMERGENCY_FREE_RATIO high.
+        let snapshot = ProbeSnapshot {
+            healthz: "200".to_string(),
+            mcp: "200".to_string(),
+            grpc: "listening".to_string(),
+            readyz: r#"503 {"ok":false,"checks":[{"name":"data_dir_capacity","ok":false,"error":"data dir free ratio below emergency threshold (free_ratio=0.060 threshold=0.100 free_bytes=50000000000 total_bytes=861000000000)"}]}"#
+                .to_string(),
+        };
+        let described = snapshot.describe();
+        assert!(described.contains("healthz=200"), "{described}");
+        assert!(described.contains("grpc=listening"), "{described}");
+        assert!(described.contains("\"name\":\"data_dir_capacity\""), "{described}");
+        assert!(described.contains("free_ratio=0.060"), "{described}");
+    }
+
+    #[test]
+    fn truncate_keeps_short_input_verbatim() {
+        assert_eq!(truncate("short body", READYZ_BODY_LIMIT), "short body");
+        assert_eq!(truncate("", READYZ_BODY_LIMIT), "");
+    }
+
+    #[test]
+    fn truncate_caps_long_input_and_marks_it() {
+        let long = "x".repeat(READYZ_BODY_LIMIT + 50);
+        let out = truncate(&long, READYZ_BODY_LIMIT);
+        assert!(out.ends_with("… (truncated)"), "{out}");
+        assert_eq!(out.chars().count(), READYZ_BODY_LIMIT + "… (truncated)".chars().count());
+    }
+
+    #[test]
+    fn truncate_splits_on_a_char_boundary() {
+        // Multi-byte input must not panic: a naive byte slice would split the
+        // 3-byte '€' and abort the whole test binary.
+        let multibyte = "€".repeat(10);
+        assert_eq!(truncate(&multibyte, 4), "€€€€… (truncated)");
     }
 }

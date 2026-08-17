@@ -1,8 +1,8 @@
 # Kit vs. do-it-yourself (the honest version)
 
-**The compaction-survival capability is free.** It is source-available in the
-Crux repo at `integrations/claude-code/compaction-survival/` under the CueCrux
-Community Licence (CCL), and separately MIT-licensed in the standalone
+**The compaction-survival capability is free.** It is open source in the
+Crux repo at `integrations/claude-code/compaction-survival/` under the Apache
+License, Version 2.0, and separately MIT-licensed in the standalone
 `proof-of-loss-hook` mini-repo. You can wire it up yourself in about ten minutes
 with two shell scripts and a `settings.json` edit. Nothing here is behind a
 licence key.
@@ -34,7 +34,7 @@ minutes of reading hook docs and debugging JSON paths.
 ### Honesty notes
 
 - We never paywall the capability. It's free forever (a vow, not a launch promo).
-- The Crux repo is **source-available under the CueCrux Community Licence (CCL)**;
+- The Crux repo is **open source under the Apache License, Version 2.0**;
   the standalone `proof-of-loss-hook` mini-repo is **MIT-licensed**.
 - The event report reads an unsigned local log — it's a convenience report, not a
   signed or verifiable record. Snapshot bodies can contain sensitive transcript

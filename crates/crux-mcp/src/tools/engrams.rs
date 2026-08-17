@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! `engram_resolve` — MCP surface for the local engram catalog.
 //!
@@ -160,5 +160,10 @@ mod tests {
         let text = out["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("crux-min:"));
         assert!(text.contains("engram_set_hash"));
+        let payload: Value = serde_json::from_str(text).expect("valid resolve payload");
+        assert_eq!(payload["engrams"][0]["version"], "v1");
+        assert!(payload["engrams"][0]["applicable_why"]
+            .as_str()
+            .is_some_and(|why| why.contains("executed no generated patch")));
     }
 }

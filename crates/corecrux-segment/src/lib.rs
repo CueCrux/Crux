@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 #![deny(clippy::unwrap_used)]
 
@@ -143,4 +143,6 @@ pub use builder::{build_segment_v1, build_segment_v1_with_block_codec};
 pub use sealer::{seal_segment_v1_from_record_area, seal_segment_v1_from_record_area_with_block_codec};
 
 // Decoder
-pub use decoder::decode_segment_v1;
+pub use decoder::{
+    decode_segment_frame_headers_v1, decode_segment_frames_v1, decode_segment_v1, SegmentFrameHeaderV1, SegmentFrameV1,
+};

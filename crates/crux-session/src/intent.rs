@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Intent shaping (master-plan §4.4, Phase 7).
 //!
@@ -54,6 +54,16 @@ pub fn default_intent_table() -> IntentTable {
     t.insert(
         "knowledge_query",
         vec![("retrieval", 30), ("memory", 20), ("session", 5)],
+    );
+    // Executing an ExecPlan milestone-by-milestone: the agent needs the work
+    // board and the coordination plane first (what is open, who else is live,
+    // claim it), then session continuity to resume, then memory to record the
+    // gate. Without this entry the `work` affinity has no intent that biases
+    // it, so those tools never rise above the floor and an agent can only
+    // reach them by already knowing their names.
+    t.insert(
+        "execplan_execution",
+        vec![("work", 30), ("session", 20), ("memory", 10)],
     );
     t
 }

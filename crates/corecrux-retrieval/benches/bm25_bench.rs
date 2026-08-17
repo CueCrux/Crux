@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
@@ -53,6 +53,7 @@ fn bench_bm25_search(c: &mut Criterion) {
                     None,
                     &params,
                     Some(0.1),
+                    None,
                 )
             });
         });
@@ -82,6 +83,7 @@ fn bench_bm25_score_multi(c: &mut Criterion) {
                     black_box(10),
                     None,
                     &params,
+                    None,
                 )
             });
         });

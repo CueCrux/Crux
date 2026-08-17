@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Client-side AEAD envelope for hosted compaction-snapshot sync
 //! (ExecPlan `hosted-compaction-sync-encrypted-2026-07-17`).
@@ -663,6 +663,7 @@ fn write_high_water_atomic(path: &Path, high_water: u64) -> std::io::Result<()> 
 
 /// fsync a directory so a preceding `rename` into it is durable. Unix-only work;
 /// a no-op elsewhere (Windows cannot fsync a directory handle).
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn fsync_parent_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {

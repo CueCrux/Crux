@@ -1,5 +1,5 @@
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 
 name: Private Paths Guard
 
@@ -11,6 +11,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -18,8 +21,8 @@ concurrency:
 jobs:
   private-paths:
     name: No private-monorepo refs
-    runs-on: [self-hosted, ci]
+    runs-on: [self-hosted, ci, Linux]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Run guard
         run: bash scripts/check-no-private-paths.sh

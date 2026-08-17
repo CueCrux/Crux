@@ -1,6 +1,6 @@
 <!--
-Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-Licensed under the CueCrux Community Licence (CCL v1.0).
+Copyright (c) 2026 CueCrux Ltd.
+Licensed under the Apache License, Version 2.0.
 -->
 
 # M9 — RCX Registry + WikiCrux shell tabs (design + gate matrix)
@@ -22,9 +22,11 @@ IPC / filesystem / keychain / updater capability** to any non-daemon origin, and
 the credential broker's bearer never reaches page JS. M9 must not weaken this:
 
 - A shell tab that loads `registry.rcxprotocol.org` or the WikiCrux origin runs
-  in a webview with **no** registered Tauri command, an explicit CSP, and a
-  navigation policy that permits only that origin's own navigations. It is a
-  sandboxed viewport, not a trusted surface.
+  in a webview with **no** registered Tauri command or remote capability grant,
+  and a navigation policy that permits only that origin's own top-level
+  navigations. It is a sandboxed viewport, not a trusted surface. Tauri cannot
+  retrofit a CSP header onto an external response, so each public origin's CSP
+  remains a runtime/operator verification item rather than a native-shell claim.
 - The connection broker/proxy and its session cookie (`__crux_proxy`) are
   **per-daemon-origin** and are **never** exposed to a registry/wiki tab
   (different origin; SameSite=Strict + HttpOnly already prevent leakage).
@@ -46,21 +48,23 @@ core of the operator test matrix below.
 
 ## Receipt → registry verification link (buildable)
 
-A CROWN receipt already anchors to the RCX Registry for external verification.
-The console can render a receipt's verification link as a normal external link
-that resolves against `registry.rcxprotocol.org` — this is a pure URL
-construction from the receipt id and needs no SSO. This is the one M9 piece that
-is verifiable headless and should land as a small console change (a
-`registryVerifyUrl(receiptId)` helper + the link on the session-detail receipt
-chip from M4b), guarded so it is an external link (M1 policy), never an embed.
+The console can construct a receipt lookup as a normal external link against
+`registry.rcxprotocol.org` without SSO. Grounding on 2026-07-21 found an
+important dependency: session observations currently expose the CROWN receipt
+`body_hash`, and the Registry plan specifies `GET /v0/receipts/{hash}`, but that
+route is not implemented on the current RCX-Registry branch. The buildable M9
+piece therefore lands the fixed-origin `registryVerifyUrl(receiptId)` contract
+and session-detail link, while **live resolution remains blocked on the Registry
+M6 route**. The console must not claim that opening the link is itself a local
+signature verification.
 
 ## Gate matrix
 
 | Gate item | Verifiable now? | Owner |
 |---|---|---|
 | Tab allowlist restricts in-shell tabs to exactly the registry + wiki origins | Yes (unit-testable in the connection crate, like `is_public_http_link`) | build |
-| Tabs receive zero native capability (no IPC command, explicit CSP, origin-locked navigation) | Partly (config asserted; runtime needs a real webview) | build + operator |
-| `registryVerifyUrl(receiptId)` resolves to a registry verification URL and renders as an external link on the receipt chip | Yes (console smoke) | build |
+| Tabs receive zero native capability (no IPC command/remote grant; origin-locked navigation); each remote origin serves an effective CSP | Partly (native config asserted; remote CSP + runtime need real webviews) | build + operator |
+| `registryVerifyUrl(receiptId)` builds a fixed-origin Registry receipt URL and renders as an external link on the receipt chip | Partly (console smoke passes; live response depends on Registry M6 `/v0/receipts/{hash}`) | build + Registry M6 |
 | One login across console + registry + wiki | **No** — needs live SSO (`cross-site-auth-sso`) | operator |
 | Works on both WebKitGTK (Linux) and WebView2 (Windows): login, logout, account-switch, token-expiry, offline, blocked-framing, deep-link | **No** — needs both real webview engines + packaged app | operator (folds with M6b) |
 | Tabs degrade gracefully offline | Partly (logic testable; real offline needs a webview) | build + operator |
@@ -70,7 +74,7 @@ chip from M4b), guarded so it is an external link (M1 policy), never an embed.
 1. **Build now** (this PR is design-only; the code is a small follow-up): the tab
    allowlist in `connection/navigation.rs` (unit-tested) + `registryVerifyUrl`
    console helper on the M4b receipt chip (smoke-tested) + the zero-capability
-   CSP/navigation config for the two tab origins.
+   and navigation config for the two tab origins.
 2. **Operator pass** (folds with M6b packaging on a real Win11+WSL2 box, once SSO
    is live): the two-engine login/session matrix above.
 

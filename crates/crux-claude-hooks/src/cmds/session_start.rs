@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! `SessionStart` hook. Automates the §11.1 session-boot ritual:
 //! 1. Call `sync_status({})` — note any `degraded`/`behind` state.
@@ -72,6 +72,33 @@ fn order_sections(sections: Vec<(Stability, String)>, align: bool) -> Vec<String
         }
     }
     stable.into_iter().chain(volatile).collect()
+}
+
+/// Boot self-check section, or `None` when the environment looks healthy.
+///
+/// Only the daemon-version probe touches the network; the cost-capture
+/// observations are a local file read (the SessionEnd hook's last outcome, plus
+/// whether the installed launcher is the one this build ships). Both fail soft —
+/// an unreadable state file reports "nothing recorded" rather than erroring, so
+/// this can run on every boot.
+///
+/// Callers reach here only after `sync_status` succeeded, hence
+/// `sync_reachable: true`.
+fn selfcheck_section(sync_degraded: bool, bootstrap_loaded: bool) -> Option<String> {
+    let daemon_version = mcp_client::server_version();
+    let cost = crux_config_wizard::hooks_install::cost_capture().ok();
+    let obs = crux_config_wizard::selfcheck::BootObservations {
+        hook_version: env!("CARGO_PKG_VERSION"),
+        daemon_version: daemon_version.as_deref(),
+        sync_reachable: true,
+        sync_degraded,
+        bootstrap_loaded,
+        cost_last_result: cost.as_ref().and_then(|c| c.result.as_deref()),
+        cost_launcher_stale: cost
+            .as_ref()
+            .is_some_and(|c| c.installed_version.is_some() && !c.launcher_current()),
+    };
+    crux_config_wizard::selfcheck::render_section(&crux_config_wizard::selfcheck::evaluate(&obs))
 }
 
 pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
@@ -185,6 +212,17 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
                 eprintln!("crux-hook session-start: wizard drift check failed: {err}");
             }
         }
+
+        // Banner-stack self-check. The drift check above covers the *composed
+        // profile text*; this covers the *installed client components* — a
+        // different failure with the same symptom of looking fine. Channels 1
+        // and 3 (statusline, first-reply card) are the two a human can see, so
+        // when they are missing or stale nobody notices: the agent brief still
+        // arrives, in a place only the model reads. Filesystem-only, no daemon
+        // I/O, and silent when healthy so it costs nothing on a good machine.
+        if let Some(advice) = crux_config_wizard::hooks_install::audit().advice() {
+            sections.push((Stability::Stable, format!("**Crux banner**\n{advice}")));
+        }
     }
 
     // Boot self-check: catch the class of failure where the daemon is healthy
@@ -196,18 +234,7 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
     // means `sync_status` succeeded (the `Err` arm returned early), so the daemon
     // was reachable this boot.
     if std::env::var("CRUX_HOOK_WIZARD_CHECK").as_deref() != Ok("off") {
-        let hook_version = env!("CARGO_PKG_VERSION");
-        let daemon_version = mcp_client::server_version();
-        let obs = crux_config_wizard::selfcheck::BootObservations {
-            hook_version,
-            daemon_version: daemon_version.as_deref(),
-            sync_reachable: true,
-            sync_degraded,
-            bootstrap_loaded,
-        };
-        if let Some(section) =
-            crux_config_wizard::selfcheck::render_section(&crux_config_wizard::selfcheck::evaluate(&obs))
-        {
+        if let Some(section) = selfcheck_section(sync_degraded, bootstrap_loaded) {
             // Volatile: reflects live daemon/hook state, not stable playbook text.
             sections.push((Stability::Volatile, section));
         }
@@ -541,6 +568,118 @@ fn sync_reports_degraded(result: &Value) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self(keys.iter().map(|key| (*key, std::env::var_os(key))).collect())
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    struct SnapshotMockServer {
+        port: u16,
+        stop: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<std::io::Result<usize>>>,
+    }
+
+    impl SnapshotMockServer {
+        fn spawn(fact_value: String) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_t = Arc::clone(&stop);
+            let handle = std::thread::spawn(move || -> std::io::Result<usize> {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut served = 0usize;
+                while !stop_t.load(Ordering::SeqCst) && served < 2 && Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            // BSD/macOS accepted sockets can inherit the
+                            // listener's nonblocking mode. The mock performs a
+                            // blocking HTTP exchange, so make that explicit.
+                            stream.set_nonblocking(false)?;
+                            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                            stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+                            let mut buf = [0u8; 4096];
+                            if stream.read(&mut buf)? == 0 {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "mock MCP client closed before sending a request",
+                                ));
+                            }
+                            let result = json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": { "structuredContent": { "rows": [{ "key": "writer-session", "value": fact_value }] } }
+                            })
+                            .to_string();
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                result.len(),
+                                result
+                            );
+                            stream.write_all(response.as_bytes())?;
+                            stream.flush()?;
+                            served += 1;
+                        }
+                        Err(ref error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock
+                                    | std::io::ErrorKind::Interrupted
+                                    | std::io::ErrorKind::ConnectionAborted
+                            ) =>
+                        {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(served)
+            });
+            Self {
+                port,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn finish(mut self) -> std::io::Result<usize> {
+            self.stop.store(true, Ordering::SeqCst);
+            self.handle
+                .take()
+                .expect("mock server handle exists")
+                .join()
+                .map_err(|_| std::io::Error::other("mock MCP server thread panicked"))?
+        }
+    }
+
+    impl Drop for SnapshotMockServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
 
     #[test]
     fn empty_stdin_is_handled() {
@@ -921,12 +1060,15 @@ mod tests {
     /// not some unrelated skip (the snapshot IS injected and the mark advances).
     #[test]
     fn fresh_restore_returns_none_when_high_water_advance_fails() {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-
         let _env = crate::test_support::env_guard();
+        // Restore process-global state even if a later assertion panics. The
+        // env mutex remains held until after this guard runs (reverse drop order).
+        let _restore_env = EnvRestore::capture(&[
+            "CRUX_MCP_URL",
+            "CRUX_COMPACTION_SYNC",
+            "CRUX_PASSPORT_KEY_PATH",
+            "CRUX_AGENT_TOKEN",
+        ]);
 
         // Passport key → derive the exact key/scope the mock envelope is sealed under.
         let tmp = tempfile::tempdir().unwrap();
@@ -942,42 +1084,9 @@ mod tests {
         let fact_value = env.to_fact_value().unwrap();
 
         // Mock MCP: answer tools/call with a query_facts-shaped result (one row).
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_t = Arc::clone(&stop);
-        let handle = std::thread::spawn(move || {
-            while !stop_t.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((mut s, _)) => {
-                        let mut buf = [0u8; 4096];
-                        let _ = s.read(&mut buf);
-                        let result = json!({
-                            "jsonrpc": "2.0",
-                            "id": 1,
-                            "result": { "structuredContent": { "rows": [{ "key": "writer-session", "value": fact_value }] } }
-                        })
-                        .to_string();
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            result.len(),
-                            result
-                        );
-                        let _ = s.write_all(resp.as_bytes());
-                        let _ = s.flush();
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::yield_now(),
-                    Err(_) => break,
-                }
-            }
-        });
+        let server = SnapshotMockServer::spawn(fact_value);
 
-        let prev_mcp = std::env::var("CRUX_MCP_URL").ok();
-        let prev_sync = std::env::var("CRUX_COMPACTION_SYNC").ok();
-        let prev_kp = std::env::var("CRUX_PASSPORT_KEY_PATH").ok();
-        let prev_tok = std::env::var("CRUX_AGENT_TOKEN").ok();
-        std::env::set_var("CRUX_MCP_URL", format!("http://127.0.0.1:{port}/mcp"));
+        std::env::set_var("CRUX_MCP_URL", format!("http://127.0.0.1:{}/mcp", server.port));
         std::env::set_var("CRUX_COMPACTION_SYNC", "1");
         std::env::set_var("CRUX_PASSPORT_KEY_PATH", &key_file);
         std::env::remove_var("CRUX_AGENT_TOKEN");
@@ -1016,24 +1125,7 @@ mod tests {
             "a committed advance records the counter"
         );
 
-        // Restore env before joining the server thread.
-        match prev_mcp {
-            Some(v) => std::env::set_var("CRUX_MCP_URL", v),
-            None => std::env::remove_var("CRUX_MCP_URL"),
-        }
-        match prev_sync {
-            Some(v) => std::env::set_var("CRUX_COMPACTION_SYNC", v),
-            None => std::env::remove_var("CRUX_COMPACTION_SYNC"),
-        }
-        match prev_kp {
-            Some(v) => std::env::set_var("CRUX_PASSPORT_KEY_PATH", v),
-            None => std::env::remove_var("CRUX_PASSPORT_KEY_PATH"),
-        }
-        match prev_tok {
-            Some(v) => std::env::set_var("CRUX_AGENT_TOKEN", v),
-            None => std::env::remove_var("CRUX_AGENT_TOKEN"),
-        }
-        stop.store(true, Ordering::SeqCst);
-        let _ = handle.join();
+        let served = server.finish().expect("mock MCP server I/O must succeed");
+        assert_eq!(served, 2, "both restore attempts must reach the mock MCP server");
     }
 }

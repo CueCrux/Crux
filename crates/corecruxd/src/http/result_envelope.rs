@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Signed Result Envelope import endpoint (W2.D2).
 //!
@@ -11,7 +11,8 @@
 //!
 //! - `facts[]`  → `FactStore::try_store_bulk` (the `/v1/facts/bulk` path), with
 //!   `source_receipt` stamped `result-envelope:<job_id>` when absent.
-//! - `entities[]` → `EntityStore::upsert` (the `entity_upsert` surface).
+//! - `entities[]` → `EntityStore::upsert` (the generic `entity_upsert`
+//!   surface); typed-governance kinds are rejected before any write.
 //! - `edges[]`  → `EdgeStore::upsert` (the `edge_upsert` surface).
 //!
 //! Idempotency: keyed on `job_id`. A prior import receipt for the same job whose
@@ -93,6 +94,7 @@ fn verify_status(err: &EnvelopeVerifyError) -> StatusCode {
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_result_envelope_import(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -211,6 +213,29 @@ pub(super) async fn post_result_envelope_import(
         }
     }
 
+    // Validate every caller-selected namespace before applying the first fact.
+    // Result envelopes are signed by a platform key, but that key authorizes
+    // extraction output—not bypassing a daemon's typed governance surfaces.
+    if let Some(entity) = envelope
+        .payload
+        .entities
+        .iter()
+        .find(|entity| crux_mcp::tools::entities::is_governed_entity_kind(&entity.kind))
+    {
+        return crate::problem::ProblemResponse(
+            corecrux_types::ProblemDetails::forbidden(format!(
+                "result envelope entity kind '{}' is governed by its typed API",
+                entity.kind
+            ))
+            .with_extensions(json!({
+                "code": "GOVERNED_ENTITY_KIND",
+                "kind": entity.kind,
+                "entity_id": entity.id,
+            })),
+        )
+        .into_response();
+    }
+
     // ---- 2a) Apply facts via the bulk store path ---------------------------
     let facts_in = &envelope.payload.facts;
     if facts_in.iter().any(|f| f.private) {
@@ -218,6 +243,21 @@ pub(super) async fn post_result_envelope_import(
             StatusCode::BAD_REQUEST,
             "envelope facts must not be private (platform never emits private facts)",
         );
+    }
+    if let Some((fact, prefix)) = facts_in.iter().find_map(|fact| {
+        crate::fact_privacy::generic_create_reserved_entity_prefix(&fact.entity).map(|prefix| (fact, prefix))
+    }) {
+        return crate::problem::ProblemResponse(
+            corecrux_types::ProblemDetails::forbidden(format!(
+                "result envelope fact uses create-reserved prefix `{prefix}`"
+            ))
+            .with_extensions(json!({
+                "code": "RESERVED_ENTITY_PREFIX",
+                "entity": fact.entity,
+                "reserved_prefix": prefix,
+            })),
+        )
+        .into_response();
     }
     let facts_applied = {
         let mut store = state.fact_store.write().await;
@@ -457,6 +497,16 @@ mod tests {
         }
     }
 
+    fn resign_envelope(envelope: &mut ResultEnvelope, signing: &SigningKey) {
+        let content_hash =
+            result_envelope_content_hash(&envelope.payload, &envelope.companion_artifacts).expect("hash");
+        let raw = hex::decode(content_hash.strip_prefix("blake3:").unwrap()).unwrap();
+        let mut hash = [0_u8; 32];
+        hash.copy_from_slice(&raw);
+        envelope.blake3_content_hash = content_hash;
+        envelope.platform_signature.signature = hex::encode(signing.sign(&hash).to_bytes());
+    }
+
     async fn body_json(resp: Response) -> (StatusCode, serde_json::Value) {
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -523,6 +573,71 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let store = state.fact_store.read().await;
         assert!(store.get_by_entity("business::acme::person::ada").is_empty());
+    }
+
+    #[tokio::test]
+    async fn signed_envelope_cannot_import_control_facts_atomically() {
+        let (signing, _guard) = pin_platform_key();
+        let state = test_app_state(8);
+        let mut envelope = build_envelope(&signing, "job_control_forgery");
+        for prefix in corecrux_memory::fact_privacy::DAEMON_OWNED_ENTITY_PREFIXES
+            .iter()
+            .chain(corecrux_memory::fact_privacy::GENERIC_CREATE_RESERVED_PREFIXES)
+        {
+            envelope.payload.facts.push(EnvelopeFact {
+                entity: format!("{prefix}forged"),
+                key: "record".into(),
+                value: "attacker-controlled".into(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+        }
+        resign_envelope(&mut envelope, &signing);
+
+        let resp = post_result_envelope_import(State(state.clone()), HeaderMap::new(), Json(envelope)).await;
+        let (status, body) = body_json(resp).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
+        assert_eq!(body["code"], "RESERVED_ENTITY_PREFIX");
+        assert_eq!(
+            state.fact_store.read().await.count(),
+            0,
+            "the safe leading fact and every control fact must be rejected atomically"
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_envelope_cannot_import_governed_entities_atomically() {
+        let (signing, _guard) = pin_platform_key();
+        let state = test_app_state(8);
+        let mut envelope = build_envelope(&signing, "job_governed_entity_forgery");
+        envelope.payload.entities.push(EnvelopeEntity {
+            kind: "orchestrator".into(),
+            id: "orc_forged".into(),
+            payload: serde_json::json!({
+                "tenant_id": "business::acme",
+                "name": "forged",
+                "created_by_passport": "platform:extraction",
+                "members": [],
+            }),
+        });
+        resign_envelope(&mut envelope, &signing);
+
+        let response = post_result_envelope_import(State(state.clone()), HeaderMap::new(), Json(envelope)).await;
+        let (status, body) = body_json(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
+        assert_eq!(body["code"], "GOVERNED_ENTITY_KIND");
+        assert_eq!(body["kind"], "orchestrator");
+        assert_eq!(
+            state.fact_store.read().await.count(),
+            0,
+            "the safe leading fact and import receipt must not be written"
+        );
+        let entities = state.entity_store.read().await;
+        assert!(entities.get("person", "p_ada").is_none());
+        assert!(entities.get("orchestrator", "orc_forged").is_none());
     }
 
     #[tokio::test]

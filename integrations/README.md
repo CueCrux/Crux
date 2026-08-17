@@ -2,6 +2,13 @@
 
 This folder is the public, PR-reviewable home for community integration packs.
 
+> **Looking for LangChain / LlamaIndex / CrewAI?** Those are *framework
+> adapters*, not packs — thin bindings over `GET /v1/context` that inject Crux
+> memory into an agent framework. They live in
+> [`integrations/adapters/`](adapters/) and follow their own conformance suite.
+> Packs, described below, are signed capability bundles the daemon installs and
+> sandboxes; the two share nothing but this folder.
+
 Community packs live under:
 
 ```text

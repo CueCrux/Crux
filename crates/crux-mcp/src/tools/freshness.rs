@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Freshness + decay MCP tool handlers.
 //!
@@ -115,12 +115,13 @@ pub async fn handle_memory_freshness(args: &Value, ctx: &McpContext) -> Result<V
     let policy = decay::DecayPolicy::from_env();
     let now = Utc::now();
 
+    let tenant_hash = ctx.scope_tenant();
     let store = ctx.fact_store.read().await;
     let mut rows: Vec<Value> = Vec::new();
     let mut used_tokens: usize = 0;
 
     let mut candidates: Vec<&corecrux_memory::Fact> = store
-        .all_facts()
+        .all_facts_for_tenant(&tenant_hash)
         .filter(|f| !f.deleted)
         .filter(|f| scope::fact_visible_to_identity(f, id_ref, &alias_refs))
         .filter(|f| !is_reserved_entity(&f.entity))
@@ -197,13 +198,14 @@ pub async fn handle_memory_sweep_candidates(args: &Value, ctx: &McpContext) -> R
     let policy = decay::DecayPolicy::from_env();
     let now = Utc::now();
 
+    let tenant_hash = ctx.scope_tenant();
     let store = ctx.fact_store.read().await;
 
     // Candidate set: visible, non-deleted, non-reserved facts that are
     // stale OR superseded. Note we deliberately DON'T pre-filter
     // superseded facts (this surface is precisely about surfacing them).
     let mut candidates: Vec<(&corecrux_memory::Fact, decay::Freshness, &'static str)> = store
-        .all_facts()
+        .all_facts_for_tenant(&tenant_hash)
         .filter(|f| !f.deleted)
         .filter(|f| scope::fact_visible_to_identity(f, id_ref, &alias_refs))
         .filter(|f| !is_reserved_entity(&f.entity))
@@ -270,7 +272,7 @@ pub async fn handle_memory_sweep_candidates(args: &Value, ctx: &McpContext) -> R
         // Determine newest stored_at per session-binding entity so we never
         // flag the live binding for a session.
         let mut newest_binding_at: std::collections::HashMap<&str, DateTime<Utc>> = std::collections::HashMap::new();
-        for f in store.all_facts().filter(|f| !f.deleted) {
+        for f in store.all_facts_for_tenant(&tenant_hash).filter(|f| !f.deleted) {
             if f.entity.starts_with("__session_binding__::") {
                 let e = newest_binding_at.entry(f.entity.as_str()).or_insert(f.stored_at);
                 if f.stored_at > *e {
@@ -279,7 +281,7 @@ pub async fn handle_memory_sweep_candidates(args: &Value, ctx: &McpContext) -> R
             }
         }
         let mut ephemeral: Vec<&corecrux_memory::Fact> = store
-            .all_facts()
+            .all_facts_for_tenant(&tenant_hash)
             .filter(|f| !f.deleted)
             .filter(|f| is_ephemeral_reserved_entity(&f.entity))
             .filter(|f| !f.private)
@@ -358,11 +360,12 @@ pub async fn handle_memory_set_horizon(args: &Value, ctx: &McpContext) -> Result
         data: Some(json!({"param": "horizon_class", "allowed": ["volatile", "medium", "stable", "none"]})),
     })?;
 
+    let tenant_hash = ctx.scope_tenant();
     let mut store = ctx.fact_store.write().await;
     // Guard: refuse to set horizon on reserved-prefix entities even with
     // a passport — these are ops/internal state and shouldn't be
     // re-classified by the agent surface.
-    if let Some(f) = store.get(fact_id) {
+    if let Some(f) = store.get_for_tenant(fact_id, &tenant_hash) {
         if is_reserved_entity(&f.entity) {
             return Err(JsonRpcError {
                 code: crate::dispatch::CAPABILITY_DENIED,
@@ -379,7 +382,7 @@ pub async fn handle_memory_set_horizon(args: &Value, ctx: &McpContext) -> Result
             "isError": false,
         }));
     }
-    let ok = store.set_horizon(fact_id, class);
+    let ok = store.set_horizon_for_tenant(&tenant_hash, fact_id, class);
 
     Ok(json!({
         "content": [{
@@ -412,9 +415,10 @@ pub async fn handle_memory_reverify(args: &Value, ctx: &McpContext) -> Result<Va
     let fact_id = require_str(args, "fact_id")?;
     let now = Utc::now();
 
+    let tenant_hash = ctx.scope_tenant();
     let mut store = ctx.fact_store.write().await;
     // Reserved-prefix guard mirrors memory_set_horizon.
-    if let Some(f) = store.get(fact_id) {
+    if let Some(f) = store.get_for_tenant(fact_id, &tenant_hash) {
         if is_reserved_entity(&f.entity) {
             return Err(JsonRpcError {
                 code: crate::dispatch::CAPABILITY_DENIED,
@@ -429,7 +433,7 @@ pub async fn handle_memory_reverify(args: &Value, ctx: &McpContext) -> Result<Va
         }));
     }
 
-    let ok = store.reverify(fact_id, now);
+    let ok = store.reverify_for_tenant(&tenant_hash, fact_id, now);
     if !ok {
         return Ok(json!({
             "content": [{ "type": "text", "text": format!("fact not found: {fact_id}") }],
@@ -450,7 +454,7 @@ pub async fn handle_memory_reverify(args: &Value, ctx: &McpContext) -> Result<Va
         "reverified_at": now.to_rfc3339(),
     });
     let req = corecrux_memory::fact_store::StoreFact {
-        tenant_hash: "default".to_string(),
+        tenant_hash,
         entity: format!("__reverify_receipts__::{fact_id}"),
         key: receipt_id.clone(),
         value: receipt_body.to_string(),
@@ -652,15 +656,22 @@ mod tests {
         handle_store_fact(&json!({"entity": "project-x", "key": "name", "value": "open"}), &ctx)
             .await
             .unwrap();
-        handle_store_fact(&json!({"entity": "__ops::audit", "key": "k", "value": "x"}), &ctx)
-            .await
-            .unwrap();
-        handle_store_fact(
-            &json!({"entity": "__bootstrap__::pat:y", "key": "k", "value": "y"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        {
+            let mut store = ctx.fact_store.write().await;
+            for (entity, value) in [("__ops::audit", "x"), ("__bootstrap__::pat:y", "y")] {
+                store.store(corecrux_memory::fact_store::StoreFact {
+                    tenant_hash: "default".to_string(),
+                    entity: entity.to_string(),
+                    key: "k".to_string(),
+                    value: value.to_string(),
+                    source_receipt: None,
+                    confidence: 1.0,
+                    private: true,
+                    horizon_class: None,
+                    actor: None,
+                });
+            }
+        }
 
         let res = handle_memory_freshness(&json!({"top_k": 50, "token_budget": 1000}), &ctx)
             .await

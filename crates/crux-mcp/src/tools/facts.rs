@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Fact store tool handlers: `store_fact`, `query_facts`, `delete_fact`,
 //! `list_entities`, `get_bootstrap`.
@@ -114,10 +114,10 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
     let entity_raw = require_str(args, "entity")?;
     let key = require_str(args, "key")?;
     let value = require_str(args, "value")?;
-    if let Some(prefix) = corecrux_memory::fact_privacy::daemon_owned_entity_prefix(entity_raw) {
+    if let Some(prefix) = corecrux_memory::fact_privacy::generic_create_reserved_entity_prefix(entity_raw) {
         return Err(JsonRpcError {
             code: INVALID_PARAMS,
-            message: format!("entity uses reserved daemon-owned prefix `{prefix}`"),
+            message: format!("entity uses create-reserved prefix `{prefix}`"),
             data: Some(json!({
                 "error_code": "RESERVED_ENTITY_PREFIX",
                 "param": "entity",
@@ -144,6 +144,33 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
     let scope_id_ref = scope_identity.as_deref();
     let aliases = ctx.scope_aliases();
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
+
+    let supersedes_refs: Vec<String> = match args.get("supersedes") {
+        Some(Value::Array(items)) => {
+            let mut refs = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_str() {
+                    Some(s) => refs.push(s.to_string()),
+                    None => {
+                        return Err(JsonRpcError {
+                            code: INVALID_PARAMS,
+                            message: "supersedes must be an array of fact_id strings".to_string(),
+                            data: Some(json!({"param": "supersedes"})),
+                        });
+                    }
+                }
+            }
+            refs
+        }
+        Some(Value::Null) | None => Vec::new(),
+        Some(_) => {
+            return Err(JsonRpcError {
+                code: INVALID_PARAMS,
+                message: "supersedes must be an array of fact_id strings".to_string(),
+                data: Some(json!({"param": "supersedes"})),
+            });
+        }
+    };
 
     // Freshness horizon (M4): an explicit `horizon_class` always wins; if
     // absent, parse the operator's free-text `freshness_horizon` line; if
@@ -205,7 +232,7 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
     };
 
     let mut req = StoreFact {
-        tenant_hash: tenant_hash_for_write_context(ctx),
+        tenant_hash: ctx.scope_tenant(),
         entity,
         key: key.to_string(),
         value: value.to_string(),
@@ -254,6 +281,63 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
         }
     }
 
+    // Validate every cross-entity retirement before the new fact is stored.
+    // This keeps the operation atomic on bad references and prevents a generic
+    // writer from retiring a legacy daemon control row by fact_id.
+    let tenant_hash = ctx.scope_tenant();
+    let mut bad_refs = Vec::new();
+    let mut reserved_refs = Vec::new();
+    let mut consolidation_refs = Vec::new();
+    for fact_id in &supersedes_refs {
+        match store.get_for_tenant(fact_id, &tenant_hash) {
+            Some(target) if scope::fact_visible_to_identity(target, scope_id_ref, &alias_refs) => {
+                if store.is_active_consolidation_source_for_tenant(fact_id, &tenant_hash) {
+                    consolidation_refs.push(fact_id.clone());
+                    continue;
+                }
+                let policy_entity = scope::visible_entity_for_identity(target, scope_id_ref, &alias_refs)
+                    .unwrap_or_else(|| target.entity.clone());
+                if let Some(prefix) = corecrux_memory::fact_privacy::daemon_owned_entity_prefix(&policy_entity) {
+                    reserved_refs.push(json!({
+                        "fact_id": fact_id,
+                        "entity": policy_entity,
+                        "reserved_prefix": prefix,
+                    }));
+                }
+            }
+            _ => bad_refs.push(fact_id.clone()),
+        }
+    }
+    if !consolidation_refs.is_empty() {
+        return Err(JsonRpcError {
+            code: crate::dispatch::CAPABILITY_DENIED,
+            message: "active consolidation source edges are immutable until dedicated undo".to_string(),
+            data: Some(json!({
+                "error_code": "CONSOLIDATION_SOURCE_REQUIRES_UNDO",
+                "param": "supersedes",
+                "fact_ids": consolidation_refs,
+            })),
+        });
+    }
+    if !reserved_refs.is_empty() {
+        return Err(JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "daemon-owned control facts cannot be superseded through store_fact".to_string(),
+            data: Some(json!({
+                "error_code": "RESERVED_SUPERSEDES_TARGET",
+                "param": "supersedes",
+                "reserved_refs": reserved_refs,
+            })),
+        });
+    }
+    if !bad_refs.is_empty() {
+        return Err(JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "one or more supersedes fact_ids do not exist or are not visible to you".to_string(),
+            data: Some(json!({"param": "supersedes", "invalid_refs": bad_refs})),
+        });
+    }
+
     corecrux_memory::fact_privacy::enforce_global(&mut req);
     let fact = store.try_store(req).map_err(|err| JsonRpcError {
         code: INTERNAL_ERROR,
@@ -261,72 +345,12 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
         data: Some(json!({"error": err.to_string()})),
     })?;
 
-    // M6 cross-entity supersession: if `supersedes` named existing fact_ids,
-    // EXPLICITLY retire each one (reversible soft-state) now that the new
-    // fact has a stable id. Every referenced fact MUST exist AND be visible
-    // to the caller (T.1 no cross-tenant retirement; T.3 passport-attributed
-    // write). We do NOT silently skip bad refs — we collect them and reject
-    // the whole batch with a clear error so the caller knows what failed.
-    // The new fact itself is already persisted; the supersession marks are
-    // additive soft-state, so a rejection here leaves the store consistent
-    // (target facts unchanged) and the new fact simply doesn't retire
-    // anything.
-    let supersedes_refs: Vec<String> = match args.get("supersedes") {
-        Some(Value::Array(items)) => {
-            let mut refs = Vec::with_capacity(items.len());
-            for item in items {
-                match item.as_str() {
-                    Some(s) => refs.push(s.to_string()),
-                    None => {
-                        return Err(JsonRpcError {
-                            code: INVALID_PARAMS,
-                            message: "supersedes must be an array of fact_id strings".to_string(),
-                            data: Some(json!({"param": "supersedes"})),
-                        });
-                    }
-                }
-            }
-            refs
-        }
-        Some(Value::Null) | None => Vec::new(),
-        Some(_) => {
-            return Err(JsonRpcError {
-                code: INVALID_PARAMS,
-                message: "supersedes must be an array of fact_id strings".to_string(),
-                data: Some(json!({"param": "supersedes"})),
-            });
-        }
-    };
-
+    // M6 cross-entity supersession: all references were validated under this
+    // same write lock before the new fact was persisted.
     let mut superseded_ok: Vec<String> = Vec::new();
     if !supersedes_refs.is_empty() {
-        // First pass: validate every ref is visible + exists. Reject the
-        // whole batch before mutating so a single bad ref can't leave a
-        // partial retirement.
-        let mut bad: Vec<String> = Vec::new();
         for r in &supersedes_refs {
-            if r == &fact.fact_id {
-                bad.push(r.clone());
-                continue;
-            }
-            match store.get(r) {
-                // T.1: you can only supersede a fact you can SEE. Uses the M5
-                // identity-scoped visibility (flag-off it reduces to the raw
-                // agent_name check, since identity == name and aliases empty).
-                Some(target) if scope::fact_visible_to_identity(target, scope_id_ref, &alias_refs) => {}
-                _ => bad.push(r.clone()),
-            }
-        }
-        if !bad.is_empty() {
-            return Err(JsonRpcError {
-                code: INVALID_PARAMS,
-                message: "one or more supersedes fact_ids do not exist or are not visible to you".to_string(),
-                data: Some(json!({"param": "supersedes", "invalid_refs": bad})),
-            });
-        }
-        // Second pass: all refs validated — apply the retirement.
-        for r in &supersedes_refs {
-            if store.mark_superseded(r, &fact.fact_id) {
+            if store.mark_superseded(&tenant_hash, r, &fact.fact_id) {
                 superseded_ok.push(r.clone());
             }
         }
@@ -363,14 +387,6 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
     }))
 }
 
-/// Resolve the trusted tenant stamp for an MCP write.
-///
-/// Authenticated MCP context has no tenant claim yet, so current deployments
-/// resolve to `default`. When one is added, only this helper needs to change.
-fn tenant_hash_for_write_context(_ctx: &McpContext) -> String {
-    corecrux_memory::fact_store::default_tenant_hash()
-}
-
 /// `fact_history` — return the full version chain for a given (entity, key) pair.
 pub async fn handle_fact_history(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let entity = require_str(args, "entity")?;
@@ -380,8 +396,9 @@ pub async fn handle_fact_history(args: &Value, ctx: &McpContext) -> Result<Value
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
 
     let store = ctx.fact_store.read().await;
+    let tenant_hash = ctx.scope_tenant();
     let mut history: Vec<&Fact> = store
-        .all_facts()
+        .all_facts_for_tenant(&tenant_hash)
         .filter(|fact| fact.key == key)
         .filter(|fact| scope::entity_matches_for_identity(fact, entity, id_ref, &alias_refs))
         .filter(|fact| scope::fact_visible_to_identity(fact, id_ref, &alias_refs))
@@ -480,7 +497,7 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     let reversible = !unshaped && token_budget.is_some() && crate::crc_v1::enabled(args);
     let q = FactQuery {
         min_effective_confidence,
-        tenant_hash: None,
+        tenant_hash: Some(ctx.scope_tenant()),
         // cloned so `query`/`entity` remain available for the CRC-v1 reshape below
         query: query.clone(),
         entity: entity.clone(),
@@ -619,11 +636,44 @@ pub async fn handle_delete_fact(args: &Value, ctx: &McpContext) -> Result<Value,
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
 
     let mut store = ctx.fact_store.write().await;
-    let deleted = store
-        .get(fact_id)
-        // T.1: you can only delete a fact you can SEE (identity-scoped).
-        .is_some_and(|fact| scope::fact_visible_to_identity(fact, id_ref, &alias_refs))
-        && store.try_delete(fact_id).map_err(|err| JsonRpcError {
+    let tenant_hash = ctx.scope_tenant();
+    let existing = store.get_for_tenant(fact_id, &tenant_hash);
+    let visible_fact = existing.filter(|fact| scope::fact_visible_to_identity(fact, id_ref, &alias_refs));
+    let policy_entity = visible_fact.and_then(|fact| {
+        if fact.entity.starts_with(crate::scope::AGENT_PRIVATE_ENTITY_PREFIX) {
+            scope::visible_entity_for_identity(fact, id_ref, &alias_refs)
+        } else {
+            Some(fact.entity.clone())
+        }
+    });
+    if let Some((entity, prefix)) = policy_entity.as_deref().and_then(|entity| {
+        corecrux_memory::fact_privacy::daemon_owned_entity_prefix(entity).map(|prefix| (entity, prefix))
+    }) {
+        return Err(JsonRpcError {
+            code: crate::dispatch::CAPABILITY_DENIED,
+            message: format!("fact belongs to reserved daemon-owned prefix `{prefix}`"),
+            data: Some(json!({
+                "error_code": "RESERVED_ENTITY_PREFIX",
+                "fact_id": fact_id,
+                "entity": entity,
+                "reserved_prefix": prefix,
+            })),
+        });
+    }
+    if visible_fact.is_some() && store.is_consolidation_canonical_for_tenant(fact_id, &tenant_hash) {
+        return Err(JsonRpcError {
+            code: crate::dispatch::CAPABILITY_DENIED,
+            message: format!(
+                "fact {fact_id} is a consolidation canonical; use the dedicated consolidation undo surface"
+            ),
+            data: Some(json!({
+                "error_code": "CONSOLIDATION_CANONICAL_REQUIRES_UNDO",
+                "fact_id": fact_id,
+            })),
+        });
+    }
+    let deleted = visible_fact.is_some()
+        && store.try_delete(&tenant_hash, fact_id).map_err(|err| JsonRpcError {
             code: INTERNAL_ERROR,
             message: "fact journal append failed".to_string(),
             data: Some(json!({"error": err.to_string()})),
@@ -654,7 +704,7 @@ pub async fn handle_list_entities(_args: &Value, ctx: &McpContext) -> Result<Val
     let id_ref = identity.as_deref();
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
     let entities: Vec<String> = store
-        .all_facts()
+        .all_facts_for_tenant(&ctx.scope_tenant())
         .filter(|fact| !fact.deleted)
         .filter_map(|fact| scope::visible_entity_for_identity(fact, id_ref, &alias_refs))
         .collect::<BTreeSet<_>>()
@@ -1091,7 +1141,7 @@ mod tests {
     async fn store_fact_born_private_reserved_prefix() {
         let ctx = test_ctx();
         let result = handle_store_fact(
-            &json!({"entity": "__passport__::victim", "key": "record", "value": "x"}),
+            &json!({"entity": "github::CueCrux/Crux::issue/1", "key": "record", "value": "x"}),
             &ctx,
         )
         .await
@@ -1104,19 +1154,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_fact_passport_rejects_daemon_owned_entity_prefixes() {
+    async fn store_fact_passport_rejects_every_create_reserved_entity_prefix() {
         let map = crate::agent_passport::AgentPassportMap::builtin_default();
         let ctx = test_ctx().with_agent_passports(true, map).with_agent(AgentIdentity {
             name: "openai".to_string(),
             token_hash: [7u8; 32],
         });
         seed_passport(&ctx, "codex-work", "work").await;
+        let before_ids: std::collections::BTreeSet<String> = ctx
+            .fact_store
+            .read()
+            .await
+            .all_facts()
+            .map(|fact| fact.fact_id.clone())
+            .collect();
 
-        for entity in [
-            "__legal_hold__::hold-1",
-            "__legal_hold_receipt__::receipt-1",
-            "__incident__::incident-1",
-        ] {
+        for prefix in corecrux_memory::fact_privacy::DAEMON_OWNED_ENTITY_PREFIXES
+            .iter()
+            .chain(corecrux_memory::fact_privacy::GENERIC_CREATE_RESERVED_PREFIXES)
+        {
+            let entity = format!("{prefix}attacker");
             let err = handle_store_fact(&json!({"entity": entity, "key": "state", "value": "attacker"}), &ctx)
                 .await
                 .unwrap_err();
@@ -1125,16 +1182,20 @@ mod tests {
                 err.data.as_ref().and_then(|data| data["error_code"].as_str()),
                 Some("RESERVED_ENTITY_PREFIX")
             );
-            assert_eq!(err.data.as_ref().and_then(|data| data["entity"].as_str()), Some(entity));
+            assert_eq!(
+                err.data.as_ref().and_then(|data| data["entity"].as_str()),
+                Some(entity.as_str())
+            );
         }
 
-        let store = ctx.fact_store.read().await;
-        assert!(
-            store
-                .all_facts()
-                .all(|fact| corecrux_memory::fact_privacy::daemon_owned_entity_prefix(&fact.entity).is_none()),
-            "client attempts must not persist daemon-owned facts"
-        );
+        let after_ids: std::collections::BTreeSet<String> = ctx
+            .fact_store
+            .read()
+            .await
+            .all_facts()
+            .map(|fact| fact.fact_id.clone())
+            .collect();
+        assert_eq!(after_ids, before_ids, "client attempts must not persist any facts");
     }
 
     #[tokio::test]
@@ -1283,13 +1344,12 @@ mod tests {
 
     // ── agent-passport M3: attribution surfaced on read ────────────────
 
-    /// Two distinct actors (claude-work, codex-work) write facts via the
-    /// flag-ON path; a third writes with the flag OFF (legacy actor=None).
-    /// `query_facts` rows must carry the correct `actor` per fact, and the
-    /// legacy fact must show `actor: null`. Shared visibility is intact —
-    /// all three non-private facts are visible from a single shared read.
+    /// Two distinct actors (claude-work, codex-work) write facts into their
+    /// shared `work` tenant via the flag-ON path; a third writes with the flag
+    /// OFF into `default` (legacy actor=None). `query_facts` rows must carry
+    /// the correct actor without crossing the tenant boundary.
     #[tokio::test]
-    async fn query_facts_rows_carry_actor_per_writer_and_null_for_legacy() {
+    async fn query_facts_rows_carry_actor_and_preserve_tenant_isolation() {
         let map = crate::agent_passport::AgentPassportMap::builtin_default();
 
         // Shared base context (single fact store, Arc-shared by every
@@ -1342,8 +1402,9 @@ mod tests {
         .await
         .unwrap();
 
-        // Single shared read sees all three (shared visibility intact).
-        let res = handle_query_facts(&json!({"query": "needle", "token_budget": 500}), &base)
+        // A work-tenant read sees both attributed collaborators, but not the
+        // legacy fact in `default`.
+        let res = handle_query_facts(&json!({"query": "needle", "token_budget": 500}), &claude)
             .await
             .unwrap();
         let rows = res["structuredContent"]["rows"].as_array().unwrap();
@@ -1357,11 +1418,17 @@ mod tests {
 
         assert_eq!(actor_for("needle-claude"), json!("claude-work"));
         assert_eq!(actor_for("needle-codex"), json!("codex-work"));
-        // Legacy fact: actor serialized as JSON null.
-        assert_eq!(actor_for("needle-legacy"), Value::Null);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row["value"] != "needle-legacy"));
 
-        // Shared visibility re-confirmed: all three present from one read.
-        assert_eq!(rows.len(), 3);
+        // The legacy/default read sees only its own fact, with actor null.
+        let res = handle_query_facts(&json!({"query": "needle", "token_budget": 500}), &base)
+            .await
+            .unwrap();
+        let rows = res["structuredContent"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["value"], "needle-legacy");
+        assert_eq!(rows[0]["actor"], Value::Null);
     }
 
     #[tokio::test]
@@ -1496,6 +1563,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_fact_hides_invisible_control_record() {
+        let ctx = test_ctx();
+        let fact_id = {
+            let mut store = ctx.fact_store.write().await;
+            store
+                .store(StoreFact {
+                    tenant_hash: "default".to_string(),
+                    entity: "__passport__::victim".to_string(),
+                    key: "record".to_string(),
+                    value: "trusted".to_string(),
+                    source_receipt: None,
+                    confidence: 1.0,
+                    private: true,
+                    horizon_class: None,
+                    actor: None,
+                })
+                .fact_id
+        };
+
+        let result = handle_delete_fact(&json!({"fact_id": fact_id}), &ctx)
+            .await
+            .expect("hidden records use not-found behavior");
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("fact not found"));
+        assert!(!ctx.fact_store.read().await.get(&fact_id).unwrap().deleted);
+    }
+
+    #[tokio::test]
+    async fn delete_fact_rejects_visible_wrapped_control_record() {
+        let ctx = test_ctx();
+        let alice = ctx.with_agent(AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+        let fact_id = {
+            let mut store = ctx.fact_store.write().await;
+            store
+                .store(StoreFact {
+                    tenant_hash: "default".to_string(),
+                    entity: "__agent::alice::__passport__::victim".to_string(),
+                    key: "record".to_string(),
+                    value: "trusted".to_string(),
+                    source_receipt: None,
+                    confidence: 1.0,
+                    private: true,
+                    horizon_class: None,
+                    actor: None,
+                })
+                .fact_id
+        };
+
+        let err = handle_delete_fact(&json!({"fact_id": fact_id}), &alice)
+            .await
+            .expect_err("generic delete must not mutate logical control records");
+        assert_eq!(err.code, crate::dispatch::CAPABILITY_DENIED);
+        assert_eq!(
+            err.data.as_ref().and_then(|data| data["error_code"].as_str()),
+            Some("RESERVED_ENTITY_PREFIX")
+        );
+        assert!(!ctx.fact_store.read().await.get(&fact_id).unwrap().deleted);
+    }
+
+    #[tokio::test]
     async fn delete_fact_missing_param() {
         let ctx = test_ctx();
         let err = handle_delete_fact(&json!({}), &ctx).await.unwrap_err();
@@ -1580,25 +1712,32 @@ mod tests {
     #[tokio::test]
     async fn get_bootstrap_returns_matching_facts() {
         let ctx = test_ctx();
-        // Store bootstrap facts.
-        handle_store_fact(
-            &json!({"entity": "__bootstrap__::pattern:retry", "key": "Retry Pattern", "value": "exponential backoff"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
-        handle_store_fact(
-            &json!({"entity": "__bootstrap__::resolution:oom", "key": "OOM Recovery", "value": "increase memory"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
-        handle_store_fact(
-            &json!({"entity": "__bootstrap__::doc:onboarding", "key": "Human-Assisted Integration", "value": "share the HTTP and MCP endpoints with the operator"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        // Bootstrap knowledge is seeded by the owning daemon workflow, not
+        // through the generic store_fact boundary.
+        {
+            let mut store = ctx.fact_store.write().await;
+            for (entity, key, value) in [
+                ("__bootstrap__::pattern:retry", "Retry Pattern", "exponential backoff"),
+                ("__bootstrap__::resolution:oom", "OOM Recovery", "increase memory"),
+                (
+                    "__bootstrap__::doc:onboarding",
+                    "Human-Assisted Integration",
+                    "share the HTTP and MCP endpoints with the operator",
+                ),
+            ] {
+                store.store(StoreFact {
+                    tenant_hash: "default".to_string(),
+                    entity: entity.to_string(),
+                    key: key.to_string(),
+                    value: value.to_string(),
+                    source_receipt: None,
+                    confidence: 1.0,
+                    private: true,
+                    horizon_class: None,
+                    actor: Some("daemon:bootstrap".to_string()),
+                });
+            }
+        }
         // Non-bootstrap fact should not appear.
         handle_store_fact(&json!({"entity": "project", "key": "name", "value": "CueCrux"}), &ctx)
             .await
@@ -2126,6 +2265,7 @@ mod tests {
         // The valid ref was NOT marked — whole batch rejected, no partial state.
         let store = ctx.fact_store.read().await;
         assert!(store.get(&real_id).unwrap().superseded_by.is_none());
+        assert!(store.get_by_entity("e2").is_empty());
     }
 
     #[tokio::test]
@@ -2163,6 +2303,93 @@ mod tests {
         // Alice's fact is untouched.
         let store = ctx.fact_store.read().await;
         assert!(store.get(&secret_id).unwrap().superseded_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn store_fact_cannot_supersede_visible_wrapped_daemon_control_fact() {
+        let ctx = test_ctx();
+        let alice = ctx.with_agent(AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+        let control = {
+            let mut store = ctx.fact_store.write().await;
+            store.store(StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "__agent::alice::__passport__::control-record".to_string(),
+                key: "state".to_string(),
+                value: "trusted".to_string(),
+                source_receipt: Some("test:typed-daemon-workflow".to_string()),
+                confidence: 1.0,
+                private: true,
+                horizon_class: None,
+                actor: Some("daemon:test".to_string()),
+            })
+        };
+
+        let err = handle_store_fact(
+            &json!({
+                "entity": "safe-new-fact",
+                "key": "state",
+                "value": "attacker-controlled",
+                "supersedes": [control.fact_id],
+            }),
+            &alice,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(err.data.as_ref().unwrap()["error_code"], "RESERVED_SUPERSEDES_TARGET");
+
+        let store = ctx.fact_store.read().await;
+        assert!(store.get(&control.fact_id).unwrap().superseded_by.is_none());
+        assert!(
+            store.get_by_entity("safe-new-fact").is_empty(),
+            "invalid supersession must reject the new write atomically"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_fact_can_supersede_own_ordinary_private_fact() {
+        let ctx = test_ctx();
+        let alice = ctx.with_agent(AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+        let original = handle_store_fact(
+            &json!({
+                "entity": "notes",
+                "key": "state",
+                "value": "draft",
+                "private": true,
+            }),
+            &alice,
+        )
+        .await
+        .unwrap();
+        let original_id = fact_id_of(&original);
+
+        handle_store_fact(
+            &json!({
+                "entity": "notes-v2",
+                "key": "state",
+                "value": "final",
+                "private": true,
+                "supersedes": [original_id],
+            }),
+            &alice,
+        )
+        .await
+        .expect("owner can supersede an ordinary private fact");
+
+        assert!(ctx
+            .fact_store
+            .read()
+            .await
+            .get(&original_id)
+            .unwrap()
+            .superseded_by
+            .is_some());
     }
 
     #[tokio::test]

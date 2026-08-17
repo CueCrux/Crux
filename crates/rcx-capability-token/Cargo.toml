@@ -4,7 +4,7 @@ publish.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "RCX Capability Token v1.0 schema, canonical bytes, and validation result types."
+description = "RCX Capability Token schema, canonical bytes, strict verification, and one-hop PoP delegation."
 
 [dependencies]
 blake3 = { workspace = true }
@@ -15,6 +15,7 @@ serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 proptest = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! `/v1/observe/*` — agent audit-chain surface (observe plan).
 //!
@@ -271,6 +271,7 @@ fn redact_output_refs(redactor: &Redactor, outputs: &mut [TraceOutput]) {
 /// Mints the monotonic `seq`, stamps `status = running`, and persists a new
 /// `agent_trace_node`. The body supplies the opening facts (label, actor,
 /// inputs, …); the response is the stored node.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn open_step(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -336,6 +337,7 @@ pub(super) async fn open_step(
 /// mutating outputs that didn't carry their own, and stamps the step-level
 /// `receipt_id` from `mutation_receipt_id` when none was supplied — so a
 /// close that names one receipt yields a chain that passes `receipt_chain_ok`.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn close_step(
     State(state): State<AppState>,
     Path((session_id, node_id)): Path<(String, String)>,
@@ -429,6 +431,7 @@ fn apply_close(node: &mut TraceNode, mut body: CloseStepBody) {
 
 /// `GET /v1/observe/sessions/{id}/audit` — return the ordered audit chain for
 /// one session, reconstructed from the `agent_trace_node` substrate.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_session_audit(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -479,6 +482,7 @@ struct ReceiptVerification {
 /// rather than failing the export. The bundle's `conformance` block carries
 /// the contract-level gate (`receipt_chain_ok` etc.) which does not require a
 /// live dataplane.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_session_audit_export(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -647,6 +651,7 @@ fn conformance_report(nodes: &[TraceNode]) -> ConformanceReport {
 
 /// `GET /v1/observe/sessions/{id}/audit/conformance` — assert the three M6
 /// gates across the session, enumerating every failure.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_session_audit_conformance(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -667,15 +672,17 @@ pub(super) async fn get_session_audit_conformance(
 
 // ── Tests ────────────────────────────────────────────────────────────────
 
-// Handler tests toggle the process-global `CORECRUXD_OBSERVE` env var, so they
-// serialise through a module mutex. Pure-logic tests (`apply_close`,
-// `conformance_report`) need no env and run unguarded. Tests assert against
-// hand-written values; expect/unwrap are panic-by-design here.
+// Env-sensitive tests take both the module mutex and serial_test's process-wide
+// lock. The latter also excludes config tests that clear every CORECRUXD_* var.
+// Pure-logic tests (`apply_close`, `conformance_report`) need no env and run
+// unguarded. Tests assert against hand-written values; expect/unwrap are
+// panic-by-design here.
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::http::tests::test_app_state;
+    use crate::test_support::EnvVarGuard;
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
     use axum::Router;
@@ -683,7 +690,8 @@ mod tests {
     use std::sync::Mutex;
     use tower::ServiceExt;
 
-    /// Serialises env-mutating handler tests (CORECRUXD_OBSERVE is process-global).
+    /// Serialises observe env mutations inside this module; `serial_test` also
+    /// excludes env-mutating tests in other modules.
     static OBSERVE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn router(state: AppState) -> Router {
@@ -875,9 +883,10 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn apply_close_redacts_output_secret_before_chaining() {
-        let _guard = OBSERVE_ENV_LOCK.lock().unwrap();
-        std::env::set_var("CORECRUXD_OBSERVE_REDACT", "on");
+        let _guard = OBSERVE_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvVarGuard::set("CORECRUXD_OBSERVE_REDACT", "on");
         let mut node = running_node("n1", 1);
         let body = CloseStepBody {
             outputs: vec![TraceOutput {
@@ -892,7 +901,6 @@ mod tests {
             ..Default::default()
         };
         apply_close(&mut node, body);
-        std::env::remove_var("CORECRUXD_OBSERVE_REDACT");
         let stored = &node.outputs[0].reference;
         assert!(!stored.contains(AWS_KEY), "secret welded into node: {stored}");
         assert!(stored.contains("REDACTED"));
@@ -907,8 +915,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn observe_redact_mode_defaults_on_and_parses_overrides() {
-        let _guard = OBSERVE_ENV_LOCK.lock().unwrap();
-        std::env::remove_var("CORECRUXD_OBSERVE_REDACT");
+        let _guard = OBSERVE_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvVarGuard::unset("CORECRUXD_OBSERVE_REDACT");
         assert_eq!(
             observe_redact_mode(),
             RedactMode::On,
@@ -920,15 +928,15 @@ mod tests {
         assert_eq!(observe_redact_mode(), RedactMode::Audit);
         std::env::set_var("CORECRUXD_OBSERVE_REDACT", "garbage");
         assert_eq!(observe_redact_mode(), RedactMode::On, "unknown values fail safe to On");
-        std::env::remove_var("CORECRUXD_OBSERVE_REDACT");
     }
 
     // ── Handler: gating ───────────────────────────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn audit_501_when_observe_disabled() {
-        let _guard = OBSERVE_ENV_LOCK.lock().unwrap();
-        std::env::remove_var("CORECRUXD_OBSERVE");
+        let _guard = OBSERVE_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvVarGuard::unset("CORECRUXD_OBSERVE");
         let state = test_app_state(1);
         let resp = router(state)
             .oneshot(
@@ -945,9 +953,10 @@ mod tests {
     // ── Handler: open → reconstruct → close → reconstruct round-trip ──────
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn open_close_reconstruct_roundtrip() {
-        let _guard = OBSERVE_ENV_LOCK.lock().unwrap();
-        std::env::set_var("CORECRUXD_OBSERVE", "1");
+        let _guard = OBSERVE_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvVarGuard::set("CORECRUXD_OBSERVE", "1");
         let state = test_app_state(1);
         crate::agentgraph_kinds::bootstrap(&mut *state.kind_registry.write().await).expect("bootstrap kinds");
         let app = router(state);
@@ -989,6 +998,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
         let audit = json_body(resp).await;
         assert_eq!(audit["steps"].as_array().unwrap().len(), 1);
         assert_eq!(audit["steps"][0]["status"], "running");
@@ -1026,6 +1036,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
         let audit = json_body(resp).await;
         assert_eq!(audit["steps"][0]["status"], "ok");
         assert_eq!(audit["steps"][0]["receipt_id"], "crn_abc");
@@ -1042,6 +1053,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
         let conf = json_body(resp).await;
         assert_eq!(conf["ok"], true);
         assert_eq!(conf["steps_total"], 1);
@@ -1057,20 +1069,20 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
         let bundle = json_body(resp).await;
         assert_eq!(bundle["schema"], "crux.observe.audit_export.v1");
         assert_eq!(bundle["receipts"].as_array().unwrap().len(), 1);
         assert_eq!(bundle["dataplane_verification_available"], false);
         assert_eq!(bundle["receipts"][0]["verified"], false);
         assert_eq!(bundle["receipts"][0]["reason"], "dataplane disabled");
-
-        std::env::remove_var("CORECRUXD_OBSERVE");
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn seq_is_monotonic_per_session() {
-        let _guard = OBSERVE_ENV_LOCK.lock().unwrap();
-        std::env::set_var("CORECRUXD_OBSERVE", "1");
+        let _guard = OBSERVE_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvVarGuard::set("CORECRUXD_OBSERVE", "1");
         let state = test_app_state(1);
         crate::agentgraph_kinds::bootstrap(&mut *state.kind_registry.write().await).expect("bootstrap kinds");
         let app = router(state);
@@ -1091,17 +1103,18 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
             let v = json_body(resp).await;
             seqs.push(v["node"]["seq"].as_u64().unwrap());
         }
         assert_eq!(seqs, vec![1, 2, 3], "seq must be monotonic per session");
-        std::env::remove_var("CORECRUXD_OBSERVE");
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn open_rejects_blank_actor() {
-        let _guard = OBSERVE_ENV_LOCK.lock().unwrap();
-        std::env::set_var("CORECRUXD_OBSERVE", "1");
+        let _guard = OBSERVE_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvVarGuard::set("CORECRUXD_OBSERVE", "1");
         let state = test_app_state(1);
         crate::agentgraph_kinds::bootstrap(&mut *state.kind_registry.write().await).expect("bootstrap kinds");
         let app = router(state);
@@ -1118,13 +1131,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        std::env::remove_var("CORECRUXD_OBSERVE");
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn close_unknown_node_is_404() {
-        let _guard = OBSERVE_ENV_LOCK.lock().unwrap();
-        std::env::set_var("CORECRUXD_OBSERVE", "1");
+        let _guard = OBSERVE_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvVarGuard::set("CORECRUXD_OBSERVE", "1");
         let state = test_app_state(1);
         crate::agentgraph_kinds::bootstrap(&mut *state.kind_registry.write().await).expect("bootstrap kinds");
         let app = router(state);
@@ -1140,6 +1153,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        std::env::remove_var("CORECRUXD_OBSERVE");
     }
 }

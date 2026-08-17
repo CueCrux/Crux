@@ -65,5 +65,20 @@ When making user-facing changes, add an entry to the `[Unreleased]` section of `
 
 ## Licence
 
-By contributing, you agree that your contributions will be licensed under the
-CueCrux Community Licence (CCL v1.0). See [LICENCE.md](LICENCE.md) for details.
+Crux Daemon is licensed under the Apache License, Version 2.0. Contributions are
+inbound=outbound: by submitting a contribution you agree it is licensed under
+Apache-2.0, per section 5 of the licence ("Submission of Contributions"), and you
+confirm you have the right to submit it. There is no separate CLA to sign, and
+you keep your own copyright. See [LICENSE](LICENSE) for details.
+
+New source files should carry the standard header:
+
+```rust
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
+```
+
+`./scripts/check-licence-headers.sh` enforces this on every `.rs` under `crates/`
+and runs in CI.

@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Readable/editable memory tool handlers (agent-ux-01).
 //!
@@ -12,7 +12,7 @@
 //!
 //! Reserved-prefix entities (`__agent::*`, `__ops::*`, `__bootstrap__::*`,
 //! plus the new `__memory_pin::*` family) are NEVER returned from these
-//! tools. They remain operator-only via `store_fact`/`query_facts`.
+//! tools. They remain operator-only via their owning typed daemon workflows.
 //!
 //! Feature flag: `CORECRUXD_FEATURE_MEMORY_PANEL` is ON by default (opt-out)
 //! at the daemon layer. Set it to `0`/`false`/`off`/`no` to short-circuit
@@ -21,8 +21,7 @@
 //!
 //! Rationale (agent-ux-01): host IDEs and the upcoming console memory panel
 //! need a "consumer-shaped" view of the fact store that is safe to render
-//! without exposing operator-only entities. The raw `store_fact` /
-//! `query_facts` surface stays unchanged for operators; the four tools here
+//! without exposing operator-only entities. The four tools here
 //! (`memory_view`, `memory_edit`, `memory_pin`, `memory_history`) layer
 //! pagination, reserved-prefix filtering, receipt attribution, and pin state
 //! on top, so a UI can show a coherent narrative without the agent having to
@@ -79,7 +78,8 @@ fn memory_panel_enabled() -> bool {
 }
 
 fn entity_is_reserved(entity: &str) -> bool {
-    RESERVED_ENTITY_PREFIXES.iter().any(|p| entity.starts_with(p))
+    corecrux_memory::fact_privacy::daemon_owned_entity_prefix(entity).is_some()
+        || RESERVED_ENTITY_PREFIXES.iter().any(|p| entity.starts_with(p))
 }
 
 /// Identity-scoped memory-panel visibility (agent-passport M5).
@@ -179,9 +179,10 @@ pub async fn handle_memory_view(args: &Value, ctx: &McpContext) -> Result<Value,
     let aliases = ctx.scope_aliases();
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
 
+    let tenant_hash = ctx.scope_tenant();
     let q = FactQuery {
         min_effective_confidence: None,
-        tenant_hash: None,
+        tenant_hash: Some(tenant_hash.clone()),
         query: None,
         entity: entity.clone(),
         entity_prefix: None,
@@ -191,7 +192,7 @@ pub async fn handle_memory_view(args: &Value, ctx: &McpContext) -> Result<Value,
 
     let store = ctx.fact_store.read().await;
     let mut visible: Vec<Fact> = store
-        .all_facts()
+        .all_facts_for_tenant(&tenant_hash)
         .filter(|fact| fact_visible_in_memory_panel_id(fact, id_ref, &alias_refs))
         .filter(|fact| match &q.entity {
             Some(want) => scope::visible_entity_for_identity(fact, id_ref, &alias_refs)
@@ -240,7 +241,7 @@ pub async fn handle_memory_view(args: &Value, ctx: &McpContext) -> Result<Value,
     let pinned_ids: std::collections::HashSet<String> = if let Some(prefix) = &pin_prefix {
         let mut latest: std::collections::HashMap<String, (chrono::DateTime<chrono::Utc>, bool)> =
             std::collections::HashMap::new();
-        for f in store.all_facts() {
+        for f in store.all_facts_for_tenant(&tenant_hash) {
             if f.deleted || !f.entity.starts_with(prefix) || f.key != "pinned" {
                 continue;
             }
@@ -335,13 +336,17 @@ pub async fn handle_memory_edit(args: &Value, ctx: &McpContext) -> Result<Value,
     let id_ref = identity.as_deref();
     let aliases = ctx.scope_aliases();
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
+    let tenant_hash = ctx.scope_tenant();
 
     let mut store = ctx.fact_store.write().await;
-    let existing = store.get(fact_id).cloned().ok_or_else(|| JsonRpcError {
-        code: INVALID_PARAMS,
-        message: format!("fact not found: {fact_id}"),
-        data: Some(json!({"fact_id": fact_id})),
-    })?;
+    let existing = store
+        .get_for_tenant(fact_id, &tenant_hash)
+        .cloned()
+        .ok_or_else(|| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: format!("fact not found: {fact_id}"),
+            data: Some(json!({"fact_id": fact_id})),
+        })?;
 
     if !fact_visible_in_memory_panel_id(&existing, id_ref, &alias_refs) {
         // Either reserved-prefix or not visible to this agent — refuse.
@@ -372,7 +377,7 @@ pub async fn handle_memory_edit(args: &Value, ctx: &McpContext) -> Result<Value,
     // under the read borrow before we mutate.
     let old_pin_entity = pin_entity(agent_name, fact_id);
     let was_pinned = store
-        .all_facts()
+        .all_facts_for_tenant(&tenant_hash)
         .filter(|f| !f.deleted && f.entity == old_pin_entity && f.key == "pinned")
         .max_by_key(|f| f.stored_at)
         .is_some_and(|f| f.value == "1" || f.value.eq_ignore_ascii_case("true"));
@@ -384,7 +389,7 @@ pub async fn handle_memory_edit(args: &Value, ctx: &McpContext) -> Result<Value,
     // audit trail is intact; the prior horizon_class is preserved so an edit
     // doesn't silently reset a pinned/overridden decay horizon.
     let req = StoreFact {
-        tenant_hash: "default".to_string(),
+        tenant_hash: tenant_hash.clone(),
         entity: existing.entity.clone(),
         key: existing.key.clone(),
         value: new_value.to_string(),
@@ -405,7 +410,7 @@ pub async fn handle_memory_edit(args: &Value, ctx: &McpContext) -> Result<Value,
     if was_pinned {
         let new_pin_entity = pin_entity(agent_name, &new_fact.fact_id);
         if let Err(err) = store.try_store(StoreFact {
-            tenant_hash: "default".to_string(),
+            tenant_hash: tenant_hash.clone(),
             entity: new_pin_entity,
             key: "pinned".to_string(),
             value: "1".to_string(),
@@ -462,13 +467,17 @@ pub async fn handle_memory_pin(args: &Value, ctx: &McpContext) -> Result<Value, 
     let id_ref = identity.as_deref();
     let aliases = ctx.scope_aliases();
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
+    let tenant_hash = ctx.scope_tenant();
 
     let mut store = ctx.fact_store.write().await;
-    let target = store.get(fact_id).cloned().ok_or_else(|| JsonRpcError {
-        code: INVALID_PARAMS,
-        message: format!("fact not found: {fact_id}"),
-        data: Some(json!({"fact_id": fact_id})),
-    })?;
+    let target = store
+        .get_for_tenant(fact_id, &tenant_hash)
+        .cloned()
+        .ok_or_else(|| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: format!("fact not found: {fact_id}"),
+            data: Some(json!({"fact_id": fact_id})),
+        })?;
 
     if !fact_visible_in_memory_panel_id(&target, id_ref, &alias_refs) {
         return Err(JsonRpcError {
@@ -481,7 +490,7 @@ pub async fn handle_memory_pin(args: &Value, ctx: &McpContext) -> Result<Value, 
     let pin_entity_name = pin_entity(agent_name, fact_id);
     let value_str = if pinned { "1" } else { "0" };
     let req = StoreFact {
-        tenant_hash: "default".to_string(),
+        tenant_hash,
         entity: pin_entity_name.clone(),
         key: "pinned".to_string(),
         value: value_str.to_string(),
@@ -524,6 +533,7 @@ pub async fn handle_memory_history(args: &Value, ctx: &McpContext) -> Result<Val
     let key_arg = args.get("key").and_then(|v| v.as_str()).map(str::to_string);
     let fact_id_arg = args.get("fact_id").and_then(|v| v.as_str()).map(str::to_string);
     let agent_name = scope::agent_name(ctx.agent.as_ref());
+    let tenant_hash = ctx.scope_tenant();
 
     let store = ctx.fact_store.read().await;
 
@@ -531,7 +541,7 @@ pub async fn handle_memory_history(args: &Value, ctx: &McpContext) -> Result<Val
     let (entity, key) = match (entity_arg, key_arg, fact_id_arg) {
         (Some(e), Some(k), _) => (e, k),
         (_, _, Some(fid)) => {
-            let f = store.get(&fid).ok_or_else(|| JsonRpcError {
+            let f = store.get_for_tenant(&fid, &tenant_hash).ok_or_else(|| JsonRpcError {
                 code: INVALID_PARAMS,
                 message: format!("fact not found: {fid}"),
                 data: Some(json!({"fact_id": fid})),
@@ -557,7 +567,7 @@ pub async fn handle_memory_history(args: &Value, ctx: &McpContext) -> Result<Val
     }
 
     let mut history: Vec<&Fact> = store
-        .all_facts()
+        .all_facts_for_tenant(&tenant_hash)
         .filter(|f| f.key == key)
         .filter(|f| scope::entity_matches_for_agent(f, &entity, agent_name))
         .filter(|f| scope::fact_visible_to_agent(f, agent_name))
@@ -666,6 +676,21 @@ mod tests {
         });
     }
 
+    async fn seed_operator_fact(ctx: &McpContext, entity: &str, key: &str, value: &str) -> Fact {
+        let mut store = ctx.fact_store.write().await;
+        store.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: entity.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+            source_receipt: Some("test:typed-operator-workflow".to_string()),
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: Some("daemon:test".to_string()),
+        })
+    }
+
     fn alice_ctx() -> McpContext {
         test_ctx().with_agent(AgentIdentity {
             name: "alice".to_string(),
@@ -730,7 +755,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_view_rows_carry_actor_and_null_for_legacy() {
+    async fn memory_view_rows_carry_actor_and_preserve_tenant_isolation() {
         // agent-passport M3: attribution surfaced on the memory_view read.
         let _guard = FlagGuard::enabled().await;
         let map = crate::agent_passport::AgentPassportMap::builtin_default();
@@ -752,7 +777,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Legacy / flag-off write (same shared pool) → actor null.
+        // Legacy / flag-off write (same shared store, `default` tenant) → actor null.
         let legacy = base.with_agent(AgentIdentity {
             name: "legacy".to_string(),
             token_hash: [9u8; 32],
@@ -764,18 +789,21 @@ mod tests {
         .await
         .unwrap();
 
+        let res = handle_memory_view(&json!({"token_budget": 500, "top_k": 10}), &claude)
+            .await
+            .unwrap();
+        let arr = res["structuredContent"]["facts"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["value"], "NYC");
+        assert_eq!(arr[0]["actor"], json!("claude-work"));
+
         let res = handle_memory_view(&json!({"token_budget": 500, "top_k": 10}), &base)
             .await
             .unwrap();
         let arr = res["structuredContent"]["facts"].as_array().unwrap();
-        let actor_for = |value: &str| -> serde_json::Value {
-            arr.iter()
-                .find(|f| f["value"].as_str() == Some(value))
-                .unwrap_or_else(|| panic!("memory_view row for {value} missing"))["actor"]
-                .clone()
-        };
-        assert_eq!(actor_for("NYC"), json!("claude-work"));
-        assert_eq!(actor_for("engineer"), serde_json::Value::Null);
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["value"], "engineer");
+        assert_eq!(arr[0]["actor"], serde_json::Value::Null);
     }
 
     #[tokio::test]
@@ -785,19 +813,9 @@ mod tests {
         handle_store_fact(&json!({"entity": "person:alice", "key": "city", "value": "LDN"}), &ctx)
             .await
             .unwrap();
-        // Reserved (operator-only) prefix.
-        handle_store_fact(
-            &json!({"entity": "__bootstrap__::pattern:retry", "key": "Retry", "value": "exp backoff"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
-        handle_store_fact(
-            &json!({"entity": "__ops::heartbeat", "key": "last", "value": "now"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        // Reserved facts can only originate from their typed daemon workflows.
+        seed_operator_fact(&ctx, "__bootstrap__::pattern:retry", "Retry", "exp backoff").await;
+        seed_operator_fact(&ctx, "__ops::heartbeat", "last", "now").await;
 
         let res = handle_memory_view(&json!({"token_budget": 500}), &ctx).await.unwrap();
         let arr = res["structuredContent"]["facts"].as_array().unwrap();
@@ -985,27 +1003,15 @@ mod tests {
     async fn memory_edit_refuses_reserved_prefix() {
         let _guard = FlagGuard::enabled().await;
         let alice = alice_ctx();
-        // Operator-style fact (reserved prefix).
-        handle_store_fact(
-            &json!({"entity": "__bootstrap__::pattern:retry", "key": "Retry", "value": "old"}),
-            &alice,
-        )
-        .await
-        .unwrap();
-        // Find its id.
-        let snapshot = handle_memory_view(&json!({"token_budget": 500}), &alice).await.unwrap();
-        let _ = snapshot; // memory_view filters it; we look it up directly.
-                          // (We can't get the id through the panel — refusal already verified
-                          // by the panel-filter test. Here we focus on the edit refusal when
-                          // an id IS provided.)
-                          // Find the fact id directly via the fact_history flow.
-        let history = handle_memory_history(
-            &json!({"entity": "__bootstrap__::pattern:retry", "key": "Retry"}),
+        let fact = seed_operator_fact(&alice, "__bootstrap__::pattern:retry", "Retry", "old").await;
+
+        let edit = handle_memory_edit(
+            &json!({"fact_id": fact.fact_id, "new_value": "attacker-controlled"}),
             &alice,
         )
         .await
         .unwrap_err();
-        assert!(history.message.contains("reserved"));
+        assert!(edit.message.contains("not editable"));
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! `autonomy_contract` — visible per-passport capability map.
 //!
@@ -347,7 +347,8 @@ mod tests {
     }
 
     fn local_only_router(passport: &str) -> RcxRouter {
-        RcxRouter::new(mint_free_local_token(
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let mut token = mint_free_local_token(
             passport,
             "daemon_01HV0000000000000000000000",
             "default",
@@ -355,7 +356,9 @@ mod tests {
             1_776_989_600,
             1_780_143_200,
             [0x11; RCX_CT_SIGNATURE_LEN],
-        ))
+        );
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+        RcxRouter::new_with_trusted_issuer_pubkey(token, signing.verifying_key().to_bytes())
     }
 
     fn pro_hosted_router(passport: &str) -> RcxRouter {

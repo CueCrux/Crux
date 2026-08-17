@@ -11,8 +11,301 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.59] - 2026-08-08
+
+### Fixed
+
+- **Erasing a tenant's corpus could take every subsequent write down with it.**
+  `POST /v1/admin/forget-tenants` with `"reclaim": true` deleted each
+  whole-tenant segment's file group but never updated the shard MANIFEST.
+  `ShardStorage::open` opens every segment the manifest references, and local
+  ingest opens the shard once per request, so from the first reclaim onward
+  *every* `POST /v1/local/ingest` returned 500 — while reads, which scan the
+  `segments/` directory rather than the manifest, carried on normally. On the
+  affected host that combination went unnoticed for 38 hours: 17 dangling
+  entries, all ingest dead, `/readyz` green throughout.
+  - Reclaim now appends a `RemoveSegment` tombstone to the manifest and fsyncs
+    it **before** unlinking anything. A crash in that window leaves files on
+    disk under a manifest that has already forgotten them — inert, and
+    reclaimable again — instead of files deleted with the manifest still
+    pointing at them.
+  - If the manifest cannot be updated, nothing is unlinked and the response says
+    so (`reclaimed: false`, plus a `manifest_error`) rather than reporting a
+    reclaim that did not happen.
+  - `RemoveSegment` is a new manifest record type. Removal is expressed as an
+    **append**, so no existing record or checksum is rewritten. Older daemons
+    skip the unknown record and simply see the pre-repair state, which makes a
+    downgrade safe but means an affected shard is only repaired once running
+    0.5.59 or later.
+- **`corecruxctl storage repair-manifest`** reports MANIFEST entries whose
+  segment file is missing, and with `--apply` retires them. It works on the
+  manifest alone rather than through `ShardStorage`, because opening the shard
+  is precisely what a shard in this state can no longer do.
+- **Live `.ccxp` embedding-profile sidecars were being quarantined on every
+  shard open.** The companion allowlist named `.ccxi` and `.ccxv` but not
+  `.ccxp`, so each open swept every profile sidecar out of `segments/`. This
+  failed silently in the worst direction: a segment with no `.ccxp` reads as
+  legacy and is scored *without* the embedding-fingerprint check the sidecar
+  exists to enforce. Recovering the files is a matter of moving them back out of
+  `quarantine/`.
+
+### Added
+
+- **The write path now has a health signal.** Local-ingest seal failures
+  increment `corecrux_local_ingest_seal_failed_total`, and after 3 consecutive
+  failures `/readyz` reports `local_ingest_seal` unhealthy with the underlying
+  error. Consecutive rather than cumulative, so a single malformed document
+  cannot unready a node. Tune or disable with
+  `CORECRUXD_SEAL_FAILED_READYZ_THRESHOLD` (`0` disables); it defaults to on,
+  because a write path that fails silently is what made the outage above last as
+  long as it did.
+
+## [0.5.58] - 2026-08-07
+
+### Fixed
+
+- **Ingest can no longer seal a corpus with no vectors and call it healthy.**
+  `POST /v1/local/ingest` returned an ordinary `202` with `sealed: true`, a full
+  `frame_count` and `dense_vectors: 0` whenever the embed step failed. BM25 still
+  indexes, so the tenant looked fine while semantic retrieval was simply gone —
+  a corpus that reads as healthy and answers worse, with nothing in the response
+  to check. The cause was **ureq's default 10 MiB response-body cap**, hit while
+  *reading* the embedder's reply: a 1024-dim vector is ~12.6 KB of JSON, so a
+  batch past roughly 830 chunks overflowed it. The ceiling therefore moved with
+  the embedding dimension, not the chunk count, which is why 749 chunks passed
+  and 776 failed.
+  - `EmbeddingClient::embed_batch` now issues sub-batches of at most 128 texts
+    and concatenates in order, so how many chunks a caller sends no longer
+    decides whether embedding succeeds. A failing sub-batch fails the whole call
+    — never a short or partially embedded result.
+  - The `202` carries `dense_status` (`ok` | `partial` | `skipped` |
+    `not_configured` | `not_applicable`) and `dense_expected` beside the existing
+    `dense_vectors`, and the daemon logs `local-ingest-dense-gap-sealed` at WARN
+    with the segment sequence. **Assert `dense_status == "ok"`** after any ingest
+    that expects semantic recall. `crux-ingest` asserts it for you and warns when
+    a batch seals lexical-only.
+  - Both fields are additive: a client that ignores them sees the response shape
+    it saw before.
+  - This matters beyond the response cap — *any* embedder error took the same
+    silent path. An audit of one host found 41 of 641 segments sealed
+    lexical-only, most of them from ordinary `502`s.
+- **`/v1/local/ingest` honours the request-body limit its own error advertises.**
+  The route inherited axum's 2 MiB `DefaultBodyLimit` while its `413` named the
+  16 MiB daemon limit, so every client that sized batches from that number sized
+  them eight times too large.
+
+### Added
+
+- **`segment_seq` on query results.** Each `/v1/query/text-search` result and
+  `/expand` chunk now carries the sealed segment's own sequence — the value the
+  ingest receipt returned — so a consumer can join a result back to the ingest
+  that produced it. `segment_index`, which sits beside it, is a position in the
+  daemon-wide loaded-reader list: it is **not** convertible to `segment_seq`, and
+  the difference between them was measured at 1, then 18, then 17 on one host
+  within hours as unrelated segments came and went. Deriving one from the other
+  unmaps every hit at once and scores a plausible, uniform 0% instead of
+  erroring. `segment_index` is unchanged for existing consumers.
+
+## [0.5.57] - 2026-08-07
+
+### Fixed
+
+- **A CPU-only daemon can verify the governance receipts it mints.** Erasure,
+  `compact_facts` erasure, `memory_forget` and held hard-erasure overrides all
+  persist their receipt as the observation envelope itself — Ed25519, passport
+  signed, on disk. Until now none of the three documented surfaces could attest
+  to one: `GET /v1/receipts/{id}` is 501 without a dataplane (by design), the
+  verification endpoint's local fallback only understood *stream* receipts, and
+  `corecruxctl inspect-receipt` searches sealed segments, where a governance
+  receipt never appears. The daemon produced an audit artefact nothing could
+  check.
+  - `GET /v1/receipts/{id}/verification` gains a second local fallback for the
+    observation-envelope shape, reporting
+    `crux.governance_receipt_verification.v1`. A caller lacking scope for the
+    receipt's *own* tenant gets **404**, byte for byte identical to a missing
+    receipt, so the endpoint cannot be used as a cross-tenant existence oracle.
+  - `corecruxctl inspect-receipt` resolves and verifies them too, printing kind,
+    signer, body hash and signature status.
+  - Both scans are bounded to `__governance__*` logs. This is a correctness
+    constraint, not a tuning choice: a production node carries tens of thousands
+    of per-session observation logs, and walking them all on an audit lookup
+    would make verification a denial-of-service surface.
+- **`serde_json/preserve_order` is now declared where the wire format is
+  defined.** `canonical_body_bytes` signs `serde_json::to_value(record)`, so map
+  ordering *is* the signed format. `corecruxd` only had the feature because
+  `crux-session` happens to enable it and Cargo unifies features across the
+  graph — an accidental dependency that left the audit trail one dependency
+  change away from every existing receipt failing to verify. The feature is now
+  declared by `corecrux-receipts` and pinned by a golden-vector test.
+
 ### Changed
 
+- Observation record types, `canonical_body_bytes` and
+  `verify_observation_envelope` move from `corecruxd` into `corecrux-receipts`.
+  `corecruxd` is a bin-only crate, so `corecruxctl` could not otherwise reach
+  the verifier; sharing beats a second copy of a signature check that can drift.
+
+### Added
+
+- `corecruxctl start --agent <claude|codex|cursor>`.
+- LlamaIndex and CrewAI adapters under the unchanged conformance suite.
+- Console Patchbay no longer freezes the tab when a system has more than 28
+  plans; drift reporting distinguishes a rejected credential from an
+  unreachable daemon.
+
+## [0.5.56] - 2026-08-07
+
+### Added
+
+- **A tenant's retrieval corpus can finally be erased.** Until now a corpus
+  could be created but never retired, so a mis-ingested or superseded tenant was
+  permanent — and there was no GDPR Art.17 story for the daemon. Two layers,
+  deliberately separated by reversibility:
+  - *Layer 1, logical erasure.* A persisted set of forgotten
+    `(tenant_hash, watermark_segment_seq)` pairs, enforced in the BM25 scorers
+    as a **required** parameter rather than an optional wrapper — so the
+    compiler forces every present and future serving path to state its intent
+    instead of one being silently missed. Reversible via
+    `DELETE /v1/admin/forget-tenants/{tenantId}`.
+  - *Layer 2, physical reclaim.* Opt-in per request (`"reclaim": true`), never
+    automatic. Whole-tenant segments are evicted from the `IndexManager` and
+    only then unlinked; mixed-tenant segments are retained, still masked, and
+    reported as `mixed_segments_retained`. Irreversible — recovery is
+    restore-from-backup only.
+  - `POST /v1/admin/forget-tenants` (+ singular alias) requires `admin:write`
+    **per named tenant**, with the whole batch rejected if any tenant fails and
+    nothing masked. Reserved `__`-prefixed namespaces are refused by convention,
+    so a future reserved namespace is protected the day it is introduced.
+  - `GET /v1/admin/tenants/{tenantId}/footprint` reports segments, docs and
+    bytes, so the blast radius is inspectable *before* anything is erased.
+  - The whole surface is gated on `CORECRUXD_TENANT_ERASURE=1` and the routes
+    404 without it. Fact-store erasure remains out of scope: the response key is
+    `corpus_erased`, never `tenant_forgotten`.
+- Key escrow M0–M3b, device-identity and CRL transport auth for the relay, and a
+  span outcome dimension.
+- Console Patchbay — a spatial projection of the open work board
+  (`GET /v1/work/graph`).
+
+### Changed
+
+- Tenant scoping tightened across the stack: derived from the token, applied by
+  type, exact-matched, and pushed down into gRPC and the lower layers.
+- Login verification is strict, and M1 auth fails closed.
+
+## [0.5.55] - 2026-08-02
+
+### Added
+
+- **Account entitlement is now a verified property of a signed token, not an
+  environment variable.** Three milestones of
+  `crux-pro-capabilities-rcx-entitled-2026-07-27` land together, all **dark** —
+  nothing enforces on them yet, `OperatingMode` still comes from
+  `CORECRUXD_OPERATING_MODE`, and the cutover is a later milestone.
+  - `corecruxd::entitlement` — an on-disk entitlement store on the reserved
+    `__entitlement__::rcx` entity (born private, no freshness horizon), plus
+    `resolve_entitlement`: revocation → presence → parse → tenant scope →
+    signature → expiry → tier. Forgery and revocation always resolve
+    `FreeLocal`; an expired token follows its own `FallbackPolicy`, so a paying
+    user who is merely offline keeps working.
+  - `corecruxd::pairing` — the daemon half of account pairing, reusing the
+    RFC 8628 device grant already shipped at `/v1/auth/device/*`. No licence key
+    and no typed secret: the `user_code` is a short-lived, single-use public
+    correlator, useless without an authenticated browser session, and never
+    written to configuration.
+  - `OperatingMode::GovernanceHosted`. `MaxPrivate` remains a composite —
+    Governance entitlement plus a private deployment shape — so no issuer can
+    hand it out.
+
+### Changed
+
+- **`RcxTier` cut over to the published ladder: `Free | Pro | Governance`.**
+  The previous `Free | Pro | Team | Enterprise` matched no product CueCrux
+  sells. `Team` is retired outright and `Enterprise` becomes `Governance`;
+  `crux-enterprise-shim` re-gates accordingly (`not_enterprise_tier` →
+  `not_governance_tier`). Retired values now fail *deserialisation*, which is
+  what makes a stale token fail closed to `FreeLocal` rather than resolve to
+  some default. `team_scope` and `enterprise_scope` stay on the token: removing
+  either would change the signed bytes for every tier, not just the retired one.
+- **New spec version `rcx-ct/1.2`, accepted alongside `rcx-ct/1.1` rather than
+  replacing it.** The spec-version check is not a version ladder but a match
+  with a rejecting catch-all, so repointing the 1.1 constant would have failed
+  every delegation token already minted. `1.2` is a *tier-vocabulary* version and
+  is orthogonal to delegation: 1.0 forbids a delegation policy, 1.1 requires
+  one, 1.2 makes it optional — a plain entitlement token carries none. A
+  cross-language byte-parity vector pins the Rust and TypeScript encoders
+  together on a `1.2` token with `tier: governance`.
+- **`corecruxd` split into sibling crates** — `corecrux-workspace-scan`,
+  `corecrux-billing`, `corecrux-providers` and `corecrux-secrets` — with the
+  unwrap ratchet re-baselined across the new boundary and `AGENTS.md` added for
+  the extracted crates.
+- Desktop shell gains isolated Registry and WikiCrux tabs.
+- Workspace test coverage raised from 88.49% to 90.11% across the nine
+  highest-debt files.
+
+### Fixed
+
+- **Seat identity is taken from the credential, not the request body**, closing
+  a bypass of the M8 per-seat rate ceiling on enriched verdicts.
+- **`dossier` and `storybook` now authorise against the tenant they answer for**
+  (code-intel M3b).
+- `ledger:history` is no longer advertised as a Pro claim. The route is fully
+  implemented but nothing produces a record, and selling a capability with no
+  producer is a truth-in-selling problem; the route and its handlers stay.
+- `run_git` gained a real wall-clock deadline. `GIT_TIMEOUT_SECS` fed only
+  `GIT_HTTP_LOW_SPEED_TIME`, an HTTP-transport setting that neither a local
+  `git blame` nor an SSH remote ever consults, so the call could block
+  unbounded on a stale `index.lock`.
+- `corecruxctl --version` now exists. It had no version surface at all, unlike
+  `crux-hook` and `corecruxd`.
+- The console `.mcpb` is rebuilt so it ships Apache-2.0 rather than the retired
+  CCL-1.0.
+- The config wizard parses profile frontmatter on a CRLF checkout.
+- The release path and a hang guard that was failing tests are unbroken.
+
+### Security
+
+- **wasmtime 47.0.2 → 47.0.3**, clearing [RUSTSEC-2026-0222] (stores can mix up
+  type indices between engines) and [RUSTSEC-2026-0223] (preemption and traps
+  during bulk operations break internal VM state). Lockfile only; `wasmtime` is
+  optional behind the default-off `wasm-extensions` feature, so default builds
+  never compiled it.
+
+[RUSTSEC-2026-0222]: https://rustsec.org/advisories/RUSTSEC-2026-0222
+[RUSTSEC-2026-0223]: https://rustsec.org/advisories/RUSTSEC-2026-0223
+
+## [0.5.54] - 2026-07-30
+
+### Changed
+
+- **Relicensed to Apache-2.0 — Crux Daemon is now open source.** The CueCrux
+  Community Licence (CCL v1.0), a source-available BSL-style licence, is
+  replaced by the **Apache License, Version 2.0** across the repository. The CCL
+  already named Apache 2.0 as its Change Licence, so this brings that conversion
+  forward for every version instead of waiting out the per-release three-year
+  clock. Redistribution in competing products and offering Crux as a hosted
+  service to third parties — the two rights the CCL withheld — are now granted,
+  along with Apache-2.0's express patent grant (section 3).
+  - `LICENCE.md` → `LICENSE`, containing the unmodified upstream Apache-2.0
+    text, so GitHub and SBOM scanners detect `Apache-2.0` instead of reporting
+    an unrecognised custom licence.
+  - New `NOTICE` file carrying the attribution required by section 4(d), plus
+    the trademark and `content/` scope notes that must not be edited into the
+    verbatim licence text.
+  - Per-file headers on all 539 crate `.rs` files (and every script, workflow,
+    proto, SDK source, and console asset) now read
+    `SPDX-License-Identifier: Apache-2.0`. The contradictory
+    "All rights reserved." line is dropped.
+  - `license = "Apache-2.0"` in `[workspace.package]` and in the desktop shell,
+    Python/TypeScript SDK, deb, Homebrew, and MCPB manifests;
+    `LicenseRef-CCL-1.0` removed from the `cargo-deny` allowlist.
+  - `scripts/check-licence-headers.sh` now enforces the Apache-2.0 header and
+    SPDX line. Contribution terms in `CONTRIBUTING.md` are inbound=outbound
+    under section 5 — no CLA. `docs/LICENCE-FAQ.md` rewritten;
+    `docs/design/licence-recommendation.md` (the BUSL 1.1 proposal) marked
+    superseded.
+  - Curated content under `content/` keeps its separate licence
+    (`content/LICENCE-CONTENT.md`) and is unaffected; that directory currently
+    ships a placeholder manifest with no covered assets.
 - **Licence file layout deduplicated to a single GitHub licence tab.**
   `LICENCE-CODE.md` (a three-line stub pointing at `LICENCE.md`) is removed, and
   the content licence moved from the root to `content/LICENCE-CONTENT.md` — the
@@ -23,9 +316,173 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The token-burn cost lens gains a model/effort axis.** `crux-cost` already
+  opened every transcript line by line and discarded what it found: `gitBranch`
+  was parsed but used only as an internal ranking tie-breaker, and `model`,
+  `effort` and `cwd` were not parsed at all. All four are now parsed onto the
+  event, promoted onto `CostReport`, and rolled up into a per-model burn
+  breakdown with per-effort burn *within* each model, rendered by both
+  `corecruxctl session cost` and the console `cx-cost` page.
+  - **It reconciles.** Per-model context, plus the `<synthetic>` pseudo-model,
+    plus records carrying usage but no model id, sum exactly to
+    `headline.measured_context_total`.
+  - **Coverage travels with every effort number.** `effort` is absent from 61%
+    of the measured corpus and its absence correlates with model — 100% / 100% /
+    22.5% / 9.4% across 46,239 assistant records — so a cross-model effort
+    comparison is confounded at source and no sample size fixes it.
+    `effort_coverage_pct` lives on the type, so no surface can render an effort
+    figure without the denominator that qualifies it.
+  - `<synthetic>` is reported separately, never ranked as a model and never
+    dropped. Model-id normalisation folds only stable presentation variants
+    (`[1m]` context suffix, `us.anthropic.`/`bedrock/`/`vertex/` route prefixes,
+    `-v1:0`); floating aliases such as `opus` and `sonnet` are deliberately left
+    unresolved, since resolving them would silently merge two models the day the
+    alias moves.
+  - The five new `CostReport` fields are additive, serde-default and omitted
+    when absent, so an older daemon ignores a newer report and a legacy report
+    is unchanged on the wire. A daemon must be upgraded before the console can
+    render the axis.
+  - Adds the cost lane's first integration coverage: a post-then-get test
+    through both `/v1/cost/report` handlers.
+
 - **`CITATION.cff`.** Machine-readable citation metadata (GitHub "Cite this
-  repository" button), matching the CCL v1.0 academic-use attribution
-  condition.
+  repository" button). Under Apache-2.0 citation is appreciated but not a
+  licence condition.
+
+- **A Windows GUI smoke lane for the desktop shell.** `desktop-shell.yml` gains
+  `desktop GUI smoke (windows, interactive session)`, running on a self-hosted
+  runner that executes inside a real logged-on desktop
+  (`[self-hosted, windows-gui]`). It bundles the MSI, installs it per-machine,
+  launches the installed app, and asserts what only a desktop can show: a window
+  appears, an `msedgewebview2` host actually starts, the bundled `corecruxd`
+  sidecar is spawned from the `externalBin` slot, and a graceful close reaps that
+  sidecar. A desktop screenshot uploads on every run, including failures.
+  Non-blocking — it depends on a single operator-owned box, so an offline runner
+  must not gate the merge queue.
+
+  This closes the gap the native-Windows build fix left open: that change noted
+  there was "no Windows job to catch the next one" of ~49 `#[cfg(unix)]` sites.
+  Compiling was never the hard part — a Tauri/WebView2 window cannot be created
+  in a headless or Session 0 context at all, so app launch was unobservable on
+  every existing runner. `scripts/provision-windows-gui-runner.ps1` provisions
+  such a box and refuses to run where a GUI cannot exist; `docs/self-hosted-runner.md`
+  records why Server Core and Session 0 are each disqualifying, and what the lane
+  deliberately does not cover (reboot re-attach, the Defender first-bind prompt,
+  WSL2 parity with a developer box).
+
+### Fixed
+
+- **The SessionEnd cost hook now records whether it worked.** The generated
+  `cost)` launcher branch failed silently on three paths — `corecruxctl` absent,
+  no configured endpoint, post rejected — each swallowed by `|| true`. Quiet is
+  the correct posture for a SessionEnd hook, which must never block session end;
+  undiagnosable is not. There was no way to distinguish "no sessions ran" from
+  "every session silently failed to post", and the branch had no test coverage
+  of any kind, which is why it survived.
+  - Every attempt writes a one-line outcome record (result, reason, endpoint,
+    endpoint source, launcher version) to `~/.claude/hooks/crux-cost.state.json`;
+    failures additionally append to `crux-cost.errors.log`. `exit 0` remains
+    unconditional on every path.
+  - `CRUX_HTTP_URL` can never actually be empty — `${CRUX_HTTP_URL:-…}`
+    substitutes for empty as well as unset — so the real misconfiguration is the
+    *unconfigured loopback default*, which fails with a connection refused the
+    operator cannot place. The launcher now records whether the endpoint came
+    from config or from the built-in default, and names the remedy.
+  - `corecruxctl hooks status` reports the last outcome and flags a stale
+    launcher by version marker. The boot self-check warns when the installed
+    launcher predates the running build, or when capture last failed or was
+    never attempted — nothing warns when no outcome has been recorded yet, since
+    a fresh install has simply not ended a session.
+  - Six shell-level tests run the *embedded* launcher template under `bash`, so
+    they cannot drift from what `hooks install` writes.
+
+  **This takes effect only after `corecruxctl hooks install` is re-run.** An
+  un-re-run wizard keeps the old silent script, and that is the most likely way
+  this fix appears not to work.
+
+- **Three tests that asserted things the machine does not guarantee.** Each
+  failed CI on an unrelated PR and passed on a re-run of the identical commit;
+  two of them gate required checks, so they cost merges rather than just noise.
+  - `envelope_build_latency_under_2ms_for_10_facts` (`crux-mcp`) asserted a
+    wall-clock bound — the only one in the workspace. On a shared runner that
+    measures how busy the machine is, not how fast the code is. The figure is
+    still measured and printed; the assertion is gone, and the test is renamed
+    `envelope_build_covers_all_ten_facts` after the check that carries content
+    (`memories_used.len() == 10`). Raising the constant was rejected: it trades a
+    frequent flake for a rarer one and keeps a load-dependent test.
+  - `allowed_origins_reads_the_env_var` (`corecruxd`) round-tripped through
+    `set_var`/`getenv` and read back the built-in defaults instead of the value
+    it had just set — *while holding the module's `env_lock()`*. The mutex was
+    never the problem: `setenv` can reallocate the environment block, and a
+    concurrent `getenv` anywhere in this 2000-plus-test binary may then read a
+    stale pointer, which no Rust-level lock can fence (hence `set_var` being
+    `unsafe` from the 2024 edition). It now parses via `resolve_allowed_origins`
+    directly, matching its five neighbours, and removes the last `set_var` in
+    the file.
+  - `pick_free_port_is_bindable` (`crux-shell-lifecycle`) asserted that a port
+    picked by binding `:0` and dropping the listener is immediately re-bindable.
+    Nothing promises that — sibling tests binding `:0` in parallel can take it
+    in the gap. It now retries a bounded number of times, so only a genuinely
+    broken helper fails.
+
+- **The desktop shell no longer opens stray console windows on Windows.** Two
+  spawn sites, both console-subsystem binaries launched from a GUI-subsystem app
+  (`windows_subsystem = "windows"`) that has no console to inherit — so Windows
+  allocated a fresh console *window* for each:
+  - `spawn_sidecar` (`crux-shell-lifecycle`) launched the bundled `corecruxd`
+    with a visible console that sat beside the app for its entire lifetime.
+    Redirecting stdout/stderr into the sidecar log did not suppress it: the
+    streams and the window are independent.
+  - the Windows credential lookup (`crux-shell-connection`) shells out to
+    `powershell.exe` for the `PasswordVault` read, flashing a console on *every*
+    attach-profile activation and retry. `-NonInteractive` governs the prompt,
+    not the window.
+
+  Both now set `CREATE_NO_WINDOW` (`0x08000000`) via `CommandExt::creation_flags`.
+  `rundll32.exe`, used to open external links, is GUI-subsystem (verified from
+  its PE header) and needed no change.
+
+  Found by the new Windows GUI smoke lane on its first green run — the
+  assertions passed while the uploaded screenshot showed the console box. That
+  lane now fails if either window returns.
+
+- **A cold `cargo build` now completes on native Windows.** Three unrelated
+  stops, none of which CI can see (every runner is Linux, and the release matrix
+  is Linux + macOS — both unix):
+  - `aws-lc-sys` assembles its x86_64 Windows routines with NASM, absent from a
+    default Windows toolchain, so the build script aborted. The crate ships
+    pre-assembled objects for this case; `AWS_LC_SYS_PREBUILT_NASM = "1"` now
+    lives in `.cargo/config.toml`. Inert on Linux and macOS, where the prebuilt
+    path is gated off by target.
+  - `fsync_dir` (`corecrux-projections`) and `write_control_atomic`
+    (`corecruxd`) bound a variable consumed only inside `#[cfg(unix)]`. Against
+    the workspace-wide `unused_variables = "deny"`, that is a hard error off
+    unix. Both bind the value under `#[cfg(not(unix))]` rather than renaming to
+    `_path`/`_parent`, which would have suppressed the lint on unix where the
+    variable is load-bearing.
+
+- **`cargo clippy --workspace -- -D warnings` now passes on native Windows.**
+  Seven `clippy::unnecessary_wraps` errors across `corecrux-receipts`,
+  `corecrux-storage`, and `crux-claude-hooks`: each is a directory-fsync or
+  file-permission routine whose body is unix-only, so off-unix it collapses to
+  `Ok(())` and the `Result` looks redundant. The signature is shared with a
+  genuinely fallible unix implementation, so these are suppressed at the site
+  with a note, not "fixed" by dropping the return type.
+
+  Native Windows remains post-v1 per `docs/getting-started.md`; WSL2 is still
+  the supported path. This only stops the gap widening — there are ~49
+  `#[cfg(unix)]` sites and no Windows job to catch the next one.
+
+- **`config.example.env` no longer claims a `.env` file is read.** The daemon
+  has no dotenv support, so copying the file and starting `corecruxd` failed
+  with "CORECRUXD_AUTH_MODE must be set explicitly" — indistinguishable from a
+  genuine config error. The header now shows how to export the values.
+
+### Security
+
+- **`.mcp.json` is gitignored.** MCP clients write the daemon's agent bearer
+  token into that file at the repository root, where it was previously
+  committable.
 
 ## [0.5.38] - 2026-07-10
 
@@ -421,7 +878,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-deny` supply chain and licence audit in CI
 - `cargo-audit` CVE scanning in CI
 
-[unreleased]: https://github.com/CueCrux/Crux/compare/v0.4.6...HEAD
+[unreleased]: https://github.com/CueCrux/Crux/compare/v0.5.59...HEAD
+[0.5.59]: https://github.com/CueCrux/Crux/compare/v0.5.58...v0.5.59
+[0.5.58]: https://github.com/CueCrux/Crux/compare/v0.5.57...v0.5.58
+[0.5.57]: https://github.com/CueCrux/Crux/compare/v0.5.56...v0.5.57
+[0.5.56]: https://github.com/CueCrux/Crux/compare/v0.5.55...v0.5.56
+[0.5.55]: https://github.com/CueCrux/Crux/compare/v0.5.54...v0.5.55
+[0.5.54]: https://github.com/CueCrux/Crux/compare/v0.5.53...v0.5.54
 [0.4.6]: https://github.com/CueCrux/Crux/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/CueCrux/Crux/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/CueCrux/Crux/compare/v0.4.3...v0.4.4

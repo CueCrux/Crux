@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Decision recording tool: `record_decision`.
 
@@ -13,9 +13,12 @@ use corecrux_memory::fact_store::StoreFact;
 
 /// `record_decision` — record why a decision was made.
 ///
-/// Stores an append-only, BLAKE3-hashed decision record as a fact under the
-/// `__decisions::{session_id}` entity. Queryable via `query_facts` with entity
-/// prefix `__decisions__::`.
+/// Stores a queryable decision annotation under `__decisions::{session_id}`.
+///
+/// The returned BLAKE3 digest is a content identifier only. This namespace is
+/// intentionally compatible with generic fact writes and the caller-selected
+/// session id is not an authority binding, so consumers MUST treat these rows
+/// as untrusted annotations rather than append-only authenticated decisions.
 pub async fn handle_record_decision(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     // Required fields
     let action = require_str(args, "action")?;
@@ -46,6 +49,7 @@ pub async fn handle_record_decision(args: &Value, ctx: &McpContext) -> Result<Va
         "session_id": session_id,
         "context_refs": context_refs,
         "recorded_at": chrono::Utc::now().to_rfc3339(),
+        "integrity": "untrusted_annotation",
     });
 
     // Compute BLAKE3 hash of canonical JSON
@@ -63,7 +67,7 @@ pub async fn handle_record_decision(args: &Value, ctx: &McpContext) -> Result<Va
         confidence,
         private: false,
         horizon_class: None,
-        actor: None,
+        actor: ctx.scope_identity(),
     };
 
     let mut store = ctx.fact_store.write().await;
@@ -79,7 +83,13 @@ pub async fn handle_record_decision(args: &Value, ctx: &McpContext) -> Result<Va
                 entity,
                 action
             )
-        }]
+        }],
+        "structuredContent": {
+            "decision_id": decision_id,
+            "content_hash": format!("blake3:{decision_hash}"),
+            "integrity": "untrusted_annotation",
+            "entity": entity,
+        }
     }))
 }
 
@@ -116,6 +126,11 @@ mod tests {
         assert!(text.contains("entity=__decisions__::_default"));
         assert!(text.contains("action=Use Postgres"));
         assert!(text.contains("hash="));
+        assert_eq!(result["structuredContent"]["integrity"], "untrusted_annotation");
+        assert!(result["structuredContent"]["content_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("blake3:"));
     }
 
     #[tokio::test]

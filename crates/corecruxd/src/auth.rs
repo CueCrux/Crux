@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! HTTP + gRPC authentication: token + passport extraction, scope checks, and the `HttpScopeContext` accessor.
 
@@ -56,6 +56,13 @@ pub enum AuthMode {
 
 impl AuthMode {
     pub fn parse(s: &str) -> Option<Self> {
+        // A value that is *present but blank* is not "off" — it is a
+        // misconfiguration. Returning `Off` here would boot the daemon with
+        // authentication disabled while the config looks set. Only a
+        // genuinely empty string (an unset variable) means "unset".
+        if !s.is_empty() && s.trim().is_empty() {
+            return None;
+        }
         match s.trim() {
             "" | "off" | "OFF" => Some(Self::Off),
             "dev" | "DEV" | "dev_scopes" | "DEV_SCOPES" | "devscopes" | "DEVSCOPES" | "dev-scopes" | "DEV-SCOPES" => {
@@ -131,6 +138,7 @@ struct AgentTokenHttpConfig {
     registry: crux_mcp::agent::AgentRegistry,
     scopes: BTreeSet<String>,
     tenants: TenantAllow,
+    passport_map: Option<crux_mcp::agent_passport::AgentPassportMap>,
 }
 
 /// Env flag enabling HTTP acceptance of MCP agent tokens. Default off.
@@ -163,10 +171,13 @@ fn build_agent_http_config() -> Option<AgentTokenHttpConfig> {
         .ok()
         .unwrap_or_else(|| "*".to_string());
     let tenants = tenant_allow_from_str(&tenant_raw);
+    let passport_map =
+        env_truthy("CORECRUXD_AGENT_PASSPORTS").then(crux_mcp::agent_passport::AgentPassportMap::from_env_or_default);
     Some(AgentTokenHttpConfig {
         registry,
         scopes,
         tenants,
+        passport_map,
     })
 }
 
@@ -206,11 +217,40 @@ impl AgentTokenHttpConfig {
     /// If `token` is a registered agent token, return an `AuthContext` carrying
     /// the configured scopes + tenant binding, attributed to the agent name.
     fn try_auth(&self, token: &str) -> Option<AuthContext> {
-        self.registry.lookup(token).map(|agent| AuthContext {
-            subject: Some(format!("agent:{}", agent.name)),
-            passport_id: Some(format!("agent:{}", agent.name)),
-            scopes: self.scopes.clone(),
-            tenants: self.tenants.clone(),
+        self.registry.lookup(token).and_then(|agent| {
+            // An opaque agent-token name is an automation principal, not a
+            // passport. Namespace it unless the operator explicitly supplied
+            // an agent→passport mapping; otherwise a token named like a real
+            // passport could inherit that passport's human/ungated policy.
+            let automation_id = format!("agent:{}", agent.name);
+            let (passport_id, tenants) = if let Some(passport_map) = &self.passport_map {
+                if let Some(group) = passport_map.get_group(&agent.name) {
+                    require_tenant_allowed(&self.tenants, &group.tenant).ok()?;
+                    let mut tenant = BTreeSet::new();
+                    tenant.insert(group.tenant.clone());
+                    (group.passport.clone(), TenantAllow::Only(tenant))
+                } else {
+                    // Flag-on but unmapped agents remain automation principals
+                    // and are confined to default, matching MCP authority.
+                    require_tenant_allowed(&self.tenants, "default").ok()?;
+                    let mut tenant = BTreeSet::new();
+                    tenant.insert("default".to_string());
+                    (automation_id.clone(), TenantAllow::Only(tenant))
+                }
+            } else {
+                // The token registry cryptographically verifies this name. It
+                // is a valid *automation* principal even when passport mapping
+                // is disabled, but it is never a human passport by name alone.
+                (automation_id, self.tenants.clone())
+            };
+            Some(AuthContext {
+                subject: Some(format!("agent:{}", agent.name)),
+                passport_id: Some(passport_id),
+                scopes: self.scopes.clone(),
+                tenants,
+                canonical_passport_claim_verified: false,
+                credential_is_agent_token: true,
+            })
         })
     }
 }
@@ -309,6 +349,20 @@ impl Authz {
     pub fn mode(&self) -> AuthMode {
         self.mode
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_hs256(secret: &[u8], issuer: &str, audience: &str) -> Self {
+        Self {
+            mode: AuthMode::JwtHs256,
+            jwt_hs256: Some(JwtHs256Config {
+                secret: secret.to_vec(),
+                issuer: Some(issuer.to_string()),
+                audience: Some(audience.to_string()),
+            }),
+            jwt_jwks: None,
+            agent_http: None,
+        }
+    }
 }
 
 fn parse_secret(raw: &str) -> Result<Vec<u8>, String> {
@@ -386,6 +440,14 @@ struct AuthContext {
     passport_id: Option<String>,
     scopes: BTreeSet<String>,
     tenants: TenantAllow,
+    /// True only when a cryptographically verified JWT carried a canonical,
+    /// non-empty `passport_id` claim. Legacy aliases and `sub` remain valid
+    /// identity fallbacks for ordinary routes, but cannot authorize sensitive
+    /// human-approval boundaries.
+    canonical_passport_claim_verified: bool,
+    /// MCP agent tokens authenticate automation, not a human reviewer. High-
+    /// risk four-eyes boundaries use this provenance to deny machine approval.
+    credential_is_agent_token: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -463,15 +525,20 @@ fn subject_from_claims(claims: &serde_json::Value) -> Option<String> {
     None
 }
 
+fn canonical_passport_from_claims(claims: &serde_json::Value) -> Option<String> {
+    claims
+        .get("passport_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|passport| !passport.is_empty())
+        .map(str::to_string)
+}
+
 fn passport_from_claims(claims: &serde_json::Value) -> Option<String> {
-    for key in [
-        "passport_id",
-        "passportId",
-        "passport",
-        "passport_fpr",
-        "passportFpr",
-        "pid",
-    ] {
+    if let Some(passport) = canonical_passport_from_claims(claims) {
+        return Some(passport);
+    }
+    for key in ["passportId", "passport", "passport_fpr", "passportFpr", "pid"] {
         if let Some(passport) = claims.get(key).and_then(|v| v.as_str()) {
             let trimmed = passport.trim();
             if !trimmed.is_empty() {
@@ -491,9 +558,14 @@ fn verify_jwt_hs256(cfg: &JwtHs256Config, token: &str) -> Result<AuthContext, St
     validation.leeway = 30;
     if let Some(iss) = cfg.issuer.as_deref() {
         validation.set_issuer(&[iss]);
+        // jsonwebtoken only compares a pinned claim WHEN PRESENT; an absent
+        // claim otherwise falls through to `Ok`. Require it so that "not
+        // checked" cannot read the same as "checked and matched".
+        validation.required_spec_claims.insert("iss".to_string());
     }
     if let Some(aud) = cfg.audience.as_deref() {
         validation.set_audience(&[aud]);
+        validation.required_spec_claims.insert("aud".to_string());
     }
 
     let data = decode::<serde_json::Value>(token, &DecodingKey::from_secret(cfg.secret.as_slice()), &validation)
@@ -502,12 +574,15 @@ fn verify_jwt_hs256(cfg: &JwtHs256Config, token: &str) -> Result<AuthContext, St
     let scopes = scopes_from_claims(&data.claims);
     let tenants = tenants_from_claims(&data.claims);
     let subject = subject_from_claims(&data.claims);
+    let canonical_passport_claim_verified = canonical_passport_from_claims(&data.claims).is_some();
     let passport_id = passport_from_claims(&data.claims);
     Ok(AuthContext {
         subject,
         passport_id,
         scopes,
         tenants,
+        canonical_passport_claim_verified,
+        credential_is_agent_token: false,
     })
 }
 
@@ -679,9 +754,13 @@ fn verify_jwt_jwks(cfg: &JwtJwksConfig, token: &str) -> Result<AuthContext, Stri
     validation.leeway = 30;
     if let Some(iss) = cfg.issuer.as_deref() {
         validation.set_issuer(&[iss]);
+        // See `verify_jwt_hs256`: pinning without requiring the claim lets a
+        // token that simply omits it bypass the pin.
+        validation.required_spec_claims.insert("iss".to_string());
     }
     if let Some(aud) = cfg.audience.as_deref() {
         validation.set_audience(&[aud]);
+        validation.required_spec_claims.insert("aud".to_string());
     }
 
     let key = resolve_jwks_key(cfg, kid)?;
@@ -690,12 +769,15 @@ fn verify_jwt_jwks(cfg: &JwtJwksConfig, token: &str) -> Result<AuthContext, Stri
     let scopes = scopes_from_claims(&data.claims);
     let tenants = tenants_from_claims(&data.claims);
     let subject = subject_from_claims(&data.claims);
+    let canonical_passport_claim_verified = canonical_passport_from_claims(&data.claims).is_some();
     let passport_id = passport_from_claims(&data.claims);
     Ok(AuthContext {
         subject,
         passport_id,
         scopes,
         tenants,
+        canonical_passport_claim_verified,
+        credential_is_agent_token: false,
     })
 }
 
@@ -816,6 +898,8 @@ fn http_ctx(auth: &Authz, headers: &HeaderMap) -> Result<AuthContext, ProblemRes
             passport_id: None,
             scopes: BTreeSet::new(),
             tenants: TenantAllow::Any,
+            canonical_passport_claim_verified: false,
+            credential_is_agent_token: false,
         }),
         AuthMode::DevScopes => {
             let scopes = extract_scopes_http_dev(headers).ok_or_else(|| {
@@ -831,6 +915,8 @@ fn http_ctx(auth: &Authz, headers: &HeaderMap) -> Result<AuthContext, ProblemRes
                 passport_id: None,
                 scopes,
                 tenants: TenantAllow::Any,
+                canonical_passport_claim_verified: false,
+                credential_is_agent_token: false,
             })
         }
         AuthMode::JwtHs256 => {
@@ -903,7 +989,13 @@ pub struct HttpScopeContext {
     pub scopes: Vec<String>,
     pub passport_id: Option<String>,
     auth_enforced: bool,
+    /// Auth-off and DevScopes are explicit local-development modes. They can
+    /// carry caller assertions, but those assertions are never verified
+    /// principals and must be durably labelled as such.
+    local_unverified_identity: bool,
     passport_override_used: bool,
+    canonical_passport_claim_verified: bool,
+    credential_is_agent_token: bool,
     scope_bypass: bool,
     /// Tenant authority derived from the bearer token's `tenant_id`/`tenants`
     /// claim (same source the query path authorizes against). Drives the
@@ -1055,6 +1147,12 @@ impl HttpScopeContext {
         self.scope_bypass || self.scopes.iter().any(|s| s == scope)
     }
 
+    /// Whether the verified credential is authorized across every tenant.
+    /// A tenant-bound admin scope is still tenant-bound.
+    pub(crate) fn has_global_tenant_authority(&self) -> bool {
+        matches!(self.tenants, TenantAllow::Any)
+    }
+
     /// Whether JWT authentication accepted a passport header that differs
     /// from the verified token identity. Most admin surfaces support this
     /// explicit override; sensitive human-approval boundaries can deny it.
@@ -1066,6 +1164,25 @@ impl HttpScopeContext {
     /// than taking the auth-off bypass. Auth-off identities are unverified.
     pub(crate) fn auth_enforced(&self) -> bool {
         self.auth_enforced
+    }
+
+    /// Whether caller-supplied identity is permitted only as an explicitly
+    /// unverified local-development assertion.
+    pub(crate) fn local_unverified_identity(&self) -> bool {
+        self.local_unverified_identity
+    }
+
+    /// Whether the verified JWT carried a canonical, non-empty `passport_id`
+    /// claim. This is stricter than the ordinary identity fallback to `sub`.
+    pub(crate) fn canonical_passport_claim_verified(&self) -> bool {
+        self.canonical_passport_claim_verified
+    }
+
+    /// Whether HTTP authentication fell back to a registered MCP agent token.
+    /// These credentials may call automation APIs but cannot satisfy a human
+    /// four-eyes decision.
+    pub(crate) fn credential_is_agent_token(&self) -> bool {
+        self.credential_is_agent_token
     }
 
     /// Tenant to stamp on an HTTP write (OD-37). `Ok(None)` → default tenant.
@@ -1081,6 +1198,57 @@ impl HttpScopeContext {
     /// Tenant an HTTP read is scoped to. `None` → default tenant.
     pub(crate) fn resolve_read_tenant(&self) -> Option<String> {
         resolve_read_tenant_flagged(&self.tenants, TenantStampMode::from_env())
+    }
+
+    /// Resolve one concrete tenant for an authority-sensitive surface,
+    /// independent of the legacy tenant-stamping rollout flag.
+    ///
+    /// `requested` is the route/body/query target. The optional
+    /// `x-corecrux-tenant-id` selector is treated as an additional constraint:
+    /// when both are present they must agree. Tokens with no tenant claim are
+    /// confined to `default`; multi-tenant tokens must select one tenant; and a
+    /// wildcard/admin token may explicitly select any tenant. Authenticated
+    /// tokens without a tenant claim are denied; this authority-sensitive
+    /// surface does not inherit the legacy shared-default fallback.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn resolve_authorized_tenant(&self, requested: Option<&str>) -> Result<String, ProblemResponse> {
+        let requested = requested.map(str::trim).filter(|value| !value.is_empty());
+        let header = self
+            .write_tenant_selector
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let (Some(requested), Some(header)) = (requested, header) {
+            if requested != header {
+                return Err(ProblemResponse(
+                    ProblemDetails::forbidden("route tenant does not match x-corecrux-tenant-id").with_extensions(
+                        serde_json::json!({
+                            "code": "TENANT_SELECTOR_MISMATCH",
+                            "routeTenantId": requested,
+                            "headerTenantId": header,
+                        }),
+                    ),
+                ));
+            }
+        }
+        let selector = requested.or(header);
+        if matches!(self.tenants, TenantAllow::Missing) && self.auth_enforced {
+            return Err(ProblemResponse(
+                ProblemDetails::forbidden("token is missing a tenant claim").with_extensions(serde_json::json!({
+                    "code": "TENANT_CLAIM_MISSING",
+                })),
+            ));
+        }
+        if matches!(self.tenants, TenantAllow::Missing) && selector.is_some_and(|tenant| tenant != "default") {
+            return Err(ProblemResponse(
+                ProblemDetails::forbidden("token without a tenant claim is confined to the default tenant")
+                    .with_extensions(serde_json::json!({
+                        "code": "TENANT_FORBIDDEN",
+                        "tenantId": selector,
+                    })),
+            ));
+        }
+        Ok(resolve_write_tenant_on(&self.tenants, selector)?.unwrap_or_else(|| "default".to_string()))
     }
 }
 
@@ -1114,7 +1282,10 @@ pub fn passport_bound_context(auth: &Authz, headers: &HeaderMap) -> Result<HttpS
         scopes: ctx.scopes.into_iter().collect(),
         passport_id,
         auth_enforced: auth.mode != AuthMode::Off,
+        local_unverified_identity: matches!(auth.mode, AuthMode::Off | AuthMode::DevScopes),
         passport_override_used,
+        canonical_passport_claim_verified: ctx.canonical_passport_claim_verified,
+        credential_is_agent_token: ctx.credential_is_agent_token,
         scope_bypass: auth.mode == AuthMode::Off,
         tenants,
         write_tenant_selector: http_tenant_selector(headers),
@@ -1169,6 +1340,8 @@ fn grpc_ctx(auth: &Authz, meta: &MetadataMap) -> Result<AuthContext, Status> {
             passport_id: None,
             scopes: BTreeSet::new(),
             tenants: TenantAllow::Any,
+            canonical_passport_claim_verified: false,
+            credential_is_agent_token: false,
         }),
         AuthMode::DevScopes => {
             let scopes = extract_scopes_grpc_dev(meta).ok_or_else(|| {
@@ -1186,6 +1359,8 @@ fn grpc_ctx(auth: &Authz, meta: &MetadataMap) -> Result<AuthContext, Status> {
                 passport_id: None,
                 scopes,
                 tenants: TenantAllow::Any,
+                canonical_passport_claim_verified: false,
+                credential_is_agent_token: false,
             })
         }
         AuthMode::JwtHs256 => {
@@ -1324,15 +1499,113 @@ pub fn require_http_any_scope_for_tenant(
     Ok(())
 }
 
+/// Proof that this request was authorised for exactly this tenant.
+///
+/// The field is private to this module and there is no public constructor that
+/// takes a tenant, so a `TenantScope` can only come from an authorization check
+/// that named the tenant it carries. Reads on the tenant-partitioned planes take
+/// `&TenantScope` rather than `&str`, which makes "authorise tenant A, then read
+/// tenant B" — the mutation the M2 isolation suite had to catch from outside the
+/// type system — not expressible in a handler.
+///
+/// **What this proves and what it does not.** It proves a check named this
+/// tenant. It does not prove the tenant exists, is entitled, or is the caller's
+/// only tenant. It is an authorization-provenance marker, and the guarantee it
+/// carries stops at the HTTP handler plane: `TraceStore::load_for_tenant` and
+/// `repo_registry::load_scan_json` still take `&str`, because they have callers
+/// with no request behind them (repo watching, retention). Handlers cannot read
+/// a tenant they did not authorise; that is the claim, and it is the whole claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantScope(String);
+
+/// The stamp on facts written before their plane was tenant-partitioned.
+///
+/// Mirrors `corecrux_memory::fact_store::default_tenant_hash`. Named here rather
+/// than spelled `"default"` at each read site so the legacy rule is one thing to
+/// find and one thing to change.
+pub const LEGACY_FACT_TENANT: &str = "default";
+
+impl TenantScope {
+    /// The daemon's own capture tenant, for the tenant-blind fallback path.
+    ///
+    /// Deliberately takes no argument: it cannot name someone else's tenant, and
+    /// `grep` finds every place that reaches for it. This is process
+    /// configuration rather than request provenance, so a surface resolving its
+    /// tenant this way still cannot be hosted — see M3b of
+    /// `crux-code-intel-pro-hosted-surface-2026-07-28`.
+    pub fn daemon_capture() -> Self {
+        Self(crate::trace_store::TraceStore::capture_tenant())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether this scope is the daemon's own capture tenant.
+    ///
+    /// Facts written before a plane was tenant-partitioned are attributed here
+    /// and nowhere else: they were captured by this process under this
+    /// configuration, so attributing them to whoever happens to ask would
+    /// recreate the leak the partitioning closed. Mirrors the legacy-span rule
+    /// in `trace_store.rs`.
+    pub fn is_daemon_capture(&self) -> bool {
+        self.0 == crate::trace_store::TraceStore::capture_tenant()
+    }
+
+    /// A scope for work with no request behind it: repo watching, retention
+    /// sweeps, scheduled jobs.
+    ///
+    /// This one CAN name an arbitrary tenant, so it is the weak point in the
+    /// argument the rest of this type makes — which is why it is a named
+    /// constructor that records why it was minted, rather than a `From<&str>`.
+    /// A source-invariant test (`background_scopes_are_not_minted_in_handlers`)
+    /// asserts it is never called from `src/http/`: a handler has a request, so
+    /// it has a real authorization to derive its scope from, and reaching for
+    /// this instead would launder an unauthorised read into a typed one.
+    pub fn background(tenant_id: &str, reason: &'static str) -> Self {
+        let _ = reason;
+        Self(tenant_id.to_string())
+    }
+
+    /// Whether a stored fact stamped `fact_tenant` may be read in this scope.
+    ///
+    /// A fact written before its plane was partitioned carries the fact store's
+    /// default stamp (`corecrux_memory::fact_store::default_tenant_hash`, i.e.
+    /// `"default"`), which is not any requester's tenant. Those rows go to the
+    /// daemon's capture tenant and to nobody else: they were written by this
+    /// process under this configuration, so attributing them there is accurate,
+    /// while attributing them to whoever happens to ask would recreate the leak
+    /// the partitioning closed. Same rule, same reasoning, as the legacy-span
+    /// case in `trace_store.rs`.
+    pub fn may_read_fact_tenant(&self, fact_tenant: &str) -> bool {
+        fact_tenant == self.0 || (fact_tenant == LEGACY_FACT_TENANT && self.is_daemon_capture())
+    }
+}
+
+impl std::fmt::Display for TenantScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Authorise `required` scopes *and* access to `tenant_id`, returning the scope
+/// the caller may then read with.
+///
+/// The tenant is returned rather than discarded on purpose. Every caller used to
+/// authorise against `tenant_id` and then pass a separately-supplied `&str` to
+/// the read, leaving nothing but a test to assert the two were the same string.
 #[allow(clippy::result_large_err)]
 pub fn require_http_scopes_for_tenant(
     auth: &Authz,
     headers: &HeaderMap,
     required: &[&str],
     tenant_id: &str,
-) -> Result<(), ProblemResponse> {
+) -> Result<TenantScope, ProblemResponse> {
     if auth.mode == AuthMode::Off {
-        return Ok(());
+        // Off authorises everything, and did so before this returned a scope.
+        // Minting for the requested tenant preserves that exactly: the caller
+        // reads what it named, as it always has.
+        return Ok(TenantScope(tenant_id.to_string()));
     }
 
     let ctx = http_ctx(auth, headers)?;
@@ -1347,7 +1620,7 @@ pub fn require_http_scopes_for_tenant(
     }
 
     require_tenant_allowed(&ctx.tenants, tenant_id)?;
-    Ok(())
+    Ok(TenantScope(tenant_id.to_string()))
 }
 
 #[allow(clippy::result_large_err, dead_code)]
@@ -1372,14 +1645,16 @@ pub fn require_grpc_scopes(auth: &Authz, meta: &MetadataMap, required: &[&str]) 
 }
 
 #[allow(clippy::result_large_err)]
+/// gRPC counterpart of [`require_http_scopes_for_tenant`], returning the same
+/// [`TenantScope`] so the two transports cannot drift into different habits.
 pub fn require_grpc_scopes_for_tenant(
     auth: &Authz,
     meta: &MetadataMap,
     required: &[&str],
     tenant_id: &str,
-) -> Result<(), Status> {
+) -> Result<TenantScope, Status> {
     if auth.mode == AuthMode::Off {
-        return Ok(());
+        return Ok(TenantScope(tenant_id.to_string()));
     }
 
     let ctx = grpc_ctx(auth, meta)?;
@@ -1395,7 +1670,7 @@ pub fn require_grpc_scopes_for_tenant(
     }
 
     match require_tenant_allowed(&ctx.tenants, tenant_id) {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(TenantScope(tenant_id.to_string())),
         Err(problem) => Err(Status::permission_denied(problem.0.title)),
     }
 }
@@ -1479,6 +1754,9 @@ mod tests {
         // The agent token authenticates on HTTP with the configured scopes.
         require_http_scopes(&auth, &headers, &["query:read", "facts:write"]).expect("agent token accepted");
         require_http_scopes_for_tenant(&auth, &headers, &["query:read"], "any-tenant").expect("tenant * allows any");
+        let context = passport_bound_context(&auth, &headers).expect("agent token context");
+        assert_eq!(context.passport_id.as_deref(), Some("agent:drivew"));
+        assert!(context.credential_is_agent_token());
 
         // A bogus bearer is still rejected.
         let mut bad = HeaderMap::new();
@@ -1498,6 +1776,56 @@ mod tests {
             "CORECRUXD_AGENT_TOKEN_HTTP_TENANT",
         ] {
             std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn agent_token_http_context_uses_configured_passport_and_tenant_mapping() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        const AGENT_TOK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
+        std::env::remove_var(ALLOW_WEAK_HS256_SECRET_ENV);
+        std::env::remove_var("CORECRUXD_JWT_ISS");
+        std::env::remove_var("CORECRUXD_JWT_AUD");
+        std::env::set_var("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS", "1");
+        std::env::set_var("CRUX_AGENT_TOKENS", format!("drivew:{AGENT_TOK}"));
+        std::env::set_var("CORECRUXD_AGENT_TOKEN_HTTP_SCOPES", "query:read facts:write");
+        std::env::set_var("CORECRUXD_AGENT_TOKEN_HTTP_TENANT", "tenant-a");
+        std::env::set_var("CORECRUXD_AGENT_PASSPORTS", "1");
+        std::env::set_var("CRUX_AGENT_PASSPORTS", "drivew:drive-pass:tenant-a");
+
+        let auth = Authz::from_env(AuthMode::JwtHs256).expect("auth from env");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {AGENT_TOK}").parse().unwrap(),
+        );
+        headers.insert("x-corecrux-passport-id", "drive-pass".parse().unwrap());
+        let context = passport_bound_context(&auth, &headers).expect("mapped agent context");
+        assert_eq!(context.passport_id.as_deref(), Some("drive-pass"));
+        assert_eq!(context.resolve_authorized_tenant(None).unwrap(), "tenant-a");
+        assert_eq!(context.resolve_authorized_tenant(Some("tenant-a")).unwrap(), "tenant-a");
+        assert!(context.resolve_authorized_tenant(Some("tenant-b")).is_err());
+        assert!(context.credential_is_agent_token());
+        assert!(!context.canonical_passport_claim_verified());
+
+        let mut mismatched = headers;
+        mismatched.insert("x-corecrux-passport-id", "other-passport".parse().unwrap());
+        assert!(passport_bound_context(&auth, &mismatched).is_err());
+
+        for key in [
+            "CORECRUXD_JWT_HS256_SECRET",
+            "CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS",
+            "CRUX_AGENT_TOKENS",
+            "CORECRUXD_AGENT_TOKEN_HTTP_SCOPES",
+            "CORECRUXD_AGENT_TOKEN_HTTP_TENANT",
+            "CORECRUXD_AGENT_PASSPORTS",
+            "CRUX_AGENT_PASSPORTS",
+        ] {
+            std::env::remove_var(key);
         }
     }
 
@@ -1583,6 +1911,135 @@ mod tests {
         assert_eq!(err.0.status, 403);
     }
 
+    /// D-1 (inverted pin): a token that OMITS a pinned `iss`/`aud` must be
+    /// rejected, not waved through. `jsonwebtoken` only compares a pinned
+    /// claim when it is present, so pinning without `required_spec_claims`
+    /// let a credential minted by the same key for a different audience
+    /// authenticate simply by leaving the claim out.
+    #[test]
+    #[serial_test::serial]
+    fn jwt_hs256_token_omitting_pinned_iss_or_aud_is_rejected() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
+        std::env::remove_var(ALLOW_WEAK_HS256_SECRET_ENV);
+        std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
+        std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
+
+        let auth = Authz::from_env(AuthMode::JwtHs256).expect("auth from env");
+        let exp = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600) as usize;
+
+        let headers_for = |claims: serde_json::Value| {
+            let token = encode(
+                &Header::new(Algorithm::HS256),
+                &claims,
+                &EncodingKey::from_secret(TEST_HS256_SECRET.as_bytes()),
+            )
+            .expect("jwt");
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {token}").parse().unwrap(),
+            );
+            headers
+        };
+
+        // Both claims omitted.
+        let both = headers_for(serde_json::json!({
+            "exp": exp, "scope": "admin:write", "tenant_id": "t1",
+        }));
+        assert_eq!(
+            require_http_scopes(&auth, &both, &["admin:write"])
+                .unwrap_err()
+                .0
+                .status,
+            401,
+            "a token omitting both pinned claims must not authenticate"
+        );
+
+        // `iss` omitted, `aud` correct.
+        let no_iss = headers_for(serde_json::json!({
+            "exp": exp, "aud": "corecrux", "scope": "admin:write", "tenant_id": "t1",
+        }));
+        assert_eq!(
+            require_http_scopes(&auth, &no_iss, &["admin:write"])
+                .unwrap_err()
+                .0
+                .status,
+            401,
+            "an absent iss must not read the same as a matching iss"
+        );
+
+        // `aud` omitted, `iss` correct.
+        let no_aud = headers_for(serde_json::json!({
+            "exp": exp, "iss": "corecrux-test", "scope": "admin:write", "tenant_id": "t1",
+        }));
+        assert_eq!(
+            require_http_scopes(&auth, &no_aud, &["admin:write"])
+                .unwrap_err()
+                .0
+                .status,
+            401,
+            "an absent aud must not read the same as a matching aud"
+        );
+
+        // Control: both present and correct still authenticates.
+        let good = headers_for(serde_json::json!({
+            "exp": exp, "iss": "corecrux-test", "aud": "corecrux",
+            "scope": "admin:write", "tenant_id": "t1",
+        }));
+        require_http_scopes(&auth, &good, &["admin:write"]).expect("fully-claimed token still works");
+
+        std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
+        std::env::remove_var("CORECRUXD_JWT_ISS");
+        std::env::remove_var("CORECRUXD_JWT_AUD");
+    }
+
+    /// D-1 (inverted pin), unpinned-config control: when the daemon pins
+    /// neither `iss` nor `aud`, a token omitting them is still fine. The fix
+    /// must tighten only what the operator actually configured.
+    #[test]
+    #[serial_test::serial]
+    fn jwt_hs256_unpinned_iss_and_aud_do_not_become_required() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
+        std::env::remove_var(ALLOW_WEAK_HS256_SECRET_ENV);
+        std::env::remove_var("CORECRUXD_JWT_ISS");
+        std::env::remove_var("CORECRUXD_JWT_AUD");
+
+        let auth = Authz::from_env(AuthMode::JwtHs256).expect("auth from env");
+        let exp = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600) as usize;
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &serde_json::json!({ "exp": exp, "scope": "admin:write", "tenant_id": "t1" }),
+            &EncodingKey::from_secret(TEST_HS256_SECRET.as_bytes()),
+        )
+        .expect("jwt");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        require_http_scopes(&auth, &headers, &["admin:write"]).expect("unpinned config is unchanged");
+
+        std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
+    }
+
     #[test]
     fn jwt_jwks_requires_config_env() {
         let lock = env_lock();
@@ -1601,12 +2058,7 @@ mod tests {
         assert!(err.contains("JWKS source"));
     }
 
-    #[test]
-    #[serial_test::serial]
-    fn jwt_jwks_rs256_enforces_scopes_and_tenant() {
-        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-
-        const PRIVATE_KEY_PEM: &str = r"-----BEGIN PRIVATE KEY-----
+    const TEST_RSA_PRIVATE_KEY_PEM: &str = r"-----BEGIN PRIVATE KEY-----
 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDNwDIf8ZW0CSCT
 utqQBPxrWFmk6Djs1jldflnhw13y0p7iFbx/RlJHwmpmQu9AgjfyRI7nYafoFh/q
 IXmnWFbO7Gln9s1GP1t5ASuJse5LBFYRfk3h+hvDROhk92ZgYLI3JpiaXsdGcwa5
@@ -1635,7 +2087,7 @@ qyuNpgqT7xnXjqHpRxvxCLFe5WXO7GBqZM9ihRkANg1sDA4Pk8UHEfVmNhT1Wjig
 rG+Vg0mnrwArNdy2hX9Qkwc=
 -----END PRIVATE KEY-----";
 
-        const JWKS_JSON: &str = r#"{
+    const TEST_JWKS_JSON: &str = r#"{
   "keys": [
     {
       "kty": "RSA",
@@ -1648,12 +2100,17 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
   ]
 }"#;
 
+    #[test]
+    #[serial_test::serial]
+    fn jwt_jwks_rs256_enforces_scopes_and_tenant() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
         let lock = env_lock();
         let _g = lock.lock().unwrap();
 
         std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
         std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
-        std::env::set_var("CORECRUXD_JWT_JWKS_JSON", JWKS_JSON);
+        std::env::set_var("CORECRUXD_JWT_JWKS_JSON", TEST_JWKS_JSON);
         std::env::remove_var("CORECRUXD_JWT_JWKS_URL");
         std::env::remove_var("CORECRUXD_JWT_OIDC_DISCOVERY_URL");
 
@@ -1685,7 +2142,7 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         let token = encode(
             &header,
             &claims,
-            &EncodingKey::from_rsa_pem(PRIVATE_KEY_PEM.as_bytes()).expect("rsa key"),
+            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY_PEM.as_bytes()).expect("rsa key"),
         )
         .expect("jwt");
 
@@ -1702,6 +2159,86 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
 
         let err = require_http_scopes_for_tenant(&auth, &headers, &["admin:read"], "t1").unwrap_err();
         assert_eq!(err.0.status, 403);
+
+        let exp = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600) as usize;
+        let signed_context = |claims: serde_json::Value| {
+            let token = encode(
+                &header,
+                &claims,
+                &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY_PEM.as_bytes()).expect("rsa key"),
+            )
+            .expect("jwt");
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {token}").parse().unwrap(),
+            );
+            passport_bound_context(&auth, &headers).expect("passport context")
+        };
+
+        let canonical = signed_context(serde_json::json!({
+            "exp": exp,
+            "iss": "corecrux-test",
+            "aud": "corecrux",
+            "scope": "admin:write",
+            "tenant_id": "default",
+            "sub": "automation-subject",
+            "passport_id": "operator-passport",
+        }));
+        assert_eq!(canonical.passport_id.as_deref(), Some("operator-passport"));
+        assert!(canonical.canonical_passport_claim_verified());
+
+        let sub_only = signed_context(serde_json::json!({
+            "exp": exp,
+            "iss": "corecrux-test",
+            "aud": "corecrux",
+            "scope": "admin:write",
+            "tenant_id": "default",
+            "sub": "automation-subject",
+        }));
+        assert_eq!(sub_only.passport_id.as_deref(), Some("automation-subject"));
+        assert!(!sub_only.canonical_passport_claim_verified());
+
+        let legacy_alias = signed_context(serde_json::json!({
+            "exp": exp,
+            "iss": "corecrux-test",
+            "aud": "corecrux",
+            "scope": "admin:write",
+            "tenant_id": "default",
+            "passportId": "legacy-passport",
+        }));
+        assert_eq!(legacy_alias.passport_id.as_deref(), Some("legacy-passport"));
+        assert!(!legacy_alias.canonical_passport_claim_verified());
+
+        // D-1 (inverted pin) on the JWKS path: omitting a pinned claim must
+        // not bypass the pin. Same defect, same fix as `verify_jwt_hs256`.
+        let omitted = encode(
+            &header,
+            &serde_json::json!({ "exp": exp, "scope": "admin:write", "tenant_id": "t1" }),
+            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY_PEM.as_bytes()).expect("rsa key"),
+        )
+        .expect("jwt");
+        let mut omitted_headers = HeaderMap::new();
+        omitted_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {omitted}").parse().unwrap(),
+        );
+        assert_eq!(
+            require_http_scopes(&auth, &omitted_headers, &["admin:write"])
+                .unwrap_err()
+                .0
+                .status,
+            401,
+            "a JWKS token omitting the pinned iss/aud must not authenticate"
+        );
+
+        std::env::remove_var("CORECRUXD_JWT_JWKS_JSON");
+        std::env::remove_var("CORECRUXD_JWT_ISS");
+        std::env::remove_var("CORECRUXD_JWT_AUD");
     }
 
     fn env_lock() -> &'static std::sync::Mutex<()> {
@@ -1757,6 +2294,28 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
                 "expected Off for alias '{alias}'"
             );
         }
+    }
+
+    /// D-2 (inverted pin): a *present but blank* auth mode is a
+    /// misconfiguration, not "off". `parse` trimmed first, so
+    /// `CORECRUXD_AUTH_MODE="   "` resolved to `Off` — the daemon booted with
+    /// authentication disabled while the config looked set — and
+    /// `auth_mode_invalid` stayed `None`, so `main`'s fail-closed guard never
+    /// fired. Only a genuinely empty string means "unset".
+    #[test]
+    fn auth_mode_parse_blank_string_is_rejected_not_off() {
+        for blank in &["   ", "\t", "\n", " \t\n "] {
+            assert_eq!(
+                AuthMode::parse(blank),
+                None,
+                "a present-but-blank mode must be reported as invalid, not Off"
+            );
+        }
+        // The unset case is still Off.
+        assert_eq!(AuthMode::parse(""), Some(AuthMode::Off));
+        // Padded but meaningful values are still trimmed and accepted.
+        assert_eq!(AuthMode::parse("  off  "), Some(AuthMode::Off));
+        assert_eq!(AuthMode::parse("\tdev\n"), Some(AuthMode::DevScopes));
     }
 
     #[test]
@@ -2107,6 +2666,25 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
     fn passport_from_claims_falls_back_to_subject() {
         let claims = serde_json::json!({ "sub": "subject-id" });
         assert_eq!(passport_from_claims(&claims), Some("subject-id".to_string()));
+    }
+
+    #[test]
+    fn canonical_passport_from_claims_requires_exact_non_empty_claim() {
+        assert_eq!(
+            canonical_passport_from_claims(&serde_json::json!({ "passport_id": " passport-id " })),
+            Some("passport-id".to_string())
+        );
+        assert_eq!(
+            canonical_passport_from_claims(&serde_json::json!({
+                "sub": "subject-id",
+                "passportId": "legacy-alias",
+            })),
+            None
+        );
+        assert_eq!(
+            canonical_passport_from_claims(&serde_json::json!({ "passport_id": "   " })),
+            None
+        );
     }
 
     // ── missing_scopes ────────────────────────────────────────────────────
@@ -2576,5 +3154,1770 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         let scopes = extract_scopes_grpc_dev(&meta).unwrap();
         assert!(scopes.contains("a:read"));
         assert!(!scopes.contains("b:read"));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Rejection-path coverage. Everything below asserts a DENY (and the exact
+    // status: 401 = unauthenticated, 403 = authenticated-but-unauthorised;
+    // conflating the two is a real bug), or pins a documented bypass.
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// Env-free HS256 `Authz` — lets the JWT rejection matrix run in parallel
+    /// instead of serialising on the process env.
+    fn hs256_authz() -> Authz {
+        Authz::test_hs256(TEST_HS256_SECRET.as_bytes(), "corecrux-test", "corecrux")
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_secs()
+    }
+
+    /// Sign `claims` as HS256 with an arbitrary secret (so wrong-key rejection
+    /// is reachable without touching the process env).
+    fn sign_hs256(claims: &serde_json::Value, secret: &str) -> String {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        encode(
+            &Header::new(Algorithm::HS256),
+            claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("sign hs256")
+    }
+
+    fn valid_claims(extra: serde_json::Value) -> serde_json::Value {
+        let mut claims = serde_json::json!({
+            "exp": now_secs() + 3600,
+            "iss": "corecrux-test",
+            "aud": "corecrux",
+        });
+        let obj = claims.as_object_mut().expect("claims object");
+        for (k, v) in extra.as_object().expect("extra object") {
+            obj.insert(k.clone(), v.clone());
+        }
+        claims
+    }
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().expect("header value"),
+        );
+        headers
+    }
+
+    fn problem_code(problem: &ProblemResponse) -> String {
+        problem
+            .0
+            .extensions
+            .as_ref()
+            .and_then(|ext| ext.get("code"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn grpc_meta(pairs: &[(&'static str, &str)]) -> MetadataMap {
+        let mut meta = MetadataMap::new();
+        for (k, v) in pairs {
+            meta.insert(*k, v.parse().expect("metadata value"));
+        }
+        meta
+    }
+
+    // ── DEFECT PIN: a whitespace-only auth mode silently means "off" ───────
+
+    // The characterization test that pinned blank-is-Off lived here. It said of
+    // itself "This test pins CURRENT behaviour. It is not an endorsement" — the
+    // behaviour it pinned is D-2, fixed above. `auth_mode_parse_blank_string_is_rejected_not_off`
+    // is its replacement and covers the same inputs with the corrected expectation.
+
+    // ── AuthMode::Off — the documented total bypass ────────────────────────
+
+    #[test]
+    fn off_mode_grants_every_scope_without_any_credential() {
+        let auth = Authz::from_env(AuthMode::Off).unwrap();
+        let headers = HeaderMap::new();
+        require_http_scopes(&auth, &headers, &["admin:write", "facts:write"]).unwrap();
+        require_http_any_scope(&auth, &headers, &["admin:write"]).unwrap();
+        require_http_scopes_for_tenant(&auth, &headers, &["admin:write"], "any-tenant").unwrap();
+        require_http_any_scope_for_tenant(&auth, &headers, &["gpu1:answer"], "any-tenant").unwrap();
+        require_grpc_scopes(&auth, &MetadataMap::new(), &["admin:write"]).unwrap();
+        require_grpc_scopes_for_tenant(&auth, &MetadataMap::new(), &["admin:write"], "any-tenant").unwrap();
+    }
+
+    #[test]
+    fn off_mode_context_reports_unenforced_and_bypasses_scope_checks() {
+        let auth = Authz::from_env(AuthMode::Off).unwrap();
+        let ctx = http_scope_context(&auth, &HeaderMap::new()).expect("off-mode context");
+        assert!(!ctx.auth_enforced(), "auth-off identities are unverified");
+        // scope_bypass: every scope reads as held, including invented ones.
+        assert!(ctx.has_scope("admin:write"));
+        assert!(ctx.has_scope("not-a-real-scope"));
+        assert!(ctx.scopes.is_empty(), "the bypass grants no *actual* scopes");
+        assert!(!ctx.passport_override_used());
+        assert!(!ctx.canonical_passport_claim_verified());
+        assert!(!ctx.credential_is_agent_token());
+    }
+
+    #[test]
+    fn off_mode_evidence_reports_wildcard_tenant_binding() {
+        let auth = Authz::from_env(AuthMode::Off).unwrap();
+        let evidence = describe_http_evidence(&auth, &HeaderMap::new()).expect("evidence");
+        assert_eq!(evidence.mode, "off");
+        assert_eq!(evidence.subject, None);
+        assert_eq!(evidence.tenant_binding.as_deref(), Some("*"));
+        assert!(evidence.scopes.is_empty());
+    }
+
+    // ── DevScopes — missing vs empty vs wrong scopes ───────────────────────
+
+    #[test]
+    fn dev_scopes_missing_credential_is_401_not_403() {
+        let auth = Authz::from_env(AuthMode::DevScopes).unwrap();
+        let err = require_http_scopes(&auth, &HeaderMap::new(), &["admin:read"]).unwrap_err();
+        assert_eq!(err.0.status, 401);
+        assert_eq!(problem_code(&err), "UNAUTHENTICATED");
+    }
+
+    #[test]
+    fn dev_scopes_present_but_empty_header_is_403_not_401() {
+        // An empty `X-Corecrux-Scopes` still *authenticates* (the header is
+        // present), so the failure must be 403 MISSING_SCOPE, not 401.
+        let auth = Authz::from_env(AuthMode::DevScopes).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-scopes", "".parse().unwrap());
+        let err = require_http_scopes(&auth, &headers, &["admin:read"]).unwrap_err();
+        assert_eq!(err.0.status, 403);
+        assert_eq!(problem_code(&err), "MISSING_SCOPE");
+    }
+
+    #[test]
+    fn dev_scopes_whitespace_only_header_authenticates_with_zero_scopes() {
+        let auth = Authz::from_env(AuthMode::DevScopes).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-scopes", "   ,  ,\t".parse().unwrap());
+        let ctx = http_scope_context(&auth, &headers).expect("authenticated");
+        assert!(ctx.scopes.is_empty());
+        assert!(!ctx.has_scope("admin:read"), "no scope_bypass outside auth-off");
+        assert_eq!(
+            require_http_scopes(&auth, &headers, &["admin:read"])
+                .unwrap_err()
+                .0
+                .status,
+            403
+        );
+    }
+
+    #[test]
+    fn dev_scopes_unknown_scope_name_does_not_satisfy_a_required_scope() {
+        let auth = Authz::from_env(AuthMode::DevScopes).unwrap();
+        let headers = {
+            let mut h = HeaderMap::new();
+            h.insert("x-corecrux-scopes", "admin:reed,admin,admin:*".parse().unwrap());
+            h
+        };
+        // Near-misses and a would-be wildcard must NOT match `admin:read`.
+        let err = require_http_scopes(&auth, &headers, &["admin:read"]).unwrap_err();
+        assert_eq!(err.0.status, 403);
+        assert_eq!(problem_code(&err), "MISSING_SCOPE");
+    }
+
+    #[test]
+    fn dev_scopes_duplicated_scopes_collapse_and_still_authorize() {
+        let auth = Authz::from_env(AuthMode::DevScopes).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-scopes", "admin:read,admin:read admin:read".parse().unwrap());
+        let ctx = http_scope_context(&auth, &headers).expect("authenticated");
+        assert_eq!(ctx.scopes, vec!["admin:read".to_string()]);
+        require_http_scopes(&auth, &headers, &["admin:read"]).unwrap();
+    }
+
+    #[test]
+    fn dev_scopes_partial_scope_set_reports_only_the_missing_ones() {
+        let auth = Authz::from_env(AuthMode::DevScopes).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-scopes", "admin:read".parse().unwrap());
+        let err = require_http_scopes(&auth, &headers, &["admin:read", "admin:write"]).unwrap_err();
+        assert_eq!(err.0.status, 403);
+        let missing = err
+            .0
+            .extensions
+            .as_ref()
+            .and_then(|ext| ext.get("missingScopes").cloned())
+            .expect("missingScopes extension");
+        assert_eq!(missing, serde_json::json!(["admin:write"]));
+    }
+
+    #[test]
+    fn dev_scopes_non_ascii_bearer_header_is_unauthenticated() {
+        // A header whose bytes are not visible ASCII fails `to_str`, so both
+        // extractors return None → 401, never a silent empty scope set.
+        let auth = Authz::from_env(AuthMode::DevScopes).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_bytes(b"Bearer \xff\xfe").unwrap(),
+        );
+        let err = require_http_scopes(&auth, &headers, &["admin:read"]).unwrap_err();
+        assert_eq!(err.0.status, 401);
+    }
+
+    #[test]
+    fn dev_scopes_non_bearer_authorization_scheme_is_unauthenticated() {
+        let auth = Authz::from_env(AuthMode::DevScopes).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::AUTHORIZATION, "Basic YWJjOmRlZg==".parse().unwrap());
+        assert_eq!(
+            require_http_scopes(&auth, &headers, &["admin:read"])
+                .unwrap_err()
+                .0
+                .status,
+            401
+        );
+    }
+
+    #[test]
+    fn dev_scopes_tenant_binding_is_wildcard_by_construction() {
+        let auth = Authz::from_env(AuthMode::DevScopes).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-scopes", "gpu1:answer".parse().unwrap());
+        // DevScopes carries no tenant claim; it is deliberately `Any`.
+        require_http_any_scope_for_tenant(&auth, &headers, &["gpu1:answer"], "whatever").unwrap();
+        let evidence = describe_http_evidence(&auth, &headers).expect("evidence");
+        assert_eq!(evidence.mode, "dev_scopes");
+        assert_eq!(evidence.tenant_binding.as_deref(), Some("*"));
+    }
+
+    // ── require_http_any_scope ─────────────────────────────────────────────
+
+    #[test]
+    fn require_http_any_scope_accepts_one_of_many() {
+        let auth = Authz::from_env(AuthMode::DevScopes).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-scopes", "exports:read".parse().unwrap());
+        require_http_any_scope(&auth, &headers, &["admin:read", "exports:read"]).unwrap();
+    }
+
+    #[test]
+    fn require_http_any_scope_rejects_when_none_match() {
+        let auth = Authz::from_env(AuthMode::DevScopes).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-scopes", "exports:read".parse().unwrap());
+        let err = require_http_any_scope(&auth, &headers, &["admin:read", "admin:write"]).unwrap_err();
+        assert_eq!(err.0.status, 403);
+        assert_eq!(problem_code(&err), "MISSING_SCOPE");
+    }
+
+    #[test]
+    fn require_http_any_scope_with_empty_candidate_list_fails_closed() {
+        // Absent-signal guard: an empty `any_of` must deny, never allow.
+        let auth = Authz::from_env(AuthMode::DevScopes).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-scopes", "admin:write".parse().unwrap());
+        assert_eq!(require_http_any_scope(&auth, &headers, &[]).unwrap_err().0.status, 403);
+    }
+
+    #[test]
+    fn require_http_any_scope_missing_credential_is_401() {
+        let auth = Authz::from_env(AuthMode::DevScopes).unwrap();
+        assert_eq!(
+            require_http_any_scope(&auth, &HeaderMap::new(), &["admin:read"])
+                .unwrap_err()
+                .0
+                .status,
+            401
+        );
+    }
+
+    #[test]
+    fn require_http_any_scope_for_tenant_missing_credential_is_401() {
+        let auth = Authz::from_env(AuthMode::DevScopes).unwrap();
+        assert_eq!(
+            require_http_any_scope_for_tenant(&auth, &HeaderMap::new(), &["admin:read"], "t1")
+                .unwrap_err()
+                .0
+                .status,
+            401
+        );
+    }
+
+    // ── HS256: credential rejection matrix ─────────────────────────────────
+
+    #[test]
+    fn hs256_missing_bearer_is_401_unauthenticated() {
+        let auth = hs256_authz();
+        let err = require_http_scopes(&auth, &HeaderMap::new(), &["admin:read"]).unwrap_err();
+        assert_eq!(err.0.status, 401);
+        assert_eq!(problem_code(&err), "UNAUTHENTICATED");
+    }
+
+    #[test]
+    fn hs256_ignores_dev_scope_header_entirely() {
+        // Absent-signal guard: the DevScopes header must not authenticate under
+        // a JWT mode, or the dev bypass would survive into production.
+        let auth = hs256_authz();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-scopes", "admin:write".parse().unwrap());
+        let err = require_http_scopes(&auth, &headers, &["admin:write"]).unwrap_err();
+        assert_eq!(err.0.status, 401);
+    }
+
+    #[test]
+    fn hs256_malformed_token_is_401() {
+        let auth = hs256_authz();
+        for token in ["", "not-a-jwt", "a.b", "a.b.c", "....."] {
+            let err = require_http_scopes(&auth, &bearer(token), &["admin:read"]).unwrap_err();
+            assert_eq!(err.0.status, 401, "token {token:?} must be 401");
+            assert_eq!(problem_code(&err), "UNAUTHENTICATED");
+        }
+    }
+
+    #[test]
+    fn hs256_wrong_signing_key_is_401() {
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "scope": "admin:write" })),
+            "ffffffffffffffffffffffffffffffff",
+        );
+        let err = require_http_scopes(&auth, &bearer(&token), &["admin:write"]).unwrap_err();
+        assert_eq!(err.0.status, 401);
+    }
+
+    #[test]
+    fn hs256_expired_token_is_401() {
+        let auth = hs256_authz();
+        // 30s leeway is configured, so back-date well past it.
+        let token = sign_hs256(
+            &serde_json::json!({
+                "exp": now_secs() - 7200,
+                "iss": "corecrux-test",
+                "aud": "corecrux",
+                "scope": "admin:write",
+            }),
+            TEST_HS256_SECRET,
+        );
+        let err = require_http_scopes(&auth, &bearer(&token), &["admin:write"]).unwrap_err();
+        assert_eq!(err.0.status, 401);
+    }
+
+    #[test]
+    fn hs256_not_yet_valid_token_is_401() {
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({
+                "nbf": now_secs() + 7200,
+                "scope": "admin:write",
+            })),
+            TEST_HS256_SECRET,
+        );
+        assert_eq!(
+            require_http_scopes(&auth, &bearer(&token), &["admin:write"])
+                .unwrap_err()
+                .0
+                .status,
+            401
+        );
+    }
+
+    #[test]
+    fn hs256_missing_exp_claim_is_401() {
+        // Absent-signal guard: a token with no expiry must not validate.
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &serde_json::json!({
+                "iss": "corecrux-test",
+                "aud": "corecrux",
+                "scope": "admin:write",
+            }),
+            TEST_HS256_SECRET,
+        );
+        assert_eq!(
+            require_http_scopes(&auth, &bearer(&token), &["admin:write"])
+                .unwrap_err()
+                .0
+                .status,
+            401
+        );
+    }
+
+    #[test]
+    fn hs256_wrong_issuer_is_401() {
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &serde_json::json!({
+                "exp": now_secs() + 3600,
+                "iss": "evil-idp",
+                "aud": "corecrux",
+                "scope": "admin:write",
+            }),
+            TEST_HS256_SECRET,
+        );
+        assert_eq!(
+            require_http_scopes(&auth, &bearer(&token), &["admin:write"])
+                .unwrap_err()
+                .0
+                .status,
+            401
+        );
+    }
+
+    #[test]
+    fn hs256_wrong_audience_is_401() {
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &serde_json::json!({
+                "exp": now_secs() + 3600,
+                "iss": "corecrux-test",
+                "aud": "someone-else",
+                "scope": "admin:write",
+            }),
+            TEST_HS256_SECRET,
+        );
+        assert_eq!(
+            require_http_scopes(&auth, &bearer(&token), &["admin:write"])
+                .unwrap_err()
+                .0
+                .status,
+            401
+        );
+    }
+
+    // The DEFECT PIN block for D-1 lived here: two tests asserting that an
+    // absent iss/aud claim sails past the configured pinning. Both said of
+    // themselves "This test pins CURRENT behaviour. It is not an endorsement".
+    // That behaviour is the defect fixed above; the replacements are
+    // jwt_hs256_token_omitting_pinned_iss_or_aud_is_rejected and its control
+    // jwt_hs256_unpinned_iss_and_aud_do_not_become_required.
+
+    #[test]
+    fn hs256_valid_token_with_wrong_scope_is_403_not_401() {
+        // The 401/403 split is the contract: this credential is *valid*.
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "scope": "exports:read", "tenant_id": "t1" })),
+            TEST_HS256_SECRET,
+        );
+        let err = require_http_scopes(&auth, &bearer(&token), &["admin:write"]).unwrap_err();
+        assert_eq!(err.0.status, 403);
+        assert_eq!(problem_code(&err), "MISSING_SCOPE");
+    }
+
+    #[test]
+    fn hs256_token_with_no_scope_claim_authorizes_nothing() {
+        let auth = hs256_authz();
+        let token = sign_hs256(&valid_claims(serde_json::json!({ "sub": "u1" })), TEST_HS256_SECRET);
+        let ctx = http_scope_context(&auth, &bearer(&token)).expect("valid token");
+        assert!(ctx.scopes.is_empty());
+        assert!(!ctx.has_scope("admin:read"));
+        assert_eq!(
+            require_http_scopes(&auth, &bearer(&token), &["admin:read"])
+                .unwrap_err()
+                .0
+                .status,
+            403
+        );
+    }
+
+    #[test]
+    fn hs256_auth_is_enforced_and_reports_the_verified_subject() {
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "sub": "svc-1", "scope": "admin:read", "tenant_id": "t1" })),
+            TEST_HS256_SECRET,
+        );
+        let ctx = http_scope_context(&auth, &bearer(&token)).expect("valid token");
+        assert!(ctx.auth_enforced());
+        assert!(!ctx.credential_is_agent_token());
+        let evidence = describe_http_evidence(&auth, &bearer(&token)).expect("evidence");
+        assert_eq!(evidence.mode, "jwt_hs256");
+        assert_eq!(evidence.subject.as_deref(), Some("svc-1"));
+        assert_eq!(evidence.tenant_binding.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn describe_http_evidence_propagates_the_credential_rejection() {
+        let auth = hs256_authz();
+        let err = describe_http_evidence(&auth, &HeaderMap::new()).unwrap_err();
+        assert_eq!(err.0.status, 401);
+    }
+
+    // ── Tenant resolution + cross-tenant refusal ───────────────────────────
+
+    #[test]
+    fn hs256_cross_tenant_access_is_403_tenant_forbidden() {
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "scope": "exports:read", "tenant_id": "t1" })),
+            TEST_HS256_SECRET,
+        );
+        let err = require_http_scopes_for_tenant(&auth, &bearer(&token), &["exports:read"], "t2").unwrap_err();
+        assert_eq!(err.0.status, 403);
+        assert_eq!(problem_code(&err), "TENANT_FORBIDDEN");
+    }
+
+    #[test]
+    fn hs256_missing_tenant_claim_is_403_tenant_claim_missing() {
+        // Absent-signal guard: no tenant claim must NOT read as "all tenants".
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "scope": "exports:read" })),
+            TEST_HS256_SECRET,
+        );
+        let err = require_http_scopes_for_tenant(&auth, &bearer(&token), &["exports:read"], "t1").unwrap_err();
+        assert_eq!(err.0.status, 403);
+        assert_eq!(problem_code(&err), "TENANT_CLAIM_MISSING");
+    }
+
+    #[test]
+    fn hs256_empty_tenant_claim_is_treated_as_missing_not_wildcard() {
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "scope": "exports:read", "tenant_id": "   " })),
+            TEST_HS256_SECRET,
+        );
+        let err = require_http_scopes_for_tenant(&auth, &bearer(&token), &["exports:read"], "t1").unwrap_err();
+        assert_eq!(problem_code(&err), "TENANT_CLAIM_MISSING");
+    }
+
+    #[test]
+    fn hs256_wildcard_tenant_claim_crosses_tenants() {
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "scope": "exports:read", "tenant_id": "*" })),
+            TEST_HS256_SECRET,
+        );
+        require_http_scopes_for_tenant(&auth, &bearer(&token), &["exports:read"], "anything").unwrap();
+    }
+
+    #[test]
+    fn hs256_multi_tenant_claim_allows_only_listed_tenants() {
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "scope": "exports:read", "tenants": ["t1", "t2"] })),
+            TEST_HS256_SECRET,
+        );
+        require_http_scopes_for_tenant(&auth, &bearer(&token), &["exports:read"], "t2").unwrap();
+        assert_eq!(
+            require_http_scopes_for_tenant(&auth, &bearer(&token), &["exports:read"], "t3")
+                .unwrap_err()
+                .0
+                .status,
+            403
+        );
+    }
+
+    #[test]
+    fn tenant_check_runs_after_the_scope_check() {
+        // A caller with neither must be told about the scope, not the tenant —
+        // the tenant id is the more sensitive of the two to leak back.
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "scope": "exports:read", "tenant_id": "t1" })),
+            TEST_HS256_SECRET,
+        );
+        let err = require_http_scopes_for_tenant(&auth, &bearer(&token), &["admin:write"], "t2").unwrap_err();
+        assert_eq!(problem_code(&err), "MISSING_SCOPE");
+    }
+
+    #[test]
+    fn any_scope_for_tenant_admin_prefix_skips_the_tenant_binding() {
+        let auth = hs256_authz();
+        // Documented bypass: an `admin:*` scope authorizes any tenant, even
+        // when the token is bound to exactly one.
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "scope": "admin:read", "tenant_id": "t1" })),
+            TEST_HS256_SECRET,
+        );
+        require_http_any_scope_for_tenant(&auth, &bearer(&token), &["admin:read"], "t2").unwrap();
+    }
+
+    #[test]
+    fn any_scope_for_tenant_non_admin_scope_still_checks_the_tenant() {
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "scope": "gpu1:answer", "tenant_id": "t1" })),
+            TEST_HS256_SECRET,
+        );
+        let err = require_http_any_scope_for_tenant(&auth, &bearer(&token), &["gpu1:answer"], "t2").unwrap_err();
+        assert_eq!(err.0.status, 403);
+        assert_eq!(problem_code(&err), "TENANT_FORBIDDEN");
+    }
+
+    #[test]
+    fn any_scope_for_tenant_admin_bypass_is_prefix_matched_on_the_matched_scope() {
+        // `administrator:read` is not `admin:` — the bypass must not fire.
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "scope": "administrator:read", "tenant_id": "t1" })),
+            TEST_HS256_SECRET,
+        );
+        let err = require_http_any_scope_for_tenant(&auth, &bearer(&token), &["administrator:read"], "t2").unwrap_err();
+        assert_eq!(problem_code(&err), "TENANT_FORBIDDEN");
+    }
+
+    // ── Passport binding ───────────────────────────────────────────────────
+
+    #[test]
+    fn passport_header_unbound_to_a_claimless_token_is_403() {
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "scope": "facts:write", "tenant_id": "t1" })),
+            TEST_HS256_SECRET,
+        );
+        let mut headers = bearer(&token);
+        headers.insert("x-corecrux-passport-id", "p-invented".parse().unwrap());
+        let err = passport_bound_context(&auth, &headers).unwrap_err();
+        assert_eq!(err.0.status, 403);
+        assert_eq!(problem_code(&err), "PASSPORT_HEADER_UNBOUND");
+    }
+
+    #[test]
+    fn passport_header_mismatch_reports_a_distinct_code() {
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({
+                "scope": "facts:write", "tenant_id": "t1", "passport_id": "p-a",
+            })),
+            TEST_HS256_SECRET,
+        );
+        let mut headers = bearer(&token);
+        headers.insert("x-corecrux-passport-id", "p-b".parse().unwrap());
+        let err = passport_bound_context(&auth, &headers).unwrap_err();
+        assert_eq!(err.0.status, 403);
+        assert_eq!(problem_code(&err), "PASSPORT_HEADER_MISMATCH");
+    }
+
+    #[test]
+    fn passport_override_requires_an_explicit_override_scope() {
+        for (scope, allowed) in [
+            ("admin:write", true),
+            ("passport:impersonate", true),
+            ("facts:write", false),
+            ("admin:read", false),
+        ] {
+            let auth = hs256_authz();
+            let token = sign_hs256(
+                &valid_claims(serde_json::json!({
+                    "scope": scope, "tenant_id": "t1", "passport_id": "p-a",
+                })),
+                TEST_HS256_SECRET,
+            );
+            let mut headers = bearer(&token);
+            headers.insert("x-corecrux-passport-id", "p-b".parse().unwrap());
+            let got = passport_bound_context(&auth, &headers);
+            assert_eq!(got.is_ok(), allowed, "scope {scope} override expectation");
+            if let Ok(ctx) = got {
+                assert_eq!(ctx.passport_id.as_deref(), Some("p-b"));
+                assert!(ctx.passport_override_used(), "an override must be flagged");
+            }
+        }
+    }
+
+    #[test]
+    fn passport_override_scope_also_binds_a_header_to_a_claimless_token() {
+        // Pinned behaviour: the override arm is checked BEFORE the unbound arm,
+        // so `admin:write` with no passport/sub claim can assert any passport.
+        // `canonical_passport_claim_verified` stays false so four-eyes
+        // boundaries can still refuse it.
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "scope": "admin:write", "tenant_id": "t1" })),
+            TEST_HS256_SECRET,
+        );
+        let mut headers = bearer(&token);
+        headers.insert("x-corecrux-passport-id", "p-anything".parse().unwrap());
+        let ctx = passport_bound_context(&auth, &headers).expect("override accepted");
+        assert_eq!(ctx.passport_id.as_deref(), Some("p-anything"));
+        assert!(ctx.passport_override_used());
+        assert!(!ctx.canonical_passport_claim_verified());
+    }
+
+    #[test]
+    fn matching_passport_header_is_not_an_override() {
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({
+                "scope": "facts:write", "tenant_id": "t1", "passport_id": "p-a",
+            })),
+            TEST_HS256_SECRET,
+        );
+        let mut headers = bearer(&token);
+        headers.insert("x-corecrux-passport-id", "p-a".parse().unwrap());
+        let ctx = passport_bound_context(&auth, &headers).expect("matching header");
+        assert!(!ctx.passport_override_used());
+        assert!(ctx.canonical_passport_claim_verified());
+    }
+
+    #[test]
+    fn dev_and_off_modes_accept_any_passport_header_unverified() {
+        // Pinned: outside a JWT mode there is nothing to bind against, so the
+        // header is taken at face value and `auth_enforced()` is the only
+        // signal a caller has that the identity is unverified.
+        for mode in [AuthMode::Off, AuthMode::DevScopes] {
+            let auth = Authz::from_env(mode).unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert("x-corecrux-scopes", "admin:read".parse().unwrap());
+            headers.insert("x-corecrux-passport-id", "p-claimed".parse().unwrap());
+            let ctx = passport_bound_context(&auth, &headers).expect("context");
+            assert_eq!(ctx.passport_id.as_deref(), Some("p-claimed"));
+            assert!(!ctx.passport_override_used(), "override flag is JWT-only");
+            assert!(!ctx.canonical_passport_claim_verified());
+        }
+    }
+
+    #[test]
+    fn bind_http_passport_without_a_header_keeps_the_claim() {
+        let ctx = AuthContext {
+            subject: None,
+            passport_id: Some("p-claim".to_string()),
+            scopes: BTreeSet::new(),
+            tenants: TenantAllow::Missing,
+            canonical_passport_claim_verified: true,
+            credential_is_agent_token: false,
+        };
+        assert_eq!(
+            bind_http_passport(AuthMode::JwtHs256, &ctx, None).unwrap(),
+            Some("p-claim".to_string())
+        );
+    }
+
+    #[test]
+    fn can_override_passport_header_accepts_only_two_scopes() {
+        let scopes = |names: &[&str]| -> BTreeSet<String> { names.iter().map(|s| (*s).to_string()).collect() };
+        assert!(can_override_passport_header(&scopes(&["admin:write"])));
+        assert!(can_override_passport_header(&scopes(&["passport:impersonate"])));
+        assert!(!can_override_passport_header(&scopes(&["admin:read", "facts:write"])));
+        assert!(!can_override_passport_header(&scopes(&[])));
+    }
+
+    #[test]
+    fn http_passport_id_rejects_blank_and_unreadable_headers() {
+        assert_eq!(http_passport_id(&HeaderMap::new()), None);
+        let mut blank = HeaderMap::new();
+        blank.insert("x-corecrux-passport-id", "   ".parse().unwrap());
+        assert_eq!(http_passport_id(&blank), None);
+        let mut binary = HeaderMap::new();
+        binary.insert(
+            "x-corecrux-passport-id",
+            axum::http::HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        assert_eq!(http_passport_id(&binary), None);
+        let mut padded = HeaderMap::new();
+        padded.insert("x-corecrux-passport-id", "  p-a  ".parse().unwrap());
+        assert_eq!(http_passport_id(&padded), Some("p-a".to_string()));
+    }
+
+    #[test]
+    fn http_tenant_selector_rejects_blank_and_unreadable_headers() {
+        assert_eq!(http_tenant_selector(&HeaderMap::new()), None);
+        let mut blank = HeaderMap::new();
+        blank.insert("x-corecrux-tenant-id", "  ".parse().unwrap());
+        assert_eq!(http_tenant_selector(&blank), None);
+        let mut binary = HeaderMap::new();
+        binary.insert(
+            "x-corecrux-tenant-id",
+            axum::http::HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        assert_eq!(http_tenant_selector(&binary), None);
+        let mut ok = HeaderMap::new();
+        ok.insert("x-corecrux-tenant-id", " t9 ".parse().unwrap());
+        assert_eq!(http_tenant_selector(&ok), Some("t9".to_string()));
+    }
+
+    // ── Misconfigured auth must be 500, never an open door ─────────────────
+
+    #[test]
+    fn jwt_mode_without_a_loaded_config_is_500_not_a_bypass() {
+        for mode in [AuthMode::JwtHs256, AuthMode::JwtJwks] {
+            let auth = Authz {
+                mode,
+                jwt_hs256: None,
+                jwt_jwks: None,
+                agent_http: None,
+            };
+            let err = require_http_scopes(&auth, &bearer("anything"), &["admin:read"]).unwrap_err();
+            assert_eq!(err.0.status, 500, "{mode:?} must not fall open");
+            assert_eq!(problem_code(&err), "AUTH_MISCONFIGURED");
+
+            let status =
+                require_grpc_scopes(&auth, &grpc_meta(&[("authorization", "Bearer x")]), &["admin:read"]).unwrap_err();
+            assert_eq!(status.code(), tonic::Code::Internal);
+        }
+    }
+
+    #[test]
+    fn authz_debug_does_not_leak_the_secret() {
+        let auth = hs256_authz();
+        let rendered = format!("{auth:?}");
+        assert!(rendered.contains("JwtHs256"));
+        assert!(
+            !rendered.contains(TEST_HS256_SECRET),
+            "Authz Debug must not print the HS256 secret"
+        );
+    }
+
+    // ── gRPC plane ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn grpc_dev_scopes_missing_credential_is_unauthenticated() {
+        let auth = Authz::from_env(AuthMode::DevScopes).unwrap();
+        let status = require_grpc_scopes(&auth, &MetadataMap::new(), &["admin:read"]).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+        assert!(status.message().contains("UNAUTHENTICATED"));
+    }
+
+    #[test]
+    fn grpc_dev_scopes_wrong_scope_is_permission_denied_not_unauthenticated() {
+        let auth = Authz::from_env(AuthMode::DevScopes).unwrap();
+        let meta = grpc_meta(&[("x-corecrux-scopes", "exports:read")]);
+        let status = require_grpc_scopes(&auth, &meta, &["admin:write"]).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert!(status.message().contains("MISSING_SCOPE"));
+    }
+
+    #[test]
+    fn grpc_dev_scopes_sufficient_scope_is_allowed() {
+        let auth = Authz::from_env(AuthMode::DevScopes).unwrap();
+        let meta = grpc_meta(&[("x-corecrux-scopes", "admin:write,admin:read")]);
+        require_grpc_scopes(&auth, &meta, &["admin:read", "admin:write"]).unwrap();
+    }
+
+    #[test]
+    fn grpc_hs256_missing_and_invalid_tokens_are_unauthenticated() {
+        let auth = hs256_authz();
+        let missing = require_grpc_scopes(&auth, &MetadataMap::new(), &["admin:read"]).unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::Unauthenticated);
+
+        let bad = require_grpc_scopes(
+            &auth,
+            &grpc_meta(&[("authorization", "Bearer not-a-jwt")]),
+            &["admin:read"],
+        )
+        .unwrap_err();
+        assert_eq!(bad.code(), tonic::Code::Unauthenticated);
+        assert!(bad.message().contains("invalid bearer token"));
+    }
+
+    #[test]
+    fn grpc_hs256_valid_token_enforces_scopes_and_tenant() {
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "scope": "exports:read", "tenant_id": "t1" })),
+            TEST_HS256_SECRET,
+        );
+        let meta = grpc_meta(&[("authorization", format!("Bearer {token}").as_str())]);
+        require_grpc_scopes_for_tenant(&auth, &meta, &["exports:read"], "t1").unwrap();
+
+        let cross = require_grpc_scopes_for_tenant(&auth, &meta, &["exports:read"], "t2").unwrap_err();
+        assert_eq!(cross.code(), tonic::Code::PermissionDenied);
+
+        let scope = require_grpc_scopes_for_tenant(&auth, &meta, &["admin:write"], "t1").unwrap_err();
+        assert_eq!(scope.code(), tonic::Code::PermissionDenied);
+        assert!(scope.message().contains("MISSING_SCOPE"));
+    }
+
+    #[test]
+    fn grpc_missing_tenant_claim_is_permission_denied() {
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "scope": "exports:read" })),
+            TEST_HS256_SECRET,
+        );
+        let meta = grpc_meta(&[("authorization", format!("Bearer {token}").as_str())]);
+        let status = require_grpc_scopes_for_tenant(&auth, &meta, &["exports:read"], "t1").unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn grpc_lowercase_bearer_prefix_is_accepted() {
+        let meta = grpc_meta(&[("authorization", "bearer grpc-token")]);
+        assert_eq!(extract_bearer_token_grpc(&meta), Some("grpc-token".to_string()));
+    }
+
+    #[test]
+    fn grpc_non_bearer_scheme_is_not_a_token() {
+        let meta = grpc_meta(&[("authorization", "Basic abc")]);
+        assert_eq!(extract_bearer_token_grpc(&meta), None);
+        assert!(extract_scopes_grpc_dev(&meta).is_none());
+    }
+
+    // ── Claim extraction edge cases ────────────────────────────────────────
+
+    #[test]
+    fn scopes_from_claims_accepts_scp_as_an_array() {
+        let claims = serde_json::json!({ "scp": ["a:read", "b:write"] });
+        let s = scopes_from_claims(&claims);
+        assert!(s.contains("a:read"));
+        assert!(s.contains("b:write"));
+    }
+
+    #[test]
+    fn scopes_from_claims_ignores_non_string_array_members() {
+        let claims = serde_json::json!({ "scopes": ["a:read", 42, null, { "x": 1 }] });
+        let s = scopes_from_claims(&claims);
+        assert_eq!(s.len(), 1);
+        assert!(s.contains("a:read"));
+    }
+
+    #[test]
+    fn scopes_from_claims_ignores_wrong_typed_scope_claims() {
+        // A numeric/array `scope` (rather than a space-delimited string) must
+        // grant nothing, not silently pass.
+        assert!(scopes_from_claims(&serde_json::json!({ "scope": 7 })).is_empty());
+        assert!(scopes_from_claims(&serde_json::json!({ "permissions": "a:read" })).is_empty());
+    }
+
+    #[test]
+    fn tenants_from_claims_ignores_non_string_array_members_and_blanks() {
+        let claims = serde_json::json!({ "tenants": ["t1", "   ", 5, null] });
+        match tenants_from_claims(&claims) {
+            TenantAllow::Only(set) => {
+                assert_eq!(set.len(), 1);
+                assert!(set.contains("t1"));
+            }
+            other => panic!("expected Only, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tenants_from_claims_all_blank_array_is_missing_not_wildcard() {
+        let claims = serde_json::json!({ "tenants": ["  ", ""] });
+        assert!(matches!(tenants_from_claims(&claims), TenantAllow::Missing));
+    }
+
+    #[test]
+    fn tenants_from_claims_prefers_scalar_claims_over_the_array() {
+        let claims = serde_json::json!({ "tenant_id": "t-scalar", "tenants": ["t-array"] });
+        match tenants_from_claims(&claims) {
+            TenantAllow::Only(set) => assert!(set.contains("t-scalar")),
+            other => panic!("expected Only, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tenants_from_claims_wrong_typed_claim_is_missing() {
+        assert!(matches!(
+            tenants_from_claims(&serde_json::json!({ "tenant_id": 7 })),
+            TenantAllow::Missing
+        ));
+        assert!(matches!(
+            tenants_from_claims(&serde_json::json!({ "tenants": "t1" })),
+            TenantAllow::Missing
+        ));
+    }
+
+    #[test]
+    fn passport_from_claims_walks_every_legacy_alias() {
+        for alias in ["passportId", "passport", "passport_fpr", "passportFpr", "pid"] {
+            let claims = serde_json::json!({ alias: "p-legacy" });
+            assert_eq!(
+                passport_from_claims(&claims),
+                Some("p-legacy".to_string()),
+                "alias {alias}"
+            );
+            assert_eq!(canonical_passport_from_claims(&claims), None, "alias {alias}");
+        }
+    }
+
+    #[test]
+    fn passport_from_claims_skips_blank_aliases() {
+        let claims = serde_json::json!({ "passportId": "  ", "sub": "u1" });
+        assert_eq!(passport_from_claims(&claims), Some("u1".to_string()));
+    }
+
+    #[test]
+    fn passport_from_claims_returns_none_when_nothing_identifies_the_caller() {
+        assert_eq!(passport_from_claims(&serde_json::json!({})), None);
+        assert_eq!(passport_from_claims(&serde_json::json!({ "sub": "   " })), None);
+    }
+
+    #[test]
+    fn subject_from_claims_ignores_non_string_values() {
+        assert_eq!(subject_from_claims(&serde_json::json!({ "sub": 42 })), None);
+    }
+
+    // ── Secret parsing / strength policy ───────────────────────────────────
+
+    #[test]
+    fn parse_secret_rejects_a_short_base64_secret() {
+        let short = base64::engine::general_purpose::STANDARD.encode(b"tooshort");
+        let err = parse_secret(&format!("base64:{short}")).unwrap_err();
+        assert!(err.contains("at least 32 bytes"), "got {err}");
+    }
+
+    #[test]
+    fn parse_secret_accepts_exactly_the_minimum_length() {
+        let secret = "a".repeat(MIN_HS256_SECRET_BYTES);
+        assert_eq!(parse_secret(&secret).unwrap().len(), MIN_HS256_SECRET_BYTES);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn weak_secret_is_only_accepted_behind_the_explicit_dev_override() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        std::env::remove_var(ALLOW_WEAK_HS256_SECRET_ENV);
+        assert!(validate_hs256_secret(b"short").is_err());
+
+        for value in ["1", "true", "TRUE", "yes", "YES"] {
+            std::env::set_var(ALLOW_WEAK_HS256_SECRET_ENV, value);
+            assert!(
+                validate_hs256_secret(b"short").is_ok(),
+                "{value} should enable the override"
+            );
+        }
+        // Anything else must NOT enable it — the override is opt-in only.
+        for value in ["0", "on", "no", "", "  1  "] {
+            std::env::set_var(ALLOW_WEAK_HS256_SECRET_ENV, value);
+            assert!(
+                validate_hs256_secret(b"short").is_err(),
+                "{value:?} must not enable the override"
+            );
+        }
+        std::env::remove_var(ALLOW_WEAK_HS256_SECRET_ENV);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn hs256_from_env_accepts_a_weak_secret_only_with_the_override() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", "weak");
+        std::env::set_var(ALLOW_WEAK_HS256_SECRET_ENV, "1");
+        let auth = Authz::from_env(AuthMode::JwtHs256).expect("override accepted");
+        assert_eq!(auth.mode(), AuthMode::JwtHs256);
+
+        std::env::remove_var(ALLOW_WEAK_HS256_SECRET_ENV);
+        std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
+    }
+
+    // ── env_truthy (gates HTTP acceptance of MCP agent tokens) ─────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn env_truthy_accepts_only_the_documented_affirmatives() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        const KEY: &str = "CORECRUXD_ENV_TRUTHY_PROBE";
+        std::env::remove_var(KEY);
+        assert!(!env_truthy(KEY), "an unset flag must be false");
+
+        for value in ["1", "true", "TRUE", "yes", "YES", "on", "ON", "  1  "] {
+            std::env::set_var(KEY, value);
+            assert!(env_truthy(KEY), "{value:?} should be truthy");
+        }
+        for value in ["0", "false", "FALSE", "no", "off", "", "  ", "True", "enabled"] {
+            std::env::set_var(KEY, value);
+            assert!(!env_truthy(KEY), "{value:?} must not be truthy");
+        }
+        std::env::remove_var(KEY);
+    }
+
+    // ── Agent-token HTTP acceptance ────────────────────────────────────────
+
+    const TEST_AGENT_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn clear_agent_env() {
+        for key in [
+            "CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS",
+            "CRUX_AGENT_TOKENS",
+            "CRUX_AGENT_TOKEN",
+            "CORECRUXD_AGENT_TOKEN_HTTP_SCOPES",
+            "CORECRUXD_AGENT_TOKEN_HTTP_TENANT",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn agent_http_config_is_none_unless_the_flag_and_a_token_are_both_present() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+        clear_agent_env();
+
+        // Flag off, token present → disabled.
+        std::env::set_var("CRUX_AGENT_TOKENS", format!("a:{TEST_AGENT_TOKEN}"));
+        assert!(build_agent_http_config().is_none());
+
+        // Flag on, no tokens → disabled (empty registry).
+        std::env::remove_var("CRUX_AGENT_TOKENS");
+        std::env::set_var("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS", "1");
+        assert!(build_agent_http_config().is_none());
+
+        // Flag on, malformed token env → fail closed, still disabled.
+        std::env::set_var("CRUX_AGENT_TOKENS", "a:short");
+        assert!(build_agent_http_config().is_none());
+
+        clear_agent_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn agent_http_config_defaults_scopes_when_the_scope_env_is_blank() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+        clear_agent_env();
+
+        std::env::set_var("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS", "1");
+        std::env::set_var("CRUX_AGENT_TOKENS", format!("a:{TEST_AGENT_TOKEN}"));
+        std::env::set_var("CORECRUXD_AGENT_TOKEN_HTTP_SCOPES", "   ,  ");
+        let cfg = build_agent_http_config().expect("agent http config");
+        assert_eq!(cfg.scopes, default_agent_http_scopes());
+        assert!(matches!(cfg.tenants, TenantAllow::Any), "tenant defaults to '*'");
+
+        clear_agent_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn agent_token_is_bound_to_the_configured_tenant_set() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+        clear_agent_env();
+
+        std::env::set_var("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS", "1");
+        std::env::set_var("CRUX_AGENT_TOKENS", format!("drivew:{TEST_AGENT_TOKEN}"));
+        std::env::set_var("CORECRUXD_AGENT_TOKEN_HTTP_SCOPES", "query:read");
+        std::env::set_var("CORECRUXD_AGENT_TOKEN_HTTP_TENANT", "t1 t2");
+        let cfg = build_agent_http_config().expect("agent http config");
+
+        let ctx = cfg.try_auth(TEST_AGENT_TOKEN).expect("registered token");
+        assert_eq!(ctx.subject.as_deref(), Some("agent:drivew"));
+        assert_eq!(ctx.passport_id.as_deref(), Some("agent:drivew"));
+        assert!(ctx.credential_is_agent_token);
+        assert!(!ctx.canonical_passport_claim_verified);
+        require_tenant_allowed(&ctx.tenants, "t2").unwrap();
+        assert_eq!(require_tenant_allowed(&ctx.tenants, "t3").unwrap_err().0.status, 403);
+
+        // An unregistered token authenticates nothing.
+        assert!(cfg
+            .try_auth("ffffffffffffffffffffffffffffffffffffffffffffffff")
+            .is_none());
+        assert!(cfg.try_auth("").is_none());
+
+        clear_agent_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn agent_token_over_http_cannot_cross_its_tenant_binding() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+        clear_agent_env();
+
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
+        std::env::remove_var(ALLOW_WEAK_HS256_SECRET_ENV);
+        std::env::remove_var("CORECRUXD_JWT_ISS");
+        std::env::remove_var("CORECRUXD_JWT_AUD");
+        std::env::set_var("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS", "1");
+        std::env::set_var("CRUX_AGENT_TOKENS", format!("drivew:{TEST_AGENT_TOKEN}"));
+        std::env::set_var("CORECRUXD_AGENT_TOKEN_HTTP_SCOPES", "query:read");
+        std::env::set_var("CORECRUXD_AGENT_TOKEN_HTTP_TENANT", "t1");
+
+        let auth = Authz::from_env(AuthMode::JwtHs256).expect("auth from env");
+        let headers = bearer(TEST_AGENT_TOKEN);
+
+        require_http_scopes_for_tenant(&auth, &headers, &["query:read"], "t1").expect("bound tenant");
+        let cross = require_http_scopes_for_tenant(&auth, &headers, &["query:read"], "t2").unwrap_err();
+        assert_eq!(cross.0.status, 403);
+        assert_eq!(problem_code(&cross), "TENANT_FORBIDDEN");
+
+        // Scopes outside the configured set are still denied (403, not 401).
+        let scope = require_http_scopes(&auth, &headers, &["admin:write"]).unwrap_err();
+        assert_eq!(scope.0.status, 403);
+
+        // And the credential is flagged as machine provenance.
+        let ctx = passport_bound_context(&auth, &headers).expect("agent context");
+        assert!(ctx.credential_is_agent_token());
+        assert!(!ctx.canonical_passport_claim_verified());
+        assert_eq!(ctx.passport_id.as_deref(), Some("agent:drivew"));
+
+        clear_agent_env();
+        std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
+    }
+
+    #[test]
+    fn tenant_allow_from_str_parses_wildcard_lists_and_blanks() {
+        assert!(matches!(tenant_allow_from_str("*"), TenantAllow::Any));
+        assert!(matches!(tenant_allow_from_str("  *  "), TenantAllow::Any));
+        assert!(matches!(tenant_allow_from_str(""), TenantAllow::Missing));
+        assert!(matches!(tenant_allow_from_str("  , ,\t"), TenantAllow::Missing));
+        match tenant_allow_from_str("t1, t2\tt3") {
+            TenantAllow::Only(set) => assert_eq!(set.len(), 3),
+            other => panic!("expected Only, got {other:?}"),
+        }
+        // A list containing `*` is NOT a wildcard — only a bare `*` is.
+        match tenant_allow_from_str("t1,*") {
+            TenantAllow::Only(set) => assert!(set.contains("*")),
+            other => panic!("expected Only, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_agent_http_scopes_is_the_documented_set() {
+        let scopes = default_agent_http_scopes();
+        for expected in [
+            "admin:read",
+            "admin:write",
+            "facts:write",
+            "query:read",
+            "sessions:read",
+            "sessions:write",
+        ] {
+            assert!(scopes.contains(expected), "missing {expected}");
+        }
+        assert_eq!(scopes.len(), 6, "scope set must not silently grow");
+    }
+
+    // ── JWKS: key selection + verification rejections ──────────────────────
+
+    fn test_jwks_agent() -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_millis(1)))
+            .build()
+            .into()
+    }
+
+    fn jwks_cfg(keys: HashMap<String, jsonwebtoken::DecodingKey>, jwks_url: Option<&str>) -> JwtJwksConfig {
+        JwtJwksConfig {
+            issuer: None,
+            audience: None,
+            algorithms: vec![jsonwebtoken::Algorithm::RS256],
+            jwks_url: jwks_url.map(str::to_string),
+            min_refresh_interval: Duration::from_secs(3600),
+            agent: test_jwks_agent(),
+            state: Arc::new(Mutex::new(JwksState {
+                keys,
+                last_refresh_attempt: None,
+                last_refresh_ok: None,
+                last_error: None,
+            })),
+        }
+    }
+
+    fn dummy_key(seed: &[u8]) -> jsonwebtoken::DecodingKey {
+        jsonwebtoken::DecodingKey::from_secret(seed)
+    }
+
+    #[test]
+    fn resolve_jwks_key_returns_the_only_key_when_no_kid_is_present() {
+        let mut keys = HashMap::new();
+        keys.insert("only".to_string(), dummy_key(b"k"));
+        let cfg = jwks_cfg(keys, None);
+        assert!(resolve_jwks_key(&cfg, None).is_ok());
+        assert!(resolve_jwks_key(&cfg, Some("only")).is_ok());
+    }
+
+    #[test]
+    fn resolve_jwks_key_static_jwks_rejects_an_unknown_kid() {
+        let mut keys = HashMap::new();
+        keys.insert("known".to_string(), dummy_key(b"k"));
+        let cfg = jwks_cfg(keys, None);
+        let err = resolve_jwks_key(&cfg, Some("attacker-kid")).unwrap_err();
+        assert!(err.contains("not found (static jwks)"), "got {err}");
+    }
+
+    #[test]
+    fn resolve_jwks_key_refuses_to_guess_between_multiple_keys() {
+        // Absent-signal guard: a token with no `kid` must not be matched
+        // against an arbitrary key when several are loaded.
+        let mut keys = HashMap::new();
+        keys.insert("a".to_string(), dummy_key(b"a"));
+        keys.insert("b".to_string(), dummy_key(b"b"));
+        let cfg = jwks_cfg(keys, None);
+        let err = resolve_jwks_key(&cfg, None).unwrap_err();
+        assert!(err.contains("multiple keys"), "got {err}");
+    }
+
+    #[test]
+    fn resolve_jwks_key_rate_limits_refresh_on_miss_without_hitting_the_network() {
+        let mut keys = HashMap::new();
+        keys.insert("known".to_string(), dummy_key(b"k"));
+        let cfg = jwks_cfg(keys, Some("http://127.0.0.1:1/jwks"));
+        {
+            // Pretend we just refreshed, so the miss path short-circuits.
+            let mut state = cfg.state.lock().unwrap();
+            state.last_refresh_attempt = Some(Instant::now());
+            state.last_refresh_ok = Some(Instant::now());
+            state.last_error = Some("previous failure".to_string());
+        }
+        let err = resolve_jwks_key(&cfg, Some("attacker-kid")).unwrap_err();
+        assert!(err.contains("rate-limited"), "got {err}");
+        assert!(err.contains("last_error"), "got {err}");
+        // The cached key is still served — rate limiting must not break the
+        // happy path for a kid we already hold.
+        assert!(resolve_jwks_key(&cfg, Some("known")).is_ok());
+    }
+
+    #[test]
+    fn resolve_jwks_key_no_kid_with_many_keys_is_rate_limited_too() {
+        let mut keys = HashMap::new();
+        keys.insert("a".to_string(), dummy_key(b"a"));
+        keys.insert("b".to_string(), dummy_key(b"b"));
+        let cfg = jwks_cfg(keys, Some("http://127.0.0.1:1/jwks"));
+        {
+            let mut state = cfg.state.lock().unwrap();
+            state.last_refresh_attempt = Some(Instant::now());
+        }
+        let err = resolve_jwks_key(&cfg, None).unwrap_err();
+        assert!(err.contains("multiple keys"), "got {err}");
+    }
+
+    #[test]
+    fn parse_jwks_keys_skips_unusable_entries() {
+        let jwks = Jwks {
+            keys: vec![
+                // encryption key — not for signatures
+                Jwk {
+                    kty: "RSA".into(),
+                    kid: Some("enc".into()),
+                    use_: Some("enc".into()),
+                    n: Some("zcAyH".into()),
+                    e: Some("AQAB".into()),
+                    x: None,
+                    y: None,
+                },
+                // no kid
+                Jwk {
+                    kty: "RSA".into(),
+                    kid: None,
+                    use_: Some("sig".into()),
+                    n: Some("zcAyH".into()),
+                    e: Some("AQAB".into()),
+                    x: None,
+                    y: None,
+                },
+                // unknown key type
+                Jwk {
+                    kty: "oct".into(),
+                    kid: Some("sym".into()),
+                    use_: Some("sig".into()),
+                    n: None,
+                    e: None,
+                    x: None,
+                    y: None,
+                },
+                // RSA missing components
+                Jwk {
+                    kty: "RSA".into(),
+                    kid: Some("partial".into()),
+                    use_: None,
+                    n: Some("zcAyH".into()),
+                    e: None,
+                    x: None,
+                    y: None,
+                },
+                // EC missing components
+                Jwk {
+                    kty: "EC".into(),
+                    kid: Some("ec-partial".into()),
+                    use_: Some("sig".into()),
+                    n: None,
+                    e: None,
+                    x: Some("abc".into()),
+                    y: None,
+                },
+            ],
+        };
+        let err = parse_jwks_keys(&jwks).unwrap_err();
+        assert!(err.contains("no usable sig keys"), "got {err}");
+    }
+
+    #[test]
+    fn parse_jwks_keys_accepts_an_ec_signing_key() {
+        let jwks = Jwks {
+            keys: vec![Jwk {
+                kty: "EC".into(),
+                kid: Some("ec-1".into()),
+                use_: Some("sig".into()),
+                n: None,
+                e: None,
+                x: Some("MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4".into()),
+                y: Some("4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM".into()),
+            }],
+        };
+        let keys = parse_jwks_keys(&jwks).expect("ec key parsed");
+        assert!(keys.contains_key("ec-1"));
+    }
+
+    #[test]
+    fn parse_jwks_keys_on_an_empty_set_is_an_error_not_an_empty_allow() {
+        let err = parse_jwks_keys(&Jwks { keys: Vec::new() }).unwrap_err();
+        assert!(err.contains("no usable sig keys"));
+    }
+
+    #[test]
+    fn resolve_initial_jwks_reports_each_bad_source() {
+        let agent = test_jwks_agent();
+
+        let err = resolve_initial_jwks(&agent, None, Some("{not json".into()), None, None, None).unwrap_err();
+        assert!(err.contains("invalid CORECRUXD_JWT_JWKS_JSON"), "got {err}");
+
+        let err = resolve_initial_jwks(
+            &agent,
+            None,
+            None,
+            Some("/nonexistent/path/to/jwks.json".into()),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("read jwks path failed"), "got {err}");
+
+        let err = resolve_initial_jwks(&agent, None, None, None, None, None).unwrap_err();
+        assert!(err.contains("missing JWKS source"), "got {err}");
+    }
+
+    #[test]
+    fn resolve_initial_jwks_loads_inline_json_and_a_file() {
+        let agent = test_jwks_agent();
+
+        let (issuer, url, keys) = resolve_initial_jwks(
+            &agent,
+            Some("https://idp.example".to_string()),
+            Some(TEST_JWKS_JSON.to_string()),
+            None,
+            None,
+            None,
+        )
+        .expect("inline jwks");
+        assert_eq!(issuer.as_deref(), Some("https://idp.example"));
+        assert_eq!(url, None);
+        assert!(keys.contains_key("test-kid"));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jwks.json");
+        std::fs::write(&path, TEST_JWKS_JSON).expect("write jwks");
+        let (_, url, keys) =
+            resolve_initial_jwks(&agent, None, None, Some(path.to_string_lossy().to_string()), None, None)
+                .expect("file jwks");
+        assert_eq!(url, None);
+        assert!(keys.contains_key("test-kid"));
+
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, "{not json").expect("write bad jwks");
+        let err =
+            resolve_initial_jwks(&agent, None, None, Some(bad.to_string_lossy().to_string()), None, None).unwrap_err();
+        assert!(err.contains("invalid jwks json"), "got {err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn jwt_jwks_rejects_a_disallowed_algorithm_before_verifying() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        std::env::remove_var("CORECRUXD_JWT_ISS");
+        std::env::remove_var("CORECRUXD_JWT_AUD");
+        std::env::remove_var("CORECRUXD_JWT_ALGS");
+        std::env::set_var("CORECRUXD_JWT_JWKS_JSON", TEST_JWKS_JSON);
+        std::env::remove_var("CORECRUXD_JWT_JWKS_URL");
+        std::env::remove_var("CORECRUXD_JWT_OIDC_DISCOVERY_URL");
+        let auth = Authz::from_env(AuthMode::JwtJwks).expect("auth from env");
+
+        // Alg-confusion attempt: sign with HS256 using the public modulus as a
+        // shared secret. Only RS256 is configured, so it must never verify.
+        let token = sign_hs256(
+            &serde_json::json!({ "exp": now_secs() + 3600, "scope": "admin:write" }),
+            "an-attacker-chosen-hs256-secret!!",
+        );
+        let err = require_http_scopes(&auth, &bearer(&token), &["admin:write"]).unwrap_err();
+        assert_eq!(err.0.status, 401);
+        assert_eq!(problem_code(&err), "UNAUTHENTICATED");
+
+        std::env::remove_var("CORECRUXD_JWT_JWKS_JSON");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn jwt_jwks_missing_and_malformed_credentials_are_401() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        std::env::remove_var("CORECRUXD_JWT_ISS");
+        std::env::remove_var("CORECRUXD_JWT_AUD");
+        std::env::remove_var("CORECRUXD_JWT_ALGS");
+        std::env::set_var("CORECRUXD_JWT_JWKS_JSON", TEST_JWKS_JSON);
+        std::env::remove_var("CORECRUXD_JWT_JWKS_URL");
+        std::env::remove_var("CORECRUXD_JWT_OIDC_DISCOVERY_URL");
+        let auth = Authz::from_env(AuthMode::JwtJwks).expect("auth from env");
+
+        assert_eq!(
+            require_http_scopes(&auth, &HeaderMap::new(), &["admin:read"])
+                .unwrap_err()
+                .0
+                .status,
+            401
+        );
+        assert_eq!(
+            require_http_scopes(&auth, &bearer("garbage"), &["admin:read"])
+                .unwrap_err()
+                .0
+                .status,
+            401
+        );
+        assert_eq!(
+            describe_http_evidence(&auth, &HeaderMap::new()).unwrap_err().0.status,
+            401
+        );
+
+        std::env::remove_var("CORECRUXD_JWT_JWKS_JSON");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn jwt_jwks_unknown_kid_is_rejected() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
+        std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
+        std::env::remove_var("CORECRUXD_JWT_ALGS");
+        std::env::set_var("CORECRUXD_JWT_JWKS_JSON", TEST_JWKS_JSON);
+        std::env::remove_var("CORECRUXD_JWT_JWKS_URL");
+        std::env::remove_var("CORECRUXD_JWT_OIDC_DISCOVERY_URL");
+        let auth = Authz::from_env(AuthMode::JwtJwks).expect("auth from env");
+
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("attacker-kid".to_string());
+        let token = encode(
+            &header,
+            &valid_claims(serde_json::json!({ "scope": "admin:write", "tenant_id": "t1" })),
+            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY_PEM.as_bytes()).expect("rsa key"),
+        )
+        .expect("jwt");
+
+        let err = require_http_scopes(&auth, &bearer(&token), &["admin:write"]).unwrap_err();
+        assert_eq!(err.0.status, 401);
+
+        std::env::remove_var("CORECRUXD_JWT_JWKS_JSON");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn jwt_jwks_expired_token_is_401() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
+        std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
+        std::env::remove_var("CORECRUXD_JWT_ALGS");
+        std::env::set_var("CORECRUXD_JWT_JWKS_JSON", TEST_JWKS_JSON);
+        std::env::remove_var("CORECRUXD_JWT_JWKS_URL");
+        std::env::remove_var("CORECRUXD_JWT_OIDC_DISCOVERY_URL");
+        let auth = Authz::from_env(AuthMode::JwtJwks).expect("auth from env");
+
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-kid".to_string());
+        let token = encode(
+            &header,
+            &serde_json::json!({
+                "exp": now_secs() - 7200,
+                "iss": "corecrux-test",
+                "aud": "corecrux",
+                "scope": "admin:write",
+                "tenant_id": "t1",
+            }),
+            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY_PEM.as_bytes()).expect("rsa key"),
+        )
+        .expect("jwt");
+
+        assert_eq!(
+            require_http_scopes(&auth, &bearer(&token), &["admin:write"])
+                .unwrap_err()
+                .0
+                .status,
+            401
+        );
+
+        std::env::remove_var("CORECRUXD_JWT_JWKS_JSON");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn jwt_jwks_rejects_an_unsupported_alg_env() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        std::env::set_var("CORECRUXD_JWT_JWKS_JSON", TEST_JWKS_JSON);
+        std::env::set_var("CORECRUXD_JWT_ALGS", "HS256");
+        let err = Authz::from_env(AuthMode::JwtJwks).unwrap_err();
+        assert!(err.contains("unsupported jwt alg HS256"), "got {err}");
+
+        std::env::remove_var("CORECRUXD_JWT_ALGS");
+        std::env::remove_var("CORECRUXD_JWT_JWKS_JSON");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn jwt_jwks_rejects_invalid_inline_jwks() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        std::env::remove_var("CORECRUXD_JWT_ALGS");
+        std::env::set_var("CORECRUXD_JWT_JWKS_JSON", "{\"keys\": []}");
+        let err = Authz::from_env(AuthMode::JwtJwks).unwrap_err();
+        assert!(err.contains("no usable sig keys"), "got {err}");
+
+        std::env::remove_var("CORECRUXD_JWT_JWKS_JSON");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn jwt_jwks_loads_from_a_path_and_verifies() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jwks.json");
+        std::fs::write(&path, TEST_JWKS_JSON).expect("write jwks");
+
+        std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
+        std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
+        std::env::remove_var("CORECRUXD_JWT_ALGS");
+        std::env::remove_var("CORECRUXD_JWT_JWKS_JSON");
+        std::env::remove_var("CORECRUXD_JWKS_JSON");
+        std::env::set_var("CORECRUXD_JWT_JWKS_PATH", &path);
+        std::env::remove_var("CORECRUXD_JWT_JWKS_URL");
+        std::env::remove_var("CORECRUXD_JWT_OIDC_DISCOVERY_URL");
+        let auth = Authz::from_env(AuthMode::JwtJwks).expect("auth from env");
+
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-kid".to_string());
+        let token = encode(
+            &header,
+            &valid_claims(serde_json::json!({ "scope": "admin:read", "tenant_id": "t1" })),
+            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY_PEM.as_bytes()).expect("rsa key"),
+        )
+        .expect("jwt");
+        require_http_scopes_for_tenant(&auth, &bearer(&token), &["admin:read"], "t1").expect("verified");
+
+        std::env::remove_var("CORECRUXD_JWT_JWKS_PATH");
+    }
+
+    // ── TenantStampMode env plumbing ───────────────────────────────────────
+
+    #[test]
+    fn tenant_stamp_mode_as_str_is_stable() {
+        assert_eq!(TenantStampMode::Off.as_str(), "off");
+        assert_eq!(TenantStampMode::Shadow.as_str(), "shadow");
+        assert_eq!(TenantStampMode::On.as_str(), "on");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn tenant_stamp_mode_from_env_reads_the_real_env() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        std::env::remove_var("CORECRUXD_TENANT_WRITE_STAMP");
+        assert_eq!(TenantStampMode::from_env(), TenantStampMode::Off);
+
+        for (raw, want) in [
+            ("1", TenantStampMode::On),
+            ("TRUE", TenantStampMode::On),
+            ("On", TenantStampMode::On),
+            ("enforce", TenantStampMode::On),
+            ("SHADOW", TenantStampMode::Shadow),
+            ("audit", TenantStampMode::Shadow),
+            ("0", TenantStampMode::Off),
+            ("off", TenantStampMode::Off),
+            ("banana", TenantStampMode::Off),
+            ("", TenantStampMode::Off),
+        ] {
+            std::env::set_var("CORECRUXD_TENANT_WRITE_STAMP", raw);
+            assert_eq!(TenantStampMode::from_env(), want, "raw {raw:?}");
+        }
+
+        std::env::remove_var("CORECRUXD_TENANT_WRITE_STAMP");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn scope_context_write_and_read_tenant_follow_the_env_posture() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "scope": "facts:write", "tenant_id": "t1" })),
+            TEST_HS256_SECRET,
+        );
+
+        std::env::remove_var("CORECRUXD_TENANT_WRITE_STAMP");
+        let ctx = passport_bound_context(&auth, &bearer(&token)).expect("context");
+        assert_eq!(ctx.resolve_write_tenant().unwrap(), None, "default posture is off");
+        assert_eq!(ctx.resolve_read_tenant(), None);
+
+        std::env::set_var("CORECRUXD_TENANT_WRITE_STAMP", "1");
+        assert_eq!(ctx.resolve_write_tenant().unwrap(), Some("t1".to_string()));
+        assert_eq!(ctx.resolve_read_tenant(), Some("t1".to_string()));
+
+        // A selector the token does not own is refused even under `On`.
+        let mut headers = bearer(&token);
+        headers.insert("x-corecrux-tenant-id", "t2".parse().unwrap());
+        let ctx = passport_bound_context(&auth, &headers).expect("context");
+        let err = ctx.resolve_write_tenant().unwrap_err();
+        assert_eq!(err.0.status, 403);
+        assert_eq!(problem_code(&err), "TENANT_FORBIDDEN");
+
+        std::env::set_var("CORECRUXD_TENANT_WRITE_STAMP", "shadow");
+        assert_eq!(
+            ctx.resolve_write_tenant().unwrap(),
+            None,
+            "shadow must never reject or stamp"
+        );
+
+        std::env::remove_var("CORECRUXD_TENANT_WRITE_STAMP");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn multi_tenant_token_needs_a_selector_when_stamping_is_on() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "scope": "facts:write", "tenants": ["t1", "t2"] })),
+            TEST_HS256_SECRET,
+        );
+        std::env::set_var("CORECRUXD_TENANT_WRITE_STAMP", "on");
+
+        let ctx = passport_bound_context(&auth, &bearer(&token)).expect("context");
+        let err = ctx.resolve_write_tenant().unwrap_err();
+        assert_eq!(problem_code(&err), "TENANT_SELECTOR_REQUIRED");
+        // Multi-tenant tokens read `default`, in lockstep with the write side.
+        assert_eq!(ctx.resolve_read_tenant(), None);
+
+        let mut headers = bearer(&token);
+        headers.insert("x-corecrux-tenant-id", "  t2  ".parse().unwrap());
+        let ctx = passport_bound_context(&auth, &headers).expect("context");
+        assert_eq!(ctx.resolve_write_tenant().unwrap(), Some("t2".to_string()));
+
+        std::env::remove_var("CORECRUXD_TENANT_WRITE_STAMP");
+    }
+
+    #[test]
+    fn resolve_write_tenant_on_ignores_a_blank_selector() {
+        assert_eq!(
+            resolve_write_tenant_on(&only(&["t1"]), Some("   ")).unwrap(),
+            Some("t1".to_string())
+        );
+        assert_eq!(resolve_write_tenant_on(&TenantAllow::Any, Some("")).unwrap(), None);
     }
 }

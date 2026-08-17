@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Shared loopback-auth helpers for MCP tools that call the daemon over HTTP.
 //!
@@ -49,6 +49,7 @@ const LOOPBACK_SCOPES: &[&str] = &[
     "admin:write",
     "facts:write",
     "query:read",
+    "receipts:read",
     "sessions:read",
 ];
 
@@ -77,6 +78,8 @@ struct LoopbackClaims<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     aud: Option<&'a str>,
     sub: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    passport_id: Option<&'a str>,
     scopes: &'a [&'a str],
     tenant_id: &'a str,
     iat: u64,
@@ -117,6 +120,7 @@ fn mint_loopback_jwt_inner(
         aud,
         &ScopedClaims {
             sub: "mcp-loopback",
+            passport_id: None,
             scopes: LOOPBACK_SCOPES,
             tenant_id: "*",
             ttl_secs: JWT_TTL_SECS,
@@ -134,6 +138,10 @@ fn mint_loopback_jwt_inner(
 pub struct ScopedClaims<'a> {
     /// Token subject (the principal the credential acts as).
     pub sub: &'a str,
+    /// Optional canonical passport binding. Internal loopback mutations set
+    /// this to the MCP session's resolved passport so the daemon does not need
+    /// to treat `X-Corecrux-Passport-Id` as an impersonation override.
+    pub passport_id: Option<&'a str>,
     /// Granted scopes (the daemon's `scopes_from_claims` reads the `scopes` array).
     pub scopes: &'a [&'a str],
     /// Tenant binding. Use a concrete tenant id; `"*"` only for cross-tenant
@@ -157,6 +165,7 @@ pub fn mint_scoped_jwt_inner(
         iss,
         aud,
         sub: claims.sub,
+        passport_id: claims.passport_id,
         scopes: claims.scopes,
         tenant_id: claims.tenant_id,
         iat: now_secs,
@@ -223,6 +232,25 @@ pub fn loopback_bearer_token() -> Option<String> {
         return Some(jwt);
     }
     resolve_bearer_token(|name| std::env::var(name).ok())
+}
+
+/// Resolve a loopback bearer token bound to the supplied MCP-session
+/// passport. HS256 mode mints a short-lived token whose canonical
+/// `passport_id` claim matches the forwarded header; other modes retain the
+/// raw-token fallback and let the daemon apply their normal binding rules.
+pub fn loopback_bearer_token_for_passport(passport_id: Option<&str>, tenant_id: Option<&str>) -> Option<String> {
+    if passport_id.is_some() || tenant_id.is_some() {
+        if let Some(jwt) = mint_scoped_jwt_from_env(&ScopedClaims {
+            sub: "mcp-loopback",
+            passport_id,
+            scopes: LOOPBACK_SCOPES,
+            tenant_id: tenant_id.unwrap_or("default"),
+            ttl_secs: JWT_TTL_SECS,
+        }) {
+            return Some(jwt);
+        }
+    }
+    loopback_bearer_token()
 }
 
 /// Pure variant of the raw-token resolver used by tests; scans the env-var
@@ -369,6 +397,7 @@ mod tests {
             Some("crux.cuecrux.com"),
             &ScopedClaims {
                 sub: "ts:alice@example.com",
+                passport_id: Some("passport-alice"),
                 scopes: &["facts:write", "query:read"],
                 tenant_id: "acme",
                 ttl_secs: 300,
@@ -377,6 +406,7 @@ mod tests {
         .unwrap();
         let claims = verify_with_daemon_rules(&token, secret, Some("cuecrux-crux-mint"), Some("crux.cuecrux.com"));
         assert_eq!(claims["sub"], "ts:alice@example.com");
+        assert_eq!(claims["passport_id"], "passport-alice");
         assert_eq!(claims["tenant_id"], "acme");
         let scopes: Vec<&str> = claims["scopes"]
             .as_array()
@@ -403,6 +433,7 @@ mod tests {
             None,
             &ScopedClaims {
                 sub: "mcp-loopback",
+                passport_id: None,
                 scopes: LOOPBACK_SCOPES,
                 tenant_id: "*",
                 ttl_secs: JWT_TTL_SECS,
@@ -410,6 +441,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn loopback_scopes_cover_receipt_verification() {
+        // The receipt_verify tool's loopback GET requires receipts:read;
+        // under JWT auth modes header scopes are ignored, so the claim set
+        // must carry it (mcp-tool-usage-analytics follow-up, 2026-07-24).
+        assert!(LOOPBACK_SCOPES.contains(&"receipts:read"));
     }
 
     #[test]
@@ -463,5 +502,61 @@ mod tests {
         let claims = verify_with_daemon_rules(&token, secret, None, None);
         assert_eq!(claims["nbf"].as_u64().unwrap(), mcp_now - 30);
         assert_eq!(claims["exp"].as_u64().unwrap() - claims["iat"].as_u64().unwrap(), 300);
+    }
+
+    /// The loopback credential is **wildcard-tenant by construction**, and that
+    /// disqualifies MCP as a hosted multi-tenant transport.
+    ///
+    /// `mint_loopback_jwt` sets `tenant_id: "*"`, which the daemon's
+    /// `tenant_allow_from_str` turns into `TenantAllow::Any`. Every
+    /// `require_http_scopes_for_tenant` check therefore passes for whatever
+    /// `tenant_id` the *caller* named in the tool arguments.
+    ///
+    /// On a local daemon that is correct and deliberate: the loopback socket is
+    /// the trust boundary, the agent is the user's own, and there is one tenant.
+    /// It is **not** safe if MCP ever becomes the transport for hosted Pro,
+    /// where the tenant named in a tool argument would be honoured for any
+    /// caller. The HTTP surface's adversarial isolation evidence does not carry
+    /// over to MCP, because the credential is different.
+    ///
+    /// This test pins the wildcard so the property cannot change silently in
+    /// either direction: narrowing it would break local MCP, and leaving it
+    /// wildcard while hosting over MCP would be a cross-tenant read.
+    #[test]
+    fn loopback_credential_is_wildcard_tenant_and_that_gates_hosted_mcp() {
+        let Some(jwt) = mint_loopback_jwt() else {
+            // No signing material in this environment; the claim under test is
+            // about the minted token's shape, so there is nothing to assert.
+            return;
+        };
+        let payload = jwt.split('.').nth(1).expect("jwt has a payload segment");
+        let decoded = base64_url_decode_for_test(payload);
+        let claims: serde_json::Value = serde_json::from_slice(&decoded).expect("payload is json");
+        assert_eq!(
+            claims["tenant_id"], "*",
+            "the loopback token is wildcard-tenant. If this has changed, hosted MCP may now be \
+             viable — update the isolation packet rather than just this assertion."
+        );
+    }
+
+    /// Minimal base64url decoder so the test does not add a dependency for one
+    /// assertion.
+    fn base64_url_decode_for_test(input: &str) -> Vec<u8> {
+        const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = Vec::new();
+        let mut buf = 0u32;
+        let mut bits = 0u32;
+        for byte in input.bytes() {
+            let Some(idx) = TABLE.iter().position(|c| *c == byte) else {
+                continue;
+            };
+            buf = (buf << 6) | idx as u32;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((buf >> bits) as u8);
+            }
+        }
+        out
     }
 }

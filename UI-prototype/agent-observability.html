@@ -1014,7 +1014,7 @@ const N = {
   /* ── filled-in panels: projects · packs · extensions · raw RPC ── */
   'proj-cuecrux':{kind:'project',label:'CueCrux',sub:'workspace · active',status:'run',
     fields:[['path','/home/myles/CueCrux'],['repos','12'],['sessions','3 active'],['execplans','7 open']]},
-  'proj-crux':{kind:'project',label:'Crux daemon',sub:'source-available · CCL',status:'ok',
+  'proj-crux':{kind:'project',label:'Crux daemon',sub:'open source · Apache-2.0',status:'ok',
     fields:[['path','CueCrux/Crux'],['crates','17'],['port','14800'],['tag','v0.4.2']]},
   'proj-audit':{kind:'project',label:'AuditCrux',sub:'benchmarks + receipts',status:'ok',
     fields:[['path','CueCrux/AuditCrux'],['runs','q500 · lme-s · agentq']]},
@@ -1049,7 +1049,7 @@ const N = {
   'readme-arch':{kind:'doc',label:'Architecture',sub:'17 crates',
     doc:'# Architecture\n\ncorecruxd — HTTP (axum :14800) + gRPC daemon\ncorecrux-retrieval — BM25 + graph fusion\ncorecrux-storage — append-only sealed segments\ncorecrux-receipts — Ed25519 CROWN signing'},
   'readme-rules':{kind:'doc',label:'Key rules',sub:'do/don\u2019t',
-    doc:'# Key Rules\n\n· No GPU/CUDA code — daemon is CPU-only\n· Licence headers on every .rs (CCL v1.0)\n· Port 14800 is fixed\n· No proprietary crates in this repo'},
+    doc:'# Key Rules\n\n· No GPU/CUDA code — daemon is CPU-only\n· Licence headers on every .rs (Apache-2.0)\n· Port 14800 is fixed\n· No proprietary crates in this repo'},
   'gsite-corecrux':{kind:'site',label:'corecrux',sub:'62,114 entries',fields:[['kind','hypernym'],['depth','4']]},
   'gsite-retrieval':{kind:'site',label:'retrieval-lanes',sub:'18,902 entries',fields:[['kind','hypernym'],['depth','3']]},
   'bulk-import':{kind:'job',label:'bulk-import · corecrux',sub:'force_seal · 12k events',status:'ok',
@@ -1146,7 +1146,7 @@ const N = {
     doc:'DOSSIER · operator\n\nWho the work is for: standing preferences, active\nplans and decision history — recalled when an agent\nasks "what does the operator want here?"'},
   'dos-crux':{kind:'dossier',label:'project / crux-daemon',sub:'17 crates · v0.4.9',status:'run',
     fields:[['subject','Crux daemon'],['state','v0.4.9 cut · console PR open'],['ports',':14800 · :14801 · :4007'],
-            ['invariants','CPU-only · CCL licence · port fixed']],
+            ['invariants','CPU-only · Apache-2.0 licence · port fixed']],
     doc:'DOSSIER · crux-daemon\n\nProject card: current version, open PRs, ports and\nthe invariants every session must respect.'},
   'dos-corecrux':{kind:'dossier',label:'platform / corecrux',sub:'GPU lanes · AMR',status:'idle',
     fields:[['subject','CoreCrux'],['role','paid retrieval substrate'],['lanes','dense · graph · entity · event · nav'],
@@ -1976,7 +1976,7 @@ const DX_DOCS=[
 const DX_README=[
  {g:'README · corecruxd',items:[
   {id:'rd-build',t:'Build & test',body:'cargo build --release   # CPU-only daemon\ncargo test --workspace\ncargo fmt --check\ncargo clippy --workspace -- -D warnings'},
-  {id:'rd-rules',t:'Key rules',body:'· No GPU/CUDA code — the daemon is CPU-only\n· Licence headers on every .rs (CCL v1.0)\n· Port 14800 is fixed — do not change the default\n· No proprietary crates in this repo\n\n17 crates · HTTP :14800 · MCP :14801 · gRPC :4007'},
+  {id:'rd-rules',t:'Key rules',body:'· No GPU/CUDA code — the daemon is CPU-only\n· Licence headers on every .rs (Apache-2.0)\n· Port 14800 is fixed — do not change the default\n· No proprietary crates in this repo\n\n17 crates · HTTP :14800 · MCP :14801 · gRPC :4007'},
   {id:'rd-arch',t:'Architecture',body:'corecruxd          HTTP (axum) + gRPC (tonic) daemon\ncorecruxctl        CLI with subcommands\ncorecrux-retrieval BM25 + graph signal fusion (CPU)\ncorecrux-storage   append-only shards · sealed segments\ncorecrux-receipts  Ed25519 CROWN receipt signing'}]}];
 const DX_EXTERNAL=[
  {g:'External surfaces',items:[
@@ -3292,7 +3292,7 @@ const PAGES={
    {t:'btn',label:'Browse as graph',action:'graph'}]}]},
  'dx-readme':{title:'README · corecruxd',sub:'17 crates · port 14800',sections:[
   {h:'Build & test',doc:'cargo build --release   # CPU-only daemon\ncargo test --workspace\ncargo fmt --check\ncargo clippy --workspace -- -D warnings',controls:[]},
-  {h:'Key rules',doc:'· No GPU/CUDA code — daemon is CPU-only\n· Licence headers on every .rs (CCL v1.0)\n· Port 14800 is fixed\n· No proprietary crates in this repo',controls:[
+  {h:'Key rules',doc:'· No GPU/CUDA code — daemon is CPU-only\n· Licence headers on every .rs (Apache-2.0)\n· Port 14800 is fixed\n· No proprietary crates in this repo',controls:[
    {t:'btn',label:'Browse sections as graph',action:'graph'}]}]},
  'dx-sites':{title:'External docs',sub:'linked surfaces',sections:[
   {h:'Links',controls:[

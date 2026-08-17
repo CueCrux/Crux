@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 #![deny(clippy::unwrap_used)]
 
@@ -27,12 +27,16 @@
 
 pub mod attribution;
 pub mod levers;
+pub mod models;
 pub mod report;
 pub mod summary;
 pub mod transcript;
 
-pub use report::{BlockCost, Bucket, CostReport, Headline, Lever, Measured, Severity, COST_REPORT_SCHEMA};
-pub use transcript::{ExecPlanSignal, SignalStrength};
+pub use report::{
+    BlockCost, Bucket, CostReport, EffortBurn, Headline, Lever, Measured, ModelBreakdown, ModelBurn, Severity,
+    COST_REPORT_SCHEMA,
+};
+pub use transcript::{normalize_model, ExecPlanSignal, SignalStrength, SYNTHETIC_MODEL};
 
 use std::path::Path;
 
@@ -324,6 +328,100 @@ mod tests {
         assert!(r.execplan_slugs.is_empty());
         let empty = analyze_str("", "empty.jsonl");
         assert!(empty.execplan_slugs.is_empty());
+    }
+
+    /// Gate 3: a report written before the model/effort axis existed must still
+    /// deserialise, and a report with nothing to say about it must not grow the
+    /// fields on the wire. This is the `execplan_slugs` compatibility pattern.
+    #[test]
+    fn legacy_report_without_the_model_axis_round_trips() {
+        let legacy = json!({
+            "schema": COST_REPORT_SCHEMA,
+            "session_id": "legacy",
+            "source": "legacy.jsonl",
+            "headline": {"assistant_turns":1,"tasks":1,"segments":1,"context_tokens_per_turn":10,
+                         "cache_read_to_output_ratio":1.0,"measured_context_total":10,"prefix_pct":0.0},
+            "measured": {"input":10,"output":10,"cache_read":0,"cache_creation":0},
+            "buckets": [], "top_blocks": [], "levers": []
+        })
+        .to_string();
+        let r: CostReport = serde_json::from_str(&legacy).expect("legacy report must deserialise");
+        assert!(r.model.is_none() && r.effort.is_none() && r.cwd.is_none());
+        assert!(r.git_branch.is_none() && r.breakdown.is_none());
+        // …and re-serialising it does not invent the fields.
+        let back = serde_json::to_string(&r).expect("serialize");
+        for field in ["\"model\"", "\"effort\"", "\"cwd\"", "\"git_branch\"", "\"breakdown\""] {
+            assert!(!back.contains(field), "empty report must not carry {field}");
+        }
+    }
+
+    /// Gate 4: an id this build has never seen is carried verbatim — neither
+    /// dropped nor folded into a known bucket. A silent merge would misattribute
+    /// one model's burn to another, and nothing downstream could detect it.
+    #[test]
+    fn unknown_model_passes_through_verbatim() {
+        let lines = [
+            json!({"type":"assistant","sessionId":"u","message":{"role":"assistant","model":"claude-opus-7-preview",
+                   "usage":{"input_tokens":5,"output_tokens":1,"cache_read_input_tokens":95},
+                   "content":[{"type":"text","text":"a"}]}}),
+            json!({"type":"assistant","sessionId":"u","message":{"role":"assistant","model":"claude-opus-5",
+                   "usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":9},
+                   "content":[{"type":"text","text":"b"}]}}),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        let r = analyze_str(&lines, "u.jsonl");
+        let b = r.breakdown.as_ref().expect("breakdown");
+        let names: Vec<&str> = b.models.iter().map(|m| m.model.as_str()).collect();
+        assert_eq!(names, vec!["claude-opus-7-preview", "claude-opus-5"]);
+        // Verbatim: no truncation to a family, no merge into opus-5.
+        assert_eq!(b.models[0].context_total, 100);
+        assert_eq!(b.models[1].context_total, 10);
+    }
+
+    /// Gate 1, on the shape of a real record: per-model turn counts must
+    /// reconcile against a direct count of the same input, and the per-model
+    /// context must sum to the session's measured total.
+    #[test]
+    fn per_model_counts_reconcile_against_a_direct_count() {
+        let lines = [
+            json!({"type":"assistant","sessionId":"r","effort":"xhigh","cwd":"/w","gitBranch":"feat/x",
+                   "message":{"role":"assistant","model":"claude-opus-5",
+                   "usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":90},
+                   "content":[{"type":"text","text":"a"}]}}),
+            json!({"type":"assistant","sessionId":"r","effort":"xhigh","cwd":"/w","gitBranch":"feat/x",
+                   "message":{"role":"assistant","model":"claude-opus-5",
+                   "usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":90},
+                   "content":[{"type":"text","text":"b"}]}}),
+            json!({"type":"assistant","sessionId":"r","cwd":"/w","gitBranch":"feat/x",
+                   "message":{"role":"assistant","model":"claude-sonnet-5",
+                   "usage":{"input_tokens":0,"output_tokens":1,"cache_read_input_tokens":50},
+                   "content":[{"type":"text","text":"c"}]}}),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        let r = analyze_str(&lines, "r.jsonl");
+        let b = r.breakdown.as_ref().expect("breakdown");
+        let opus = b.models.iter().find(|m| m.model == "claude-opus-5").expect("opus");
+        let sonnet = b.models.iter().find(|m| m.model == "claude-sonnet-5").expect("sonnet");
+        assert_eq!(opus.turns, 2, "direct count of opus-5 records");
+        assert_eq!(sonnet.turns, 1, "direct count of sonnet-5 records");
+        assert_eq!(opus.turns + sonnet.turns, r.headline.assistant_turns);
+        let summed: u64 = b.models.iter().map(|m| m.context_total).sum::<u64>() + b.unattributed_context;
+        assert_eq!(summed, r.headline.measured_context_total);
+        // Coverage travels with the effort rows: 100% for opus, 0% for sonnet.
+        assert!((opus.effort_coverage_pct - 100.0).abs() < 1e-9);
+        assert!((sonnet.effort_coverage_pct - 0.0).abs() < 1e-9);
+        assert!(sonnet.efforts.is_empty());
+        // The promoted scalars.
+        assert_eq!(r.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(r.effort.as_deref(), Some("xhigh"));
+        assert_eq!(r.cwd.as_deref(), Some("/w"));
+        assert_eq!(r.git_branch.as_deref(), Some("feat/x"));
     }
 
     #[test]

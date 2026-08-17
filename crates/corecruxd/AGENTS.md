@@ -21,6 +21,10 @@ this file is an index, not an inventory.
   `GET /v1/repos/{repo_id}/codemap` (`get_repo_codemap`)
 - `src/work.rs` + `src/work_execplans.rs` — /v1/work kanban + ExecPlan projection
   (`derive_state`)
+- `src/attention.rs` — counts-only attention roll-up behind
+  `GET /v1/attention/summary`; port of the console's `deriveAttentionZone`
+- `src/relay_device.rs` + `src/relay_client.rs` — relay device identity (derived
+  from the passport seed) and the outbound handshake (contract v1 §§3,4,6,11)
 
 ## Key symbols
 - `sign_segment_seal_material` / `build_segment_seal_receipt` (`src/grpc.rs`) — private
@@ -44,3 +48,13 @@ this file is an index, not an inventory.
 - The daemon must never panic on untrusted input — the crate-level clippy denies are
   load-bearing; `#[allow]` only with a `// SAFETY:` justification.
 - New HTTP routes must be classified in `src/http/route_auth.rs`.
+- **The relay handshake context lives in ONE function** (`relay_client::relay_context`).
+  The daemon signs over it and the relay rebuilds it independently; it is not a wire
+  field, so a second copy that drifts shows up only as an unexplained proof failure
+  in production. Its `data_egress_classes` is `["text"]` — do **not** copy sync's `&[]`.
+- **Never log a relay token or possession proof** (contract §11). `AttachFrame`'s
+  hand-written `Debug` redacts both; keep it that way if fields are added.
+- `AttentionSummary` is counts-only on purpose — it exists so the hosted view can
+  show attention without the plan names and local paths that disqualify
+  `/v1/work` and `/v1/coord/active` from the frozen subset. Adding an item field
+  reintroduces exactly the leak it was written to avoid.

@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Dynamic MCP surface for installed community extensions.
 
@@ -75,7 +75,7 @@ pub async fn list_extension_tools(ctx: &McpContext) -> Vec<ToolDefinition> {
             tools.push(ToolDefinition {
                 name: tool.name.clone(),
                 description: format!(
-                    "[local][extension:{}][trust:{:?}] {}",
+                    "[tier:local][extension:{}][trust:{:?}] {}",
                     extension.manifest.id, extension.trust_tier, tool.description
                 ),
                 input_schema,
@@ -251,6 +251,7 @@ mod tests {
     use super::*;
     use corecrux_memory::fact_store::StoreFact;
     use crux_router::{mint_free_local_token, RcxRouter};
+    use ed25519_dalek::{Signer, SigningKey};
     use rcx_capability_token::RCX_CT_SIGNATURE_LEN;
 
     const TEST_PASSPORT: &str = "p_0123456789abcdef0123456789abcdef";
@@ -280,7 +281,8 @@ mod tests {
     }
 
     fn rcx_ctx(capabilities: Vec<&str>) -> McpContext {
-        McpContext::new_default("test-node").with_rcx_router(RcxRouter::new(mint_free_local_token(
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let mut token = mint_free_local_token(
             TEST_PASSPORT,
             "daemon_01HV0000000000000000000000",
             "default",
@@ -288,7 +290,12 @@ mod tests {
             1_776_989_000,
             1_776_990_000,
             [0x22; RCX_CT_SIGNATURE_LEN],
-        )))
+        );
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+        McpContext::new_default("test-node").with_rcx_router(RcxRouter::new_with_trusted_issuer_pubkey(
+            token,
+            signing.verifying_key().to_bytes(),
+        ))
     }
 
     async fn seed_extension_and_grant(ctx: &McpContext) {

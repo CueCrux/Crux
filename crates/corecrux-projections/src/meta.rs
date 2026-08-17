@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! `projections-meta.json` reader + writer; tracks per-shard projection state versions and snapshot fingerprints.
 
@@ -273,7 +273,7 @@ fn module_version(module_id: &str, schema_version: u32, config: &str, created_at
         "corecrux-projections:{MODULE_VERSION}:{module_id}:schema:{schema_version}:runner_v1:state_v1"
     ));
     let config_hash = hash_hex(&format!(
-        "corecrux-projections:{module_id}:schema:{schema_version}:ccxs_v1:codec_none:{config}"
+        "corecrux-projections:{module_id}:schema:{schema_version}:ccxsnap_v1:codec_none:{config}"
     ));
     ProjectionModuleVersionV1 {
         schema: PROJECTION_MODULE_VERSION_SCHEMA_V1.to_string(),

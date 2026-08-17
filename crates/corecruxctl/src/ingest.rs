@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! File and directory ingest for the daemon's local CPU prose-ingest route.
 
@@ -85,6 +85,13 @@ struct IngestResponse {
     receipt_id: Option<String>,
     dense_vectors: usize,
     dense_dim: Option<usize>,
+    /// B1 (`corecrux-ingest-dense-silent-failure-2026-08-07`): `ok` | `partial` |
+    /// `skipped` | `not_configured` | `not_applicable`. Defaulted so this CLI
+    /// still talks to a daemon that predates the field.
+    #[serde(default)]
+    dense_status: Option<String>,
+    #[serde(default)]
+    dense_expected: Option<usize>,
 }
 
 /// Receipt and sealed-segment identifiers returned for one HTTP batch.
@@ -99,6 +106,9 @@ pub struct BatchSeal {
     pub sealed: bool,
     pub dense_vectors: usize,
     pub dense_dim: Option<usize>,
+    /// `None` when the daemon predates `dense_status` (B1).
+    pub dense_status: Option<String>,
+    pub dense_expected: Option<usize>,
 }
 
 /// Aggregate result for a completed or dry-run ingest.
@@ -178,7 +188,26 @@ pub fn execute(options: &IngestOptions) -> Result<IngestReport, DynErr> {
         .ok()
         .filter(|value| !value.trim().is_empty());
     for (index, request) in requests.iter().enumerate() {
+        let sent_documents = request.documents.len();
+        let sent_chunks: usize = request.documents.iter().map(|document| document.chunks.len()).sum();
         let response = post_request(&options.daemon_url, token.as_deref(), request)?;
+        // Reconcile sent against acknowledged. A 202 carrying `ingested: 0`
+        // for a two-document batch used to be copied straight into the report,
+        // which then claimed `files_ingested: 2, documents_sealed: 0` and
+        // returned `Ok`. `openclaw::import_run` in this crate already compares
+        // the two sides; this is the same shape.
+        if response.documents != sent_documents || response.ingested != sent_chunks {
+            return Err(format!(
+                "ingest batch {}/{} was accepted but the daemon acknowledged {} documents / {} chunks against {sent_documents} documents / {sent_chunks} chunks sent; \
+                 {} documents sealed in earlier batches",
+                index + 1,
+                requests.len(),
+                response.documents,
+                response.ingested,
+                report.documents_sealed,
+            )
+            .into());
+        }
         report.documents_sealed += response.documents;
         report.seals.push(BatchSeal {
             batch: index + 1,
@@ -190,6 +219,8 @@ pub fn execute(options: &IngestOptions) -> Result<IngestReport, DynErr> {
             sealed: response.sealed,
             dense_vectors: response.dense_vectors,
             dense_dim: response.dense_dim,
+            dense_status: response.dense_status,
+            dense_expected: response.dense_expected,
         });
     }
     Ok(report)
@@ -221,6 +252,20 @@ pub fn run(options: &IngestOptions) -> Result<(), DynErr> {
                 seal.chunks,
                 seal.sealed
             );
+            // B1: a dense gap is not visible in chunks/sealed — those look
+            // healthy while retrieval has degraded to lexical-only. Say it.
+            if let Some(status) = seal.dense_status.as_deref() {
+                if matches!(status, "skipped" | "partial") {
+                    eprintln!(
+                        "  warning: batch {} sealed with dense_status={status} \
+                         ({} of {} chunks embedded) — this corpus is lexical-only \
+                         and semantic recall will be degraded",
+                        seal.batch,
+                        seal.dense_vectors,
+                        seal.dense_expected.unwrap_or(seal.chunks),
+                    );
+                }
+            }
         }
     }
     println!("query next:");
@@ -595,50 +640,105 @@ struct EmbeddingData {
     embedding: Vec<f32>,
 }
 
+/// OpenAI-compatible embedding client, one text per call.
+///
+/// Shared by `crux-ingest --embed` and `rebuild-companions`, because both ask
+/// the same question of the same door and two clients would be two chances to
+/// disagree about the endpoint shape, the auth header, or what counts as a
+/// usable vector. One call per text is also the metering unit on the delegated
+/// door (1 credit/call), so a caller can count calls and report spend.
+pub(crate) struct EmbeddingClient {
+    endpoint: String,
+    model: String,
+    api_key: Option<String>,
+    agent: ureq::Agent,
+}
+
+impl EmbeddingClient {
+    /// Resolve from `CORECRUXD_EMBEDDING_URL` / `CORECRUXD_EMBEDDING_MODEL`,
+    /// with explicit overrides taking precedence.
+    ///
+    /// `required_by` names the flag in the error, so "you need a URL" says which
+    /// command needed one.
+    pub(crate) fn from_env(
+        url_override: Option<&str>,
+        model_override: Option<&str>,
+        required_by: &str,
+    ) -> Result<Self, DynErr> {
+        let base = url_override
+            .map(str::to_string)
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                std::env::var("CORECRUXD_EMBEDDING_URL")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .ok_or_else(|| format!("{required_by} requires CORECRUXD_EMBEDDING_URL or --embedding-url"))?;
+        let model = model_override
+            .map(str::to_string)
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                std::env::var("CORECRUXD_EMBEDDING_MODEL")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .unwrap_or_else(|| "nomic-embed-text".to_string());
+        Ok(Self {
+            endpoint: embedding_endpoint(&base),
+            model,
+            api_key: std::env::var("OPENAI_API_KEY")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            agent: ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(120)))
+                .build()
+                .into(),
+        })
+    }
+
+    pub(crate) fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Embed one text. One HTTP call, one credit on the metered door.
+    pub(crate) fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+        let mut builder = self.agent.post(&self.endpoint);
+        if let Some(api_key) = &self.api_key {
+            builder = builder.header("authorization", format!("Bearer {api_key}"));
+        }
+        let mut response = match builder.send_json(EmbeddingRequest {
+            model: &self.model,
+            input: text,
+        }) {
+            Ok(response) => response,
+            Err(ureq::Error::StatusCode(code)) => {
+                return Err(format!("embedding request failed (HTTP {code}) at {}", self.endpoint));
+            }
+            Err(error) => return Err(format!("embedding request to {} failed: {error}", self.endpoint)),
+        };
+        let parsed: EmbeddingResponse = response
+            .body_mut()
+            .read_json()
+            .map_err(|error| format!("embedding response did not parse: {error}"))?;
+        let vector = parsed
+            .data
+            .into_iter()
+            .next()
+            .map(|item| item.embedding)
+            .ok_or("embedding endpoint returned no vectors")?;
+        if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
+            return Err("embedding endpoint returned an empty or non-finite vector".to_string());
+        }
+        Ok(vector)
+    }
+}
+
 fn embed_documents(documents: &mut [IngestDocument]) -> Result<(), DynErr> {
-    let base = std::env::var("CORECRUXD_EMBEDDING_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or("--embed requires CORECRUXD_EMBEDDING_URL")?;
-    let model = std::env::var("CORECRUXD_EMBEDDING_MODEL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "nomic-embed-text".to_string());
-    let endpoint = embedding_endpoint(&base);
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(120)))
-        .build()
-        .into();
+    let client = EmbeddingClient::from_env(None, None, "--embed")?;
     let mut dimensions = None;
     for document in documents {
         for chunk in &mut document.chunks {
-            let mut builder = agent.post(&endpoint);
-            if let Some(api_key) = &api_key {
-                builder = builder.header("authorization", format!("Bearer {api_key}"));
-            }
-            let mut response = match builder.send_json(EmbeddingRequest {
-                model: &model,
-                input: &chunk.text,
-            }) {
-                Ok(response) => response,
-                Err(ureq::Error::StatusCode(code)) => {
-                    return Err(format!("embedding request failed (HTTP {code}) at {endpoint}").into());
-                }
-                Err(error) => return Err(format!("embedding request to {endpoint} failed: {error}").into()),
-            };
-            let parsed: EmbeddingResponse = response.body_mut().read_json()?;
-            let vector = parsed
-                .data
-                .into_iter()
-                .next()
-                .map(|item| item.embedding)
-                .ok_or("embedding endpoint returned no vectors")?;
-            if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
-                return Err("embedding endpoint returned an empty or non-finite vector".into());
-            }
+            let vector = client.embed(&chunk.text)?;
             match dimensions {
                 None => dimensions = Some(vector.len()),
                 Some(expected) if expected != vector.len() => {
@@ -846,5 +946,660 @@ mod tests {
     #[test]
     fn shell_quote_handles_apostrophes_in_query_fields() {
         assert_eq!(shell_single_quote("tenant's docs"), "'tenant'\"'\"'s docs'");
+    }
+
+    // ── shared scaffolding for the transport / filesystem tests ──────────────
+
+    /// Set (or clear) process env vars for the duration of a test, restoring the
+    /// previous values on drop. Every user must be `#[serial_test::serial]`.
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvGuard {
+        fn apply(vars: &[(&'static str, Option<&str>)]) -> Self {
+            let mut prev = Vec::new();
+            for (key, value) in vars {
+                prev.push((*key, std::env::var_os(key)));
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            EnvGuard(prev)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    /// B1: a daemon that reports a dense gap has that gap carried into the
+    /// `BatchSeal`, so the caller-facing warning has something to fire on.
+    #[test]
+    fn dense_gap_reply_is_carried_into_the_seal() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.md"), "# Alpha\n\nbody text").unwrap();
+        let reply = serde_json::json!({
+            "ingested": 1,
+            "documents": 1,
+            "frame_count": 7u64,
+            "sealed": true,
+            "segment_seq": 42u64,
+            "receipt_id": "rcpt-1",
+            "dense_vectors": 0,
+            "dense_dim": serde_json::Value::Null,
+            "dense_status": "skipped",
+            "dense_expected": 1,
+        })
+        .to_string();
+        let (port, _handle) = crate::test_support::serve_responses(vec![(202, reply)]);
+
+        let report = execute(&options(temp.path(), &format!("http://127.0.0.1:{port}"))).unwrap();
+        assert_eq!(report.seals[0].dense_status.as_deref(), Some("skipped"));
+        assert_eq!(report.seals[0].dense_expected, Some(1));
+    }
+
+    /// A well-formed `/v1/local/ingest` reply body.
+    fn ingest_reply(ingested: usize, documents: usize) -> String {
+        serde_json::json!({
+            "ingested": ingested,
+            "documents": documents,
+            "frame_count": 7u64,
+            "sealed": true,
+            "segment_seq": 42u64,
+            "receipt_id": "rcpt-1",
+            "dense_vectors": 0,
+            "dense_dim": serde_json::Value::Null,
+        })
+        .to_string()
+    }
+
+    fn options(path: &Path, url: &str) -> IngestOptions {
+        IngestOptions {
+            path: path.to_path_buf(),
+            tenant: "local".to_string(),
+            corpus: "docs".to_string(),
+            daemon_url: url.to_string(),
+            dry_run: false,
+            embed: false,
+        }
+    }
+
+    // ── D-9: sent-vs-acknowledged reconciliation ──────────────────────────
+
+    fn two_document_corpus() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.txt"), "alpha body text\n").expect("a.txt");
+        std::fs::write(tmp.path().join("b.txt"), "beta body text\n").expect("b.txt");
+        tmp
+    }
+
+    fn options_for(dir: &Path, port: u16) -> IngestOptions {
+        IngestOptions {
+            path: dir.to_path_buf(),
+            tenant: "local".to_string(),
+            corpus: "docs".to_string(),
+            daemon_url: format!("http://127.0.0.1:{port}"),
+            dry_run: false,
+            embed: false,
+        }
+    }
+
+    /// Parse the JSON body out of a captured raw request (`ureq` pretty-prints
+    /// `send_json` bodies, so match on structure rather than raw substrings).
+    fn body_json(raw: &str) -> serde_json::Value {
+        let (_, body) = raw.split_once("\r\n\r\n").expect("request body");
+        serde_json::from_str(body).expect("json body")
+    }
+
+    // ── rejections ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn execute_rejects_blank_tenant_and_corpus() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.md"), "# hi").unwrap();
+        let mut opts = options(temp.path(), "http://127.0.0.1:1");
+        opts.dry_run = true;
+        opts.tenant = "   ".to_string();
+        assert!(execute(&opts).unwrap_err().to_string().contains("--tenant"));
+        opts.tenant = "local".to_string();
+        opts.corpus = String::new();
+        assert!(execute(&opts).unwrap_err().to_string().contains("--corpus"));
+    }
+
+    /// A directory with nothing ingestable must fail loudly rather than report a
+    /// clean run of zero documents — the empty batch is the error, not a pass.
+    #[test]
+    #[serial_test::serial]
+    fn execute_errors_when_nothing_ingestable_was_found() {
+        let _env = EnvGuard::apply(&[("CRUX_AGENT_TOKEN", None)]);
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("image.png"), [0u8, 1, 2]).unwrap();
+        let err = execute(&options(temp.path(), "http://127.0.0.1:1"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no supported, non-empty text was found"), "{err}");
+    }
+
+    #[test]
+    fn collect_supported_files_reports_an_unreadable_input_path() {
+        let err = collect_supported_files(Path::new("/no/such/ingest/path"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot inspect"), "{err}");
+    }
+
+    #[test]
+    fn document_from_file_rejects_malformed_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("broken.json");
+        std::fs::write(&path, "{\"a\": ").unwrap();
+        let err = document_from_file(&path, temp.path()).unwrap_err().to_string();
+        assert!(err.contains("invalid JSON in"), "{err}");
+    }
+
+    /// One malformed `.json` file aborts the whole walk — fail-closed, so a
+    /// corrupt record can never be quietly dropped from an otherwise-clean batch.
+    #[test]
+    fn execute_aborts_the_whole_run_on_one_malformed_json_file() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("good.md"), "# fine\n\nbody text").unwrap();
+        std::fs::write(temp.path().join("bad.json"), "{not json}").unwrap();
+        let mut opts = options(temp.path(), "http://127.0.0.1:1");
+        opts.dry_run = true;
+        assert!(execute(&opts).unwrap_err().to_string().contains("invalid JSON in"));
+    }
+
+    #[test]
+    fn document_from_file_skips_empty_json_and_whitespace_only_text() {
+        let temp = tempfile::tempdir().unwrap();
+        // Valid JSON carrying no string values flattens to nothing.
+        let numbers = temp.path().join("numbers.json");
+        std::fs::write(&numbers, r#"{"a":1,"b":[2,3],"c":null}"#).unwrap();
+        assert!(document_from_file(&numbers, temp.path()).unwrap().is_none());
+        // Whitespace-only text file.
+        let blank = temp.path().join("blank.txt");
+        std::fs::write(&blank, "   \n\t\n").unwrap();
+        assert!(document_from_file(&blank, temp.path()).unwrap().is_none());
+    }
+
+    /// A UTF-8 BOM must be stripped from the chunk text, but the file hash is
+    /// still taken over the raw bytes (so re-ingest stays content-addressed).
+    #[test]
+    fn document_from_file_strips_the_utf8_bom() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bom.txt");
+        let bytes = "\u{feff}hello bom".as_bytes().to_vec();
+        std::fs::write(&path, &bytes).unwrap();
+        let doc = document_from_file(&path, temp.path()).unwrap().unwrap();
+        assert_eq!(doc.chunks[0].text, "hello bom");
+        assert_eq!(
+            doc.chunks[0].metadata.file_hash,
+            blake3::hash(&bytes).to_hex().to_string()
+        );
+        assert_eq!(doc.chunks[0].metadata.chunk_count, 1);
+        assert_eq!(doc.title, "bom.txt");
+    }
+
+    #[test]
+    fn document_from_file_flattens_json_string_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("record.json");
+        std::fs::write(&path, r#"{"title":"Alpha","n":1,"body":{"text":"Beta"}}"#).unwrap();
+        let doc = document_from_file(&path, temp.path()).unwrap().unwrap();
+        assert_eq!(doc.chunks[0].text, "Alpha\n\nBeta");
+        assert!(doc.doc_id.starts_with("doc-"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_input_is_skipped_never_followed() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real.md");
+        std::fs::write(&real, "# real").unwrap();
+        let link = temp.path().join("link.md");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // Symlink passed directly as the input path.
+        let (files, stats) = collect_supported_files(&link).unwrap();
+        assert!(files.is_empty());
+        assert_eq!((stats.files_walked, stats.skipped_files), (0, 1));
+
+        // Symlink encountered during a directory walk.
+        let (files, stats) = collect_supported_files(temp.path()).unwrap();
+        assert_eq!(files, vec![real]);
+        assert_eq!(stats.skipped_files, 1, "the link is skipped, not double-ingested");
+    }
+
+    #[test]
+    fn execute_records_binary_files_as_skipped_not_ingested() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("good.md"), "# keep\n\nbody").unwrap();
+        // NUL bytes under a supported extension: walked, then skipped at parse.
+        std::fs::write(temp.path().join("binary.txt"), [0x68, 0x00, 0x69]).unwrap();
+        let mut opts = options(temp.path(), "http://127.0.0.1:1");
+        opts.dry_run = true;
+        let report = execute(&opts).unwrap();
+        assert_eq!(report.files_walked, 2);
+        assert_eq!(report.files_ingested, 1);
+        assert_eq!(report.skipped_files, 1, "the binary file is counted, not silently lost");
+        assert!(report.dry_run && !report.embedded);
+        assert_eq!(report.batches, 1);
+        assert_eq!(report.documents_sealed, 0, "a dry run seals nothing");
+    }
+
+    #[test]
+    fn build_requests_rejects_a_single_oversize_fragment() {
+        let mut doc = test_document(0, 1);
+        doc.chunks[0].text = "x".repeat(MAX_REQUEST_JSON_BYTES + 1_024);
+        let err = build_requests("local", "docs", vec![doc]).unwrap_err().to_string();
+        assert!(err.contains("exceeds the conservative 12 MiB request limit"), "{err}");
+    }
+
+    /// A document whose 1,024-chunk append slice still serializes over the 12 MiB
+    /// cap is halved until it fits — no chunk may be dropped in the process.
+    #[test]
+    fn fragment_documents_halves_oversize_appends_without_losing_chunks() {
+        let mut doc = test_document(0, MAX_CHUNKS_PER_DOCUMENT_APPEND + 1);
+        for chunk in &mut doc.chunks {
+            chunk.text = "y".repeat(16 * 1024);
+        }
+        let fragments = fragment_documents(vec![doc]).unwrap();
+        let total: usize = fragments.iter().map(|f| f.chunks.len()).sum();
+        assert_eq!(total, MAX_CHUNKS_PER_DOCUMENT_APPEND + 1, "no chunk may be dropped");
+        assert!(
+            fragments
+                .iter()
+                .any(|f| f.chunks.len() < MAX_CHUNKS_PER_DOCUMENT_APPEND),
+            "the oversize slice must have been halved"
+        );
+        assert!(fragments
+            .iter()
+            .all(|f| serde_json::to_vec(f).unwrap().len() <= MAX_REQUEST_JSON_BYTES));
+        assert!(fragments.iter().all(|f| f.doc_id == "doc-0"));
+    }
+
+    // ── transport ───────────────────────────────────────────────────────────
+
+    /// The route contract is 202 Accepted. A 2xx that is *not* 202 (a proxy's
+    /// bare 200, say) must be refused — otherwise a request that never reached
+    /// the ingest handler would be read as a successful seal.
+    #[test]
+    fn post_request_rejects_a_non_202_success() {
+        let (port, handle) = crate::test_support::serve_responses(vec![(200, ingest_reply(1, 1))]);
+        let request = IngestRequest {
+            tenant_id: "local".to_string(),
+            corpus_id: "docs".to_string(),
+            documents: vec![test_document(1, 1)],
+        };
+        let err = post_request(&format!("http://127.0.0.1:{port}"), None, &request)
+            .unwrap_err()
+            .to_string();
+        handle.join().ok();
+        assert!(err.contains("unexpected HTTP 200"), "{err}");
+    }
+
+    #[test]
+    fn post_request_maps_an_http_status_failure() {
+        let (port, handle) = crate::test_support::serve_responses(vec![(503, "unavailable".to_string())]);
+        let request = IngestRequest {
+            tenant_id: "local".to_string(),
+            corpus_id: "docs".to_string(),
+            documents: vec![test_document(1, 1)],
+        };
+        let err = post_request(&format!("http://127.0.0.1:{port}"), None, &request)
+            .unwrap_err()
+            .to_string();
+        handle.join().ok();
+        assert!(err.contains("local ingest failed (HTTP 503)"), "{err}");
+        assert!(err.contains("/v1/local/ingest"), "{err}");
+    }
+
+    #[test]
+    fn post_request_reports_a_transport_failure_with_the_endpoint() {
+        // Nothing is listening on port 1 — the non-status error arm.
+        let request = IngestRequest {
+            tenant_id: "local".to_string(),
+            corpus_id: "docs".to_string(),
+            documents: Vec::new(),
+        };
+        let err = post_request("http://127.0.0.1:1/", None, &request)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("local ingest request to http://127.0.0.1:1/v1/local/ingest failed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn execute_posts_the_batch_and_records_the_seal() {
+        let _env = EnvGuard::apply(&[("CRUX_AGENT_TOKEN", Some("tok-123"))]);
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.md"), "# Alpha\n\nbody text").unwrap();
+        let (port, handle) = crate::test_support::serve_responses(vec![(202, ingest_reply(1, 1))]);
+
+        let report = execute(&options(temp.path(), &format!("http://127.0.0.1:{port}"))).unwrap();
+        assert_eq!(report.documents_sealed, 1);
+        assert_eq!(report.batches, 1);
+        assert_eq!(
+            report.seals,
+            vec![BatchSeal {
+                batch: 1,
+                segment_seq: 42,
+                receipt_id: Some("rcpt-1".to_string()),
+                chunks: 1,
+                documents: 1,
+                frame_count: 7,
+                sealed: true,
+                dense_vectors: 0,
+                dense_dim: None,
+                // The fixture reply predates `dense_status`, as a daemon older
+                // than B1 would — the field must decode as absent, not fail.
+                dense_status: None,
+                dense_expected: None,
+            }]
+        );
+
+        let reqs = handle.join().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].starts_with("POST /v1/local/ingest "));
+        assert!(reqs[0].to_lowercase().contains("authorization: bearer tok-123"));
+        let body = body_json(&reqs[0]);
+        assert_eq!(body["tenant_id"], "local");
+        assert_eq!(body["corpus_id"], "docs");
+        assert_eq!(body["documents"][0]["chunks"][0]["metadata"]["source_path"], "a.md");
+    }
+
+    /// A blank `CRUX_AGENT_TOKEN` must not become an `Authorization: Bearer `
+    /// header — an empty bearer reads as "authenticated" to some proxies.
+    #[test]
+    #[serial_test::serial]
+    fn execute_omits_the_bearer_for_a_blank_token() {
+        let _env = EnvGuard::apply(&[("CRUX_AGENT_TOKEN", Some("   "))]);
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.md"), "# Alpha\n\nbody").unwrap();
+        let (port, handle) = crate::test_support::serve_responses(vec![(202, ingest_reply(1, 1))]);
+        execute(&options(temp.path(), &format!("http://127.0.0.1:{port}"))).unwrap();
+        let reqs = handle.join().unwrap();
+        assert!(!reqs[0].to_lowercase().contains("authorization:"), "{}", reqs[0]);
+    }
+
+    /// D-9 (inverted pin): `execute` copied the daemon's own
+    /// `documents`/`ingested` counters into the report without comparing them
+    /// to what it sent, so a daemon that accepted the request but sealed
+    /// nothing (`ingested: 0`) yielded `Ok` with `files_ingested: 2` and
+    /// `documents_sealed: 0` — a no-op ingest read as success. Fixed in M4 of
+    /// `crux-pinned-defect-remediation-2026-07-31`.
+    #[test]
+    #[serial_test::serial]
+    fn execute_reconciles_sent_against_acknowledged_counts() {
+        let _env = EnvGuard::apply(&[("CRUX_AGENT_TOKEN", None)]);
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.md"), "# Alpha\n\nbody").unwrap();
+        std::fs::write(temp.path().join("b.md"), "# Beta\n\nbody").unwrap();
+        let (port, handle) = crate::test_support::serve_responses(vec![(202, ingest_reply(0, 0))]);
+
+        let err = execute(&options(temp.path(), &format!("http://127.0.0.1:{port}")))
+            .expect_err("a zero acknowledgement must not read as success");
+        handle.join().ok();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("acknowledged 0 documents") && msg.contains("2 documents"),
+            "the error names both sides of the reconciliation: {msg}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn run_prints_a_summary_for_both_dry_and_live_runs() {
+        let _env = EnvGuard::apply(&[("CRUX_AGENT_TOKEN", None)]);
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.md"), "# Alpha\n\nbody").unwrap();
+        let mut opts = options(temp.path(), "http://127.0.0.1:1");
+        opts.dry_run = true;
+        run(&opts).unwrap();
+
+        let (port, handle) = crate::test_support::serve_responses(vec![(202, ingest_reply(1, 1))]);
+        let live = options(temp.path(), &format!("http://127.0.0.1:{port}"));
+        run(&live).unwrap();
+        handle.join().ok();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn follow_up_query_command_carries_auth_only_when_a_token_is_set() {
+        let temp = "http://host:14800/";
+        {
+            let _env = EnvGuard::apply(&[("CRUX_AGENT_TOKEN", Some("t"))]);
+            let cmd = follow_up_query_command(temp, "local");
+            assert!(cmd.contains("Authorization: Bearer $CRUX_AGENT_TOKEN"));
+            assert!(cmd.contains("'http://host:14800/v1/query/text-search'"));
+        }
+        let _env = EnvGuard::apply(&[("CRUX_AGENT_TOKEN", None)]);
+        assert!(!follow_up_query_command(temp, "local").contains("Authorization"));
+    }
+
+    // ── embedding lane ──────────────────────────────────────────────────────
+
+    fn embedding_reply(vector: &[f32]) -> String {
+        serde_json::json!({ "data": [{ "embedding": vector }] }).to_string()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn embed_documents_requires_the_endpoint_env() {
+        let _env = EnvGuard::apply(&[("CORECRUXD_EMBEDDING_URL", Some("   ")), ("OPENAI_API_KEY", None)]);
+        let mut docs = vec![test_document(0, 1)];
+        let err = embed_documents(&mut docs).unwrap_err().to_string();
+        assert!(err.contains("--embed requires CORECRUXD_EMBEDDING_URL"), "{err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn embed_documents_attaches_one_vector_per_chunk() {
+        let (port, handle) = crate::test_support::serve_responses(vec![
+            (200, embedding_reply(&[0.1, 0.2, 0.3])),
+            (200, embedding_reply(&[0.4, 0.5, 0.6])),
+        ]);
+        let _env = EnvGuard::apply(&[
+            ("CORECRUXD_EMBEDDING_URL", Some(&format!("http://127.0.0.1:{port}"))),
+            ("CORECRUXD_EMBEDDING_MODEL", Some("fixture-embed")),
+            ("OPENAI_API_KEY", Some("sk-test")),
+        ]);
+        let mut docs = vec![test_document(0, 2)];
+        embed_documents(&mut docs).unwrap();
+        assert_eq!(
+            docs[0].chunks[0].dense_vector.as_deref(),
+            Some([0.1, 0.2, 0.3].as_slice())
+        );
+        assert_eq!(
+            docs[0].chunks[1].dense_vector.as_deref(),
+            Some([0.4, 0.5, 0.6].as_slice())
+        );
+
+        let reqs = handle.join().unwrap();
+        assert!(reqs[0].starts_with("POST /v1/embeddings "));
+        assert!(reqs[0].to_lowercase().contains("authorization: bearer sk-test"));
+        assert_eq!(body_json(&reqs[0])["model"], "fixture-embed");
+        assert_eq!(body_json(&reqs[1])["input"], "text 1");
+    }
+
+    /// A mid-ingest dimension change would silently corrupt the dense lane, so
+    /// the second, differently-sized vector must abort the run.
+    #[test]
+    #[serial_test::serial]
+    fn embed_documents_rejects_a_dimension_change_mid_ingest() {
+        let (port, handle) = crate::test_support::serve_responses(vec![
+            (200, embedding_reply(&[0.1, 0.2, 0.3])),
+            (200, embedding_reply(&[0.4, 0.5])),
+        ]);
+        let _env = EnvGuard::apply(&[
+            ("CORECRUXD_EMBEDDING_URL", Some(&format!("http://127.0.0.1:{port}/v1"))),
+            ("CORECRUXD_EMBEDDING_MODEL", None),
+            ("OPENAI_API_KEY", None),
+        ]);
+        let mut docs = vec![test_document(0, 2)];
+        let err = embed_documents(&mut docs).unwrap_err().to_string();
+        let reqs = handle.join().unwrap();
+        assert!(err.contains("expected 3, got 2"), "{err}");
+        // The default model is used when the env var is unset.
+        assert_eq!(body_json(&reqs[0])["model"], "nomic-embed-text");
+        assert!(!reqs[0].to_lowercase().contains("authorization:"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn embed_documents_rejects_empty_and_non_finite_vectors() {
+        for (reply, expected) in [
+            (embedding_reply(&[]), "empty or non-finite vector"),
+            // JSON cannot spell NaN, and serde_json rejects literals that
+            // overflow f64 — but a valid f64 past the f32 range widens to +inf.
+            (
+                r#"{"data":[{"embedding":[1e39]}]}"#.to_string(),
+                "empty or non-finite vector",
+            ),
+            (r#"{"data":[]}"#.to_string(), "returned no vectors"),
+        ] {
+            let (port, handle) = crate::test_support::serve_responses(vec![(200, reply)]);
+            let _env = EnvGuard::apply(&[
+                (
+                    "CORECRUXD_EMBEDDING_URL",
+                    Some(&format!("http://127.0.0.1:{port}/v1/embeddings")),
+                ),
+                ("OPENAI_API_KEY", None),
+            ]);
+            let mut docs = vec![test_document(0, 1)];
+            let err = embed_documents(&mut docs).unwrap_err().to_string();
+            handle.join().ok();
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn embed_documents_maps_endpoint_status_and_transport_failures() {
+        let (port, handle) = crate::test_support::serve_responses(vec![(429, "slow down".to_string())]);
+        {
+            let _env = EnvGuard::apply(&[
+                ("CORECRUXD_EMBEDDING_URL", Some(&format!("http://127.0.0.1:{port}"))),
+                ("OPENAI_API_KEY", None),
+            ]);
+            let mut docs = vec![test_document(0, 1)];
+            let err = embed_documents(&mut docs).unwrap_err().to_string();
+            assert!(err.contains("embedding request failed (HTTP 429)"), "{err}");
+        }
+        handle.join().ok();
+
+        let _env = EnvGuard::apply(&[
+            ("CORECRUXD_EMBEDDING_URL", Some("http://127.0.0.1:1")),
+            ("OPENAI_API_KEY", None),
+        ]);
+        let mut docs = vec![test_document(0, 1)];
+        let err = embed_documents(&mut docs).unwrap_err().to_string();
+        assert!(
+            err.contains("embedding request to http://127.0.0.1:1/v1/embeddings failed"),
+            "{err}"
+        );
+    }
+
+    /// `--embed` is honoured on a live run and ignored on a dry run (the dry run
+    /// must never dial the embedding endpoint).
+    #[test]
+    #[serial_test::serial]
+    fn dry_run_never_calls_the_embedding_endpoint() {
+        let _env = EnvGuard::apply(&[("CORECRUXD_EMBEDDING_URL", Some("http://127.0.0.1:1"))]);
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.md"), "# Alpha\n\nbody").unwrap();
+        let mut opts = options(temp.path(), "http://127.0.0.1:1");
+        opts.dry_run = true;
+        opts.embed = true;
+        let report = execute(&opts).unwrap();
+        assert!(!report.embedded, "embedding is suppressed on a dry run");
+    }
+
+    /// D-9: `execute` copied the daemon's counts into its report without
+    /// comparing them to what it sent. A 202 carrying `ingested: 0` for a
+    /// two-document batch returned `Ok` with `files_ingested: 2,
+    /// documents_sealed: 0` — the operator was told the ingest succeeded and
+    /// nothing recorded that the documents never landed.
+    #[test]
+    fn an_acknowledged_zero_count_is_an_error_not_a_successful_report() {
+        let tmp = two_document_corpus();
+        let body = serde_json::json!({
+            "ingested": 0,
+            "documents": 0,
+            "frame_count": 0,
+            "sealed": true,
+            "segment_seq": 1,
+            "receipt_id": null,
+            "dense_vectors": 0,
+            "dense_dim": null,
+        })
+        .to_string();
+        let (port, handle) = crate::test_support::serve_responses(vec![(202, body)]);
+
+        let err = execute(&options_for(tmp.path(), port)).expect_err("a zero acknowledgement must not read as success");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("acknowledged 0 documents") && msg.contains("2 documents"),
+            "the error names both sides of the reconciliation: {msg}"
+        );
+        let _ = handle.join();
+    }
+
+    /// A partial acknowledgement is caught the same way — one of two documents
+    /// landing is not a success.
+    #[test]
+    fn a_partial_acknowledgement_is_an_error() {
+        let tmp = two_document_corpus();
+        let body = serde_json::json!({
+            "ingested": 1,
+            "documents": 1,
+            "frame_count": 1,
+            "sealed": true,
+            "segment_seq": 1,
+            "receipt_id": null,
+            "dense_vectors": 0,
+            "dense_dim": null,
+        })
+        .to_string();
+        let (port, handle) = crate::test_support::serve_responses(vec![(202, body)]);
+
+        let err =
+            execute(&options_for(tmp.path(), port)).expect_err("a partial acknowledgement must not read as success");
+        assert!(err.to_string().contains("acknowledged 1 documents"), "{err}");
+        let _ = handle.join();
+    }
+
+    /// Control: a matching acknowledgement still reports success.
+    #[test]
+    fn a_matching_acknowledgement_reports_success() {
+        let tmp = two_document_corpus();
+        let body = serde_json::json!({
+            "ingested": 2,
+            "documents": 2,
+            "frame_count": 2,
+            "sealed": true,
+            "segment_seq": 1,
+            "receipt_id": "abc",
+            "dense_vectors": 0,
+            "dense_dim": null,
+        })
+        .to_string();
+        let (port, handle) = crate::test_support::serve_responses(vec![(202, body)]);
+
+        let report = execute(&options_for(tmp.path(), port)).expect("matching counts succeed");
+        assert_eq!(report.files_ingested, 2);
+        assert_eq!(report.documents_sealed, 2);
+        assert_eq!(report.seals.len(), 1);
+        let _ = handle.join();
     }
 }

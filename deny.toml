@@ -8,6 +8,7 @@ no-default-features = false
 
 # ── Advisories ──────────────────────────────────────────────────────
 [advisories]
+yanked = "deny"
 ignore = [
     # Resolved: protobuf 2.28.0 eliminated by tonic 0.14 upgrade + prometheus default-features=false.
 ]
@@ -29,7 +30,6 @@ allow = [
     "CC0-1.0",
     "Unlicense",
     "CDLA-Permissive-2.0",
-    "LicenseRef-CCL-1.0",
     "bzip2-1.0.6",
 ]
 

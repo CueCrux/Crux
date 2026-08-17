@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Pure verification for the signed federation peer-identity handshake.
 
@@ -81,6 +81,29 @@ impl NonceCache {
     /// Remove nonce entries whose TTL has elapsed.
     pub fn sweep_expired(&mut self, now_unix_seconds: u64) {
         self.entries.retain(|_, entry| now_unix_seconds <= entry.expires_at);
+    }
+
+    /// Whether `nonce` is a currently-issued challenge that is unconsumed and
+    /// unexpired. Used by the v1.1 delegation path, which verifies the
+    /// presentation proof before [`Self::consume`]-ing the nonce; the caller
+    /// holds the cache lock across both so the check-then-consume is atomic.
+    pub fn is_fresh(&self, nonce: &[u8], now_unix_seconds: u64) -> bool {
+        self.entries
+            .get(nonce)
+            .is_some_and(|entry| !entry.consumed && now_unix_seconds <= entry.expires_at)
+    }
+
+    /// Mark `nonce` consumed (single-use). Returns `false` if the nonce is
+    /// unknown or was already consumed — a second presentation of the same
+    /// nonce therefore fails closed.
+    pub fn consume(&mut self, nonce: &[u8]) -> bool {
+        match self.entries.get_mut(nonce) {
+            Some(entry) if !entry.consumed => {
+                entry.consumed = true;
+                true
+            }
+            _ => false,
+        }
     }
 }
 

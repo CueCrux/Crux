@@ -1,5 +1,5 @@
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 #
 # Homebrew formula TEMPLATE for the cuecrux/tap tap (repo: CueCrux/homebrew-tap,
 # creation is an operator action — see ExecPlan decision log).
@@ -13,7 +13,7 @@ class Crux < Formula
   desc "Local-first agent memory, retrieval, and signed-receipts daemon"
   homepage "https://github.com/CueCrux/Crux"
   version "{{VERSION}}"
-  license "CCL-1.0" # CueCrux Community Licence — source-available
+  license "Apache-2.0"
 
   on_macos do
     on_arm do
@@ -52,6 +52,25 @@ class Crux < Formula
     end
   end
 
+  resource "crux-hook" do
+    on_macos do
+      on_arm do
+        url "https://github.com/CueCrux/Crux/releases/download/v{{VERSION}}/crux-hook-darwin-arm64"
+        sha256 "{{SHA256_HOOK_DARWIN_ARM64}}"
+      end
+      on_intel do
+        url "https://github.com/CueCrux/Crux/releases/download/v{{VERSION}}/crux-hook-darwin-amd64"
+        sha256 "{{SHA256_HOOK_DARWIN_AMD64}}"
+      end
+    end
+    on_linux do
+      on_intel do
+        url "https://github.com/CueCrux/Crux/releases/download/v{{VERSION}}/crux-hook-linux-amd64"
+        sha256 "{{SHA256_HOOK_LINUX_AMD64}}"
+      end
+    end
+  end
+
   def install
     binary = Dir["crux-*"].first
     bin.install binary => "crux"
@@ -60,6 +79,10 @@ class Crux < Formula
       ctl = Dir["corecruxctl-*"].first
       bin.install ctl => "corecruxctl"
     end
+    resource("crux-hook").stage do
+      hook = Dir["crux-hook-*"].first
+      bin.install hook => "crux-hook"
+    end
   end
 
   service do
@@ -67,6 +90,7 @@ class Crux < Formula
     keep_alive successful_exit: false
     environment_variables CORECRUXD_DATA_DIR: var/"crux",
                           CORECRUXD_AUTH_MODE: "dev_scopes",
+                          CORECRUXD_ROUTE_AUTH: "enforce",
                           CORECRUXD_UPDATE_CHECK_ENABLED: "0"
     working_dir var/"crux"
   end
@@ -89,5 +113,6 @@ class Crux < Formula
 
   test do
     assert_match "corecruxd", shell_output("#{bin}/crux --version")
+    assert_equal "crux-hook #{version}\n", shell_output("#{bin}/crux-hook --version")
   end
 end

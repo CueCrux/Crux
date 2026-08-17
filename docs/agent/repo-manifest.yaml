@@ -7,7 +7,7 @@ schema: crux-agent-manifest/v1
 summary: Local-first, tamper-evident retrieval + memory engine with signed, replayable receipts.
 msrv: "1.88.0"
 edition: "2021"
-workspace_version: "0.5.37"
+workspace_version: "0.5.59"
 
 verify_commands:
   - cargo test --workspace
@@ -188,7 +188,7 @@ ci_assertions:
     - post_credit_spend
     - handle_issue_passport
     - handle_declare_constraint
-    - write_ccxv
+    - write_ccxe
     - BootstrapSeeder
   tests:
     - tampering_with_signature_breaks_signature_check

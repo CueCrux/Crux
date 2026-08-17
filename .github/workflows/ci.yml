@@ -1,5 +1,5 @@
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 
 name: CI
 
@@ -12,6 +12,9 @@ on:
   # on the speculative `gh-readonly-queue/main/...` ref or the queue hangs
   # waiting on them. No-op until a merge queue is enabled on `main`.
   merge_group:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -34,11 +37,11 @@ jobs:
   # the full gate.
   changes:
     name: Detect change scope
-    runs-on: [self-hosted, ci]
+    runs-on: [self-hosted, ci, Linux]
     outputs:
       code: ${{ steps.scope.outputs.code }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
       - name: Classify changed files
@@ -90,26 +93,39 @@ jobs:
     name: Lint
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: [self-hosted, ci]
-    env:
-      # Per-job CARGO_HOME isolates the cargo package-cache file lock so the
-      # four concurrent jobs on this self-hosted runner don't serialise
-      # through one mutex. See run 26575505389 (40m Coverage block, 1h28m
-      # Test job stuck, runner cancelled). github.job + github.run_id give
-      # a unique cache dir per job per run; the seed step below symlinks
-      # the toolchain binaries from the shared CARGO_HOME so cargo/rustc
-      # discovery keeps working without copying gigabytes.
-      CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
+    runs-on: [self-hosted, ci, Linux]
+    # Per-job CARGO_HOME isolates the cargo package-cache file lock so the
+    # four concurrent jobs on this self-hosted runner don't serialise
+    # through one mutex. See run 26575505389 (40m Coverage block, 1h28m
+    # Test job stuck, runner cancelled). github.job + github.run_id give
+    # a unique cache dir per job per run; the seed step below symlinks
+    # the toolchain binaries from the shared CARGO_HOME so cargo/rustc
+    # discovery keeps working without copying gigabytes.
     steps:
-      - name: Seed per-job CARGO_HOME from shared toolchain
+      - name: Resolve CARGO_HOME (shared toolchain when the runner has one)
         run: |
+          # $RUNNER_TEMP is writable on EVERY runner pool, unlike the
+          # /home/gha-runner path this used to hardcode — which is what made
+          # these jobs a scheduling coin flip (pass on hel1, die in 13s on
+          # vukgpu02 with "mkdir: cannot create directory ... Permission denied").
+          #
+          # Set HERE and not in the job-level `env:` because the `runner` context
+          # is not available there; only `github`/`needs`/`matrix` etc. are.
+          # Using it at job level makes the whole workflow file invalid.
+          #
+          # The symlink loop is the FAST PATH, not a requirement: where a shared
+          # toolchain exists it is linked in and the toolchain action becomes a
+          # no-op; where it does not, the glob stays literal, `-e` fails, and the
+          # action installs into this writable home. Same workflow, both pools.
+          CARGO_HOME="${RUNNER_TEMP}/cargo-${{ github.job }}-${{ github.run_id }}"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
           mkdir -p "$CARGO_HOME/bin"
-          for tool in /home/gha-runner/.cargo/bin/*; do
+          for tool in "${CRUX_SHARED_CARGO_HOME:-/home/gha-runner/.cargo}"/bin/*; do
             [ -e "$tool" ] || continue
             ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
           done
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Preflight (self-hosted runner toolchain)
         run: |
           set +e
@@ -122,10 +138,11 @@ jobs:
             echo "::error::Or add the ci:fallback label on this PR to use ubuntu-latest runners (see docs/self-hosted-runner.md)."
             exit 1
           fi
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
         with:
           tool: typos-cli
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
@@ -135,6 +152,8 @@ jobs:
       - name: Unwrap/expect ratchet
         run: bash scripts/unwrap-ratchet.sh
       - run: bash scripts/assert-daemon-release-boundary.sh
+      - name: Reader-only companion ports (ExecPlan C7)
+        run: bash scripts/assert-reader-only-companions.sh
       - run: bash scripts/ci-cargo-with-fallback.sh clippy --workspace -- -D warnings
       - name: Reclaim per-job CARGO_HOME
         if: always()
@@ -149,20 +168,41 @@ jobs:
     name: Test
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: [self-hosted, ci]
-    env:
-      # See `lint` job above for the per-job CARGO_HOME rationale.
-      CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
+    # NOT widened to the whole `ci` pool, unlike every other job here. The
+    # vukgpu02 runners are Docker containers on a Windows host, and the
+    # workspace test run includes crux-claude-hooks' witness-key tests, which
+    # require real POSIX custody: a 0700 parent, a 0600 key, and no
+    # group/world write bit. Those semantics do not survive that mount, so
+    # `WitnessKey::load_or_create` fails and the runtime degrades to an
+    # unsigned witness. Confirmed: Test/Coverage have never passed on
+    # vukgpu02, and pass on every hel1 runner.
+    runs-on: [self-hosted, hel1]
+    # See `lint` job above for the per-job CARGO_HOME rationale.
     steps:
-      - name: Seed per-job CARGO_HOME from shared toolchain
+      - name: Resolve CARGO_HOME (shared toolchain when the runner has one)
         run: |
+          # $RUNNER_TEMP is writable on EVERY runner pool, unlike the
+          # /home/gha-runner path this used to hardcode — which is what made
+          # these jobs a scheduling coin flip (pass on hel1, die in 13s on
+          # vukgpu02 with "mkdir: cannot create directory ... Permission denied").
+          #
+          # Set HERE and not in the job-level `env:` because the `runner` context
+          # is not available there; only `github`/`needs`/`matrix` etc. are.
+          # Using it at job level makes the whole workflow file invalid.
+          #
+          # The symlink loop is the FAST PATH, not a requirement: where a shared
+          # toolchain exists it is linked in and the toolchain action becomes a
+          # no-op; where it does not, the glob stays literal, `-e` fails, and the
+          # action installs into this writable home. Same workflow, both pools.
+          CARGO_HOME="${RUNNER_TEMP}/cargo-${{ github.job }}-${{ github.run_id }}"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
           mkdir -p "$CARGO_HOME/bin"
-          for tool in /home/gha-runner/.cargo/bin/*; do
+          for tool in "${CRUX_SHARED_CARGO_HOME:-/home/gha-runner/.cargo}"/bin/*; do
             [ -e "$tool" ] || continue
             ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
           done
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Preflight (self-hosted runner toolchain)
         run: |
           set +e
@@ -175,9 +215,28 @@ jobs:
             echo "::error::Or add the ci:fallback label on this PR to use ubuntu-latest runners (see docs/self-hosted-runner.md)."
             exit 1
           fi
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: bash scripts/ci-cargo-with-fallback.sh build --workspace
+      # setup-python brings its own interpreter, so this does not depend on the
+      # host having python3-venv and does not install into the persistent
+      # runner's system python. Same action, pin and runner label as
+      # audit-vectors.yml, which is the proven pattern here.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+      - name: Escrow verification cross-check (Rust vs Python reference)
+        # The published verification page (docs/verify-key-escrow.md) tells
+        # customers that two independent implementations agree and that CI fails
+        # if they diverge. CRUX_REQUIRE_PYTHON_REFERENCE=1 makes that true: the
+        # test refuses to skip here, so a runner that lost the dependency fails
+        # the build instead of quietly leaving the claim unchecked.
+        run: |
+          python3 -m pip install --disable-pip-version-check pynacl blake3
+          CRUX_REQUIRE_PYTHON_REFERENCE=1 \
+            bash scripts/ci-cargo-with-fallback.sh test -p crux-escrow --test python_reference_agrees
       - name: HTTP auth boundary contracts
         run: bash scripts/ci-cargo-with-fallback.sh test -p corecruxd route_auth
       - name: HTTP boundary smoke contracts
@@ -209,8 +268,15 @@ jobs:
           # Stride 2 so this job's MCP port can never equal a neighbour's HTTP.
           HTTP_PORT=$((15000 + 2 * (${{ github.run_id }} % 4500)))
           MCP_PORT=$((HTTP_PORT + 1))
-          CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR="$DATA_DIR" \
+          # gRPC needs the same treatment and was missed: it stayed on the
+          # default 4007, so a neighbouring Test job on this runner takes the
+          # port and tonic fails the whole boot with AddrInUse -- which reads
+          # as an unrelated red on whatever PR happened to be second.
+          # Own range, above HTTP/MCP's 15000-23999 band.
+          GRPC_PORT=$((24000 + (${{ github.run_id }} % 4500)))
+          CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_ROUTE_AUTH=enforce CORECRUXD_DATA_DIR="$DATA_DIR" \
             CORECRUXD_HTTP_PORT="$HTTP_PORT" CORECRUXD_MCP_PORT="$MCP_PORT" \
+            CORECRUXD_GRPC_PORT="$GRPC_PORT" \
             ./target/debug/corecruxd &
           PID=$!
           cleanup() {
@@ -292,21 +358,36 @@ jobs:
     name: Test (hosted-surfaces)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: [self-hosted, ci]
-    env:
-      # See `lint` job above for the per-job CARGO_HOME rationale.
-      CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
+    runs-on: [self-hosted, ci, Linux]
+    # See `lint` job above for the per-job CARGO_HOME rationale.
     steps:
-      - name: Seed per-job CARGO_HOME from shared toolchain
+      - name: Resolve CARGO_HOME (shared toolchain when the runner has one)
         run: |
+          # $RUNNER_TEMP is writable on EVERY runner pool, unlike the
+          # /home/gha-runner path this used to hardcode — which is what made
+          # these jobs a scheduling coin flip (pass on hel1, die in 13s on
+          # vukgpu02 with "mkdir: cannot create directory ... Permission denied").
+          #
+          # Set HERE and not in the job-level `env:` because the `runner` context
+          # is not available there; only `github`/`needs`/`matrix` etc. are.
+          # Using it at job level makes the whole workflow file invalid.
+          #
+          # The symlink loop is the FAST PATH, not a requirement: where a shared
+          # toolchain exists it is linked in and the toolchain action becomes a
+          # no-op; where it does not, the glob stays literal, `-e` fails, and the
+          # action installs into this writable home. Same workflow, both pools.
+          CARGO_HOME="${RUNNER_TEMP}/cargo-${{ github.job }}-${{ github.run_id }}"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
           mkdir -p "$CARGO_HOME/bin"
-          for tool in /home/gha-runner/.cargo/bin/*; do
+          for tool in "${CRUX_SHARED_CARGO_HOME:-/home/gha-runner/.cargo}"/bin/*; do
             [ -e "$tool" ] || continue
             ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
           done
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - name: Test corecruxd with hosted-surfaces enabled
         run: bash scripts/ci-cargo-with-fallback.sh test -p corecruxd --features hosted-surfaces
@@ -318,20 +399,33 @@ jobs:
     name: MSRV (1.88.0)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: [self-hosted, ci]
-    env:
-      # See `lint` job above for the per-job CARGO_HOME rationale.
-      CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
+    runs-on: [self-hosted, ci, Linux]
+    # See `lint` job above for the per-job CARGO_HOME rationale.
     steps:
-      - name: Seed per-job CARGO_HOME from shared toolchain
+      - name: Resolve CARGO_HOME (shared toolchain when the runner has one)
         run: |
+          # $RUNNER_TEMP is writable on EVERY runner pool, unlike the
+          # /home/gha-runner path this used to hardcode — which is what made
+          # these jobs a scheduling coin flip (pass on hel1, die in 13s on
+          # vukgpu02 with "mkdir: cannot create directory ... Permission denied").
+          #
+          # Set HERE and not in the job-level `env:` because the `runner` context
+          # is not available there; only `github`/`needs`/`matrix` etc. are.
+          # Using it at job level makes the whole workflow file invalid.
+          #
+          # The symlink loop is the FAST PATH, not a requirement: where a shared
+          # toolchain exists it is linked in and the toolchain action becomes a
+          # no-op; where it does not, the glob stays literal, `-e` fails, and the
+          # action installs into this writable home. Same workflow, both pools.
+          CARGO_HOME="${RUNNER_TEMP}/cargo-${{ github.job }}-${{ github.run_id }}"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
           mkdir -p "$CARGO_HOME/bin"
-          for tool in /home/gha-runner/.cargo/bin/*; do
+          for tool in "${CRUX_SHARED_CARGO_HOME:-/home/gha-runner/.cargo}"/bin/*; do
             [ -e "$tool" ] || continue
             ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
           done
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Preflight (self-hosted runner toolchain)
         run: |
           set +e
@@ -343,7 +437,9 @@ jobs:
             echo "::error::Run scripts/provision-self-hosted-runner.sh on the runner host (or add ci:fallback label)."
             exit 1
           fi
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # 1.88.0
+        with:
+          toolchain: 1.88.0
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: bash scripts/ci-cargo-with-fallback.sh build --workspace
       - name: Reclaim per-job CARGO_HOME
@@ -354,10 +450,10 @@ jobs:
     name: Coverage
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: [self-hosted, ci]
+    # Same workspace-wide run as `test`, so same pool restriction — see there.
+    runs-on: [self-hosted, hel1]
     env:
       # See `lint` job above for the per-job CARGO_HOME rationale.
-      CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
       # Coverage scope. The exclusion list is deliberately narrow — only code
       # that is not meaningfully unit-testable:
       #   * binary entry points: `main.rs` (#[tokio::main] bootstrap / clap
@@ -381,15 +477,30 @@ jobs:
       # (masking their true coverage) and are now IN scope and gated.
       COVERAGE_IGNORE_REGEX: '(.*/corecruxd/src/pool\.rs|.*/corecruxd/src/dataplane_store\.rs|.*/corecruxd/src/http/dataplane\.rs|.*/corecruxd/src/main\.rs|.*/corecruxctl/src/main\.rs|.*/crux-claude-hooks/src/main\.rs|.*/crux-claude-hooks/src/bin/crux_llm_shim\.rs|.*/crux-config-wizard/src/main\.rs|.*/crux-config-wizard/src/interactive\.rs)$'
     steps:
-      - name: Seed per-job CARGO_HOME from shared toolchain
+      - name: Resolve CARGO_HOME (shared toolchain when the runner has one)
         run: |
+          # $RUNNER_TEMP is writable on EVERY runner pool, unlike the
+          # /home/gha-runner path this used to hardcode — which is what made
+          # these jobs a scheduling coin flip (pass on hel1, die in 13s on
+          # vukgpu02 with "mkdir: cannot create directory ... Permission denied").
+          #
+          # Set HERE and not in the job-level `env:` because the `runner` context
+          # is not available there; only `github`/`needs`/`matrix` etc. are.
+          # Using it at job level makes the whole workflow file invalid.
+          #
+          # The symlink loop is the FAST PATH, not a requirement: where a shared
+          # toolchain exists it is linked in and the toolchain action becomes a
+          # no-op; where it does not, the glob stays literal, `-e` fails, and the
+          # action installs into this writable home. Same workflow, both pools.
+          CARGO_HOME="${RUNNER_TEMP}/cargo-${{ github.job }}-${{ github.run_id }}"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
           mkdir -p "$CARGO_HOME/bin"
-          for tool in /home/gha-runner/.cargo/bin/*; do
+          for tool in "${CRUX_SHARED_CARGO_HOME:-/home/gha-runner/.cargo}"/bin/*; do
             [ -e "$tool" ] || continue
             ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
           done
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Preflight (self-hosted runner toolchain)
         run: |
           set +e
@@ -401,10 +512,11 @@ jobs:
             echo "::error::Run scripts/provision-self-hosted-runner.sh on the runner host (or add ci:fallback label)."
             exit 1
           fi
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          toolchain: stable
           components: llvm-tools-preview
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
         with:
           tool: cargo-llvm-cov
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
@@ -426,8 +538,12 @@ jobs:
 
           FAILED=0
 
-          if (( $(echo "$TOTAL < 86" | bc -l) )); then
-            echo "::error::Workspace coverage ${TOTAL}% is below 86% floor"
+          # Ratcheted 86 -> 89 on 2026-07-30 (measured 90.11%). Deliberately 89
+          # and not 90: at a 90 floor the headline gate would sit 0.11pp above
+          # reality, so a single feature PR adding ~400 uncovered regions would
+          # turn main red. 90 is the ratchet target once there is headroom.
+          if (( $(echo "$TOTAL < 89" | bc -l) )); then
+            echo "::error::Workspace coverage ${TOTAL}% is below 89% floor"
             FAILED=1
           fi
 
@@ -469,7 +585,7 @@ jobs:
           echo "All coverage thresholds met."
       - name: Upload coverage
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: coverage-report
           path: lcov.info

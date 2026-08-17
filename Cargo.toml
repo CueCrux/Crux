@@ -1,6 +1,8 @@
 [workspace]
 members = [
   "crates/corecrux-types",
+  "crates/corecrux-secrets",
+  "crates/corecrux-billing",
   "crates/corecrux-frame",
   "crates/corecrux-proto",
   "crates/corecrux-receipts",
@@ -10,6 +12,8 @@ members = [
   "crates/corecrux-index",
   "crates/corecrux-retrieval",
   "crates/corecrux-memory",
+  "crates/corecrux-providers",
+  "crates/corecrux-workspace-scan",
   "crates/crux-sync",
   "crates/crux-contrib",
   "crates/crux-integrations",
@@ -21,7 +25,9 @@ members = [
   "crates/crux-lens-features",
   "crates/crux-mcp",
   "crates/crux-session",
+  "crates/crux-escrow",
   "crates/rcx-capability-token",
+  "crates/rcx-revocation",
   "crates/crux-router",
   "crates/crux-enterprise-shim",
   "crates/corecruxd",
@@ -42,19 +48,20 @@ edition = "2021"
 # Kept in lock-step with the release tag (v<MAJOR.MINOR.PATCH>). Bump via
 # scripts/cut-release.sh; the version-sync CI gate (.github/workflows/version-sync.yml)
 # fails any v* tag whose workspace version != the tag.
-version = "0.5.46"
-license = "LicenseRef-CCL-1.0"
+version = "0.5.59"
+license = "Apache-2.0"
 rust-version = "1.88.0"
-# CCL crates are source-available and never published to a registry. Marking
-# them non-publishable lets cargo-deny's `allow-wildcard-paths` exempt the
-# unversioned `{ path = "../x" }` workspace deps so `wildcards = "deny"` can be
-# enforced against real (registry) wildcard requirements. (deny.toml C2)
+# Apache-2.0 licensed but not (yet) published to crates.io: the workspace uses
+# unversioned `{ path = "../x" }` deps, which a registry publish would reject.
+# Marking the crates non-publishable also lets cargo-deny's `allow-wildcard-paths`
+# exempt those path deps so `wildcards = "deny"` can be enforced against real
+# (registry) wildcard requirements. (deny.toml C2)
 publish = false
 
 [workspace.dependencies]
 anyhow = "1.0.97"
 axum = "0.8.9"
-base64 = "0.22.1"
+base64 = "0.23.0"
 blake3 = "1.8.5"
 chacha20poly1305 = "0.11.0"
 chrono = { version = "0.4.45", default-features = false }
@@ -65,13 +72,14 @@ crc32fast = "1.4.2"
 # `zeroize` is a default feature of ed25519-dalek; pinned explicitly so the
 # SigningKey seed zeroize-on-drop guarantee (compaction-sync review F4) survives a
 # future `default-features = false` on any consumer. Additive; no lock/version change.
+data-encoding = "2.9.0"
 ed25519-dalek = { version = "2.2.0", features = ["zeroize"] }
 fs2 = "0.4.3"
 hex = "0.4.3"
 http-body-util = "0.1.3"
-jsonwebtoken = { version = "10.3.0", default-features = false }
-lz4_flex = "0.13.1"
-p256 = { version = "0.13.2", default-features = false }
+jsonwebtoken = { version = "11.0.0", default-features = false }
+lz4_flex = "0.14.0"
+p256 = { version = "0.14.0", default-features = false }
 prometheus = { version = "0.13.4", default-features = false }
 proptest = "1.6.0"
 prost = "0.14.4"
@@ -87,11 +95,17 @@ serial_test = "3"
 sha2 = "0.11"
 subtle = "2"
 syn = "3.0.0"
+proc-macro2 = "1.0"
 tar = "0.4.44"
 tempfile = "3.16.0"
 thiserror = "2.0.12"
 tokio = "1.52.3"
 tokio-stream = "0.1.17"
+# Client-only WebSocket for the relay dial (relay contract v1 §3). Pinned to
+# 0.30 and default-features = false so rustls resolves with a SINGLE crypto
+# provider (ring, no aws-lc-rs) — a dual-provider rustls has no default and
+# ClientConfig::builder() then fails at RUNTIME, not at compile time.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 toml = "1.1"
 tonic = "0.14.6"
 tower = "0.5"
@@ -103,6 +117,10 @@ url = "2.5.7"
 urlencoding = "2.1"
 utoipa = "5"
 uuid = "1.23.2"
+# GF(256) Shamir for the 2-of-3 key escrow (`Gf256::split_bytes`). Default features
+# off keeps the prime-field/elliptic-curve half of the crate out of the tree.
+vsss-rs = { version = "6.0.1", default-features = false, features = ["std", "zeroize"] }
+zeroize = { version = "1", features = ["derive"] }
 x509-cert = { version = "0.3.0", default-features = false }
 xxhash-rust = "0.8.12"
 zip = { version = "8.6.0", default-features = false }

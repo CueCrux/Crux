@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Ephemeral reserved-fact garbage collector.
 //!
@@ -150,7 +150,10 @@ pub async fn run_sweep_once(store: &Arc<RwLock<FactStore>>, now: DateTime<Utc>, 
     let mut deleted = 0usize;
     let mut guard = store.write().await;
     for id in &candidates {
-        match guard.try_delete(id) {
+        let Some(tenant_hash) = guard.get(id).map(|fact| fact.tenant_hash.clone()) else {
+            continue;
+        };
+        match guard.try_delete(&tenant_hash, id) {
             Ok(true) => deleted += 1,
             Ok(false) => {}
             Err(err) => {
@@ -431,7 +434,7 @@ mod tests {
         // Drive the real journaled delete path.
         {
             let mut g = store.write().await;
-            assert!(g.try_delete(&receipt_id).expect("journaled delete"));
+            assert!(g.try_delete("default", &receipt_id).expect("journaled delete"));
         }
 
         let g = store.read().await;
@@ -466,7 +469,7 @@ mod tests {
             horizon_class: None,
             actor: None,
         });
-        assert!(s.try_delete(&f.fact_id).unwrap(), "secret fact soft-deleted");
+        assert!(s.try_delete("default", &f.fact_id).unwrap(), "secret fact soft-deleted");
         // One fact swept ⇒ receipt is built from the count alone.
         let payload = serde_json::to_value(build_gc_receipt(1, DEFAULT_RETAIN_DAYS)).unwrap();
         assert_eq!(payload["deleted"], 1);

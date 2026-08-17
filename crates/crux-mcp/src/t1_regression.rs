@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! agent-passport M5 — T.1 cross-tenant-leak regression suite (the merge bar).
 //!
@@ -12,27 +12,27 @@
 //!
 //! ## What "tenant isolation" maps onto in the current model (read this first)
 //!
-//! There is **no Fact-level `tenant` column** in `corecrux_memory::Fact`. The
-//! substrate has exactly two isolation primitives that a fact can ride on:
+//! Every `corecrux_memory::Fact` carries a concrete `tenant_hash`. Tenant
+//! authorization is applied before private-owner visibility on every generic
+//! fact read and mutation path:
 //!
-//! 1. **Private-fact ownership** (`__agent::<owner>::…`, enforced in
+//! 1. **Tenant partitioning** (`Fact::tenant_hash`, resolved from the caller's
+//!    agent-passport mapping). Version chains, history, lookup-by-id,
+//!    supersession, deletion, freshness, and acknowledgement remain inside
+//!    that concrete tenant. A fact id is an identifier, never an authority
+//!    token.
+//! 2. **Private-fact ownership** (`__agent::<owner>::…`, enforced in
 //!    `crate::scope`). Under M5 the `<owner>` key is the caller's resolved
 //!    *passport_id* (e.g. `claude-work`), not the raw token-name. A private
-//!    fact is visible ONLY to its owning passport (plus the owner's own legacy
-//!    raw-name alias for back-compat). This is the strong, per-principal
-//!    boundary — it is what "tenant A's private fact is invisible to tenant B"
-//!    concretely means here.
-//! 2. **Write-category exclusivity** (`crate::category_enforce`). A `work`
+//!    fact is visible only to its owning passport, within the already-authorized
+//!    tenant. The owner's raw-name alias remains available only when the legacy
+//!    fact is in that same tenant.
+//! 3. **Write-category exclusivity** (`crate::category_enforce`). A `work`
 //!    passport cannot WRITE a `personal`-category entity and vice-versa. This
-//!    partitions the *non-private* shared pool by category at write time.
+//!    is an additional write-policy boundary, not a substitute for tenancy.
 //!
-//! **Non-private facts remain a SHARED pool** readable by every authenticated
-//! caller — that is the existing, intended collaboration model (two work agents
-//! share their non-private memory). M5 does NOT make non-private facts
-//! tenant-private, because the data model has no per-fact tenant tag to scope
-//! them by; inventing a half-implementation there could leak, so it is
-//! deliberately out of scope (documented in the report). What M5 DOES enforce:
-//! a non-private fact cannot be *written* across a category boundary.
+//! Non-private facts are shared by authenticated collaborators only inside the
+//! same tenant. They are never readable or mutable from a different tenant.
 //!
 //! The `query` (BM25 retrieval) path is a SEPARATE data plane from facts: it
 //! reads the tenant-hash-partitioned doc index, never the FactStore. Its tenant
@@ -55,7 +55,7 @@ use crate::tools::freshness::{handle_memory_freshness, handle_memory_sweep_candi
 use crate::tools::memory::{handle_memory_edit, handle_memory_pin, handle_memory_view};
 use crate::tools::memory_use::handle_memory_acknowledge_use;
 use crate::tools::query::handle_query;
-use corecrux_memory::fact_store::StoreFact;
+use corecrux_memory::fact_store::{ConsolidationRequestV1, StoreFact};
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -205,15 +205,15 @@ async fn t1_write_personal_passport_writes_personal_ok_but_work_blocked() {
 }
 
 #[tokio::test]
-async fn t1_write_system_entity_exempt() {
+async fn t1_write_non_control_system_entity_exempt() {
     let base = flag_on_base();
     seed_passport(&base, "claude-work", "work").await;
     let claude = agent(&base, "anthropic", 0);
 
-    // System entity (`__*__`) is exempt — a work passport may write it even
-    // though it is not "work"-categorised.
+    // A non-control system entity is exempt from category enforcement. Daemon
+    // control namespaces have a separate generic-write prohibition.
     handle_store_fact(
-        &json!({"entity": "__bootstrap__::pattern:retry", "key": "k", "value": "sys-ok"}),
+        &json!({"entity": "__synthetic__::pattern:retry", "key": "k", "value": "sys-ok"}),
         &claude,
     )
     .await
@@ -388,14 +388,182 @@ async fn t1_adversarial_cross_passport_supersede_and_delete_denied() {
     );
 }
 
+/// Two concrete tenants may use the same logical `(entity, key)` without
+/// sharing version chains, history, reads, supersession authority, or deletion
+/// authority.
+#[tokio::test]
+async fn t1_fact_lifecycle_is_partitioned_by_concrete_tenant() {
+    let map = AgentPassportMap::from_pairs_str("agent-a:passport-a:tenant-a,agent-b:passport-b:tenant-b");
+    let base = McpContext::new_default("t1-node").with_agent_passports(true, map);
+    seed_passport(&base, "passport-a", "work").await;
+    seed_passport(&base, "passport-b", "work").await;
+    let tenant_a = agent(&base, "agent-a", 1);
+    let tenant_b = agent(&base, "agent-b", 2);
+
+    let a1 = handle_store_fact(
+        &json!({"entity": "work::shared-key", "key": "status", "value": "tenant-a-v1"}),
+        &tenant_a,
+    )
+    .await
+    .unwrap();
+    let a1_id = fact_id_of(&a1);
+    let b1 = handle_store_fact(
+        &json!({"entity": "work::shared-key", "key": "status", "value": "tenant-b-v1"}),
+        &tenant_b,
+    )
+    .await
+    .unwrap();
+    let b1_id = fact_id_of(&b1);
+    let a2 = handle_store_fact(
+        &json!({"entity": "work::shared-key", "key": "status", "value": "tenant-a-v2"}),
+        &tenant_a,
+    )
+    .await
+    .unwrap();
+    let a2_id = fact_id_of(&a2);
+
+    {
+        let store = base.fact_store.read().await;
+        let a1 = store.get(&a1_id).unwrap();
+        let a2 = store.get(&a2_id).unwrap();
+        let b1 = store.get(&b1_id).unwrap();
+        assert_eq!(a1.tenant_hash, "tenant-a");
+        assert_eq!(a1.version, 1);
+        assert_eq!(a1.superseded_by.as_deref(), Some(a2_id.as_str()));
+        assert_eq!(a2.version, 2);
+        assert_eq!(a2.supersedes.as_deref(), Some(a1_id.as_str()));
+        assert_eq!(b1.tenant_hash, "tenant-b");
+        assert_eq!(b1.version, 1);
+        assert!(b1.supersedes.is_none());
+        assert!(b1.superseded_by.is_none());
+    }
+
+    let a_query = handle_query_facts(&json!({"entity": "work::shared-key", "token_budget": 500}), &tenant_a)
+        .await
+        .unwrap();
+    assert!(query_facts_has_value(&a_query, "tenant-a-v2"));
+    assert!(!query_facts_has_value(&a_query, "tenant-b-v1"));
+
+    let b_query = handle_query_facts(&json!({"entity": "work::shared-key", "token_budget": 500}), &tenant_b)
+        .await
+        .unwrap();
+    assert!(query_facts_has_value(&b_query, "tenant-b-v1"));
+    assert!(!query_facts_has_value(&b_query, "tenant-a-v2"));
+
+    let a_history = handle_fact_history(&json!({"entity": "work::shared-key", "key": "status"}), &tenant_a)
+        .await
+        .unwrap();
+    assert!(fact_history_has_value(&a_history, "tenant-a-v1"));
+    assert!(fact_history_has_value(&a_history, "tenant-a-v2"));
+    assert!(!fact_history_has_value(&a_history, "tenant-b-v1"));
+
+    let b_history = handle_fact_history(&json!({"entity": "work::shared-key", "key": "status"}), &tenant_b)
+        .await
+        .unwrap();
+    assert!(fact_history_has_value(&b_history, "tenant-b-v1"));
+    assert!(!fact_history_has_value(&b_history, "tenant-a-v1"));
+
+    let supersede_err = handle_store_fact(
+        &json!({
+            "entity": "work::cross-tenant-attempt",
+            "key": "status",
+            "value": "must-not-land",
+            "supersedes": [a2_id],
+        }),
+        &tenant_b,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(supersede_err.code, crate::protocol::INVALID_PARAMS);
+
+    let delete = handle_delete_fact(&json!({"fact_id": a2_id}), &tenant_b).await.unwrap();
+    assert!(
+        delete["content"][0]["text"].as_str().unwrap().contains("not found"),
+        "a foreign-tenant fact id must not authorize deletion"
+    );
+    let store = base.fact_store.read().await;
+    assert!(
+        !store.get(&a2_id).unwrap().deleted,
+        "cross-tenant delete must leave the target untouched"
+    );
+    assert!(
+        store
+            .all_facts_for_tenant("tenant-b")
+            .all(|fact| fact.value != "must-not-land"),
+        "rejected cross-tenant supersession must be atomic"
+    );
+}
+
+#[tokio::test]
+async fn t1_generic_delete_cannot_retire_consolidation_canonical() {
+    let map = AgentPassportMap::from_pairs_str("agent-a:passport-a:tenant-a");
+    let base = McpContext::new_default("t1-node").with_agent_passports(true, map);
+    seed_passport(&base, "passport-a", "work").await;
+    let tenant_a = agent(&base, "agent-a", 1);
+    let first = handle_store_fact(
+        &json!({"entity": "work::consolidate", "key": "status", "value": "blocked", "confidence": 0.2}),
+        &tenant_a,
+    )
+    .await
+    .unwrap();
+    let second = handle_store_fact(
+        &json!({"entity": "work::consolidate", "key": "status", "value": "active", "confidence": 0.3}),
+        &tenant_a,
+    )
+    .await
+    .unwrap();
+    let first_id = fact_id_of(&first);
+    let second_id = fact_id_of(&second);
+    let canonical_id = {
+        let mut store = base.fact_store.write().await;
+        assert!(store.clear_superseded("tenant-a", &first_id));
+        store
+            .consolidate_facts_v1(
+                "tenant-a",
+                ConsolidationRequestV1 {
+                    consolidation_id: "con-mcp-delete".to_string(),
+                    entity: "work::consolidate".to_string(),
+                    key: "status".to_string(),
+                    canonical_value: "settled".to_string(),
+                    target_fact_ids: vec![first_id.clone(), second_id.clone()],
+                    protected_fact_ids: vec![],
+                    confidence: 0.8,
+                    source_receipt: None,
+                    actor: Some("passport-a".to_string()),
+                    horizon_class: None,
+                    protected_confidence_floor: 0.99,
+                },
+            )
+            .unwrap()
+            .receipt
+            .canonical_fact_id
+    };
+
+    let err = handle_delete_fact(&json!({"fact_id": canonical_id}), &tenant_a)
+        .await
+        .expect_err("generic delete must require consolidation undo");
+    assert_eq!(err.code, crate::dispatch::CAPABILITY_DENIED);
+    assert_eq!(err.data.unwrap()["error_code"], "CONSOLIDATION_CANONICAL_REQUIRES_UNDO");
+    let store = base.fact_store.read().await;
+    assert!(store.get(&canonical_id).is_some());
+    assert_eq!(
+        store.get(&first_id).unwrap().superseded_by.as_deref(),
+        Some(canonical_id.as_str())
+    );
+    assert_eq!(
+        store.get(&second_id).unwrap().superseded_by.as_deref(),
+        Some(canonical_id.as_str())
+    );
+}
+
 // ── INVARIANT 4: migration / back-compat ──────────────────────────────────────
 
-/// An existing personal-default / non-private fact (no actor, written flag-OFF)
-/// STILL resolves and is visible to its legitimate readers after the flag is
-/// turned on. Non-private facts are the shared pool — they must NOT be stranded
-/// or wrongly hidden by the M5 identity rekeying.
+/// An existing default-tenant non-private fact remains visible after the flag
+/// is turned on only when the mapped passport stays in the default tenant.
+/// Moving the passport to `work` is an explicit tenant migration and must not
+/// silently bridge the two partitions.
 #[tokio::test]
-async fn t1_migration_legacy_nonprivate_fact_still_visible_after_flag_on() {
+async fn t1_migration_legacy_nonprivate_fact_is_visible_only_in_its_tenant() {
     // Write the legacy fact with the flag OFF (the pre-M5 world), then read it
     // back through a flag-ON context over the SAME store.
     let off = flag_off_base();
@@ -407,17 +575,36 @@ async fn t1_migration_legacy_nonprivate_fact_still_visible_after_flag_on() {
     .await
     .unwrap();
 
-    // Same underlying store, flag now ON, a different (work) passport reads.
-    let on = off.with_agent_passports(true, AgentPassportMap::builtin_default());
-    seed_passport(&on, "claude-work", "work").await;
-    let claude = agent(&on, "anthropic", 0);
+    // Same store, flag now ON, and the mapped passport remains in `default`.
+    let on_default = off
+        .clone()
+        .with_agent_passports(true, AgentPassportMap::from_pairs_str("anthropic:claude-work:default"));
+    seed_passport(&on_default, "claude-work", "work").await;
+    let claude_default = agent(&on_default, "anthropic", 0);
 
-    let q = handle_query_facts(&json!({"query": "legacy-shared-needle", "token_budget": 500}), &claude)
-        .await
-        .unwrap();
+    let q = handle_query_facts(
+        &json!({"query": "legacy-shared-needle", "token_budget": 500}),
+        &claude_default,
+    )
+    .await
+    .unwrap();
     assert!(
         query_facts_has_value(&q, "legacy-shared-needle"),
-        "legacy non-private fact must remain visible to the shared pool after flag-on"
+        "same-tenant legacy non-private fact must remain visible after flag-on"
+    );
+
+    // Rebinding the same agent to `work` does not grant access to `default`.
+    let on_work = off.with_agent_passports(true, AgentPassportMap::from_pairs_str("anthropic:claude-work:work"));
+    let claude_work = agent(&on_work, "anthropic", 0);
+    let q = handle_query_facts(
+        &json!({"query": "legacy-shared-needle", "token_budget": 500}),
+        &claude_work,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !query_facts_has_value(&q, "legacy-shared-needle"),
+        "legacy default fact must not cross into a newly assigned work tenant"
     );
 }
 
@@ -441,8 +628,11 @@ async fn t1_migration_legacy_private_fact_not_stranded_for_owner() {
         assert_eq!(store.get(&fid).unwrap().entity, "__agent::anthropic::oldnotes");
     }
 
-    // Flag flips ON: same `anthropic` agent now resolves to `claude-work`.
-    let on = off.with_agent_passports(true, AgentPassportMap::builtin_default());
+    // Flag flips ON: same agent resolves to a passport in the SAME tenant.
+    let on = off.with_agent_passports(
+        true,
+        AgentPassportMap::from_pairs_str("anthropic:claude-work:default,openai:codex-work:default"),
+    );
     seed_passport(&on, "claude-work", "work").await;
     let anth_on = agent(&on, "anthropic", 0);
 
@@ -588,8 +778,8 @@ async fn t1_flag_off_byte_for_byte_control() {
     );
 }
 
-/// Flag-OFF non-private facts remain a SHARED pool (the pre-M5 collaboration
-/// model is untouched): a fact written by one agent is visible to another.
+/// Flag-OFF non-private facts remain a shared `default`-tenant pool: a fact
+/// written by one agent is visible to another caller in that same tenant.
 #[tokio::test]
 async fn t1_flag_off_nonprivate_pool_is_shared_control() {
     let off = flag_off_base();
@@ -644,8 +834,9 @@ async fn owner_other_fixture() -> (McpContext, McpContext, McpContext) {
 }
 
 /// memory_freshness: the converted identity-scoped visibility gate governs the
-/// SHARED (non-private) pool; a non-private fact written by the owner is visible
-/// to BOTH passports (the intended collaboration model — not a leak). Private
+/// same-tenant non-private pool; a non-private fact written by the owner is
+/// visible to BOTH passports in `work` (the intended collaboration model).
+/// Private
 /// facts never ride this surface for ANYONE because the handler ALSO filters the
 /// `__agent::*` stored entity as reserved BEFORE the row is rendered — that
 /// pre-existing guard is intentionally preserved. The owner-can / other-CANNOT
@@ -659,7 +850,7 @@ async fn t1_memory_freshness_shared_pool_and_private_filtered() {
     std::env::set_var("CORECRUXD_FEATURE_FRESHNESS", "1");
     let (_base, claude, codex) = owner_other_fixture().await;
 
-    // Non-private (shared-pool) fact — both passports see it on memory_freshness.
+    // Non-private same-tenant fact — both passports see it on memory_freshness.
     let shared = handle_store_fact(
         &json!({"entity": "work::fresh-shared", "key": "k", "value": "fresh-shared-needle"}),
         &claude,
@@ -691,7 +882,7 @@ async fn t1_memory_freshness_shared_pool_and_private_filtered() {
         .unwrap();
     assert!(
         rows_have_fact_id(&other, &shared_id),
-        "shared (non-private) pool is visible to a different passport — intended collaboration"
+        "same-tenant non-private pool is visible to a different passport"
     );
     assert!(
         !rows_have_fact_id(&other, &secret_id),
@@ -700,8 +891,8 @@ async fn t1_memory_freshness_shared_pool_and_private_filtered() {
     std::env::remove_var("CORECRUXD_FEATURE_FRESHNESS");
 }
 
-/// memory_sweep_candidates: a superseded NON-private fact is a sweep candidate
-/// for both passports (shared pool); a superseded PRIVATE fact is reserved-
+/// memory_sweep_candidates: a superseded same-tenant NON-private fact is a
+/// sweep candidate for both passports; a superseded PRIVATE fact is reserved-
 /// filtered for everyone. Same reasoning as memory_freshness — the conversion
 /// governs the shared pool and preserves the private-reserved guard.
 #[tokio::test]
@@ -798,10 +989,9 @@ async fn t1_memory_forget_owner_can_other_cannot() {
     .unwrap();
     let target_id = fact_id_of(&target);
 
-    // A non-private fact is the SHARED pool, so a different passport CAN see it
-    // here — that is the intended collaboration model, NOT a leak (private facts
-    // are the per-principal boundary, covered elsewhere). What we assert: both
-    // dry-runs preview it, and the OWNER's forget actually removes it.
+    // A non-private fact is shared inside the `work` tenant, so a different
+    // passport in that tenant can see it. What we assert: both dry-runs preview
+    // it, and the owner's forget actually removes it.
     let owner_dry = handle_memory_forget_dry_run(
         &json!({"scope": {"type": "entity_prefix", "value": "work::forget-target"}}),
         &claude,
@@ -879,7 +1069,7 @@ async fn t1_memory_forget_owner_can_other_cannot() {
 }
 
 /// memory_acknowledge_use: the converted identity-scoped visibility gate is the
-/// `not_visible` discriminator. A SHARED (non-private) fact is ackable by both
+/// `not_visible` discriminator. A same-tenant non-private fact is ackable by both
 /// passports. A PRIVATE fact is redacted (reserved) for the OWNER — who CAN see
 /// it (passes the visibility gate) but it carries the `__agent::*` reserved
 /// prefix, so the pre-existing reserved redaction applies — and is `not_visible`

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 #
-# Generate update-manifest.json (schema crux.update_manifest.v1) for a
+# Generate update-manifest.json (schema crux.update_manifest.v2) for a
 # release tag, from the release's cosign-verified RELEASE-MANIFEST files —
 # the emitted sha256 pins inherit the supply-chain guarantees.
 #
@@ -41,12 +41,16 @@ for suffix in "${SUFFIXES[@]}"; do
     --certificate-oidc-issuer "${OIDC_ISSUER}" \
     "${WORK}/${manifest}" >/dev/null
 
-  name="crux-${suffix}"
-  # RELEASE-MANIFEST paths are ./-prefixed (sha256sum run in the package dir);
-  # v0.5.45's manifest job failed on the bare-name-only match.
-  sha="$(awk -v f="$name" '$2 == f || $2 == "*"f || $2 == "./"f {print $1}' "${WORK}/${manifest}")"
-  [ -n "$sha" ] || { echo "ERROR: ${name} not found in ${manifest}" >&2; exit 1; }
-  artifacts="$(jq -c --arg n "$name" --arg s "$sha" '. + [{name:$n, sha256:$s}]' <<<"$artifacts")"
+  asset_name="crux-${suffix}"
+  # Logical name is deliberately invisible to pre-M5 self-updaters. Those
+  # clients would otherwise replace only the daemon and omit the newly bundled
+  # hook/CLI; failing lookup forces the complete installer transition.
+  name="standalone-${asset_name}"
+  # Current manifests use public flat basenames. Keep the ./ match for releases
+  # produced before the basename collision hardening.
+  sha="$(awk -v f="$asset_name" '$2 == f || $2 == "*"f || $2 == "./"f {print $1}' "${WORK}/${manifest}")"
+  [ -n "$sha" ] || { echo "ERROR: ${asset_name} not found in ${manifest}" >&2; exit 1; }
+  artifacts="$(jq -c --arg n "$name" --arg a "$asset_name" --arg s "$sha" '. + [{name:$n, asset_name:$a, sha256:$s}]' <<<"$artifacts")"
 done
 
 jq -n \
@@ -56,6 +60,6 @@ jq -n \
   --arg notes_url "https://github.com/${REPO}/releases/tag/${TAG}" \
   --arg verify_doc "https://github.com/${REPO}/blob/${TAG}/docs/verify-release.md" \
   --argjson artifacts "$artifacts" \
-  '{schema:"crux.update_manifest.v1", tag:$tag, version:$version,
+  '{schema:"crux.update_manifest.v2", tag:$tag, version:$version,
     published_at:$published_at, notes_url:$notes_url, verify_doc:$verify_doc,
     artifacts:$artifacts}'

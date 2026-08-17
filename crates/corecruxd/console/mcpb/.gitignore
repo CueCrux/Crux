@@ -1,0 +1,6 @@
+# Transient build output — `build.sh` repopulates these. Only the packed
+# artifact (../assets/crux.mcpb) is committed.
+server/node_modules/
+server/package.json
+server/package-lock.json
+*.mcpb

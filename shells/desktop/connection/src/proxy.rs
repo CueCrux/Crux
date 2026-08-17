@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -25,7 +25,22 @@ const SESSION_HANDSHAKE_PATH: &str = "/__crux_session";
 const PROXY_COOKIE_NAME: &[u8] = b"__crux_proxy";
 const CONSOLE_PATH: &str = "/console";
 
-const CSP: &str = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'self'; connect-src 'self'; img-src 'self' data: blob:; font-src 'self' data:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; worker-src 'self'; manifest-src 'self'";
+// Keep this policy byte-for-byte aligned with corecruxd's console policy. The
+// shipped shell embeds same-origin 3D and Studio web tiles, so foreign framing
+// is denied while same-origin framing remains available.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-src 'self'; frame-ancestors 'self'; form-action 'self'; connect-src 'self'; img-src 'self' data: blob:; font-src 'self' data:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; worker-src 'self'; manifest-src 'self'";
+const BROWSER_SECURITY_HEADERS: [(&str, &str); 7] = [
+    ("Content-Security-Policy", CONTENT_SECURITY_POLICY),
+    ("X-Content-Type-Options", "nosniff"),
+    ("X-Frame-Options", "SAMEORIGIN"),
+    ("Referrer-Policy", "no-referrer"),
+    (
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=()",
+    ),
+    ("Cross-Origin-Opener-Policy", "same-origin"),
+    ("Cross-Origin-Resource-Policy", "same-origin"),
+];
 
 /// A sanitized request passed from the loopback BFF to a native HTTP adapter.
 pub struct ForwardRequest {
@@ -1238,10 +1253,10 @@ fn write_status_line(stream: &mut dyn Write, status: u16) -> io::Result<()> {
 }
 
 fn write_security_headers(stream: &mut dyn Write) -> io::Result<()> {
-    write!(
-        stream,
-        "Content-Security-Policy: {CSP}\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nPermissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=()\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Resource-Policy: same-origin\r\n"
-    )
+    for (name, value) in BROWSER_SECURITY_HEADERS {
+        write!(stream, "{name}: {value}\r\n")?;
+    }
+    Ok(())
 }
 
 fn reason_phrase(status: u16) -> &'static str {
@@ -1336,7 +1351,7 @@ mod tests {
     use super::{
         forward_request, handle_session_handshake, render_status_html, validate_browser_origin, ForwardMode,
         ForwardRequest, ParsedRequest, ProxyControl, ProxyMode, ProxyServer, ProxySessionState, SecretBytes, Shared,
-        StatusPage, Upstream, UpstreamError, UpstreamResponse,
+        StatusPage, Upstream, UpstreamError, UpstreamResponse, BROWSER_SECURITY_HEADERS, CONTENT_SECURITY_POLICY,
     };
     use crate::{validate_attach_url, SecretToken};
 
@@ -1486,6 +1501,89 @@ mod tests {
             }
             Err(error) => panic!("could not bind proxy test server: {error}"),
         }
+    }
+
+    fn assert_browser_security_headers(response: &[u8]) {
+        let rendered = String::from_utf8_lossy(response);
+        let header_block = rendered
+            .split_once("\r\n\r\n")
+            .map_or(rendered.as_ref(), |(headers, _)| headers);
+        for (name, value) in BROWSER_SECURITY_HEADERS {
+            let matches: Vec<_> = header_block
+                .lines()
+                .filter(|line| {
+                    line.split_once(':')
+                        .is_some_and(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+                })
+                .collect();
+            assert_eq!(matches.len(), 1, "{name} must occur exactly once");
+            assert_eq!(matches[0], format!("{name}: {value}"), "{name} must be canonical");
+        }
+        assert!(CONTENT_SECURITY_POLICY.contains("frame-src 'self'"));
+        assert!(CONTENT_SECURITY_POLICY.contains("frame-ancestors 'self'"));
+        assert!(!CONTENT_SECURITY_POLICY.contains("'unsafe-eval'"));
+        assert!(!CONTENT_SECURITY_POLICY.contains("'wasm-unsafe-eval'"));
+    }
+
+    #[test]
+    fn browser_security_policy_covers_every_proxy_response_class() {
+        let mode = ForwardMode {
+            upstream_origin: validate_attach_url("https://daemon.example").unwrap(),
+            upstream: Arc::new(FakeUpstream::new(UpstreamResponse::new(
+                200,
+                Vec::new(),
+                Cursor::new(Vec::new()),
+            ))),
+            token: Arc::new(token()),
+            session: established_session(),
+            active: Arc::new(AtomicBool::new(true)),
+            clear_browser_state: Arc::new(AtomicBool::new(false)),
+        };
+        let running = AtomicBool::new(true);
+
+        for (method, status) in [("GET", 200), ("HEAD", 200), ("GET", 204), ("GET", 304)] {
+            let mut response = Vec::new();
+            super::write_upstream_response(
+                &mut response,
+                UpstreamResponse::new(
+                    status,
+                    vec![
+                        (
+                            "Content-Security-Policy".to_string(),
+                            b"default-src *; script-src * 'unsafe-eval'".to_vec(),
+                        ),
+                        ("X-Frame-Options".to_string(), b"ALLOWALL".to_vec()),
+                        ("X-Content-Type-Options".to_string(), b"off".to_vec()),
+                        ("Referrer-Policy".to_string(), b"unsafe-url".to_vec()),
+                        ("Permissions-Policy".to_string(), b"camera=*".to_vec()),
+                        ("Cross-Origin-Opener-Policy".to_string(), b"unsafe-none".to_vec()),
+                        ("Cross-Origin-Resource-Policy".to_string(), b"cross-origin".to_vec()),
+                    ],
+                    Cursor::new(b"body".to_vec()),
+                ),
+                method,
+                &mode,
+                &running,
+            )
+            .unwrap();
+            assert_browser_security_headers(&response);
+        }
+
+        let mut status_response = Vec::new();
+        super::write_status(
+            &mut status_response,
+            &StatusPage::new("Connecting", "Browser policy is active."),
+        )
+        .unwrap();
+        assert_browser_security_headers(&status_response);
+
+        let mut error_response = Vec::new();
+        super::write_safe_error(&mut error_response, 502, "The daemon response was blocked.").unwrap();
+        assert_browser_security_headers(&error_response);
+
+        let mut handshake_response = Vec::new();
+        super::write_session_established(&mut handshake_response, TEST_SESSION_ID, &AtomicBool::new(false)).unwrap();
+        assert_browser_security_headers(&handshake_response);
     }
 
     #[test]
@@ -1812,6 +1910,16 @@ mod tests {
                 ("Proxy-Connection".to_string(), b"keep-alive".to_vec()),
                 ("WWW-Authenticate".to_string(), b"Basic realm=hostile".to_vec()),
                 ("Content-Type".to_string(), b"text/plain".to_vec()),
+                (
+                    "Content-Security-Policy".to_string(),
+                    b"default-src *; script-src * 'unsafe-eval'".to_vec(),
+                ),
+                ("X-Content-Type-Options".to_string(), b"off".to_vec()),
+                ("X-Frame-Options".to_string(), b"ALLOWALL".to_vec()),
+                ("Referrer-Policy".to_string(), b"unsafe-url".to_vec()),
+                ("Permissions-Policy".to_string(), b"camera=*".to_vec()),
+                ("Cross-Origin-Opener-Policy".to_string(), b"unsafe-none".to_vec()),
+                ("Cross-Origin-Resource-Policy".to_string(), b"cross-origin".to_vec()),
             ],
             Cursor::new(reflected),
         )));
@@ -1844,7 +1952,7 @@ mod tests {
         let rendered = String::from_utf8_lossy(&browser_response);
         assert!(rendered.starts_with("HTTP/1.1 200"));
         assert!(rendered.contains("[REDACTED]"));
-        assert!(rendered.contains("Content-Security-Policy:"));
+        assert_browser_security_headers(&browser_response);
         assert_eq!(rendered.matches("Clear-Site-Data:").count(), 1);
         assert!(rendered.contains("Clear-Site-Data: \"cache\", \"storage\""));
         assert!(!rendered.to_ascii_lowercase().contains("set-cookie"));

@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! MCP tool definitions and sub-module dispatch.
 //!
@@ -16,9 +16,11 @@ pub mod artefacts;
 pub mod audit;
 pub mod audit_export;
 pub mod autonomy;
+pub mod code_intel;
 pub mod consolidation;
 pub mod constraint;
 pub mod context_custody_audit;
+pub mod context_graph;
 pub mod coordination;
 pub mod cuecrux_session;
 pub mod decision;
@@ -222,8 +224,9 @@ pub fn list_tools_with_flags(
         ToolDefinition {
             name: "query".to_string(),
             description: "Search the retrieval index using BM25 + graph fusion. Returns \
-                          scored results with query coverage. Use `token_budget` to cap \
-                          results by token count (60-80% cost reduction vs top-K)."
+                          scored results with query coverage. ALWAYS pass `token_budget` — \
+                          it is the primary defence against output-token blowouts and cuts \
+                          cost 60-80% vs top-K. Omitting it returns an untrimmed result set."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -231,7 +234,7 @@ pub fn list_tools_with_flags(
                     "tenant_id":    { "type": "string",  "description": "Tenant identifier for scoped search" },
                     "query":        { "type": "string",  "description": "Natural-language search query" },
                     "limit":        { "type": "integer", "description": "Maximum results to return", "default": 10 },
-                    "token_budget": { "type": "integer", "description": "Optional token budget for result trimming" },
+                    "token_budget": { "type": "integer", "description": "Token ceiling for the trimmed result set. Pass on EVERY call, including exploratory ones. Conventional defaults: 500 to confirm a fact, 2000 for a scan, 4000 for a design pull. Prefer this over `limit` — it caps cost directly instead of by result count." },
                     "min_score":    { "type": "number",  "description": "Minimum relevance score threshold" }
                 },
                 "required": ["tenant_id", "query"],
@@ -245,25 +248,29 @@ pub fn list_tools_with_flags(
             name: "query_scan".to_string(),
             description: "Lightweight scan returning metadata only (no content). Useful for \
                           checking what exists before expanding. Returns scores and token \
-                          counts per result. Use to decide what to expand."
+                          counts per result. Use to decide what to expand. ALWAYS pass \
+                          `token_budget` — 2000 is the conventional default for a scan."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "tenant_id": { "type": "string",  "description": "Tenant identifier" },
-                    "query":     { "type": "string",  "description": "Search query" },
-                    "limit":     { "type": "integer", "description": "Maximum results", "default": 20 }
+                    "tenant_id":    { "type": "string",  "description": "Tenant identifier" },
+                    "query":        { "type": "string",  "description": "Search query" },
+                    "limit":        { "type": "integer", "description": "Maximum results", "default": 20 },
+                    "token_budget": { "type": "integer", "description": "Token ceiling for the scan. Pass on EVERY call, including exploratory ones. 2000 is the conventional scan default." }
                 },
                 "required": ["tenant_id", "query"],
                 "examples": [
-                    { "tenant_id": "my-project", "query": "authentication flow", "limit": 20 }
+                    { "tenant_id": "my-project", "query": "authentication flow", "limit": 20, "token_budget": 2000 }
                 ]
             }),
         },
         ToolDefinition {
             name: "query_expand".to_string(),
             description: "Expand previously retrieved results by segment/doc IDs to get full \
-                          content."
+                          content. This is the expensive half of the scan-then-expand \
+                          pattern — ALWAYS pass `token_budget`, and expand only the IDs \
+                          the scan showed you need."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -273,11 +280,12 @@ pub fn list_tools_with_flags(
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Result IDs from a prior query/query_scan to expand"
-                    }
+                    },
+                    "token_budget": { "type": "integer", "description": "Token ceiling for the expanded content. Pass on EVERY call. 4000 is the conventional default for a design pull; use less when confirming a single fact." }
                 },
                 "required": ["tenant_id", "result_ids"],
                 "examples": [
-                    { "tenant_id": "my-project", "result_ids": ["r_01J_abc", "r_01J_def"] }
+                    { "tenant_id": "my-project", "result_ids": ["r_01J_abc", "r_01J_def"], "token_budget": 4000 }
                 ]
             }),
         },
@@ -286,12 +294,21 @@ pub fn list_tools_with_flags(
             name: "store_fact".to_string(),
             description: "Store a key-value fact against an entity. Facts carry optional \
                           receipt references and confidence scores. Set `private: true` to \
-                          scope the fact to your agent identity only."
+                          scope the fact to your agent identity only. Use the conventional \
+                          entity prefixes (see the `entity` field) — they are what keeps \
+                          `query_facts` recall consistent across sessions. Store facts \
+                          deliberately, not reflexively: volume dilutes recall, so do not \
+                          drive this tool from a PostToolUse hook. Writes to whichever \
+                          daemon this MCP client is connected to (see your client's \
+                          configured server url) — the `[tier:local]` marker is an \
+                          entitlement tier, not a statement that the write stays on this \
+                          machine. There is no need to hand-roll an HTTP `PUT /v1/facts` \
+                          to reach a remote daemon; this tool already goes there."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "entity":         { "type": "string",  "description": "Entity the fact belongs to" },
+                    "entity":         { "type": "string",  "description": "Entity the fact belongs to. Conventional prefixes, which downstream recall depends on: `execplan:<slug>` (keys `decision:<topic>`, `milestone:M<n>`, `gate:M<n>`; decision values must carry a commit_sha) · `bench:<id>` (value requires {metric, value, corpus, lane_flags, commit_sha, run_id} — `corpus` is mandatory, misattributing a corpus is the known failure mode) · `incident:<YYYY-MM-DD>` (value requires {symptom, cause, fix_sha, repro_steps}) · `design:<slug>` (value carries a `doc_path` pointing at the design doc)." },
                     "key":            { "type": "string",  "description": "Fact key" },
                     "value":          { "type": "string",  "description": "Fact value" },
                     "source_receipt": { "type": "string",  "description": "CROWN receipt reference" },
@@ -321,7 +338,12 @@ pub fn list_tools_with_flags(
                           only (a binary stale-demotion, not a continuous time-decay \
                           curve); stored confidence is never mutated. Pass \
                           `min_effective_confidence` to drop facts below a floor. Private \
-                          facts are visible only to their owning agent."
+                          facts are visible only to their owning agent. ALWAYS pass \
+                          `token_budget` — 500 is the conventional default for confirming \
+                          a fact. Reads from whichever daemon this MCP client is connected \
+                          to (see your client's configured server url); the `[tier:local]` \
+                          marker is an entitlement tier, not a claim that the store is on \
+                          this machine."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -329,7 +351,7 @@ pub fn list_tools_with_flags(
                     "query":        { "type": "string",  "description": "Keyword search across fact values, keys, and entities" },
                     "entity":       { "type": "string",  "description": "Filter to a specific entity" },
                     "top_k":        { "type": "integer", "description": "Maximum facts to return", "default": 10 },
-                    "token_budget": { "type": "integer", "description": "Optional token budget" },
+                    "token_budget": { "type": "integer", "description": "Token ceiling for the returned facts. Pass on EVERY call, including exploratory ones. Conventional defaults: 500 to confirm a fact, 2000 for a scan, 4000 for a design pull." },
                     "include_superseded": { "type": "boolean", "description": "If true, also return facts explicitly retired via cross-entity supersession (their `superseded_by` is exposed). Default false (retired facts are hidden).", "default": false },
                     "as_of": { "type": "string", "description": "Bi-temporal as-of filter (RFC 3339). Return only facts that were TRUE IN THE WORLD at this instant — whose valid-time interval [valid_from, valid_to) contains it — regardless of when they were learned. Omit for present-day recall." },
                     "min_effective_confidence": { "type": "number", "description": "Confidence floor in 0..1. Drop facts whose recall-time EFFECTIVE confidence (stored confidence, halved once the fact is past its freshness horizon) is below this. The response's structuredContent carries `filtered_below_threshold` so you can tell 'no facts' apart from 'nothing above the floor' and fall back to a non-LLM path. Omit for no floor." }
@@ -844,18 +866,35 @@ pub fn list_tools_with_flags(
         ToolDefinition {
             name: "save_session".to_string(),
             description: "Create or update your session state. Authenticated agents write \
-                          into their own session namespace."
+                          into their own session namespace. The writer's identity is stamped \
+                          onto the record automatically (no argument) — anonymous callers \
+                          store no identity rather than a guessed one. CONVENTION: give the \
+                          session a human `title` and a one-paragraph `summary` inside `state` \
+                          so the console can name it; without them it shows as an opaque id."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "session_id":   { "type": "string",  "description": "Session identifier" },
-                    "state":        { "type": "object",  "description": "Arbitrary JSON state to persist" },
+                    "state":        {
+                        "type": "object",
+                        "description": "Arbitrary JSON state to persist. Two CONVENTIONAL optional keys are read by the console \
+                                        and every other session lens — set them on every save: `title` (a short human name for what \
+                                        this session is, e.g. 'M21 console round 10') and `summary` (one paragraph on where the work \
+                                        stands). Both are plain strings and entirely optional; when absent the console falls back to \
+                                        the first conventional state line (decisions[0] / note / context_summary / summary) and then \
+                                        to a short id, and labels the row as untitled. Everything else in the object is opaque to the \
+                                        daemon and preserved verbatim.",
+                        "properties": {
+                            "title":   { "type": "string", "description": "Conventional: short human name for this session." },
+                            "summary": { "type": "string", "description": "Conventional: one paragraph on what happened / where it stands." }
+                        }
+                    },
                     "ttl_seconds":  { "type": "integer", "description": "Optional time-to-live in seconds. Session expires after this duration." }
                 },
                 "required": ["session_id", "state"],
                 "examples": [
-                    { "session_id": "session-42", "state": { "decisions": ["Use PostgreSQL"], "open_questions": ["Which cache?"] } },
+                    { "session_id": "session-42", "state": { "title": "Postgres cutover spike", "summary": "Chose PostgreSQL; cache layer still open. Next: benchmark pgbouncer.", "decisions": ["Use PostgreSQL"], "open_questions": ["Which cache?"] } },
                     { "session_id": "session-42", "state": { "step": 1 }, "ttl_seconds": 3600 }
                 ]
             }),
@@ -1168,8 +1207,9 @@ pub fn list_tools_with_flags(
         // ── Decisions ─────────────────────────────────────────────
         ToolDefinition {
             name: "record_decision".to_string(),
-            description: "Record why a decision was made. Stores an append-only, \
-                          BLAKE3-hashed decision record as a fact. Queryable via \
+            description: "Record why a decision was made as a mutable, untrusted \
+                          annotation. Its BLAKE3 digest is a content identifier only, \
+                          not a signature or authorization decision. Queryable via \
                           query_facts with entity prefix __decisions__::."
                 .to_string(),
             input_schema: json!({
@@ -1472,7 +1512,7 @@ pub fn list_tools_with_flags(
                     },
                     "reason": {
                         "type": "string",
-                        "description": "Optional reason shown to the approving operator"
+                        "description": "Optional reason shown to the approving operator (maximum 2048 UTF-8 bytes)"
                     }
                 },
                 "examples": [
@@ -1748,6 +1788,24 @@ pub fn list_tools_with_flags(
             }),
         },
         ToolDefinition {
+            name: "execplan_write".to_string(),
+            description: coordination::EXECPLAN_WRITE_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "slug":                  { "type": "string", "description": "plan filename without .md, lowercase kebab-case" },
+                    "content":               { "type": "string", "description": "full plan markdown; must carry `# Title`, `## Purpose`, `## Milestones`" },
+                    "expected_content_hash": { "type": "string", "description": "omit to create; pass the current plan_content_hash to update" },
+                    "push":                  { "type": "boolean", "description": "push after committing (default false)" },
+                    "author":                { "type": "string", "description": "passport or agent id for the commit trailer" }
+                },
+                "required": ["slug", "content"],
+                "examples": [
+                    { "slug": "my-feature-2026-07-29", "content": "# My feature\n\n## Purpose\n\nWhy.\n\n## Milestones\n\n- [ ] M0 — first.\n" }
+                ]
+            }),
+        },
+        ToolDefinition {
             name: "list_work".to_string(),
             description: coordination::LIST_WORK_DESCRIPTION.to_string(),
             input_schema: json!({
@@ -1938,6 +1996,52 @@ pub fn list_tools_with_flags(
                 "examples": [{ "limit": 30 }]
             }),
         },
+        // ── Context graph — storybook readout + agent dossier exchange ──
+        // Adapters over /v1/projects/{id}/storybook* and .../dossiers*. The
+        // storybook says where a project is; dossiers say what each agent
+        // believes about it and where those beliefs conflict. Together they are
+        // the multi-session-drift surface: without them an agent re-derives
+        // every session what the last one already worked out.
+        ToolDefinition {
+            name: "get_project_storybook".to_string(),
+            description: context_graph::get_storybook_description().to_string(),
+            input_schema: context_graph::get_storybook_schema(),
+        },
+        ToolDefinition {
+            name: "generate_project_storybook".to_string(),
+            description: context_graph::generate_storybook_description().to_string(),
+            input_schema: context_graph::generate_storybook_schema(),
+        },
+        ToolDefinition {
+            name: "diff_project_storybook".to_string(),
+            description: context_graph::diff_storybook_description().to_string(),
+            input_schema: context_graph::diff_storybook_schema(),
+        },
+        ToolDefinition {
+            name: "get_project_dossiers".to_string(),
+            description: context_graph::get_dossiers_description().to_string(),
+            input_schema: context_graph::get_dossiers_schema(),
+        },
+        ToolDefinition {
+            name: "generate_project_dossier".to_string(),
+            description: context_graph::generate_dossier_description().to_string(),
+            input_schema: context_graph::generate_dossier_schema(),
+        },
+        ToolDefinition {
+            name: "publish_project_dossier".to_string(),
+            description: context_graph::publish_dossier_description().to_string(),
+            input_schema: context_graph::publish_dossier_schema(),
+        },
+        ToolDefinition {
+            name: "reconcile_project_dossiers".to_string(),
+            description: context_graph::reconcile_dossiers_description().to_string(),
+            input_schema: context_graph::reconcile_dossiers_schema(),
+        },
+        ToolDefinition {
+            name: "diff_project_dossiers".to_string(),
+            description: context_graph::diff_dossiers_description().to_string(),
+            input_schema: context_graph::diff_dossiers_schema(),
+        },
         // ── Workspace storyline ──────────────────────────────────────
         ToolDefinition {
             name: "get_workspace_storyline".to_string(),
@@ -1953,6 +2057,37 @@ pub fn list_tools_with_flags(
             name: "list_repos".to_string(),
             description: repos::list_description().to_string(),
             input_schema: repos::list_schema(),
+        },
+        // ── Runtime code intelligence ────────────────────────────────
+        // Thin adapters over GET /v1/code-intel/*. Answers come from spans
+        // actually captured while the code ran, joined to file:line — the
+        // distinction from static navigation, which can only say what might
+        // run. `code_*` prefix keeps these clear of `tool_trace_recent`
+        // (agent tool-call traces, unrelated).
+        ToolDefinition {
+            name: "code_path".to_string(),
+            description: code_intel::path_description().to_string(),
+            input_schema: code_intel::path_schema(),
+        },
+        ToolDefinition {
+            name: "code_blast_radius".to_string(),
+            description: code_intel::blast_radius_description().to_string(),
+            input_schema: code_intel::blast_radius_schema(),
+        },
+        ToolDefinition {
+            name: "code_liveness".to_string(),
+            description: code_intel::liveness_description().to_string(),
+            input_schema: code_intel::liveness_schema(),
+        },
+        ToolDefinition {
+            name: "code_trace_diff".to_string(),
+            description: code_intel::trace_diff_description().to_string(),
+            input_schema: code_intel::trace_diff_schema(),
+        },
+        ToolDefinition {
+            name: "code_dead_code".to_string(),
+            description: code_intel::dead_code_description().to_string(),
+            input_schema: code_intel::dead_code_schema(),
         },
         // ── Substrate: entities / edges / kinds (M1) ──────────────
         ToolDefinition {
@@ -2427,7 +2562,7 @@ pub fn list_tools_with_flags(
         // static `[hosted]` from the tool-surface table. No other tool is
         // affected, and flag-off uses the static marker unchanged.
         let marker = if agent_passports_enabled && t.name == "issue_passport" {
-            "[local]"
+            "[tier:local]"
         } else {
             vaultcrux_local::tool_surface::marker_for_tool(&t.name)
         };
@@ -2574,7 +2709,7 @@ fn tools_to_json(tools: Vec<ToolDefinition>, auth: Option<ToolAuthMetadata>) -> 
             // description marker. Mirror that decision as structured metadata
             // so agents don't have to parse description prefixes. Honest
             // signpost only — no filtering or dispatch change.
-            if t.description.starts_with("[hosted]") {
+            if t.description.starts_with("[tier:hosted]") {
                 crux_meta["upgrade"] = json!({
                     "platform_available": true,
                     "requires": "rcx_capability_token",
@@ -2614,9 +2749,13 @@ fn tools_to_json(tools: Vec<ToolDefinition>, auth: Option<ToolAuthMetadata>) -> 
     response
 }
 
-/// Return the MCP catalogue after applying an RCX Capability Token matrix.
-pub fn list_tools_for_rcx_token(token: &RcxCapabilityToken, now_unix_seconds: u64) -> Vec<ToolDefinition> {
-    let router = RcxRouter::new(token.clone());
+/// Return the MCP catalogue after signature-checking an RCX Capability Token.
+pub fn list_tools_for_verified_rcx_token(
+    token: &RcxCapabilityToken,
+    trusted_issuer_pubkey: [u8; 32],
+    now_unix_seconds: u64,
+) -> Vec<ToolDefinition> {
+    let router = RcxRouter::new_with_trusted_issuer_pubkey(token.clone(), trusted_issuer_pubkey);
     list_tools_for_rcx_router(&router, now_unix_seconds)
 }
 
@@ -2705,7 +2844,11 @@ fn rcx_capability_for_tool(tool_name: &str) -> String {
 /// function provides a standalone JSON document describing each tool's response
 /// shape. Included in the `get_bootstrap` response for agent discoverability.
 pub fn tool_output_docs() -> Value {
-    json!([
+    // Split across two `json!` arrays and concatenated: one literal this long
+    // exceeds serde_json's macro recursion limit. The split point carries no
+    // meaning — append new rows to `context_graph_output_docs` and it stays
+    // under the limit for the next few additions too.
+    let mut rows = match json!([
         { "tool": "cuecrux_session",    "output": "SessionPlan (see agents.cuecrux.com/schemas/SessionPlan.v1). Contains plan_id, session_id, passport, channels {bulk?, mcp}, capability_graph[], receipt {hash, signature?, signer_kid?, mode}, budget, minted_at, session_ttl_s." },
         { "tool": "autonomy_contract",  "output": "{ feature_enabled, passport_id, tier, token_id, token_hash, capabilities: [{name, allowed, scope, backend_id, mode, cost_credits, why_denied?}], summary: {total_tools, returned, allowed, denied, truncated_by_token_budget} }. Disabled when CORECRUXD_FEATURE_AUTONOMY_CONTRACT is off (feature_enabled=false, empty capabilities)." },
         { "tool": "reuse_check",        "output": "{ schema, verdict: 'reuse-candidate-found'|'nothing-found', retrieval_candidates: [{result_id, rank, score, doc_length_tokens}], capability_candidates: [{id, name, system, maturity, files, overlap_terms}], guidance }. CAPABILITY_DENIED when CORECRUXD_FEATURE_REUSE_CHECK is off (default)." },
@@ -2757,7 +2900,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "resolve_principal",  "output": "{ content: [...], principal: { passport_id, category, tier, tier_rank: int, capabilities: [string], tenant_id, agent_work_gate: bool, resolved_via: 'session'|'passport'|'identity_link:<id>', federation_grant?: { capability, scope, allowed_capabilities } }, resolved_param: 'session_id'|'passport_id' } — loopback to GET /v1/principal/resolve; tenant-scoped server-side. agent→passport resolution parity for the MCP surface." },
         { "tool": "create_handoff",     "output": "{ package_json, content_hash, signature, relevant_fact_count }" },
         { "tool": "accept_handoff",     "output": "{ session_loaded, facts_loaded, verified: bool, task_record? }" },
-        { "tool": "record_decision",    "output": "{ decision_id, decision_hash, entity, action }" },
+        { "tool": "record_decision",    "output": "{ content: [...], structuredContent: { decision_id, content_hash: 'blake3:<hex>', integrity: 'untrusted_annotation', entity } } — mutable compatibility annotation; never authorization evidence." },
         { "tool": "declare_constraint", "output": "{ constraint_id, constraint_hash, constraint_type, assertion }" },
         { "tool": "get_constraints",    "output": "{ constraints: [{constraint_id, constraint_type, assertion, severity, status, created_at}], count }" },
         { "tool": "check_constraints",  "output": "{ verdict: pass|warn|block, matched_constraints: [{constraint_id, assertion, severity, match_score}] }" },
@@ -2778,6 +2921,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "update_status",      "output": "{ enabled, state, basis(binary|checkout), tracking_ref, current_commit, binary_commit, latest_commit, ahead_by, behind_by, checkout_commit, checkout_ahead_by, checkout_behind_by, checked_at, error, comparison_stale, upgrade_hint, upgrade_playbook_query, backup_playbook_query }" },
         { "tool": "list_projects",      "output": "{ projects: [{ id, name, planning_target?, default_passport_id, created_at_unix_ms }] }" },
         { "tool": "get_project_context","output": "{ id, name, planning_target?, default_passport_id, members: [{ passport_id, role }], tenants: [{ tenant_id, default_passport_id? }] }" },
+        { "tool": "execplan_write",     "output": "{ execplan: { action: created|updated, slug, rel_path, commit_sha, content_hash, pushed } }. 400 on an invalid slug/skeleton; 409 with current_content_hash on a lost update." },
         { "tool": "list_work",          "output": "{ count, work: [{ id, project_id, state, title, body, assignee_passport?, tenant_id?, linked_pr?, linked_issue?, blocker_reason?, created_by_passport, created_at_unix_ms, updated_at_unix_ms }] }" },
         { "tool": "create_work",        "output": "WorkItem record (same shape as list_work entries, includes the freshly minted id)." },
         { "tool": "update_work_state",  "output": "{ applied: bool, work?: WorkItem, queued?: { action_id, work_id, requested_by_passport, target_state, status: 'pending', requested_at_unix_ms } }" },
@@ -2824,7 +2968,36 @@ pub fn tool_output_docs() -> Value {
         { "tool": "force_release",            "output": "Force-released punchcard record (status=force_released, force_released_by, receipt_release). Requires confirm=true (Art.14)." },
         { "tool": "check_punchcard",          "output": "Lease probe { held_by_other, enforce, holder_passport, resource, mode, expires_at_unix_ms }. Always 200 (fail-open); the PreToolUse hook denies only when held_by_other && enforce." },
         { "tool": "register_repo",            "output": "Proxied POST /v1/repos: the registration { repo_id, tenant_id, root_path?, clone_url?, languages: [string], enabled, added_at_unix_ms, last_scan_id? }. Registering a local root_path runs a one-shot scan and sets last_scan_id; clone_url registration defers the scan." },
-        { "tool": "list_repos",               "output": "Proxied GET /v1/repos?tenant_id=…: { repos: [{ repo_id, tenant_id, root_path?, clone_url?, languages, enabled, last_scan_id? }] } scoped to the caller's tenant." }
+        { "tool": "list_repos",               "output": "Proxied GET /v1/repos?tenant_id=…: { repos: [{ repo_id, tenant_id, root_path?, clone_url?, languages, enabled, last_scan_id? }] } scoped to the caller's tenant." },
+        { "tool": "code_path",                "output": "Proxied GET /v1/code-intel/path: { entry_point, matched_traces, steps: [{ depth, name, symbol_id?, file?, line?, calls, total_ns, join, had_error }], truncated, omitted_steps, window }. Steps are the observed execution order; `window` states the observation period the answer is true for." },
+        { "tool": "code_blast_radius",        "output": "Proxied GET /v1/code-intel/blast-radius: { symbol, static_dependents, runtime_callers, dependents: [{ name, file?, evidence: 'static'|'runtime'|'both' }], truncated, omitted, window }. `evidence: 'both'` is the strongest signal; 'runtime' alone catches callers grep cannot see." },
+        { "tool": "code_liveness",            "output": "Proxied GET /v1/code-intel/liveness: { symbol, executed, executions, total_ns, exists_statically, flagged_dead_static, verdict, window }. `executed: false` means 'not seen in this window', never 'dead' — read `window` before concluding anything." },
+        { "tool": "code_trace_diff",          "output": "Proxied GET /v1/code-intel/trace-diff: { trace_a, trace_b, first_divergence?, only_in_a: [string], only_in_b: [string], slower_in_b: [string], truncated }. `slower_in_b` lists steps in both traces where b took >2x and >1ms longer." },
+        { "tool": "code_dead_code",           "output": "Proxied GET /v1/code-intel/dead-code (pass `symbol` to scope it to one): { verdicts: [{ symbol, file?, line?, verdict, evidence: [{ tier, says, detail }], agreeing_tiers, single_signal, actionable, finding_id }], counts, extractor_false_positives: [string], window, truncated, omitted, budget_exceeded }. Act only on `actionable: true`; `single_signal: true` needs a human. `budget_exceeded` means one verdict alone did not fit the budget — the answer is honest about overshooting rather than returning nothing." }
+    ]) {
+        Value::Array(v) => v,
+        other => return other,
+    };
+    if let Value::Array(extra) = context_graph_output_docs() {
+        rows.extend(extra);
+    }
+    Value::Array(rows)
+}
+
+/// Output shapes for the context-graph tools (storybook + dossiers).
+///
+/// Split out of [`tool_output_docs`] purely to keep each `json!` literal under
+/// the macro recursion limit; the contents belong to the same document.
+fn context_graph_output_docs() -> Value {
+    json!([
+        { "tool": "get_project_storybook",      "output": "StorybookDocument + selection report: { project_id, generated_at_unix_ms, generated_by_passport, markdown, sections: {section_id: md}, stats: { plane_count, planes_with_vision, planes_with_mapped_modules, orphan_planes[], workspace_loc, stub_count, dead_code_count, bytes }, truncated, sections_omitted[], available_versions[] }. `markdown` is rebuilt from the surviving sections when `section` or `token_budget` trimmed anything." },
+        { "tool": "generate_project_storybook", "output": "{ project_id, generated_at_unix_ms, generated_by_passport, stats, bytes, section_count } — a summary, not the document. Read it back with get_project_storybook." },
+        { "tool": "diff_project_storybook",     "output": "{ from_ts, to_ts, added_sections[], removed_sections[], changed_sections[], bytes_delta }" },
+        { "tool": "get_project_dossiers",       "output": "Without dossier_id: { project_id, count, returned, truncated, dossiers_omitted, dossiers: [{ dossier_id, generated_at_unix_ms, agent_passport }] } (newest first; `count` is the total, `returned` what fit). With dossier_id: the Dossier { dossier_id, project_id, agent_passport, generated_at_unix_ms, based_on: { storybook_ts?, workspace_scan_id?, plane_count, graph_node_count }, claims: [{ claim_id, kind, subject, object?, confidence, evidence[], rationale? }], uncertainties[], contradictions[], open_questions[], stats } plus { truncated, claims_omitted }. stats always describes the STORED dossier, not the trimmed one." },
+        { "tool": "generate_project_dossier",   "output": "The freshly generated Dossier (same shape as get_project_dossiers with a dossier_id), already persisted." },
+        { "tool": "publish_project_dossier",    "output": "{ stored: true, dossier_id, agent, claim_count }" },
+        { "tool": "reconcile_project_dossiers", "output": "{ project_id, generated_at_unix_ms, dossier_count, agents[], agreement: [{ kind, subject, object?, agreed_by_agents[], max_confidence, avg_confidence }], disagreement: [{ kind, subject, variants: [{ object?, agents[], max_confidence }] }], unique: [{ kind, subject, object?, by_agent, confidence }], stats, truncated, disagreements_omitted, agreements_omitted, unique_omitted } — a budget is spent on disagreement first." },
+        { "tool": "diff_project_dossiers",      "output": "{ added_claims[], removed_claims[], confidence_changes: [{ claim_id, from, to }], stats_delta }" },
     ])
 }
 
@@ -2937,6 +3110,7 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         // Coordination — projects + work kanban (Plan A M5).
         "list_projects" => coordination::handle_list_projects(args, ctx).await,
         "get_project_context" => coordination::handle_get_project_context(args, ctx).await,
+        "execplan_write" => coordination::handle_execplan_write(args, ctx).await,
         "list_work" => coordination::handle_list_work(args, ctx).await,
         "create_work" => coordination::handle_create_work(args, ctx).await,
         "update_work_state" => coordination::handle_update_work_state(args, ctx).await,
@@ -2963,10 +3137,24 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "github_open_prs" => github::handle_github_open_prs(args, ctx).await,
         "github_open_issues" => github::handle_github_open_issues(args, ctx).await,
         "github_comments_since" => github::handle_github_comments_since(args, ctx).await,
+        // Context graph — storybook + dossiers (HTTP loopback to corecruxd).
+        "get_project_storybook" => context_graph::handle_get_project_storybook(args, ctx).await,
+        "generate_project_storybook" => context_graph::handle_generate_project_storybook(args, ctx).await,
+        "diff_project_storybook" => context_graph::handle_diff_project_storybook(args, ctx).await,
+        "get_project_dossiers" => context_graph::handle_get_project_dossiers(args, ctx).await,
+        "generate_project_dossier" => context_graph::handle_generate_project_dossier(args, ctx).await,
+        "publish_project_dossier" => context_graph::handle_publish_project_dossier(args, ctx).await,
+        "reconcile_project_dossiers" => context_graph::handle_reconcile_project_dossiers(args, ctx).await,
+        "diff_project_dossiers" => context_graph::handle_diff_project_dossiers(args, ctx).await,
         // Workspace storyline (HTTP loopback to corecruxd).
         "get_workspace_storyline" => storyline::handle_get_workspace_storyline(args, ctx).await,
         "register_repo" => repos::handle_register_repo(args, ctx).await,
         "list_repos" => repos::handle_list_repos(args, ctx).await,
+        "code_path" => code_intel::handle_code_path(args, ctx).await,
+        "code_blast_radius" => code_intel::handle_code_blast_radius(args, ctx).await,
+        "code_liveness" => code_intel::handle_code_liveness(args, ctx).await,
+        "code_trace_diff" => code_intel::handle_code_trace_diff(args, ctx).await,
+        "code_dead_code" => code_intel::handle_code_dead_code(args, ctx).await,
         // Substrate (M1).
         "entity_upsert" => entities::handle_entity_upsert(args, ctx).await,
         "entity_get" => entities::handle_entity_get(args, ctx).await,
@@ -3078,13 +3266,14 @@ mod tests {
     use crate::dispatch::McpContext;
     use crate::tools::test_support::{clear_sync_env, sync_env_lock};
     use crux_router::{mint_free_local_token, RcxRouter};
+    use crux_session::intent::default_intent_table;
     use ed25519_dalek::{Signer, SigningKey};
     use rcx_capability_token::{
         Backend, CreditCost, CreditCostUnit, CreditRefill, Credits, FallbackAction, FallbackPolicy, OverdraftPolicy,
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 118; // +1 engram_resolve +1 reuse_check (minimalism plane M2/M3). +2 register_repo + list_repos (repo-watch M3). +1 status_feed (open-engine-coordination-surfaces M3). +1 context_custody_audit (race-to-context positioning). +1 revoke_passport (passport-revocation M2). main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4) + 1 session-mining (learn, token-efficiency M4) + 1 holdout (token_savings, token-efficiency cutover CO-4).
+    const TOOL_COUNT: usize = 132; // +1 execplan_write (source-of-truth plane M2: the one legal plan write path). +5 code_intel (code_path/blast_radius/liveness/trace_diff/dead_code, crux-codemap-agent-surface M1). +8 context_graph (3 storybook + 5 dossier, crux-storybook-dossier-agent-and-console-surface M2). // +1 engram_resolve +1 reuse_check (minimalism plane M2/M3). +2 register_repo + list_repos (repo-watch M3). +1 status_feed (open-engine-coordination-surfaces M3). +1 context_custody_audit (race-to-context positioning). +1 revoke_passport (passport-revocation M2). main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4) + 1 session-mining (learn, token-efficiency M4) + 1 holdout (token_savings, token-efficiency cutover CO-4).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
@@ -3167,6 +3356,98 @@ mod tests {
                 tool.input_schema.get("properties").is_some(),
                 "tool '{}' schema must have properties",
                 tool.name
+            );
+        }
+    }
+
+    /// Every catalogued tool should carry an EXPLICIT `TOOL_SURFACE` tier.
+    ///
+    /// **Correction (2026-07-28).** This test shipped with a doc comment saying
+    /// an absent entry causes the RCX router to refuse the tool. That is wrong.
+    /// `tool_tier` returns `ToolTier::Local` for any name it does not find
+    /// (`vaultcrux-local/src/tool_surface.rs`), so the table is a
+    /// **default-allow model with a three-item deny-list** — `issue_passport`,
+    /// `sync_pull`, `sync_push`. An untiered tool is permitted, not denied.
+    /// Verified live: `list_work` has no entry and answers normally through a
+    /// real capability token, while `issue_passport` is correctly refused.
+    ///
+    /// The `denied:capability_not_permitted` that prompted the original claim
+    /// had a duller cause — the deployed binary predated the tools being called,
+    /// so `list_tools()` never emitted them and their capability was never
+    /// minted. Absent from the catalogue, not absent from this table.
+    ///
+    /// The guard is still worth keeping, for a different and smaller reason:
+    /// because the default is Local, a future **hosted** tool ships free unless
+    /// someone remembers to gate it. Defaulting an entitlement is a commercial
+    /// decision made by omission. Requiring an explicit entry makes each new
+    /// tool state its tier once, deliberately.
+    ///
+    /// `KNOWN_UNTIERED` is therefore a **backlog of undeclared tiers, not a
+    /// defect list**: every tool on it works today. It exists so new additions
+    /// fail this test rather than inheriting a default silently.
+    #[test]
+    fn every_catalogued_tool_carries_a_tier() {
+        // Emptied 2026-07-28: all 85 were classified and tiered Local in
+        // vaultcrux-local/src/tool_surface.rs. The constant and both assertions
+        // stay — the staleness check below is what keeps it empty, and the
+        // primary check is what stops the next tool being added without a tier.
+        const KNOWN_UNTIERED: &[&str] = &[];
+
+        let tiered: std::collections::HashSet<&str> = vaultcrux_local::tool_surface::TOOL_SURFACE
+            .iter()
+            .map(|e| e.name)
+            .collect();
+        let known: std::collections::HashSet<&str> = KNOWN_UNTIERED.iter().copied().collect();
+
+        let mut newly_untiered: Vec<String> = list_tools()
+            .into_iter()
+            .map(|t| t.name)
+            .filter(|n| !tiered.contains(n.as_str()) && !known.contains(n.as_str()))
+            .collect();
+        newly_untiered.sort();
+        assert!(
+            newly_untiered.is_empty(),
+            "these tools have no TOOL_SURFACE tier, so the RCX router will refuse every call \
+             to them (denied:capability_not_permitted). Add a ToolSurfaceEntry in \
+             vaultcrux-local/src/tool_surface.rs: {newly_untiered:?}"
+        );
+
+        // The defect list must not rot: a name that has since been tiered, or
+        // removed from the catalogue, has to come off it.
+        let catalogue: std::collections::HashSet<String> = list_tools().into_iter().map(|t| t.name).collect();
+        let mut stale: Vec<&str> = KNOWN_UNTIERED
+            .iter()
+            .copied()
+            .filter(|n| tiered.contains(n) || !catalogue.contains(*n))
+            .collect();
+        stale.sort_unstable();
+        assert!(
+            stale.is_empty(),
+            "KNOWN_UNTIERED lists tools that are now tiered or no longer exist — remove them: {stale:?}"
+        );
+    }
+
+    /// The context-graph family specifically, by name, because it is the family
+    /// this guard was written for.
+    #[test]
+    fn context_graph_tools_are_local_tier() {
+        for name in [
+            "get_project_storybook",
+            "generate_project_storybook",
+            "diff_project_storybook",
+            "get_project_dossiers",
+            "generate_project_dossier",
+            "publish_project_dossier",
+            "reconcile_project_dossiers",
+            "diff_project_dossiers",
+        ] {
+            assert!(
+                vaultcrux_local::tool_surface::is_local_tool(name),
+                "{name} must be local tier or the RCX router denies it"
+            );
+            assert!(
+                rcx_local_capabilities().contains(&format!("crux-mcp.{name}")),
+                "{name} must contribute a permitted local capability"
             );
         }
     }
@@ -3272,6 +3553,30 @@ mod tests {
     }
 
     #[test]
+    fn record_decision_catalogue_contract_is_explicitly_untrusted() {
+        let tools = list_tools();
+        let description = &tools
+            .iter()
+            .find(|tool| tool.name == "record_decision")
+            .expect("record_decision tool")
+            .description;
+        assert!(description.contains("untrusted"));
+        assert!(description.contains("content identifier only"));
+        assert!(!description.contains("append-only"));
+
+        let docs = tool_output_docs();
+        let output = docs
+            .as_array()
+            .expect("tool docs array")
+            .iter()
+            .find(|entry| entry["tool"] == "record_decision")
+            .and_then(|entry| entry["output"].as_str())
+            .expect("record_decision output contract");
+        assert!(output.contains("untrusted_annotation"));
+        assert!(output.contains("never authorization"));
+    }
+
+    #[test]
     fn legacy_tools_carry_cuecrux_session_hint_but_session_tool_does_not() {
         // M10 gate: every legacy tool's description points at
         // cuecrux_session; the collapsed entry tool does NOT hint at
@@ -3315,12 +3620,12 @@ mod tests {
         let tools = list_tools();
         let by_name = |n: &str| tools.iter().find(|t| t.name == n).unwrap();
 
-        assert!(by_name("query").description.starts_with("[local]"));
-        assert!(by_name("enrich_action").description.starts_with("[local]"));
-        assert!(by_name("sync_status").description.starts_with("[local]"));
-        assert!(by_name("issue_passport").description.starts_with("[hosted]"));
-        assert!(by_name("sync_pull").description.starts_with("[hosted]"));
-        assert!(by_name("sync_push").description.starts_with("[hosted]"));
+        assert!(by_name("query").description.starts_with("[tier:local]"));
+        assert!(by_name("enrich_action").description.starts_with("[tier:local]"));
+        assert!(by_name("sync_status").description.starts_with("[tier:local]"));
+        assert!(by_name("issue_passport").description.starts_with("[tier:hosted]"));
+        assert!(by_name("sync_pull").description.starts_with("[tier:hosted]"));
+        assert!(by_name("sync_push").description.starts_with("[tier:hosted]"));
     }
 
     #[test]
@@ -3331,9 +3636,9 @@ mod tests {
         let tools = list_tools_local_surface(true);
         let by_name = |n: &str| tools.iter().find(|t| t.name == n).unwrap();
 
-        assert!(by_name("issue_passport").description.starts_with("[local]"));
-        assert!(by_name("sync_pull").description.starts_with("[hosted]"));
-        assert!(by_name("sync_push").description.starts_with("[hosted]"));
+        assert!(by_name("issue_passport").description.starts_with("[tier:local]"));
+        assert!(by_name("sync_pull").description.starts_with("[tier:hosted]"));
+        assert!(by_name("sync_push").description.starts_with("[tier:hosted]"));
     }
 
     #[test]
@@ -3347,7 +3652,7 @@ mod tests {
             .iter()
             .find(|tool| tool.name == "request_passport_mint")
             .expect("mint-request tool should be listed while enabled");
-        assert!(tool.description.starts_with("[local]"));
+        assert!(tool.description.starts_with("[tier:local]"));
         assert!(tool.input_schema["properties"].get("requester_id").is_none());
         assert!(tool.input_schema["properties"].get("requested_category").is_some());
         assert!(tool.input_schema["properties"].get("reason").is_some());
@@ -3355,7 +3660,8 @@ mod tests {
 
     #[tokio::test]
     async fn passport_mint_request_survives_rcx_context_filtering_when_enabled() {
-        let token = mint_free_local_token(
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let mut token = mint_free_local_token(
             "p_0123456789abcdef0123456789abcdef",
             "daemon_01HV0000000000000000000000",
             "default",
@@ -3364,8 +3670,12 @@ mod tests {
             1_780_143_200,
             [0x11; RCX_CT_SIGNATURE_LEN],
         );
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
         let ctx = McpContext::new_default("test-node")
-            .with_rcx_router(RcxRouter::new(token))
+            .with_rcx_router(RcxRouter::new_with_trusted_issuer_pubkey(
+                token,
+                signing.verifying_key().to_bytes(),
+            ))
             .with_passport_mint_requests(true);
 
         let listed = list_tools_json_for_context_with_mode(&ctx, 1_776_989_601, surface::ToolSurfaceMode::Full).await;
@@ -3525,8 +3835,9 @@ mod tests {
     }
 
     #[test]
-    fn list_tools_for_rcx_token_filters_unpermitted_tools() {
-        let token = mint_free_local_token(
+    fn list_tools_for_verified_rcx_token_filters_unpermitted_tools() {
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let mut token = mint_free_local_token(
             "p_0123456789abcdef0123456789abcdef",
             "daemon_01HV0000000000000000000000",
             "default",
@@ -3535,21 +3846,41 @@ mod tests {
             1_780_143_200,
             [0x11; RCX_CT_SIGNATURE_LEN],
         );
-        let names: Vec<String> = list_tools_for_rcx_token(&token, 1_776_989_601)
-            .into_iter()
-            .map(|tool| tool.name)
-            .collect();
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+        let names: Vec<String> =
+            list_tools_for_verified_rcx_token(&token, signing.verifying_key().to_bytes(), 1_776_989_601)
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect();
 
         assert!(names.contains(&"query".to_string()));
         assert!(names.contains(&"query_scan".to_string()));
         assert!(names.contains(&"query_expand".to_string()));
         assert!(names.contains(&"store_fact".to_string()));
         assert!(!names.contains(&"sync_pull".to_string()));
+
+        let mut contextual = token;
+        contextual.spec_version = rcx_capability_token::RCX_CT_DELEGATION_SPEC_VERSION.to_string();
+        contextual.delegation_policy = Some(rcx_capability_token::DelegationPolicy {
+            presentation: rcx_capability_token::DelegationPresentation::ProofOfPossession,
+            max_depth: 1,
+            audience: rcx_capability_token::DelegationAudience::CruxSync,
+            allowed_delegate_fprs: vec!["p_0123456789abcdef0123456789abcdef".to_string()],
+        });
+        contextual.signature.sig = signing.sign(&contextual.token_hash()).to_bytes();
+        let mut stripped = contextual;
+        stripped.spec_version = rcx_capability_token::RCX_CT_SPEC_VERSION.to_string();
+        stripped.delegation_policy = None;
+        stripped.delegation_envelope = None;
+        assert!(
+            list_tools_for_verified_rcx_token(&stripped, signing.verifying_key().to_bytes(), 1_776_989_601,).is_empty()
+        );
     }
 
     #[test]
     fn list_tools_json_for_rcx_router_includes_token_metadata() {
-        let token = mint_free_local_token(
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let mut token = mint_free_local_token(
             "p_0123456789abcdef0123456789abcdef",
             "daemon_01HV0000000000000000000000",
             "default",
@@ -3558,9 +3889,10 @@ mod tests {
             1_780_143_200,
             [0x11; RCX_CT_SIGNATURE_LEN],
         );
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
         let token_id = token.token_id.clone();
         let token_hash = token.token_hash_hex();
-        let router = RcxRouter::new(token);
+        let router = RcxRouter::new_with_trusted_issuer_pubkey(token, signing.verifying_key().to_bytes());
 
         let listed = list_tools_json_for_rcx_router(&router, 1_776_989_601);
         assert_eq!(listed["_meta"]["crux"]["token_ref"]["token_id"], token_id);
@@ -3830,5 +4162,51 @@ mod tests {
         let result = call_tool("update_status", &json!({}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"state\": \"disabled\""));
+    }
+
+    /// The substrate edge tools are callable but **not advertised**, and an
+    /// affinity alone does not change that.
+    ///
+    /// `edge_delete`/`edge_list` were given a `"memory"` affinity in b98ebec8
+    /// after a Feature Registry session read `tools/list`, saw no `edge_delete`
+    /// and recorded a stale dependency edge as permanently unretractable. The
+    /// affinity is necessary but not sufficient: every intent that weights
+    /// `"memory"` scores all ~27 non-floor memory tools identically, the tie
+    /// breaks on catalogue order, and the substrate family sits last — so the
+    /// twelve `DYNAMIC_TOP_N` slots are exhausted by `delete_fact` through
+    /// `memory_set_horizon` before the edge tools are reached.
+    ///
+    /// Pinned as a test because the gap is invisible by construction: nothing
+    /// else fails when a tool is merely undiscoverable. Callers must therefore
+    /// invoke these by name, which is what the out-of-repo Feature Registry
+    /// capability-graph reconciler does, and documents.
+    ///
+    /// Closing the gap means changing the ranking in
+    /// [`surface`] — a distinct affinity for the substrate family plus an intent
+    /// that weights it, or a `CORE_FLOOR` entry. When that lands this test fails
+    /// on the second assertion; update it, and update the reconciler's note.
+    #[test]
+    fn substrate_edge_tools_are_callable_but_never_advertised_when_shaped() {
+        let full: Vec<String> = list_tools().into_iter().map(|t| t.name).collect();
+        for name in ["edge_list", "edge_delete"] {
+            assert!(
+                full.iter().any(|n| n == name),
+                "`{name}` left the full surface — the loader calls it by name and would break"
+            );
+        }
+
+        // Every intent in the shaping table, not just the memory-weighted ones:
+        // absence must not depend on which intent an agent happens to declare.
+        for intent in default_intent_table().keys() {
+            let shaped = surface::shape_dynamic(list_tools(), Some(intent), surface::DYNAMIC_TOP_N);
+            let names: Vec<&str> = shaped.iter().map(|t| t.name.as_str()).collect();
+            for name in ["edge_list", "edge_delete"] {
+                assert!(
+                    !names.contains(&name),
+                    "`{name}` now surfaces under intent `{intent}` — the discovery gap is closed. \
+                     Update this test and drop the by-name-only note in the Feature Registry loader."
+                );
+            }
+        }
     }
 }

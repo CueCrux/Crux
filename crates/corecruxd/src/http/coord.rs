@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! HTTP surface for the multi-agent coordination plane ([`crate::coord`]).
 //!
@@ -17,8 +17,7 @@
 use serde_json::Value;
 
 use super::{
-    problem_response, require_http_any_scope, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Query,
-    State, StatusCode,
+    problem_response, require_http_any_scope, AppState, HeaderMap, IntoResponse, Json, Query, State, StatusCode,
 };
 use crate::agentgraph_kinds::PUNCHCARD_KIND;
 use crate::coord::{CoordIntent, LeaseSummary};
@@ -26,6 +25,7 @@ use crate::coord::{CoordIntent, LeaseSummary};
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct ActiveQuery {
     pub project_id: Option<String>,
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -45,6 +45,13 @@ pub(super) struct AnnounceBody {
     /// `deploy_target` warning. Advisory only.
     #[serde(default)]
     pub deploy_target: Option<String>,
+    /// Absolute path of the git worktree this session is working in. Optional.
+    /// Recorded so a worktree can be tied to the plan that created it — a
+    /// worktree whose plan has closed is an orphan, and without this the only
+    /// way to find one is to walk every repo and test each branch against
+    /// `origin/main`.
+    #[serde(default)]
+    pub worktree: Option<String>,
     #[serde(default)]
     pub paths: Vec<String>,
     #[serde(default)]
@@ -112,6 +119,7 @@ async fn live_lease_summaries(state: &AppState, now_ms: i64) -> Vec<LeaseSummary
 
 /// `GET /v1/coord/active?project_id=` — merged "who is live, what are they
 /// doing" view.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_coord_active(
     State(state): State<AppState>,
     Query(q): Query<ActiveQuery>,
@@ -120,19 +128,36 @@ pub(super) async fn get_coord_active(
     if !state.coord_enabled {
         return coord_disabled_response();
     }
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-        return problem.into_response();
+    let context = match crate::auth::passport_bound_context(&state.auth, &headers) {
+        Ok(context) => context,
+        Err(problem) => return problem.into_response(),
+    };
+    if !context.has_scope("admin:read") {
+        return problem_response(
+            StatusCode::FORBIDDEN,
+            "admin:read scope required for coordination status",
+        );
     }
+    let tenant_id = match context.resolve_authorized_tenant(q.tenant_id.as_deref()) {
+        Ok(tenant_id) => tenant_id,
+        Err(problem) => return problem.into_response(),
+    };
     let now = now_unix_ms();
     let store = state.fact_store.read().await;
     let bindings = crate::session_bindings::list_bindings(&store);
     let intents = crate::coord::list_intents(&store, q.project_id.as_deref());
-    let mut work_in_flight = crate::work::list_work(&store, q.project_id.as_deref(), Some("in_progress"), None, None);
+    let mut work_in_flight = crate::work::list_work(
+        &store,
+        q.project_id.as_deref(),
+        Some("in_progress"),
+        Some(&tenant_id),
+        None,
+    );
     work_in_flight.extend(crate::work::list_work(
         &store,
         q.project_id.as_deref(),
         Some("blocked"),
-        None,
+        Some(&tenant_id),
         None,
     ));
     drop(store);
@@ -162,6 +187,7 @@ pub(super) async fn get_coord_active(
 
 /// `POST /v1/coord/announce` — declare this session's focus. Re-announcing
 /// replaces; `ttl_seconds: 0` clears.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_coord_announce(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -211,6 +237,7 @@ pub(super) async fn post_coord_announce(
         execplan_slug: body.execplan_slug.filter(|s| !s.trim().is_empty()),
         milestone: body.milestone.filter(|s| !s.trim().is_empty()),
         deploy_target: body.deploy_target.filter(|s| !s.trim().is_empty()),
+        worktree: body.worktree.filter(|s| !s.trim().is_empty()),
         paths: body.paths,
         note: body.note.filter(|s| !s.trim().is_empty()),
         announced_at_unix_ms: now,
@@ -235,7 +262,15 @@ pub(super) async fn post_coord_announce(
         .touch(&intent.passport_id, "POST", "/v1/coord/announce")
         .await;
     let leases = live_lease_summaries(&state, now as i64).await;
-    let overlaps = crate::coord::find_overlaps(&intent, &peer_intents, &leases, now);
+    let mut overlaps = crate::coord::find_overlaps(&intent, &peer_intents, &leases, now);
+    // Fourth signal: two OPEN plans naming the same file. Unlike the other
+    // three it needs neither an announcement nor a lease, so it is the only one
+    // that sees a peer who has not announced and has not edited yet. Weakest
+    // and last, and each warning says so via its `signal`.
+    overlaps.extend(crate::coord::find_plan_path_overlaps(
+        &intent,
+        &open_plan_path_claims(&state).await,
+    ));
     let peers = peer_intents
         .iter()
         .filter(|p| p.session_id_hex != intent.session_id_hex && p.is_live(now))
@@ -276,6 +311,7 @@ mod tests {
             execplan_slug: Some("plan-x".to_string()),
             milestone: Some("M2".to_string()),
             deploy_target: None,
+            worktree: None,
             paths: vec!["crates/corecruxd/src/coord.rs".to_string()],
             note: None,
             ttl_seconds: None,
@@ -312,7 +348,10 @@ mod tests {
         state.coord_enabled = false;
         let resp = get_coord_active(
             StateExtract(state.clone()),
-            QueryExtract(ActiveQuery { project_id: None }),
+            QueryExtract(ActiveQuery {
+                project_id: None,
+                tenant_id: None,
+            }),
             HeaderMap::new(),
         )
         .await
@@ -326,6 +365,82 @@ mod tests {
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A worktree announced on the intent must survive the fact round-trip and
+    /// reappear on `/v1/coord/active` — that read is the only way another
+    /// session (or the reaper) can learn which checkout belongs to which plan.
+    #[tokio::test]
+    async fn announce_carries_worktree_through_to_active() {
+        let state = test_app_state(1);
+        seed_live_session(&state, "aaaa", "proj").await;
+
+        let mut body = announce_body("aaaa", "proj");
+        body.worktree = Some("/w/Crux-worktrees/coord-board-honesty".to_string());
+        let resp = post_coord_announce(StateExtract(state.clone()), HeaderMap::new(), JsonExtract(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let announced = body_json(resp).await;
+        assert_eq!(
+            announced["intent"]["worktree"], "/w/Crux-worktrees/coord-board-honesty",
+            "announce response must echo the worktree"
+        );
+
+        let active = get_coord_active(
+            StateExtract(state.clone()),
+            Query(ActiveQuery {
+                project_id: Some("proj".to_string()),
+                tenant_id: None,
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        let view = body_json(active).await;
+        assert_eq!(
+            view["active_sessions"][0]["intent"]["worktree"], "/w/Crux-worktrees/coord-board-honesty",
+            "worktree must survive the fact round-trip onto the active board: {view}"
+        );
+    }
+
+    /// Omitting it must leave the wire shape exactly as it was — the field is
+    /// `skip_serializing_if`, so an intent that declares no worktree carries no
+    /// `worktree` key at all, not a null.
+    #[tokio::test]
+    async fn announce_without_worktree_is_wire_identical() {
+        let state = test_app_state(1);
+        seed_live_session(&state, "aaaa", "proj").await;
+        let resp = post_coord_announce(
+            StateExtract(state.clone()),
+            HeaderMap::new(),
+            JsonExtract(announce_body("aaaa", "proj")),
+        )
+        .await
+        .into_response();
+        let announced = body_json(resp).await;
+        assert!(
+            announced["intent"].get("worktree").is_none(),
+            "an intent with no worktree must omit the key, not emit null: {announced}"
+        );
+    }
+
+    /// Whitespace is filtered to `None` like `deploy_target`, so a client that
+    /// sends `""` does not pin an empty string onto the board.
+    #[tokio::test]
+    async fn announce_blank_worktree_is_treated_as_absent() {
+        let state = test_app_state(1);
+        seed_live_session(&state, "aaaa", "proj").await;
+        let mut body = announce_body("aaaa", "proj");
+        body.worktree = Some("   ".to_string());
+        let resp = post_coord_announce(StateExtract(state.clone()), HeaderMap::new(), JsonExtract(body))
+            .await
+            .into_response();
+        let announced = body_json(resp).await;
+        assert!(
+            announced["intent"].get("worktree").is_none(),
+            "blank worktree must be dropped: {announced}"
+        );
     }
 
     #[tokio::test]
@@ -377,6 +492,7 @@ mod tests {
             StateExtract(state.clone()),
             QueryExtract(ActiveQuery {
                 project_id: Some("proj".to_string()),
+                tenant_id: None,
             }),
             HeaderMap::new(),
         )
@@ -398,6 +514,7 @@ mod tests {
             StateExtract(state),
             QueryExtract(ActiveQuery {
                 project_id: Some("other".to_string()),
+                tenant_id: None,
             }),
             HeaderMap::new(),
         )
@@ -424,6 +541,7 @@ mod tests {
             StateExtract(state),
             QueryExtract(ActiveQuery {
                 project_id: Some("proj".to_string()),
+                tenant_id: None,
             }),
             HeaderMap::new(),
         )
@@ -471,6 +589,7 @@ mod tests {
             StateExtract(state),
             QueryExtract(ActiveQuery {
                 project_id: Some("proj".to_string()),
+                tenant_id: None,
             }),
             HeaderMap::new(),
         )
@@ -552,4 +671,71 @@ mod tests {
             .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
+}
+
+/// Repo-relative paths declared by each OPEN ExecPlan, for the plan-paths
+/// collision signal.
+///
+/// Reads the plans the projection already walked — no extra scan — and pulls
+/// the paths out of each plan's own text. Deliberately cheap and approximate:
+/// this signal exists to say "two plans name the same file", and a missed path
+/// costs a warning nobody needed rather than a wrong one.
+async fn open_plan_path_claims(state: &AppState) -> Vec<crate::coord::PlanPathClaim> {
+    let Some(root) = crate::work_execplans::execplans_root_from_env() else {
+        return Vec::new();
+    };
+    let files = match crate::work_execplans::walk_execplans_root(&root) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let store = state.fact_store.read().await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let items = crate::work_execplans::list_execplans(&store, &root, now).unwrap_or_default();
+    drop(store);
+    let open: std::collections::HashSet<&str> = items
+        .iter()
+        .filter(|i| crate::work_execplans::is_open_state(&i.state))
+        .filter_map(|i| i.id.strip_prefix("execplan:"))
+        .collect();
+
+    files
+        .iter()
+        .filter(|f| open.contains(f.slug.as_str()))
+        .map(|f| crate::coord::PlanPathClaim {
+            execplan_slug: f.slug.clone(),
+            paths: extract_declared_paths(&f.content),
+        })
+        .filter(|c| !c.paths.is_empty())
+        .collect()
+}
+
+/// Pull `<Repo>/path/to/file.ext` mentions out of a plan's markdown.
+///
+/// Vendored and generated trees carry no authorship signal — two plans
+/// "sharing" a `node_modules` file tells you nothing — so they are dropped.
+fn extract_declared_paths(md: &str) -> Vec<String> {
+    const NOISE: &[&str] = &["node_modules/", "target/", "dist/", "build/", ".git/", "vendor/"];
+    let mut out: Vec<String> = Vec::new();
+    for token in md.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '`' | '"' | ',' | ';')) {
+        let t = token.trim_matches(|c: char| matches!(c, '.' | ':' | '*' | '#' | '<' | '>'));
+        if t.len() < 5 || !t.contains('/') || !t.contains('.') {
+            continue;
+        }
+        let ext_ok = [
+            ".rs", ".ts", ".tsx", ".js", ".mjs", ".py", ".vue", ".sh", ".toml", ".sql",
+        ]
+        .iter()
+        .any(|e| t.ends_with(e));
+        if !ext_ok || NOISE.iter().any(|n| t.contains(n)) {
+            continue;
+        }
+        let s = t.to_string();
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out.truncate(64);
+    out
 }

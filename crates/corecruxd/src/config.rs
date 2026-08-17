@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Daemon configuration: parses `CORECRUXD_*` environment variables into a typed `Config` at startup.
 
@@ -417,6 +417,9 @@ pub struct Config {
     pub append_lane_scope: AppendLaneScope,
     pub tail_cache_enabled: bool,
     pub read_retry_failed_readyz_threshold: u64,
+    /// Consecutive local-ingest seal failures before `/readyz` reports the write
+    /// path down. `0` disables the check.
+    pub seal_failed_readyz_threshold: u64,
     pub backpressure_high_watermark_ratio: f64,
     pub backpressure_low_watermark_ratio: f64,
     pub backpressure_retry_after_ms: u32,
@@ -494,9 +497,14 @@ pub struct Config {
     /// Require issuer-signed Ed25519 peer handshakes on sync server routes.
     /// Default OFF (`CORECRUXD_SYNC_MUTUAL_AUTH=1`).
     pub sync_mutual_auth: bool,
-    /// VaultCrux/issuer Ed25519 trust-root public key, parsed from exactly
+    /// CruxEngine/issuer Ed25519 trust-root public key, parsed from exactly
     /// 64 hexadecimal characters in `CORECRUXD_SYNC_PEER_TRUST_ROOT`.
     pub sync_peer_trust_root: Option<Vec<u8>>,
+    /// Accept recipient-bound v1.1 delegation tokens at the sync boundary
+    /// (macaroon M3′). Default OFF (`CORECRUXD_SYNC_DELEGATION_ENFORCE=1`). When
+    /// OFF, a contextual (v1.1) token is rejected fail-closed; v1.0 tokens are
+    /// unaffected either way.
+    pub sync_delegation_enforce: bool,
 
     // Background update checks against a tracked git ref.
     pub update_check_enabled: bool,
@@ -537,6 +545,11 @@ pub struct Config {
     pub context_surface_enabled: bool,
     /// Gated auto-capture surface (`/v1/memory/*`). Default OFF.
     pub auto_capture_enabled: bool,
+
+    /// Tenant corpus erasure (`/v1/admin/forget-tenants`,
+    /// `/v1/admin/tenants/{id}/footprint`). Default OFF
+    /// (`CORECRUXD_TENANT_ERASURE=1`); when off the routes return 404.
+    pub tenant_erasure_enabled: bool,
 
     // Local CPU prose-ingest door (`/v1/local/ingest`,
     // `crate::http::local_ingest`). Seals pre-formatted prose payloads into
@@ -1068,6 +1081,14 @@ pub fn load_config() -> Config {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
+    // Defaults ON. A total write outage that leaves `/readyz` green is exactly
+    // how host `crux` lost 38 hours of ingest without a single alert; a check
+    // that ships disabled would not have caught it either. Consecutive rather
+    // than cumulative, so one malformed document cannot unready the node.
+    let seal_failed_readyz_threshold = std::env::var("CORECRUXD_SEAL_FAILED_READYZ_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
     let mut backpressure_high_watermark_ratio: f64 = std::env::var("CORECRUXD_BACKPRESSURE_HIGH_WATERMARK_RATIO")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
@@ -1222,6 +1243,7 @@ pub fn load_config() -> Config {
         append_lane_scope,
         tail_cache_enabled,
         read_retry_failed_readyz_threshold,
+        seal_failed_readyz_threshold,
         backpressure_high_watermark_ratio,
         backpressure_low_watermark_ratio,
         backpressure_retry_after_ms,
@@ -1334,6 +1356,9 @@ pub fn load_config() -> Config {
         sync_peer_trust_root: env_string("CORECRUXD_SYNC_PEER_TRUST_ROOT")
             .as_deref()
             .and_then(parse_sync_peer_trust_root),
+        sync_delegation_enforce: std::env::var("CORECRUXD_SYNC_DELEGATION_ENFORCE")
+            .ok()
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
         update_check_enabled: std::env::var("CORECRUXD_UPDATE_CHECK_ENABLED")
             .ok()
             .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
@@ -1378,6 +1403,7 @@ pub fn load_config() -> Config {
             .clamp(60, crate::coord::MAX_TTL_SECS),
         context_surface_enabled: env_bool("CORECRUXD_CONTEXT_SURFACE").unwrap_or(false),
         auto_capture_enabled: env_bool("CORECRUXD_AUTO_CAPTURE").unwrap_or(false),
+        tenant_erasure_enabled: env_bool("CORECRUXD_TENANT_ERASURE").unwrap_or(false),
         local_ingest_enabled: env_default_on("CORECRUXD_LOCAL_INGEST"),
         stream_receipts_enabled: env_bool("CORECRUXD_STREAM_RECEIPTS").unwrap_or(false),
         usage_receipts_enabled: env_bool("CORECRUXD_FEATURE_USAGE_RECEIPTS").unwrap_or(false),
@@ -1833,6 +1859,8 @@ mod tests {
         assert_eq!(cfg.append_lane_scope, AppendLaneScope::Global);
         assert!(cfg.tail_cache_enabled);
         assert_eq!(cfg.read_retry_failed_readyz_threshold, 3);
+        // Must default ON: a write path that fails silently is the defect.
+        assert_eq!(cfg.seal_failed_readyz_threshold, 3);
         // backpressure defaults
         assert!((cfg.backpressure_high_watermark_ratio - 0.90).abs() < 0.001);
         assert!((cfg.backpressure_low_watermark_ratio - 0.80).abs() < 0.001);
@@ -2003,6 +2031,34 @@ mod tests {
         clear_corecruxd_env();
         assert!(cfg.auth_mode_explicitly_set);
         assert_eq!(cfg.auth_mode_invalid.as_deref(), Some("prod-typo"));
+    }
+
+    /// D-2 (inverted pin): `env_string` only filters the *empty* string, so a
+    /// whitespace-only `CORECRUXD_AUTH_MODE` reached `AuthMode::parse`, trimmed
+    /// to `""` and resolved to `Off`. `auth_mode_invalid` stayed `None`, so
+    /// `main`'s fail-closed guard did not abort and the daemon served with
+    /// authentication disabled. A blank value must now be flagged invalid.
+    #[test]
+    #[serial_test::serial]
+    fn blank_auth_mode_is_startup_error_not_off() {
+        let _g = env_lock().lock().unwrap();
+        for blank in ["   ", "\t", "\n"] {
+            clear_corecruxd_env();
+            std::env::set_var("CORECRUXD_AUTH_MODE", blank);
+            let cfg = super::load_config();
+            assert!(cfg.auth_mode_explicitly_set, "a blank value is still present");
+            assert_eq!(
+                cfg.auth_mode_invalid.as_deref(),
+                Some(blank),
+                "a blank auth mode must abort startup, not resolve to Off"
+            );
+            assert_ne!(
+                cfg.auth_mode,
+                crate::auth::AuthMode::Off,
+                "the placeholder mode must never be Off for an invalid value"
+            );
+        }
+        clear_corecruxd_env();
     }
 
     #[test]

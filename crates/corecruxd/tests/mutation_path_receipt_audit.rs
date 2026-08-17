@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! P4 / M5+M6 — mutation-path receipt audit guard (ExecPlan
 //! `verifiable-record-products-2026-07-17`, threat T.4 audit-trail gap).
@@ -62,7 +62,7 @@ const PATHS: &[MutationPath] = &[
     },
     MutationPath {
         id: 2,
-        name: "FactStore::try_store_bulk (StoreBatch)",
+        name: "FactStore::try_store_bulk/try_store_bulk_durable (StoreBatch)",
         class: Class::Receipted,
         backing_test: "",
         followup_ref: "",
@@ -148,7 +148,7 @@ const PATHS: &[MutationPath] = &[
     },
     MutationPath {
         id: 13,
-        name: "set_horizon/reverify/record_access (in-memory metadata)",
+        name: "set_horizon[_for_tenant]/reverify[_for_tenant]/record_access (in-memory metadata)",
         class: Class::JustifiedMaintenance,
         backing_test: "",
         followup_ref: "",
@@ -213,7 +213,9 @@ const NON_DURABLE_MUTATORS: &[&str] = &[
     "set_semantic_dedup",
     "take_near_duplicates",
     "set_horizon",
+    "set_horizon_for_tenant",
     "reverify",
+    "reverify_for_tenant",
     "record_access",
 ];
 
@@ -223,6 +225,7 @@ const AUDITED_MUTATORS: &[&str] = &[
     "try_store",
     "store_bulk",
     "try_store_bulk",
+    "try_store_bulk_durable",
     "store_synced",
     "delete",
     "try_delete",

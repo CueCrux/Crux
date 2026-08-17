@@ -24,7 +24,7 @@ passports, portable `.cruxpack` export. No account. No API keys. Nothing leaves 
 [![CI](https://github.com/CueCrux/Crux/actions/workflows/ci.yml/badge.svg)](https://github.com/CueCrux/Crux/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/badge/coverage-CI%20gated-green)](https://github.com/CueCrux/Crux/actions/workflows/coverage-attestation.yml)
 [![MCP](https://img.shields.io/badge/MCP-native-blue)](#100-mcp-tools-memory-first)
-[![Licence: CCL-1.0 (source-available)](https://img.shields.io/badge/licence-CCL--1.0_(source--available)-blue)](LICENCE.md)
+[![Licence: Apache-2.0](https://img.shields.io/badge/licence-Apache--2.0-blue)](LICENSE)
 
 <img src="docs/Images/readme/console-overwatch.png" alt="Crux console Overwatch view: a gate queue of decisions that need you, a live fleet of agent sessions, and a rolling receipted activity ticker" width="88%">
 
@@ -107,7 +107,23 @@ corecruxctl start
 
 `start` is the canonical on-ramp: it detects the daemon, authenticates on the lowest-friction
 secure rail, wires the MCP endpoint + Claude Code hooks, round-trips a first fact, and prints a
-single "you're live" summary. Longer install path: [docs/getting-started.md](docs/getting-started.md) ·
+single "you're live" summary.
+
+**Using Codex or Cursor?** One command each — `--agent` wires that client's own config too:
+
+| Agent | Command | What it writes |
+|---|---|---|
+| Claude Code | `corecruxctl start --agent claude` | `~/.claude/settings.json` (hooks + statusline) |
+| Codex CLI | `corecruxctl start --agent codex` | `~/.codex/config.toml` + the stdio bridge |
+| Cursor | `corecruxctl start --agent cursor` | `~/.cursor/mcp.json` |
+
+Every write is a **merge, not an overwrite** — your other MCP servers and settings survive — and
+re-running is safe. No bearer token is ever written into an agent config; it stays in
+`~/.config/cuecrux/env` (0600) and is resolved at runtime. Codex gets the stdio bridge rather
+than the HTTP endpoint because Codex CLI fails the daemon's streamable-HTTP handshake
+([details](integrations/codex-cli/README.md#in-session-mcp-tools)).
+
+Longer install path: [docs/getting-started.md](docs/getting-started.md) ·
 guided rails: `corecruxctl login`, `corecruxctl quickstart` · ready-made MCP connector configs
 for Claude Code, Claude Desktop and Cursor: [`examples/mcp-configs/`](examples/mcp-configs/).
 
@@ -185,7 +201,7 @@ Report it privately per the [security policy](SECURITY.md).
 <sub><b>receipts as a literal chain</b> — click any block in the console, inspect the proof</sub>
 </div>
 
-**Testing & coverage:** 5,000+ tests and **~87%** CI-gated region coverage, with per-crate floors
+**Testing & coverage:** 6,000+ tests and **~90%** CI-gated region coverage, with per-crate floors
 on the trust core (`corecrux-receipts` / `-segment` / `-storage`) and the ungated total reported
 alongside so exclusions can't hide low-coverage code. How it's measured and exactly what's
 excluded: [docs/testing-and-coverage.md](docs/testing-and-coverage.md).
@@ -393,6 +409,7 @@ Config via environment variables or YAML (`config.example.env`, `config.example.
 | Variable | Default | Description |
 |---|---|---|
 | `CORECRUXD_AUTH_MODE` | required | `off`, `dev_scopes`, `jwt_hs256`, or `jwt_jwks`. |
+| `CORECRUXD_ROUTE_AUTH` | derived | `enforce` when auth is enabled or the listener is non-loopback; otherwise `shadow`. Shipped packaging pins `enforce`. |
 | `CORECRUXD_DATA_DIR` | `../CoreCruxData/v1` | Data directory. |
 | `CORECRUXD_HTTP_PORT` | `14800` | HTTP API port. |
 | `CORECRUXD_GRPC_PORT` | `4007` | gRPC API port. |
@@ -515,6 +532,7 @@ More: [`docs/troubleshooting.md`](docs/troubleshooting.md) ·
 | `corecruxd` | Canonical daemon binary built by Cargo. |
 | `crux` | User-facing release alias for `corecruxd`. |
 | `corecruxctl` | CLI for verification, replay, receipts, and operations. |
+| `crux-hook` | Agent lifecycle hooks, including encrypted compaction snapshot sync. |
 | `CORECRUXD_*` | Environment-variable prefix for daemon config. |
 
 **This repo contains** the local-first daemon, CLI, MCP server, append-only storage, BM25
@@ -548,14 +566,15 @@ Built in the open, verified in the open. If Crux is useful to you, a star helps 
 
 ## Licence
 
-Crux Daemon is source-available under the
-[CueCrux Community Licence (CCL v1.0)](LICENCE.md).
+Crux Daemon is open source under the
+[Apache License, Version 2.0](LICENSE).
 
-- Internal commercial use is permitted.
-- Reading, auditing, and internal modification are permitted.
-- Offering Crux as a managed, hosted, or cloud service to third parties is prohibited.
-- **Three years after each versioned release, the code converts to Apache 2.0.**
+- Commercial use, modification, distribution, and private use are permitted.
+- Running Crux as a managed, hosted, or cloud service is permitted.
+- Apache-2.0 includes an express patent grant (section 3).
+- Redistribution must retain the copyright, licence, and `NOTICE` attribution
+  (sections 4(a)–4(d)); it grants no trademark rights (section 6).
 - Curated content is covered separately by [`content/LICENCE-CONTENT.md`](content/LICENCE-CONTENT.md).
 - Plain-English answers: [`docs/LICENCE-FAQ.md`](docs/LICENCE-FAQ.md).
 
-Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+Copyright (c) 2026 CueCrux Ltd.

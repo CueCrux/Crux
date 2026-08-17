@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! OpenAPI document — `GET /v1/openapi.json`.
 //!
@@ -29,7 +29,7 @@ use utoipa::OpenApi;
         title = "Crux Daemon API",
         version = env!("CARGO_PKG_VERSION"),
         description = "Append-only event store with BM25 retrieval, CROWN receipts, and fact memory.",
-        license(name = "CCL v1.0", url = "https://github.com/CueCrux/Crux/blob/main/LICENCE.md")
+        license(name = "Apache-2.0", url = "https://github.com/CueCrux/Crux/blob/main/LICENSE")
     ),
     paths(
         // Health
@@ -45,6 +45,9 @@ use utoipa::OpenApi;
         super::facts::get_facts_by_entity,
         super::facts::query_facts,
         super::facts::export_facts,
+        super::facts::list_facts,
+        // Engrams
+        super::engrams::upsert_engram,
         // Sessions
         super::facts::put_session_state,
         super::facts::get_session_state,
@@ -58,6 +61,7 @@ use utoipa::OpenApi;
         super::query::post_query_graph_expand,
         super::query::post_query_time_range,
         // Receipts
+        super::observations::get_receipts_list,
         super::receipts::get_receipt_body_v1,
         super::receipts::get_receipt_signature_v1,
         super::receipts::get_receipt_verification_v1,
@@ -150,6 +154,10 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/admin/append", methods: &["POST"], tag: "Admin", auth: "admin-write", summary: "Admin append" },
     RouteEntry { path: "/v1/admin/control", methods: &["GET"], tag: "Admin", auth: "admin-read", summary: "Admin control" },
     RouteEntry { path: "/v1/admin/ops-log", methods: &["GET"], tag: "Admin", auth: "admin-read", summary: "Admin ops log" },
+    RouteEntry { path: "/v1/admin/tenants/{tenantId}/footprint", methods: &["GET"], tag: "Admin", auth: "admin-read", summary: "Tenant retrieval-corpus footprint" },
+    RouteEntry { path: "/v1/admin/forget-tenants", methods: &["POST"], tag: "Admin", auth: "admin-write", summary: "Erase tenant retrieval corpora" },
+    RouteEntry { path: "/v1/admin/forget-tenant", methods: &["POST"], tag: "Admin", auth: "admin-write", summary: "Erase a tenant retrieval corpus (singular alias)" },
+    RouteEntry { path: "/v1/admin/forget-tenants/{tenantId}", methods: &["DELETE"], tag: "Admin", auth: "admin-write", summary: "Lift a tenant corpus erasure mask" },
     RouteEntry { path: "/v1/admin/projections/artifacts/{artifactId}/dependents", methods: &["GET"], tag: "Admin", auth: "admin-read", summary: "Admin projections artifacts {artifactId} dependents" },
     RouteEntry { path: "/v1/admin/projections/artifacts/{artifactId}/pressure-events", methods: &["GET"], tag: "Admin", auth: "admin-read", summary: "Admin projections artifacts {artifactId} pressure events" },
     RouteEntry { path: "/v1/admin/projections/artifacts/{artifactId}/relations", methods: &["GET"], tag: "Admin", auth: "admin-read", summary: "Admin projections artifacts {artifactId} relations" },
@@ -187,6 +195,19 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/console/chunks/{chunkDigest}", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console chunks {chunkDigest}" },
     RouteEntry { path: "/v1/console/chunks/{chunkDigest}/preview", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console chunks {chunkDigest} preview" },
     RouteEntry { path: "/v1/console/corecrux/lane-weights", methods: &["GET", "PUT", "DELETE"], tag: "Console", auth: "admin", summary: "Console corecrux lane weights" },
+    RouteEntry { path: "/v1/code-intel/blast-radius", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Static + observed dependents of a symbol" },
+    RouteEntry { path: "/v1/code-intel/dead-code", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Dead-code evidence ladder across tiers" },
+    RouteEntry { path: "/v1/code-intel/liveness", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Did this symbol execute, in a stated window" },
+    RouteEntry { path: "/v1/code-intel/path", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "What actually executes for an entry point" },
+    RouteEntry { path: "/v1/code-intel/trace-diff", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Where two traces diverge" },
+    RouteEntry { path: "/v1/code-intel/releases", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Releases held for a tenant, with retention window" },
+    RouteEntry { path: "/v1/code-intel/volume", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Retained spans against the tenant ceiling" },
+    RouteEntry { path: "/v1/code-intel/enrich", methods: &["POST"], tag: "CodeIntel", auth: "admin-write", summary: "LLM-enriched dead-code verdict, per-seat rate ceilinged" },
+    RouteEntry { path: "/v1/code-intel/enrich-budget", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Remaining enrichment headroom for a seat" },
+    RouteEntry { path: "/v1/console/corecrux/graph/stats", methods: &["GET"], tag: "console-graph", auth: "admin-read", summary: "Console CoreCrux link-graph stats (read-only mediation proxy)" },
+    RouteEntry { path: "/v1/console/corecrux/graph/resolve", methods: &["GET"], tag: "console-graph", auth: "admin-read", summary: "Console CoreCrux link-graph title resolve (read-only mediation proxy)" },
+    RouteEntry { path: "/v1/console/corecrux/graph/ego", methods: &["GET"], tag: "console-graph", auth: "admin-read", summary: "Console CoreCrux link-graph ego expansion (read-only mediation proxy)" },
+    RouteEntry { path: "/v1/console/corecrux/graph/path", methods: &["GET"], tag: "console-graph", auth: "admin-read", summary: "Console CoreCrux link-graph six-degrees path (read-only mediation proxy)" },
     RouteEntry { path: "/v1/console/embedding/probe", methods: &["POST"], tag: "Console", auth: "admin-write", summary: "Console embedding probe" },
     RouteEntry { path: "/v1/console/engine/bench", methods: &["GET"], tag: "console-engine", auth: "admin-read", summary: "Console engine bench (read-only Engine mediation)" },
     RouteEntry { path: "/v1/console/engine/search", methods: &["POST"], tag: "console-engine", auth: "admin-read", summary: "Console engine search (mediated WikiCrux retrieval; curated read POST)" },
@@ -195,6 +216,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/console/facts", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console facts" },
     RouteEntry { path: "/v1/console/facts/add", methods: &["POST"], tag: "Console", auth: "admin-write", summary: "Console facts add" },
     RouteEntry { path: "/v1/console/infra/summary", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console infra summary" },
+    RouteEntry { path: "/v1/console/connections", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console connections" },
     RouteEntry { path: "/v1/console/integrations", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console integrations" },
     RouteEntry { path: "/v1/console/integrations/{packId}/disable", methods: &["POST"], tag: "Console", auth: "admin-write", summary: "Console integrations {packId} disable" },
     RouteEntry { path: "/v1/console/integrations/{packId}/grant", methods: &["POST"], tag: "Console", auth: "admin-write", summary: "Console integrations {packId} grant" },
@@ -209,6 +231,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/console/review/expiries", methods: &["POST"], tag: "Console", auth: "admin-write", summary: "Apply reviewed expiry proposals (explicit fact_ids, revalidated at apply)" },
     RouteEntry { path: "/v1/console/review/queue", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Surfaced consolidation-review queue" },
     RouteEntry { path: "/v1/console/sessions", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console sessions" },
+    RouteEntry { path: "/v1/console/sessions/detail", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console session detail (full state + binding/coord/gate joins)" },
     RouteEntry { path: "/v1/console/settings", methods: &["GET", "PUT"], tag: "Console", auth: "admin", summary: "Console settings" },
     RouteEntry { path: "/v1/console/storage-breakdown", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console storage breakdown" },
     RouteEntry { path: "/v1/console/summary", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console summary" },
@@ -222,6 +245,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/credits/spend", methods: &["POST"], tag: "Credits", auth: "feature-gated", summary: "Credits spend" },
     RouteEntry { path: "/v1/edges", methods: &["GET", "PUT", "DELETE"], tag: "Edges", auth: "read-write", summary: "Edges" },
     RouteEntry { path: "/v1/engrams", methods: &["GET"], tag: "Engrams", auth: "read", summary: "Engrams" },
+    RouteEntry { path: "/v1/engrams/{name}", methods: &["PUT"], tag: "Engrams", auth: "admin-write", summary: "Validated engram overlay upsert" },
     RouteEntry { path: "/v1/entities", methods: &["GET"], tag: "Entities", auth: "read", summary: "Entities" },
     RouteEntry { path: "/v1/entities/{kind}/{id}", methods: &["GET", "PUT", "DELETE"], tag: "Entities", auth: "read-write", summary: "Entities {kind} {id}" },
     RouteEntry { path: "/v1/entities/{kind}/{id}/history", methods: &["GET"], tag: "Entities", auth: "read", summary: "Entities {kind} {id} history" },
@@ -231,6 +255,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/extensions/keys", methods: &["GET", "POST"], tag: "Extensions", auth: "read-write", summary: "Extensions keys" },
     RouteEntry { path: "/v1/extensions/keys/{passport_fpr}", methods: &["DELETE"], tag: "Extensions", auth: "write", summary: "Extensions keys {passport fpr}" },
     RouteEntry { path: "/v1/extensions/register", methods: &["POST"], tag: "Extensions", auth: "write", summary: "Extensions register" },
+    RouteEntry { path: "/v1/extensions/registry", methods: &["GET"], tag: "Extensions", auth: "read", summary: "Extensions registry" },
     RouteEntry { path: "/v1/extensions/{id}", methods: &["GET", "DELETE"], tag: "Extensions", auth: "read-write", summary: "Extensions {id}" },
     RouteEntry { path: "/v1/extensions/{id}/grants", methods: &["GET", "POST"], tag: "Extensions", auth: "read-write", summary: "Extensions {id} grants" },
     RouteEntry { path: "/v1/extensions/{id}/grants/{passport_fpr}", methods: &["DELETE"], tag: "Extensions", auth: "write", summary: "Extensions {id} grants {passport fpr}" },
@@ -244,6 +269,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/facts/aggregate", methods: &["POST"], tag: "Facts", auth: "read", summary: "Deterministic 0-LLM aggregate lane" },
     RouteEntry { path: "/v1/facts/entity/{entity}", methods: &["GET"], tag: "Facts", auth: "read", summary: "Facts entity {entity}" },
     RouteEntry { path: "/v1/facts/export", methods: &["GET"], tag: "Facts", auth: "read", summary: "Facts export" },
+    RouteEntry { path: "/v1/facts/list", methods: &["GET"], tag: "Facts", auth: "read", summary: "Facts list (console paged listing)" },
     RouteEntry { path: "/v1/facts/{factId}", methods: &["GET", "DELETE"], tag: "Facts", auth: "read-write", summary: "Facts {factId}" },
     RouteEntry { path: "/v1/features/capabilities", methods: &["GET"], tag: "Features", auth: "read", summary: "Features capabilities" },
     RouteEntry { path: "/v1/features/capabilities/analysis/coverage", methods: &["GET"], tag: "Features", auth: "read", summary: "Features capabilities analysis coverage" },
@@ -267,6 +293,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/gpu1/rerank", methods: &["POST"], tag: "GPU1", auth: "feature-gated", summary: "Gpu1 rerank" },
     RouteEntry { path: "/v1/gpus", methods: &["GET"], tag: "Routing", auth: "admin-read", summary: "Gpus" },
     RouteEntry { path: "/v1/identity/candidates", methods: &["GET"], tag: "Identity", auth: "admin-read", summary: "Identity candidates" },
+    RouteEntry { path: "/v1/identity/candidates/propose", methods: &["POST"], tag: "Identity", auth: "admin-write", summary: "Identity candidates propose" },
     RouteEntry { path: "/v1/identity/candidates/{candidateId}/confirm", methods: &["POST"], tag: "Identity", auth: "admin-write", summary: "Identity candidates {candidateId} confirm" },
     RouteEntry { path: "/v1/identity/candidates/{candidateId}/reject", methods: &["POST"], tag: "Identity", auth: "admin-write", summary: "Identity candidates {candidateId} reject" },
     RouteEntry { path: "/v1/identity/links", methods: &["GET", "POST"], tag: "Identity", auth: "read-write", summary: "Identity links" },
@@ -290,10 +317,16 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/internal/replication/segments", methods: &["POST"], tag: "Internal", auth: "internal", summary: "Internal replication segments" },
     RouteEntry { path: "/v1/kinds", methods: &["GET"], tag: "Kinds", auth: "read", summary: "Kinds" },
     RouteEntry { path: "/v1/kinds/{kind}", methods: &["GET"], tag: "Kinds", auth: "read", summary: "Kinds {kind}" },
+    RouteEntry { path: "/v1/escrow/releases/{request_id}", methods: &["GET"], tag: "Escrow", auth: "admin-read", summary: "Read a custodian-share release, replayed from its receipt chain" },
+    RouteEntry { path: "/v1/escrow/releases/{request_id}/cancel", methods: &["POST"], tag: "Escrow", auth: "admin-write", summary: "Cancel a pending release from a notified device" },
+    RouteEntry { path: "/v1/escrow/releases/{request_id}/complete", methods: &["POST"], tag: "Escrow", auth: "admin-write", summary: "Complete a release once its delay has elapsed" },
+    RouteEntry { path: "/v1/escrow/vaults/{vault_id}", methods: &["PUT", "GET"], tag: "Escrow", auth: "admin-write", summary: "Store or read a vault's wrapped data encryption key" },
+    RouteEntry { path: "/v1/escrow/vaults/{vault_id}/release", methods: &["POST"], tag: "Escrow", auth: "admin-write", summary: "Request release of the custodian share" },
     RouteEntry { path: "/v1/legal-holds", methods: &["POST"], tag: "Legal holds", auth: "feature-gated", summary: "Place a legal hold" },
     RouteEntry { path: "/v1/legal-holds/{id}", methods: &["DELETE"], tag: "Legal holds", auth: "feature-gated", summary: "Release a legal hold" },
     RouteEntry { path: "/v1/local/ingest", methods: &["POST"], tag: "Local", auth: "admin-write", summary: "Local ingest" },
     RouteEntry { path: "/v1/mcp/tools", methods: &["GET"], tag: "MCP", auth: "read", summary: "Mcp tools" },
+    RouteEntry { path: "/v1/mcp/tools/usage", methods: &["GET"], tag: "MCP", auth: "read", summary: "Mcp tools usage" },
     RouteEntry { path: "/v1/mediation/receipts", methods: &["POST"], tag: "Mediation", auth: "write", summary: "Mediation receipts" },
     RouteEntry { path: "/v1/memory/engrams/resolve", methods: &["POST"], tag: "Memory", auth: "write", summary: "Memory engrams resolve" },
     RouteEntry { path: "/v1/memory/import", methods: &["POST"], tag: "Memory", auth: "write", summary: "Memory import" },
@@ -315,7 +348,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/orchestrators/{id}/members", methods: &["POST"], tag: "Orchestrators", auth: "feature-gated", summary: "Orchestrators {id} members" },
     RouteEntry { path: "/v1/orchestrators/{id}/members/{ref}", methods: &["DELETE"], tag: "Orchestrators", auth: "feature-gated", summary: "Orchestrators {id} members {ref}" },
     RouteEntry { path: "/v1/orchestrators/{id}/work", methods: &["GET"], tag: "Orchestrators", auth: "feature-gated", summary: "Orchestrators {id} work" },
-    RouteEntry { path: "/v1/passport/mint-requests/pending", methods: &["GET"], tag: "Passports", auth: "admin-read", summary: "Pending passport mint requests" },
+    RouteEntry { path: "/v1/passport/mint-requests/pending", methods: &["GET"], tag: "Passports", auth: "feature-gated", summary: "Pending passport mint requests" },
     RouteEntry { path: "/v1/passport/mint-requests/{request_id}/approve", methods: &["POST"], tag: "Passports", auth: "feature-gated", summary: "Approve passport mint request" },
     RouteEntry { path: "/v1/passport/mint-requests/{request_id}/reject", methods: &["POST"], tag: "Passports", auth: "feature-gated", summary: "Reject passport mint request" },
     RouteEntry { path: "/v1/passports", methods: &["GET", "POST"], tag: "Passports", auth: "read-write", summary: "Passports" },
@@ -323,11 +356,11 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/passports/{passportId}", methods: &["GET", "PATCH", "DELETE"], tag: "Passports", auth: "read-write", summary: "Passports {passportId}" },
     RouteEntry { path: "/v1/policy/capabilities", methods: &["GET"], tag: "Policy", auth: "read", summary: "Policy capabilities" },
     RouteEntry { path: "/v1/principal/resolve", methods: &["GET"], tag: "Principal", auth: "read", summary: "Principal resolve" },
-    RouteEntry { path: "/v1/projections/batch_lookup", methods: &["POST"], tag: "Projections", auth: "admin-write", summary: "Projections batch lookup" },
+    RouteEntry { path: "/v1/projections/batch_lookup", methods: &["POST"], tag: "Projections", auth: "admin-read", summary: "Projections batch lookup" },
     RouteEntry { path: "/v1/projections/entity/count", methods: &["GET"], tag: "Projections", auth: "read", summary: "Projections entity count" },
     RouteEntry { path: "/v1/projections/entity/current-state", methods: &["GET"], tag: "Projections", auth: "read", summary: "Projections entity current state" },
     RouteEntry { path: "/v1/projections/entity/timeline", methods: &["GET"], tag: "Projections", auth: "read", summary: "Projections entity timeline" },
-    RouteEntry { path: "/v1/projections/lookup", methods: &["POST"], tag: "Projections", auth: "admin-write", summary: "Projections lookup" },
+    RouteEntry { path: "/v1/projections/lookup", methods: &["POST"], tag: "Projections", auth: "admin-read", summary: "Projections lookup" },
     RouteEntry { path: "/v1/projects", methods: &["GET", "POST"], tag: "Projects", auth: "read-write", summary: "Projects" },
     RouteEntry { path: "/v1/projects/{id}", methods: &["GET", "PATCH", "DELETE"], tag: "Projects", auth: "read-write", summary: "Projects {id}" },
     RouteEntry { path: "/v1/projects/{id}/context-graph", methods: &["GET"], tag: "Projects", auth: "read", summary: "Projects {id} context graph" },
@@ -375,6 +408,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/rcx/publish/passports/{passportId}/preview", methods: &["POST"], tag: "RCX", auth: "write", summary: "Rcx publish passports {passportId} preview" },
     RouteEntry { path: "/v1/rcx/publish/projects/{projectId}/emit", methods: &["POST"], tag: "RCX", auth: "write", summary: "Rcx publish projects {projectId} emit" },
     RouteEntry { path: "/v1/rcx/publish/projects/{projectId}/preview", methods: &["POST"], tag: "RCX", auth: "write", summary: "Rcx publish projects {projectId} preview" },
+    RouteEntry { path: "/v1/receipts/list", methods: &["GET"], tag: "Receipts", auth: "read", summary: "Receipts list" },
     RouteEntry { path: "/v1/receipts/{receiptId}", methods: &["GET"], tag: "Receipts", auth: "read", summary: "Receipts {receiptId}" },
     RouteEntry { path: "/v1/receipts/{receiptId}/signature", methods: &["GET"], tag: "Receipts", auth: "read", summary: "Receipts {receiptId} signature" },
     RouteEntry { path: "/v1/receipts/{receiptId}/verification", methods: &["GET"], tag: "Receipts", auth: "read", summary: "Receipts {receiptId} verification" },
@@ -388,10 +422,17 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/replay/exports/receipts/{receiptId}", methods: &["GET"], tag: "Replay", auth: "read", summary: "Replay exports receipts {receiptId}" },
     RouteEntry { path: "/v1/replay/exports/streams/{streamType}/{streamId}", methods: &["GET"], tag: "Replay", auth: "read", summary: "Replay exports streams {streamType} {streamId}" },
     RouteEntry { path: "/v1/repos", methods: &["GET", "POST"], tag: "Repos", auth: "admin", summary: "Repos" },
+    RouteEntry { path: "/v1/repos/allowance", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Pro repo allowance: included vs used, reporting only" },
     RouteEntry { path: "/v1/repos/dependents", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Repos dependents" },
     RouteEntry { path: "/v1/repos/scan-jobs/{job_id}", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Repos scan jobs {job_id}" },
     RouteEntry { path: "/v1/repos/{repo_id}", methods: &["GET", "DELETE"], tag: "Repos", auth: "admin", summary: "Repos {repo_id}" },
     RouteEntry { path: "/v1/repos/{repo_id}/codemap", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Repos {repo_id} codemap" },
+    RouteEntry { path: "/v1/repos/{repo_id}/spatial", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Deterministic spatial layout (districts, buildings, bundles)" },
+    RouteEntry { path: "/v1/repos/{repo_id}/symbols/resolve", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Resolve a (file, name[, line]) callsite to a stable symbol_id" },
+    RouteEntry { path: "/v1/traces", methods: &["GET"], tag: "Traces", auth: "admin-read", summary: "List persisted runtime traces" },
+    RouteEntry { path: "/v1/traces/stats", methods: &["GET"], tag: "Traces", auth: "admin-read", summary: "Runtime span capture stats" },
+    RouteEntry { path: "/v1/traces/spans", methods: &["GET"], tag: "Traces", auth: "admin-read", summary: "Captured runtime spans" },
+    RouteEntry { path: "/v1/traces/{trace_id}", methods: &["GET"], tag: "Traces", auth: "admin-read", summary: "One persisted trace, spans resolved to symbols" },
     RouteEntry { path: "/v1/result-envelope/import", methods: &["POST"], tag: "ResultEnvelope", auth: "write", summary: "Result envelope import" },
     RouteEntry { path: "/v1/route", methods: &["GET"], tag: "Routing", auth: "admin-read", summary: "Route" },
     RouteEntry { path: "/v1/routing/route", methods: &["GET"], tag: "Routing", auth: "admin-read", summary: "Routing route" },
@@ -406,6 +447,10 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/shard-map", methods: &["GET"], tag: "Routing", auth: "admin-read", summary: "Shard map" },
     RouteEntry { path: "/v1/shards", methods: &["GET"], tag: "Routing", auth: "admin-read", summary: "Shards" },
     RouteEntry { path: "/v1/status-feed", methods: &["GET"], tag: "StatusFeed", auth: "read", summary: "Status feed" },
+    RouteEntry { path: "/v1/studio/library", methods: &["GET"], tag: "Studio", auth: "read", summary: "Browse the verified cached Studio template library (curator-signed index + installed join)" },
+    RouteEntry { path: "/v1/studio/library/{id}/install", methods: &["POST"], tag: "Studio", auth: "write", summary: "Install one Studio template from the verified library index (sha256-pinned, require-signed)" },
+    RouteEntry { path: "/v1/studio/pack/build", methods: &["POST"], tag: "Studio", auth: "read", summary: "Build a Studio board pack (curated read POST; hashes + optional sign)" },
+    RouteEntry { path: "/v1/studio/pack/verify", methods: &["POST"], tag: "Studio", auth: "read", summary: "Verify an uploaded Studio board pack (curated read POST; schema/hash/signature)" },
     RouteEntry { path: "/v1/sync/handshake/nonce", methods: &["POST"], tag: "Sync", auth: "public", summary: "Issue sync peer handshake nonce" },
     RouteEntry { path: "/v1/sync/tenants/{tenantId}/collections/{collection}", methods: &["GET"], tag: "Sync", auth: "read", summary: "Sync tenants {tenantId} collections {collection}" },
     RouteEntry { path: "/v1/sync/tenants/{tenantId}/manifest", methods: &["GET"], tag: "Sync", auth: "read", summary: "Sync tenants {tenantId} manifest" },
@@ -414,7 +459,11 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/sync/tenants/{tenantId}/promotions/preview", methods: &["POST"], tag: "Sync", auth: "write", summary: "Sync tenants {tenantId} promotions preview" },
     RouteEntry { path: "/v1/version", methods: &["GET"], tag: "Version", auth: "public", summary: "Version" },
     RouteEntry { path: "/v1/witness/smoke", methods: &["GET"], tag: "Witness", auth: "public", summary: "Witness smoke" },
+    RouteEntry { path: "/v1/execplans", methods: &["POST"], tag: "Work", auth: "write", summary: "Write and commit an ExecPlan" },
+    RouteEntry { path: "/v1/execplans/refresh", methods: &["POST"], tag: "Work", auth: "write", summary: "Refresh the git-backed ExecPlan replica" },
+    RouteEntry { path: "/v1/attention/summary", methods: &["GET"], tag: "Work", auth: "read", summary: "Attention roll-up (counts only)" },
     RouteEntry { path: "/v1/work", methods: &["GET", "POST"], tag: "Work", auth: "read-write", summary: "Work" },
+    RouteEntry { path: "/v1/work/graph", methods: &["GET"], tag: "Work", auth: "read", summary: "Spatial projection of the open ExecPlan board" },
     RouteEntry { path: "/v1/work/gate/pending", methods: &["GET"], tag: "Work", auth: "read", summary: "Work gate pending" },
     RouteEntry { path: "/v1/work/gate/{actionId}/approve", methods: &["POST"], tag: "Work", auth: "write", summary: "Work gate {actionId} approve" },
     RouteEntry { path: "/v1/work/gate/{actionId}/reject", methods: &["POST"], tag: "Work", auth: "write", summary: "Work gate {actionId} reject" },
@@ -480,6 +529,7 @@ fn apply_route_manifest(spec: &mut serde_json::Value) {
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn openapi_json() -> Json<serde_json::Value> {
     let mut spec =
         serde_json::to_value(ApiDoc::openapi()).unwrap_or_else(|_| serde_json::json!({ "openapi": "3.1.0" }));

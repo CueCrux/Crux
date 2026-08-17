@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! `session_plans_by_principal` projection (M2; master-plan §7.4).
 //!
@@ -14,7 +14,7 @@
 //! - **Continuity:** the last N sessions this agent ran, as a timeline.
 //!
 //! M2 ships a **pure in-memory projection** that replays the sealed-event
-//! stream on demand. The full `.ccxs`-backed, hot/cold, snapshot-durable
+//! stream on demand. The full `.ccxsnap`-backed, hot/cold, snapshot-durable
 //! variant (the pattern used by the four existing projections in
 //! `ProjectionStoreV1`) is a follow-up refinement once the dataplane
 //! sealer lands. The on-wire event format is already stable, so the

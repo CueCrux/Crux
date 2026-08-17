@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! HTTP surface for the Features lens (M3): `/v1/features/capabilities/*` +
 //! `/v1/features/capabilities/analysis/*` + `POST audit`.
@@ -81,6 +81,7 @@ fn payload_matches(p: &Value, q: &ListCapabilitiesQuery) -> bool {
     true
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_capabilities(
     State(state): State<AppState>,
     Query(q): Query<ListCapabilitiesQuery>,
@@ -95,6 +96,7 @@ pub(super) async fn list_capabilities(
     (StatusCode::OK, Json(json!({"items": items, "count": count}))).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_capability(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -110,6 +112,7 @@ pub(super) async fn get_capability(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_dependency_tree(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -182,6 +185,7 @@ pub(super) async fn get_dependency_tree(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn analysis_gaps(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(p) = require_http_any_scope(&state.auth, &headers, &["facts:read", "admin:read"]) {
         return p.into_response();
@@ -191,6 +195,7 @@ pub(super) async fn analysis_gaps(State(state): State<AppState>, headers: Header
     (StatusCode::OK, Json(json!(r))).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn analysis_promises(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(p) = require_http_any_scope(&state.auth, &headers, &["facts:read", "admin:read"]) {
         return p.into_response();
@@ -200,6 +205,7 @@ pub(super) async fn analysis_promises(State(state): State<AppState>, headers: He
     (StatusCode::OK, Json(json!(r))).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn analysis_coverage(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(p) = require_http_any_scope(&state.auth, &headers, &["facts:read", "admin:read"]) {
         return p.into_response();
@@ -216,6 +222,7 @@ pub(super) struct AuditBody {
     pub notes: Option<String>,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_audit(
     State(state): State<AppState>,
     Path(id): Path<String>,

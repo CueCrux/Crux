@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Profile fragment loader.
 //!
@@ -13,6 +13,8 @@
 //! Bundled profiles ship in `crates/crux-config-wizard/profiles/` and are
 //! embedded into the binary via `include_str!`. The `load_bundled_profiles()`
 //! function returns the list at runtime; no filesystem read is required.
+
+use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
@@ -57,8 +59,21 @@ pub struct ProfileFragment {
 
 impl ProfileFragment {
     /// Parse a raw fragment string (with `+++`-delimited TOML frontmatter).
+    ///
+    /// CRLF input parses identically to LF. `bundled_raw` resolves these
+    /// fragments with `include_str!`, which bakes in whatever bytes are on disk
+    /// at compile time, so a checkout under git's `core.autocrlf=true` (the
+    /// Windows default) hands every fence below a `\r` it would not otherwise
+    /// match. Normalising once here — rather than relying on `.gitattributes` —
+    /// keeps parsing and the composed output byte-identical across platforms,
+    /// and covers existing clones that an attributes file could not reach.
     pub fn parse(name_hint: &str, raw: &str) -> Result<Self, ProfileError> {
-        let trimmed = raw.trim_start();
+        let normalised: Cow<'_, str> = if raw.contains('\r') {
+            Cow::Owned(raw.replace("\r\n", "\n"))
+        } else {
+            Cow::Borrowed(raw)
+        };
+        let trimmed = normalised.trim_start();
         let rest = trimmed.strip_prefix("+++\n").ok_or_else(|| ProfileError::Frontmatter {
             name: name_hint.to_string(),
             reason: "missing opening '+++' frontmatter fence".into(),
@@ -99,6 +114,11 @@ fn bundled_raw() -> Vec<(&'static str, &'static str)> {
             "token-conservation.md",
             include_str!("../profiles/token-conservation.md"),
         ),
+        ("claude-5.md", include_str!("../profiles/claude-5.md")),
+        (
+            "agent-harness-parity.md",
+            include_str!("../profiles/agent-harness-parity.md"),
+        ),
         (
             "execplan-discipline.md",
             include_str!("../profiles/execplan-discipline.md"),
@@ -109,6 +129,7 @@ fn bundled_raw() -> Vec<(&'static str, &'static str)> {
             "scratchpad-survival.md",
             include_str!("../profiles/scratchpad-survival.md"),
         ),
+        ("boot-banner.md", include_str!("../profiles/boot-banner.md")),
         ("pre-deploy-gate.md", include_str!("../profiles/pre-deploy-gate.md")),
         ("eu-ai-act.md", include_str!("../profiles/eu-ai-act.md")),
         ("audit-soc2.md", include_str!("../profiles/audit-soc2.md")),
@@ -143,6 +164,45 @@ risk_class = "medium"
 This is the body.
 "#;
 
+    /// A CRLF checkout must parse exactly as an LF one, and produce the same
+    /// body bytes. `include_str!` embeds the on-disk form, so under git's
+    /// `core.autocrlf=true` this is what every bundled profile actually looks
+    /// like to the parser — the whole crate failed to load a single profile on
+    /// Windows until the parser normalised it, while Linux-only CI stayed green.
+    #[test]
+    fn crlf_checkout_parses_identically_to_lf() {
+        let lf = ProfileFragment::parse("sample.md", SAMPLE).unwrap();
+        let crlf_src = SAMPLE.replace('\n', "\r\n");
+        let crlf = ProfileFragment::parse("sample.md", &crlf_src).unwrap();
+
+        assert_eq!(crlf.frontmatter.name, lf.frontmatter.name);
+        assert_eq!(crlf.frontmatter.version, lf.frontmatter.version);
+        assert_eq!(crlf.frontmatter.targets, lf.frontmatter.targets);
+        assert_eq!(crlf.frontmatter.order, lf.frontmatter.order);
+        // Byte-identical bodies: a composed CLAUDE.md must not depend on how
+        // the repository happened to be checked out.
+        assert_eq!(crlf.body, lf.body);
+        assert!(
+            !crlf.body.contains('\r'),
+            "normalisation must not leave stray CR in the body"
+        );
+    }
+
+    /// The bundled set must load on the host actually running the tests, not
+    /// just on the CI platform. This is the assertion Linux-only CI could not make.
+    #[test]
+    fn bundled_profiles_load_on_this_platform() {
+        let loaded = load_bundled_profiles().expect("every bundled profile must parse on this platform");
+        assert_eq!(loaded.len(), bundled_raw().len());
+        for f in &loaded {
+            assert!(
+                !f.body.contains('\r'),
+                "profile {} kept a CR in its body",
+                f.frontmatter.name
+            );
+        }
+    }
+
     #[test]
     fn parse_round_trip() {
         let f = ProfileFragment::parse("sample.md", SAMPLE).unwrap();
@@ -175,13 +235,280 @@ This is the body.
     #[test]
     fn bundled_load_returns_all_in_order() {
         let bundled = load_bundled_profiles().unwrap();
-        assert_eq!(bundled.len(), 10);
+        assert_eq!(bundled.len(), 13);
         for win in bundled.windows(2) {
             assert!(
                 win[0].frontmatter.order <= win[1].frontmatter.order,
                 "bundled profiles must be sorted by order"
             );
         }
+    }
+
+    #[test]
+    fn code_minimalism_v2_bounds_benchmark_claims() {
+        let bundled = load_bundled_profiles().unwrap();
+        let profile = bundled
+            .iter()
+            .find(|f| f.frontmatter.name == "code-minimalism")
+            .expect("code-minimalism fragment must be bundled");
+        assert_eq!(profile.frontmatter.version, 2);
+
+        let claims = format!("{}\n{}", profile.frontmatter.description, profile.body)
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(claims.contains("did not execute"));
+        assert!(claims.contains("non-empty code diff"));
+        assert!(claims.contains("95 returned cli result json"));
+        assert!(claims.contains("timed out"));
+        assert!(claims.contains("censored/provisional"));
+        assert!(claims.contains("functional correctness"));
+        assert!(claims.contains("causal"));
+        for unsupported in [
+            "no correctness regression",
+            "zero correctness",
+            "correctness 1.0",
+            "correctness 1.00",
+            "both arms correct",
+            "48/48 correct",
+            "all cells correct",
+            "effect scales with model",
+            "effect grows with model",
+            "stronger models over-build",
+            "matters most on the strongest",
+        ] {
+            assert!(!claims.contains(unsupported), "unsupported claim: {unsupported}");
+        }
+    }
+
+    /// The `claude-5` profile exists to *remove* two instruction classes that cost
+    /// tokens without improving results on Claude 5 generation models: re-verification
+    /// prompts and fixed numeric output ceilings. Both are the kind of rule that creeps
+    /// back in during a well-meaning edit, so guard them here.
+    #[test]
+    fn claude_5_omits_numeric_caps_and_keeps_the_no_reverify_carve_out() {
+        let bundled = load_bundled_profiles().unwrap();
+        let p = bundled
+            .iter()
+            .find(|f| f.frontmatter.name == "claude-5")
+            .expect("claude-5 fragment must be bundled");
+
+        // claude_md only. Rendering this into AGENTS.md would duplicate what Claude
+        // Code's own system prompt already supplies — see `agent-harness-parity`.
+        assert_eq!(p.frontmatter.targets, vec![Target::ClaudeMd]);
+        assert!(
+            p.frontmatter.conflicts_with.iter().any(|c| c == "token-conservation"),
+            "claude-5 supersedes token-conservation and must declare the conflict"
+        );
+
+        // Match against description + body, normalised to one space-joined line, so a
+        // reflow cannot silently defeat these guards. The rationale lives in the
+        // description on purpose: it is *why* the profile is shaped this way, and
+        // frontmatter is not rendered into CLAUDE.md, so it costs no session context.
+        let claims = format!("{}\n{}", p.frontmatter.description, p.body)
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for cap in ["500-token", "at most 10 lines", "token output max", "2,000 for design"] {
+            assert!(
+                !claims.contains(cap),
+                "claude-5 must not carry a fixed output cap: {cap}"
+            );
+        }
+        assert!(
+            claims.contains("self-verification is already the model's default behaviour"),
+            "the no-reverification rationale must stay explicit or the profile rots"
+        );
+        assert!(
+            claims.contains("verification belongs in the main loop"),
+            "subagent-verification carve-out must survive"
+        );
+
+        // The body is the part that costs context on every session. Keep it lean —
+        // this profile replaces a 19-line one, and a subtraction pass that grows the
+        // rendered file has failed at its own premise.
+        let body_lines = p.body.lines().filter(|l| !l.trim().is_empty()).count();
+        assert!(
+            body_lines <= 40,
+            "claude-5 body is {body_lines} non-blank lines; keep rationale in `description`"
+        );
+    }
+
+    /// `agent-harness-parity` carries the rules Claude Code's harness supplies natively,
+    /// for harnesses that do not. It must never render into CLAUDE.md, or it re-introduces
+    /// exactly the duplication `claude-5` was written to remove.
+    #[test]
+    fn agent_harness_parity_is_agents_md_only_and_disjoint_from_claude_5() {
+        let bundled = load_bundled_profiles().unwrap();
+        let p = bundled
+            .iter()
+            .find(|f| f.frontmatter.name == "agent-harness-parity")
+            .expect("agent-harness-parity fragment must be bundled");
+        assert_eq!(p.frontmatter.targets, vec![Target::AgentsMd]);
+
+        let body = p.body.to_lowercase();
+        assert!(body.contains("single message"), "tool-batching rule must be stated");
+        assert!(
+            body.contains("\"x exists now\""),
+            "memory-staleness rule must be stated for non-Claude harnesses"
+        );
+
+        // The two profiles must not both land in the same file.
+        let claude5 = bundled
+            .iter()
+            .find(|f| f.frontmatter.name == "claude-5")
+            .expect("claude-5 fragment must be bundled");
+        for t in &p.frontmatter.targets {
+            assert!(
+                !claude5.frontmatter.targets.contains(t),
+                "claude-5 and agent-harness-parity must not share a target"
+            );
+        }
+    }
+
+    /// v2 narrowed this profile to source-citation and corpus-identity. The dropped
+    /// sections were re-verification instructions; re-adding them would reintroduce the
+    /// over-verification this generation is prone to.
+    #[test]
+    fn code_grounding_v2_drops_the_reverification_sections() {
+        let bundled = load_bundled_profiles().unwrap();
+        let p = bundled
+            .iter()
+            .find(|f| f.frontmatter.name == "code-grounding")
+            .expect("code-grounding fragment must be bundled");
+        assert_eq!(p.frontmatter.version, 2);
+
+        let body = p.body.to_lowercase();
+        for dropped in [
+            "when the result surprises you",
+            "memory-versus-current-state",
+            "substrate scans need budgets",
+        ] {
+            assert!(
+                !body.contains(dropped),
+                "code-grounding v2 dropped this section: {dropped}"
+            );
+        }
+        assert!(body.contains("file:line"), "citation rule survives");
+        assert!(body.contains("corpus"), "corpus-identity rule survives");
+    }
+
+    /// v2 collapsed four competing boot rituals into one, and handed the retrieval-budget
+    /// and entity-prefix rules to the MCP tool schemas. Guard both.
+    #[test]
+    fn memory_practices_v3_declares_a_single_boot_and_pins_tool_routing() {
+        let bundled = load_bundled_profiles().unwrap();
+        let p = bundled
+            .iter()
+            .find(|f| f.frontmatter.name == "memory-practices")
+            .expect("memory-practices fragment must be bundled");
+        assert_eq!(p.frontmatter.version, 3);
+
+        let body = p.body.to_lowercase();
+        assert!(
+            body.contains("this is the **only** boot sequence"),
+            "the single-boot claim must be explicit"
+        );
+        assert!(
+            !body.contains("is mandatory on every retrieval call"),
+            "the token_budget mandate now lives in the MCP tool schemas, not here"
+        );
+        assert!(
+            !body.contains("entity=\"execplan:"),
+            "entity conventions now live in the store_fact schema, not here"
+        );
+
+        // v3: the three signals that were being misread as "the tools cannot
+        // reach the daemon" must each be named, or the misreading recurs.
+        for signal in ["[tier:local]", "local_only", "unreachable"] {
+            assert!(
+                body.contains(signal),
+                "v3 must disambiguate the `{signal}` signal from tool routing"
+            );
+        }
+        assert!(
+            body.contains("fall back to raw http only on an actual failure"),
+            "v3 must state the call-then-fall-back rule, not merely explain the markers"
+        );
+    }
+
+    /// v3 moved the drift guard's install/wiring detail into
+    /// `docs/execplan-drift-guard.md`. The body keeps only what an agent needs
+    /// mid-session; operator setup is read on demand. Guard both halves.
+    #[test]
+    fn execplan_discipline_v5_pins_the_refresh_step_and_still_defers_setup_detail() {
+        let bundled = load_bundled_profiles().unwrap();
+        let p = bundled
+            .iter()
+            .find(|f| f.frontmatter.name == "execplan-discipline")
+            .expect("execplan-discipline fragment must be bundled");
+        assert_eq!(p.frontmatter.version, 5);
+
+        let body = p.body.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // Operator-time setup detail belongs in the doc, not in every session.
+        for setup in [
+            ".claude/settings.json",
+            ".codex/hooks.json",
+            "xdg_data_home",
+            "--print-only",
+            "crux_execplans_root",
+            "~/.local/share/crux/hooks",
+        ] {
+            assert!(
+                !body.contains(setup),
+                "execplan-discipline v3 defers setup detail to docs: {setup}"
+            );
+        }
+
+        // Agent-time behaviour must survive: the hook can fire mid-session, and the
+        // leading-token rule is a real semantic gotcha that is not inferable.
+        // v5: the propagation step. The board is a read-time projection over the
+        // daemon's replica, so a locally-committed plan is invisible to every other
+        // session until it is pushed and refreshed — and an untracked plan can be
+        // destroyed outright by a sibling checkout (one was, on 2026-07-31).
+        assert!(
+            body.contains("/v1/execplans/refresh"),
+            "the gate routine must name the refresh call"
+        );
+        assert!(
+            body.contains("untracked"),
+            "commit-on-create must survive: an untracked plan is one checkout from gone"
+        );
+        assert!(body.contains("posttooluse"), "the agent must know the hook exists");
+        assert!(body.contains("leading"), "leading-Status:-token semantics must survive");
+        assert!(
+            body.contains("docs/execplan-drift-guard.md"),
+            "must point at the reference doc"
+        );
+
+        // v4: the pre-flight pointed at `get_gaps`, which reads retrieval-coverage
+        // facts, and at the retired PlanCrux API. Pin the real endpoint and the
+        // disambiguation, or agents silently pre-flight against the wrong surface.
+        assert!(
+            body.contains("/v1/features/capabilities/analysis/gaps"),
+            "the pre-flight must name the Features-lens endpoint"
+        );
+        assert!(
+            body.contains("get_gaps` is **not** this"),
+            "the get_gaps/capability-registry distinction must be explicit"
+        );
+    }
+
+    #[test]
+    fn boot_banner_fragment_loads() {
+        let bundled = load_bundled_profiles().unwrap();
+        let bb = bundled
+            .iter()
+            .find(|f| f.frontmatter.name == "boot-banner")
+            .expect("boot-banner fragment must be bundled");
+        assert_eq!(bb.frontmatter.order, 47);
+        assert_eq!(bb.frontmatter.targets, vec![Target::ClaudeMd, Target::AgentsMd]);
+        assert!(bb.body.contains("crux-statusline"), "documents the statusline");
+        assert!(bb.body.contains("crux-claude-banner"), "documents the agent brief");
+        assert!(bb.body.contains("CRUX_BANNER_CARD"), "documents the switches");
     }
 
     #[test]

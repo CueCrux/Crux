@@ -1,0 +1,935 @@
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
+
+//! GitHub integration — encrypted PAT storage + verification + status.
+//!
+//! On-disk layout (under `data_dir/integrations/github/`):
+//!
+//! - `credentials.json` — `GithubCredentials { encrypted_pat, username, scopes,
+//!   connected_at_unix_ms, last_verified_at_unix_ms? }`. The PAT itself never
+//!   appears in plaintext; the envelope is sealed with the daemon-root
+//!   passport-derived key (see `corecrux_secrets`).
+//!
+//! Future (G2): `selected_repos.json` for the operator-selected repo set.
+
+#![allow(dead_code)] // integration scaffolding kept for upcoming PAT-rotation flow
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use corecrux_secrets::{EncryptedEnvelope, EncryptedSecretError};
+
+#[derive(Debug, thiserror::Error)]
+pub enum GithubIntegrationError {
+    #[error("not connected: no credentials on disk")]
+    NotConnected,
+    #[error("PAT verification failed: {0}")]
+    VerifyFailed(String),
+    #[error("network: {0}")]
+    Network(String),
+    #[error(transparent)]
+    Encryption(#[from] EncryptedSecretError),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(
+        "selected repositories file is present but unreadable ({0}); refusing to overwrite it — repair or remove it"
+    )]
+    SelectionUnreadable(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GithubCredentials {
+    pub encrypted_pat: EncryptedEnvelope,
+    pub username: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    pub connected_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verified_at_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GithubStatus {
+    pub connected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connected_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verified_at_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifiedUser {
+    pub username: String,
+    pub scopes: Vec<String>,
+}
+
+pub fn read_status(data_dir: &Path) -> GithubStatus {
+    match read_credentials(data_dir) {
+        Ok(creds) => GithubStatus {
+            connected: true,
+            username: Some(creds.username),
+            scopes: creds.scopes,
+            connected_at_unix_ms: Some(creds.connected_at_unix_ms),
+            last_verified_at_unix_ms: creds.last_verified_at_unix_ms,
+        },
+        Err(_) => GithubStatus {
+            connected: false,
+            username: None,
+            scopes: Vec::new(),
+            connected_at_unix_ms: None,
+            last_verified_at_unix_ms: None,
+        },
+    }
+}
+
+pub fn read_credentials(data_dir: &Path) -> Result<GithubCredentials, GithubIntegrationError> {
+    let path = credentials_path(data_dir);
+    if !path.exists() {
+        return Err(GithubIntegrationError::NotConnected);
+    }
+    let bytes = fs::read(&path)?;
+    let creds: GithubCredentials = serde_json::from_slice(&bytes)?;
+    Ok(creds)
+}
+
+pub fn write_credentials(data_dir: &Path, creds: &GithubCredentials) -> Result<(), GithubIntegrationError> {
+    let path = credentials_path(data_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(creds)?)?;
+    fs::rename(tmp, &path)?;
+    set_owner_only_perms(&path)?;
+    Ok(())
+}
+
+pub fn delete_credentials(data_dir: &Path) -> Result<(), GithubIntegrationError> {
+    let path = credentials_path(data_dir);
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)] // Used by G3 sync worker — reads PAT for outbound api.github.com calls.
+pub fn decrypt_pat(creds: &GithubCredentials, key: &[u8; 32]) -> Result<String, GithubIntegrationError> {
+    let bytes = corecrux_secrets::open(&creds.encrypted_pat, key)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Verify a PAT by hitting `GET https://api.github.com/user`. Used at /connect
+/// time so we can return the resolved username + scopes immediately. Blocking
+/// call — caller must dispatch via `tokio::task::spawn_blocking`.
+pub fn verify_pat(pat: &str) -> Result<VerifiedUser, GithubIntegrationError> {
+    if pat.trim().is_empty() {
+        return Err(GithubIntegrationError::VerifyFailed("PAT is empty".to_string()));
+    }
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .build()
+        .into();
+    let req = agent
+        .get("https://api.github.com/user")
+        .header("Authorization", &format!("Bearer {}", pat.trim()))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", "crux-daemon");
+    let mut response = req.call().map_err(|e| GithubIntegrationError::Network(e.to_string()))?;
+    let status = response.status().as_u16();
+    let scopes = response
+        .headers()
+        .get("x-oauth-scopes")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| GithubIntegrationError::Network(e.to_string()))?;
+    if status != 200 {
+        return Err(GithubIntegrationError::VerifyFailed(format!(
+            "github returned {status}: {}",
+            truncate(&body, 256)
+        )));
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&body)?;
+    let username = parsed
+        .get("login")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GithubIntegrationError::VerifyFailed("no 'login' field in /user response".to_string()))?
+        .to_string();
+    Ok(VerifiedUser { username, scopes })
+}
+
+fn credentials_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("integrations").join("github").join("credentials.json")
+}
+
+fn selected_repos_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("integrations").join("github").join("selected_repos.json")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SelectedRepo {
+    pub owner: String,
+    pub repo: String,
+    pub private: bool,
+    pub selected_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_synced_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync_error: Option<String>,
+    /// Operator-flagged: this repo is the canonical planning surface (e.g.
+    /// open issues = roadmap). Surfaced on the Project detail page so the
+    /// planning-target picker can suggest it.
+    #[serde(default)]
+    pub planning: bool,
+}
+
+impl SelectedRepo {
+    pub fn full_name(&self) -> String {
+        format!("{}/{}", self.owner, self.repo)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+struct SelectedReposFile {
+    #[serde(default)]
+    repos: Vec<SelectedRepo>,
+}
+
+pub fn list_selected_repos(data_dir: &Path) -> Vec<SelectedRepo> {
+    match read_selected_repos(&selected_repos_path(data_dir)) {
+        Ok(repos) => repos,
+        Err(err) => {
+            // Read paths still degrade to "nothing selected" so the console
+            // renders, but never silently: the operator's selection is intact
+            // on disk and every write path refuses to clobber it.
+            tracing::warn!(%err, "github-selected-repos-unreadable");
+            Vec::new()
+        }
+    }
+}
+
+/// Read the selection, distinguishing **absent** (a legitimate empty set) from
+/// **present but unreadable** (an operator file we must not silently discard).
+fn read_selected_repos(path: &Path) -> Result<Vec<SelectedRepo>, GithubIntegrationError> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let bytes = fs::read(path).map_err(|err| GithubIntegrationError::SelectionUnreadable(err.to_string()))?;
+    let file = serde_json::from_slice::<SelectedReposFile>(&bytes)
+        .map_err(|err| GithubIntegrationError::SelectionUnreadable(err.to_string()))?;
+    Ok(file.repos)
+}
+
+/// Guard every whole-file rewrite of `selected_repos.json`.
+///
+/// A corrupt file read as an *empty* selection, so the next `select_repo`
+/// rewrote the file with just that one repo and the operator's set was gone
+/// with no signal. An unreadable file is not an empty one: refuse the write
+/// and surface why.
+pub(crate) fn ensure_selection_writable(path: &Path) -> Result<(), GithubIntegrationError> {
+    read_selected_repos(path).map(|_| ())
+}
+
+pub fn select_repo(
+    data_dir: &Path,
+    owner: &str,
+    repo: &str,
+    private: bool,
+    now_unix_ms: u64,
+) -> Result<SelectedRepo, GithubIntegrationError> {
+    let mut repos = list_selected_repos(data_dir);
+    if let Some(existing) = repos.iter().find(|r| r.owner == owner && r.repo == repo) {
+        // Always upgrade an existing selection's `private` flag if the new
+        // call says it's private — never downgrade. This is the safe direction:
+        // if a repo became private after first select, treat it as private.
+        if private && !existing.private {
+            let mut upgraded = existing.clone();
+            upgraded.private = true;
+            for r in &mut repos {
+                if r.owner == owner && r.repo == repo {
+                    *r = upgraded.clone();
+                }
+            }
+            write_selected_repos(data_dir, &repos)?;
+            return Ok(upgraded);
+        }
+        return Ok(existing.clone());
+    }
+    let new = SelectedRepo {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        private,
+        selected_at_unix_ms: now_unix_ms,
+        last_synced_at_unix_ms: None,
+        last_sync_error: None,
+        planning: false,
+    };
+    repos.push(new.clone());
+    write_selected_repos(data_dir, &repos)?;
+    Ok(new)
+}
+
+pub fn set_planning_repo(
+    data_dir: &Path,
+    owner: &str,
+    repo: &str,
+    planning: bool,
+) -> Result<SelectedRepo, GithubIntegrationError> {
+    let mut repos = list_selected_repos(data_dir);
+    let target = repos
+        .iter_mut()
+        .find(|r| r.owner == owner && r.repo == repo)
+        .ok_or_else(|| {
+            GithubIntegrationError::VerifyFailed(format!(
+                "repo {owner}/{repo} is not in the selected set; select it first"
+            ))
+        })?;
+    target.planning = planning;
+    let updated = target.clone();
+    write_selected_repos(data_dir, &repos)?;
+    Ok(updated)
+}
+
+pub fn unselect_repo(data_dir: &Path, owner: &str, repo: &str) -> Result<(), GithubIntegrationError> {
+    let mut repos = list_selected_repos(data_dir);
+    repos.retain(|r| !(r.owner == owner && r.repo == repo));
+    write_selected_repos(data_dir, &repos)?;
+    Ok(())
+}
+
+fn write_selected_repos(data_dir: &Path, repos: &[SelectedRepo]) -> Result<(), GithubIntegrationError> {
+    let path = selected_repos_path(data_dir);
+    ensure_selection_writable(&path)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = SelectedReposFile { repos: repos.to_vec() };
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(&file)?)?;
+    fs::rename(tmp, &path)?;
+    set_owner_only_perms(&path)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AccessibleRepo {
+    pub owner: String,
+    pub repo: String,
+    pub private: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub default_branch: String,
+    pub stargazers_count: u64,
+    pub html_url: String,
+}
+
+/// Fetch up to `max_pages` of repos accessible to the PAT. Page size 100.
+/// Blocking call — caller dispatches via `tokio::task::spawn_blocking`.
+pub fn fetch_accessible_repos(pat: &str, max_pages: usize) -> Result<Vec<AccessibleRepo>, GithubIntegrationError> {
+    if pat.trim().is_empty() {
+        return Err(GithubIntegrationError::VerifyFailed("PAT is empty".to_string()));
+    }
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(20)))
+        .build()
+        .into();
+    let mut out = Vec::new();
+    for page in 1..=max_pages.max(1) {
+        let url = format!(
+            "https://api.github.com/user/repos?per_page=100&page={page}&affiliation=owner,collaborator,organization_member&sort=updated"
+        );
+        let mut response = agent
+            .get(&url)
+            .header("Authorization", &format!("Bearer {}", pat.trim()))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "crux-daemon")
+            .call()
+            .map_err(|e| GithubIntegrationError::Network(e.to_string()))?;
+        let status = response.status().as_u16();
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| GithubIntegrationError::Network(e.to_string()))?;
+        if status != 200 {
+            return Err(GithubIntegrationError::VerifyFailed(format!(
+                "github returned {status}: {}",
+                truncate(&body, 256)
+            )));
+        }
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+        if parsed.is_empty() {
+            break;
+        }
+        let page_count = parsed.len();
+        for repo in parsed {
+            let owner = repo
+                .get("owner")
+                .and_then(|o| o.get("login"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = repo.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if owner.is_empty() || name.is_empty() {
+                continue;
+            }
+            out.push(AccessibleRepo {
+                owner,
+                repo: name,
+                private: repo.get("private").and_then(|v| v.as_bool()).unwrap_or(false),
+                description: repo.get("description").and_then(|v| v.as_str()).map(str::to_string),
+                default_branch: repo
+                    .get("default_branch")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("main")
+                    .to_string(),
+                stargazers_count: repo.get("stargazers_count").and_then(|v| v.as_u64()).unwrap_or(0),
+                html_url: repo.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            });
+        }
+        if page_count < 100 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.len() <= n {
+        s.to_string()
+    } else {
+        let mut out = s[..n].to_string();
+        out.push_str("...");
+        out
+    }
+}
+
+#[cfg(unix)]
+fn set_owner_only_perms(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(path, perms)
+}
+
+// Mirrors the signature of the genuinely fallible unix implementation above.
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+fn set_owner_only_perms(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        // nanos alone collides on VMs with coarse clocks (parallel tests
+        // land in the same quantum and share a dir) — salt with pid + a counter.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("corecruxd-github-{name}-{nanos}-{}-{seq}", std::process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    fn sample_creds() -> (GithubCredentials, [u8; 32]) {
+        let key = [7u8; 32];
+        let env = corecrux_secrets::seal(b"github_pat_test_token_12345", &key);
+        (
+            GithubCredentials {
+                encrypted_pat: env,
+                username: "octocat".to_string(),
+                scopes: vec!["repo".to_string(), "read:org".to_string()],
+                connected_at_unix_ms: 1_700_000_000_000,
+                last_verified_at_unix_ms: None,
+            },
+            key,
+        )
+    }
+
+    #[test]
+    fn status_reports_disconnected_when_no_file() {
+        let dir = temp_dir("disconn");
+        let s = read_status(&dir);
+        assert!(!s.connected);
+        assert!(s.username.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_then_read_round_trip_preserves_envelope() {
+        let dir = temp_dir("rt");
+        let (creds, _) = sample_creds();
+        write_credentials(&dir, &creds).expect("write");
+        let loaded = read_credentials(&dir).expect("read");
+        assert_eq!(loaded, creds);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_reports_connected_after_write() {
+        let dir = temp_dir("conn");
+        let (creds, _) = sample_creds();
+        write_credentials(&dir, &creds).expect("write");
+        let s = read_status(&dir);
+        assert!(s.connected);
+        assert_eq!(s.username.as_deref(), Some("octocat"));
+        assert_eq!(s.scopes, vec!["repo".to_string(), "read:org".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_removes_credentials() {
+        let dir = temp_dir("del");
+        let (creds, _) = sample_creds();
+        write_credentials(&dir, &creds).expect("write");
+        delete_credentials(&dir).expect("delete");
+        assert!(!read_status(&dir).connected);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decrypt_pat_round_trip() {
+        let (creds, key) = sample_creds();
+        let pat = decrypt_pat(&creds, &key).expect("decrypt");
+        assert_eq!(pat, "github_pat_test_token_12345");
+    }
+
+    #[test]
+    fn decrypt_pat_with_wrong_key_fails() {
+        let (creds, _) = sample_creds();
+        let wrong = [0u8; 32];
+        let err = decrypt_pat(&creds, &wrong).expect_err("must fail");
+        assert!(matches!(
+            err,
+            GithubIntegrationError::Encryption(EncryptedSecretError::DecryptionFailed)
+        ));
+    }
+
+    #[test]
+    fn verify_pat_rejects_empty() {
+        let err = verify_pat("").expect_err("empty rejected");
+        assert!(matches!(err, GithubIntegrationError::VerifyFailed(_)));
+    }
+
+    #[test]
+    fn select_then_list_round_trip() {
+        let dir = temp_dir("select");
+        let r = select_repo(&dir, "cuecrux", "Crux", false, 1_000).expect("select");
+        assert_eq!(r.full_name(), "cuecrux/Crux");
+        let listed = list_selected_repos(&dir);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].full_name(), "cuecrux/Crux");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn select_is_idempotent() {
+        let dir = temp_dir("idem");
+        select_repo(&dir, "a", "b", false, 1).expect("first");
+        select_repo(&dir, "a", "b", false, 2).expect("second");
+        assert_eq!(list_selected_repos(&dir).len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unselect_removes_only_target() {
+        let dir = temp_dir("unsel");
+        select_repo(&dir, "a", "x", false, 1).expect("a/x");
+        select_repo(&dir, "a", "y", false, 1).expect("a/y");
+        unselect_repo(&dir, "a", "x").expect("unsel");
+        let remaining = list_selected_repos(&dir);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].full_name(), "a/y");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_accessible_rejects_empty_pat() {
+        let err = fetch_accessible_repos("", 1).expect_err("empty rejected");
+        assert!(matches!(err, GithubIntegrationError::VerifyFailed(_)));
+    }
+
+    // ── Credential file error branches ────────────────────────────────────
+
+    /// A truncated / hand-edited `credentials.json` must surface as a JSON
+    /// error, not as "connected with an empty username". Catches a regression
+    /// where a partial write would be treated as a live credential.
+    #[test]
+    fn read_credentials_on_corrupt_json_returns_json_error() {
+        let dir = temp_dir("corrupt-creds");
+        let path = credentials_path(&dir);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, b"{ not json").expect("write");
+        let err = read_credentials(&dir).expect_err("must fail");
+        assert!(matches!(err, GithubIntegrationError::Json(_)), "got {err:?}");
+        // …and the status view must degrade to disconnected rather than
+        // reporting a half-populated connection.
+        let status = read_status(&dir);
+        assert!(!status.connected);
+        assert!(status.scopes.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_credentials_missing_file_is_not_connected_error() {
+        let dir = temp_dir("missing-creds");
+        let err = read_credentials(&dir).expect_err("must fail");
+        assert!(matches!(err, GithubIntegrationError::NotConnected));
+        assert_eq!(err.to_string(), "not connected: no credentials on disk");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `delete_credentials` is called on the disconnect path even when nothing
+    /// was ever connected; it must be a no-op rather than an io error.
+    #[test]
+    fn delete_credentials_is_idempotent_when_absent() {
+        let dir = temp_dir("del-absent");
+        delete_credentials(&dir).expect("first delete");
+        delete_credentials(&dir).expect("second delete");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The PAT envelope is the only thing standing between an on-disk read and
+    /// a live GitHub token — the file must not be world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn write_credentials_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("perms");
+        let (creds, _) = sample_creds();
+        write_credentials(&dir, &creds).expect("write");
+        let mode = fs::metadata(credentials_path(&dir)).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "credentials.json must be 0600, got {mode:o}");
+        // The temp file used for the atomic rename must not be left behind.
+        assert!(!credentials_path(&dir).with_extension("json.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Re-connecting overwrites the previous envelope instead of appending or
+    /// failing on the existing file.
+    #[test]
+    fn write_credentials_overwrites_previous_envelope() {
+        let dir = temp_dir("overwrite");
+        let (first, _) = sample_creds();
+        write_credentials(&dir, &first).expect("write 1");
+        let key = [9u8; 32];
+        let second = GithubCredentials {
+            encrypted_pat: corecrux_secrets::seal(b"github_pat_second_fake", &key),
+            username: "hubot".to_string(),
+            scopes: Vec::new(),
+            connected_at_unix_ms: 42,
+            last_verified_at_unix_ms: Some(43),
+        };
+        write_credentials(&dir, &second).expect("write 2");
+        let loaded = read_credentials(&dir).expect("read");
+        assert_eq!(loaded, second);
+        let status = read_status(&dir);
+        assert_eq!(status.username.as_deref(), Some("hubot"));
+        assert_eq!(status.last_verified_at_unix_ms, Some(43));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `scopes` is `#[serde(default)]` — a credentials file written by an older
+    /// build without the field must still load.
+    #[test]
+    fn credentials_without_scopes_field_defaults_to_empty() {
+        let dir = temp_dir("no-scopes");
+        let (creds, _) = sample_creds();
+        let path = credentials_path(&dir);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let json = serde_json::json!({
+            "encrypted_pat": creds.encrypted_pat,
+            "username": "octocat",
+            "connected_at_unix_ms": 1_700_000_000_000u64,
+        });
+        fs::write(&path, serde_json::to_vec(&json).expect("json")).expect("write");
+        let loaded = read_credentials(&dir).expect("read");
+        assert!(loaded.scopes.is_empty());
+        assert!(loaded.last_verified_at_unix_ms.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decrypt_pat_rejects_unknown_scheme() {
+        let (mut creds, key) = sample_creds();
+        creds.encrypted_pat.scheme = "xchacha-v99".to_string();
+        let err = decrypt_pat(&creds, &key).expect_err("must fail");
+        assert!(matches!(
+            err,
+            GithubIntegrationError::Encryption(EncryptedSecretError::UnknownScheme(_))
+        ));
+    }
+
+    #[test]
+    fn decrypt_pat_rejects_tampered_ciphertext() {
+        let (mut creds, key) = sample_creds();
+        creds.encrypted_pat.ciphertext_hex = "zz".to_string() + &creds.encrypted_pat.ciphertext_hex;
+        let err = decrypt_pat(&creds, &key).expect_err("must fail");
+        assert!(matches!(
+            err,
+            GithubIntegrationError::Encryption(EncryptedSecretError::InvalidHex)
+        ));
+    }
+
+    #[test]
+    fn verify_pat_rejects_whitespace_only_pat() {
+        // Whitespace-only must be rejected *before* any outbound call — a
+        // blank token trimmed to nothing is not a credential.
+        let err = verify_pat("   \t\n ").expect_err("blank rejected");
+        assert!(matches!(err, GithubIntegrationError::VerifyFailed(_)));
+    }
+
+    #[test]
+    fn fetch_accessible_rejects_whitespace_only_pat() {
+        let err = fetch_accessible_repos("  ", 3).expect_err("blank rejected");
+        assert!(matches!(err, GithubIntegrationError::VerifyFailed(_)));
+    }
+
+    // ── Selected-repo set ─────────────────────────────────────────────────
+
+    /// A repo that became private after first selection must be upgraded to
+    /// private; the reverse (private -> public) must never happen, or a private
+    /// repo's commits would start being stored as non-private facts.
+    #[test]
+    fn select_upgrades_private_but_never_downgrades() {
+        let dir = temp_dir("privacy-ratchet");
+        let first = select_repo(&dir, "a", "b", false, 1).expect("public select");
+        assert!(!first.private);
+
+        let upgraded = select_repo(&dir, "a", "b", true, 2).expect("private select");
+        assert!(upgraded.private, "private flag must ratchet up");
+        assert_eq!(upgraded.selected_at_unix_ms, 1, "original selection time preserved");
+        assert_eq!(list_selected_repos(&dir).len(), 1, "still one entry");
+
+        let downgrade_attempt = select_repo(&dir, "a", "b", false, 3).expect("public re-select");
+        assert!(downgrade_attempt.private, "private must not be downgraded");
+        assert!(list_selected_repos(&dir)[0].private);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The private ratchet must only touch the named repo — a sibling entry in
+    /// the same file must keep its own flag.
+    #[test]
+    fn select_upgrade_does_not_touch_siblings() {
+        let dir = temp_dir("ratchet-sibling");
+        select_repo(&dir, "a", "x", false, 1).expect("a/x");
+        select_repo(&dir, "a", "y", false, 1).expect("a/y");
+        select_repo(&dir, "a", "x", true, 2).expect("upgrade a/x");
+        let repos = list_selected_repos(&dir);
+        let x = repos.iter().find(|r| r.repo == "x").expect("a/x present");
+        let y = repos.iter().find(|r| r.repo == "y").expect("a/y present");
+        assert!(x.private);
+        assert!(!y.private);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn select_distinguishes_same_repo_name_across_owners() {
+        let dir = temp_dir("owners");
+        select_repo(&dir, "owner-a", "Crux", false, 1).expect("a");
+        select_repo(&dir, "owner-b", "Crux", false, 1).expect("b");
+        let names: Vec<String> = list_selected_repos(&dir).iter().map(SelectedRepo::full_name).collect();
+        assert_eq!(names, vec!["owner-a/Crux".to_string(), "owner-b/Crux".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_planning_repo_toggles_flag_and_persists() {
+        let dir = temp_dir("planning");
+        select_repo(&dir, "a", "b", false, 1).expect("select");
+        let on = set_planning_repo(&dir, "a", "b", true).expect("set on");
+        assert!(on.planning);
+        assert!(list_selected_repos(&dir)[0].planning, "persisted to disk");
+        let off = set_planning_repo(&dir, "a", "b", false).expect("set off");
+        assert!(!off.planning);
+        assert!(!list_selected_repos(&dir)[0].planning);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Flagging an unselected repo as the planning target must be an explicit
+    /// error rather than silently creating a selection.
+    #[test]
+    fn set_planning_repo_on_unselected_repo_errors_without_creating_it() {
+        let dir = temp_dir("planning-missing");
+        let err = set_planning_repo(&dir, "ghost", "repo", true).expect_err("must fail");
+        assert!(matches!(err, GithubIntegrationError::VerifyFailed(_)));
+        assert!(err.to_string().contains("select it first"));
+        assert!(list_selected_repos(&dir).is_empty(), "no phantom selection created");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Unselecting a repo that was never selected must succeed (idempotent
+    /// disconnect path) and must not create the file with junk in it.
+    #[test]
+    fn unselect_unknown_repo_is_idempotent() {
+        let dir = temp_dir("unsel-unknown");
+        unselect_repo(&dir, "nope", "nada").expect("unselect");
+        assert!(list_selected_repos(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_selected_repos_on_missing_file_is_empty() {
+        let dir = temp_dir("list-missing");
+        assert!(list_selected_repos(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// D-8 (inverted pin): a corrupt `selected_repos.json` was swallowed and
+    /// reported as "no repos selected", and the next `select_repo` overwrote
+    /// the unreadable file — the operator's whole selection was gone with no
+    /// signal. Reads still degrade to empty so the console renders, but every
+    /// write path now refuses to clobber a file it could not read.
+    #[test]
+    fn corrupt_selected_repos_file_is_never_overwritten() {
+        let dir = temp_dir("corrupt-selected");
+        let path = selected_repos_path(&dir);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, b"[[[not json").expect("write");
+
+        let err = select_repo(&dir, "a", "b", false, 1).expect_err("must refuse to overwrite");
+        assert!(
+            matches!(err, GithubIntegrationError::SelectionUnreadable(_)),
+            "the operator is told why, not handed a silent success: {err}"
+        );
+        assert!(
+            unselect_repo(&dir, "a", "b").is_err(),
+            "every whole-file rewrite is guarded, not just select"
+        );
+        assert!(set_planning_repo(&dir, "a", "b", true).is_err());
+
+        assert_eq!(
+            fs::read(&path).expect("file still there"),
+            b"[[[not json",
+            "the unreadable file is left exactly as it was, for repair"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Control: an *absent* file is a legitimate empty selection and must stay
+    /// writable. Only present-but-unreadable is refused.
+    #[test]
+    fn an_absent_selection_file_still_accepts_a_first_select() {
+        let dir = temp_dir("absent-selected");
+        assert!(list_selected_repos(&dir).is_empty());
+        select_repo(&dir, "a", "b", false, 1).expect("first select on a fresh install");
+        assert_eq!(list_selected_repos(&dir).len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A well-formed file with an unknown top-level shape also degrades to
+    /// empty rather than erroring.
+    #[test]
+    fn selected_repos_file_without_repos_key_reads_as_empty() {
+        let dir = temp_dir("no-repos-key");
+        let path = selected_repos_path(&dir);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, br#"{"other": 1}"#).expect("write");
+        assert!(list_selected_repos(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_repos_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("selected-perms");
+        select_repo(&dir, "a", "b", true, 1).expect("select");
+        let mode = fs::metadata(selected_repos_path(&dir))
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Sync bookkeeping fields must survive a write/read cycle — the sync
+    /// worker's `since=` cursor lives here.
+    #[test]
+    fn selected_repo_sync_cursor_round_trips() {
+        let dir = temp_dir("cursor");
+        select_repo(&dir, "a", "b", false, 1).expect("select");
+        let mut repos = list_selected_repos(&dir);
+        repos[0].last_synced_at_unix_ms = Some(1_700_000_000_000);
+        repos[0].last_sync_error = Some("boom".to_string());
+        write_selected_repos(&dir, &repos).expect("write");
+        let reloaded = list_selected_repos(&dir);
+        assert_eq!(reloaded[0].last_synced_at_unix_ms, Some(1_700_000_000_000));
+        assert_eq!(reloaded[0].last_sync_error.as_deref(), Some("boom"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Status / serde surface ────────────────────────────────────────────
+
+    /// The disconnected status must not emit `null` fields the console would
+    /// have to special-case.
+    #[test]
+    fn disconnected_status_omits_optional_fields() {
+        let dir = temp_dir("status-json");
+        let json = serde_json::to_value(read_status(&dir)).expect("serialise");
+        assert_eq!(json["connected"], serde_json::Value::Bool(false));
+        assert!(json.get("username").is_none());
+        assert!(json.get("connected_at_unix_ms").is_none());
+        assert!(json.get("last_verified_at_unix_ms").is_none());
+        assert_eq!(json["scopes"], serde_json::json!([]));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A serialised status must never leak the sealed PAT envelope.
+    #[test]
+    fn connected_status_does_not_expose_the_pat_envelope() {
+        let dir = temp_dir("status-no-pat");
+        let (creds, _) = sample_creds();
+        let cipher = creds.encrypted_pat.ciphertext_hex.clone();
+        write_credentials(&dir, &creds).expect("write");
+        let json = serde_json::to_string(&read_status(&dir)).expect("serialise");
+        assert!(!json.contains(&cipher), "status must not carry the sealed PAT");
+        assert!(!json.contains("encrypted_pat"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncate_appends_ellipsis_only_when_over_limit() {
+        assert_eq!(truncate("abc", 3), "abc");
+        assert_eq!(truncate("abc", 10), "abc");
+        assert_eq!(truncate("abcdef", 3), "abc...");
+        assert_eq!(truncate("", 4), "");
+    }
+
+    #[test]
+    fn error_display_strings_are_stable() {
+        assert_eq!(
+            GithubIntegrationError::VerifyFailed("nope".to_string()).to_string(),
+            "PAT verification failed: nope"
+        );
+        assert_eq!(
+            GithubIntegrationError::Network("timeout".to_string()).to_string(),
+            "network: timeout"
+        );
+    }
+}

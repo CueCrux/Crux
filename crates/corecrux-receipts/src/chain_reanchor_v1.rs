@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! G6 crypto-migration: signature-algorithm re-anchoring.
 //!
@@ -25,9 +25,14 @@
 
 use ciborium::value::Value as CborValue;
 use ed25519_dalek::{Signer as _, SigningKey as Ed25519SigningKey, VerifyingKey as Ed25519VerifyingKey};
+// `Signer` is imported from `p256`'s own `signature` re-export, not inherited
+// from `ed25519_dalek` above: the two crates are on different major versions of
+// `signature` (2.x vs 3.x), so one `Signer as _` cannot cover both arms. It used
+// to, when both sat on `signature` 2.x, which is why the P-256 arm compiled
+// without this import until the p256 0.14 bump.
 use p256::ecdsa::{
-    signature::Verifier as _, Signature as P256Signature, SigningKey as P256SigningKey,
-    VerifyingKey as P256VerifyingKey,
+    signature::{Signer as _, Verifier as _},
+    Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey,
 };
 
 use crate::verify_v1::ReceiptSigV1;
@@ -419,7 +424,7 @@ pub fn assert_chain_signature_reanchor_kind_v1(body_bytes: &[u8]) -> bool {
 mod tests {
     use super::*;
     use p256::ecdsa::SigningKey as P256SigningKey;
-    use rand_core::OsRng;
+    use p256::elliptic_curve::Generate as _;
 
     /// A stand-in chain head: a normal receipt body signed under alg A
     /// (ed25519). Returns (head_body_bytes, head_hash, original_signature).
@@ -477,7 +482,7 @@ mod tests {
         let (head_bytes, head_hash, head_sig) = make_head_signed_under_ed25519(&alg_a_sk);
 
         // Alg B: re-anchor signer is p256-ecdsa-sha256.
-        let alg_b_sk = P256SigningKey::random(&mut OsRng);
+        let alg_b_sk = P256SigningKey::generate();
         let alg_b_vk = P256VerifyingKey::from(&alg_b_sk);
 
         let (body, hash) = build_chain_signature_reanchor_body_v1(&reanchor_input(head_hash, &head_sig));
@@ -510,7 +515,7 @@ mod tests {
         let alg_a_sk = Ed25519SigningKey::from_bytes(&[5u8; 32]);
         let alg_a_vk = alg_a_sk.verifying_key();
         let (head_bytes, head_hash, head_sig) = make_head_signed_under_ed25519(&alg_a_sk);
-        let alg_b_sk = P256SigningKey::random(&mut OsRng);
+        let alg_b_sk = P256SigningKey::generate();
         let alg_b_vk = P256VerifyingKey::from(&alg_b_sk);
 
         let (body, hash) = build_chain_signature_reanchor_body_v1(&reanchor_input(head_hash, &head_sig));
@@ -543,7 +548,7 @@ mod tests {
         let alg_a_sk = Ed25519SigningKey::from_bytes(&[6u8; 32]);
         let alg_a_vk = alg_a_sk.verifying_key();
         let (head_bytes, head_hash, head_sig) = make_head_signed_under_ed25519(&alg_a_sk);
-        let alg_b_sk = P256SigningKey::random(&mut OsRng);
+        let alg_b_sk = P256SigningKey::generate();
         let alg_b_vk = P256VerifyingKey::from(&alg_b_sk);
 
         let (body, hash) = build_chain_signature_reanchor_body_v1(&reanchor_input(head_hash, &head_sig));
@@ -577,8 +582,8 @@ mod tests {
         let alg_a_sk = Ed25519SigningKey::from_bytes(&[8u8; 32]);
         let alg_a_vk = alg_a_sk.verifying_key();
         let (head_bytes, head_hash, head_sig) = make_head_signed_under_ed25519(&alg_a_sk);
-        let alg_b_sk = P256SigningKey::random(&mut OsRng);
-        let other_b_sk = P256SigningKey::random(&mut OsRng);
+        let alg_b_sk = P256SigningKey::generate();
+        let other_b_sk = P256SigningKey::generate();
         let other_b_vk = P256VerifyingKey::from(&other_b_sk);
 
         let (body, hash) = build_chain_signature_reanchor_body_v1(&reanchor_input(head_hash, &head_sig));
@@ -607,7 +612,7 @@ mod tests {
         let alg_a_sk = Ed25519SigningKey::from_bytes(&[9u8; 32]);
         let alg_a_vk = alg_a_sk.verifying_key();
         let (head_bytes, head_hash, head_sig) = make_head_signed_under_ed25519(&alg_a_sk);
-        let alg_b_sk = P256SigningKey::random(&mut OsRng);
+        let alg_b_sk = P256SigningKey::generate();
         let alg_b_vk = P256VerifyingKey::from(&alg_b_sk);
 
         let (body, hash) = build_chain_signature_reanchor_body_v1(&reanchor_input(head_hash, &head_sig));
@@ -642,7 +647,7 @@ mod tests {
         let alg_a_sk = Ed25519SigningKey::from_bytes(&[10u8; 32]);
         let alg_a_vk = alg_a_sk.verifying_key();
         let (head_bytes, head_hash, head_sig) = make_head_signed_under_ed25519(&alg_a_sk);
-        let alg_b_sk = P256SigningKey::random(&mut OsRng);
+        let alg_b_sk = P256SigningKey::generate();
         let alg_b_vk = P256VerifyingKey::from(&alg_b_sk);
 
         let (body, hash) = build_chain_signature_reanchor_body_v1(&reanchor_input(head_hash, &head_sig));
@@ -684,7 +689,7 @@ mod tests {
     fn reanchor_signed_under_ed25519_new_side_also_verifies() {
         // Algorithm-agile: alg B can itself be ed25519 (e.g. key rotation under
         // the same family). Original under p256, re-anchor under ed25519.
-        let alg_a_sk = P256SigningKey::random(&mut OsRng);
+        let alg_a_sk = P256SigningKey::generate();
         let alg_a_vk = P256VerifyingKey::from(&alg_a_sk);
         // Head signed under p256 (alg A here).
         let head_body = CborValue::Map(vec![

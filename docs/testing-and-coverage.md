@@ -3,15 +3,16 @@
 How the Crux Daemon is tested, how coverage is measured and gated, and an honest
 account of why the gated number sits where it does.
 
-> **Snapshot (2026-06-18, `main`):** **4,489** test functions; **86.97%** gated
-> region coverage. CI is the source of truth — the live numbers are printed in
+> **Snapshot (2026-07-30, `main`):** **6,671** test functions; **90.11%** gated
+> region coverage (ungated, whole tree: **88.81%**).
+> CI is the source of truth — the live numbers are printed in
 > the [Coverage job](../.github/workflows/ci.yml) of every run and attested by
 > [`coverage-attestation.yml`](../.github/workflows/coverage-attestation.yml).
 
 ## Running the tests
 
 ```bash
-cargo test --workspace            # the full suite (4,489 tests)
+cargo test --workspace            # the full suite (6,671 test functions)
 cargo test -p corecruxd           # one crate (corecruxd is a binary crate — no lib target)
 cargo fmt --check                 # formatting gate
 cargo clippy --workspace -- -D warnings   # lint gate (lib + bins; not #[cfg(test)] code)
@@ -37,13 +38,13 @@ The [`Coverage` job in `ci.yml`](../.github/workflows/ci.yml) enforces:
 
 | Scope | Floor | Actual (snapshot) | Notes |
 |---|---|---|---|
-| **Workspace total** | **86%** | 86.97% | the headline gate |
+| **Workspace total** | **89%** | 90.11% | the headline gate; ratchet target **90** |
 | `corecrux-memory` | 93% | 93.5% | ratchet target **95** (see below) |
-| `crux-sync` | 98% | 99.0% | |
+| `crux-sync` | 98% | 98.4% | |
 | `crux-contrib` | 99% | 100% | |
-| `corecrux-receipts` | 88% | 88.6% | trust core (CROWN receipts) |
-| `corecrux-segment` | 85% | 86.2% | trust core (sealed `.ccxseg`) |
-| `corecrux-storage` | 79% | 80.2% | trust core (append-only store) |
+| `corecrux-receipts` | 88% | 91.2% | trust core (CROWN receipts); ratchet available |
+| `corecrux-segment` | 85% | 93.8% | trust core (sealed `.ccxseg`); ratchet available |
+| `corecrux-storage` | 79% | 89.9% | trust core (append-only store); ratchet available |
 
 Floors are set **at current-rounded-down** ("ratchet from reality"): they prevent
 regression today and are raised as coverage improves. The job also prints the
@@ -84,20 +85,21 @@ admin HTTP surfaces — is gated.
 
 | Crate | Tests | | Crate | Tests |
 |---|---:|---|---|---:|
-| `corecruxd` | 1537 | | `corecrux-receipts` | 170 |
-| `corecruxctl` | 933 | | `corecrux-storage` | 143 |
-| `crux-mcp` | 622 | | `crux-claude-hooks` | 108 |
-| `corecrux-projections` | 269 | | `crux-session` | 76 |
-| `corecrux-memory` | 176 | | `corecrux-segment` | 54 |
+| `corecruxd` | 2671 | | `corecrux-receipts` | 275 |
+| `corecruxctl` | 1174 | | `corecrux-storage` | 223 |
+| `crux-mcp` | 798 | | `crux-claude-hooks` | 222 |
+| `corecrux-memory` | 288 | | `crux-session` | 89 |
+| `corecrux-projections` | 276 | | `corecrux-segment` | 62 |
 
-## Why the gated number is ~87%, not higher
+## Why the gated number is ~90%, not higher
 
-This is the honest part. 86.97% is what an *accurate* gate over the
+This is the honest part. 90.11% is what an *accurate* gate over the
 *meaningfully-testable* tree reports — it is not a target someone padded up to.
 
-1. **The trust-core crates pull the average down on purpose.**
-   `corecrux-storage` (80%), `corecrux-segment` (86%), and `corecrux-receipts`
-   (89%) are large and full of deep I/O and error branches. The
+1. **The trust-core crates used to pull the average down, and no longer do.**
+   `corecrux-storage` (89.9%), `corecrux-segment` (93.8%) and
+   `corecrux-receipts` (91.2%) are large and full of deep I/O and error
+   branches; they sat at 80/86/89% as recently as 2026-06-18. The
    **security-critical** paths in them *are* covered — tamper-rejection in
    [`corecrux-segment/tests/corruption_matrix.rs`](../crates/corecrux-segment/tests/corruption_matrix.rs)
    (magic / version / CRC / record-hash / TOC corruption all rejected) and
@@ -107,10 +109,35 @@ This is the honest part. 86.97% is what an *accurate* gate over the
    exhaustive error/IO-branch fan-out, not the invariants (see
    [`docs/agent/INVARIANTS.md`](agent/INVARIANTS.md)).
 
-2. **`corecruxd` is an ~87k-LOC surface.** Most handlers are covered, but a few
-   newer ones (`http/events.rs`, `http/infra.rs`, `http/policy.rs`) are still at
-   0% — they are *gated* (not excluded), so they are visible debt and natural
-   next targets, not hidden.
+2. **`corecruxd` is an ~87k-LOC surface.** Most handlers are covered. The three
+   that this doc previously recorded at 0% — `http/events.rs`, `http/infra.rs`,
+   `http/policy.rs` — were closed on 2026-07-30 and now sit at **95.4%**,
+   **98.8%** and **98.7%** region coverage respectively. They were *gated* (not
+   excluded) throughout, which is why they showed up as debt rather than
+   staying hidden. Remaining `corecruxd` debt is tracked per-file in the
+   Coverage job log.
+
+   A second sweep on 2026-07-30 took the nine largest remaining concentrations
+   across `corecruxd` and `corecruxctl` — `http/replay.rs` (1032 missed regions
+   → 66), `corecruxctl/audit_pack.rs` (1164 → 228), `corecruxctl/login.rs`
+   (1035 → 159), `repo_watch.rs` (456 → 125), `storybook.rs` (411 → 35),
+   `context_graph.rs` (296 → 19) and `http/incidents.rs` (379 → 211).
+
+   **What is left is mostly not testable without a production change.** The
+   clearest example is `integrations_github_sync.rs` (532 → 421) and
+   `integrations_github.rs` (253 → 215): every fetch builds a `ureq::Agent`
+   inline against a hard-coded `https://api.github.com/...` URL, with no
+   base-URL or transport injection seam, so the pagination and status-code
+   branches cannot be reached without hitting the real network. Adding a seam
+   is the prerequisite for covering them — not more test effort.
+
+   A related trap worth knowing: **no CI job runs `cargo test -- --ignored`**, so
+   an `#[ignore]`d test contributes nothing to the gate. Two exist today —
+   `sse_session_survives_30s_idle` (>35s wall clock) and `witness_submit`'s live
+   Rekor probe. Both are ignored for good reasons, but the SSE endpoint's
+   *only* test was one of them, which is how a whole handler sat at 0% while
+   looking tested. Prefer a fast handler-level test alongside any long-running
+   or network-dependent one.
 
 3. **The denominator includes the test code itself.** `#[cfg(test)]` regions
    count toward the total, so each new test batch raises coverage by less than
@@ -142,8 +169,17 @@ This is the honest part. 86.97% is what an *accurate* gate over the
 
 - **To raise a floor:** add tests for the crate, confirm the new per-crate number
   in the Coverage job log, then bump the `pair` floor in
-  [`ci.yml`](../.github/workflows/ci.yml) (keep it ≤ actual). Raising
-  `corecrux-memory` to its 95 target is the first such opportunity.
+  [`ci.yml`](../.github/workflows/ci.yml) (keep it ≤ actual). Three per-crate
+  floors are currently well below reality and are the standing opportunities:
+  `corecrux-storage` (79 → 89), `corecrux-segment` (85 → 93) and
+  `corecrux-receipts` (88 → 91). They were left alone on 2026-07-30 because
+  part of that headroom comes from `corecruxctl` tests exercising those crates
+  *transitively*, so the numbers should be confirmed stable across a couple of
+  main runs before being locked in. `corecrux-memory` remains at 93.5% against
+  its 95 target.
+- **Leave headroom when ratcheting the workspace floor.** It is set one point
+  below the measured total, not at it: a floor equal to reality turns main red
+  on the first feature PR that adds uncovered code.
 - **Keep the regex in lock-step:** the `COVERAGE_IGNORE_REGEX` is duplicated in
   `ci.yml` and `coverage-attestation.yml` — change both together.
 - **Adding an exclusion is a reviewed decision:** justify it inline (the only

@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Product-tier metadata + sync-runtime status types — feeds `/v1/version` and onboarding probes.
 
@@ -14,6 +14,10 @@ pub enum OperatingMode {
     ProLocalFirst,
     ProCloudOnly,
     ProHybrid,
+    /// Governance tier. Reachable from a verified `RcxTier::Governance`
+    /// capability token; `ProCloudOnly` and `ProHybrid` are not reachable from any
+    /// tier mapping and are retained for explicitly configured hosted deployments.
+    GovernanceHosted,
     MaxPrivate,
 }
 
@@ -30,6 +34,7 @@ impl OperatingMode {
             "pro_local_first" | "pro_local" | "local_first" => Some(Self::ProLocalFirst),
             "pro_cloud_only" | "cloud_only" => Some(Self::ProCloudOnly),
             "pro_hybrid" | "hybrid" | "pro" => Some(Self::ProHybrid),
+            "governance_hosted" | "governance" => Some(Self::GovernanceHosted),
             "max_private" | "max" | "private" | "onsite" | "on_site" => Some(Self::MaxPrivate),
             _ => None,
         }
@@ -41,6 +46,7 @@ impl OperatingMode {
             Self::ProLocalFirst => "pro_local_first",
             Self::ProCloudOnly => "pro_cloud_only",
             Self::ProHybrid => "pro_hybrid",
+            Self::GovernanceHosted => "governance_hosted",
             Self::MaxPrivate => "max_private",
         }
     }
@@ -49,6 +55,7 @@ impl OperatingMode {
         match self {
             Self::FreeLocal => "free",
             Self::ProLocalFirst | Self::ProCloudOnly | Self::ProHybrid => "pro",
+            Self::GovernanceHosted => "governance",
             Self::MaxPrivate => "max",
         }
     }
@@ -75,6 +82,20 @@ pub const FREE_CAPABILITY_CLAIMS: &[&str] = &[
     "store:durable",
 ];
 
+/// A claim listed here is **sold**, and `require_surface_enabled` will let a
+/// paying tenant reach the surface behind it. So a claim earns its place by
+/// delivering something, not by having an implemented route.
+///
+/// `ledger:history` is deliberately absent. `/v1/workbench/command-ledger` is
+/// implemented in both directions and still served — but no CLI, MCP tool or
+/// hook has ever written a record to it, so the capability could only ever
+/// render an empty page. Do not re-add it without landing a producer first;
+/// the surface returns `402 pro_service_not_enabled` until then, and
+/// `workbench_command_ledger_is_not_a_sold_claim_without_a_producer` pins
+/// that. Removing it from [`DAEMON_IMPLEMENTED_PRO_CLAIMS`] alone would have
+/// been worse than leaving it: `pro_claim_placements` would then report it as
+/// `contracted_external`, asserting an outside implementer that does not
+/// exist. See ExecPlan `crux-command-ledger-claim-truth-2026-07-30`.
 pub const PRO_CAPABILITY_CLAIMS: &[&str] = &[
     "memorycrux:tenant",
     "gpu1:answer",
@@ -89,7 +110,6 @@ pub const PRO_CAPABILITY_CLAIMS: &[&str] = &[
     "agent_brief:pro",
     "context_pack:budgeted",
     "impact:preflight",
-    "ledger:history",
     "audit:triage",
     "audit:central_retention",
     "reasoning:timeline",
@@ -123,7 +143,6 @@ pub const DAEMON_IMPLEMENTED_PRO_CLAIMS: &[&str] = &[
     "agent_brief:pro",
     "context_pack:budgeted",
     "impact:preflight",
-    "ledger:history",
     "audit:triage",
     "reasoning:timeline",
     "handoff:v2",
@@ -133,6 +152,65 @@ pub const DAEMON_IMPLEMENTED_PRO_CLAIMS: &[&str] = &[
     "enrichers:first_party",
     "console:workbench",
     "tenant:business_offboarding",
+];
+
+/// Where each [`DAEMON_IMPLEMENTED_PRO_CLAIMS`] entry is actually enforced.
+///
+/// `pro_claim_placements` derives `implementation: "daemon"` from list
+/// membership alone — it never checks that a gate exists — so adding a string
+/// to two arrays is enough to make the daemon report a capability as
+/// implemented. The M4 vow audit found four claims in exactly that state.
+///
+/// This table is the missing check. A claim earns `daemon_implemented` by
+/// naming the `file:line` that refuses it, and
+/// `daemon_implemented_pro_claims_have_a_gate_site` fails the build if the two
+/// lists drift apart in either direction.
+///
+/// `None` means **sold, declared daemon-implemented, and enforced nowhere**.
+/// Do not add a `None` row to make a new claim compile. The four below are
+/// recorded findings awaiting the M5 human gate, not a pattern to follow —
+/// and note the `ledger:history` trap above: dropping one from
+/// `DAEMON_IMPLEMENTED_PRO_CLAIMS` alone re-labels it `contracted_external`,
+/// asserting an outside implementer that does not exist. They leave both lists
+/// together or not at all.
+///
+/// The classification behind the four, for the record: of the twenty claims
+/// declared daemon-implemented, five egress (the GPU-1 bridge, the only Pro
+/// handler that reaches the network), eleven are local compute that answers on
+/// a network-severed daemon, and these four have no gate and no handler at all.
+#[cfg(test)]
+const DAEMON_CLAIM_GATE_SITES: &[(&str, Option<&str>)] = &[
+    ("gpu1:answer", Some("http/gpu1.rs:801 service_enabled")),
+    ("gpu1:rerank", Some("http/gpu1.rs:801 service_enabled")),
+    ("gpu1:enrich", Some("http/gpu1.rs:801 service_enabled")),
+    ("gpu1:coverage", Some("http/gpu1.rs:801 service_enabled")),
+    ("gpu1:developer", Some("http/gpu1.rs:801 service_enabled")),
+    ("replay:answer", Some("http/replay.rs:214")),
+    ("agent_brief:pro", Some("http/workbench.rs:875 require_surface_enabled")),
+    (
+        "context_pack:budgeted",
+        Some("http/workbench.rs:875 require_surface_enabled"),
+    ),
+    (
+        "impact:preflight",
+        Some("http/workbench.rs:875 require_surface_enabled"),
+    ),
+    ("audit:triage", Some("http/workbench.rs:875 require_surface_enabled")),
+    (
+        "reasoning:timeline",
+        Some("http/workbench.rs:875 require_surface_enabled"),
+    ),
+    ("handoff:v2", Some("http/workbench.rs:875 require_surface_enabled")),
+    ("route_probe:lab", Some("http/workbench.rs:875 require_surface_enabled")),
+    ("api_drift:check", Some("http/workbench.rs:875 require_surface_enabled")),
+    ("policy:simulate", Some("http/workbench.rs:875 require_surface_enabled")),
+    ("enrichers:first_party", Some("http/actions.rs:59")),
+    // M4 findings — no gate, no handler, claim string occurs only in the
+    // PRO_CAPABILITY_CLAIMS / DAEMON_IMPLEMENTED_PRO_CLAIMS arrays.
+    ("sync:mirror", None),
+    ("sync:promote", None),
+    ("console:workbench", None),
+    ("tenant:business_offboarding", None),
 ];
 
 pub const HOSTED_CONTROL_PLANE_PRO_CLAIMS: &[&str] = &[
@@ -239,6 +317,16 @@ pub struct RuntimeCapabilities {
     pub hosted_sync: RuntimeCapability,
     pub projection_queries: RuntimeCapability,
     pub graph_expand: RuntimeCapability,
+    /// The CoreCrux link-graph console mediation proxy (`/v1/console/corecrux/graph/*`).
+    /// `configured` ⇔ the graph upstream base URL env is set on this daemon; the
+    /// unified-shell console gates its six-degrees link-graph pane on this signal
+    /// (render from the capability plan, never the route registry). See ExecPlan
+    /// `wikicrux-link-graph-explorer-2026-07-23` (M4).
+    pub console_link_graph: RuntimeCapability,
+    /// Who produced the companions this daemon is serving. `degraded` when any
+    /// segment is unattested or refused — and when the check itself is off,
+    /// because "we turned the alarm off" has to be visible.
+    pub companion_provenance: RuntimeCapability,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -246,6 +334,10 @@ pub struct RuntimeCapability {
     pub availability: &'static str,
     pub reason_code: &'static str,
     pub reason: &'static str,
+    /// Capability-specific counts. Omitted entirely when absent, so every
+    /// existing consumer of this shape is unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
     pub compiled: bool,
     pub configured: bool,
     pub initialized: bool,
@@ -261,6 +353,40 @@ pub struct RuntimeCapabilityInputs {
     pub embedding_delegation: EmbeddingDelegationRuntimeState,
     pub rerank_endpoint_configured: bool,
     pub graph_expand_configured: bool,
+    /// The CoreCrux link-graph console mediation proxy is configured (graph
+    /// upstream base URL env set). Sourced from `http::console` at `/v1/version`.
+    pub console_link_graph_configured: bool,
+    /// Live companion-provenance tallies, read from the retrieval index.
+    pub companion_provenance: CompanionProvenanceRuntime,
+}
+
+/// Snapshot of companion provenance across the loaded corpus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompanionProvenanceRuntime {
+    /// `off` | `warn` | `enforce`.
+    pub mode: &'static str,
+    pub platform: usize,
+    pub local: usize,
+    pub none: usize,
+    pub invalid: usize,
+    /// Segments whose provenance cost them their lanes (still erasable).
+    pub refused: usize,
+}
+
+impl Default for CompanionProvenanceRuntime {
+    /// An empty corpus under the ship default. Notably `mode: "warn"`, not `""`:
+    /// a default that reads as "no mode" would report the capability as
+    /// configured-off and quietly mark a healthy daemon degraded.
+    fn default() -> Self {
+        Self {
+            mode: "warn",
+            platform: 0,
+            local: 0,
+            none: 0,
+            invalid: 0,
+            refused: 0,
+        }
+    }
 }
 
 /// Safe, public projection of the delegation client's live breaker state.
@@ -485,6 +611,25 @@ impl RuntimeCapabilityDescriptor {
         } else {
             RuntimeCapability::available(graph_stages)
         };
+        // The link-graph console proxy is a stateless GET-only mediation surface:
+        // once the graph upstream base URL env is set it is both configured and
+        // ready (no in-process init). Available ⇔ configured.
+        let console_link_graph_stages = RuntimeCapabilityStages {
+            compiled: true,
+            configured: inputs.console_link_graph_configured,
+            initialized: inputs.console_link_graph_configured,
+            entitled: true,
+            degraded: false,
+        };
+        let console_link_graph = if inputs.console_link_graph_configured {
+            RuntimeCapability::available(console_link_graph_stages)
+        } else {
+            RuntimeCapability::unavailable(
+                "console_link_graph_not_configured",
+                "The CoreCrux link-graph mediation proxy is not configured; set CORECRUXD_CORECRUX_GRAPH_BASE_URL on the Crux daemon.",
+                console_link_graph_stages,
+            )
+        };
 
         Self {
             schema_version: RUNTIME_CAPABILITY_SCHEMA_VERSION,
@@ -496,9 +641,60 @@ impl RuntimeCapabilityDescriptor {
                 hosted_sync,
                 projection_queries,
                 graph_expand,
+                console_link_graph,
+                companion_provenance: companion_provenance_capability(inputs.companion_provenance),
             },
         }
     }
+}
+
+/// Surface 2 of 4 — the machine-readable one the console reads.
+///
+/// `degraded` is the honest state for all three bad outcomes: companions from
+/// nowhere, companions that fail their own digests, and a daemon told not to
+/// look. The last is deliberate — an operator inheriting a box must be able to
+/// see that the alarm was disabled, so `off` reports itself rather than
+/// reporting clean.
+fn companion_provenance_capability(runtime: CompanionProvenanceRuntime) -> RuntimeCapability {
+    let stages = RuntimeCapabilityStages {
+        compiled: true,
+        configured: runtime.mode != "off",
+        initialized: true,
+        entitled: true,
+        degraded: runtime.mode == "off" || runtime.invalid > 0 || runtime.none > 0,
+    };
+    let detail = serde_json::json!({
+        "mode": runtime.mode,
+        "platform": runtime.platform,
+        "local": runtime.local,
+        "none": runtime.none,
+        "invalid": runtime.invalid,
+        "refused": runtime.refused,
+    });
+
+    let mut capability = if runtime.mode == "off" {
+        RuntimeCapability::degraded(
+            "companion_attestation_off",
+            "Companion attestation is disabled; missing provenance is not reported.",
+            stages,
+        )
+    } else if runtime.invalid > 0 {
+        RuntimeCapability::degraded(
+            "companion_attestation_invalid",
+            "Some companions do not match their signed digests and were refused their lanes.",
+            stages,
+        )
+    } else if runtime.none > 0 {
+        RuntimeCapability::degraded(
+            "companion_unattested",
+            "Some segments carry no companion attestation.",
+            stages,
+        )
+    } else {
+        RuntimeCapability::available(stages)
+    };
+    capability.detail = Some(detail);
+    capability
 }
 
 impl RuntimeCapability {
@@ -511,6 +707,7 @@ impl RuntimeCapability {
             availability: "available",
             reason_code,
             reason,
+            detail: None,
             compiled: stages.compiled,
             configured: stages.configured,
             initialized: stages.initialized,
@@ -524,6 +721,7 @@ impl RuntimeCapability {
             availability: "unavailable",
             reason_code,
             reason,
+            detail: None,
             compiled: stages.compiled,
             configured: stages.configured,
             initialized: stages.initialized,
@@ -537,6 +735,7 @@ impl RuntimeCapability {
             availability: "degraded",
             reason_code,
             reason,
+            detail: None,
             compiled: stages.compiled,
             configured: stages.configured,
             initialized: stages.initialized,
@@ -886,13 +1085,6 @@ fn hosted_rest_endpoints() -> Vec<RestEndpointContract> {
             scopes: vec!["impact:preflight"],
         },
         RestEndpointContract {
-            name: "command_test_ledger",
-            method: "GET/POST",
-            hosted_path: "/v1/workbench/command-ledger",
-            local_path: Some("/v1/workbench/command-ledger"),
-            scopes: vec!["ledger:history"],
-        },
-        RestEndpointContract {
             name: "audit_triage_mode",
             method: "GET",
             hosted_path: "/v1/workbench/audit-triage",
@@ -1096,6 +1288,60 @@ mod tests {
         assert_eq!(OperatingMode::parse("onsite"), Some(OperatingMode::MaxPrivate));
     }
 
+    /// A claim may not be sold as daemon-implemented without a gate that
+    /// refuses it.
+    ///
+    /// `pro_claim_placements` reports `implementation: "daemon"` from list
+    /// membership, so without this the only thing standing between "we built
+    /// it" and "we added a string to an array" is review. M4 found four claims
+    /// that had crossed that line.
+    #[test]
+    fn daemon_implemented_pro_claims_have_a_gate_site() {
+        for claim in DAEMON_IMPLEMENTED_PRO_CLAIMS {
+            assert!(
+                DAEMON_CLAIM_GATE_SITES.iter().any(|(name, _)| name == claim),
+                "{claim} is declared daemon-implemented but has no DAEMON_CLAIM_GATE_SITES row. \
+                 Add the file:line of the gate that refuses it — or, if nothing enforces it, do not \
+                 declare it daemon-implemented."
+            );
+        }
+
+        for (claim, _) in DAEMON_CLAIM_GATE_SITES {
+            assert!(
+                contains_claim(DAEMON_IMPLEMENTED_PRO_CLAIMS, claim),
+                "{claim} has a gate-site row but is no longer in DAEMON_IMPLEMENTED_PRO_CLAIMS; \
+                 drop the stale row so the table keeps meaning what it says"
+            );
+        }
+    }
+
+    /// The four ungated claims are pinned by name so that fixing one is a
+    /// deliberate edit to this list rather than a silent drift, and so that a
+    /// *fifth* cannot appear unnoticed.
+    ///
+    /// This asserts a known defect, not a desired state. It goes away at M5,
+    /// which is a human gate because it changes what is sold.
+    #[test]
+    fn the_only_ungated_daemon_claims_are_the_four_m4_found() {
+        let ungated: Vec<&str> = DAEMON_CLAIM_GATE_SITES
+            .iter()
+            .filter_map(|(claim, gate)| gate.is_none().then_some(*claim))
+            .collect();
+
+        assert_eq!(
+            ungated,
+            vec![
+                "sync:mirror",
+                "sync:promote",
+                "console:workbench",
+                "tenant:business_offboarding",
+            ],
+            "the set of sold-but-unenforced Pro claims changed. If you added one, don't — wire a \
+             gate. If you removed one, remove it from PRO_CAPABILITY_CLAIMS too (see the \
+             ledger:history note) and update this assertion."
+        );
+    }
+
     #[test]
     fn free_mode_keeps_safety_baseline_without_pro_claims() {
         let posture = ProductPosture::new(OperatingMode::FreeLocal, &[]);
@@ -1147,6 +1393,8 @@ mod tests {
                 embedding_delegation: EmbeddingDelegationRuntimeState::NotConfigured,
                 rerank_endpoint_configured: true,
                 graph_expand_configured: true,
+                console_link_graph_configured: false,
+                companion_provenance: CompanionProvenanceRuntime::default(),
             },
         );
 
@@ -1172,6 +1420,8 @@ mod tests {
                 embedding_delegation: EmbeddingDelegationRuntimeState::NotConfigured,
                 rerank_endpoint_configured: false,
                 graph_expand_configured: true,
+                console_link_graph_configured: false,
+                companion_provenance: CompanionProvenanceRuntime::default(),
             },
         );
         assert!(!missing_endpoint.capabilities.rerank_gpu.configured);
@@ -1194,6 +1444,8 @@ mod tests {
                 embedding_delegation: EmbeddingDelegationRuntimeState::NotConfigured,
                 rerank_endpoint_configured: false,
                 graph_expand_configured: true,
+                console_link_graph_configured: false,
+                companion_provenance: CompanionProvenanceRuntime::default(),
             },
         );
         let hosted_sync = descriptor.capabilities.hosted_sync;
@@ -1220,6 +1472,8 @@ mod tests {
                 embedding_delegation: EmbeddingDelegationRuntimeState::Available,
                 rerank_endpoint_configured: false,
                 graph_expand_configured: true,
+                console_link_graph_configured: false,
+                companion_provenance: CompanionProvenanceRuntime::default(),
             },
         );
 
@@ -1244,6 +1498,8 @@ mod tests {
                 embedding_delegation: EmbeddingDelegationRuntimeState::CircuitOpen,
                 rerank_endpoint_configured: false,
                 graph_expand_configured: true,
+                console_link_graph_configured: false,
+                companion_provenance: CompanionProvenanceRuntime::default(),
             },
         );
         assert_eq!(circuit_open.capabilities.embedding_delegation.availability, "degraded");

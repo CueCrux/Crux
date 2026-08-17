@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Local passport synthesis for Crux Daemon (master-plan §3.2).
 //!
@@ -171,6 +171,32 @@ impl LocalPassportKey {
         &self.public_key_hex
     }
 
+    /// Public Ed25519 verifier bytes for locally issued RCX tokens.
+    /// Borrow the signing key for RCX **delegation attenuation**.
+    ///
+    /// This is the one place the passport's key leaves the module as a key
+    /// rather than as a signature, and it exists because
+    /// `RcxCapabilityToken::attenuate_for` takes `&SigningKey` directly — it
+    /// derives the delegator fingerprint from the key in order to check it
+    /// against `subject.passport_fpr`, so a `sign_hash`-shaped callback would
+    /// not be enough.
+    ///
+    /// Deliberately narrow: named for its purpose rather than a general
+    /// `signing_key()`, so a future caller wanting the raw key for something
+    /// else has to add its own accessor and justify it. The cleaner shape is
+    /// for `attenuate_for` to take a signer trait; that is a change to
+    /// `rcx-capability-token`'s public API and every one of its call sites, and
+    /// is worth doing separately rather than as a rider on M1.
+    ///
+    /// See ExecPlan `crux-hosted-relay-gateway-2026-07-30` M1 / OD-44.
+    pub fn delegation_signing_key(&self) -> &SigningKey {
+        &self.signing_key
+    }
+
+    pub fn verifying_key_bytes(&self) -> [u8; 32] {
+        self.signing_key.verifying_key().to_bytes()
+    }
+
     pub fn sign_hash(&self, hash: &[u8; HASH_LEN]) -> [u8; SIGNATURE_LEN] {
         let sig = self.signing_key.sign(hash);
         let mut out = [0_u8; SIGNATURE_LEN];
@@ -272,7 +298,11 @@ fn write_new_passport_seed(path: &Path) -> Result<[u8; 32], SessionError> {
     }
 }
 
-fn passport_fpr_from_public_key(public_key: &[u8; 32]) -> String {
+/// Canonical passport fingerprint of an Ed25519 public key: `p_` + hex of the
+/// first 16 bytes (`PASSPORT_FPR_BYTES`) of `blake3(pubkey)`. This is the fingerprint
+/// minters write into `subject.passport_fpr`, so verifiers (e.g. RCX token caveat
+/// attenuation) resolve a holder pubkey to its fingerprint through this one fn.
+pub fn passport_fpr_from_public_key(public_key: &[u8; 32]) -> String {
     let digest = blake3::hash(public_key);
     format!("p_{}", hex::encode(&digest.as_bytes()[..PASSPORT_FPR_BYTES]))
 }

@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Project ↔ GitHub-repo links.
 //!
@@ -134,9 +134,9 @@ pub fn list_links(store: &FactStore, project_id: &str) -> Vec<RepoLink> {
     let result = store.query(&FactQuery {
         min_effective_confidence: None,
         tenant_hash: None,
-        query: Some(prefix.clone()),
+        query: None,
         entity: None,
-        entity_prefix: None,
+        entity_prefix: Some(prefix.clone()),
         top_k: 500,
         token_budget: None,
     });

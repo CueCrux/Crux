@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Shared audit-export signing-key resolution.
 //!
@@ -203,7 +203,10 @@ fn set_owner_only_permissions(path: &Path) -> Result<(), AuditSigningKeyError> {
     })
 }
 
+// Signature mirrors the unix implementation, which is genuinely fallible; the
+// Result is not redundant there, so the lint is suppressed rather than obeyed.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn set_owner_only_permissions(_path: &Path) -> Result<(), AuditSigningKeyError> {
     Ok(())
 }

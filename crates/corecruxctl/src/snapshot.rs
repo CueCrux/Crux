@@ -1,13 +1,13 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
-//! Snapshot loader — opens a `.ccxs` snapshot via `corecrux-projections` and prints its contents.
+//! Snapshot loader — opens a `.ccxsnap` snapshot via `corecrux-projections` and prints its contents.
 
 use std::path::{Path, PathBuf};
 
-use corecrux_projections::{load_projections_meta_v1, CcxsSnapshot};
+use corecrux_projections::{load_projections_meta_v1, CcxsnapSnapshot};
 
 #[derive(Debug, Clone)]
 pub struct SnapshotOptions {
@@ -68,6 +68,15 @@ pub struct SnapshotVerifyReport {
     #[serde(rename = "failedShards")]
     pub failed_shards: u64,
     pub shards: Vec<SnapshotShardVerifyItem>,
+    /// Checks that were requested but could not be evaluated.
+    ///
+    /// With no shards on disk the loop below never ran, yet `failed_shards`
+    /// was 0 and `ok` was `true` — a fresh or wiped data directory verified
+    /// identically to one whose every snapshot matched. `ok` keeps its
+    /// meaning; a caller that needs a snapshot to have actually been hashed
+    /// gates on `ok && checks_skipped.is_empty()`.
+    #[serde(rename = "checksSkipped", default)]
+    pub checks_skipped: Vec<String>,
 }
 
 fn list_shards(shard_root: &Path) -> Result<Vec<u32>, Box<dyn std::error::Error + Send + Sync>> {
@@ -102,19 +111,19 @@ struct ProjectionDef {
 const PROJECTIONS: [ProjectionDef; 4] = [
     ProjectionDef {
         key: "artifact_living_state",
-        file: "artifact_living_state.snapshot.ccxs",
+        file: "artifact_living_state.snapshot.ccxsnap",
     },
     ProjectionDef {
         key: "artifact_relations",
-        file: "artifact_relations.snapshot.ccxs",
+        file: "artifact_relations.snapshot.ccxsnap",
     },
     ProjectionDef {
         key: "pressure_events",
-        file: "pressure_events.snapshot.ccxs",
+        file: "pressure_events.snapshot.ccxsnap",
     },
     ProjectionDef {
         key: "artifact_dependents",
-        file: "artifact_dependents.snapshot.ccxs",
+        file: "artifact_dependents.snapshot.ccxsnap",
     },
 ];
 
@@ -204,7 +213,7 @@ pub fn verify_snapshots(
                 item.reason = Some("MISSING_SNAPSHOT".to_string());
             } else {
                 let bytes = std::fs::read(&path)?;
-                let actual = CcxsSnapshot::snapshot_blake3_hex(&bytes);
+                let actual = CcxsnapSnapshot::snapshot_blake3_hex(&bytes);
                 item.actual_blake3 = Some(actual.clone());
                 if Some(actual) != expected {
                     item.ok = false;
@@ -228,11 +237,19 @@ pub fn verify_snapshots(
         });
     }
 
+    // D-15: an empty `shards/` walked zero shards and reported a clean pass.
+    let checks_skipped = if out_shards.is_empty() {
+        vec!["snapshot_verify:no_shards".to_string()]
+    } else {
+        Vec::new()
+    };
+
     Ok(SnapshotVerifyReport {
         ok: failed_shards == 0,
         data_dir: opts.data_dir.display().to_string(),
         failed_shards,
         shards: out_shards,
+        checks_skipped,
     })
 }
 
@@ -350,7 +367,7 @@ mod tests {
                 shard_id: 0,
                 projections: vec![SnapshotProjectionListItem {
                     projection: "artifact_living_state".to_string(),
-                    path: "/data/shards/shard-0000/projections/artifact_living_state.snapshot.ccxs".to_string(),
+                    path: "/data/shards/shard-0000/projections/artifact_living_state.snapshot.ccxsnap".to_string(),
                     exists: true,
                     bytes: 1024,
                     expected_blake3: Some("abc".to_string()),
@@ -364,6 +381,29 @@ mod tests {
         assert_eq!(parsed.shards[0].shard_id, 0);
         assert_eq!(parsed.shards[0].projections.len(), 1);
         assert_eq!(parsed.shards[0].projections[0].bytes, 1024);
+    }
+
+    /// D-15: an empty `shards/` walked zero shards, so `failed_shards` was 0
+    /// and `ok` was `true` — a fresh or wiped data directory verified
+    /// identically to one whose every snapshot matched.
+    #[test]
+    fn verify_snapshots_records_a_skip_when_there_are_no_shards() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("shards")).unwrap();
+
+        let report = verify_snapshots(&SnapshotOptions {
+            data_dir: tmp.path().to_path_buf(),
+            shard: None,
+        })
+        .unwrap();
+
+        assert!(report.ok, "an empty data dir is not itself an error");
+        assert_eq!(
+            report.checks_skipped,
+            vec!["snapshot_verify:no_shards".to_string()],
+            "but nothing was hashed, and the report says so"
+        );
+        assert!(report.shards.is_empty());
     }
 
     #[test]
@@ -384,6 +424,7 @@ mod tests {
                     actual_blake3: None,
                 }],
             }],
+            checks_skipped: Vec::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
         let parsed: SnapshotVerifyReport = serde_json::from_str(&json).unwrap();
@@ -435,7 +476,7 @@ mod tests {
 
         // Create one snapshot file
         fs::write(
-            proj_dir.join("artifact_living_state.snapshot.ccxs"),
+            proj_dir.join("artifact_living_state.snapshot.ccxsnap"),
             b"fake snapshot data",
         )
         .unwrap();

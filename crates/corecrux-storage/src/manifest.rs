@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Manifest codec (`CCMF`) — encodes/decodes add-segment / add-dir-run / stream-meta-update records.
 
@@ -17,6 +17,7 @@ use std::io::{Read, Seek};
 use std::path::Path;
 
 const MANIFEST_RECORD_TYPE_ADD_SEGMENT_V1: u8 = 1;
+const MANIFEST_RECORD_TYPE_REMOVE_SEGMENT_V1: u8 = 2;
 const MANIFEST_RECORD_TYPE_ADD_DIR_RUN_V1: u8 = 10;
 const MANIFEST_RECORD_TYPE_REMOVE_DIR_RUN_V1: u8 = 11;
 const MANIFEST_RECORD_TYPE_STREAM_META_UPDATE_V1: u8 = 20;
@@ -32,6 +33,12 @@ pub(crate) struct StreamMetaUpdateV1 {
 #[derive(Debug, Clone)]
 pub(crate) enum ManifestRecord {
     AddSegment(SegmentMeta),
+    /// Segment `segment_seq` no longer exists on disk and must not be opened.
+    ///
+    /// Reclaim (tenant erasure) deletes a whole-tenant segment's file group. The
+    /// manifest is append-only, so the deletion is recorded as this tombstone
+    /// rather than by rewriting the `AddSegment` record out of the log.
+    RemoveSegment(u64),
     AddDirRun(DirRunMeta),
     RemoveDirRun(DirRunKey),
     StreamMetaUpdate(StreamMetaUpdateV1),
@@ -49,6 +56,9 @@ impl ManifestState {
         match rec {
             ManifestRecord::AddSegment(seg) => {
                 self.segments_by_seq.insert(seg.segment_seq, seg);
+            }
+            ManifestRecord::RemoveSegment(segment_seq) => {
+                self.segments_by_seq.remove(&segment_seq);
             }
             ManifestRecord::AddDirRun(run) => {
                 self.dir_runs.insert(run.key, run);
@@ -225,6 +235,9 @@ fn parse_manifest_record(bytes: &[u8]) -> Result<Option<ManifestRecord>> {
     }
     match record_type {
         MANIFEST_RECORD_TYPE_ADD_SEGMENT_V1 => Ok(Some(ManifestRecord::AddSegment(parse_add_segment_v1(bytes)?))),
+        MANIFEST_RECORD_TYPE_REMOVE_SEGMENT_V1 => {
+            Ok(Some(ManifestRecord::RemoveSegment(parse_remove_segment_v1(bytes)?)))
+        }
         MANIFEST_RECORD_TYPE_ADD_DIR_RUN_V1 => Ok(Some(ManifestRecord::AddDirRun(parse_add_dir_run_v1(bytes)?))),
         MANIFEST_RECORD_TYPE_REMOVE_DIR_RUN_V1 => {
             Ok(Some(ManifestRecord::RemoveDirRun(parse_remove_dir_run_v1(bytes)?)))
@@ -312,6 +325,25 @@ pub fn encode_manifest_add_segment_v1(seg: &SegmentMeta) -> Result<Vec<u8>> {
     out.extend_from_slice(&seg.max_seq.to_le_bytes());
     out.extend_from_slice(&seg.segment_hash);
     Ok(out)
+}
+
+fn parse_remove_segment_v1(bytes: &[u8]) -> Result<u64> {
+    let mut cur = 4usize;
+    read_u64(bytes, &mut cur)
+}
+
+/// Tombstone for a segment whose file group has been deleted.
+///
+/// Deliberately carries only the sequence: the `AddSegment` record it retires is
+/// still in the log ahead of it, and duplicating its fields would create two
+/// sources of truth for a segment that no longer exists.
+pub fn encode_manifest_remove_segment_v1(segment_seq: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16);
+    out.push(MANIFEST_RECORD_TYPE_REMOVE_SEGMENT_V1); // record_type
+    out.push(1u8); // record_version
+    out.extend_from_slice(&0u16.to_le_bytes()); // reserved
+    out.extend_from_slice(&segment_seq.to_le_bytes());
+    out
 }
 
 fn parse_add_dir_run_v1(bytes: &[u8]) -> Result<DirRunMeta> {

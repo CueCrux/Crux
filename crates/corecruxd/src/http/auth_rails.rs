@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Auth-rail endpoints — the daemon side of `crux login` (ExecPlan
 //! `crux-unified-login-rails`).
@@ -177,6 +177,7 @@ pub(super) fn peer_identity_trusted(peer: Option<IpAddr>, trusted: &[(IpAddr, u8
 }
 
 /// `GET /v1/auth/whoami` — echo the identity the daemon trusts for this caller.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_whoami(
     State(_state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -204,6 +205,7 @@ pub(super) async fn get_whoami(
 
 /// `POST /v1/auth/tailscale/token` — mint a scoped short-lived JWT for a verified,
 /// allowlisted tailnet identity.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_tailscale_token(
     State(_state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -239,6 +241,7 @@ pub(super) async fn post_tailscale_token(
     let sub = format!("ts:{login}");
     let claims = ScopedClaims {
         sub: &sub,
+        passport_id: None,
         scopes: &scope_refs,
         tenant_id: &principal.tenant_id,
         ttl_secs: ISSUED_TOKEN_TTL_SECS,

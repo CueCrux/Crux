@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Agent handoff protocol for multi-agent delegation.
 //!
@@ -66,6 +66,10 @@ pub struct HandoffPackage {
     pub facts: Vec<Fact>,
     pub created_at: String,
     pub source_agent: String,
+    /// Tenant that authorized the bundled facts. Legacy packages omit this
+    /// field and therefore remain confined to `default`.
+    #[serde(default = "default_tenant_hash", skip_serializing_if = "is_default_tenant_hash")]
+    pub tenant_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_agent: Option<String>,
     pub message: Option<String>,
@@ -140,6 +144,12 @@ pub enum HandoffError {
     TargetAgentMismatch { expected: String, actual: String },
     #[error("private facts in a handoff require an authenticated receiving agent")]
     ReceiverAgentRequired,
+    #[error("handoff fact entity '{entity}' uses create-reserved namespace '{prefix}'")]
+    ReservedEntity { entity: String, prefix: String },
+    #[error("private handoff fact entity '{0}' is not owned by the declared source agent")]
+    InvalidPrivateFact(String),
+    #[error("handoff tenant mismatch: package is for '{package}', receiver is '{receiver}'")]
+    TenantMismatch { package: String, receiver: String },
 }
 
 /// Create a signed handoff package from current session state and relevant facts.
@@ -149,6 +159,17 @@ pub fn create_handoff(
     request: CreateHandoffRequest<'_>,
     handoff_key: &[u8; 32],
 ) -> Result<SignedHandoff, HandoffError> {
+    create_handoff_for_tenant(session_store, fact_store, request, "default", handoff_key)
+}
+
+/// Tenant-authorized handoff creation used by request-facing MCP handlers.
+pub fn create_handoff_for_tenant(
+    session_store: &SessionStore,
+    fact_store: &FactStore,
+    request: CreateHandoffRequest<'_>,
+    tenant_hash: &str,
+    handoff_key: &[u8; 32],
+) -> Result<SignedHandoff, HandoffError> {
     let session_state = session_store.get(request.stored_session_id).map(|s| s.state.clone());
     let facts = if request.include_facts {
         collect_relevant_facts(
@@ -156,6 +177,7 @@ pub fn create_handoff(
             request.session_id,
             session_state.as_ref(),
             Some(request.source_agent),
+            tenant_hash,
         )
     } else {
         Vec::new()
@@ -175,6 +197,7 @@ pub fn create_handoff(
         facts,
         created_at: Utc::now().to_rfc3339(),
         source_agent: request.source_agent.to_string(),
+        tenant_hash: tenant_hash.to_string(),
         target_agent: request.target_agent,
         message: request.message,
         work_ids,
@@ -202,6 +225,25 @@ pub fn accept_handoff(
     receiver_agent: Option<&str>,
     handoff_key: &[u8; 32],
 ) -> Result<AcceptResult, HandoffError> {
+    accept_handoff_for_tenant(
+        session_store,
+        fact_store,
+        signed,
+        receiver_agent,
+        "default",
+        handoff_key,
+    )
+}
+
+/// Tenant-authorized handoff acceptance used by request-facing MCP handlers.
+pub fn accept_handoff_for_tenant(
+    session_store: &mut SessionStore,
+    fact_store: &mut FactStore,
+    signed: &SignedHandoff,
+    receiver_agent: Option<&str>,
+    receiver_tenant: &str,
+    handoff_key: &[u8; 32],
+) -> Result<AcceptResult, HandoffError> {
     if signed.signature_alg != HANDOFF_SIGNATURE_ALG {
         return Err(HandoffError::UnsupportedSignatureAlgorithm(
             signed.signature_alg.clone(),
@@ -224,6 +266,12 @@ pub fn accept_handoff(
     }
 
     let package: HandoffPackage = serde_json::from_slice(&payload_bytes)?;
+    if package.tenant_hash != receiver_tenant {
+        return Err(HandoffError::TenantMismatch {
+            package: package.tenant_hash,
+            receiver: receiver_tenant.to_string(),
+        });
+    }
 
     // Capture the task record before `package` is partially moved below, so it
     // can be surfaced to the receiver in the result.
@@ -239,6 +287,39 @@ pub fn accept_handoff(
         }
     }
 
+    // Validate the complete package before mutating either store. A valid MAC
+    // proves the package came from this daemon; it does not make legacy
+    // package-controlled entity names safe to feed into typed control
+    // namespaces.
+    let mut prepared_facts = Vec::with_capacity(package.facts.len());
+    for fact in &package.facts {
+        if fact.private {
+            let logical_entity = scope::visible_entity_for_agent(fact, Some(&package.source_agent))
+                .ok_or_else(|| HandoffError::InvalidPrivateFact(fact.entity.clone()))?;
+            if let Some(prefix) = corecrux_memory::fact_privacy::generic_create_reserved_entity_prefix(&logical_entity)
+            {
+                return Err(HandoffError::ReservedEntity {
+                    entity: logical_entity,
+                    prefix: prefix.to_string(),
+                });
+            }
+            let receiver = receiver_agent.ok_or(HandoffError::ReceiverAgentRequired)?;
+            prepared_facts.push((
+                fact.clone(),
+                scope::private_entity_for_agent(receiver, &logical_entity),
+                true,
+            ));
+        } else if let Some(prefix) = corecrux_memory::fact_privacy::generic_create_reserved_entity_prefix(&fact.entity)
+        {
+            return Err(HandoffError::ReservedEntity {
+                entity: fact.entity.clone(),
+                prefix: prefix.to_string(),
+            });
+        } else {
+            prepared_facts.push((fact.clone(), fact.entity.clone(), false));
+        }
+    }
+
     let stored_session_id = scope::scoped_session_id(receiver_agent, &package.session_id);
     let session_loaded = if let Some(state) = package.session_state {
         session_store.put(&stored_session_id, state, None);
@@ -247,19 +328,10 @@ pub fn accept_handoff(
         false
     };
 
-    let facts_loaded = package.facts.len();
-    for fact in package.facts {
-        let (entity, private) = if fact.private {
-            let logical_entity = scope::visible_entity_for_agent(&fact, Some(&package.source_agent))
-                .unwrap_or_else(|| fact.entity.clone());
-            let receiver = receiver_agent.ok_or(HandoffError::ReceiverAgentRequired)?;
-            (scope::private_entity_for_agent(receiver, &logical_entity), true)
-        } else {
-            (fact.entity, false)
-        };
-
+    let facts_loaded = prepared_facts.len();
+    for (fact, entity, private) in prepared_facts {
         fact_store.store(StoreFact {
-            tenant_hash: "default".to_string(),
+            tenant_hash: receiver_tenant.to_string(),
             entity,
             key: fact.key,
             value: fact.value,
@@ -288,12 +360,17 @@ fn collect_relevant_facts(
     session_id: &str,
     session_state: Option<&serde_json::Value>,
     agent_name: Option<&str>,
+    tenant_hash: &str,
 ) -> Vec<Fact> {
     let referenced_ids = extract_fact_ids(session_state);
+    // Decision rows are convenience annotations, not authenticated control
+    // records. They remain handoff-visible for compatibility; the handoff MAC
+    // authenticates transport of the package, not the historical author or
+    // truth of a `__decisions__::` fact.
     let decision_entity = format!("__decisions__::{session_id}");
 
     let mut facts: Vec<Fact> = fact_store
-        .all_facts()
+        .all_facts_for_tenant(tenant_hash)
         .filter(|fact| !fact.deleted)
         .filter(|fact| !fact.private)
         .filter(|fact| scope::fact_visible_to_agent(fact, agent_name))
@@ -313,6 +390,14 @@ fn collect_relevant_facts(
             .then_with(|| left.fact_id.cmp(&right.fact_id))
     });
     facts
+}
+
+fn default_tenant_hash() -> String {
+    "default".to_string()
+}
+
+fn is_default_tenant_hash(tenant_hash: &String) -> bool {
+    tenant_hash == "default"
 }
 
 /// Collect work item ids to bundle on a handoff (orchestrators plan, M5).
@@ -405,6 +490,16 @@ mod tests {
     use crate::scope;
 
     const HANDOFF_KEY: [u8; 32] = [7_u8; 32];
+
+    fn resign_package(package: &HandoffPackage) -> SignedHandoff {
+        let payload_json = serde_json::to_vec(package).expect("serialize package");
+        SignedHandoff {
+            payload_b64: B64.encode(&payload_json),
+            content_hash: blake3::hash(&payload_json).to_hex().to_string(),
+            signature_b64: B64.encode(compute_mac(&HANDOFF_KEY, &payload_json)),
+            signature_alg: HANDOFF_SIGNATURE_ALG.to_string(),
+        }
+    }
 
     fn seed_stores() -> (SessionStore, FactStore) {
         let mut sessions = SessionStore::new();
@@ -539,6 +634,238 @@ mod tests {
         assert!(imported_values.iter().any(|value| value == "linked by fact id"));
         assert!(!imported_values.iter().any(|value| value == "private note"));
         assert!(!imported_values.iter().any(|value| value == "unrelated fact"));
+    }
+
+    #[test]
+    fn handoff_facts_and_acceptance_are_tenant_bound() {
+        let mut sessions = SessionStore::new();
+        let mut facts = FactStore::new();
+        let tenant_a = facts.store(StoreFact {
+            tenant_hash: "tenant-a".to_string(),
+            entity: "sess_tenant".to_string(),
+            key: "summary".to_string(),
+            value: "tenant-a-only".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        let tenant_b = facts.store(StoreFact {
+            tenant_hash: "tenant-b".to_string(),
+            entity: "sess_tenant".to_string(),
+            key: "summary".to_string(),
+            value: "tenant-b-only".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        sessions.put(
+            "sess_tenant",
+            json!({"context_refs": [tenant_a.fact_id, tenant_b.fact_id]}),
+            None,
+        );
+
+        let signed = create_handoff_for_tenant(
+            &sessions,
+            &facts,
+            CreateHandoffRequest {
+                session_id: "sess_tenant",
+                stored_session_id: "sess_tenant",
+                include_facts: true,
+                source_agent: "agent-alpha",
+                target_agent: Some("agent-beta".to_string()),
+                message: None,
+                task_record: None,
+            },
+            "tenant-a",
+            &HANDOFF_KEY,
+        )
+        .expect("tenant-a handoff");
+        let package: HandoffPackage = serde_json::from_slice(&B64.decode(&signed.payload_b64).unwrap()).unwrap();
+        assert_eq!(package.tenant_hash, "tenant-a");
+        assert_eq!(package.facts.len(), 1);
+        assert_eq!(package.facts[0].value, "tenant-a-only");
+
+        let mut recv_sessions = SessionStore::new();
+        let mut recv_facts = FactStore::new();
+        let err = accept_handoff_for_tenant(
+            &mut recv_sessions,
+            &mut recv_facts,
+            &signed,
+            Some("agent-beta"),
+            "tenant-b",
+            &HANDOFF_KEY,
+        )
+        .expect_err("cross-tenant acceptance must fail");
+        assert!(matches!(err, HandoffError::TenantMismatch { .. }));
+        assert!(recv_sessions.list().is_empty());
+        assert_eq!(recv_facts.count(), 0);
+
+        let accepted = accept_handoff_for_tenant(
+            &mut recv_sessions,
+            &mut recv_facts,
+            &signed,
+            Some("agent-beta"),
+            "tenant-a",
+            &HANDOFF_KEY,
+        )
+        .expect("same-tenant acceptance");
+        assert_eq!(accepted.facts_loaded, 1);
+        assert!(recv_facts
+            .all_facts_for_tenant("tenant-a")
+            .any(|fact| fact.value == "tenant-a-only"));
+        assert_eq!(recv_facts.all_facts_for_tenant("tenant-b").count(), 0);
+    }
+
+    #[test]
+    fn accept_rejects_legacy_control_fact_atomically() {
+        let (sessions, facts) = seed_stores();
+        let signed = create_handoff(
+            &sessions,
+            &facts,
+            CreateHandoffRequest {
+                session_id: "sess_handoff",
+                stored_session_id: "sess_handoff",
+                include_facts: false,
+                source_agent: "agent-alpha",
+                target_agent: Some("agent-beta".to_string()),
+                message: None,
+                task_record: None,
+            },
+            &HANDOFF_KEY,
+        )
+        .expect("create");
+        let mut package: HandoffPackage = serde_json::from_slice(&B64.decode(&signed.payload_b64).unwrap()).unwrap();
+        let mut legacy = FactStore::new();
+        let mut legacy_fact = legacy.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "__passport__::forged".to_string(),
+            key: "record".to_string(),
+            value: r#"{"tier":"operator"}"#.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        // Simulate a pre-policy public control row carried by an old but
+        // otherwise MAC-valid handoff package.
+        legacy_fact.private = false;
+        package.facts = vec![legacy_fact];
+        let signed = resign_package(&package);
+
+        let mut recv_sessions = SessionStore::new();
+        let mut recv_facts = FactStore::new();
+        let err = accept_handoff(
+            &mut recv_sessions,
+            &mut recv_facts,
+            &signed,
+            Some("agent-beta"),
+            &HANDOFF_KEY,
+        )
+        .expect_err("protected fact must be rejected");
+
+        assert!(matches!(
+            err,
+            HandoffError::ReservedEntity {
+                ref prefix,
+                ..
+            } if prefix == "__passport__::"
+        ));
+        assert!(recv_sessions.list().is_empty(), "session write must be atomic");
+        assert_eq!(recv_facts.count(), 0, "fact write must be atomic");
+    }
+
+    #[test]
+    fn accept_remaps_valid_source_owned_private_fact() {
+        let package = HandoffPackage {
+            session_id: "sess-private".to_string(),
+            session_state: None,
+            facts: {
+                let mut source = FactStore::new();
+                vec![source.store(StoreFact {
+                    tenant_hash: "default".to_string(),
+                    entity: scope::private_entity_for_agent("agent-alpha", "notes"),
+                    key: "decision".to_string(),
+                    value: "keep local".to_string(),
+                    source_receipt: None,
+                    confidence: 1.0,
+                    private: true,
+                    horizon_class: None,
+                    actor: None,
+                })]
+            },
+            created_at: Utc::now().to_rfc3339(),
+            source_agent: "agent-alpha".to_string(),
+            tenant_hash: "default".to_string(),
+            target_agent: Some("agent-beta".to_string()),
+            message: None,
+            work_ids: Vec::new(),
+            task_record: None,
+        };
+
+        let mut recv_sessions = SessionStore::new();
+        let mut recv_facts = FactStore::new();
+        let result = accept_handoff(
+            &mut recv_sessions,
+            &mut recv_facts,
+            &resign_package(&package),
+            Some("agent-beta"),
+            &HANDOFF_KEY,
+        )
+        .expect("valid private handoff");
+
+        assert_eq!(result.facts_loaded, 1);
+        let imported = recv_facts.all_facts().next().expect("imported fact");
+        assert_eq!(imported.entity, "__agent::agent-beta::notes");
+        assert!(imported.private);
+    }
+
+    #[test]
+    fn accept_rejects_private_fact_disguising_control_entity() {
+        let package = HandoffPackage {
+            session_id: "sess-private".to_string(),
+            session_state: Some(json!({"must_not": "load"})),
+            facts: {
+                let mut source = FactStore::new();
+                vec![source.store(StoreFact {
+                    tenant_hash: "default".to_string(),
+                    entity: scope::private_entity_for_agent("agent-alpha", "__passport__::forged"),
+                    key: "record".to_string(),
+                    value: "{}".to_string(),
+                    source_receipt: None,
+                    confidence: 1.0,
+                    private: true,
+                    horizon_class: None,
+                    actor: None,
+                })]
+            },
+            created_at: Utc::now().to_rfc3339(),
+            source_agent: "agent-alpha".to_string(),
+            tenant_hash: "default".to_string(),
+            target_agent: Some("agent-beta".to_string()),
+            message: None,
+            work_ids: Vec::new(),
+            task_record: None,
+        };
+
+        let mut recv_sessions = SessionStore::new();
+        let mut recv_facts = FactStore::new();
+        let err = accept_handoff(
+            &mut recv_sessions,
+            &mut recv_facts,
+            &resign_package(&package),
+            Some("agent-beta"),
+            &HANDOFF_KEY,
+        )
+        .expect_err("logical control entity must be rejected");
+
+        assert!(matches!(err, HandoffError::ReservedEntity { .. }));
+        assert!(recv_sessions.list().is_empty());
+        assert_eq!(recv_facts.count(), 0);
     }
 
     #[test]

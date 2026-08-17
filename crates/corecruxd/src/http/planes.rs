@@ -1,14 +1,14 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! HTTP CRUD for project planes (sub-units inside a project) + their members,
 //! tenants, and layers.
 //!
 //! All routes scope under `/v1/projects/{id}/planes/...`. Reads need
-//! `admin:read`; mutations need `admin:read` for member/tenant changes (same
-//! posture as the parent project routes) and `facts:write` for layer writes.
+//! `admin:read`; structural mutations need `admin:write`, while layer writes
+//! use their dedicated `facts:write` contract.
 
 use super::{problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, State, StatusCode};
 
@@ -58,6 +58,7 @@ pub(super) struct PutPlaneLayerBody {
     pub content: String,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_planes(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -80,6 +81,7 @@ pub(super) async fn get_planes(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_plane(
     State(state): State<AppState>,
     Path((project_id, plane_id)): Path<(String, String)>,
@@ -97,13 +99,14 @@ pub(super) async fn get_plane(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_plane(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<CreatePlaneBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -129,12 +132,13 @@ pub(super) async fn post_plane(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_plane(
     State(state): State<AppState>,
     Path((project_id, plane_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -147,13 +151,14 @@ pub(super) async fn delete_plane(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_plane_member(
     State(state): State<AppState>,
     Path((project_id, plane_id)): Path<(String, String)>,
     headers: HeaderMap,
     Json(body): Json<PlaneMemberBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -173,12 +178,13 @@ pub(super) async fn post_plane_member(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_plane_member(
     State(state): State<AppState>,
     Path((project_id, plane_id, passport_id)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -190,13 +196,14 @@ pub(super) async fn delete_plane_member(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_plane_tenant(
     State(state): State<AppState>,
     Path((project_id, plane_id)): Path<(String, String)>,
     headers: HeaderMap,
     Json(body): Json<PlaneTenantBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -216,12 +223,13 @@ pub(super) async fn post_plane_tenant(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_plane_tenant(
     State(state): State<AppState>,
     Path((project_id, plane_id, tenant_id)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -233,6 +241,7 @@ pub(super) async fn delete_plane_tenant(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_plane_layers(
     State(state): State<AppState>,
     Path((project_id, plane_id)): Path<(String, String)>,
@@ -246,9 +255,9 @@ pub(super) async fn get_plane_layers(
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
         min_effective_confidence: None,
         tenant_hash: None,
-        query: Some(prefix.clone()),
+        query: None,
         entity: None,
-        entity_prefix: None,
+        entity_prefix: Some(prefix.clone()),
         top_k: 200,
         token_budget: None,
     });
@@ -294,6 +303,7 @@ pub(super) async fn get_plane_layers(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn put_plane_layer(
     State(state): State<AppState>,
     Path((project_id, plane_id, layer)): Path<(String, String, String)>,
@@ -360,6 +370,7 @@ fn default_sync_max_bytes() -> usize {
     24 * 1024 // 24 KB per layer is plenty for keyword-overlap signal
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_sync_layers(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -397,6 +408,7 @@ pub(super) async fn post_sync_layers(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_plane_layer(
     State(state): State<AppState>,
     Path((project_id, plane_id, layer)): Path<(String, String, String)>,

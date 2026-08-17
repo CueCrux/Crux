@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Liveness + readiness probes — `/healthz`, `/readyz`, `/metrics` (Prometheus text format).
 
@@ -20,6 +20,7 @@ use super::{
         (status = 200, description = "Node health status"),
     )
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     let _ = state.commit_level;
     // Minimal public mode: omit routing (node id, shard map) and valve state so
@@ -141,6 +142,7 @@ pub(super) fn evaluate_replicated_commit_topology(
         (status = 503, description = "Node not ready"),
     )
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     // Phase 3 readiness: lock held + routing table loaded + control evidence + capacity checks.
     let routing = state.routing.read().await;
@@ -190,6 +192,18 @@ pub(super) async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
         Some(format!(
             "failed read retries exceeded threshold (failed={} threshold={})",
             read_retry_failed_total, state.read_retry_failed_readyz_threshold
+        ))
+    };
+    let (seal_failed_streak, seal_failed_last_error) = state.seal_failed_streak.read().await.clone();
+    let seal_ok = state.seal_failed_readyz_threshold == 0 || seal_failed_streak < state.seal_failed_readyz_threshold;
+    let seal_error = if seal_ok {
+        None
+    } else {
+        Some(format!(
+            "local ingest seal failing (consecutive={} threshold={}): {}",
+            seal_failed_streak,
+            state.seal_failed_readyz_threshold,
+            seal_failed_last_error.as_deref().unwrap_or("unknown")
         ))
     };
     let projection_snapshot_issues = if let Some(pool) = state.dataplane_pool.as_ref() {
@@ -262,6 +276,7 @@ pub(super) async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
         && replicated_commit_dataplane_ok
         && replicated_commit_topology_ok
         && read_retry_failed_ok
+        && seal_ok
         && projection_snapshots_valid_ok
         && corruption_state_clear
         && control_evidence_ready
@@ -306,6 +321,13 @@ pub(super) async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
             error: read_retry_failed_error,
         });
     }
+    if !seal_ok {
+        checks.push(ReadyCheck {
+            name: "local_ingest_seal",
+            ok: false,
+            error: seal_error,
+        });
+    }
     if !projection_snapshots_valid_ok {
         checks.push(ReadyCheck {
             name: "projection_snapshots_valid",
@@ -346,6 +368,7 @@ pub(super) async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
         (status = 200, description = "Prometheus metrics", content_type = "text/plain"),
     )
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     match state.metrics.render() {
         Ok(body) => {
@@ -457,12 +480,40 @@ fn embedding_delegation_runtime_state(
     }
 }
 
+/// Live companion-provenance tallies for `/v1/version`.
+///
+/// The mode is read from config rather than cached on the index: an operator who
+/// changes it wants `/v1/version` to say so after a restart, and this is the
+/// surface they check.
+async fn companion_provenance_runtime(state: &AppState) -> crate::product::CompanionProvenanceRuntime {
+    use corecrux_index::AttestationMode;
+
+    let mode = std::env::var(crate::companion_attestation::MODE_ENV)
+        .map(|raw| AttestationMode::from_str_or_default(&raw))
+        .unwrap_or_default();
+    let index = state.retrieval_index.read().await;
+    let counts = index.provenance_counts();
+    crate::product::CompanionProvenanceRuntime {
+        mode: match mode {
+            AttestationMode::Off => "off",
+            AttestationMode::Warn => "warn",
+            AttestationMode::Enforce => "enforce",
+        },
+        platform: counts.get("platform").copied().unwrap_or(0),
+        local: counts.get("local").copied().unwrap_or(0),
+        none: counts.get("none").copied().unwrap_or(0),
+        invalid: counts.get("invalid").copied().unwrap_or(0),
+        refused: index.refused_segments().len(),
+    }
+}
+
 fn runtime_capability_descriptor(
     state: &AppState,
     sync_status: &corecrux_memory::sync::SyncRuntimeStatus,
     local_embedder_configured: bool,
     local_embedder_initialized: bool,
     embedding_delegation: crate::product::EmbeddingDelegationRuntimeState,
+    companion_provenance: crate::product::CompanionProvenanceRuntime,
 ) -> crate::product::RuntimeCapabilityDescriptor {
     crate::product::RuntimeCapabilityDescriptor::from_runtime(
         state.operating_mode,
@@ -475,6 +526,8 @@ fn runtime_capability_descriptor(
             embedding_delegation,
             rerank_endpoint_configured: rerank_endpoint_configured(state),
             graph_expand_configured: is_query_feature_enabled("CORECRUXD_QUERY_GRAPH_EXPAND"),
+            console_link_graph_configured: super::console::corecrux_graph_base_url_configured(),
+            companion_provenance,
         },
     )
 }
@@ -487,6 +540,7 @@ fn runtime_capability_descriptor(
         (status = 200, description = "Build version and feature flags"),
     )
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoResponse {
     let sync_status = sync_runtime_status();
     let cloud = crate::product::CloudPosture::from_sync(&sync_status);
@@ -510,6 +564,7 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
             local_embedder_configured,
             local_embedder_configured && semantic_profile.is_some(),
             embedding_delegation,
+            companion_provenance_runtime(&state).await,
         ));
     let retrieval_segment_count = state.retrieval_index.read().await.segment_count();
     let protocol_contracts =
@@ -593,6 +648,7 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
     }))
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_admin_version(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
@@ -621,6 +677,7 @@ pub(super) async fn get_admin_version(State(state): State<AppState>, headers: He
             local_embedder_configured,
             local_embedder_configured && semantic_profile.is_some(),
             embedding_delegation,
+            companion_provenance_runtime(&state).await,
         ));
     let retrieval_segment_count = state.retrieval_index.read().await.segment_count();
     let protocol_contracts =

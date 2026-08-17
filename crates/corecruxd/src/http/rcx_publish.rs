@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Local RCX Registry publish preview/emit flows.
 //!
@@ -32,6 +32,7 @@ pub(super) struct PublishBody {
     pub operator_metadata: Option<Value>,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn preview_passport(
     State(state): State<AppState>,
     Path(passport_id): Path<String>,
@@ -47,6 +48,7 @@ pub(super) async fn preview_passport(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn emit_passport(
     State(state): State<AppState>,
     Path(passport_id): Path<String>,
@@ -63,6 +65,7 @@ pub(super) async fn emit_passport(
     emit_response(state, "passport", &passport_id, record, body.registry_url).await
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn preview_project(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -78,6 +81,7 @@ pub(super) async fn preview_project(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn emit_project(
     State(state): State<AppState>,
     Path(project_id): Path<String>,

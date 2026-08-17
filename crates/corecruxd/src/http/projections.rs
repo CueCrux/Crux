@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Projection-query routes — `/v1/projections/entity/{count,timeline,current-state}` + admin rebuild.
 
@@ -11,6 +11,7 @@ use super::{
     StatusCode, TenantQuery,
 };
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_proj_meta(
     State(state): State<AppState>,
     Query(q): Query<ProjMetaQuery>,
@@ -88,6 +89,7 @@ pub(super) struct ProjectionModulesQuery {
     pub shard_id: Option<String>,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_projection_modules(
     State(state): State<AppState>,
     Query(q): Query<ProjectionModulesQuery>,
@@ -505,6 +507,7 @@ pub(super) async fn get_proj_artifact_pressure_events(
 
 // ── Phase 7: Entity projection HTTP handlers ────────────────────────────
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_entity_count(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -543,6 +546,7 @@ pub(super) async fn get_entity_count(
     .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_entity_timeline(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -593,6 +597,7 @@ pub(super) async fn get_entity_timeline(
     .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_entity_current_state(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -698,6 +703,7 @@ pub(super) struct BatchLookupRequest {
 /// fed by the append handler when it observes `corecrux.proj.extraction.*` events.
 ///
 /// Scopes: `admin:read` (tenant-agnostic by design; the cache stream is `__global__`).
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_projection_lookup(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -755,6 +761,7 @@ pub(super) async fn post_projection_lookup(
 }
 
 /// `POST /v1/projections/batch_lookup` — N-key projection read in one round-trip.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_projection_batch_lookup(
     State(state): State<AppState>,
     headers: HeaderMap,

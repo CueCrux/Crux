@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Substrate entity MCP tools: `entity_get`, `entity_list`, `entity_upsert`,
 //! `entity_delete`.
@@ -13,6 +13,25 @@ use serde_json::{json, Value};
 
 use crate::dispatch::McpContext;
 use crate::protocol::{JsonRpcError, INTERNAL_ERROR, INVALID_PARAMS};
+
+/// Entity kinds whose authority belongs to a typed governance surface. Generic
+/// substrate CRUD must neither read nor mutate them.
+pub const GOVERNED_ENTITY_KINDS: &[&str] = &["orchestrator"];
+
+pub fn is_governed_entity_kind(kind: &str) -> bool {
+    GOVERNED_ENTITY_KINDS.contains(&kind)
+}
+
+fn reject_governed_kind(kind: &str) -> Result<(), JsonRpcError> {
+    if is_governed_entity_kind(kind) {
+        return Err(JsonRpcError {
+            code: INVALID_PARAMS,
+            message: format!("entity kind '{kind}' is governed by its typed API"),
+            data: Some(json!({"kind": kind, "code": "GOVERNED_ENTITY_KIND"})),
+        });
+    }
+    Ok(())
+}
 
 fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, JsonRpcError> {
     args.get(key).and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
@@ -30,6 +49,7 @@ fn actor_from_ctx(ctx: &McpContext) -> String {
 
 pub async fn handle_entity_upsert(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let kind = require_str(args, "kind")?;
+    reject_governed_kind(kind)?;
     let id = require_str(args, "id")?;
     let payload = args.get("payload").cloned().ok_or_else(|| JsonRpcError {
         code: INVALID_PARAMS,
@@ -65,6 +85,7 @@ pub async fn handle_entity_upsert(args: &Value, ctx: &McpContext) -> Result<Valu
 
 pub async fn handle_entity_get(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let kind = require_str(args, "kind")?;
+    reject_governed_kind(kind)?;
     let id = require_str(args, "id")?;
     let include_deleted = args.get("include_deleted").and_then(|v| v.as_bool()).unwrap_or(false);
     let store = ctx.entity_store.read().await;
@@ -86,13 +107,33 @@ pub async fn handle_entity_get(args: &Value, ctx: &McpContext) -> Result<Value, 
 }
 
 pub async fn handle_entity_list(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    let requested_kind = args.get("kind").and_then(|value| value.as_str());
+    if let Some(kind) = requested_kind {
+        reject_governed_kind(kind)?;
+    }
+    let requested_limit = args
+        .get("limit")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize);
     let q = EntityQuery {
-        kind: args.get("kind").and_then(|v| v.as_str()).map(String::from),
-        limit: args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize),
+        kind: requested_kind.map(String::from),
+        // Filter governed rows before limiting so hidden records cannot starve
+        // an unfiltered generic listing.
+        limit: requested_kind.and(requested_limit),
         include_deleted: args.get("include_deleted").and_then(|v| v.as_bool()).unwrap_or(false),
     };
     let store = ctx.entity_store.read().await;
-    let items: Vec<_> = store.list(&q).into_iter().cloned().collect();
+    let mut items: Vec<_> = store
+        .list(&q)
+        .into_iter()
+        .filter(|record| !is_governed_entity_kind(&record.kind))
+        .cloned()
+        .collect();
+    if requested_kind.is_none() {
+        if let Some(limit) = requested_limit {
+            items.truncate(limit);
+        }
+    }
     Ok(json!({
         "content": [{"type":"text","text": format!("listed {} entities", items.len())}],
         "entities": items,
@@ -102,6 +143,7 @@ pub async fn handle_entity_list(args: &Value, ctx: &McpContext) -> Result<Value,
 
 pub async fn handle_entity_history(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let kind = require_str(args, "kind")?;
+    reject_governed_kind(kind)?;
     let id = require_str(args, "id")?;
     let store = ctx.entity_store.read().await;
     let versions: Vec<_> = store.history(kind, id).into_iter().cloned().collect();
@@ -114,6 +156,7 @@ pub async fn handle_entity_history(args: &Value, ctx: &McpContext) -> Result<Val
 
 pub async fn handle_entity_delete(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let kind = require_str(args, "kind")?;
+    reject_governed_kind(kind)?;
     let id = require_str(args, "id")?;
     let actor = actor_from_ctx(ctx);
     let mut store = ctx.entity_store.write().await;
@@ -197,5 +240,61 @@ mod tests {
             .await
             .unwrap();
         assert!(res["entity"].is_null());
+    }
+
+    #[tokio::test]
+    async fn governed_kinds_are_neither_visible_nor_mutable() {
+        let ctx = McpContext::new_default("test-node");
+        {
+            let mut store = ctx.entity_store.write().await;
+            store
+                .upsert(
+                    "orchestrator",
+                    "orc_secret",
+                    json!({"tenant_id":"tenant-b","name":"secret"}),
+                    "seed",
+                    None,
+                )
+                .expect("seed governed entity");
+            store
+                .upsert("capability", "visible", json!({"name":"visible"}), "seed", None)
+                .expect("seed visible entity");
+        }
+
+        for result in [
+            handle_entity_get(&json!({"kind":"orchestrator","id":"orc_secret"}), &ctx).await,
+            handle_entity_upsert(
+                &json!({
+                    "kind":"orchestrator",
+                    "id":"orc_secret",
+                    "payload":{"tenant_id":"tenant-a","name":"stolen"}
+                }),
+                &ctx,
+            )
+            .await,
+            handle_entity_history(&json!({"kind":"orchestrator","id":"orc_secret"}), &ctx).await,
+            handle_entity_delete(&json!({"kind":"orchestrator","id":"orc_secret"}), &ctx).await,
+            handle_entity_list(&json!({"kind":"orchestrator"}), &ctx).await,
+        ] {
+            let error = result.expect_err("governed entity operation must be rejected");
+            assert_eq!(
+                error.data.as_ref().and_then(|data| data["code"].as_str()),
+                Some("GOVERNED_ENTITY_KIND")
+            );
+        }
+
+        let unfiltered = handle_entity_list(&json!({"limit":1}), &ctx)
+            .await
+            .expect("unfiltered list");
+        assert_eq!(unfiltered["count"], 1);
+        assert_eq!(unfiltered["entities"][0]["kind"], "capability");
+
+        let store = ctx.entity_store.read().await;
+        let governed = store
+            .get("orchestrator", "orc_secret")
+            .expect("governed entity remains");
+        assert_eq!(governed.version, 1);
+        assert!(!governed.deleted);
+        assert_eq!(governed.payload["tenant_id"], "tenant-b");
     }
 }

@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Bridge between [`crate::http::extensions::invoke_extension_tool`] and
 //! [`crate::wasm_host`] for `kind: wasm` manifests (M6.3 of the
@@ -70,7 +70,7 @@ pub fn module_path_for(data_dir: &Path, extension_id: &str, manifest: &Integrati
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Top-level entry point used by the HTTP dispatcher when
@@ -182,6 +182,9 @@ impl HostFactStore for WasmFactStoreAdapter {
     }
 
     fn store_fact(&self, req: HostStoreFact) -> Result<HostFact, String> {
+        if let Some(prefix) = crate::fact_privacy::generic_create_reserved_entity_prefix(&req.entity) {
+            return Err(format!("create-reserved fact namespace `{prefix}`"));
+        }
         let mut store = self.store.blocking_write();
         let mut sf = StoreFact {
             tenant_hash: "default".to_string(),
@@ -192,6 +195,7 @@ impl HostFactStore for WasmFactStoreAdapter {
             confidence: req.confidence,
             private: false,
             horizon_class: None,
+            actor: None,
         };
         // Final belt-and-braces: even if the grant allowed the prefix,
         // privacy gate has the last word over private prefixes.

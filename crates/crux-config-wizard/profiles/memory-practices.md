@@ -1,7 +1,7 @@
 +++
 name = "memory-practices"
-version = 1
-description = "Crux daemon memory + retrieval discipline."
+version = 3
+description = "Crux daemon memory + retrieval discipline. v3 adds the tool-routing block: three signals (the [tier:local] marker, sync_status local_only, and a stale 'unreachable' boot banner) were each being misread as 'the MCP tools cannot reach the daemon', causing agents to hand-roll curl against /v1/facts to reach a host the tools were already connected to. States what each signal actually means and the rule that one call settles it. v2 collapsed the four competing session-boot rituals that were spread across this profile, execplan-discipline, and workspace-cuecrux into one ordered block, and dropped the token_budget mandate and fact-storage entity conventions now that both are carried by the MCP tool schemas themselves (crux-mcp/src/tools/mod.rs), where the model reads them at call time instead of once at session start. Historical driver: the Insights report's friction #1, nine sessions blocked on output-token exhaustion."
 targets = ["claude_md", "agents_md"]
 order = 10
 risk_class = "low"
@@ -9,33 +9,48 @@ risk_class = "low"
 
 ## Crux Daemon Memory Practices
 
-### Session boot (once per session)
+### Session boot
 
-Before any non-trivial work, in this order:
+This is the **only** boot sequence — run it once, in order, before non-trivial work; skip it for
+trivial single-file edits. Later sections reference these steps; none of them start a second sequence.
 
-1. `sync_status()` — if mode is `local_only` or `degraded`, stay on the local store and skip cross-agent handoffs.
-2. `update_status()` — if `behind`, pull `get_bootstrap(topic="docs", query="upgrade")` before touching deploys. If `ahead` or `diverged`, stop and escalate.
-3. `get_bootstrap(topic="patterns")` on cold start to load current playbooks (token_budget=500).
+1. `sync_status()` — on `local_only` or `degraded`, stay local and skip cross-agent handoffs.
+2. `update_status()` — if `behind`, pull `get_bootstrap(topic="docs", query="upgrade")` before touching
+   deploys; if `ahead` or `diverged`, stop and escalate.
+3. `get_bootstrap(topic="patterns")` on a cold start.
+4. `list_work(source="all")` — the work table is true north for what to pick up.
+5. If sessions may be live in this tree, read the banner's live-sessions block or call `coord_status`
+   before claiming paths.
 
-Skip these only for trivial single-file edits.
+### Chat is for state transitions
 
-### Two non-negotiable rules
+Durable content goes to `store_fact` or to files. Chat carries what changed, the gate result, and the
+next milestone or escalation. ExecPlans, audit tables, and benchmark results are written and referenced
+by path.
 
-- **`token_budget` is mandatory on every retrieval call.** Defaults: 500 for confirmations, 2000 for scans, 4000 for design pulls. The primary defence against output-token blowouts (Insights report friction #1, 9 sessions blocked).
-- **Chat is for state transitions; durable content goes to `store_fact` or files.** Per-message chat output is limited to: (1) what changed, (2) gate result, (3) next milestone or escalation. ExecPlans, audit tables, benchmark results, and milestone summaries are written to files and referenced by path.
+### The MCP tools already reach the right daemon
 
-### Fact-storage conventions
+Three signals get misread as "the daemon is unreachable, so write around it". They mean different things,
+and none of them means the MCP tools are the wrong path:
 
-When calling `store_fact`, use these entity prefixes and required keys — this keeps `query_facts` recall consistent across sessions.
+| Signal | What it actually means |
+|---|---|
+| `[tier:local]` on a tool | **Entitlement tier** — callable on a free/local install. Not a claim about where data is stored. |
+| `sync_status: local_only` | **Remote fact mirroring** is unconfigured. Unrelated to whether the client can reach a daemon. |
+| Boot banner `unreachable` | **This session's MCP binding**, which can be stale. Probe `/readyz` before believing it. |
 
-- `entity="execplan:<slug>"` — keys: `decision:<topic>`, `milestone:M<n>`, `gate:M<n>`. Decision values must include `commit_sha`.
-- `entity="bench:<id>"` — value object requires `{metric, value, corpus, lane_flags, commit_sha, run_id}`. `corpus` is mandatory.
-- `entity="incident:<YYYY-MM-DD>"` — value requires `{symptom, cause, fix_sha, repro_steps}`.
-- `entity="design:<slug>"` — for architectural notes; value includes a `doc_path` field pointing at the design doc in your repo.
+Every tool executes against whichever daemon the MCP client is configured to talk to, which is frequently
+a remote host. So: **call the tool, and fall back to raw HTTP only on an actual failure.** Do not
+hand-roll `curl` against `/v1/facts` because a marker or a banner implied the tool would not get there —
+verifying costs one call, and inferring costs a rewrite.
 
 ### Don'ts
 
-- Do not call retrieval tools without `token_budget`.
-- Do not put `store_fact` behind PostToolUse hooks — facts must be deliberate, not reflexive (volume dilutes recall).
-- Do not migrate `MEMORY.md` content wholesale into Crux facts — they serve different audiences. Link via `store_fact(... value={memory_md_ref: "<slug>.md"})`.
-- Do not skip `sync_status()` before remote integration work — operating on a `degraded` node and assuming sync produces silent contradictions.
+- Do not put `store_fact` behind PostToolUse hooks — facts must be deliberate. Volume dilutes recall.
+- Do not migrate `MEMORY.md` wholesale into facts; link via `value={memory_md_ref: "<slug>.md"}`.
+- Do not skip `sync_status()` before remote integration work: assuming sync on a `degraded` node
+  produces silent contradictions.
+- Do not conclude a tool is unavailable from its description or the banner. One call settles it.
+
+> Retrieval budgets and `store_fact` entity conventions live on the tools — read the `token_budget` and
+> `entity` field descriptions in the MCP schema rather than restating them here.

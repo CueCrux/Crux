@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! HTTP routes for the workspace scanner. The scanner walks a Rust workspace
 //! (default `/src` under docker-compose.dev.yml) and emits structured facts
@@ -13,14 +13,14 @@
 
 use super::{problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, State, StatusCode};
 
-const LATEST_SCAN_ENTITY: &str = "__workspace_scan__::latest";
-const SCAN_KEY: &str = "content";
+use crate::workspace_scan::{LATEST_SCAN_ENTITY, SCAN_KEY};
 
 /// `POST /v1/workspace/scan` — kick off a scan of the configured workspace
 /// path. Returns the scan summary (no file contents) inline; full payload is
 /// persisted as a fact.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_scan(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let scan_result = tokio::task::spawn_blocking(crate::workspace_scan::run_scan).await;
@@ -77,6 +77,7 @@ pub(super) async fn post_scan(State(state): State<AppState>, headers: HeaderMap)
 /// main HTTP port (14800) so the in-browser console can read it without
 /// crossing CORS to the MCP port (14801). Returns the same shape as the
 /// JSON-RPC tools/list result, minus the JSON-RPC envelope.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_mcp_tools(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
@@ -103,6 +104,7 @@ pub(super) async fn get_mcp_tools(State(state): State<AppState>, headers: Header
 }
 
 /// `GET /v1/workspace/scan` — return the latest persisted scan in full.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_scan(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
@@ -150,6 +152,7 @@ fn parse_truthy(s: Option<&str>) -> bool {
 /// - `?format=json` — full compact graph (no root needed; agents want it all).
 /// - `?root=POST /v1/projects&format=tree` — single route storyline as text.
 /// - `?root=crates/corecruxd/src/main.rs&format=tree` — root at any file.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_storyline(
     State(state): State<AppState>,
     headers: HeaderMap,

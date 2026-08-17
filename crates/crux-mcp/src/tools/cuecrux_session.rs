@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! `cuecrux_session` — the single collapsed-surface MCP tool
 //! (master-plan §6).
@@ -42,7 +42,11 @@ pub fn tool_input_schema() -> Value {
                 "properties": {
                     "prefer_bulk":       { "type": "boolean" },
                     "max_capabilities":  { "type": "integer", "minimum": 0 },
-                    "want_parent_chain": { "type": "boolean" }
+                    "want_parent_chain": { "type": "boolean" },
+                    "hide_exclusions":   {
+                        "type": "boolean",
+                        "description": "Suppress the capability-graph 'excluded' list entirely (§5.7 privacy). Default false."
+                    }
                 },
                 "additionalProperties": false
             }
@@ -203,6 +207,16 @@ mod tests {
         // `additionalProperties: false` prevents unknown top-level keys from
         // being silently accepted.
         assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn hints_schema_advertises_hide_exclusions() {
+        // §5.7 privacy flag must be a discoverable, typed hint so MCP-only
+        // clients can request a leak-free plan; the handler forwards the whole
+        // `hints` object to POST /session, where corecruxd threads it through.
+        let schema = tool_input_schema();
+        let hints = &schema["properties"]["hints"]["properties"];
+        assert_eq!(hints["hide_exclusions"]["type"], "boolean");
     }
 
     #[tokio::test]

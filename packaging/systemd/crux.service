@@ -1,5 +1,5 @@
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 #
 # System-wide unit, shipped in the .deb (packaging/deb/nfpm.yaml).
 # Per-user installs get a user unit from packaging/install.sh instead.
@@ -20,6 +20,7 @@ StateDirectory=crux
 StateDirectoryMode=0700
 Environment=CORECRUXD_DATA_DIR=/var/lib/crux
 Environment=CORECRUXD_AUTH_MODE=dev_scopes
+Environment=CORECRUXD_ROUTE_AUTH=enforce
 # Binary installs have no git checkout to compare against; keep the
 # no-phone-home posture explicit (see scripts/assert-no-phone-home.sh).
 Environment=CORECRUXD_UPDATE_CHECK_ENABLED=0

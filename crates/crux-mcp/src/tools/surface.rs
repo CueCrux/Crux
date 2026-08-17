@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Tool-surface shaping — graph-driven dynamic tool surface (M1–M4).
 //!
@@ -104,6 +104,15 @@ impl ToolSurfaceMode {
             "minimal" => Self::Minimal,
             "dynamic" => Self::Dynamic,
             _ => Self::Full,
+        }
+    }
+
+    /// Stable lowercase wire string (ledger `agent.tools_offered.v1` events).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Minimal => "minimal",
+            Self::Dynamic => "dynamic",
         }
     }
 }
@@ -210,7 +219,29 @@ pub fn tool_affinity(tool: &str) -> &'static str {
         | "memory_acknowledge_use"
         | "artefact_put"
         | "artefact_get"
-        | "artefact_list" => "memory",
+        | "artefact_list"
+        // Substrate CRUD: entities, edges and the kind registry. The whole
+        // family had no entry, so every one scored 0 and was reachable only by
+        // an agent that already knew the name — `tools/list` advertises the
+        // floor, and none of them are in it. That is not theoretical: a session
+        // reconciling the Feature Registry's capability graph read `tools/list`,
+        // concluded the daemon had no `edge_delete`, and recorded a stale edge
+        // as permanently unfixable. It had been there the whole time.
+        //
+        // "memory" because that is exactly what they are — `corecrux-memory`
+        // owns entities, edges and the kind registry alongside the fact store,
+        // and `list_entities` was already tagged this way.
+        | "entity_upsert"
+        | "entity_get"
+        | "entity_list"
+        | "entity_delete"
+        | "entity_history"
+        | "edge_upsert"
+        | "edge_get"
+        | "edge_list"
+        | "edge_delete"
+        | "kind_get"
+        | "kind_list" => "memory",
         "save_session"
         | "get_session"
         | "list_sessions"
@@ -222,7 +253,22 @@ pub fn tool_affinity(tool: &str) -> &'static str {
         | "accept_handoff"
         | "get_workspace_storyline"
         | "register_repo"
-        | "list_repos" => "session",
+        | "list_repos"
+        // Context graph (storybook + dossiers). These belong beside
+        // create_handoff/accept_handoff rather than under "memory": a dossier IS
+        // the cross-session handoff of what an agent worked out, and the
+        // storybook is the project state a resuming session reads first.
+        // Without an entry here they score 0 and never surface beyond the floor
+        // in ANY intent, so an agent could only reach them by already knowing
+        // their names — which is the discovery problem they were built to solve.
+        | "get_project_storybook"
+        | "generate_project_storybook"
+        | "diff_project_storybook"
+        | "get_project_dossiers"
+        | "generate_project_dossier"
+        | "publish_project_dossier"
+        | "reconcile_project_dossiers"
+        | "diff_project_dossiers" => "session",
         "audit_config"
         | "check_config_audit"
         | "audit_export_bundle"
@@ -237,6 +283,24 @@ pub fn tool_affinity(tool: &str) -> &'static str {
         | "learn"
         | "token_savings" => "audit",
         "proof_verify" | "receipt_verify" | "output_attest" => "proof",
+        // Work board + coordination plane. Same argument as the context-graph
+        // block above, and the same one CORE_FLOOR makes for the handoff pair:
+        // clients only call advertised tools. Coordination that no client can
+        // invoke detects no collisions — on 2026-08-06 two live sessions
+        // overlapped on one checkout and one deleted the other's file, with
+        // `coord_announce` deployed and unreachable from both.
+        "list_work"
+        | "create_work"
+        | "update_work_state"
+        | "comment_on_work"
+        | "coord_announce"
+        | "coord_status"
+        | "punch_in"
+        | "punch_out"
+        | "check_punchcard"
+        | "list_punchcards"
+        | "execplan_write"
+        | "execplan_gate" => "work",
         _ => "",
     }
 }
@@ -427,7 +491,13 @@ mod tests {
             !names.contains(&"github_search"),
             "irrelevant tool must not be surfaced"
         );
-        assert!(!names.contains(&"list_work"), "irrelevant tool must not be surfaced");
+        // `list_work` carries the `work` affinity, which `audit_review` does not
+        // bias — so it still scores 0 here. Affinity alone never surfaces a tool;
+        // an intent has to ask for it.
+        assert!(
+            !names.contains(&"list_work"),
+            "work-affinity tool must not surface under an intent that does not bias it"
+        );
         assert!(names.len() <= CORE_FLOOR.len() + DYNAMIC_TOP_N, "respects top_n cap");
         assert!(names.len() < list_tools().len(), "still far smaller than full");
     }
@@ -459,6 +529,137 @@ mod tests {
         assert_eq!(tool_affinity("receipt_verify"), "proof");
         assert_eq!(tool_affinity("save_session"), "session");
         assert_eq!(tool_affinity("github_search"), "", "unmapped tool ⇒ no affinity");
+    }
+
+    /// The twelve tools an agent executing an ExecPlan has to reach. Every one
+    /// was unmapped before 2026-08-06 and therefore scored 0 in *every* intent —
+    /// the collision detection and board reads documented in the workspace guide
+    /// were uninvokable from the client that was told to use them.
+    const WORK_TOOLS: &[&str] = &[
+        "list_work",
+        "create_work",
+        "update_work_state",
+        "comment_on_work",
+        "coord_announce",
+        "coord_status",
+        "punch_in",
+        "punch_out",
+        "check_punchcard",
+        "list_punchcards",
+        "execplan_write",
+        "execplan_gate",
+    ];
+
+    #[test]
+    fn work_tools_all_carry_the_work_affinity() {
+        for t in WORK_TOOLS {
+            assert_eq!(
+                tool_affinity(t),
+                "work",
+                "{t} must carry an affinity — unmapped means bias 0 in every intent"
+            );
+        }
+    }
+
+    /// Guards the half that is easy to get wrong: an affinity tag is inert
+    /// unless some intent biases it. Both halves of the M1 fix, asserted together.
+    #[test]
+    fn execplan_execution_intent_surfaces_the_coordination_plane() {
+        let shaped = shape_dynamic(list_tools(), Some("execplan_execution"), DYNAMIC_TOP_N);
+        let names: Vec<&str> = shaped.iter().map(|t| t.name.as_str()).collect();
+        for t in ["coord_announce", "list_work"] {
+            assert!(names.contains(&t), "execplan_execution must surface {t}; got {names:?}");
+        }
+        assert!(
+            names.len() <= CORE_FLOOR.len() + DYNAMIC_TOP_N,
+            "must respect the top_n cap, got {}",
+            names.len()
+        );
+        assert!(names.len() < list_tools().len(), "still far smaller than full");
+    }
+
+    /// Flag-off proof: adding an affinity arm and an intent entry must not move
+    /// the no-intent surface, which is what a cold agent gets.
+    #[test]
+    fn work_affinity_does_not_leak_into_the_no_intent_floor() {
+        let shaped = shape_dynamic(list_tools(), None, DYNAMIC_TOP_N);
+        let names: Vec<&str> = shaped.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names.len(), CORE_FLOOR.len(), "no intent ⇒ floor only");
+        for t in WORK_TOOLS {
+            assert!(
+                !names.contains(t),
+                "{t} must not reach the floor without a declared intent"
+            );
+        }
+    }
+
+    /// An unmapped tool scores 0 and is unreachable beyond the floor in every
+    /// intent. That is correct for a tool an agent would never want surfaced,
+    /// and wrong for one whose whole purpose is to be found — so the
+    /// context-graph family is asserted mapped, by name, rather than left to be
+    /// silently forgotten the next time a tool is added.
+    #[test]
+    fn every_context_graph_tool_has_an_affinity() {
+        for tool in [
+            "get_project_storybook",
+            "generate_project_storybook",
+            "diff_project_storybook",
+            "get_project_dossiers",
+            "generate_project_dossier",
+            "publish_project_dossier",
+            "reconcile_project_dossiers",
+            "diff_project_dossiers",
+        ] {
+            assert_eq!(
+                tool_affinity(tool),
+                "session",
+                "{tool} must carry an affinity or it can never be surfaced beyond the floor"
+            );
+        }
+    }
+
+    /// Same reasoning as the context-graph family, learned the hard way. The
+    /// substrate CRUD tools carried no affinity at all, so they scored 0 in
+    /// every intent and never appeared beyond the 16-tool floor. An agent
+    /// reconciling the Feature Registry's capability graph read `tools/list`,
+    /// saw no `edge_delete`, and concluded a stale edge could never be
+    /// retracted — the tool existed and worked. Asserted by name so the next
+    /// tool added to this family cannot be silently forgotten.
+    #[test]
+    fn every_substrate_tool_has_an_affinity() {
+        for tool in [
+            "entity_upsert",
+            "entity_get",
+            "entity_list",
+            "entity_delete",
+            "entity_history",
+            "edge_upsert",
+            "edge_get",
+            "edge_list",
+            "edge_delete",
+            "kind_get",
+            "kind_list",
+        ] {
+            assert_eq!(
+                tool_affinity(tool),
+                "memory",
+                "{tool} must carry an affinity or it can never be surfaced beyond the floor"
+            );
+        }
+    }
+
+    /// The pairing an agent actually needs must be reachable from a declared
+    /// intent, not only by knowing the names.
+    #[test]
+    fn session_review_intent_surfaces_the_context_graph_tools() {
+        let shaped = shape_dynamic(list_tools(), Some("session_review"), DYNAMIC_TOP_N);
+        let names: Vec<&str> = shaped.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names
+                .iter()
+                .any(|n| n.starts_with("get_project_dossiers") || n.starts_with("get_project_storybook")),
+            "a session_review intent must surface at least one context-graph read; got {names:?}"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! `/v1/orchestrators/*` — multi-agent orchestrator surface (orchestrators
 //! plan).
@@ -18,19 +18,18 @@
 //! reference surfaces as `missing: true` rather than failing the whole call.
 //!
 //! Storage: orchestrators persist as `orchestrator`-kind entities in the
-//! substrate entity store (`PUT/GET/DELETE /v1/entities/orchestrator/{id}`
-//! under the hood), so they inherit the journal + restart-survival that
-//! Package S wired. Each mutation emits a `CruxEvent::OrchestratorChanged`
-//! and writes a receipt fact.
+//! substrate entity store, so they inherit the journal + restart-survival that
+//! Package S wired. Generic HTTP/MCP entity CRUD reserves this governed kind;
+//! callers must use this typed surface so tenant and actor checks cannot be
+//! bypassed. Each mutation emits a `CruxEvent::OrchestratorChanged` and writes
+//! a receipt fact.
 
 use axum::routing::{delete, get, post};
 use axum::Router;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{
-    problem_response, require_http_any_scope, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode,
-};
+use super::{problem_response, AppState, HeaderMap, IntoResponse, Json, Path, Query, Response, State, StatusCode};
 use crate::agentgraph_kinds::{orchestrators_enabled, ORCHESTRATOR_KIND};
 
 /// Member reference types accepted by `POST …/{id}/members`.
@@ -83,14 +82,80 @@ fn gate_check() -> Option<axum::response::Response> {
     }
 }
 
-/// Resolve the calling passport from the request headers. Copied from
-/// `entities.rs::actor_from_headers` — orchestrators stamp this as the
-/// `created_by_passport` and as the entity-store `actor`.
-fn actor_from_headers(state: &AppState, headers: &HeaderMap) -> String {
-    crate::auth::http_scope_context(&state.auth, headers)
-        .ok()
-        .and_then(|ctx| ctx.passport_id)
-        .unwrap_or_else(|| "anonymous".into())
+#[allow(clippy::result_large_err)]
+fn scoped_context(
+    state: &AppState,
+    headers: &HeaderMap,
+    accepted_scopes: &[&str],
+) -> Result<crate::auth::HttpScopeContext, Response> {
+    let context = crate::auth::passport_bound_context(&state.auth, headers)
+        .map_err(axum::response::IntoResponse::into_response)?;
+    if !accepted_scopes.iter().any(|scope| context.has_scope(scope)) {
+        return Err(problem_response(
+            StatusCode::FORBIDDEN,
+            format!("one of {} is required", accepted_scopes.join(", ")),
+        ));
+    }
+    Ok(context)
+}
+
+struct MutationAuthority {
+    context: crate::auth::HttpScopeContext,
+    actor: String,
+}
+
+#[allow(clippy::result_large_err)]
+fn mutation_authority(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity_hint: Option<&str>,
+) -> Result<MutationAuthority, Response> {
+    let context = scoped_context(state, headers, &["facts:write", "admin:write"])?;
+    let body_hint = identity_hint.map(str::trim).filter(|value| !value.is_empty());
+    if !context.local_unverified_identity() {
+        if context.passport_override_used() {
+            return Err(problem_response(
+                StatusCode::FORBIDDEN,
+                "passport impersonation is not permitted for orchestrator mutations",
+            ));
+        }
+        let Some(passport_id) = context.passport_id.as_deref() else {
+            return Err(problem_response(
+                StatusCode::FORBIDDEN,
+                "an authenticated passport is required for orchestrator mutations",
+            ));
+        };
+        if body_hint.is_some_and(|hint| hint != passport_id) {
+            return Err(problem_response(
+                StatusCode::FORBIDDEN,
+                "body passport does not match the authenticated passport",
+            ));
+        }
+        Ok(MutationAuthority {
+            actor: passport_id.to_string(),
+            context,
+        })
+    } else {
+        let header_hint = context.passport_id.as_deref();
+        if let (Some(body_hint), Some(header_hint)) = (body_hint, header_hint) {
+            if body_hint != header_hint {
+                return Err(problem_response(
+                    StatusCode::FORBIDDEN,
+                    "body passport does not match the local identity assertion header",
+                ));
+            }
+        }
+        let Some(asserted) = body_hint.or(header_hint) else {
+            return Err(problem_response(
+                StatusCode::BAD_REQUEST,
+                "an explicit passport identity assertion is required in local unverified mode",
+            ));
+        };
+        Ok(MutationAuthority {
+            actor: format!("{}{asserted}", super::approval_receipts::UNVERIFIED_APPROVER_PREFIX),
+            context,
+        })
+    }
 }
 
 fn now_unix_ms() -> u64 {
@@ -146,12 +211,15 @@ fn members_of(payload: &Value) -> Vec<MemberRef> {
         .unwrap_or_default()
 }
 
-/// `tenant_id` of a stored orchestrator payload (empty string if absent).
+/// Concrete tenant of a stored orchestrator payload. Legacy records without a
+/// tenant belong to `default`; there are no tenant-wildcard orchestrators.
 fn tenant_of(payload: &Value) -> String {
     payload
         .get("tenant_id")
         .and_then(Value::as_str)
-        .unwrap_or_default()
+        .map(str::trim)
+        .filter(|tenant| !tenant.is_empty())
+        .unwrap_or("default")
         .to_string()
 }
 
@@ -182,7 +250,7 @@ async fn after_mutation(state: &AppState, id: &str, actor: &str) {
                 confidence: 1.0,
                 private: true,
                 horizon_class: None,
-                actor: None,
+                actor: Some(actor.to_string()),
             };
             crate::fact_privacy::enforce(&state.privacy_policy, &mut fact);
             state.fact_store.write().await.store(fact);
@@ -208,6 +276,7 @@ pub(super) struct CreateOrchestratorBody {
     pub state: Option<String>,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn create_orchestrator(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -216,16 +285,20 @@ pub(super) async fn create_orchestrator(
     if let Some(resp) = gate_check() {
         return resp;
     }
-    if let Err(p) = require_http_any_scope(&state.auth, &headers, &["facts:write", "admin:write"]) {
-        return p.into_response();
-    }
+    let authority = match mutation_authority(&state, &headers, body.created_by_passport.as_deref()) {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    let tenant = match authority.context.resolve_authorized_tenant(body.tenant_id.as_deref()) {
+        Ok(tenant) => tenant,
+        Err(problem) => return problem.into_response(),
+    };
     if body.name.trim().is_empty() {
         return problem_response(StatusCode::BAD_REQUEST, "name must not be empty");
     }
-    let actor = actor_from_headers(&state, &headers);
-    let created_by = body.created_by_passport.unwrap_or_else(|| actor.clone());
+    let actor = authority.actor;
+    let created_by = actor.clone();
     let assignee = body.assignee_passport.unwrap_or_else(|| created_by.clone());
-    let tenant = body.tenant_id.unwrap_or_default();
     let st = body.state.unwrap_or_else(|| DEFAULT_STATE.to_string());
     if !ORCHESTRATOR_STATES.contains(&st.as_str()) {
         return problem_response(
@@ -265,6 +338,7 @@ pub(super) struct ListOrchestratorsQuery {
     pub limit: Option<usize>,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_orchestrators(
     State(state): State<AppState>,
     Query(q): Query<ListOrchestratorsQuery>,
@@ -273,9 +347,14 @@ pub(super) async fn list_orchestrators(
     if let Some(resp) = gate_check() {
         return resp;
     }
-    if let Err(p) = require_http_any_scope(&state.auth, &headers, &["facts:read", "admin:read"]) {
-        return p.into_response();
-    }
+    let context = match scoped_context(&state, &headers, &["facts:read", "admin:read"]) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    let tenant = match context.resolve_authorized_tenant(q.tenant_id.as_deref()) {
+        Ok(tenant) => tenant,
+        Err(problem) => return problem.into_response(),
+    };
     let query = corecrux_memory::EntityQuery {
         kind: Some(ORCHESTRATOR_KIND.to_string()),
         limit: None,
@@ -290,9 +369,7 @@ pub(super) async fn list_orchestrators(
             q.assignee
                 .as_deref()
                 .is_none_or(|a| p.get("assignee_passport").and_then(Value::as_str) == Some(a))
-                && q.tenant_id
-                    .as_deref()
-                    .is_none_or(|t| p.get("tenant_id").and_then(Value::as_str) == Some(t))
+                && tenant_of(p) == tenant
                 && q.state
                     .as_deref()
                     .is_none_or(|s| p.get("state").and_then(Value::as_str) == Some(s))
@@ -311,6 +388,7 @@ pub(super) async fn list_orchestrators(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_orchestrator(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -319,12 +397,18 @@ pub(super) async fn get_orchestrator(
     if let Some(resp) = gate_check() {
         return resp;
     }
-    if let Err(p) = require_http_any_scope(&state.auth, &headers, &["facts:read", "admin:read"]) {
-        return p.into_response();
-    }
+    let context = match scoped_context(&state, &headers, &["facts:read", "admin:read"]) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
     let store = state.entity_store.read().await;
     match store.get(ORCHESTRATOR_KIND, &id) {
-        Some(rec) => (StatusCode::OK, Json(json!({ "orchestrator": rec }))).into_response(),
+        Some(rec) => {
+            if let Err(problem) = context.resolve_authorized_tenant(Some(&tenant_of(&rec.payload))) {
+                return problem.into_response();
+            }
+            (StatusCode::OK, Json(json!({ "orchestrator": rec }))).into_response()
+        }
         None => problem_response(StatusCode::NOT_FOUND, format!("orchestrator {id} not found")),
     }
 }
@@ -339,6 +423,7 @@ pub(super) struct PatchOrchestratorBody {
     pub state: Option<String>,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn patch_orchestrator(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -348,9 +433,10 @@ pub(super) async fn patch_orchestrator(
     if let Some(resp) = gate_check() {
         return resp;
     }
-    if let Err(p) = require_http_any_scope(&state.auth, &headers, &["facts:write", "admin:write"]) {
-        return p.into_response();
-    }
+    let authority = match mutation_authority(&state, &headers, None) {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
     if let Some(s) = &body.state {
         if !ORCHESTRATOR_STATES.contains(&s.as_str()) {
             return problem_response(
@@ -359,7 +445,7 @@ pub(super) async fn patch_orchestrator(
             );
         }
     }
-    let actor = actor_from_headers(&state, &headers);
+    let actor = authority.actor;
 
     let mut store = state.entity_store.write().await;
     let mut payload = match store.get(ORCHESTRATOR_KIND, &id) {
@@ -369,6 +455,9 @@ pub(super) async fn patch_orchestrator(
             return problem_response(StatusCode::NOT_FOUND, format!("orchestrator {id} not found"));
         }
     };
+    if let Err(problem) = authority.context.resolve_authorized_tenant(Some(&tenant_of(&payload))) {
+        return problem.into_response();
+    }
     if let Some(name) = &body.name {
         if name.trim().is_empty() {
             drop(store);
@@ -415,12 +504,15 @@ pub(super) struct AddMemberBody {
 
 /// True when a member's tenant conflicts with the orchestrator's tenant (T.1).
 ///
-/// An empty orchestrator tenant is a wildcard — it accepts members from any
-/// tenant (orchestrators created without a tenant are workspace-global). A
-/// member with no tenant (`None`) never conflicts. Conflict arises only when
-/// both sides are populated and differ.
+/// Legacy missing/empty values on either side mean `default`; orchestrators
+/// never act as tenant wildcards.
 fn tenant_conflict(orchestrator_tenant: &str, member_tenant: Option<&str>) -> bool {
-    !orchestrator_tenant.is_empty() && member_tenant.is_some_and(|t| t != orchestrator_tenant)
+    let orchestrator_tenant = if orchestrator_tenant.trim().is_empty() {
+        "default"
+    } else {
+        orchestrator_tenant
+    };
+    member_tenant.unwrap_or("default") != orchestrator_tenant
 }
 
 /// Infer the member type from an id prefix when the caller omitted `type`.
@@ -455,12 +547,12 @@ async fn validate_member(
                 return Err((StatusCode::NOT_FOUND, format!("work item '{member_ref}' not found")));
             };
             // T.1: cross-tenant reject.
-            if tenant_conflict(orchestrator_tenant, item.tenant_id.as_deref()) {
+            if tenant_conflict(orchestrator_tenant, Some(crate::work::work_tenant_id(&item))) {
                 return Err((
                     StatusCode::CONFLICT,
                     format!(
                         "cross-tenant membership rejected: work '{member_ref}' tenant '{}' != orchestrator tenant '{orchestrator_tenant}'",
-                        item.tenant_id.as_deref().unwrap_or("")
+                        crate::work::work_tenant_id(&item)
                     ),
                 ));
             }
@@ -474,8 +566,17 @@ async fn validate_member(
                 let store = state.fact_store.read().await;
                 let items = crate::work_execplans::list_execplans(&store, &root, now_unix_ms()).unwrap_or_default();
                 drop(store);
-                if !items.iter().any(|w| w.id == member_ref) {
+                let Some(item) = items.iter().find(|work| work.id == member_ref) else {
                     return Err((StatusCode::NOT_FOUND, format!("execplan '{member_ref}' not found")));
+                };
+                if tenant_conflict(orchestrator_tenant, Some(crate::work::work_tenant_id(item))) {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        format!(
+                            "cross-tenant membership rejected: execplan '{member_ref}' tenant '{}' != orchestrator tenant '{orchestrator_tenant}'",
+                            crate::work::work_tenant_id(item)
+                        ),
+                    ));
                 }
             }
         }
@@ -506,6 +607,7 @@ async fn validate_member(
     })
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn add_member(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -515,9 +617,10 @@ pub(super) async fn add_member(
     if let Some(resp) = gate_check() {
         return resp;
     }
-    if let Err(p) = require_http_any_scope(&state.auth, &headers, &["facts:write", "admin:write"]) {
-        return p.into_response();
-    }
+    let authority = match mutation_authority(&state, &headers, None) {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
     let Some(member_ref) = body.r#ref.filter(|s| !s.trim().is_empty()) else {
         return problem_response(StatusCode::BAD_REQUEST, "ref (or member_ref) is required");
     };
@@ -548,7 +651,7 @@ pub(super) async fn add_member(
         },
     };
 
-    let actor = actor_from_headers(&state, &headers);
+    let actor = authority.actor;
 
     // Load the orchestrator first (for tenant + existing members).
     let (mut payload, orchestrator_tenant) = {
@@ -561,6 +664,9 @@ pub(super) async fn add_member(
             }
         }
     };
+    if let Err(problem) = authority.context.resolve_authorized_tenant(Some(&orchestrator_tenant)) {
+        return problem.into_response();
+    }
 
     let new_member = match validate_member(&state, &member_type, &member_ref, &orchestrator_tenant).await {
         Ok(m) => m,
@@ -588,7 +694,9 @@ pub(super) async fn add_member(
 
     // For work members, stamp orchestrator_id on the WorkItem.
     if new_member.member_type == MEMBER_TYPE_WORK {
-        if let Err(e) = stamp_work_orchestrator(&state, &new_member.member_ref, Some(&id), &actor).await {
+        if let Err(e) =
+            stamp_work_orchestrator(&state, &new_member.member_ref, Some(&id), &orchestrator_tenant, &actor).await
+        {
             tracing::warn!(error = %e, work = %new_member.member_ref, "failed to stamp orchestrator_id on work item");
         }
     }
@@ -603,18 +711,26 @@ async fn stamp_work_orchestrator(
     state: &AppState,
     work_ref: &str,
     orchestrator_id: Option<&str>,
-    _actor: &str,
+    expected_tenant: &str,
+    actor: &str,
 ) -> Result<(), String> {
     let mut store = state.fact_store.write().await;
     let Some(mut item) = crate::work::get_work(&store, work_ref) else {
         return Ok(());
     };
+    if crate::work::work_tenant_id(&item) != expected_tenant {
+        return Err(format!(
+            "work item tenant '{}' does not match authorized orchestrator tenant '{expected_tenant}'",
+            crate::work::work_tenant_id(&item)
+        ));
+    }
     item.orchestrator_id = orchestrator_id.map(str::to_string);
     item.updated_at_unix_ms = now_unix_ms();
-    crate::work::write_work_record(&mut store, &item).map_err(|e| e.to_string())?;
+    crate::work::write_work_record_with_actor(&mut store, &item, actor).map_err(|e| e.to_string())?;
     Ok(())
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn remove_member(
     State(state): State<AppState>,
     Path((id, member_ref)): Path<(String, String)>,
@@ -623,21 +739,25 @@ pub(super) async fn remove_member(
     if let Some(resp) = gate_check() {
         return resp;
     }
-    if let Err(p) = require_http_any_scope(&state.auth, &headers, &["facts:write", "admin:write"]) {
-        return p.into_response();
-    }
-    let actor = actor_from_headers(&state, &headers);
+    let authority = match mutation_authority(&state, &headers, None) {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    let actor = authority.actor;
 
-    let mut payload = {
+    let (mut payload, orchestrator_tenant) = {
         let store = state.entity_store.read().await;
         match store.get(ORCHESTRATOR_KIND, &id) {
-            Some(rec) => rec.payload.clone(),
+            Some(rec) => (rec.payload.clone(), tenant_of(&rec.payload)),
             None => {
                 drop(store);
                 return problem_response(StatusCode::NOT_FOUND, format!("orchestrator {id} not found"));
             }
         }
     };
+    if let Err(problem) = authority.context.resolve_authorized_tenant(Some(&orchestrator_tenant)) {
+        return problem.into_response();
+    }
 
     let mut members = members_of(&payload);
     let before = members.len();
@@ -666,7 +786,7 @@ pub(super) async fn remove_member(
     // Unstamp orchestrator_id on any removed work members.
     for m in &removed {
         if m.member_type == MEMBER_TYPE_WORK {
-            if let Err(e) = stamp_work_orchestrator(&state, &m.member_ref, None, &actor).await {
+            if let Err(e) = stamp_work_orchestrator(&state, &m.member_ref, None, &orchestrator_tenant, &actor).await {
                 tracing::warn!(error = %e, work = %m.member_ref, "failed to clear orchestrator_id on work item");
             }
         }
@@ -678,6 +798,7 @@ pub(super) async fn remove_member(
 
 // ── M3: member resolution ────────────────────────────────────────────
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_orchestrator_work(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -686,23 +807,27 @@ pub(super) async fn list_orchestrator_work(
     if let Some(resp) = gate_check() {
         return resp;
     }
-    if let Err(p) = require_http_any_scope(&state.auth, &headers, &["facts:read", "admin:read"]) {
-        return p.into_response();
-    }
+    let context = match scoped_context(&state, &headers, &["facts:read", "admin:read"]) {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
 
-    let payload = {
+    let (payload, orchestrator_tenant) = {
         let store = state.entity_store.read().await;
         match store.get(ORCHESTRATOR_KIND, &id) {
-            Some(rec) => rec.payload.clone(),
+            Some(rec) => (rec.payload.clone(), tenant_of(&rec.payload)),
             None => {
                 drop(store);
                 return problem_response(StatusCode::NOT_FOUND, format!("orchestrator {id} not found"));
             }
         }
     };
+    if let Err(problem) = context.resolve_authorized_tenant(Some(&orchestrator_tenant)) {
+        return problem.into_response();
+    }
     let members = members_of(&payload);
 
-    let resolved = resolve_members(&state, &members).await;
+    let resolved = resolve_members(&state, &members, &orchestrator_tenant).await;
     (
         StatusCode::OK,
         Json(json!({
@@ -716,13 +841,14 @@ pub(super) async fn list_orchestrator_work(
 
 /// Resolve every member reference to a live record. Dangling references
 /// surface as `{type, ref, missing: true}` rather than failing the call.
-async fn resolve_members(state: &AppState, members: &[MemberRef]) -> Vec<Value> {
+async fn resolve_members(state: &AppState, members: &[MemberRef], tenant_id: &str) -> Vec<Value> {
     // Load the kanban + execplan universes once, then resolve each member.
     let store = state.fact_store.read().await;
-    let kanban = crate::work::list_work(&store, None, None, None, None);
-    let execplans = crate::work_execplans::execplans_root_from_env()
+    let kanban = crate::work::list_work(&store, None, None, Some(tenant_id), None);
+    let mut execplans = crate::work_execplans::execplans_root_from_env()
         .and_then(|root| crate::work_execplans::list_execplans(&store, &root, now_unix_ms()).ok())
         .unwrap_or_default();
+    execplans.retain(|work| crate::work::work_tenant_id(work) == tenant_id);
     drop(store);
     resolve_members_against(members, &kanban, &execplans)
 }
@@ -764,9 +890,11 @@ fn resolve_members_against(
 pub(crate) fn orchestrator_member_refs(
     entity_store: &corecrux_memory::EntityStore,
     orchestrator_id: &str,
+    tenant_id: &str,
 ) -> std::collections::HashSet<String> {
     entity_store
         .get(ORCHESTRATOR_KIND, orchestrator_id)
+        .filter(|rec| tenant_of(&rec.payload) == tenant_id)
         .map(|rec| members_of(&rec.payload).into_iter().map(|m| m.member_ref).collect())
         .unwrap_or_default()
 }
@@ -809,7 +937,7 @@ mod tests {
     fn members_of_tolerates_missing_field() {
         let payload = json!({ "id": "orc_1", "name": "x" });
         assert!(members_of(&payload).is_empty());
-        assert_eq!(tenant_of(&payload), "");
+        assert_eq!(tenant_of(&payload), "default");
     }
 
     #[test]
@@ -827,13 +955,13 @@ mod tests {
 
     #[test]
     fn tenant_conflict_rules() {
-        // Empty orchestrator tenant is a wildcard.
-        assert!(!tenant_conflict("", Some("tenant-a")));
+        // Missing/empty values are the legacy spelling of default.
+        assert!(tenant_conflict("", Some("tenant-a")));
         assert!(!tenant_conflict("", None));
         // Matching tenants are fine.
         assert!(!tenant_conflict("tenant-a", Some("tenant-a")));
-        // Member with no tenant never conflicts.
-        assert!(!tenant_conflict("tenant-a", None));
+        // A legacy default member conflicts with a non-default orchestrator.
+        assert!(tenant_conflict("tenant-a", None));
         // Populated + differing = conflict.
         assert!(tenant_conflict("tenant-a", Some("tenant-b")));
     }
@@ -899,11 +1027,12 @@ mod tests {
             .upsert(ORCHESTRATOR_KIND, "orc_1", payload, "p1", Some(&reg))
             .unwrap();
 
-        let refs = orchestrator_member_refs(&store, "orc_1");
+        let refs = orchestrator_member_refs(&store, "orc_1", "tenant-a");
         assert_eq!(refs.len(), 2, "duplicate w_1 collapsed");
         assert!(refs.contains("w_1"));
         assert!(refs.contains("execplan:p"));
-        assert!(orchestrator_member_refs(&store, "orc_unknown").is_empty());
+        assert!(orchestrator_member_refs(&store, "orc_1", "tenant-b").is_empty());
+        assert!(orchestrator_member_refs(&store, "orc_unknown", "tenant-a").is_empty());
     }
 
     // ── resolution (M3) ─────────────────────────────────────────────
@@ -931,6 +1060,7 @@ mod tests {
             superseded_by: None,
             depends_on: Vec::new(),
             extended_by: Vec::new(),
+            blocked_by: Vec::new(),
             open_decisions: Vec::new(),
             orchestrator_id: None,
             milestones_done: None,
@@ -1048,7 +1178,7 @@ mod tests {
 
     async fn seed_work(st: &AppState, id: &str) {
         let mut store = st.fact_store.write().await;
-        crate::work::write_work_record(&mut store, &work_item(id, None)).unwrap();
+        crate::work::write_work_record_with_actor(&mut store, &work_item(id, None), "test:orchestrator").unwrap();
     }
 
     async fn seed_passport(st: &AppState, id: &str, principal: &str) {
@@ -1073,14 +1203,55 @@ mod tests {
         });
     }
 
-    async fn create(st: &AppState, body: Value) -> (StatusCode, Value) {
+    fn local_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-passport-id", axum::http::HeaderValue::from_static("p1"));
+        headers
+    }
+
+    fn verified_headers(tenant: &str, passport: &str) -> HeaderMap {
+        const SECRET: &str = "orchestrator-auth-test-secret-32-bytes";
+        const ISSUER: &str = "corecrux-orchestrator-test";
+        const AUDIENCE: &str = "corecrux";
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_secs()
+            .saturating_add(3_600) as usize;
+        let claims = json!({
+            "exp": exp,
+            "iss": ISSUER,
+            "aud": AUDIENCE,
+            "scope": "admin:read facts:write",
+            "tenant_id": tenant,
+            "passport_id": passport,
+        });
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(SECRET.as_bytes()),
+        )
+        .expect("orchestrator auth test JWT");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer header"),
+        );
+        headers
+    }
+
+    async fn create_with_headers(st: &AppState, headers: HeaderMap, body: Value) -> (StatusCode, Value) {
         let body: CreateOrchestratorBody = serde_json::from_value(body).unwrap();
         parts(
-            create_orchestrator(State(st.clone()), HeaderMap::new(), Json(body))
+            create_orchestrator(State(st.clone()), headers, Json(body))
                 .await
                 .into_response(),
         )
         .await
+    }
+
+    async fn create(st: &AppState, body: Value) -> (StatusCode, Value) {
+        create_with_headers(st, local_headers(), body).await
     }
 
     #[tokio::test]
@@ -1133,7 +1304,7 @@ mod tests {
             let st = st.clone();
             async move {
                 parts(
-                    list_orchestrators(State(st), Query(q), HeaderMap::new())
+                    list_orchestrators(State(st), Query(q), local_headers())
                         .await
                         .into_response(),
                 )
@@ -1147,7 +1318,7 @@ mod tests {
             limit: None,
         })
         .await;
-        assert!(body["count"].as_u64().unwrap() >= 1);
+        assert_eq!(body["count"], 0, "default-tenant list must not leak tenant-a");
         let (_, body) = list(ListOrchestratorsQuery {
             assignee: None,
             tenant_id: Some("tenant-a".into()),
@@ -1170,7 +1341,7 @@ mod tests {
             patch_orchestrator(
                 State(st.clone()),
                 Path(id.clone()),
-                HeaderMap::new(),
+                local_headers(),
                 Json(
                     serde_json::from_value(json!({ "name": "Coord2", "state": "active", "assignee_passport": "p9" }))
                         .unwrap(),
@@ -1192,7 +1363,7 @@ mod tests {
                 patch_orchestrator(
                     State(st),
                     Path(id),
-                    HeaderMap::new(),
+                    local_headers(),
                     Json(serde_json::from_value(b).unwrap()),
                 )
                 .await
@@ -1218,10 +1389,157 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn verified_tenant_cannot_read_or_mutate_foreign_orchestrator() {
+        const SECRET: &str = "orchestrator-auth-test-secret-32-bytes";
+        const ISSUER: &str = "corecrux-orchestrator-test";
+        const AUDIENCE: &str = "corecrux";
+        std::env::set_var("CORECRUXD_ORCHESTRATORS", "1");
+        let mut st = handler_state().await;
+        st.auth = crate::auth::Authz::test_hs256(SECRET.as_bytes(), ISSUER, AUDIENCE);
+
+        let (status, a) = create_with_headers(
+            &st,
+            verified_headers("tenant-a", "passport-a"),
+            json!({"name":"A","tenant_id":"tenant-a"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(a["orchestrator"]["payload"]["created_by_passport"], "passport-a");
+        let a_id = a["orchestrator"]["id"].as_str().expect("A id").to_string();
+        let (status, b) = create_with_headers(
+            &st,
+            verified_headers("tenant-b", "passport-b"),
+            json!({"name":"B","tenant_id":"tenant-b"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let b_id = b["orchestrator"]["id"].as_str().expect("B id").to_string();
+        let b_version = b["orchestrator"]["version"].as_u64().expect("B version") as u32;
+
+        let list_a = list_orchestrators(
+            State(st.clone()),
+            Query(ListOrchestratorsQuery {
+                assignee: None,
+                tenant_id: None,
+                state: None,
+                limit: None,
+            }),
+            verified_headers("tenant-a", "passport-a"),
+        )
+        .await
+        .into_response();
+        assert_eq!(list_a.status(), StatusCode::OK);
+        let (_, list_a) = parts(list_a).await;
+        assert_eq!(list_a["count"], 1);
+        assert_eq!(list_a["orchestrators"][0]["id"], a_id);
+
+        let cross_list = list_orchestrators(
+            State(st.clone()),
+            Query(ListOrchestratorsQuery {
+                assignee: None,
+                tenant_id: Some("tenant-b".to_string()),
+                state: None,
+                limit: None,
+            }),
+            verified_headers("tenant-a", "passport-a"),
+        )
+        .await
+        .into_response();
+        assert_eq!(cross_list.status(), StatusCode::FORBIDDEN);
+
+        let cross_get = get_orchestrator(
+            State(st.clone()),
+            Path(b_id.clone()),
+            verified_headers("tenant-a", "passport-a"),
+        )
+        .await
+        .into_response();
+        assert_eq!(cross_get.status(), StatusCode::FORBIDDEN);
+        let cross_patch = patch_orchestrator(
+            State(st.clone()),
+            Path(b_id.clone()),
+            verified_headers("tenant-a", "passport-a"),
+            Json(PatchOrchestratorBody {
+                name: Some("stolen".to_string()),
+                assignee_passport: None,
+                state: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(cross_patch.status(), StatusCode::FORBIDDEN);
+        let cross_add = add_member(
+            State(st.clone()),
+            Path(b_id.clone()),
+            verified_headers("tenant-a", "passport-a"),
+            Json(AddMemberBody {
+                member_type: Some("work".to_string()),
+                r#ref: Some("w_missing".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(cross_add.status(), StatusCode::FORBIDDEN);
+        let cross_remove = remove_member(
+            State(st.clone()),
+            Path((b_id.clone(), "w_missing".to_string())),
+            verified_headers("tenant-a", "passport-a"),
+        )
+        .await
+        .into_response();
+        assert_eq!(cross_remove.status(), StatusCode::FORBIDDEN);
+        let cross_members = list_orchestrator_work(
+            State(st.clone()),
+            Path(b_id.clone()),
+            verified_headers("tenant-a", "passport-a"),
+        )
+        .await
+        .into_response();
+        assert_eq!(cross_members.status(), StatusCode::FORBIDDEN);
+
+        let spoofed_identity = create_with_headers(
+            &st,
+            verified_headers("tenant-a", "passport-a"),
+            json!({
+                "name":"spoofed",
+                "tenant_id":"tenant-a",
+                "created_by_passport":"passport-b"
+            }),
+        )
+        .await;
+        assert_eq!(spoofed_identity.0, StatusCode::FORBIDDEN);
+        let cross_create = create_with_headers(
+            &st,
+            verified_headers("tenant-a", "passport-a"),
+            json!({"name":"cross","tenant_id":"tenant-b"}),
+        )
+        .await;
+        assert_eq!(cross_create.0, StatusCode::FORBIDDEN);
+
+        let store = st.entity_store.read().await;
+        let b_after = store.get(ORCHESTRATOR_KIND, &b_id).expect("B remains");
+        assert_eq!(b_after.version, b_version);
+        assert_eq!(b_after.payload["name"], "B");
+        assert_eq!(
+            store
+                .list(&corecrux_memory::EntityQuery {
+                    kind: Some(ORCHESTRATOR_KIND.to_string()),
+                    limit: None,
+                    include_deleted: false,
+                })
+                .len(),
+            2,
+            "denied creates must not add orchestrators"
+        );
+        std::env::remove_var("CORECRUXD_ORCHESTRATORS");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn membership_add_remove_and_resolution() {
         std::env::set_var("CORECRUXD_ORCHESTRATORS", "1");
         let st = handler_state().await;
-        let (_, body) = create(&st, json!({ "name": "Coord" })).await; // empty tenant = wildcard
+        let (_, body) = create(&st, json!({ "name": "Coord" })).await; // absent tenant = default
         let id = body["orchestrator"]["id"].as_str().unwrap().to_string();
 
         seed_work(&st, "w_1").await;
@@ -1234,7 +1552,7 @@ mod tests {
                     add_member(
                         State(st),
                         Path(id),
-                        HeaderMap::new(),
+                        local_headers(),
                         Json(serde_json::from_value(b).unwrap()),
                     )
                     .await
@@ -1287,7 +1605,7 @@ mod tests {
 
         // Resolve members → live work resolves, handoff/execplan-missing flagged.
         let (status, body) = parts(
-            list_orchestrator_work(State(st.clone()), Path(id.clone()), HeaderMap::new())
+            list_orchestrator_work(State(st.clone()), Path(id.clone()), local_headers())
                 .await
                 .into_response(),
         )
@@ -1298,7 +1616,7 @@ mod tests {
         // Remove the work member (also unstamps), then a non-member, then missing orchestrator.
         assert_eq!(
             parts(
-                remove_member(State(st.clone()), Path((id.clone(), "w_1".into())), HeaderMap::new())
+                remove_member(State(st.clone()), Path((id.clone(), "w_1".into())), local_headers())
                     .await
                     .into_response()
             )
@@ -1310,7 +1628,7 @@ mod tests {
             remove_member(
                 State(st.clone()),
                 Path((id.clone(), "not-a-member".into())),
-                HeaderMap::new()
+                local_headers()
             )
             .await
             .into_response()
@@ -1321,7 +1639,7 @@ mod tests {
             remove_member(
                 State(st.clone()),
                 Path(("orc_missing".into(), "w_1".into())),
-                HeaderMap::new()
+                local_headers()
             )
             .await
             .into_response()
@@ -1331,7 +1649,7 @@ mod tests {
 
         // list_orchestrator_work on a missing orchestrator → 404.
         assert_eq!(
-            list_orchestrator_work(State(st.clone()), Path("orc_missing".into()), HeaderMap::new())
+            list_orchestrator_work(State(st.clone()), Path("orc_missing".into()), local_headers())
                 .await
                 .into_response()
                 .status(),

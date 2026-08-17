@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Integration tests for the HTTP surface — spins up `AppState` and exercises every route family.
 
@@ -342,6 +342,389 @@ async fn sync_mutual_auth_flag_off_preserves_scope_auth_and_hides_nonce() {
     assert_eq!(manifest_response.status(), StatusCode::OK);
 }
 
+// --- M3′: recipient-bound v1.1 delegation at the sync boundary --------------
+
+/// A CruxEngine-issued sync-delegation base token per the 2026-07-22 convention:
+/// `rcx-ct/1.1`, `crux-sync` backend granting `corecrux.sync.pull|push`
+/// (attestation `passport_bound`), CruxSync PoP policy allowing `delegate`.
+/// Returns `(issuer, subject, delegate, base_token)`.
+fn sync_delegation_base_token(
+    tenant_id: &str,
+) -> (
+    SigningKey,
+    SigningKey,
+    SigningKey,
+    rcx_capability_token::RcxCapabilityToken,
+) {
+    use rcx_capability_token::{
+        DataEgressClass, DelegationAudience, DelegationPolicy, DelegationPresentation, PermittedCapability,
+        RCX_CT_DELEGATION_SPEC_VERSION, RCX_SYNC_BACKEND_ID, RCX_SYNC_PASSPORT_ATTESTATION, RCX_SYNC_PULL_CAPABILITY,
+        RCX_SYNC_PUSH_CAPABILITY,
+    };
+    let issuer = SigningKey::from_bytes(&[0x41; 32]);
+    let subject = SigningKey::from_bytes(&[0x42; 32]);
+    let delegate = SigningKey::from_bytes(&[0x43; 32]);
+    let issuer_fpr = sync_test_passport_fpr(&issuer.verifying_key().to_bytes());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_secs();
+    let mut token = rcx_capability_token::free_local_verified_fixture();
+    token.spec_version = RCX_CT_DELEGATION_SPEC_VERSION.to_string();
+    token.token_id = "rcxct_sync_delegation_http_test".to_string();
+    token.issued_at = now.saturating_sub(60);
+    token.refresh_hint_at = now.saturating_add(1_800);
+    token.expires_at = now.saturating_add(3_600);
+    token.subject.passport_fpr = sync_test_passport_fpr(&subject.verifying_key().to_bytes());
+    token.tenant_scope.tenant_id = tenant_id.to_string();
+    token.issuer.passport_kid.clone_from(&issuer_fpr);
+    token.signature.kid.clone_from(&issuer_fpr);
+    token.backends[0].backend_id = RCX_SYNC_BACKEND_ID.to_string();
+    token.backends[0].trust_root_kid.clone_from(&issuer_fpr);
+    token.backends[0].permitted_capabilities = vec![
+        PermittedCapability {
+            capability: RCX_SYNC_PULL_CAPABILITY.to_string(),
+            data_egress_classes: vec![DataEgressClass::None],
+            required_attestations: vec![RCX_SYNC_PASSPORT_ATTESTATION.to_string()],
+            credit_cost: None,
+        },
+        PermittedCapability {
+            capability: RCX_SYNC_PUSH_CAPABILITY.to_string(),
+            data_egress_classes: vec![DataEgressClass::None],
+            required_attestations: vec![RCX_SYNC_PASSPORT_ATTESTATION.to_string()],
+            credit_cost: None,
+        },
+    ];
+    token.delegation_policy = Some(DelegationPolicy {
+        presentation: DelegationPresentation::ProofOfPossession,
+        max_depth: 1,
+        audience: DelegationAudience::CruxSync,
+        allowed_delegate_fprs: vec![sync_test_passport_fpr(&delegate.verifying_key().to_bytes())],
+    });
+    token.signature.sig = issuer.sign(&token.token_hash()).to_bytes();
+    (issuer, subject, delegate, token)
+}
+
+fn sync_delegated_token(
+    base: &rcx_capability_token::RcxCapabilityToken,
+    subject: &SigningKey,
+    delegate: &SigningKey,
+    caveats: Vec<rcx_capability_token::Caveat>,
+) -> rcx_capability_token::RcxCapabilityToken {
+    base.attenuate_for(caveats, delegate.verifying_key().to_bytes(), "delegation-1", subject)
+        .expect("attenuate_for")
+}
+
+/// Recipient (`delegate`) presentation headers: the proof is signed over the
+/// exact `AttenuationContext` the sync boundary builds for `(tenant, capability)`.
+fn sync_delegation_headers(
+    token: &rcx_capability_token::RcxCapabilityToken,
+    delegate: &SigningKey,
+    nonce: &[u8],
+    tenant_id: &str,
+    capability: &str,
+) -> HeaderMap {
+    use rcx_capability_token::{
+        presentation_proof_message, AttenuationContext, DelegationAudience, RCX_SYNC_BACKEND_ID,
+        RCX_SYNC_PASSPORT_ATTESTATION,
+    };
+    let attestations = [RCX_SYNC_PASSPORT_ATTESTATION];
+    let context = AttenuationContext {
+        audience: DelegationAudience::CruxSync,
+        tenant_id,
+        backend_id: RCX_SYNC_BACKEND_ID,
+        capability,
+        data_egress_classes: &[],
+        present_attestations: &attestations,
+    };
+    let signature = delegate
+        .sign(&presentation_proof_message(token, context, nonce))
+        .to_bytes();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-crux-peer-token",
+        HeaderValue::from_str(&base64::engine::general_purpose::STANDARD.encode(token.to_canonical_json().as_bytes()))
+            .expect("peer token header"),
+    );
+    headers.insert(
+        "x-crux-peer-pubkey",
+        HeaderValue::from_str(&hex::encode(delegate.verifying_key().to_bytes())).expect("peer public key header"),
+    );
+    headers.insert(
+        "x-crux-peer-nonce",
+        HeaderValue::from_str(&hex::encode(nonce)).expect("peer nonce header"),
+    );
+    headers.insert(
+        "x-crux-peer-sig",
+        HeaderValue::from_str(&hex::encode(signature)).expect("peer signature header"),
+    );
+    headers
+}
+
+fn sync_delegation_app(trust_root: &SigningKey) -> Router {
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.sync_mutual_auth = true;
+    state.sync_peer_trust_root = Some(trust_root.verifying_key().to_bytes().to_vec());
+    state.sync_delegation_enforce = true;
+    router_with_route_auth(state, test_case_store(), RouteAuthMode::Enforce)
+}
+
+fn sync_far_future_expiry() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_secs()
+        .saturating_add(1_800)
+}
+
+#[tokio::test]
+async fn sync_delegation_accepts_valid_recipient_for_bound_tenant() {
+    use rcx_capability_token::Caveat;
+    let (issuer, subject, delegate, base) = sync_delegation_base_token("tenant-acme");
+    let token = sync_delegated_token(
+        &base,
+        &subject,
+        &delegate,
+        vec![
+            Caveat::TenantIdEq {
+                tenant_id: "tenant-acme".to_string(),
+            },
+            Caveat::ExpiresAtLe {
+                expires_at: sync_far_future_expiry(),
+            },
+        ],
+    );
+    let app = sync_delegation_app(&issuer);
+    let nonce = issue_sync_handshake_nonce(&app).await;
+    let response = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            sync_delegation_headers(&token, &delegate, &nonce, "tenant-acme", "corecrux.sync.pull"),
+        ))
+        .await
+        .expect("manifest response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn sync_delegation_flag_off_rejects_contextual_token_fail_closed() {
+    use rcx_capability_token::Caveat;
+    let (issuer, subject, delegate, base) = sync_delegation_base_token("tenant-acme");
+    let token = sync_delegated_token(
+        &base,
+        &subject,
+        &delegate,
+        vec![
+            Caveat::TenantIdEq {
+                tenant_id: "tenant-acme".to_string(),
+            },
+            Caveat::ExpiresAtLe {
+                expires_at: sync_far_future_expiry(),
+            },
+        ],
+    );
+    // sync_mutual_auth_app leaves sync_delegation_enforce OFF.
+    let app = sync_mutual_auth_app(&issuer);
+    let nonce = issue_sync_handshake_nonce(&app).await;
+    let response = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            sync_delegation_headers(&token, &delegate, &nonce, "tenant-acme", "corecrux.sync.pull"),
+        ))
+        .await
+        .expect("manifest response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(response).await["reason_class"], "peer_delegation_disabled");
+}
+
+#[tokio::test]
+async fn sync_delegation_rejects_request_for_other_tenant() {
+    use rcx_capability_token::Caveat;
+    let (issuer, subject, delegate, base) = sync_delegation_base_token("tenant-acme");
+    let token = sync_delegated_token(
+        &base,
+        &subject,
+        &delegate,
+        vec![
+            Caveat::TenantIdEq {
+                tenant_id: "tenant-acme".to_string(),
+            },
+            Caveat::ExpiresAtLe {
+                expires_at: sync_far_future_expiry(),
+            },
+        ],
+    );
+    let app = sync_delegation_app(&issuer);
+    let nonce = issue_sync_handshake_nonce(&app).await;
+    let response = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-other/manifest",
+            sync_delegation_headers(&token, &delegate, &nonce, "tenant-other", "corecrux.sync.pull"),
+        ))
+        .await
+        .expect("manifest response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(response).await["reason_class"], "peer_context_denied");
+}
+
+#[tokio::test]
+async fn sync_delegation_rejects_expired_caveat() {
+    use rcx_capability_token::Caveat;
+    let (issuer, subject, delegate, base) = sync_delegation_base_token("tenant-acme");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_secs();
+    let token = sync_delegated_token(
+        &base,
+        &subject,
+        &delegate,
+        vec![Caveat::ExpiresAtLe {
+            expires_at: now.saturating_sub(1),
+        }],
+    );
+    let app = sync_delegation_app(&issuer);
+    let nonce = issue_sync_handshake_nonce(&app).await;
+    let response = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            sync_delegation_headers(&token, &delegate, &nonce, "tenant-acme", "corecrux.sync.pull"),
+        ))
+        .await
+        .expect("manifest response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(response).await["reason_class"], "peer_caveat_denied");
+}
+
+#[tokio::test]
+async fn sync_delegation_rejects_scope_subset_excluding_the_request() {
+    use rcx_capability_token::Caveat;
+    let (issuer, subject, delegate, base) = sync_delegation_base_token("tenant-acme");
+    // Narrow to push only, then request a pull (manifest read).
+    let token = sync_delegated_token(
+        &base,
+        &subject,
+        &delegate,
+        vec![Caveat::ScopeSubset {
+            scopes: vec!["corecrux.sync.push".to_string()],
+        }],
+    );
+    let app = sync_delegation_app(&issuer);
+    let nonce = issue_sync_handshake_nonce(&app).await;
+    let response = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            sync_delegation_headers(&token, &delegate, &nonce, "tenant-acme", "corecrux.sync.pull"),
+        ))
+        .await
+        .expect("manifest response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(response).await["reason_class"], "peer_caveat_denied");
+}
+
+#[tokio::test]
+async fn sync_delegation_rejects_unissued_nonce() {
+    use rcx_capability_token::Caveat;
+    let (issuer, subject, delegate, base) = sync_delegation_base_token("tenant-acme");
+    let token = sync_delegated_token(
+        &base,
+        &subject,
+        &delegate,
+        vec![
+            Caveat::TenantIdEq {
+                tenant_id: "tenant-acme".to_string(),
+            },
+            Caveat::ExpiresAtLe {
+                expires_at: sync_far_future_expiry(),
+            },
+        ],
+    );
+    let app = sync_delegation_app(&issuer);
+    // Never issued by the server.
+    let nonce = [0x5a_u8; 32].to_vec();
+    let response = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            sync_delegation_headers(&token, &delegate, &nonce, "tenant-acme", "corecrux.sync.pull"),
+        ))
+        .await
+        .expect("manifest response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(response).await["reason_class"], "peer_nonce_rejected");
+}
+
+#[tokio::test]
+async fn sync_delegation_denies_replayed_nonce() {
+    use rcx_capability_token::Caveat;
+    let (issuer, subject, delegate, base) = sync_delegation_base_token("tenant-acme");
+    let token = sync_delegated_token(
+        &base,
+        &subject,
+        &delegate,
+        vec![
+            Caveat::TenantIdEq {
+                tenant_id: "tenant-acme".to_string(),
+            },
+            Caveat::ExpiresAtLe {
+                expires_at: sync_far_future_expiry(),
+            },
+        ],
+    );
+    let app = sync_delegation_app(&issuer);
+    let nonce = issue_sync_handshake_nonce(&app).await;
+
+    let first = app
+        .clone()
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            sync_delegation_headers(&token, &delegate, &nonce, "tenant-acme", "corecrux.sync.pull"),
+        ))
+        .await
+        .expect("first manifest response");
+    assert_eq!(first.status(), StatusCode::OK);
+
+    // Second presentation of the same (now consumed) nonce fails closed.
+    let second = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            sync_delegation_headers(&token, &delegate, &nonce, "tenant-acme", "corecrux.sync.pull"),
+        ))
+        .await
+        .expect("second manifest response");
+    assert_eq!(second.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(second).await["reason_class"], "peer_nonce_rejected");
+}
+
+#[tokio::test]
+async fn sync_delegation_enforce_on_leaves_v1_peer_unchanged() {
+    // A plain v1.0 (non-contextual) peer token keeps working through the
+    // existing path, with delegation enforcement ON.
+    let (trust_root, subject, token) = sync_test_peer("tenant-acme");
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.sync_mutual_auth = true;
+    state.sync_peer_trust_root = Some(trust_root.verifying_key().to_bytes().to_vec());
+    state.sync_delegation_enforce = true;
+    let app = router_with_route_auth(state, test_case_store(), RouteAuthMode::Enforce);
+    let nonce = issue_sync_handshake_nonce(&app).await;
+    let response = app
+        .oneshot(sync_http_request(
+            "GET",
+            "/v1/sync/tenants/tenant-acme/manifest",
+            sync_peer_headers(&token, &subject, &subject, &nonce),
+        ))
+        .await
+        .expect("manifest response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn sync_manifest_and_collection_page_are_tenant_scoped() {
     let state = test_app_state(1);
@@ -628,6 +1011,7 @@ pub(crate) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         data_dir: root.clone(),
         sync_mutual_auth: false,
         sync_peer_trust_root: None,
+        sync_delegation_enforce: false,
         sync_handshake_nonces: Arc::new(std::sync::Mutex::new(crux_sync::peer_handshake::NonceCache::new(
             SYNC_HANDSHAKE_NONCE_TTL_SECONDS,
         ))),
@@ -643,6 +1027,7 @@ pub(crate) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         coord_presence_ttl_secs: crate::coord::DEFAULT_PRESENCE_TTL_SECS,
         consolidation_scheduler_enabled: false,
         context_surface_enabled: true,
+        tenant_erasure_enabled: true,
         compute_provider_enabled: false,
         auto_capture_enabled: true,
         local_ingest_enabled: false,
@@ -656,6 +1041,7 @@ pub(crate) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         quota_hosted_surfaces: Arc::new(Vec::new()),
         quota_ledger: Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
         credit_meter: None,
+        enrich_budgets: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
         openai_shim_enabled: false,
         memory_import_enabled: true,
         identity_links_enabled: true,
@@ -666,6 +1052,8 @@ pub(crate) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         operating_mode: crate::product::OperatingMode::FreeLocal,
         enabled_pro_services: Vec::new(),
         read_retry_failed_readyz_threshold: 0,
+        seal_failed_readyz_threshold: 0,
+        seal_failed_streak: Arc::new(RwLock::new((0, None))),
         commit_level: CommitLevel::LocalCommit,
         metrics,
         node_id: "node-a".to_string(),
@@ -735,7 +1123,7 @@ pub(super) fn test_app_state(action_max_pending: usize) -> AppState {
 }
 
 /// Fresh in-memory case store for `router(state, …)` test calls (M3).
-fn test_case_store() -> std::sync::Arc<tokio::sync::RwLock<corecrux_memory::CaseStore>> {
+pub(super) fn test_case_store() -> std::sync::Arc<tokio::sync::RwLock<corecrux_memory::CaseStore>> {
     std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::CaseStore::new()))
 }
 
@@ -746,7 +1134,7 @@ fn pro_workbench_state(services: &[&str]) -> AppState {
     state
 }
 
-fn bind_test_state_to_root_passport_key(state: &mut AppState) {
+pub(super) fn bind_test_state_to_root_passport_key(state: &mut AppState) {
     let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).expect("root passport key");
     state.passport_fpr = key.passport_fpr().to_string();
     state.passport_public_key_hex = key.public_key_hex().to_string();
@@ -757,7 +1145,8 @@ fn test_rcx_router(capabilities: Vec<&str>) -> std::sync::Arc<crux_router::RcxRo
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock")
         .as_secs();
-    std::sync::Arc::new(crux_router::RcxRouter::new(crux_router::mint_free_local_token(
+    let signing = SigningKey::from_bytes(&[0x44; 32]);
+    let mut token = crux_router::mint_free_local_token(
         "p_0123456789abcdef0123456789abcdef",
         "daemon_01HV0000000000000000000000",
         "default",
@@ -765,10 +1154,18 @@ fn test_rcx_router(capabilities: Vec<&str>) -> std::sync::Arc<crux_router::RcxRo
         now.saturating_sub(60),
         now.saturating_add(3600),
         [0x22; 64],
-    )))
+    );
+    token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+    std::sync::Arc::new(crux_router::RcxRouter::new_with_trusted_issuer_pubkey(
+        token,
+        signing.verifying_key().to_bytes(),
+    ))
 }
 
-fn dev_scope_headers(scopes: &str) -> HeaderMap {
+/// `X-Corecrux-Scopes` header for [`AuthMode::DevScopes`] handler tests.
+/// `pub(super)` so sibling `http::*` modules with inline test blocks share one
+/// builder instead of re-declaring it per file.
+pub(super) fn dev_scope_headers(scopes: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
         "x-corecrux-scopes",
@@ -1672,6 +2069,42 @@ async fn console_redacts_private_facts_and_session_state() {
     let facts_text = serde_json::to_string(&facts_body).expect("facts json");
     assert!(!facts_text.contains("secret-token-123"));
 
+    // D-26: `as_of_unix_ms` was filtered with `.filter(|t| *t > 0)`, so a
+    // client computing 0 silently got ALL current facts while the response
+    // echoed the parameter back — it was told it had time-travelled and had
+    // not. Zero is a valid epoch cutoff: nothing had been stored yet.
+    let epoch_resp = console::get_console_facts(
+        State(state.clone()),
+        Query(console::ConsoleFactsQuery {
+            q: None,
+            top_k: None,
+            as_of_unix_ms: Some(0),
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(epoch_resp.status(), StatusCode::OK);
+    let epoch_body = json_body(epoch_resp).await;
+    assert_eq!(
+        epoch_body["visible_count"], 0,
+        "an epoch cutoff returns nothing, it does not disable the filter"
+    );
+
+    // A cutoff that cannot be applied is refused, not ignored.
+    let negative_resp = console::get_console_facts(
+        State(state.clone()),
+        Query(console::ConsoleFactsQuery {
+            q: None,
+            top_k: None,
+            as_of_unix_ms: Some(-1),
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(negative_resp.status(), StatusCode::BAD_REQUEST);
+
     let sessions_resp = console::get_console_sessions(
         State(state),
         dev_scope_headers("admin:read"),
@@ -2061,7 +2494,7 @@ async fn put_fact_forces_reserved_prefix_private_before_store() {
     let state = test_app_state(16);
     let body = corecrux_memory::fact_store::StoreFact {
         tenant_hash: "default".to_string(),
-        entity: "__ops__::deploy".to_string(),
+        entity: "github::CueCrux/Crux::issue/1".to_string(),
         key: "status".to_string(),
         value: "ready".to_string(),
         source_receipt: None,
@@ -2076,7 +2509,10 @@ async fn put_fact_forces_reserved_prefix_private_before_store() {
         .into_response();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let store = state.fact_store.read().await;
-    let fact = store.all_facts().find(|fact| fact.entity == "__ops__::deploy").unwrap();
+    let fact = store
+        .all_facts()
+        .find(|fact| fact.entity == "github::CueCrux/Crux::issue/1")
+        .unwrap();
     assert!(fact.private);
 }
 
@@ -2086,7 +2522,7 @@ async fn put_facts_bulk_forces_reserved_prefix_private_before_store() {
     let body = vec![
         corecrux_memory::fact_store::StoreFact {
             tenant_hash: "default".to_string(),
-            entity: "__bootstrap__::patterns".to_string(),
+            entity: "github::CueCrux/Crux::issue/2".to_string(),
             key: "p1".to_string(),
             value: "pattern".to_string(),
             source_receipt: None,
@@ -2115,7 +2551,7 @@ async fn put_facts_bulk_forces_reserved_prefix_private_before_store() {
     let store = state.fact_store.read().await;
     let reserved = store
         .all_facts()
-        .find(|fact| fact.entity == "__bootstrap__::patterns")
+        .find(|fact| fact.entity == "github::CueCrux/Crux::issue/2")
         .unwrap();
     assert!(reserved.private);
     let public = store.all_facts().find(|fact| fact.entity == "public").unwrap();
@@ -2123,61 +2559,20 @@ async fn put_facts_bulk_forces_reserved_prefix_private_before_store() {
 }
 
 #[tokio::test]
-async fn put_fact_passport_rejects_daemon_owned_entity_prefix() {
+async fn put_fact_passport_rejects_every_create_reserved_entity_prefix() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     {
         let mut store = state.fact_store.write().await;
         crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
     }
-    let body = corecrux_memory::fact_store::StoreFact {
-        tenant_hash: "client-supplied-must-be-ignored".to_string(),
-        entity: "__legal_hold__::hold-1".to_string(),
-        key: "state".to_string(),
-        value: "attacker".to_string(),
-        source_receipt: None,
-        confidence: 1.0,
-        private: false,
-        horizon_class: None,
-        actor: None,
-    };
-
-    let resp = facts::put_fact(
-        State(state.clone()),
-        dev_scope_passport_headers("facts:write", "work-default"),
-        Json(body),
-    )
-    .await
-    .into_response();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let body = json_body(resp).await;
-    assert_eq!(body["code"], "RESERVED_ENTITY_PREFIX");
-    assert_eq!(body["reserved_prefix"], "__legal_hold__::");
-    assert!(state
-        .fact_store
-        .read()
-        .await
-        .get_by_entity("__legal_hold__::hold-1")
-        .is_empty());
-}
-
-#[tokio::test]
-async fn put_facts_bulk_rejects_daemon_owned_entity_prefix_atomically() {
-    let state = test_app_state(16);
-    let body = vec![
-        corecrux_memory::fact_store::StoreFact {
-            tenant_hash: "default".to_string(),
-            entity: "public".to_string(),
-            key: "safe".to_string(),
-            value: "must-not-partially-store".to_string(),
-            source_receipt: None,
-            confidence: 1.0,
-            private: false,
-            horizon_class: None,
-            actor: None,
-        },
-        corecrux_memory::fact_store::StoreFact {
-            tenant_hash: "default".to_string(),
-            entity: "__incident__::incident-1".to_string(),
+    for prefix in corecrux_memory::fact_privacy::DAEMON_OWNED_ENTITY_PREFIXES
+        .iter()
+        .chain(corecrux_memory::fact_privacy::GENERIC_CREATE_RESERVED_PREFIXES)
+    {
+        let entity = format!("{prefix}attacker");
+        let body = corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "client-supplied-must-be-ignored".to_string(),
+            entity: entity.clone(),
             key: "state".to_string(),
             value: "attacker".to_string(),
             source_receipt: None,
@@ -2185,8 +2580,53 @@ async fn put_facts_bulk_rejects_daemon_owned_entity_prefix_atomically() {
             private: false,
             horizon_class: None,
             actor: None,
-        },
-    ];
+        };
+
+        let resp = facts::put_fact(
+            State(state.clone()),
+            dev_scope_passport_headers("facts:write", "work-default"),
+            Json(body),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "prefix {prefix}");
+        let body = json_body(resp).await;
+        assert_eq!(body["code"], "RESERVED_ENTITY_PREFIX");
+        assert_eq!(body["reserved_prefix"], *prefix);
+        assert!(state.fact_store.read().await.get_by_entity(&entity).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn put_facts_bulk_rejects_create_reserved_entity_prefix_atomically() {
+    let state = test_app_state(16);
+    let mut body = vec![corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
+        entity: "public".to_string(),
+        key: "safe".to_string(),
+        value: "must-not-partially-store".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+        horizon_class: None,
+        actor: None,
+    }];
+    body.extend(
+        corecrux_memory::fact_privacy::DAEMON_OWNED_ENTITY_PREFIXES
+            .iter()
+            .chain(corecrux_memory::fact_privacy::GENERIC_CREATE_RESERVED_PREFIXES)
+            .map(|prefix| corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: format!("{prefix}attacker"),
+                key: "state".to_string(),
+                value: "attacker".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            }),
+    );
 
     let resp = facts::put_facts_bulk(State(state.clone()), HeaderMap::new(), Json(body))
         .await
@@ -2194,7 +2634,10 @@ async fn put_facts_bulk_rejects_daemon_owned_entity_prefix_atomically() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let body = json_body(resp).await;
     assert_eq!(body["code"], "RESERVED_ENTITY_PREFIX");
-    assert_eq!(body["reserved_prefix"], "__incident__::");
+    assert_eq!(
+        body["reserved_prefix"],
+        corecrux_memory::fact_privacy::DAEMON_OWNED_ENTITY_PREFIXES[0]
+    );
     assert_eq!(state.fact_store.read().await.all_facts().count(), 0);
 }
 
@@ -2285,6 +2728,102 @@ async fn delete_fact_not_found() {
         .await
         .into_response();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_fact_rejects_daemon_owned_control_record() {
+    let state = test_app_state(16);
+    let fact_id = {
+        let mut store = state.fact_store.write().await;
+        store
+            .store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "__passport__::victim".to_string(),
+                key: "record".to_string(),
+                value: "trusted".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: true,
+                horizon_class: None,
+                actor: None,
+            })
+            .fact_id
+    };
+
+    let resp = delete_fact(State(state.clone()), HeaderMap::new(), Path(fact_id.clone()))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = json_body(resp).await;
+    assert_eq!(body["code"], "RESERVED_ENTITY_PREFIX");
+    assert!(!state.fact_store.read().await.get(&fact_id).unwrap().deleted);
+}
+
+#[tokio::test]
+async fn delete_fact_requires_dedicated_undo_for_consolidation_canonical() {
+    let state = test_app_state(16);
+    let (first_id, second_id, canonical_id) = {
+        let mut store = state.fact_store.write().await;
+        let first = store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "proj".to_string(),
+            key: "status".to_string(),
+            value: "blocked".to_string(),
+            source_receipt: None,
+            confidence: 0.2,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        let second = store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "proj".to_string(),
+            key: "status".to_string(),
+            value: "active".to_string(),
+            source_receipt: None,
+            confidence: 0.3,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        assert!(store.clear_superseded("default", &first.fact_id));
+        let report = store
+            .consolidate_facts_v1(
+                "default",
+                corecrux_memory::fact_store::ConsolidationRequestV1 {
+                    consolidation_id: "con-http-delete".to_string(),
+                    entity: "proj".to_string(),
+                    key: "status".to_string(),
+                    canonical_value: "settled".to_string(),
+                    target_fact_ids: vec![first.fact_id.clone(), second.fact_id.clone()],
+                    protected_fact_ids: vec![],
+                    confidence: 0.8,
+                    source_receipt: None,
+                    actor: Some("operator:unverified:test".to_string()),
+                    horizon_class: None,
+                    protected_confidence_floor: 0.99,
+                },
+            )
+            .unwrap();
+        (first.fact_id, second.fact_id, report.receipt.canonical_fact_id)
+    };
+
+    let resp = delete_fact(State(state.clone()), HeaderMap::new(), Path(canonical_id.clone()))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = json_body(resp).await;
+    assert_eq!(body["code"], "CONSOLIDATION_CANONICAL_REQUIRES_UNDO");
+    let store = state.fact_store.read().await;
+    assert!(store.get(&canonical_id).is_some());
+    assert_eq!(
+        store.get(&first_id).unwrap().superseded_by.as_deref(),
+        Some(canonical_id.as_str())
+    );
+    assert_eq!(
+        store.get(&second_id).unwrap().superseded_by.as_deref(),
+        Some(canonical_id.as_str())
+    );
 }
 
 // ── Fact Store (GET /v1/facts/entity/{entity}) ──────────────────
@@ -2801,6 +3340,421 @@ async fn export_facts_honors_cursor_and_reports_next_cursor() {
     assert_eq!(facts.len(), 1);
     assert_eq!(body["has_more"], true);
     assert_eq!(body["next_cursor"], facts[0]["fact_id"]);
+}
+
+// ── GET /v1/facts/list (console paged listing, M1) ──────────────────
+
+fn list_facts_params() -> ListFactsParams {
+    ListFactsParams {
+        cursor: None,
+        limit: None,
+        include_reserved: None,
+        include_superseded: None,
+        entity_prefix: None,
+        q: None,
+        as_of_unix_ms: None,
+    }
+}
+
+async fn store_plain_fact(state: &AppState, entity: &str, key: &str, value: &str) -> String {
+    let mut store = state.fact_store.write().await;
+    store
+        .store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: entity.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        })
+        .fact_id
+}
+
+/// The ordering key each row is sorted by: `(stored_at_unix_ms, fact_id)` DESC.
+fn list_row_key(row: &serde_json::Value) -> (i64, String) {
+    (
+        row["stored_at_unix_ms"].as_i64().expect("stored_at_unix_ms"),
+        row["fact_id"].as_str().expect("fact_id").to_string(),
+    )
+}
+
+#[tokio::test]
+async fn list_facts_paginates_full_store_exactly_once_descending() {
+    let state = test_app_state(16);
+    for i in 0..25 {
+        store_plain_fact(&state, "note", &format!("k{i}"), &format!("v{i}")).await;
+    }
+
+    let mut collected: Vec<serde_json::Value> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let params = ListFactsParams {
+            cursor: cursor.clone(),
+            limit: Some(10),
+            ..list_facts_params()
+        };
+        let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["total_visible"], 25);
+        assert_eq!(body["limit"], 10);
+        let rows = body["facts"].as_array().unwrap().clone();
+        pages += 1;
+        let next = body["next_cursor"].as_str().map(str::to_string);
+        if next.is_some() {
+            assert_eq!(body["has_more"], true);
+            assert_eq!(rows.len(), 10);
+        } else {
+            assert_eq!(body["has_more"], false);
+        }
+        collected.extend(rows);
+        match next {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+
+    assert_eq!(pages, 3, "25 / 10 = 3 pages");
+    assert_eq!(collected.len(), 25);
+    // Every fact exactly once.
+    let ids: std::collections::BTreeSet<String> = collected
+        .iter()
+        .map(|r| r["fact_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), 25, "no dupes / no gaps across cursor pages");
+    // Strictly descending by (stored_at_unix_ms, fact_id).
+    for pair in collected.windows(2) {
+        assert!(
+            list_row_key(&pair[0]) > list_row_key(&pair[1]),
+            "rows must be strictly descending"
+        );
+    }
+}
+
+/// Store one fact with an explicit `stored_at` (ingest time) via the sync path —
+/// `store()` stamps `Utc::now()`, which a tight loop cannot spread across
+/// distinct milliseconds. Deterministic timestamps are what the `as_of` filter
+/// needs to be exercised meaningfully.
+async fn store_fact_at(state: &AppState, entity: &str, key: &str, value: &str, stored_at_ms: i64) {
+    let mut store = state.fact_store.write().await;
+    store.store_synced(corecrux_memory::fact_store::Fact {
+        fact_id: format!("f_{entity}_{key}"),
+        tenant_hash: "default".to_string(),
+        entity: entity.to_string(),
+        key: key.to_string(),
+        value: value.to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        stored_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(stored_at_ms).unwrap(),
+        tokens: 1,
+        deleted: false,
+        version: 1,
+        supersedes: None,
+        private: false,
+        horizon_class: corecrux_memory::HorizonClass::None,
+        reverified_at: None,
+        superseded_by: None,
+        actor: None,
+        valid_from: None,
+        valid_to: None,
+        access_count: 0,
+        last_accessed_at: None,
+    });
+}
+
+#[tokio::test]
+async fn list_facts_as_of_excludes_newer_facts_and_paginates_exactly() {
+    let state = test_app_state(16);
+    // 20 facts with strictly increasing stored_at (1_000ms ..= 20_000ms).
+    for i in 1..=20i64 {
+        store_fact_at(&state, "note", &format!("k{i:02}"), &format!("v{i}"), i * 1000).await;
+    }
+
+    // Time-machine cutoff between the 12th and 13th fact: only facts stored at
+    // or before 12_500ms (i = 1..=12) may appear.
+    let cutoff = 12_500i64;
+    let mut collected: Vec<serde_json::Value> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let params = ListFactsParams {
+            cursor: cursor.clone(),
+            limit: Some(5),
+            as_of_unix_ms: Some(cutoff),
+            ..list_facts_params()
+        };
+        let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(params))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        // total_visible is the as-of universe (12), not the whole store …
+        assert_eq!(
+            body["total_visible"], 12,
+            "only facts at/under the as_of cutoff are visible"
+        );
+        // … while total_nondeleted still reports the true store size (20).
+        assert_eq!(
+            body["total_nondeleted"], 20,
+            "as_of never shrinks the store-size denominator"
+        );
+        let rows = body["facts"].as_array().unwrap().clone();
+        pages += 1;
+        let next = body["next_cursor"].as_str().map(str::to_string);
+        if next.is_some() {
+            assert_eq!(body["has_more"], true);
+            assert_eq!(rows.len(), 5);
+        } else {
+            assert_eq!(body["has_more"], false);
+        }
+        collected.extend(rows);
+        match next {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+
+    assert_eq!(pages, 3, "12 visible / limit 5 = 3 pages (5 + 5 + 2)");
+    assert_eq!(collected.len(), 12);
+    // No fact newer than the cutoff leaked, and every fact appears exactly once.
+    let ids: std::collections::BTreeSet<String> = collected
+        .iter()
+        .map(|r| r["fact_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), 12, "no dupes / no gaps across cursor pages under as_of");
+    for r in &collected {
+        assert!(
+            r["stored_at_unix_ms"].as_i64().unwrap() <= cutoff,
+            "no fact newer than as_of may appear"
+        );
+    }
+    // Strictly descending by (stored_at_unix_ms, fact_id) — the as_of filter
+    // must not disturb ordering.
+    for pair in collected.windows(2) {
+        assert!(
+            list_row_key(&pair[0]) > list_row_key(&pair[1]),
+            "rows stay strictly descending"
+        );
+    }
+
+    // Sanity: omitting as_of returns the whole store.
+    let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(list_facts_params()))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["total_visible"], 20, "as_of omitted ⇒ whole visible store");
+}
+
+#[tokio::test]
+async fn list_facts_excludes_reserved_unless_requested() {
+    let state = test_app_state(16);
+    store_plain_fact(&state, "note", "k", "public-one").await;
+    // Typed decision records are export-reserved but intentionally remain in
+    // the local shared query pool, so include_reserved can surface them.
+    // Daemon-control rows such as `__memory_pin::` are born private and never
+    // surface through this list.
+    store_plain_fact(&state, "__decisions__::plan", "k", "reserved-one").await;
+
+    // Default: reserved hidden.
+    let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(list_facts_params()))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["total_visible"], 1);
+    let text = serde_json::to_string(&body["facts"]).unwrap();
+    assert!(text.contains("public-one"));
+    assert!(!text.contains("reserved-one"));
+
+    // include_reserved=1 → both.
+    let params = ListFactsParams {
+        include_reserved: Some("1".to_string()),
+        ..list_facts_params()
+    };
+    let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["total_visible"], 2);
+    let text = serde_json::to_string(&body["facts"]).unwrap();
+    assert!(text.contains("reserved-one"));
+}
+
+#[tokio::test]
+async fn list_facts_always_excludes_private_and_deleted() {
+    let state = test_app_state(16);
+    store_plain_fact(&state, "note", "shared", "public-value").await;
+    let deleted_id = store_plain_fact(&state, "note", "gone", "deleted-value").await;
+    {
+        let mut store = state.fact_store.write().await;
+        store.delete("default", &deleted_id);
+        store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: crux_mcp::scope::private_entity_for_agent("alice", "notes"),
+            key: "secret".to_string(),
+            value: "private-value".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+
+    let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(list_facts_params()))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["total_visible"], 1);
+    // total_nondeleted counts the universe (incl. private) minus tombstones: the
+    // public + the private fact = 2, the deleted one excluded.
+    assert_eq!(body["total_nondeleted"], 2);
+    let text = serde_json::to_string(&body["facts"]).unwrap();
+    assert!(text.contains("public-value"));
+    assert!(!text.contains("deleted-value"));
+    assert!(!text.contains("private-value"));
+}
+
+#[tokio::test]
+async fn list_facts_applies_entity_prefix_and_q_filters() {
+    let state = test_app_state(16);
+    store_plain_fact(&state, "deploy:gpu", "method", "canary rollout").await;
+    store_plain_fact(&state, "deploy:cpu", "method", "blue green").await;
+    store_plain_fact(&state, "testing:e2e", "approach", "canary smoke").await;
+
+    // entity_prefix confines to `deploy:` (2 of 3).
+    let params = ListFactsParams {
+        entity_prefix: Some("deploy:".to_string()),
+        ..list_facts_params()
+    };
+    let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["total_visible"], 2);
+
+    // q="canary" hits value on deploy:gpu and testing:e2e (2 of 3),
+    // case-insensitively.
+    let params = ListFactsParams {
+        q: Some("CANARY".to_string()),
+        ..list_facts_params()
+    };
+    let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["total_visible"], 2);
+    let text = serde_json::to_string(&body["facts"]).unwrap();
+    assert!(text.contains("canary rollout"));
+    assert!(text.contains("canary smoke"));
+    assert!(!text.contains("blue green"));
+
+    // entity_prefix + q combined: only deploy:gpu.
+    let params = ListFactsParams {
+        entity_prefix: Some("deploy:".to_string()),
+        q: Some("canary".to_string()),
+        ..list_facts_params()
+    };
+    let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["total_visible"], 1);
+}
+
+#[tokio::test]
+async fn list_facts_scopes_by_tenant_for_non_admin_context() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        for (tenant, value) in [("default", "default-fact"), ("other", "other-fact")] {
+            store.store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: tenant.to_string(),
+                entity: "note".to_string(),
+                key: "k".to_string(),
+                value: value.to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+        }
+    }
+
+    // Scoped (no passport, query:read) ⇒ read-tenant "default": sees only its own.
+    let resp = facts::list_facts(
+        State(state.clone()),
+        dev_scope_headers("query:read"),
+        Query(list_facts_params()),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["total_visible"], 1);
+    assert_eq!(body["total_nondeleted"], 1);
+    let text = serde_json::to_string(&body["facts"]).unwrap();
+    assert!(text.contains("default-fact"));
+    assert!(!text.contains("other-fact"));
+
+    // Raw-admin (admin:read, no passport) sees both tenants.
+    let resp = facts::list_facts(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Query(list_facts_params()),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["total_visible"], 2);
+}
+
+#[tokio::test]
+async fn list_facts_clamps_limit_and_rejects_bad_cursor() {
+    let state = test_app_state(16);
+    for i in 0..3 {
+        store_plain_fact(&state, "note", &format!("k{i}"), &format!("v{i}")).await;
+    }
+
+    // limit above the cap is clamped to 500 (reported), not echoed raw.
+    let params = ListFactsParams {
+        limit: Some(100_000),
+        ..list_facts_params()
+    };
+    let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["limit"], 500);
+    assert_eq!(body["facts"].as_array().unwrap().len(), 3);
+
+    // limit=0 clamps up to 1.
+    let params = ListFactsParams {
+        limit: Some(0),
+        ..list_facts_params()
+    };
+    let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["limit"], 1);
+    assert_eq!(body["facts"].as_array().unwrap().len(), 1);
+    assert_eq!(body["has_more"], true);
+
+    // Malformed cursor ⇒ 400 problem response, never a panic.
+    let params = ListFactsParams {
+        cursor: Some("not-a-valid-cursor".to_string()),
+        ..list_facts_params()
+    };
+    let resp = facts::list_facts(State(state.clone()), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 // ── Session Store (PUT /v1/sessions/{sessionId}/state) ──────────
@@ -3795,6 +4749,48 @@ async fn readyz_fails_when_corruption_detected() {
     assert!(checks.iter().any(|c| c["name"] == "corruption_state_clear"));
 }
 
+/// The 2026-08-07 outage in one test: ingest 500s on every request while every
+/// other readiness signal stays green. Before this check `/readyz` said `ok`
+/// through 38 hours of total write failure.
+#[tokio::test]
+async fn readyz_fails_when_local_ingest_seal_keeps_failing() {
+    let mut state = test_app_state(16);
+    state.seal_failed_readyz_threshold = 3;
+    mark_ready_except_control(&state).await;
+    {
+        let mut streak = state.seal_failed_streak.write().await;
+        *streak = (3, Some("storage error: No such file or directory".to_string()));
+    }
+    let resp = health::readyz(State(state)).await.into_response();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json_body(resp).await;
+    assert_eq!(body["ok"], false);
+    let checks = body["checks"].as_array().expect("checks array");
+    let check = checks
+        .iter()
+        .find(|c| c["name"] == "local_ingest_seal")
+        .expect("local_ingest_seal check");
+    assert!(
+        check["error"].as_str().unwrap_or_default().contains("No such file"),
+        "the check must carry the underlying seal error: {check}"
+    );
+}
+
+/// One failure is not an outage. A single malformed document must not unready
+/// the node, or the check becomes something operators route around.
+#[tokio::test]
+async fn readyz_tolerates_a_seal_failure_below_the_threshold() {
+    let mut state = test_app_state(16);
+    state.seal_failed_readyz_threshold = 3;
+    mark_ready_except_control(&state).await;
+    {
+        let mut streak = state.seal_failed_streak.write().await;
+        *streak = (2, Some("transient".to_string()));
+    }
+    let resp = health::readyz(State(state)).await.into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn readyz_fails_when_capacity_low() {
     let state = test_app_state(16);
@@ -3992,7 +4988,9 @@ async fn get_receipt_signature_returns_501_without_dataplane() {
 // ── get_receipt_verification_v1 (no dataplane) ──────────────────
 
 #[tokio::test]
-async fn get_receipt_verification_returns_501_without_dataplane() {
+async fn get_receipt_verification_resolves_locally_without_dataplane() {
+    // Dataplane off: the local mediation-log resolver answers — an unknown
+    // id is a 404, not the pre-2026-07-24 unconditional 501.
     let state = test_app_state(16);
     let resp = receipts::get_receipt_verification_v1(
         State(state),
@@ -4004,7 +5002,113 @@ async fn get_receipt_verification_returns_501_without_dataplane() {
     )
     .await
     .into_response();
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// A governance receipt (tenant corpus erasure and friends) must verify
+/// through the same route on a CPU-only build. Before this fallback the
+/// daemon minted an Ed25519-signed audit artefact it had no supported way
+/// to attest to: this route 404'd, `GET /v1/receipts/{id}` 501s by design,
+/// and `corecruxctl inspect-receipt` searches sealed segments only.
+#[tokio::test]
+async fn get_receipt_verification_resolves_a_governance_receipt_without_a_dataplane() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).expect("passport key");
+    let mut state = test_app_state(16);
+    state.data_dir = tmp.path().to_path_buf();
+    state.passport_key_path = tmp.path().join("passport.key");
+    state.passport_fpr = key.passport_fpr().to_string();
+    state.passport_public_key_hex = key.public_key_hex().to_string();
+
+    let receipt_id = super::observations::mint_governance_receipt(
+        &state,
+        "__governance__::erasure",
+        "operator",
+        "erasure.forget_tenant_corpus",
+        &serde_json::json!({ "tenant_id": "MarketResearch", "segments_reclaimed": 17 }),
+    )
+    .expect("governance receipt must mint");
+
+    let resp = receipts::get_receipt_verification_v1(
+        State(state),
+        Path(receipt_id.clone()),
+        Query(TenantQuery {
+            tenant_id: "MarketResearch".to_string(),
+        }),
+        HeaderMap::new(),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json["schema"], "crux.governance_receipt_verification.v1");
+    assert_eq!(json["receipt_id"], receipt_id);
+    assert_eq!(json["tenant_id"], "MarketResearch");
+    assert_eq!(json["kind"], "erasure.forget_tenant_corpus");
+    assert_eq!(json["signature_valid"], true);
+    assert_eq!(json["chain_valid"], true);
+}
+
+/// A caller authorised for one tenant must not be able to confirm that a
+/// receipt belonging to *another* tenant exists. The re-gate happens after
+/// resolution — the receipt was found — so this must answer **404**, byte
+/// for byte the same as a receipt that does not exist. A 403 here would
+/// turn the endpoint into an existence oracle across tenants.
+#[tokio::test]
+async fn governance_receipt_for_another_tenant_is_404_not_403() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).expect("passport key");
+    let mut state = mint_test_verified_app_state(16);
+    state.data_dir = tmp.path().to_path_buf();
+    state.passport_key_path = tmp.path().join("passport.key");
+    state.passport_fpr = key.passport_fpr().to_string();
+    state.passport_public_key_hex = key.public_key_hex().to_string();
+
+    // The receipt belongs to MarketResearch.
+    let receipt_id = super::observations::mint_governance_receipt(
+        &state,
+        "__governance__::erasure",
+        "operator",
+        "erasure.forget_tenant_corpus",
+        &serde_json::json!({ "tenant_id": "MarketResearch", "segments_reclaimed": 17 }),
+    )
+    .expect("governance receipt must mint");
+
+    // The caller holds receipts:read, but only for a different tenant —
+    // and asks under that tenant, so the route's first gate passes.
+    let headers = mint_test_jwt_headers_for_tenant("receipts:read", "other-tenant");
+    let resp = receipts::get_receipt_verification_v1(
+        State(state.clone()),
+        Path(receipt_id.clone()),
+        Query(TenantQuery {
+            tenant_id: "other-tenant".to_string(),
+        }),
+        headers,
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a cross-tenant hit must be indistinguishable from a miss"
+    );
+
+    // Control: the same request from the receipt's own tenant succeeds, so
+    // the 404 above is the tenant re-gate and not a broken lookup.
+    let owner_headers = mint_test_jwt_headers_for_tenant("receipts:read", "MarketResearch");
+    let ok = receipts::get_receipt_verification_v1(
+        State(state),
+        Path(receipt_id),
+        Query(TenantQuery {
+            tenant_id: "MarketResearch".to_string(),
+        }),
+        owner_headers,
+    )
+    .await
+    .into_response();
+    assert_eq!(ok.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -6858,13 +7962,14 @@ async fn panic_handler_handles_string_panic() {
 
 // ── Production hardening: /v1/version endpoint ──────────────────
 
-fn runtime_capability_profile_env() -> [EnvVarGuard; 5] {
+fn runtime_capability_profile_env() -> [EnvVarGuard; 6] {
     [
         EnvVarGuard::set("CORECRUXD_SYNC_ENABLED", "true"),
         EnvVarGuard::set("CORECRUXD_SYNC_REMOTE_URL", "http://sync.example.test:14800"),
         EnvVarGuard::set("CORECRUXD_SYNC_API_KEY", "test-key"),
         EnvVarGuard::set("CORECRUXD_QUERY_GRAPH_EXPAND", "1"),
         EnvVarGuard::set("CORECRUXD_GPU1_BASE_URL", "http://gpu.example.test"),
+        EnvVarGuard::set("CORECRUXD_CORECRUX_GRAPH_BASE_URL", "http://graph.example.test"),
     ]
 }
 
@@ -6895,7 +8000,7 @@ async fn version_runtime_capability_descriptor_full_profile() {
     let Some(capability_values) = capabilities.as_object() else {
         panic!("runtime_capabilities.capabilities must be a JSON object");
     };
-    assert_eq!(capability_values.len(), 7);
+    assert_eq!(capability_values.len(), 9);
     for capability in capability_values.values() {
         assert!(capability["availability"].is_string());
         assert!(capability["reason_code"].is_string());
@@ -6910,6 +8015,7 @@ async fn version_runtime_capability_descriptor_full_profile() {
         "hosted_sync",
         "projection_queries",
         "graph_expand",
+        "console_link_graph",
     ] {
         assert_eq!(capabilities[capability]["availability"], "available", "{capability}");
         assert_eq!(capabilities[capability]["reason_code"], "available", "{capability}");
@@ -6925,6 +8031,17 @@ async fn version_runtime_capability_descriptor_full_profile() {
         "embedding_delegation_not_configured"
     );
     assert_eq!(capabilities["embedding_delegation"]["configured"], false);
+
+    // Companion provenance on an empty corpus: nothing unattested, nothing
+    // refused, and the check is on — so `available`, not `degraded`. The counts
+    // ride in `detail`, which only this capability carries.
+    assert_eq!(capabilities["companion_provenance"]["availability"], "available");
+    assert_eq!(capabilities["companion_provenance"]["reason_code"], "available");
+    assert_eq!(capabilities["companion_provenance"]["degraded"], false);
+    assert_eq!(capabilities["companion_provenance"]["detail"]["mode"], "warn");
+    for tally in ["platform", "local", "none", "invalid", "refused"] {
+        assert_eq!(capabilities["companion_provenance"]["detail"][tally], 0, "{tally}");
+    }
     #[cfg(feature = "hosted-surfaces")]
     {
         assert_eq!(capabilities["rerank_gpu"]["availability"], "available");
@@ -7581,8 +8698,8 @@ async fn workbench_brief_requires_enabled_pro_service() {
 }
 
 #[tokio::test]
-async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
-    let state = pro_workbench_state(&["context_pack:budgeted", "ledger:history"]);
+async fn workbench_context_pack_stores_private_receipts() {
+    let state = pro_workbench_state(&["context_pack:budgeted"]);
     let shared = state.clone();
     {
         let mut store = shared.fact_store.write().await;
@@ -7621,43 +8738,6 @@ async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
         .unwrap()
         .starts_with("workbench:context_pack:"));
 
-    let ledger_resp = super::workbench::post_command_ledger(
-        State(state.clone()),
-        HeaderMap::new(),
-        Json(super::workbench::CommandLedgerBody {
-            tenant_id: "business::acme".to_string(),
-            command: "cargo".to_string(),
-            args: vec!["test".to_string(), "-p".to_string(), "corecruxd".to_string()],
-            cwd: Some("/home/myles/CueCrux/Crux".to_string()),
-            exit_status: Some(0),
-            duration_ms: Some(42),
-            started_at_unix_ms: Some(100),
-            completed_at_unix_ms: Some(142),
-            stdout_hash: Some("blake3:stdout".to_string()),
-            stderr_hash: None,
-            linked_receipts: vec![pack["receipt"]["receipt_id"].as_str().unwrap().to_string()],
-            project_id: Some("alpha".to_string()),
-            work_id: Some("work-1".to_string()),
-        }),
-    )
-    .await;
-    assert_eq!(ledger_resp.status(), StatusCode::OK);
-
-    let list_resp = super::workbench::get_command_ledger(
-        State(state),
-        HeaderMap::new(),
-        Query(super::workbench::TenantWorkbenchQuery {
-            tenant_id: "business::acme".to_string(),
-            project_id: None,
-            limit: Some(10),
-        }),
-    )
-    .await;
-    assert_eq!(list_resp.status(), StatusCode::OK);
-    let list = json_body(list_resp).await;
-    assert_eq!(list["count"], 1);
-    assert_eq!(list["entries"][0]["record"]["command"], "cargo");
-
     let store = shared.fact_store.read().await;
     let facts = store.query(&corecrux_memory::fact_store::FactQuery {
         min_effective_confidence: None,
@@ -7668,8 +8748,76 @@ async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
         top_k: 10,
         token_budget: None,
     });
-    assert_eq!(facts.facts.len(), 2);
+    assert_eq!(facts.facts.len(), 1);
     assert!(facts.facts.iter().all(|fact| fact.private));
+}
+
+/// `ledger:history` is not a sold claim, because nothing in the product ever
+/// writes a command-ledger record. `/v1/workbench/command-ledger` is still
+/// implemented and still routed — it simply cannot be enabled, so it answers
+/// `402 pro_service_not_enabled` in every mode.
+///
+/// This is the regression pin for re-adding the claim without a producer.
+/// If you are here because this test failed, land the producer first.
+/// ExecPlan: `crux-command-ledger-claim-truth-2026-07-30`.
+#[tokio::test]
+async fn workbench_command_ledger_is_not_a_sold_claim_without_a_producer() {
+    // Even asking for it explicitly cannot enable it: `ProductPosture::new`
+    // filters `enabled_pro_services` through `PRO_CAPABILITY_CLAIMS`.
+    let state = pro_workbench_state(&["ledger:history"]);
+    let posture = crate::product::ProductPosture::new(state.operating_mode, &state.enabled_pro_services);
+    assert!(
+        posture.enabled_pro_services.is_empty(),
+        "ledger:history must not survive the PRO_CAPABILITY_CLAIMS filter"
+    );
+
+    // It appears in no catalogue, so it can never be reported as
+    // `contracted_external` by `pro_claim_placements`.
+    assert!(!crate::product::PRO_CAPABILITY_CLAIMS.contains(&"ledger:history"));
+    assert!(!crate::product::DAEMON_IMPLEMENTED_PRO_CLAIMS.contains(&"ledger:history"));
+    assert!(!crate::product::HOSTED_CONTROL_PLANE_PRO_CLAIMS.contains(&"ledger:history"));
+    assert!(!posture
+        .capability_catalog
+        .pro_claim_placements
+        .iter()
+        .any(|placement| placement.claim == "ledger:history"));
+
+    let write_resp = super::workbench::post_command_ledger(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::workbench::CommandLedgerBody {
+            tenant_id: "business::acme".to_string(),
+            command: "cargo".to_string(),
+            args: vec!["test".to_string()],
+            cwd: None,
+            exit_status: Some(0),
+            duration_ms: Some(42),
+            started_at_unix_ms: Some(100),
+            completed_at_unix_ms: Some(142),
+            stdout_hash: None,
+            stderr_hash: None,
+            linked_receipts: Vec::new(),
+            project_id: None,
+            work_id: None,
+        }),
+    )
+    .await;
+    assert_eq!(write_resp.status(), StatusCode::PAYMENT_REQUIRED);
+    let write_body = json_body(write_resp).await;
+    assert_eq!(write_body["status"], "pro_service_not_enabled");
+    assert_eq!(write_body["capability"], "ledger:history");
+
+    let read_resp = super::workbench::get_command_ledger(
+        State(state),
+        HeaderMap::new(),
+        Query(super::workbench::TenantWorkbenchQuery {
+            tenant_id: "business::acme".to_string(),
+            project_id: None,
+            limit: Some(10),
+        }),
+    )
+    .await;
+    assert_eq!(read_resp.status(), StatusCode::PAYMENT_REQUIRED);
 }
 
 #[tokio::test]
@@ -8878,6 +10026,34 @@ async fn console_fact_add_then_search_round_trip() {
 }
 
 #[tokio::test]
+async fn console_fact_add_rejects_every_create_reserved_entity_prefix() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    for prefix in corecrux_memory::fact_privacy::DAEMON_OWNED_ENTITY_PREFIXES
+        .iter()
+        .chain(corecrux_memory::fact_privacy::GENERIC_CREATE_RESERVED_PREFIXES)
+    {
+        let entity = format!("{prefix}attacker");
+        let resp = console::post_console_fact_add(
+            State(state.clone()),
+            dev_scope_headers("facts:write"),
+            Json(console::ConsoleAddFactBody {
+                entity: entity.clone(),
+                key: "state".to_string(),
+                value: "attacker".to_string(),
+                confidence: 1.0,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "prefix {prefix}");
+        let body = json_body(resp).await;
+        assert_eq!(body["code"], "RESERVED_ENTITY_PREFIX");
+        assert_eq!(body["reserved_prefix"], *prefix);
+        assert!(state.fact_store.read().await.get_by_entity(&entity).is_empty());
+    }
+}
+
+#[tokio::test]
 async fn console_fact_add_requires_facts_write_scope() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let resp = console::post_console_fact_add(
@@ -9304,7 +10480,7 @@ async fn put_fact_system_entity_exempt_from_passport_category() {
     }
     let body = corecrux_memory::fact_store::StoreFact {
         tenant_hash: "default".to_string(),
-        entity: "__bootstrap__::seed".to_string(),
+        entity: "__synthetic__::seed".to_string(),
         key: "x".to_string(),
         value: "v".to_string(),
         source_receipt: None,
@@ -9313,7 +10489,9 @@ async fn put_fact_system_entity_exempt_from_passport_category() {
         horizon_class: None,
         actor: None,
     };
-    // personal-default writing a __bootstrap__:: system entity must succeed.
+    // A non-control system namespace remains category-exempt. Daemon-owned
+    // namespaces such as __bootstrap__:: are rejected by the earlier authority
+    // boundary instead.
     let resp = facts::put_fact(
         State(state),
         dev_scope_passport_headers("facts:write", "personal-default"),
@@ -9496,6 +10674,87 @@ async fn console_settings_get_returns_running_and_chosen_state() {
     assert_eq!(body["auth"]["running_mode"], "dev_scopes");
     assert!(body["embedding"]["active"].is_boolean());
     assert!(body["onboarding"]["completed_at_unix_ms"].is_null());
+}
+
+/// The reason this route is allowed to exist. The console is publicly exposed and
+/// the agent token authenticates the whole MCP surface, so "no raw token in the
+/// body unless explicitly armed" is the security boundary — not a nicety.
+#[tokio::test]
+#[serial_test::serial]
+async fn console_connections_never_reveals_the_token_by_default() {
+    const AGENT_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+    let _token = EnvVarGuard::set("CRUX_AGENT_TOKEN", AGENT_TOKEN);
+    let _tokens = EnvVarGuard::unset("CRUX_AGENT_TOKENS");
+    let _reveal = EnvVarGuard::unset("CORECRUXD_CONSOLE_REVEAL_AGENT_TOKEN");
+
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::get_console_connections(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["agent_token"]["configured"], true);
+    assert_eq!(body["agent_token"]["reveal_enabled"], false);
+    assert!(
+        body["agent_token"]["token"].is_null(),
+        "raw token must be absent when the reveal flag is unset"
+    );
+    // Belt and braces: the token must not appear ANYWHERE in the payload — not
+    // in a hint string, not in a fingerprint, not in a URL.
+    let serialised = serde_json::to_string(&body).expect("body serialises");
+    assert!(
+        !serialised.contains(AGENT_TOKEN),
+        "agent token leaked into the connections payload: {serialised}"
+    );
+    // The fingerprint identifies the credential without disclosing it.
+    let fingerprint = body["agent_token"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint present");
+    assert_eq!(fingerprint.len(), 8);
+    assert!(
+        !AGENT_TOKEN.contains(fingerprint),
+        "fingerprint is a digest, not a token slice"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn console_connections_reveals_the_token_when_explicitly_armed() {
+    const AGENT_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+    let _token = EnvVarGuard::set("CRUX_AGENT_TOKEN", AGENT_TOKEN);
+    let _tokens = EnvVarGuard::unset("CRUX_AGENT_TOKENS");
+    let _reveal = EnvVarGuard::set("CORECRUXD_CONSOLE_REVEAL_AGENT_TOKEN", "1");
+
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::get_console_connections(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["agent_token"]["reveal_enabled"], true);
+    assert_eq!(body["agent_token"]["token"], AGENT_TOKEN);
+}
+
+/// Per-agent tokens are a map of other people's credentials; the reveal flag is a
+/// single-token affordance and must not spill the map.
+#[tokio::test]
+#[serial_test::serial]
+async fn console_connections_never_reveals_named_agent_tokens() {
+    const AGENT_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+    let _tokens = EnvVarGuard::set("CRUX_AGENT_TOKENS", &format!("alice:{AGENT_TOKEN}"));
+    let _reveal = EnvVarGuard::set("CORECRUXD_CONSOLE_REVEAL_AGENT_TOKEN", "1");
+
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::get_console_connections(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    let serialised = serde_json::to_string(&body).expect("body serialises");
+    assert!(
+        !serialised.contains(AGENT_TOKEN),
+        "named agent token leaked even though only the single-token rail is revealable: {serialised}"
+    );
+    assert_eq!(body["agent_token"]["agent_names"], "alice");
 }
 
 #[tokio::test]
@@ -9846,7 +11105,7 @@ async fn console_review_contradictions_returns_factstore_candidates() {
             horizon_class: None,
             actor: None,
         });
-        assert!(store.clear_superseded(&first.fact_id));
+        assert!(store.clear_superseded("default", &first.fact_id));
         (first.fact_id, second.fact_id)
     };
 
@@ -10062,7 +11321,7 @@ async fn console_review_consolidation_supersedes_targets_with_actor() {
             horizon_class: None,
             actor: None,
         });
-        assert!(store.clear_superseded(&old.fact_id));
+        assert!(store.clear_superseded("default", &old.fact_id));
         (old.fact_id, newer.fact_id)
     };
 
@@ -10078,7 +11337,7 @@ async fn console_review_consolidation_supersedes_targets_with_actor() {
             protected_fact_ids: vec![],
             confidence: 0.8,
             source_receipt: None,
-            actor: None,
+            actor: Some("forged-body-actor".to_string()),
             horizon_class: Some(corecrux_memory::fact_store::HorizonClass::Stable),
             protected_confidence_floor: 0.99,
         }),
@@ -10103,7 +11362,12 @@ async fn console_review_consolidation_supersedes_targets_with_actor() {
     );
     assert_eq!(
         store.get(&canonical_id).unwrap().actor.as_deref(),
-        Some("passport:reviewer")
+        Some("operator:unverified:passport:reviewer")
+    );
+    assert_ne!(
+        store.get(&canonical_id).unwrap().actor.as_deref(),
+        Some("forged-body-actor"),
+        "body actor must never become signed or stored authority"
     );
 }
 
@@ -10582,7 +11846,8 @@ async fn passports_list_after_seed_returns_three_defaults() {
 
 #[tokio::test]
 async fn passport_mint_requests_pending_lists_filed_request_without_minting() {
-    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.passport_mint_requests_enabled = true;
     {
         let mut store = state.fact_store.write().await;
         let filed = crate::mint_requests::file_mint_request(
@@ -10620,9 +11885,206 @@ async fn passport_mint_requests_pending_lists_filed_request_without_minting() {
     assert!(!store.all_facts().any(|fact| fact.entity.starts_with("__passport__::")));
 }
 
+async fn mint_test_state(
+    auth_mode: AuthMode,
+    requester_id: &str,
+    requested_by_passport: &str,
+    requested_category: Option<&str>,
+) -> Result<(AppState, String), Box<dyn std::error::Error>> {
+    let mut state = test_app_state_with_auth(16, auth_mode);
+    bind_test_state_to_root_passport_key(&mut state);
+    state.passport_mint_requests_enabled = true;
+    let request_id = {
+        let mut store = state.fact_store.write().await;
+        crate::mint_requests::file_mint_request(
+            &mut store,
+            requester_id.to_string(),
+            requested_by_passport.to_string(),
+            requested_category.map(str::to_string),
+            None,
+            100,
+        )?
+        .request_id
+    };
+    Ok((state, request_id))
+}
+
+const MINT_TEST_HS256_SECRET: &str = "mint-approval-test-secret-32-bytes-minimum";
+const MINT_TEST_ISSUER: &str = "corecrux-mint-test";
+const MINT_TEST_AUDIENCE: &str = "corecrux";
+
+fn mint_test_verified_app_state(action_max_pending: usize) -> AppState {
+    let mut state = test_app_state_with_auth(action_max_pending, AuthMode::Off);
+    state.auth =
+        crate::auth::Authz::test_hs256(MINT_TEST_HS256_SECRET.as_bytes(), MINT_TEST_ISSUER, MINT_TEST_AUDIENCE);
+    state
+}
+
+fn mint_test_jwt_headers(scopes: &str, identity_claim: (&str, &str)) -> HeaderMap {
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs()
+        .saturating_add(3_600) as usize;
+    let mut claims = serde_json::json!({
+        "exp": exp,
+        "iss": MINT_TEST_ISSUER,
+        "aud": MINT_TEST_AUDIENCE,
+        "scope": scopes,
+        "tenant_id": "default",
+    });
+    claims[identity_claim.0] = serde_json::json!(identity_claim.1);
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(MINT_TEST_HS256_SECRET.as_bytes()),
+    )
+    .expect("mint approval test JWT");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer header"),
+    );
+    headers
+}
+
+fn mint_test_verified_headers(scopes: &str, passport_id: &str) -> HeaderMap {
+    mint_test_jwt_headers(scopes, ("passport_id", passport_id))
+}
+
+/// Like [`mint_test_jwt_headers`] but binds the token to a named tenant, so
+/// a test can exercise `TenantAllow::Only` — the cross-tenant path. Neither
+/// `AuthMode::Off` nor `AuthMode::DevScopes` can: both resolve to
+/// `TenantAllow::Any`, so every tenant check trivially passes.
+fn mint_test_jwt_headers_for_tenant(scopes: &str, tenant_id: &str) -> HeaderMap {
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs()
+        .saturating_add(3_600) as usize;
+    let claims = serde_json::json!({
+        "exp": exp,
+        "iss": MINT_TEST_ISSUER,
+        "aud": MINT_TEST_AUDIENCE,
+        "scope": scopes,
+        "tenant_id": tenant_id,
+    });
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(MINT_TEST_HS256_SECRET.as_bytes()),
+    )
+    .expect("mint tenant-scoped test JWT");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer header"),
+    );
+    headers
+}
+
+fn mint_test_sub_only_headers(scopes: &str, subject: &str) -> HeaderMap {
+    mint_test_jwt_headers(scopes, ("sub", subject))
+}
+
+async fn mint_test_verified_state(
+    requester_id: &str,
+    requested_by_passport: &str,
+    requested_category: Option<&str>,
+) -> Result<(AppState, String), Box<dyn std::error::Error>> {
+    let mut state = mint_test_verified_app_state(16);
+    bind_test_state_to_root_passport_key(&mut state);
+    state.passport_mint_requests_enabled = true;
+    let request_id = {
+        let mut store = state.fact_store.write().await;
+        crate::mint_requests::file_mint_request(
+            &mut store,
+            requester_id.to_string(),
+            requested_by_passport.to_string(),
+            requested_category.map(str::to_string),
+            None,
+            100,
+        )?
+        .request_id
+    };
+    Ok((state, request_id))
+}
+
+async fn mint_test_resolve(
+    state: &AppState,
+    request_id: &str,
+    headers: HeaderMap,
+    approver_hint: Option<&str>,
+    category: Option<&str>,
+    approve: bool,
+) -> Response {
+    let body = super::passports::ResolveMintRequestBody {
+        approver_passport: approver_hint.map(str::to_string),
+        category: category.map(str::to_string),
+        name: None,
+    };
+    if approve {
+        super::passports::post_mint_request_approve(
+            State(state.clone()),
+            Path(request_id.to_string()),
+            headers,
+            Json(body),
+        )
+        .await
+        .into_response()
+    } else {
+        super::passports::post_mint_request_reject(
+            State(state.clone()),
+            Path(request_id.to_string()),
+            headers,
+            Json(body),
+        )
+        .await
+        .into_response()
+    }
+}
+
+fn mint_test_observation_count(state: &AppState) -> Result<usize, Box<dyn std::error::Error>> {
+    let path =
+        super::observations::observation_file_path(&state.data_dir, super::approval_receipts::APPROVAL_RECEIPT_SESSION);
+    Ok(super::observations::read_observations_strict(&path)?.len())
+}
+
+#[tokio::test]
+async fn passport_mint_request_flag_off_hides_pending_list() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        let filed = crate::mint_requests::file_mint_request(
+            &mut store,
+            "codex-work".to_string(),
+            "codex-work".to_string(),
+            Some("work".to_string()),
+            Some("operator review".to_string()),
+            1_726_000_000_000,
+        );
+        assert!(filed.is_ok(), "seed pending request: {filed:?}");
+    }
+
+    let resp = super::passports::get_pending_mint_requests(
+        State(state),
+        Query(super::passports::ListPendingMintRequestsQuery { by_passport: None }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = json_body(resp).await;
+    assert!(body["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("passport mint requests disabled")));
+}
+
 #[tokio::test]
 async fn passport_mint_request_approve_http_mints_and_attributes_operator() -> Result<(), Box<dyn std::error::Error>> {
-    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let mut state = mint_test_verified_app_state(16);
+    bind_test_state_to_root_passport_key(&mut state);
     state.passport_mint_requests_enabled = true;
     let request_id = {
         let mut store = state.fact_store.write().await;
@@ -10640,9 +12102,9 @@ async fn passport_mint_request_approve_http_mints_and_attributes_operator() -> R
     let resp = super::passports::post_mint_request_approve(
         State(state.clone()),
         Path(request_id.clone()),
-        dev_scope_headers("admin:write"),
+        mint_test_verified_headers("admin:write", "operator-work"),
         Json(super::passports::ResolveMintRequestBody {
-            approver_passport: "operator-work".to_string(),
+            approver_passport: Some("operator-work".to_string()),
             category: Some("work".to_string()),
             name: Some("Codex work agent".to_string()),
         }),
@@ -10656,6 +12118,16 @@ async fn passport_mint_request_approve_http_mints_and_attributes_operator() -> R
     assert_eq!(body["category"], "work");
     assert_eq!(body["minted"], true);
     assert_eq!(body["status"], "approved");
+    assert_eq!(
+        body["receipt_session_id"],
+        super::approval_receipts::APPROVAL_RECEIPT_SESSION
+    );
+    let receipt_id = body["receipt_id"]
+        .as_str()
+        .ok_or_else(|| std::io::Error::other("mint approval receipt_id missing"))?
+        .to_string();
+    assert_eq!(receipt_id, format!("ad_{request_id}"));
+    assert!(body["receipt_record_id"].is_string());
 
     let store = state.fact_store.read().await;
     let passport = crate::passports::get_passport(&store, "codex-work")
@@ -10666,6 +12138,103 @@ async fn passport_mint_request_approve_http_mints_and_attributes_operator() -> R
         .ok_or_else(|| std::io::Error::other("resolved request missing"))?;
     assert_eq!(resolved.status, crate::mint_requests::MINT_REQUEST_STATUS_APPROVED);
     assert_eq!(resolved.resolved_by_passport.as_deref(), Some("operator-work"));
+    assert_eq!(resolved.resolution_receipt_id.as_deref(), Some(receipt_id.as_str()));
+    assert_eq!(resolved.approved_category.as_deref(), Some("work"));
+    assert_eq!(resolved.passport_operation.as_deref(), Some("create"));
+    assert_eq!(
+        resolved.passport_record_hash.as_deref(),
+        body["passport_record_hash"].as_str()
+    );
+    assert_eq!(
+        resolved.passport_mutation_hash.as_deref(),
+        body["passport_mutation_hash"].as_str()
+    );
+    let passport_entity = format!("{}::codex-work", crate::passports::PASSPORT_ENTITY_PREFIX);
+    let passport_fact = store
+        .all_facts()
+        .filter(|fact| fact.entity == passport_entity && fact.key == crate::passports::PASSPORT_RECORD_KEY)
+        .max_by_key(|fact| fact.version)
+        .ok_or_else(|| std::io::Error::other("minted passport fact missing"))?;
+    let request_entity = format!("{}::{request_id}", crate::mint_requests::MINT_REQUEST_ENTITY_PREFIX);
+    let request_fact = store
+        .all_facts()
+        .filter(|fact| fact.entity == request_entity && fact.key == crate::mint_requests::MINT_REQUEST_RECORD_KEY)
+        .max_by_key(|fact| fact.version)
+        .ok_or_else(|| std::io::Error::other("resolved mint request fact missing"))?;
+    for fact in [passport_fact, request_fact] {
+        assert_eq!(fact.actor.as_deref(), Some("operator-work"));
+        assert_eq!(fact.source_receipt.as_deref(), Some(receipt_id.as_str()));
+    }
+    drop(store);
+
+    let follow_up_request_id = {
+        let mut store = state.fact_store.write().await;
+        crate::mint_requests::file_mint_request(
+            &mut store,
+            "codex-work".to_string(),
+            "codex-work".to_string(),
+            Some("work".to_string()),
+            Some("request after receipt-backed resolution".to_string()),
+            101,
+        )?
+        .request_id
+    };
+    assert_ne!(follow_up_request_id, request_id);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(state.data_dir.join("passports/codex-work.key"))?
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    let local = super::receipts::local_approval_receipt(&state, "default", &receipt_id)?
+        .ok_or_else(|| std::io::Error::other("local mint approval receipt missing"))?;
+    assert_eq!(local.reviewer_passport, "operator-work");
+    assert_eq!(local.decision, "approve");
+    assert_eq!(local.risk_tier, "high");
+    assert!(local.action_summary.contains("category=work"));
+    assert!(local.passport_issued_at_unix_ms.is_some());
+
+    let body_response = super::receipts::get_receipt_body_v1(
+        State(state.clone()),
+        Path(receipt_id.clone()),
+        Query(TenantQuery {
+            tenant_id: "default".to_string(),
+        }),
+        mint_test_verified_headers("receipts:read", "operator-work"),
+    )
+    .await
+    .into_response();
+    assert_eq!(body_response.status(), StatusCode::OK);
+    let signature_response = super::receipts::get_receipt_signature_v1(
+        State(state.clone()),
+        Path(receipt_id.clone()),
+        Query(TenantQuery {
+            tenant_id: "default".to_string(),
+        }),
+        mint_test_verified_headers("receipts:read", "operator-work"),
+    )
+    .await
+    .into_response();
+    assert_eq!(signature_response.status(), StatusCode::OK);
+    let verification_response = super::receipts::get_receipt_verification_v1(
+        State(state),
+        Path(receipt_id),
+        Query(TenantQuery {
+            tenant_id: "default".to_string(),
+        }),
+        mint_test_verified_headers("receipts:read", "operator-work"),
+    )
+    .await
+    .into_response();
+    assert_eq!(verification_response.status(), StatusCode::OK);
+    let verification = json_body(verification_response).await;
+    assert_eq!(verification["signature_valid"], true);
+    assert_eq!(verification["error_code"], "OK");
     Ok(())
 }
 
@@ -10673,6 +12242,7 @@ async fn passport_mint_request_approve_http_mints_and_attributes_operator() -> R
 async fn passport_mint_request_resolution_requires_admin_write_without_mutation(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    bind_test_state_to_root_passport_key(&mut state);
     state.passport_mint_requests_enabled = true;
     let request_id = {
         let mut store = state.fact_store.write().await;
@@ -10692,7 +12262,7 @@ async fn passport_mint_request_resolution_requires_admin_write_without_mutation(
         Path(request_id.clone()),
         dev_scope_headers("admin:read"),
         Json(super::passports::ResolveMintRequestBody {
-            approver_passport: "operator-work".to_string(),
+            approver_passport: Some("operator-work".to_string()),
             category: Some("work".to_string()),
             name: None,
         }),
@@ -10706,7 +12276,7 @@ async fn passport_mint_request_resolution_requires_admin_write_without_mutation(
         Path(request_id.clone()),
         dev_scope_headers("admin:read"),
         Json(super::passports::ResolveMintRequestBody {
-            approver_passport: "operator-work".to_string(),
+            approver_passport: Some("operator-work".to_string()),
             category: None,
             name: None,
         }),
@@ -10739,7 +12309,7 @@ async fn passport_mint_request_flag_off_approve_and_reject_are_noops() -> Result
         .request_id
     };
     let body = || super::passports::ResolveMintRequestBody {
-        approver_passport: "operator-work".to_string(),
+        approver_passport: Some("operator-work".to_string()),
         category: Some("work".to_string()),
         name: None,
     };
@@ -10747,7 +12317,7 @@ async fn passport_mint_request_flag_off_approve_and_reject_are_noops() -> Result
     let approve = super::passports::post_mint_request_approve(
         State(state.clone()),
         Path(request_id.clone()),
-        dev_scope_headers("admin:write"),
+        dev_scope_passport_headers("admin:write", "rejecting-operator"),
         Json(body()),
     )
     .await
@@ -10777,7 +12347,8 @@ async fn passport_mint_request_flag_off_approve_and_reject_are_noops() -> Result
 #[tokio::test]
 async fn passport_mint_request_reject_http_mints_nothing_and_attributes_operator(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let mut state = mint_test_verified_app_state(16);
+    bind_test_state_to_root_passport_key(&mut state);
     state.passport_mint_requests_enabled = true;
     let request_id = {
         let mut store = state.fact_store.write().await;
@@ -10795,9 +12366,9 @@ async fn passport_mint_request_reject_http_mints_nothing_and_attributes_operator
     let resp = super::passports::post_mint_request_reject(
         State(state.clone()),
         Path(request_id.clone()),
-        dev_scope_headers("admin:write"),
+        mint_test_verified_headers("admin:write", "rejecting-operator"),
         Json(super::passports::ResolveMintRequestBody {
-            approver_passport: "rejecting-operator".to_string(),
+            approver_passport: Some("rejecting-operator".to_string()),
             category: Some("public".to_string()),
             name: Some("must be ignored".to_string()),
         }),
@@ -10810,6 +12381,15 @@ async fn passport_mint_request_reject_http_mints_nothing_and_attributes_operator
     assert_eq!(body["requester_id"], "rejected-agent");
     assert_eq!(body["minted"], false);
     assert_eq!(body["status"], "rejected");
+    let receipt_id = body["receipt_id"]
+        .as_str()
+        .ok_or_else(|| std::io::Error::other("mint rejection receipt_id missing"))?
+        .to_string();
+    assert_eq!(receipt_id, format!("ad_{request_id}"));
+    assert_eq!(
+        body["receipt_session_id"],
+        super::approval_receipts::APPROVAL_RECEIPT_SESSION
+    );
 
     let store = state.fact_store.read().await;
     assert!(crate::passports::get_passport(&store, "rejected-agent").is_none());
@@ -10817,13 +12397,47 @@ async fn passport_mint_request_reject_http_mints_nothing_and_attributes_operator
         .ok_or_else(|| std::io::Error::other("rejected request missing"))?;
     assert_eq!(request.status, crate::mint_requests::MINT_REQUEST_STATUS_REJECTED);
     assert_eq!(request.resolved_by_passport.as_deref(), Some("rejecting-operator"));
+    assert_eq!(request.resolution_receipt_id.as_deref(), Some(receipt_id.as_str()));
+    assert_eq!(request.approved_category, None);
+    assert_eq!(request.passport_operation, None);
+    assert_eq!(request.passport_record_hash, None);
+    assert_eq!(request.passport_mutation_hash, None);
+    let request_entity = format!("{}::{request_id}", crate::mint_requests::MINT_REQUEST_ENTITY_PREFIX);
+    let request_fact = store
+        .all_facts()
+        .filter(|fact| fact.entity == request_entity && fact.key == crate::mint_requests::MINT_REQUEST_RECORD_KEY)
+        .max_by_key(|fact| fact.version)
+        .ok_or_else(|| std::io::Error::other("rejected mint request fact missing"))?;
+    assert_eq!(request_fact.actor.as_deref(), Some("rejecting-operator"));
+    assert_eq!(request_fact.source_receipt.as_deref(), Some(receipt_id.as_str()));
+    drop(store);
+
+    let local = super::receipts::local_approval_receipt(&state, "default", &receipt_id)?
+        .ok_or_else(|| std::io::Error::other("local mint rejection receipt missing"))?;
+    assert_eq!(local.reviewer_passport, "rejecting-operator");
+    assert_eq!(local.decision, "reject");
+    assert_eq!(local.passport_issued_at_unix_ms, None);
+    let verification_response = super::receipts::get_receipt_verification_v1(
+        State(state),
+        Path(receipt_id),
+        Query(TenantQuery {
+            tenant_id: "default".to_string(),
+        }),
+        mint_test_verified_headers("receipts:read", "rejecting-operator"),
+    )
+    .await
+    .into_response();
+    assert_eq!(verification_response.status(), StatusCode::OK);
+    let verification = json_body(verification_response).await;
+    assert_eq!(verification["signature_valid"], true);
+    assert_eq!(verification["error_code"], "OK");
     Ok(())
 }
 
 #[tokio::test]
 async fn passport_mint_request_approve_http_maps_category_and_terminal_errors_without_minting(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let mut state = mint_test_verified_app_state(16);
     state.passport_mint_requests_enabled = true;
     let (missing_category_id, invalid_category_id, resolved_id) = {
         let mut store = state.fact_store.write().await;
@@ -10831,7 +12445,7 @@ async fn passport_mint_request_approve_http_maps_category_and_terminal_errors_wi
             &mut store,
             "missing-category-agent".to_string(),
             "missing-category-agent".to_string(),
-            None,
+            Some("work".to_string()),
             None,
             100,
         )?;
@@ -10851,7 +12465,13 @@ async fn passport_mint_request_approve_http_maps_category_and_terminal_errors_wi
             None,
             100,
         )?;
-        crate::mint_requests::reject_mint_request(&mut store, &resolved.request_id, "first-operator".to_string(), 200)?;
+        crate::mint_requests::reject_mint_request(
+            &mut store,
+            &resolved.request_id,
+            "first-operator".to_string(),
+            &format!("ad_{}", resolved.request_id),
+            200,
+        )?;
         (missing.request_id, invalid.request_id, resolved.request_id)
     };
 
@@ -10859,9 +12479,9 @@ async fn passport_mint_request_approve_http_maps_category_and_terminal_errors_wi
         super::passports::post_mint_request_approve(
             State(state.clone()),
             Path(request_id),
-            dev_scope_headers("admin:write"),
+            mint_test_verified_headers("admin:write", "operator-work"),
             Json(super::passports::ResolveMintRequestBody {
-                approver_passport: "operator-work".to_string(),
+                approver_passport: Some("operator-work".to_string()),
                 category,
                 name: None,
             }),
@@ -10901,6 +12521,574 @@ async fn passport_mint_request_approve_http_maps_category_and_terminal_errors_wi
     let terminal = crate::mint_requests::get_mint_request(&store, &resolved_id)
         .ok_or_else(|| std::io::Error::other("terminal request missing"))?;
     assert_eq!(terminal.status, crate::mint_requests::MINT_REQUEST_STATUS_REJECTED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_denies_missing_spoofed_and_self_reviewer_without_mutation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    for approve in [true, false] {
+        let (state, request_id) =
+            mint_test_state(AuthMode::DevScopes, "requester-a", "requester-a", Some("work")).await?;
+
+        let missing = mint_test_resolve(
+            &state,
+            &request_id,
+            dev_scope_headers("admin:write"),
+            Some("approver-a"),
+            Some("work"),
+            approve,
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+
+        let spoofed = mint_test_resolve(
+            &state,
+            &request_id,
+            dev_scope_passport_headers("admin:write", "approver-a"),
+            Some("approver-b"),
+            Some("work"),
+            approve,
+        )
+        .await;
+        assert_eq!(spoofed.status(), StatusCode::FORBIDDEN);
+
+        let unverified = mint_test_resolve(
+            &state,
+            &request_id,
+            dev_scope_passport_headers("admin:write", "approver-a"),
+            Some("approver-a"),
+            Some("work"),
+            approve,
+        )
+        .await;
+        assert_eq!(unverified.status(), StatusCode::FORBIDDEN);
+
+        let self_review = mint_test_resolve(
+            &state,
+            &request_id,
+            dev_scope_passport_headers("admin:write", "requester-a"),
+            Some("requester-a"),
+            Some("work"),
+            approve,
+        )
+        .await;
+        assert_eq!(self_review.status(), StatusCode::FORBIDDEN);
+        assert_eq!(mint_test_observation_count(&state)?, 0);
+
+        let store = state.fact_store.read().await;
+        let pending = crate::mint_requests::get_mint_request(&store, &request_id)
+            .ok_or_else(|| std::io::Error::other("pending mint request missing"))?;
+        assert_eq!(pending.status, crate::mint_requests::MINT_REQUEST_STATUS_PENDING);
+        assert!(crate::passports::get_passport(&store, "requester-a").is_none());
+        assert!(!state.data_dir.join("passports/requester-a.key").exists());
+
+        let (verified_state, verified_request_id) =
+            mint_test_verified_state("requester-a", "requester-a", Some("work")).await?;
+        let verified_self_review = mint_test_resolve(
+            &verified_state,
+            &verified_request_id,
+            mint_test_verified_headers("admin:write", "requester-a"),
+            Some("requester-a"),
+            Some("work"),
+            approve,
+        )
+        .await;
+        assert_eq!(verified_self_review.status(), StatusCode::FORBIDDEN);
+        assert_eq!(mint_test_observation_count(&verified_state)?, 0);
+        let verified_store = verified_state.fact_store.read().await;
+        let verified_pending = crate::mint_requests::get_mint_request(&verified_store, &verified_request_id)
+            .ok_or_else(|| std::io::Error::other("verified self-review request missing"))?;
+        assert_eq!(
+            verified_pending.status,
+            crate::mint_requests::MINT_REQUEST_STATUS_PENDING
+        );
+        assert!(crate::passports::get_passport(&verified_store, "requester-a").is_none());
+        assert!(!verified_state.data_dir.join("passports/requester-a.key").exists());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_auth_off_is_rejected_without_mutation() -> Result<(), Box<dyn std::error::Error>> {
+    for approve in [true, false] {
+        let (state, request_id) = mint_test_state(AuthMode::Off, "requester-a", "requester-a", Some("work")).await?;
+
+        for claimed in [None, Some("requester-a"), Some("approver-a")] {
+            let denied = mint_test_resolve(&state, &request_id, HeaderMap::new(), claimed, Some("work"), approve).await;
+            assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        }
+        assert_eq!(mint_test_observation_count(&state)?, 0);
+
+        let store = state.fact_store.read().await;
+        let pending = crate::mint_requests::get_mint_request(&store, &request_id)
+            .ok_or_else(|| std::io::Error::other("auth-off pending mint request missing"))?;
+        assert_eq!(pending.status, crate::mint_requests::MINT_REQUEST_STATUS_PENDING);
+        assert_eq!(pending.resolved_by_passport, None);
+        assert_eq!(pending.resolution_receipt_id, None);
+        assert!(crate::passports::get_passport(&store, "requester-a").is_none());
+        assert!(!state.data_dir.join("passports/requester-a.key").exists());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn passport_mint_request_jwt_reviewer_binding_denies_body_and_header_impersonation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    let _secret = EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", SECRET);
+    let _issuer = EnvVarGuard::set("CORECRUXD_JWT_ISS", "corecrux-test");
+    let _audience = EnvVarGuard::set("CORECRUXD_JWT_AUD", "corecrux");
+
+    #[derive(serde::Serialize)]
+    struct Claims<'a> {
+        exp: usize,
+        iss: &'a str,
+        aud: &'a str,
+        scope: &'a str,
+        tenant_id: &'a str,
+        passport_id: &'a str,
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let token = encode(
+        &Header::new(Algorithm::HS256),
+        &Claims {
+            exp: now.as_secs().saturating_add(3_600) as usize,
+            iss: "corecrux-test",
+            aud: "corecrux",
+            scope: "admin:write",
+            tenant_id: "default",
+            passport_id: "approver-a",
+        },
+        &EncodingKey::from_secret(SECRET.as_bytes()),
+    )?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}"))?,
+    );
+
+    let (state, request_id) = mint_test_state(AuthMode::JwtHs256, "requester-a", "requester-a", Some("work")).await?;
+    let spoofed = mint_test_resolve(
+        &state,
+        &request_id,
+        headers.clone(),
+        Some("approver-b"),
+        Some("work"),
+        true,
+    )
+    .await;
+    assert_eq!(spoofed.status(), StatusCode::FORBIDDEN);
+
+    let mut override_headers = headers.clone();
+    override_headers.insert("x-corecrux-passport-id", HeaderValue::from_static("approver-b"));
+    let impersonated = mint_test_resolve(
+        &state,
+        &request_id,
+        override_headers,
+        Some("approver-b"),
+        Some("work"),
+        true,
+    )
+    .await;
+    assert_eq!(impersonated.status(), StatusCode::FORBIDDEN);
+    assert_eq!(mint_test_observation_count(&state)?, 0);
+
+    let accepted = mint_test_resolve(&state, &request_id, headers, None, Some("work"), true).await;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let body = json_body(accepted).await;
+    let receipt_id = body["receipt_id"]
+        .as_str()
+        .ok_or_else(|| std::io::Error::other("JWT mint receipt id missing"))?;
+    let receipt = super::receipts::local_approval_receipt(&state, "default", receipt_id)?
+        .ok_or_else(|| std::io::Error::other("JWT mint receipt missing"))?;
+    assert_eq!(receipt.reviewer_passport, "approver-a");
+    let store = state.fact_store.read().await;
+    let resolved = crate::mint_requests::get_mint_request(&store, &request_id)
+        .ok_or_else(|| std::io::Error::other("JWT resolved mint request missing"))?;
+    assert_eq!(resolved.resolved_by_passport.as_deref(), Some("approver-a"));
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn passport_mint_request_rejects_agent_token_as_human_approval() -> Result<(), Box<dyn std::error::Error>> {
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    const AGENT_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+    let _secret = EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", SECRET);
+    let _accept = EnvVarGuard::set("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS", "1");
+    let _tokens = EnvVarGuard::set("CRUX_AGENT_TOKENS", &format!("drivew:{AGENT_TOKEN}"));
+    let _scopes = EnvVarGuard::set("CORECRUXD_AGENT_TOKEN_HTTP_SCOPES", "admin:write");
+    let _tenant = EnvVarGuard::set("CORECRUXD_AGENT_TOKEN_HTTP_TENANT", "default");
+
+    let (state, request_id) = mint_test_state(AuthMode::JwtHs256, "requester-a", "requester-a", Some("work")).await?;
+    for approve in [true, false] {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {AGENT_TOKEN}"))?,
+        );
+        let denied = mint_test_resolve(&state, &request_id, headers, None, Some("work"), approve).await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    }
+    assert_eq!(mint_test_observation_count(&state)?, 0);
+    let store = state.fact_store.read().await;
+    let pending = crate::mint_requests::get_mint_request(&store, &request_id)
+        .ok_or_else(|| std::io::Error::other("agent-token pending mint request missing"))?;
+    assert_eq!(pending.status, crate::mint_requests::MINT_REQUEST_STATUS_PENDING);
+    assert!(crate::passports::get_passport(&store, "requester-a").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_rejects_sub_only_jwt_as_human_approval() -> Result<(), Box<dyn std::error::Error>> {
+    let (state, request_id) = mint_test_verified_state("requester-a", "requester-a", Some("work")).await?;
+
+    for approve in [true, false] {
+        let denied = mint_test_resolve(
+            &state,
+            &request_id,
+            mint_test_sub_only_headers("admin:write", "automation-subject"),
+            None,
+            Some("work"),
+            approve,
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    }
+
+    assert_eq!(mint_test_observation_count(&state)?, 0);
+    let store = state.fact_store.read().await;
+    let pending = crate::mint_requests::get_mint_request(&store, &request_id)
+        .ok_or_else(|| std::io::Error::other("sub-only JWT pending mint request missing"))?;
+    assert_eq!(pending.status, crate::mint_requests::MINT_REQUEST_STATUS_PENDING);
+    assert_eq!(pending.resolved_by_passport, None);
+    assert_eq!(pending.resolution_receipt_id, None);
+    assert!(crate::passports::get_passport(&store, "requester-a").is_none());
+    assert!(!state.data_dir.join("passports/requester-a.key").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_receipt_failure_cleans_new_key_and_leaves_request_pending(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (state, request_id) = mint_test_verified_state("requester-a", "requester-a", Some("work")).await?;
+    let receipt_path =
+        super::observations::observation_file_path(&state.data_dir, super::approval_receipts::APPROVAL_RECEIPT_SESSION);
+    std::fs::create_dir_all(&receipt_path)?;
+
+    let failed = mint_test_resolve(
+        &state,
+        &request_id,
+        mint_test_verified_headers("admin:write", "approver-a"),
+        Some("approver-a"),
+        Some("work"),
+        true,
+    )
+    .await;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!state.data_dir.join("passports/requester-a.key").exists());
+
+    let store = state.fact_store.read().await;
+    let pending = crate::mint_requests::get_mint_request(&store, &request_id)
+        .ok_or_else(|| std::io::Error::other("pending request missing after receipt failure"))?;
+    assert_eq!(pending.status, crate::mint_requests::MINT_REQUEST_STATUS_PENDING);
+    assert!(crate::passports::get_passport(&store, "requester-a").is_none());
+    drop(store);
+
+    let duplicate = {
+        let mut store = state.fact_store.write().await;
+        crate::mint_requests::file_mint_request(
+            &mut store,
+            "requester-a".to_string(),
+            "requester-a".to_string(),
+            Some("work".to_string()),
+            None,
+            101,
+        )
+    };
+    assert!(matches!(
+        duplicate,
+        Err(crate::mint_requests::MintRequestError::AlreadyPending {
+            request_id: duplicate_request_id,
+            ..
+        }) if duplicate_request_id == request_id
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_post_append_sync_failure_retains_key_for_exact_retry(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (state, request_id) = mint_test_verified_state("requester-a", "requester-a", Some("work")).await?;
+    let receipt_path =
+        super::observations::observation_file_path(&state.data_dir, super::approval_receipts::APPROVAL_RECEIPT_SESSION);
+    let sync_failure_marker = receipt_path.with_extension("sync-fail");
+    if let Some(parent) = sync_failure_marker.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&sync_failure_marker, b"fail after append")?;
+    let headers = mint_test_verified_headers("admin:write", "approver-a");
+
+    let failed = mint_test_resolve(
+        &state,
+        &request_id,
+        headers.clone(),
+        Some("approver-a"),
+        Some("work"),
+        true,
+    )
+    .await;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(mint_test_observation_count(&state)?, 1);
+    let key_path = state.data_dir.join("passports/requester-a.key");
+    let receipt_bound_key = std::fs::read(&key_path)?;
+    {
+        let store = state.fact_store.read().await;
+        let pending = crate::mint_requests::get_mint_request(&store, &request_id)
+            .ok_or_else(|| std::io::Error::other("pending request missing after receipt sync failure"))?;
+        assert_eq!(pending.status, crate::mint_requests::MINT_REQUEST_STATUS_PENDING);
+        assert!(crate::passports::get_passport(&store, "requester-a").is_none());
+    }
+
+    std::fs::remove_file(&sync_failure_marker)?;
+    let retried = mint_test_resolve(&state, &request_id, headers, Some("approver-a"), Some("work"), true).await;
+    assert_eq!(retried.status(), StatusCode::OK);
+    assert_eq!(mint_test_observation_count(&state)?, 1);
+    assert_eq!(std::fs::read(&key_path)?, receipt_bound_key);
+    let store = state.fact_store.read().await;
+    assert!(crate::passports::get_passport(&store, "requester-a").is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_quarantines_torn_receipt_tail_before_approval() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (state, request_id) = mint_test_verified_state("requester-a", "requester-a", Some("work")).await?;
+    let receipt_path =
+        super::observations::observation_file_path(&state.data_dir, super::approval_receipts::APPROVAL_RECEIPT_SESSION);
+    if let Some(parent) = receipt_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&receipt_path, br#"{"observation_id":"torn""#)?;
+
+    let approved = mint_test_resolve(
+        &state,
+        &request_id,
+        mint_test_verified_headers("admin:write", "approver-a"),
+        Some("approver-a"),
+        Some("work"),
+        true,
+    )
+    .await;
+    assert_eq!(approved.status(), StatusCode::OK);
+    assert_eq!(mint_test_observation_count(&state)?, 1);
+    let quarantine_count = std::fs::read_dir(
+        receipt_path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("receipt path parent missing"))?,
+    )?
+    .filter_map(Result::ok)
+    .filter(|entry| entry.file_name().to_string_lossy().contains("jsonl.torn."))
+    .count();
+    assert_eq!(quarantine_count, 1);
+    let store = state.fact_store.read().await;
+    assert!(crate::passports::get_passport(&store, "requester-a").is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_reuses_receipt_bound_key_after_fact_journal_failure(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut state = mint_test_verified_app_state(16);
+    bind_test_state_to_root_passport_key(&mut state);
+    state.passport_mint_requests_enabled = true;
+    let fact_dir = state.data_dir.join("mint-fact-journal");
+    let mut persistent_store = corecrux_memory::FactStore::with_persistence(&fact_dir)?;
+    let request_id = crate::mint_requests::file_mint_request(
+        &mut persistent_store,
+        "requester-a".to_string(),
+        "requester-a".to_string(),
+        Some("work".to_string()),
+        None,
+        100,
+    )?
+    .request_id;
+    state.fact_store = Arc::new(RwLock::new(persistent_store));
+
+    let journal_path = fact_dir.join("facts.jsonl");
+    let journal_backup = fact_dir.join("facts.before-failure.jsonl");
+    std::fs::rename(&journal_path, &journal_backup)?;
+    std::fs::create_dir(&journal_path)?;
+    let headers = mint_test_verified_headers("admin:write", "approver-a");
+
+    let failed = mint_test_resolve(
+        &state,
+        &request_id,
+        headers.clone(),
+        Some("approver-a"),
+        Some("work"),
+        true,
+    )
+    .await;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(mint_test_observation_count(&state)?, 1);
+    let key_path = state.data_dir.join("passports/requester-a.key");
+    let receipt_bound_key = std::fs::read(&key_path)?;
+    {
+        let store = state.fact_store.read().await;
+        let pending = crate::mint_requests::get_mint_request(&store, &request_id)
+            .ok_or_else(|| std::io::Error::other("pending request missing after fact failure"))?;
+        assert_eq!(pending.status, crate::mint_requests::MINT_REQUEST_STATUS_PENDING);
+        assert!(crate::passports::get_passport(&store, "requester-a").is_none());
+    }
+    let duplicate = {
+        let mut store = state.fact_store.write().await;
+        crate::mint_requests::file_mint_request(
+            &mut store,
+            "requester-a".to_string(),
+            "requester-a".to_string(),
+            Some("work".to_string()),
+            None,
+            101,
+        )
+    };
+    assert!(matches!(
+        duplicate,
+        Err(crate::mint_requests::MintRequestError::AlreadyPending {
+            request_id: duplicate_request_id,
+            ..
+        }) if duplicate_request_id == request_id
+    ));
+    let receipt_records = super::observations::read_observations_strict(&super::observations::observation_file_path(
+        &state.data_dir,
+        super::approval_receipts::APPROVAL_RECEIPT_SESSION,
+    ))?;
+    let receipt_record_id = receipt_records
+        .first()
+        .ok_or_else(|| std::io::Error::other("orphan mint receipt missing"))?
+        .observation_id
+        .clone();
+
+    std::fs::remove_dir(&journal_path)?;
+    std::fs::rename(&journal_backup, &journal_path)?;
+
+    let changed_category = mint_test_resolve(
+        &state,
+        &request_id,
+        headers.clone(),
+        Some("approver-a"),
+        Some("public"),
+        true,
+    )
+    .await;
+    assert_eq!(changed_category.status(), StatusCode::CONFLICT);
+    let opposite_decision =
+        mint_test_resolve(&state, &request_id, headers.clone(), Some("approver-a"), None, false).await;
+    assert_eq!(opposite_decision.status(), StatusCode::CONFLICT);
+    assert_eq!(mint_test_observation_count(&state)?, 1);
+
+    let retried = mint_test_resolve(&state, &request_id, headers, Some("approver-a"), Some("work"), true).await;
+    assert_eq!(retried.status(), StatusCode::OK);
+    let retried_body = json_body(retried).await;
+    assert_eq!(retried_body["receipt_record_id"], receipt_record_id);
+    assert_eq!(mint_test_observation_count(&state)?, 1);
+    assert_eq!(std::fs::read(&key_path)?, receipt_bound_key);
+
+    let store = state.fact_store.read().await;
+    let resolved = crate::mint_requests::get_mint_request(&store, &request_id)
+        .ok_or_else(|| std::io::Error::other("retried mint request missing"))?;
+    assert_eq!(resolved.status, crate::mint_requests::MINT_REQUEST_STATUS_APPROVED);
+    assert!(crate::passports::get_passport(&store, "requester-a").is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_conflicting_approve_cleans_key_after_reject_receipt_failure(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut state = mint_test_verified_app_state(16);
+    bind_test_state_to_root_passport_key(&mut state);
+    state.passport_mint_requests_enabled = true;
+    let fact_dir = state.data_dir.join("reject-fact-journal");
+    let mut persistent_store = corecrux_memory::FactStore::with_persistence(&fact_dir)?;
+    let request_id = crate::mint_requests::file_mint_request(
+        &mut persistent_store,
+        "requester-a".to_string(),
+        "requester-a".to_string(),
+        Some("work".to_string()),
+        None,
+        100,
+    )?
+    .request_id;
+    state.fact_store = Arc::new(RwLock::new(persistent_store));
+    let journal_path = fact_dir.join("facts.jsonl");
+    let journal_backup = fact_dir.join("facts.before-failure.jsonl");
+    std::fs::rename(&journal_path, &journal_backup)?;
+    std::fs::create_dir(&journal_path)?;
+    let headers = mint_test_verified_headers("admin:write", "approver-a");
+
+    let failed_reject = mint_test_resolve(&state, &request_id, headers.clone(), Some("approver-a"), None, false).await;
+    assert_eq!(failed_reject.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(mint_test_observation_count(&state)?, 1);
+    assert!(!state.data_dir.join("passports/requester-a.key").exists());
+    std::fs::remove_dir(&journal_path)?;
+    std::fs::rename(&journal_backup, &journal_path)?;
+
+    let conflicting_approve = mint_test_resolve(
+        &state,
+        &request_id,
+        headers.clone(),
+        Some("approver-a"),
+        Some("work"),
+        true,
+    )
+    .await;
+    assert_eq!(conflicting_approve.status(), StatusCode::CONFLICT);
+    let facts = state.fact_store.read().await;
+    assert!(crate::passports::get_passport(&facts, "requester-a").is_none());
+    drop(facts);
+    assert!(!state.data_dir.join("passports/requester-a.key").exists());
+
+    let retried_reject = mint_test_resolve(&state, &request_id, headers, Some("approver-a"), None, false).await;
+    assert_eq!(retried_reject.status(), StatusCode::OK);
+    assert_eq!(mint_test_observation_count(&state)?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn passport_mint_request_concurrent_opposite_decisions_have_one_winner() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (state, request_id) = mint_test_verified_state("requester-a", "requester-a", Some("work")).await?;
+    let headers = mint_test_verified_headers("admin:write", "approver-a");
+    let approve = mint_test_resolve(
+        &state,
+        &request_id,
+        headers.clone(),
+        Some("approver-a"),
+        Some("work"),
+        true,
+    );
+    let reject = mint_test_resolve(&state, &request_id, headers, Some("approver-a"), None, false);
+    let (approve, reject) = tokio::join!(approve, reject);
+    let mut statuses = [approve.status(), reject.status()];
+    statuses.sort();
+    assert_eq!(statuses, [StatusCode::OK, StatusCode::CONFLICT]);
+    assert_eq!(mint_test_observation_count(&state)?, 1);
+
+    let store = state.fact_store.read().await;
+    let resolved = crate::mint_requests::get_mint_request(&store, &request_id)
+        .ok_or_else(|| std::io::Error::other("concurrently resolved mint request missing"))?;
+    assert!(matches!(
+        resolved.status.as_str(),
+        crate::mint_requests::MINT_REQUEST_STATUS_APPROVED | crate::mint_requests::MINT_REQUEST_STATUS_REJECTED
+    ));
+    assert_eq!(
+        crate::passports::get_passport(&store, "requester-a").is_some(),
+        resolved.status == crate::mint_requests::MINT_REQUEST_STATUS_APPROVED
+    );
     Ok(())
 }
 
@@ -11025,7 +13213,7 @@ async fn passports_patch_updates_gate_and_default_flag() {
     let resp = super::passports::patch_passport(
         State(state),
         Path("alice".to_string()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::passports::UpdatePassportBody {
             category: Some("work".to_string()),
             agent_work_gate: Some(true),
@@ -11073,7 +13261,7 @@ async fn passports_delete_removes_record() {
     let del_resp = super::passports::delete_passport(
         State(state.clone()),
         Path("alice".to_string()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
     )
     .await
     .into_response();
@@ -11410,6 +13598,89 @@ async fn engram_list_session_init_and_resolve_match_hosted_shape() {
         .starts_with("local-engram-dispatch:"));
 }
 
+fn test_engram_upsert_body() -> super::engrams::UpsertEngramBody {
+    super::engrams::UpsertEngramBody {
+        version: "v1".to_string(),
+        intent_bucket: "developer_surface".to_string(),
+        query_pattern: Some("code|minimal".to_string()),
+        content: "operator-validated minimalism overlay".to_string(),
+        applicable_why: Some("local policy".to_string()),
+        capability_class_min: Some("capable".to_string()),
+        capability_class_max: Some("frontier".to_string()),
+        generated_class: None,
+        source_chunk_hashes: Vec::new(),
+        source_chunk_set_hash: None,
+        inherited_reason: None,
+        policy_hash: None,
+        enabled: true,
+    }
+}
+
+#[tokio::test]
+async fn typed_engram_upsert_validates_and_stamps_provenance() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::engrams::upsert_engram(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Path("code-minimalism".to_string()),
+        Json(test_engram_upsert_body()),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = json_body(resp).await;
+    assert_eq!(body["schema"], "crux.local.engram_upsert.v1");
+    assert_eq!(body["name"], "code-minimalism");
+    assert!(body["actor"].as_str().is_some_and(|actor| !actor.is_empty()));
+    assert!(body["source_receipt"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("engram-upsert:blake3:"));
+
+    let store = state.fact_store.read().await;
+    let rows = store.get_by_entity("__engram__::code-minimalism::v1");
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].private);
+    assert!(rows[0].actor.is_some());
+    assert!(rows[0].source_receipt.is_some());
+    let catalog = corecrux_memory::engrams::local_catalog_with_overlays(&store);
+    let overlay = catalog
+        .iter()
+        .find(|engram| engram.name == "code-minimalism" && engram.version == "v1")
+        .expect("validated overlay");
+    assert_eq!(overlay.content, "operator-validated minimalism overlay");
+}
+
+#[tokio::test]
+async fn typed_engram_upsert_rejects_wrong_scope_and_malformed_name() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let wrong_scope = super::engrams::upsert_engram(
+        State(state.clone()),
+        dev_scope_headers("facts:write"),
+        Path("code-minimalism".to_string()),
+        Json(test_engram_upsert_body()),
+    )
+    .await
+    .into_response();
+    assert_eq!(wrong_scope.status(), StatusCode::FORBIDDEN);
+
+    let malformed = super::engrams::upsert_engram(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Path("../escape".to_string()),
+        Json(test_engram_upsert_body()),
+    )
+    .await
+    .into_response();
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    assert!(state
+        .fact_store
+        .read()
+        .await
+        .get_by_entity("__engram__::../escape::v1")
+        .is_empty());
+}
+
 #[tokio::test]
 async fn rcx_publish_passport_preview_builds_signed_schema_record() {
     let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
@@ -11560,7 +13831,7 @@ async fn projects_create_then_list_then_get() {
 
     let create_resp = super::projects::post_project(
         State(state.clone()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::projects::CreateProjectBody {
             id: "alpha".to_string(),
             name: "Alpha".to_string(),
@@ -11599,7 +13870,7 @@ async fn projects_invalid_planning_target_returns_400() {
     }
     let resp = super::projects::post_project(
         State(state),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::projects::CreateProjectBody {
             id: "alpha".to_string(),
             name: "Alpha".to_string(),
@@ -11622,7 +13893,7 @@ async fn projects_add_unknown_passport_returns_404() {
     }
     let _ = super::projects::post_project(
         State(state.clone()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::projects::CreateProjectBody {
             id: "alpha".to_string(),
             name: "Alpha".to_string(),
@@ -11637,7 +13908,7 @@ async fn projects_add_unknown_passport_returns_404() {
     let resp = super::projects::post_project_member(
         State(state),
         Path("alpha".to_string()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::projects::AddMemberBody {
             passport_id: "ghost".to_string(),
             role: "contributor".to_string(),
@@ -11660,7 +13931,7 @@ async fn projects_delete_removes_subentities() {
     }
     let _ = super::projects::post_project(
         State(state.clone()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::projects::CreateProjectBody {
             id: "alpha".to_string(),
             name: "Alpha".to_string(),
@@ -11674,7 +13945,7 @@ async fn projects_delete_removes_subentities() {
     let del = super::projects::delete_project(
         State(state.clone()),
         Path("alpha".to_string()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
     )
     .await
     .into_response();
@@ -11695,7 +13966,7 @@ async fn projects_members_tenants_layers_repos_and_graph_round_trip() {
 
     let create_resp = super::projects::post_project(
         State(state.clone()),
-        dev_scope_headers("admin:read facts:write"),
+        dev_scope_headers("admin:write facts:write"),
         Json(super::projects::CreateProjectBody {
             id: "alpha".to_string(),
             name: "Alpha".to_string(),
@@ -11711,7 +13982,7 @@ async fn projects_members_tenants_layers_repos_and_graph_round_trip() {
     let patch_resp = super::projects::patch_project(
         State(state.clone()),
         Path("alpha".to_string()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::projects::UpdateProjectBody {
             name: Some("Alpha Updated".to_string()),
             planning_target: Some(None),
@@ -11729,7 +14000,7 @@ async fn projects_members_tenants_layers_repos_and_graph_round_trip() {
     let member_resp = super::projects::post_project_member(
         State(state.clone()),
         Path("alpha".to_string()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::projects::AddMemberBody {
             passport_id: "work-default".to_string(),
             role: "reviewer".to_string(),
@@ -11742,7 +14013,7 @@ async fn projects_members_tenants_layers_repos_and_graph_round_trip() {
     let tenant_resp = super::projects::post_project_tenant(
         State(state.clone()),
         Path("alpha".to_string()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(super::projects::AddTenantBody {
             tenant_id: "tenant-b".to_string(),
             default_passport_id: Some("public-default".to_string()),
@@ -11843,7 +14114,7 @@ async fn projects_members_tenants_layers_repos_and_graph_round_trip() {
     let delete_tenant = super::projects::delete_project_tenant(
         State(state.clone()),
         Path(("alpha".to_string(), "tenant-b".to_string())),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
     )
     .await
     .into_response();
@@ -11852,17 +14123,234 @@ async fn projects_members_tenants_layers_repos_and_graph_round_trip() {
     let delete_member = super::projects::delete_project_member(
         State(state),
         Path(("alpha".to_string(), "work-default".to_string())),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
     )
     .await
     .into_response();
     assert_eq!(delete_member.status(), StatusCode::NO_CONTENT);
 }
 
+const WORK_AUTH_TEST_SECRET: &str = "work-auth-test-secret-at-least-32-bytes";
+const WORK_AUTH_TEST_ISSUER: &str = "corecrux-work-test";
+const WORK_AUTH_TEST_AUDIENCE: &str = "corecrux";
+
+fn work_auth_test_state(action_max_pending: usize) -> AppState {
+    let mut state = test_app_state_with_auth(action_max_pending, AuthMode::Off);
+    state.auth = crate::auth::Authz::test_hs256(
+        WORK_AUTH_TEST_SECRET.as_bytes(),
+        WORK_AUTH_TEST_ISSUER,
+        WORK_AUTH_TEST_AUDIENCE,
+    );
+    state
+}
+
+fn work_auth_headers(tenant_id: &str, passport_id: Option<&str>, scopes: &str) -> HeaderMap {
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs()
+        .saturating_add(3_600) as usize;
+    let mut claims = serde_json::json!({
+        "exp": exp,
+        "iss": WORK_AUTH_TEST_ISSUER,
+        "aud": WORK_AUTH_TEST_AUDIENCE,
+        "scope": scopes,
+        "tenant_id": tenant_id,
+    });
+    if let Some(passport_id) = passport_id {
+        claims["passport_id"] = serde_json::json!(passport_id);
+    }
+    work_auth_headers_from_claims(claims)
+}
+
+fn work_auth_headers_from_claims(claims: serde_json::Value) -> HeaderMap {
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(WORK_AUTH_TEST_SECRET.as_bytes()),
+    )
+    .expect("work auth test JWT");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer header"),
+    );
+    headers
+}
+
+fn work_auth_sub_headers(tenant_id: &str, subject: &str, scopes: &str) -> HeaderMap {
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs()
+        .saturating_add(3_600) as usize;
+    work_auth_headers_from_claims(serde_json::json!({
+        "exp": exp,
+        "iss": WORK_AUTH_TEST_ISSUER,
+        "aud": WORK_AUTH_TEST_AUDIENCE,
+        "scope": scopes,
+        "tenant_id": tenant_id,
+        "sub": subject,
+    }))
+}
+
+fn work_auth_missing_tenant_headers(passport_id: &str, scopes: &str) -> HeaderMap {
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs()
+        .saturating_add(3_600) as usize;
+    work_auth_headers_from_claims(serde_json::json!({
+        "exp": exp,
+        "iss": WORK_AUTH_TEST_ISSUER,
+        "aud": WORK_AUTH_TEST_AUDIENCE,
+        "scope": scopes,
+        "passport_id": passport_id,
+    }))
+}
+
+#[tokio::test]
+async fn fact_aggregate_requires_and_enforces_one_authorized_tenant() {
+    let state = work_auth_test_state(16);
+    {
+        let mut store = state.fact_store.write().await;
+        for (tenant, entity, value) in [
+            ("tenant-a", "metric:a1", "10"),
+            ("tenant-a", "metric:a2", "20"),
+            ("tenant-b", "metric:b1", "999"),
+        ] {
+            store.store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: tenant.to_string(),
+                entity: entity.to_string(),
+                key: "amount".to_string(),
+                value: value.to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+        }
+    }
+    let request = corecrux_memory::fact_store::AggregateRequestV1 {
+        op: corecrux_memory::fact_store::AggregateOp::Count,
+        entity: None,
+        key: Some("amount".to_string()),
+        query: None,
+        as_of: None,
+        token_budget: None,
+    };
+
+    let a = facts::post_aggregate(
+        State(state.clone()),
+        work_auth_headers("tenant-a", None, "query:read"),
+        Json(request.clone()),
+    )
+    .await
+    .into_response();
+    assert_eq!(a.status(), StatusCode::OK);
+    assert_eq!(json_body(a).await["value"], serde_json::json!(2));
+
+    let b = facts::post_aggregate(
+        State(state.clone()),
+        work_auth_headers("tenant-b", None, "query:read"),
+        Json(request.clone()),
+    )
+    .await
+    .into_response();
+    assert_eq!(b.status(), StatusCode::OK);
+    assert_eq!(json_body(b).await["value"], serde_json::json!(1));
+
+    let missing = facts::post_aggregate(
+        State(state.clone()),
+        work_auth_missing_tenant_headers("passport-a", "query:read"),
+        Json(request.clone()),
+    )
+    .await
+    .into_response();
+    assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .saturating_add(3_600) as usize;
+    let multi_headers = work_auth_headers_from_claims(serde_json::json!({
+        "exp": exp,
+        "iss": WORK_AUTH_TEST_ISSUER,
+        "aud": WORK_AUTH_TEST_AUDIENCE,
+        "scope": "query:read",
+        "tenants": ["tenant-a", "tenant-b"],
+    }));
+    let ambiguous = facts::post_aggregate(State(state), multi_headers, Json(request))
+        .await
+        .into_response();
+    assert_eq!(ambiguous.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn fact_export_tenant_filter_precedes_pagination() {
+    let state = work_auth_test_state(16);
+    let (a1, a2) = {
+        let mut store = state.fact_store.write().await;
+        let put = |store: &mut corecrux_memory::FactStore, tenant: &str, entity: &str, value: &str| {
+            store.store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: tenant.to_string(),
+                entity: entity.to_string(),
+                key: "k".to_string(),
+                value: value.to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            })
+        };
+        put(&mut store, "tenant-b", "b1", "foreign-first");
+        let a1 = put(&mut store, "tenant-a", "a1", "a-first");
+        put(&mut store, "tenant-b", "b2", "foreign-middle");
+        let a2 = put(&mut store, "tenant-a", "a2", "a-second");
+        (a1, a2)
+    };
+
+    let page1 = facts::export_facts(
+        State(state.clone()),
+        work_auth_headers("tenant-a", None, "query:read"),
+        Query(ExportFactsParams {
+            since: None,
+            cursor: None,
+            limit: Some(1),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(page1.status(), StatusCode::OK);
+    let page1 = json_body(page1).await;
+    assert_eq!(page1["facts"][0]["fact_id"], a1.fact_id);
+    assert_eq!(page1["next_cursor"], a1.fact_id);
+    assert_eq!(page1["has_more"], true);
+
+    let page2 = facts::export_facts(
+        State(state),
+        work_auth_headers("tenant-a", None, "query:read"),
+        Query(ExportFactsParams {
+            since: None,
+            cursor: page1["next_cursor"].as_str().map(str::to_string),
+            limit: Some(1),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(page2.status(), StatusCode::OK);
+    let page2 = json_body(page2).await;
+    assert_eq!(page2["facts"][0]["fact_id"], a2.fact_id);
+    assert_eq!(page2["has_more"], false);
+}
+
 #[serial_test::serial]
 #[tokio::test]
 async fn work_post_then_list_then_patch_state_round_trip() {
-    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let state = work_auth_test_state(16);
     {
         let mut store = state.fact_store.write().await;
         crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
@@ -11871,7 +14359,7 @@ async fn work_post_then_list_then_patch_state_round_trip() {
 
     let create_resp = super::work::post_work(
         State(state.clone()),
-        dev_scope_headers("facts:write"),
+        work_auth_headers("personal", Some("personal-default"), "facts:write"),
         Json(super::work::CreateWorkBody {
             project_id: "default".to_string(),
             title: "fix the thing".to_string(),
@@ -11881,7 +14369,7 @@ async fn work_post_then_list_then_patch_state_round_trip() {
             tenant_id: Some("personal".to_string()),
             linked_pr: None,
             linked_issue: None,
-            created_by_passport: "personal-default".to_string(),
+            created_by_passport: Some("personal-default".to_string()),
         }),
     )
     .await
@@ -11895,12 +14383,15 @@ async fn work_post_then_list_then_patch_state_round_trip() {
         Query(super::work::ListWorkQuery {
             project_id: Some("default".to_string()),
             state: Some("planned".to_string()),
-            tenant_id: None,
+            tenant_id: Some("personal".to_string()),
             assignee_passport: None,
             source: super::work::WorkSource::default(),
             orchestrator: None,
+            ranked: false,
+            limit: None,
+            fields: None,
         }),
-        dev_scope_headers("admin:read"),
+        work_auth_headers("personal", Some("personal-default"), "admin:read"),
     )
     .await
     .into_response();
@@ -11910,7 +14401,7 @@ async fn work_post_then_list_then_patch_state_round_trip() {
     let patch_resp = super::work::patch_work(
         State(state.clone()),
         Path(work_id.clone()),
-        dev_scope_headers("facts:write"),
+        work_auth_headers("personal", Some("personal-default"), "facts:write"),
         Json(super::work::UpdateWorkBody {
             title: None,
             body: None,
@@ -11921,7 +14412,7 @@ async fn work_post_then_list_then_patch_state_round_trip() {
             linked_issue: None,
             blocker_reason: None,
             blocker_kind: None,
-            by_passport: "personal-default".to_string(),
+            by_passport: Some("personal-default".to_string()),
         }),
     )
     .await
@@ -11931,14 +14422,730 @@ async fn work_post_then_list_then_patch_state_round_trip() {
     assert_eq!(patched["applied"], true);
     assert_eq!(patched["work"]["state"], "in_progress");
 
-    let txn_resp = super::work::get_transitions(State(state), Path(work_id), dev_scope_headers("admin:read"))
-        .await
-        .into_response();
+    let txn_resp = super::work::get_transitions(
+        State(state),
+        Path(work_id),
+        work_auth_headers("personal", Some("personal-default"), "admin:read"),
+    )
+    .await
+    .into_response();
     let txn_body = json_body(txn_resp).await;
     let txns = txn_body["transitions"].as_array().expect("transitions");
     assert_eq!(txns.len(), 2, "create + transition");
     assert_eq!(txns[0]["from_state"], "(none)");
     assert_eq!(txns[1]["to_state"], "in_progress");
+}
+
+#[tokio::test]
+async fn work_jwt_actor_and_tenant_isolation_matrix() {
+    let state = work_auth_test_state(16);
+    let (work_a, work_b) = {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed passports");
+        crate::projects::seed_default_if_missing(&mut store, 1).expect("seed project");
+        let create = |tenant: &str, actor: &str, title: &str| crate::work::CreateWorkInput {
+            project_id: "default".to_string(),
+            title: title.to_string(),
+            body: None,
+            state: None,
+            assignee_passport: None,
+            tenant_id: Some(tenant.to_string()),
+            linked_pr: None,
+            linked_issue: None,
+            created_by_passport: actor.to_string(),
+        };
+        let a = crate::work::create_work(&mut store, create("tenant-a", "passport-a", "tenant a"), 1_000)
+            .expect("create tenant A");
+        let b = crate::work::create_work(&mut store, create("tenant-b", "passport-b", "tenant b"), 1_100)
+            .expect("create tenant B");
+        crate::work::add_comment(&mut store, &b.id, "passport-b", "tenant b comment", 1_200).expect("comment tenant B");
+        let queued = crate::work::update_work(
+            &mut store,
+            &b.id,
+            crate::work::UpdateWorkInput {
+                title: None,
+                body: None,
+                state: Some("in_progress".to_string()),
+                assignee_passport: None,
+                tenant_id: None,
+                linked_pr: None,
+                linked_issue: None,
+                blocker_reason: None,
+                blocker_kind: None,
+            },
+            crate::work::UpdateWorkContext {
+                by_passport: "passport-b".to_string(),
+                passport_gated: true,
+                now_unix_ms: 1_300,
+            },
+        )
+        .expect("queue tenant B transition");
+        assert!(matches!(queued, crate::work::UpdateOutcome::Queued(_)));
+        (a, b)
+    };
+
+    let read_a = || work_auth_headers("tenant-a", Some("passport-a"), "admin:read");
+    let write_a = || work_auth_headers("tenant-a", Some("passport-a"), "facts:write");
+
+    let list = super::work::get_work(
+        State(state.clone()),
+        Query(super::work::ListWorkQuery {
+            project_id: None,
+            state: None,
+            tenant_id: None,
+            assignee_passport: None,
+            source: super::work::WorkSource::Kanban,
+            orchestrator: None,
+            ranked: false,
+            limit: None,
+            fields: None,
+        }),
+        read_a(),
+    )
+    .await
+    .into_response();
+    assert_eq!(list.status(), StatusCode::OK);
+    let listed = json_body(list).await;
+    assert_eq!(listed["count"], 1);
+    assert_eq!(listed["work"][0]["id"], work_a.id);
+
+    let cross_list = super::work::get_work(
+        State(state.clone()),
+        Query(super::work::ListWorkQuery {
+            project_id: None,
+            state: None,
+            tenant_id: Some("tenant-b".to_string()),
+            assignee_passport: None,
+            source: super::work::WorkSource::Kanban,
+            orchestrator: None,
+            ranked: false,
+            limit: None,
+            fields: None,
+        }),
+        read_a(),
+    )
+    .await
+    .into_response();
+    assert_eq!(cross_list.status(), StatusCode::FORBIDDEN);
+
+    for response in [
+        super::work::get_work_item(State(state.clone()), Path(work_b.id.clone()), read_a())
+            .await
+            .into_response(),
+        super::work::get_comments(State(state.clone()), Path(work_b.id.clone()), read_a())
+            .await
+            .into_response(),
+        super::work::get_transitions(State(state.clone()), Path(work_b.id.clone()), read_a())
+            .await
+            .into_response(),
+    ] {
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    let pending = super::work::get_pending_gates(
+        State(state.clone()),
+        Query(super::work::GateListQuery {
+            by_passport: None,
+            tenant_id: None,
+        }),
+        read_a(),
+    )
+    .await
+    .into_response();
+    assert_eq!(pending.status(), StatusCode::OK);
+    assert_eq!(json_body(pending).await["count"], 0);
+
+    let before_denied = {
+        let store = state.fact_store.read().await;
+        store.all_facts().count()
+    };
+    let cross_patch = super::work::patch_work(
+        State(state.clone()),
+        Path(work_b.id.clone()),
+        write_a(),
+        Json(super::work::UpdateWorkBody {
+            title: Some("stolen".to_string()),
+            body: None,
+            state: None,
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: None,
+            blocker_kind: None,
+            by_passport: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(cross_patch.status(), StatusCode::FORBIDDEN);
+    let cross_comment = super::work::post_comment(
+        State(state.clone()),
+        Path(work_b.id.clone()),
+        write_a(),
+        Json(super::work::CommentBody {
+            author_passport: None,
+            body: "stolen".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(cross_comment.status(), StatusCode::FORBIDDEN);
+
+    let spoof_create = super::work::post_work(
+        State(state.clone()),
+        write_a(),
+        Json(super::work::CreateWorkBody {
+            project_id: "default".to_string(),
+            title: "spoof".to_string(),
+            body: None,
+            state: None,
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            created_by_passport: Some("passport-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(spoof_create.status(), StatusCode::FORBIDDEN);
+    let cross_create = super::work::post_work(
+        State(state.clone()),
+        write_a(),
+        Json(super::work::CreateWorkBody {
+            project_id: "default".to_string(),
+            title: "cross tenant".to_string(),
+            body: None,
+            state: None,
+            assignee_passport: None,
+            tenant_id: Some("tenant-b".to_string()),
+            linked_pr: None,
+            linked_issue: None,
+            created_by_passport: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(cross_create.status(), StatusCode::FORBIDDEN);
+    let spoof_patch = super::work::patch_work(
+        State(state.clone()),
+        Path(work_a.id.clone()),
+        write_a(),
+        Json(super::work::UpdateWorkBody {
+            title: Some("spoof".to_string()),
+            body: None,
+            state: None,
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: None,
+            blocker_kind: None,
+            by_passport: Some("passport-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(spoof_patch.status(), StatusCode::FORBIDDEN);
+    let spoof_comment = super::work::post_comment(
+        State(state.clone()),
+        Path(work_a.id.clone()),
+        write_a(),
+        Json(super::work::CommentBody {
+            author_passport: Some("passport-b".to_string()),
+            body: "spoof".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(spoof_comment.status(), StatusCode::FORBIDDEN);
+
+    let missing_identity = super::work::post_work(
+        State(state.clone()),
+        work_auth_headers("tenant-a", None, "facts:write"),
+        Json(super::work::CreateWorkBody {
+            project_id: "default".to_string(),
+            title: "anonymous".to_string(),
+            body: None,
+            state: None,
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            created_by_passport: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(missing_identity.status(), StatusCode::FORBIDDEN);
+    let missing_tenant = super::work::post_work(
+        State(state.clone()),
+        work_auth_missing_tenant_headers("passport-a", "facts:write"),
+        Json(super::work::CreateWorkBody {
+            project_id: "default".to_string(),
+            title: "tenantless".to_string(),
+            body: None,
+            state: None,
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            created_by_passport: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(missing_tenant.status(), StatusCode::FORBIDDEN);
+
+    let after_denied = {
+        let store = state.fact_store.read().await;
+        store.all_facts().count()
+    };
+    assert_eq!(after_denied, before_denied, "denied work requests must not write facts");
+
+    for initial_state in ["drafting", "in_progress", "complete", "deployed", "pending_approval"] {
+        let before = {
+            let store = state.fact_store.read().await;
+            store.all_facts().count()
+        };
+        let response = super::work::post_work(
+            State(state.clone()),
+            write_a(),
+            Json(super::work::CreateWorkBody {
+                project_id: "default".to_string(),
+                title: format!("bad initial {initial_state}"),
+                body: None,
+                state: Some(initial_state.to_string()),
+                assignee_passport: None,
+                tenant_id: None,
+                linked_pr: None,
+                linked_issue: None,
+                created_by_passport: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let store = state.fact_store.read().await;
+        assert_eq!(store.all_facts().count(), before);
+    }
+
+    for tenant_change in [Some(Some("tenant-b".to_string())), Some(None)] {
+        let response = super::work::patch_work(
+            State(state.clone()),
+            Path(work_a.id.clone()),
+            write_a(),
+            Json(super::work::UpdateWorkBody {
+                title: None,
+                body: None,
+                state: None,
+                assignee_passport: None,
+                tenant_id: tenant_change,
+                linked_pr: None,
+                linked_issue: None,
+                blocker_reason: None,
+                blocker_kind: None,
+                by_passport: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    let queued_unknown = super::work::patch_work(
+        State(state.clone()),
+        Path(work_a.id.clone()),
+        work_auth_headers("tenant-a", Some("unknown-passport"), "facts:write"),
+        Json(super::work::UpdateWorkBody {
+            title: None,
+            body: None,
+            state: Some("in_progress".to_string()),
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: None,
+            blocker_kind: None,
+            by_passport: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(queued_unknown.status(), StatusCode::ACCEPTED);
+    let queued = json_body(queued_unknown).await;
+    assert_eq!(queued["queued"]["requested_by_passport"], "unknown-passport");
+}
+
+#[tokio::test]
+async fn work_local_assertions_are_tagged_and_known_ungated_passports_still_queue() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed passports");
+        crate::projects::seed_default_if_missing(&mut store, 1).expect("seed project");
+        let passport = crate::passports::get_passport(&store, "personal-default").expect("personal passport");
+        assert!(
+            !passport.agent_work_gate,
+            "fixture must be an ordinarily ungated passport"
+        );
+    }
+    let expected_actor = "operator:unverified:personal-default";
+    let headers = || dev_scope_passport_headers("facts:write", "personal-default");
+
+    let created = super::work::post_work(
+        State(state.clone()),
+        headers(),
+        Json(super::work::CreateWorkBody {
+            project_id: "default".to_string(),
+            title: "local assertion attribution".to_string(),
+            body: None,
+            state: None,
+            assignee_passport: None,
+            tenant_id: Some("tenant-a".to_string()),
+            linked_pr: None,
+            linked_issue: None,
+            created_by_passport: Some("personal-default".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created = json_body(created).await;
+    assert_eq!(created["created_by_passport"], expected_actor);
+    let work_id = created["id"].as_str().expect("created work id").to_string();
+
+    let commented = super::work::post_comment(
+        State(state.clone()),
+        Path(work_id.clone()),
+        headers(),
+        Json(super::work::CommentBody {
+            author_passport: Some("personal-default".to_string()),
+            body: "locally asserted comment".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(commented.status(), StatusCode::CREATED);
+    assert_eq!(json_body(commented).await["author_passport"], expected_actor);
+
+    let transition = super::work::patch_work(
+        State(state.clone()),
+        Path(work_id.clone()),
+        headers(),
+        Json(super::work::UpdateWorkBody {
+            title: None,
+            body: None,
+            state: Some("in_progress".to_string()),
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: None,
+            blocker_kind: None,
+            by_passport: Some("personal-default".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(transition.status(), StatusCode::ACCEPTED);
+    let transition = json_body(transition).await;
+    assert_eq!(transition["applied"], false);
+    assert_eq!(transition["queued"]["requested_by_passport"], expected_actor);
+
+    let store = state.fact_store.read().await;
+    let persisted = crate::work::get_work(&store, &work_id).expect("persisted work");
+    assert_eq!(persisted.created_by_passport, expected_actor);
+    assert_eq!(
+        persisted.state, "planned",
+        "unverified state transition must remain gated"
+    );
+    assert_eq!(
+        crate::work::list_comments(&store, &work_id)[0].author_passport,
+        expected_actor
+    );
+    let pending = crate::work::list_pending_gates(&store, Some("tenant-a"), Some(expected_actor));
+    assert_eq!(pending.len(), 1);
+    assert!(
+        store
+            .all_facts()
+            .filter(|fact| { fact.entity.contains(&work_id) || fact.entity.contains(pending[0].action_id.as_str()) })
+            .all(|fact| fact.actor.as_deref() == Some(expected_actor)),
+        "all local work mutations must retain the durable unverified actor tag"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn unmapped_agent_token_cannot_inherit_colliding_passport_policy() -> Result<(), Box<dyn std::error::Error>> {
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    const AGENT_TOKEN: &str = "abcdef0123456789abcdef0123456789abcdef0123456789";
+    let _secret = EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", SECRET);
+    let _issuer = EnvVarGuard::unset("CORECRUXD_JWT_ISS");
+    let _audience = EnvVarGuard::unset("CORECRUXD_JWT_AUD");
+    let _accept = EnvVarGuard::set("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS", "1");
+    let _tokens = EnvVarGuard::set("CRUX_AGENT_TOKENS", &format!("personal-default:{AGENT_TOKEN}"));
+    let _scopes = EnvVarGuard::set("CORECRUXD_AGENT_TOKEN_HTTP_SCOPES", "facts:write");
+    let _tenant = EnvVarGuard::set("CORECRUXD_AGENT_TOKEN_HTTP_TENANT", "tenant-a");
+    let _passport_flag = EnvVarGuard::unset("CORECRUXD_AGENT_PASSPORTS");
+    let _passport_map = EnvVarGuard::unset("CRUX_AGENT_PASSPORTS");
+
+    let mut state = test_app_state_with_auth(16, AuthMode::Off);
+    state.auth = crate::auth::Authz::from_env(AuthMode::JwtHs256).expect("agent-token auth config");
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed passports");
+        crate::projects::seed_default_if_missing(&mut store, 1).expect("seed project");
+        let colliding = crate::passports::get_passport(&store, "personal-default").expect("colliding passport");
+        assert!(
+            !colliding.agent_work_gate,
+            "fixture must prove the human passport would ordinarily be ungated"
+        );
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {AGENT_TOKEN}"))?,
+    );
+
+    let created = super::work::post_work(
+        State(state.clone()),
+        headers.clone(),
+        Json(super::work::CreateWorkBody {
+            project_id: "default".to_string(),
+            title: "agent-token collision regression".to_string(),
+            body: None,
+            state: None,
+            assignee_passport: None,
+            tenant_id: Some("tenant-a".to_string()),
+            linked_pr: None,
+            linked_issue: None,
+            created_by_passport: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created = json_body(created).await;
+    assert_eq!(created["created_by_passport"], "agent:personal-default");
+    let work_id = created["id"].as_str().expect("created work id").to_string();
+
+    let transitioned = super::work::patch_work(
+        State(state.clone()),
+        Path(work_id.clone()),
+        headers,
+        Json(super::work::UpdateWorkBody {
+            title: None,
+            body: None,
+            state: Some("in_progress".to_string()),
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: None,
+            blocker_kind: None,
+            by_passport: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(transitioned.status(), StatusCode::ACCEPTED);
+    let transitioned = json_body(transitioned).await;
+    assert_eq!(transitioned["applied"], false);
+    assert_eq!(
+        transitioned["queued"]["requested_by_passport"],
+        "agent:personal-default"
+    );
+
+    let store = state.fact_store.read().await;
+    let persisted = crate::work::get_work(&store, &work_id).expect("persisted work");
+    assert_eq!(persisted.state, "planned");
+    assert_eq!(persisted.created_by_passport, "agent:personal-default");
+    Ok(())
+}
+
+#[tokio::test]
+async fn coord_active_filters_embedded_work_by_verified_tenant() {
+    let mut state = work_auth_test_state(16);
+    state.coord_enabled = true;
+    let (work_a, work_b) = {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed passports");
+        crate::projects::seed_default_if_missing(&mut store, 1).expect("seed project");
+        let mut create = |tenant: &str, actor: &str, now| {
+            let work = crate::work::create_work(
+                &mut store,
+                crate::work::CreateWorkInput {
+                    project_id: "default".to_string(),
+                    title: format!("{tenant} work"),
+                    body: None,
+                    state: None,
+                    assignee_passport: None,
+                    tenant_id: Some(tenant.to_string()),
+                    linked_pr: None,
+                    linked_issue: None,
+                    created_by_passport: actor.to_string(),
+                },
+                now,
+            )
+            .expect("create work");
+            let outcome = crate::work::update_work(
+                &mut store,
+                &work.id,
+                crate::work::UpdateWorkInput {
+                    title: None,
+                    body: None,
+                    state: Some("in_progress".to_string()),
+                    assignee_passport: None,
+                    tenant_id: None,
+                    linked_pr: None,
+                    linked_issue: None,
+                    blocker_reason: None,
+                    blocker_kind: None,
+                },
+                crate::work::UpdateWorkContext {
+                    by_passport: actor.to_string(),
+                    passport_gated: false,
+                    now_unix_ms: now + 1,
+                },
+            )
+            .expect("transition work");
+            assert!(matches!(outcome, crate::work::UpdateOutcome::Applied(_)));
+            work.id
+        };
+        (
+            create("tenant-a", "passport-a", 1_000),
+            create("tenant-b", "passport-b", 2_000),
+        )
+    };
+
+    let response = super::coord::get_coord_active(
+        State(state.clone()),
+        Query(super::coord::ActiveQuery {
+            project_id: None,
+            tenant_id: None,
+        }),
+        work_auth_headers("tenant-a", Some("passport-a"), "admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let work = body["work_in_flight"].as_array().expect("work in flight");
+    assert_eq!(work.len(), 1);
+    assert_eq!(work[0]["id"], work_a);
+    assert!(work.iter().all(|item| item["id"] != work_b));
+
+    let cross_tenant = super::coord::get_coord_active(
+        State(state),
+        Query(super::coord::ActiveQuery {
+            project_id: None,
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+        work_auth_headers("tenant-a", Some("passport-a"), "admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(cross_tenant.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn generic_http_entities_hide_and_reject_governed_kinds() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.entity_store.write().await;
+        store
+            .upsert(
+                "orchestrator",
+                "orc_secret",
+                serde_json::json!({"tenant_id":"tenant-b","name":"secret"}),
+                "seed",
+                None,
+            )
+            .expect("seed governed entity");
+        store
+            .upsert(
+                "capability",
+                "visible",
+                serde_json::json!({"name":"visible"}),
+                "seed",
+                None,
+            )
+            .expect("seed visible entity");
+    }
+
+    let denied_get = super::entities::get_entity(
+        State(state.clone()),
+        Path(("orchestrator".to_string(), "orc_secret".to_string())),
+        dev_scope_headers("facts:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(denied_get.status(), StatusCode::FORBIDDEN);
+    let denied_list = super::entities::list_entities(
+        State(state.clone()),
+        Query(super::entities::ListEntitiesQuery {
+            kind: Some("orchestrator".to_string()),
+            limit: None,
+            include_deleted: false,
+        }),
+        dev_scope_headers("facts:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(denied_list.status(), StatusCode::FORBIDDEN);
+    let denied_put = super::entities::put_entity(
+        State(state.clone()),
+        Path(("orchestrator".to_string(), "orc_secret".to_string())),
+        dev_scope_headers("facts:write"),
+        Json(super::entities::UpsertEntityBody {
+            payload: serde_json::json!({"tenant_id":"tenant-a","name":"stolen"}),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(denied_put.status(), StatusCode::FORBIDDEN);
+    let denied_history = super::entities::get_entity_history(
+        State(state.clone()),
+        Path(("orchestrator".to_string(), "orc_secret".to_string())),
+        dev_scope_headers("facts:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(denied_history.status(), StatusCode::FORBIDDEN);
+    let denied_delete = super::entities::delete_entity(
+        State(state.clone()),
+        Path(("orchestrator".to_string(), "orc_secret".to_string())),
+        dev_scope_headers("facts:write"),
+    )
+    .await
+    .into_response();
+    assert_eq!(denied_delete.status(), StatusCode::FORBIDDEN);
+
+    let unfiltered = super::entities::list_entities(
+        State(state.clone()),
+        Query(super::entities::ListEntitiesQuery {
+            kind: None,
+            limit: Some(1),
+            include_deleted: false,
+        }),
+        dev_scope_headers("facts:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(unfiltered.status(), StatusCode::OK);
+    let body = json_body(unfiltered).await;
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["entities"][0]["kind"], "capability");
+
+    let store = state.entity_store.read().await;
+    let governed = store
+        .get("orchestrator", "orc_secret")
+        .expect("governed entity remains");
+    assert_eq!(governed.version, 1);
+    assert!(!governed.deleted);
+    assert_eq!(governed.payload["tenant_id"], "tenant-b");
 }
 
 #[serial_test::serial]
@@ -11960,6 +15167,9 @@ async fn work_source_all_handler_round_trips_plan_content_hash() -> Result<(), B
             assignee_passport: None,
             source: super::work::WorkSource::All,
             orchestrator: None,
+            ranked: false,
+            limit: None,
+            fields: None,
         }),
         dev_scope_headers("admin:read"),
     )
@@ -11991,6 +15201,7 @@ async fn status_feed_disabled_returns_notice_not_error() {
         State(state),
         axum::extract::Query(super::work::StatusFeedQuery {
             work_id: None,
+            tenant_id: None,
             limit: None,
         }),
         dev_scope_headers("admin:read"),
@@ -12107,7 +15318,8 @@ fn gate_test_observation_count(state: &AppState) -> Result<usize, Box<dyn std::e
 }
 
 #[tokio::test]
-async fn work_gate_spoofed_body_is_denied_and_bound_passport_is_stored() -> Result<(), Box<dyn std::error::Error>> {
+async fn work_gate_spoofed_local_assertion_is_denied_and_accepted_actor_is_tagged(
+) -> Result<(), Box<dyn std::error::Error>> {
     for approve in [true, false] {
         let (state, _work_id, action_id) = gate_test_state(AuthMode::DevScopes, Some("tenant-a")).await?;
         let spoofed = gate_test_resolve(
@@ -12146,7 +15358,10 @@ async fn work_gate_spoofed_body_is_denied_and_bound_passport_is_stored() -> Resu
             return Err(std::io::Error::other("resolved gate fact missing").into());
         };
         let gate: crate::work::PendingGateAction = serde_json::from_str(&fact.value)?;
-        assert_eq!(gate.resolved_by_passport.as_deref(), Some("approver-a"));
+        assert_eq!(
+            gate.resolved_by_passport.as_deref(),
+            Some("operator:unverified:approver-a")
+        );
         assert_ne!(gate.resolved_by_passport.as_deref(), Some("approver-b"));
     }
     Ok(())
@@ -12189,15 +15404,8 @@ async fn work_gate_read_only_token_is_denied_in_route_auth_shadow() -> Result<()
 async fn work_gate_missing_passport_is_denied_closed() -> Result<(), Box<dyn std::error::Error>> {
     for approve in [true, false] {
         let (state, _work_id, action_id) = gate_test_state(AuthMode::DevScopes, Some("tenant-a")).await?;
-        let response = gate_test_resolve(
-            &state,
-            &action_id,
-            dev_scope_headers("facts:write"),
-            Some("approver-a"),
-            approve,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = gate_test_resolve(&state, &action_id, dev_scope_headers("facts:write"), None, approve).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let store = state.fact_store.read().await;
         let entity = format!("{}::{action_id}", crate::work::WORK_GATE_ENTITY_PREFIX);
@@ -12206,6 +15414,85 @@ async fn work_gate_missing_passport_is_denied_closed() -> Result<(), Box<dyn std
         };
         let gate: crate::work::PendingGateAction = serde_json::from_str(&fact.value)?;
         assert_eq!(gate.status, "pending");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn work_gate_requires_canonical_passport_and_tenant_claims() -> Result<(), Box<dyn std::error::Error>> {
+    for approve in [true, false] {
+        let (mut state, _work_id, action_id) = gate_test_state(AuthMode::Off, Some("tenant-a")).await?;
+        state.auth = crate::auth::Authz::test_hs256(
+            WORK_AUTH_TEST_SECRET.as_bytes(),
+            WORK_AUTH_TEST_ISSUER,
+            WORK_AUTH_TEST_AUDIENCE,
+        );
+
+        let sub_only = gate_test_resolve(
+            &state,
+            &action_id,
+            work_auth_sub_headers("tenant-a", "approver-a", "facts:write"),
+            None,
+            approve,
+        )
+        .await;
+        assert_eq!(sub_only.status(), StatusCode::FORBIDDEN);
+
+        let missing_tenant = gate_test_resolve(
+            &state,
+            &action_id,
+            work_auth_missing_tenant_headers("approver-a", "facts:write"),
+            None,
+            approve,
+        )
+        .await;
+        assert_eq!(missing_tenant.status(), StatusCode::FORBIDDEN);
+
+        let store = state.fact_store.read().await;
+        let entity = format!("{}::{action_id}", crate::work::WORK_GATE_ENTITY_PREFIX);
+        let fact = gate_test_latest_fact(&store, &entity)
+            .ok_or_else(|| std::io::Error::other("pending gate missing after denied identity attempts"))?;
+        let gate: crate::work::PendingGateAction = serde_json::from_str(&fact.value)?;
+        assert_eq!(gate.status, "pending");
+        assert_eq!(gate_test_observation_count(&state)?, 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn work_gate_rejects_registered_agent_token_as_human_decision() -> Result<(), Box<dyn std::error::Error>> {
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    const AGENT_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+    let _secret = EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", SECRET);
+    let _issuer = EnvVarGuard::unset("CORECRUXD_JWT_ISS");
+    let _audience = EnvVarGuard::unset("CORECRUXD_JWT_AUD");
+    let _accept = EnvVarGuard::set("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS", "1");
+    let _tokens = EnvVarGuard::set("CRUX_AGENT_TOKENS", &format!("approver-agent:{AGENT_TOKEN}"));
+    let _scopes = EnvVarGuard::set("CORECRUXD_AGENT_TOKEN_HTTP_SCOPES", "facts:write");
+    let _tenant = EnvVarGuard::set("CORECRUXD_AGENT_TOKEN_HTTP_TENANT", "tenant-a");
+    let _passport_flag = EnvVarGuard::unset("CORECRUXD_AGENT_PASSPORTS");
+    let _passport_map = EnvVarGuard::unset("CRUX_AGENT_PASSPORTS");
+
+    for approve in [true, false] {
+        let (state, _work_id, action_id) = gate_test_state(AuthMode::JwtHs256, Some("tenant-a")).await?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {AGENT_TOKEN}"))?,
+        );
+        let response = gate_test_resolve(&state, &action_id, headers, None, approve).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(gate_test_observation_count(&state)?, 0);
+
+        let store = state.fact_store.read().await;
+        let entity = format!("{}::{action_id}", crate::work::WORK_GATE_ENTITY_PREFIX);
+        let fact = gate_test_latest_fact(&store, &entity)
+            .ok_or_else(|| std::io::Error::other("agent-token pending gate missing"))?;
+        let gate: crate::work::PendingGateAction = serde_json::from_str(&fact.value)?;
+        assert_eq!(gate.status, "pending");
+        assert_eq!(gate.resolved_by_passport, None);
+        assert_eq!(gate.receipt_id, None);
     }
     Ok(())
 }
@@ -12433,7 +15720,7 @@ async fn work_gate_jwt_binding_and_cross_tenant_enforcement() -> Result<(), Box<
             gate_test_state(AuthMode::JwtHs256, Some("tenant-y")).await?;
         {
             let mut store = drift_state.fact_store.write().await;
-            let _ = crate::work::update_work(
+            let immutable = crate::work::update_work(
                 &mut store,
                 &drift_work_id,
                 crate::work::UpdateWorkInput {
@@ -12452,7 +15739,32 @@ async fn work_gate_jwt_binding_and_cross_tenant_enforcement() -> Result<(), Box<
                     passport_gated: false,
                     now_unix_ms: 2_500,
                 },
-            )?;
+            )
+            .expect_err("ordinary work updates must not move a tenant");
+            assert!(matches!(immutable, crate::work::WorkError::TenantImmutable));
+
+            // Model an already-corrupt/legacy row so the independent gate-drift
+            // fail-closed check remains covered without using the now-closed
+            // public tenant-mutation path.
+            let mut drifted = crate::work::get_work(&store, &drift_work_id)
+                .ok_or_else(|| std::io::Error::other("drift work fixture missing"))?;
+            drifted.tenant_id = Some("tenant-x".to_string());
+            store.store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: format!(
+                    "{}::{}::{}",
+                    crate::work::WORK_ENTITY_PREFIX,
+                    drifted.project_id,
+                    drifted.id
+                ),
+                key: crate::work::RECORD_KEY.to_string(),
+                value: serde_json::to_string(&drifted)?,
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: Some("test:legacy-corruption".to_string()),
+            });
         }
         let current_tenant_attempt = gate_test_resolve(
             &drift_state,
@@ -12481,6 +15793,7 @@ async fn work_gate_jwt_binding_and_cross_tenant_enforcement() -> Result<(), Box<
 async fn work_gate_receipt_resolves_and_resolution_facts_are_attributed() -> Result<(), Box<dyn std::error::Error>> {
     for approve in [true, false] {
         let (mut state, work_id, action_id) = gate_test_state(AuthMode::DevScopes, Some("tenant-a")).await?;
+        let expected_actor = "operator:unverified:approver-a";
         let response = gate_test_resolve(
             &state,
             &action_id,
@@ -12534,7 +15847,7 @@ async fn work_gate_receipt_resolves_and_resolution_facts_are_attributed() -> Res
         };
         assert_eq!(
             receipt_fields.get("reviewer_passport").map(String::as_str),
-            Some("approver-a")
+            Some(expected_actor)
         );
         assert_eq!(
             receipt_fields.get("decision").map(String::as_str),
@@ -12601,10 +15914,10 @@ async fn work_gate_receipt_resolves_and_resolution_facts_are_attributed() -> Res
         let Some(gate_fact) = gate_test_latest_fact(&store, &gate_entity) else {
             return Err(std::io::Error::other("resolved gate fact missing").into());
         };
-        assert_eq!(gate_fact.actor.as_deref(), Some("approver-a"));
+        assert_eq!(gate_fact.actor.as_deref(), Some(expected_actor));
         assert_eq!(gate_fact.source_receipt.as_deref(), Some(receipt_id));
         let gate: crate::work::PendingGateAction = serde_json::from_str(&gate_fact.value)?;
-        assert_eq!(gate.resolved_by_passport.as_deref(), Some("approver-a"));
+        assert_eq!(gate.resolved_by_passport.as_deref(), Some(expected_actor));
         assert_eq!(gate.receipt_id.as_deref(), Some(receipt_id));
 
         let expected_gate_status = if approve { "approved" } else { "rejected" };
@@ -12621,10 +15934,10 @@ async fn work_gate_receipt_resolves_and_resolution_facts_are_attributed() -> Res
         let Some(transition_fact) = transition else {
             return Err(std::io::Error::other("gate resolution transition fact missing").into());
         };
-        assert_eq!(transition_fact.actor.as_deref(), Some("approver-a"));
+        assert_eq!(transition_fact.actor.as_deref(), Some(expected_actor));
         assert_eq!(transition_fact.source_receipt.as_deref(), Some(receipt_id));
         let transition: crate::work::WorkTransition = serde_json::from_str(&transition_fact.value)?;
-        assert_eq!(transition.by_passport, "approver-a");
+        assert_eq!(transition.by_passport, expected_actor);
         assert_eq!(transition.receipt_id.as_deref(), Some(receipt_id));
 
         if approve {
@@ -12632,7 +15945,7 @@ async fn work_gate_receipt_resolves_and_resolution_facts_are_attributed() -> Res
             let Some(work_fact) = gate_test_latest_fact(&store, &work_entity) else {
                 return Err(std::io::Error::other("approved work fact missing").into());
             };
-            assert_eq!(work_fact.actor.as_deref(), Some("approver-a"));
+            assert_eq!(work_fact.actor.as_deref(), Some(expected_actor));
             assert_eq!(work_fact.source_receipt.as_deref(), Some(receipt_id));
         }
     }
@@ -12981,7 +16294,7 @@ async fn work_patch_with_gated_passport_returns_202_queued() {
     let patch_resp = super::work::patch_work(
         State(state.clone()),
         Path(work_id),
-        dev_scope_headers("facts:write"),
+        dev_scope_passport_headers("facts:write", "personal-default"),
         Json(super::work::UpdateWorkBody {
             title: None,
             body: None,
@@ -12992,7 +16305,7 @@ async fn work_patch_with_gated_passport_returns_202_queued() {
             linked_issue: None,
             blocker_reason: None,
             blocker_kind: None,
-            by_passport: "personal-default".to_string(),
+            by_passport: Some("personal-default".to_string()),
         }),
     )
     .await
@@ -13004,7 +16317,10 @@ async fn work_patch_with_gated_passport_returns_202_queued() {
 
     let pending_resp = super::work::get_pending_gates(
         State(state),
-        Query(super::work::GateListQuery { by_passport: None }),
+        Query(super::work::GateListQuery {
+            by_passport: None,
+            tenant_id: None,
+        }),
         dev_scope_headers("admin:read"),
     )
     .await
@@ -13052,9 +16368,9 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
     let comment_resp = super::work::post_comment(
         State(state.clone()),
         Path(work_id.clone()),
-        dev_scope_headers("facts:write"),
+        dev_scope_passport_headers("facts:write", "personal-default"),
         Json(super::work::CommentBody {
-            author_passport: "personal-default".to_string(),
+            author_passport: Some("personal-default".to_string()),
             body: "ready for review".to_string(),
         }),
     )
@@ -13096,7 +16412,7 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
     let queue_for_reject = super::work::patch_work(
         State(state.clone()),
         Path(work_id.clone()),
-        dev_scope_headers("facts:write"),
+        dev_scope_passport_headers("facts:write", "personal-default"),
         Json(super::work::UpdateWorkBody {
             title: Some("queued reject".to_string()),
             body: None,
@@ -13107,7 +16423,7 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
             linked_issue: None,
             blocker_reason: Some(Some("needs approval".to_string())),
             blocker_kind: Some(crate::work::BlockerKind::NeedsApproval),
-            by_passport: "personal-default".to_string(),
+            by_passport: Some("personal-default".to_string()),
         }),
     )
     .await
@@ -13130,7 +16446,7 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
     let queue_for_approve = super::work::patch_work(
         State(state.clone()),
         Path(work_id),
-        dev_scope_headers("facts:write"),
+        dev_scope_passport_headers("facts:write", "personal-default"),
         Json(super::work::UpdateWorkBody {
             title: None,
             body: None,
@@ -13141,7 +16457,7 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
             linked_issue: None,
             blocker_reason: None,
             blocker_kind: None,
-            by_passport: "personal-default".to_string(),
+            by_passport: Some("personal-default".to_string()),
         }),
     )
     .await
@@ -13505,7 +16821,7 @@ async fn workspace_routes_report_catalog_and_missing_scan_states() {
     assert_eq!(missing_storyline.status(), StatusCode::NOT_FOUND);
 
     std::env::remove_var("CORECRUXD_WORKSPACE_PATH");
-    let unconfigured = super::workspace::post_scan(State(state), dev_scope_headers("admin:read"))
+    let unconfigured = super::workspace::post_scan(State(state), dev_scope_headers("admin:write"))
         .await
         .into_response();
     assert_eq!(unconfigured.status(), StatusCode::PRECONDITION_FAILED);
@@ -14526,7 +17842,7 @@ async fn seed_project_for_planes_tests(state: &AppState) {
     }
     let resp = super::projects::post_project(
         State(state.clone()),
-        dev_scope_headers("admin:read facts:write"),
+        dev_scope_headers("admin:write facts:write"),
         Json(super::projects::CreateProjectBody {
             id: "alpha".to_string(),
             name: "Alpha".to_string(),
@@ -14549,7 +17865,7 @@ async fn planes_create_then_list_then_get() {
     let create_resp = super::planes::post_plane(
         State(state.clone()),
         Path("alpha".to_string()),
-        dev_scope_headers("admin:read facts:write"),
+        dev_scope_headers("admin:write facts:write"),
         Json(super::planes::CreatePlaneBody {
             id: "daemon".to_string(),
             name: "Crux Daemon".to_string(),
@@ -14602,7 +17918,7 @@ async fn planes_member_round_trip() {
     let _ = super::planes::post_plane(
         State(state.clone()),
         Path("alpha".to_string()),
-        dev_scope_headers("admin:read facts:write"),
+        dev_scope_headers("admin:write facts:write"),
         Json(super::planes::CreatePlaneBody {
             id: "daemon".to_string(),
             name: "Daemon".to_string(),
@@ -14617,7 +17933,7 @@ async fn planes_member_round_trip() {
     let add_resp = super::planes::post_plane_member(
         State(state.clone()),
         Path(("alpha".to_string(), "daemon".to_string())),
-        dev_scope_headers("admin:read facts:write"),
+        dev_scope_headers("admin:write facts:write"),
         Json(super::planes::PlaneMemberBody {
             passport_id: "work-default".to_string(),
             role: "contributor".to_string(),
@@ -14630,7 +17946,7 @@ async fn planes_member_round_trip() {
     let rm_resp = super::planes::delete_plane_member(
         State(state),
         Path(("alpha".to_string(), "daemon".to_string(), "work-default".to_string())),
-        dev_scope_headers("admin:read facts:write"),
+        dev_scope_headers("admin:write facts:write"),
     )
     .await
     .into_response();
@@ -14644,7 +17960,7 @@ async fn planes_layer_put_then_get_then_delete() {
     let _ = super::planes::post_plane(
         State(state.clone()),
         Path("alpha".to_string()),
-        dev_scope_headers("admin:read facts:write"),
+        dev_scope_headers("admin:write facts:write"),
         Json(super::planes::CreatePlaneBody {
             id: "daemon".to_string(),
             name: "Daemon".to_string(),
@@ -14698,7 +18014,7 @@ async fn planes_delete_removes_record() {
     let _ = super::planes::post_plane(
         State(state.clone()),
         Path("alpha".to_string()),
-        dev_scope_headers("admin:read facts:write"),
+        dev_scope_headers("admin:write facts:write"),
         Json(super::planes::CreatePlaneBody {
             id: "daemon".to_string(),
             name: "Daemon".to_string(),
@@ -14712,7 +18028,7 @@ async fn planes_delete_removes_record() {
     let resp = super::planes::delete_plane(
         State(state.clone()),
         Path(("alpha".to_string(), "daemon".to_string())),
-        dev_scope_headers("admin:read facts:write"),
+        dev_scope_headers("admin:write facts:write"),
     )
     .await
     .into_response();
@@ -14728,9 +18044,15 @@ async fn planes_delete_removes_record() {
 #[tokio::test]
 async fn dossier_list_when_empty_returns_empty_array() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
-    let resp = super::dossier::list_dossiers(State(state), Path("alpha".to_string()), dev_scope_headers("admin:read"))
-        .await
-        .into_response();
+    let resp = super::dossier::list_dossiers(
+        State(state),
+        Path("alpha".to_string()),
+        Query(Default::default()),
+        dev_scope_headers("admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
+    )
+    .await
+    .into_response();
     let body = json_body(resp).await;
     assert!(body["dossiers"].is_array());
 }
@@ -14738,9 +18060,15 @@ async fn dossier_list_when_empty_returns_empty_array() {
 #[tokio::test]
 async fn dossier_list_requires_admin_read() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
-    let resp = super::dossier::list_dossiers(State(state), Path("alpha".to_string()), HeaderMap::new())
-        .await
-        .into_response();
+    let resp = super::dossier::list_dossiers(
+        State(state),
+        Path("alpha".to_string()),
+        Query(Default::default()),
+        HeaderMap::new(),
+        Query(super::traces::OptionalTenantQuery::default()),
+    )
+    .await
+    .into_response();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -14753,6 +18081,7 @@ async fn storybook_post_generate_then_get_latest() {
         State(state.clone()),
         Path("alpha".to_string()),
         dev_scope_headers("admin:read facts:write"),
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -14761,7 +18090,9 @@ async fn storybook_post_generate_then_get_latest() {
     let latest_resp = super::storybook::get_latest(
         State(state.clone()),
         Path("alpha".to_string()),
+        Query(Default::default()),
         dev_scope_headers("admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -14771,10 +18102,14 @@ async fn storybook_post_generate_then_get_latest() {
         latest_resp.status()
     );
 
-    let versions_resp =
-        super::storybook::list_versions(State(state), Path("alpha".to_string()), dev_scope_headers("admin:read"))
-            .await
-            .into_response();
+    let versions_resp = super::storybook::list_versions(
+        State(state),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
+    )
+    .await
+    .into_response();
     let body = json_body(versions_resp).await;
     assert!(body["versions"].is_array());
 }
@@ -14785,7 +18120,9 @@ async fn storybook_get_latest_when_none_returns_404() {
     let resp = super::storybook::get_latest(
         State(state),
         Path("nonexistent".to_string()),
+        Query(Default::default()),
         dev_scope_headers("admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -14799,6 +18136,7 @@ async fn storybook_post_generate_requires_facts_write() {
         State(state),
         Path("alpha".to_string()),
         dev_scope_headers("admin:read"), // missing facts:write
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -14811,7 +18149,9 @@ async fn dossier_get_unknown_returns_404() {
     let resp = super::dossier::get_dossier(
         State(state),
         Path(("alpha".to_string(), "nonexistent".to_string())),
+        Query(Default::default()),
         dev_scope_headers("admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
     )
     .await
     .into_response();
@@ -15010,6 +18350,129 @@ async fn extensions_install_from_registry_verifies_index_and_manifest_sha() {
     assert_eq!(body["installed"]["trust_tier"], "community_reviewed");
 }
 
+/// Build a signed index with the given entry ids and write it to the
+/// daemon's default cache path. `signing_key` may differ from the key
+/// trusted under `curator_fpr` — that is how the bad-signature case is
+/// constructed.
+fn write_cached_registry_index(
+    data_dir: &std::path::Path,
+    curator_fpr: &str,
+    signing_key: &ed25519_dalek::SigningKey,
+    ids: &[&str],
+) {
+    use crux_integrations::{CommunityExtensionEntry, CommunityExtensionsIndex, EntryKind, TrustTier};
+    let mut index = CommunityExtensionsIndex::new(curator_fpr, 1_700_000_000_000);
+    for id in ids {
+        index.entries.push(CommunityExtensionEntry {
+            id: (*id).to_string(),
+            name: format!("Entry {id}"),
+            version: "0.1.0".to_string(),
+            summary: "Catalog entry.".to_string(),
+            manifest_url: format!("https://example.invalid/{id}.json"),
+            manifest_sha256: "0".repeat(64),
+            repo_url: format!("https://example.invalid/{id}"),
+            kind: EntryKind::HttpRecipe,
+            trust_tier: TrustTier::CommunityReviewed,
+        });
+    }
+    index.sign(signing_key).expect("sign index");
+    let index_path = data_dir.join("extensions/registry/index.json");
+    std::fs::create_dir_all(index_path.parent().expect("index parent")).expect("index dir");
+    std::fs::write(&index_path, serde_json::to_vec(&index).expect("index bytes")).expect("write index");
+}
+
+#[tokio::test]
+async fn extensions_registry_lists_verified_entries_with_installed_join() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xad; 32]);
+    let curator_fpr = "p_test_curator";
+    add_test_key(&state, curator_fpr, hex::encode(signing_key.verifying_key().to_bytes())).await;
+
+    // One entry is already installed; the other is catalog-only.
+    let manifest = build_signed_manifest("ext.example.installed", &signing_key, curator_fpr);
+    let reg_resp = super::extensions::register_extension(
+        State(state.clone()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::RegisterExtensionBody { manifest }),
+    )
+    .await
+    .into_response();
+    assert_eq!(reg_resp.status(), StatusCode::CREATED);
+
+    write_cached_registry_index(
+        &state.data_dir,
+        curator_fpr,
+        &signing_key,
+        &["ext.example.installed", "ext.example.notyet"],
+    );
+
+    let resp = super::extensions::list_registry_entries(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["schema"], "crux.extensions.registry_list.v1");
+    assert_eq!(body["curator_passport_fpr"], curator_fpr);
+    assert_eq!(body["updated_at_unix_ms"], 1_700_000_000_000_u64);
+
+    let entries = body["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["id"], "ext.example.installed");
+    assert_eq!(entries[0]["installed"], true);
+    assert_eq!(entries[0]["installed_version"], "0.1.0");
+    // Curator metadata rides through unchanged for the console badges.
+    assert_eq!(entries[0]["kind"], "http_recipe");
+    assert_eq!(entries[0]["trust_tier"], "community_reviewed");
+    assert_eq!(entries[1]["id"], "ext.example.notyet");
+    assert_eq!(entries[1]["installed"], false);
+    assert!(entries[1]["installed_version"].is_null());
+}
+
+#[tokio::test]
+async fn extensions_registry_requires_admin_read() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::extensions::list_registry_entries(State(state), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn extensions_registry_without_cache_returns_404_naming_sync() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::extensions::list_registry_entries(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let detail = json_body(resp).await["detail"].as_str().unwrap_or_default().to_string();
+    assert!(
+        detail.contains("corecruxctl extensions sync"),
+        "expected the sync hint in the 404 detail, got: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn extensions_registry_with_bad_signature_returns_403() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let curator_key = ed25519_dalek::SigningKey::from_bytes(&[0xae; 32]);
+    let attacker_key = ed25519_dalek::SigningKey::from_bytes(&[0xaf; 32]);
+    let curator_fpr = "p_test_curator_real";
+    add_test_key(&state, curator_fpr, hex::encode(curator_key.verifying_key().to_bytes())).await;
+
+    // Index claims the curator's fpr but is signed by someone else.
+    write_cached_registry_index(&state.data_dir, curator_fpr, &attacker_key, &["ext.example.forged"]);
+
+    let resp = super::extensions::list_registry_entries(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let detail = json_body(resp).await["detail"].as_str().unwrap_or_default().to_string();
+    assert!(
+        detail.contains("signature verification failed"),
+        "expected a signature-verification detail, got: {detail}"
+    );
+}
+
 #[tokio::test]
 async fn extensions_register_unsigned_returns_400_with_dev_hint() {
     use crux_integrations::{
@@ -15131,6 +18594,21 @@ async fn extensions_keyring_add_list_remove_round_trip() {
     .await
     .into_response();
     assert_eq!(del_resp.status(), StatusCode::NO_CONTENT);
+
+    let audit = crux_integrations::read_audit_tail(&state.data_dir, 50).expect("audit tail");
+    let key_events: Vec<&crux_integrations::IntegrationAuditEvent> = audit
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.action.as_str(),
+                crux_integrations::AUDIT_TRUSTED_KEY_ADDED | crux_integrations::AUDIT_TRUSTED_KEY_REMOVED
+            )
+        })
+        .collect();
+    assert_eq!(key_events.len(), 2);
+    assert_eq!(key_events[0].pack_id, "p_alice");
+    assert_eq!(key_events[0].actor, "operator");
+    assert_eq!(key_events[1].pack_id, "p_alice");
 
     let list2 = super::extensions::list_trusted_keys(State(state), dev_scope_headers("admin:read"))
         .await
@@ -15742,6 +19220,7 @@ async fn wasm_summarise_extension_end_to_end_or_skip() {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             };
             crate::fact_privacy::enforce_global(&mut sf);
             store.store(sf);
@@ -16382,6 +19861,56 @@ async fn agent_usage_raw_admin_reads_others_200() {
     assert_eq!(body["window"], "24h");
 }
 
+// ── Fleet tool usage: /v1/mcp/tools/usage ────────────────────────────────
+
+#[tokio::test]
+async fn mcp_tools_usage_unauthenticated_denied_401() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = agent_usage::get_mcp_tools_usage(State(state), HeaderMap::new(), usage_query(None))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn mcp_tools_usage_non_admin_denied_403() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = agent_usage::get_mcp_tools_usage(State(state), dev_scope_headers("sessions:read"), usage_query(None))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn mcp_tools_usage_admin_gets_catalog_joined_rollup() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    seed_ledger_file(
+        &state,
+        "alice",
+        &[
+            serde_json::json!({"tool": "query_facts", "passport": "alice", "est_tokens_in": 10, "est_tokens_out": 90, "latency_ms": 4, "outcome": "ok"}),
+        ],
+    );
+    let resp = agent_usage::get_mcp_tools_usage(State(state), dev_scope_headers("admin:read"), usage_query(None))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["calls_total"], 1);
+    let catalog_len = crux_mcp::tools::list_tools().len();
+    assert_eq!(body["tools_in_catalog"], catalog_len as u64);
+    let tools = &body["tools"];
+    assert!(
+        tools.as_array().map_or(0, Vec::len) >= catalog_len,
+        "every catalog tool present (zeros included)"
+    );
+    // The one called tool sorts first with its stats; the rest are zeros.
+    assert_eq!(tools[0]["tool"], "query_facts");
+    assert_eq!(tools[0]["calls"], 1);
+    assert_eq!(tools[0]["passports"], 1);
+    assert_eq!(tools[1]["calls"], 0);
+}
+
 #[tokio::test]
 async fn agent_usage_empty_ledger_is_200_zeroes() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
@@ -16617,7 +20146,7 @@ async fn memory_import_collision_supersedes_never_overwrites() {
     assert_eq!(body["collisions_superseded"], 1);
 
     let store = state.fact_store.read().await;
-    let history = store.fact_history("shared", "k");
+    let history = store.fact_history("default", "shared", "k");
     assert_eq!(history.len(), 2, "local value retired, never destroyed");
     assert_eq!(history[0].value, "local-value");
     assert!(history[0].superseded_by.is_some());
@@ -16906,6 +20435,108 @@ async fn identity_candidates_list_requires_admin_read_and_filters() {
     .await
     .into_response();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── Candidate seed route (console-surfaces-remediation M6) ─────────────────
+
+/// Seed two session→passport bindings sharing a tenant + project inside the
+/// temporal window but with DISTINCT passports — the shape `propose_from_session_
+/// bindings` turns into exactly one candidate.
+async fn seed_two_distinct_bindings(state: &AppState) {
+    seed_default_passports(state).await;
+    let mut store = state.fact_store.write().await;
+    for (hex, passport, at) in [
+        ("seed-sess-a", "personal-default", 1_000_u64),
+        ("seed-sess-b", "work-default", 2_000),
+    ] {
+        let binding = crate::session_bindings::resolve(
+            &store,
+            crate::session_bindings::ResolveInput {
+                session_id_hex: hex,
+                project_id: Some("alpha".to_string()),
+                tenant_id: Some("work::team".to_string()),
+                passport_id: Some(passport.to_string()),
+                now_unix_ms: at,
+            },
+        )
+        .expect("resolve binding");
+        crate::session_bindings::write_binding(&mut store, &binding).expect("write binding");
+    }
+}
+
+#[tokio::test]
+async fn identity_candidates_propose_disabled_returns_404() {
+    let mut state = test_app_state(16);
+    state.identity_links_enabled = false;
+    let resp = identity_links::post_identity_candidates_propose(State(state), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn identity_candidates_propose_requires_admin_write() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    // No credentials → 401.
+    let resp = identity_links::post_identity_candidates_propose(State(state.clone()), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // facts:write is not enough — seeding is an operator (admin:write) action.
+    let resp = identity_links::post_identity_candidates_propose(State(state), dev_scope_headers("facts:write"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn identity_candidates_propose_from_bindings_is_idempotent() {
+    let state = test_app_state(16); // AuthMode::Off — guard passes, actor = operator:admin
+    seed_two_distinct_bindings(&state).await;
+
+    // First run: the binding pair yields a candidate.
+    let resp = identity_links::post_identity_candidates_propose(State(state.clone()), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert!(
+        body["created"].as_u64().unwrap() >= 1,
+        "bindings source seeds at least one candidate"
+    );
+    assert_eq!(body["by_source"]["bindings"]["created"].as_u64().unwrap(), 1);
+    assert_eq!(body["by_source"]["bindings"]["examined"].as_u64().unwrap(), 2);
+    // No observation journals in this fixture → observations source is empty.
+    assert_eq!(body["by_source"]["observations"]["created"].as_u64().unwrap(), 0);
+    let first_created = body["created"].as_u64().unwrap();
+
+    // The candidate is now listable.
+    let resp = identity_links::get_identity_candidates(
+        State(state.clone()),
+        HeaderMap::new(),
+        Query(identity_links::ListIdentityCandidatesQuery { status: None }),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["candidates"].as_array().unwrap().len() as u64, first_created);
+
+    // Re-propose over the same evidence: proposers dedup by content-derived id.
+    let resp = identity_links::post_identity_candidates_propose(State(state), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["created"].as_u64().unwrap(),
+        0,
+        "re-propose is idempotent (creates nothing)"
+    );
+    assert_eq!(
+        body["examined"].as_u64().unwrap(),
+        2,
+        "still examines the same evidence"
+    );
 }
 
 #[tokio::test]
@@ -17258,6 +20889,21 @@ fn route_auth_request(method: &str, uri: &str, scopes: Option<&str>) -> axum::ht
     builder.body(axum::body::Body::empty()).expect("build request")
 }
 
+fn route_auth_json_request(
+    method: &str,
+    uri: &str,
+    scopes: &str,
+    body: &serde_json::Value,
+) -> axum::http::Request<axum::body::Body> {
+    axum::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("x-corecrux-scopes", scopes)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .expect("build JSON request")
+}
+
 /// (b) Enforce mode fails closed on a route with no contract entry, even when
 /// the caller presents ample scopes.
 #[tokio::test]
@@ -17430,4 +21076,2745 @@ async fn route_auth_enforce_contract_matrix() {
             sufficient.status()
         );
     }
+}
+
+/// Handler/contract drift gate for every structural mutation tightened by
+/// H-02. Shadow mode deliberately lets the request reach the real handler:
+/// `admin:read` must be rejected there, while `admin:write` must clear both
+/// middleware and handler authorization (the domain operation may still
+/// return a non-auth 4xx because this compact matrix does not seed every
+/// referenced object).
+#[tokio::test]
+async fn structural_mutation_handlers_reject_admin_read_and_accept_admin_write() {
+    use tower::ServiceExt;
+
+    let cases = vec![
+        (
+            "PATCH",
+            "/v1/passports/scope-passport",
+            serde_json::json!({"name": "Scope"}),
+        ),
+        ("DELETE", "/v1/passports/scope-passport", serde_json::json!({})),
+        (
+            "POST",
+            "/v1/projects",
+            serde_json::json!({
+                "id": "scope-project",
+                "default_passport_id": "personal-default"
+            }),
+        ),
+        (
+            "PATCH",
+            "/v1/projects/scope-project",
+            serde_json::json!({"name": "Scope project"}),
+        ),
+        ("DELETE", "/v1/projects/scope-project", serde_json::json!({})),
+        (
+            "POST",
+            "/v1/projects/scope-project/passports",
+            serde_json::json!({"passport_id": "work-default"}),
+        ),
+        (
+            "DELETE",
+            "/v1/projects/scope-project/passports/work-default",
+            serde_json::json!({}),
+        ),
+        (
+            "POST",
+            "/v1/projects/scope-project/tenants",
+            serde_json::json!({"tenant_id": "tenant-a"}),
+        ),
+        (
+            "DELETE",
+            "/v1/projects/scope-project/tenants/tenant-a",
+            serde_json::json!({}),
+        ),
+        (
+            "POST",
+            "/v1/projects/scope-project/planes",
+            serde_json::json!({"id": "scope-plane"}),
+        ),
+        (
+            "DELETE",
+            "/v1/projects/scope-project/planes/scope-plane",
+            serde_json::json!({}),
+        ),
+        (
+            "POST",
+            "/v1/projects/scope-project/planes/scope-plane/passports",
+            serde_json::json!({"passport_id": "work-default"}),
+        ),
+        (
+            "DELETE",
+            "/v1/projects/scope-project/planes/scope-plane/passports/work-default",
+            serde_json::json!({}),
+        ),
+        (
+            "POST",
+            "/v1/projects/scope-project/planes/scope-plane/tenants",
+            serde_json::json!({"tenant_id": "tenant-a"}),
+        ),
+        (
+            "DELETE",
+            "/v1/projects/scope-project/planes/scope-plane/tenants/tenant-a",
+            serde_json::json!({}),
+        ),
+        ("POST", "/v1/workspace/scan", serde_json::json!({})),
+    ];
+
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let app = router_with_route_auth(state, test_case_store(), RouteAuthMode::Shadow);
+    for (method, uri, body) in cases {
+        let denied = app
+            .clone()
+            .oneshot(route_auth_json_request(method, uri, "admin:read", &body))
+            .await
+            .expect("admin:read response");
+        assert_eq!(
+            denied.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {uri} must reject admin:read in the handler"
+        );
+
+        let admitted = app
+            .clone()
+            .oneshot(route_auth_json_request(method, uri, "admin:write", &body))
+            .await
+            .expect("admin:write response");
+        assert!(
+            admitted.status() != StatusCode::UNAUTHORIZED && admitted.status() != StatusCode::FORBIDDEN,
+            "{method} {uri} must admit admin:write to the domain handler, got {}",
+            admitted.status()
+        );
+    }
+}
+
+// ── Central Studio template library (crux-integrations-and-template-library L2) ─
+//
+// GET  /v1/studio/library              — verified cached catalog + installed join
+// POST /v1/studio/library/{id}/install — sha256-pinned, require-signed install
+//
+// The install tests serve BOTH the index (from disk) and the pack (over a
+// one-shot loopback TCP listener), mirroring
+// `extensions_install_from_registry_verifies_index_and_manifest_sha`.
+
+fn studio_test_payload() -> serde_json::Value {
+    serde_json::json!({
+        "schema": "crux.studio.v1",
+        "version": 1,
+        "created_at_unix_ms": 1_700_000_000_000_u64,
+        "board": {
+            "id": "default",
+            "doc": { "nodes": [{ "id": "a", "kind": "note" }], "links": [], "texts": [], "pan": { "x": 0, "y": 0 }, "zoom": 1, "version": 1 }
+        },
+        "designs": [{ "slug": "latency-tile", "name": "Latency", "config": { "kind": "api" } }],
+        "workspaces": [{
+            "schema_version": 1, "uid": "ops", "name": "Ops", "icon": "meters", "order": 100, "source": "user",
+            "dests": [{ "id": "main", "label": "Main", "icon": "work", "pages": ["ops-overview", "explorer"] }]
+        }],
+        "pages": [{ "schema_version": 1, "uid": "ops-overview", "type": "facts", "title": "Overview", "dest": "main" }]
+    })
+}
+
+/// Build a Studio pack exactly as `POST /v1/studio/pack/build` would: a
+/// `crux.integration.v1` manifest with `hashes.bundle` over the canonical
+/// studio payload, optionally signed by `signing_key`.
+fn build_studio_pack(
+    id: &str,
+    version: &str,
+    publisher_fpr: &str,
+    studio: &serde_json::Value,
+    signing_key: Option<&ed25519_dalek::SigningKey>,
+) -> serde_json::Value {
+    use crux_integrations::{
+        sign_manifest, DataAccess, EntryKind, IntegrationEntry, IntegrationManifest, ManifestHashes, NetworkAccess,
+        SafetyPolicy, INTEGRATION_SCHEMA_V1,
+    };
+    let canonical = super::studio_pack::canonical_json_string(studio);
+    let bundle_hash = format!("blake3:{}", blake3::hash(canonical.as_bytes()).to_hex());
+    let mut manifest = IntegrationManifest {
+        schema: INTEGRATION_SCHEMA_V1.to_string(),
+        id: id.to_string(),
+        name: "Ops Overview".to_string(),
+        version: version.to_string(),
+        publisher_passport_fpr: publisher_fpr.to_string(),
+        summary: "Studio board pack.".to_string(),
+        entry: IntegrationEntry {
+            kind: EntryKind::SdkRecipe,
+            path: "studio-board.json".to_string(),
+        },
+        capabilities: vec!["integrations:read".to_string()],
+        network: NetworkAccess::default(),
+        data_access: DataAccess::default(),
+        safety: SafetyPolicy::default(),
+        hashes: ManifestHashes::default(),
+        signature: None,
+        external_tool_endpoint: None,
+        tools: Vec::new(),
+        wasm_module_path: None,
+        wasm_module_url: None,
+        wasm_module_sha256: None,
+    };
+    manifest.hashes.bundle = Some(bundle_hash.clone());
+    match signing_key {
+        Some(key) => {
+            sign_manifest(&mut manifest, key, publisher_fpr.to_string()).expect("sign pack");
+            manifest.hashes.bundle = Some(bundle_hash);
+        }
+        None => {
+            manifest.hashes.manifest = Some(manifest.manifest_hash().expect("manifest hash"));
+        }
+    }
+    let mut pack = match serde_json::to_value(&manifest).expect("manifest value") {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    pack.insert("studio".to_string(), studio.clone());
+    serde_json::Value::Object(pack)
+}
+
+/// Serve `bytes` once over loopback HTTP; returns the base URL.
+fn serve_pack_once(bytes: Vec<u8>) -> String {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind pack server");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept pack request");
+        let mut request_buf = [0u8; 1024];
+        let _ = stream.read(&mut request_buf);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            bytes.len()
+        )
+        .expect("write response head");
+        stream.write_all(&bytes).expect("write response body");
+    });
+    url
+}
+
+/// Write a signed Studio library index carrying one entry to the daemon's
+/// default cache path. `signing_key` may differ from the key trusted under
+/// `curator_fpr` — that is how the bad-signature case is built.
+fn write_cached_studio_index(
+    data_dir: &std::path::Path,
+    curator_fpr: &str,
+    signing_key: &ed25519_dalek::SigningKey,
+    entries: Vec<crux_integrations::StudioLibraryEntry>,
+) {
+    let mut index = crux_integrations::StudioLibraryIndex::new(curator_fpr, 1_700_000_000_000);
+    index.entries = entries;
+    index.sign(signing_key).expect("sign studio index");
+    let path = data_dir.join("studio/library/index.json");
+    std::fs::create_dir_all(path.parent().expect("index parent")).expect("index dir");
+    std::fs::write(&path, serde_json::to_vec(&index).expect("index bytes")).expect("write index");
+}
+
+fn studio_library_entry(id: &str, pack_url: &str, pack_sha256: &str) -> crux_integrations::StudioLibraryEntry {
+    crux_integrations::StudioLibraryEntry {
+        id: id.to_string(),
+        kind: crux_integrations::StudioEntryKind::Pack,
+        name: "Ops Overview".to_string(),
+        version: "0.1.0".to_string(),
+        summary: "Retrieval latency + receipt freshness.".to_string(),
+        publisher_passport_fpr: "p_test_studio_pub".to_string(),
+        tags: vec!["ops".to_string()],
+        required_tier: Some(crux_integrations::RcxTier::Pro),
+        pack_url: pack_url.to_string(),
+        pack_sha256: pack_sha256.to_string(),
+        repo_url: Some("https://example.invalid/studio-library".to_string()),
+        preview: Some("1 tile, 1 design, 1 workspace.".to_string()),
+    }
+}
+
+fn sha256_hex_of(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+#[tokio::test]
+async fn studio_library_requires_read_scope() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::studio_library::get_studio_library(State(state), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn studio_library_without_cache_returns_404_naming_studio_sync() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::studio_library::get_studio_library(State(state), dev_scope_headers("query:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let detail = json_body(resp).await["detail"].as_str().unwrap_or_default().to_string();
+    assert!(
+        detail.contains("corecruxctl studio sync"),
+        "expected the sync hint in the 404 detail, got: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn studio_library_with_bad_signature_returns_403() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let curator_key = ed25519_dalek::SigningKey::from_bytes(&[0xb1; 32]);
+    let attacker_key = ed25519_dalek::SigningKey::from_bytes(&[0xb2; 32]);
+    let curator_fpr = "p_test_studio_curator_real";
+    add_test_key(&state, curator_fpr, hex::encode(curator_key.verifying_key().to_bytes())).await;
+
+    // Index claims the curator's fpr but is signed by someone else.
+    write_cached_studio_index(
+        &state.data_dir,
+        curator_fpr,
+        &attacker_key,
+        vec![studio_library_entry(
+            "studio.forged",
+            "https://example.invalid/p.json",
+            &"0".repeat(64),
+        )],
+    );
+
+    let resp = super::studio_library::get_studio_library(State(state), dev_scope_headers("query:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let detail = json_body(resp).await["detail"].as_str().unwrap_or_default().to_string();
+    assert!(
+        detail.contains("signature verification failed"),
+        "expected a signature-verification detail, got: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn studio_library_lists_verified_entries_with_installed_join() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let curator_key = ed25519_dalek::SigningKey::from_bytes(&[0xb3; 32]);
+    let curator_fpr = "p_test_studio_curator";
+    add_test_key(&state, curator_fpr, hex::encode(curator_key.verifying_key().to_bytes())).await;
+
+    write_cached_studio_index(
+        &state.data_dir,
+        curator_fpr,
+        &curator_key,
+        vec![
+            studio_library_entry("studio.installed", "https://example.invalid/a.json", &"0".repeat(64)),
+            studio_library_entry("studio.notyet", "https://example.invalid/b.json", &"1".repeat(64)),
+        ],
+    );
+
+    // Simulate a prior install: a console fact carrying the provenance stamp.
+    {
+        let mut store = state.fact_store.write().await;
+        store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "console:tileboard:studio.installed".to_string(),
+            key: "doc".to_string(),
+            value: serde_json::json!({
+                "nodes": [],
+                "installed_from": {
+                    "library_id": "studio.installed",
+                    "version": "0.1.0",
+                    "pack_sha256": "a".repeat(64),
+                    "publisher_passport_fpr": "p_test_studio_pub",
+                    "installed_at_unix_ms": 1_700_000_000_001_u64
+                }
+            })
+            .to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+
+    let resp = super::studio_library::get_studio_library(State(state), dev_scope_headers("query:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["schema"], "crux.studio.library_list.v1");
+    assert_eq!(body["curator_passport_fpr"], curator_fpr);
+    assert_eq!(body["updated_at_unix_ms"], 1_700_000_000_000_u64);
+    // The daemon never gates on the tier — it says so in the response.
+    assert_eq!(body["tier_enforcement"], "advisory");
+
+    let entries = body["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["id"], "studio.installed");
+    assert_eq!(entries[0]["installed"], true);
+    assert_eq!(entries[0]["installed_version"], "0.1.0");
+    assert_eq!(
+        entries[0]["installed_entities"][0],
+        "console:tileboard:studio.installed"
+    );
+    // Curator metadata rides through unchanged for the console badges.
+    assert_eq!(entries[0]["kind"], "pack");
+    assert_eq!(entries[0]["required_tier"], "pro");
+    assert_eq!(entries[1]["id"], "studio.notyet");
+    assert_eq!(entries[1]["installed"], false);
+    assert!(entries[1]["installed_version"].is_null());
+}
+
+#[tokio::test]
+async fn studio_library_install_writes_console_facts_with_provenance() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[0xb4; 32]);
+    let fpr = "p_test_studio_pub";
+    add_test_key(&state, fpr, hex::encode(key.verifying_key().to_bytes())).await;
+
+    let studio = studio_test_payload();
+    let pack = build_studio_pack("studio.ops", "0.1.0", fpr, &studio, Some(&key));
+    let pack_bytes = serde_json::to_vec(&pack).expect("pack bytes");
+    let pack_sha256 = sha256_hex_of(&pack_bytes);
+    let pack_url = serve_pack_once(pack_bytes);
+
+    let mut entry = studio_library_entry("studio.ops", &pack_url, &pack_sha256);
+    entry.publisher_passport_fpr = fpr.to_string();
+    write_cached_studio_index(&state.data_dir, fpr, &key, vec![entry]);
+
+    let resp = super::studio_library::post_studio_library_install(
+        State(state.clone()),
+        Path("studio.ops".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::studio_library::InstallFromLibraryBody { index_path: None }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = json_body(resp).await;
+    assert_eq!(body["schema"], "crux.studio.library_install.v1");
+    assert_eq!(body["library_id"], "studio.ops");
+    assert_eq!(body["pack_sha256"], pack_sha256);
+    assert_eq!(body["signed"], true);
+    // Tier is echoed for display only.
+    assert_eq!(body["required_tier"], "pro");
+    assert_eq!(body["tier_enforcement"], "advisory");
+    assert!(body["remaps"].as_array().expect("remaps").is_empty());
+
+    let written: Vec<String> = body["written"]
+        .as_array()
+        .expect("written")
+        .iter()
+        .map(|w| w["entity"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        written,
+        vec![
+            "console:tileboard:studio.ops".to_string(),
+            "console:tiledesign:latency-tile".to_string(),
+            "console:page:ops-overview".to_string(),
+            "console:workspace:ops".to_string(),
+        ]
+    );
+
+    // Every written fact carries the provenance stamp, and the values are the
+    // canonical key-sorted JSON the console itself writes.
+    let store = state.fact_store.read().await;
+    for entity in &written {
+        let fact = store
+            .get_by_entity(entity)
+            .into_iter()
+            .max_by_key(|f| f.version)
+            .expect("stored fact");
+        let value: serde_json::Value = serde_json::from_str(&fact.value).expect("fact value json");
+        let provenance = &value["installed_from"];
+        assert_eq!(provenance["library_id"], "studio.ops", "{entity}");
+        assert_eq!(provenance["version"], "0.1.0", "{entity}");
+        assert_eq!(provenance["pack_sha256"], pack_sha256, "{entity}");
+        assert_eq!(provenance["publisher_passport_fpr"], fpr, "{entity}");
+        assert!(provenance["installed_at_unix_ms"].as_u64().unwrap_or(0) > 0, "{entity}");
+        assert_eq!(
+            fact.value,
+            super::studio_pack::canonical_json_string(&value),
+            "{entity} value must be canonical key-sorted JSON"
+        );
+    }
+    drop(store);
+}
+
+#[tokio::test]
+async fn studio_library_install_remaps_collisions_and_never_overwrites() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[0xb5; 32]);
+    let fpr = "p_test_studio_pub";
+    add_test_key(&state, fpr, hex::encode(key.verifying_key().to_bytes())).await;
+
+    // Pre-existing operator artifacts that the install MUST NOT touch.
+    {
+        let mut store = state.fact_store.write().await;
+        for (entity, key_name) in [
+            ("console:tileboard:studio.ops", "doc"),
+            ("console:page:ops-overview", "def"),
+        ] {
+            store.store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: entity.to_string(),
+                key: key_name.to_string(),
+                value: r#"{"mine":true}"#.to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+        }
+    }
+
+    let studio = studio_test_payload();
+    let pack = build_studio_pack("studio.ops", "0.1.0", fpr, &studio, Some(&key));
+    let pack_bytes = serde_json::to_vec(&pack).expect("pack bytes");
+    let pack_sha256 = sha256_hex_of(&pack_bytes);
+    let pack_url = serve_pack_once(pack_bytes);
+
+    let mut entry = studio_library_entry("studio.ops", &pack_url, &pack_sha256);
+    entry.publisher_passport_fpr = fpr.to_string();
+    write_cached_studio_index(&state.data_dir, fpr, &key, vec![entry]);
+
+    let resp = super::studio_library::post_studio_library_install(
+        State(state.clone()),
+        Path("studio.ops".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::studio_library::InstallFromLibraryBody { index_path: None }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = json_body(resp).await;
+
+    let remaps = body["remaps"].as_array().expect("remaps");
+    assert_eq!(remaps.len(), 2, "board + page collided, workspace + design did not");
+    let written: Vec<String> = body["written"]
+        .as_array()
+        .expect("written")
+        .iter()
+        .map(|w| w["entity"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        written.contains(&"console:tileboard:studio.ops-2".to_string()),
+        "{written:?}"
+    );
+    assert!(
+        written.contains(&"console:page:ops-overview-2".to_string()),
+        "{written:?}"
+    );
+
+    let store = state.fact_store.read().await;
+    // The operator's originals are untouched (still the ONLY version, still theirs).
+    for entity in ["console:tileboard:studio.ops", "console:page:ops-overview"] {
+        let facts = store.get_by_entity(entity);
+        assert_eq!(facts.len(), 1, "{entity} must not have been rewritten");
+        assert_eq!(facts[0].value, r#"{"mine":true}"#, "{entity}");
+    }
+    // The installed workspace points at the REMAPPED page, not the operator's.
+    let workspace = store
+        .get_by_entity("console:workspace:ops")
+        .into_iter()
+        .max_by_key(|f| f.version)
+        .expect("workspace fact");
+    let value: serde_json::Value = serde_json::from_str(&workspace.value).expect("workspace json");
+    let pages = value["dests"][0]["pages"].as_array().expect("pages");
+    assert_eq!(pages[0], "ops-overview-2");
+    // A reference the pack does not carry (built-in `explorer`) is left alone.
+    assert_eq!(pages[1], "explorer");
+    drop(store);
+}
+
+#[tokio::test]
+async fn studio_library_install_rejects_sha256_mismatch_with_409() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[0xb6; 32]);
+    let fpr = "p_test_studio_pub";
+    add_test_key(&state, fpr, hex::encode(key.verifying_key().to_bytes())).await;
+
+    let pack = build_studio_pack("studio.ops", "0.1.0", fpr, &studio_test_payload(), Some(&key));
+    let pack_url = serve_pack_once(serde_json::to_vec(&pack).expect("pack bytes"));
+
+    // The index pins a DIFFERENT sha than the bytes the URL serves.
+    let mut entry = studio_library_entry("studio.ops", &pack_url, &"c".repeat(64));
+    entry.publisher_passport_fpr = fpr.to_string();
+    write_cached_studio_index(&state.data_dir, fpr, &key, vec![entry]);
+
+    let resp = super::studio_library::post_studio_library_install(
+        State(state.clone()),
+        Path("studio.ops".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::studio_library::InstallFromLibraryBody { index_path: None }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let detail = json_body(resp).await["detail"].as_str().unwrap_or_default().to_string();
+    assert!(detail.contains("pack_sha256 mismatch"), "{detail}");
+
+    // Nothing was written.
+    let store = state.fact_store.read().await;
+    assert!(store.get_by_entity("console:tileboard:studio.ops").is_empty());
+    drop(store);
+}
+
+#[tokio::test]
+async fn studio_library_install_refuses_unsigned_pack_naming_the_env_var() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[0xb7; 32]);
+    let fpr = "p_test_studio_pub";
+    add_test_key(&state, fpr, hex::encode(key.verifying_key().to_bytes())).await;
+
+    // Pack is well-formed and hash-bound, but carries NO signature.
+    let pack = build_studio_pack("studio.ops", "0.1.0", fpr, &studio_test_payload(), None);
+    let pack_bytes = serde_json::to_vec(&pack).expect("pack bytes");
+    let pack_sha256 = sha256_hex_of(&pack_bytes);
+    let pack_url = serve_pack_once(pack_bytes);
+
+    let mut entry = studio_library_entry("studio.ops", &pack_url, &pack_sha256);
+    entry.publisher_passport_fpr = fpr.to_string();
+    write_cached_studio_index(&state.data_dir, fpr, &key, vec![entry]);
+
+    let resp = super::studio_library::post_studio_library_install(
+        State(state.clone()),
+        Path("studio.ops".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::studio_library::InstallFromLibraryBody { index_path: None }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let detail = json_body(resp).await["detail"].as_str().unwrap_or_default().to_string();
+    assert!(detail.contains("unsigned"), "{detail}");
+    assert!(
+        detail.contains("CORECRUXD_STUDIO_ALLOW_UNSIGNED"),
+        "the 403 must name the dev bypass env var, got: {detail}"
+    );
+
+    let store = state.fact_store.read().await;
+    assert!(store.get_by_entity("console:tileboard:studio.ops").is_empty());
+    drop(store);
+}
+
+#[tokio::test]
+async fn studio_library_install_unknown_id_returns_404() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[0xb8; 32]);
+    let fpr = "p_test_studio_curator_404";
+    add_test_key(&state, fpr, hex::encode(key.verifying_key().to_bytes())).await;
+    write_cached_studio_index(
+        &state.data_dir,
+        fpr,
+        &key,
+        vec![studio_library_entry(
+            "studio.present",
+            "https://example.invalid/p.json",
+            &"0".repeat(64),
+        )],
+    );
+
+    let resp = super::studio_library::post_studio_library_install(
+        State(state),
+        Path("studio.missing".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::studio_library::InstallFromLibraryBody { index_path: None }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let detail = json_body(resp).await["detail"].as_str().unwrap_or_default().to_string();
+    assert!(detail.contains("not found in the Studio library index"), "{detail}");
+}
+
+#[tokio::test]
+async fn studio_library_install_requires_write_scope() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::studio_library::post_studio_library_install(
+        State(state),
+        Path("studio.ops".to_string()),
+        dev_scope_headers("query:read"),
+        Json(super::studio_library::InstallFromLibraryBody { index_path: None }),
+    )
+    .await
+    .into_response();
+    assert!(
+        resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::FORBIDDEN,
+        "a read-only scope must not authorize an install, got {}",
+        resp.status()
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Repo allowance accounting — crux-code-intel-pro-hosted-surface M1.
+//
+// The gate is "counts correct across add/remove/disable, verified on a seeded
+// multi-tenant fixture, zero behaviour change for any existing caller". The unit
+// tests in `repo_allowance` cover the arithmetic; these cover the store read, the
+// route, and the one property that matters most — a tenant's allowance must be
+// computed from its own repos and nobody else's.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn seed_repo(store: &mut corecrux_memory::FactStore, tenant_id: &str, repo_id: &str, enabled: bool) {
+    let registration = crate::repo_registry::RepoRegistration {
+        repo_id: repo_id.to_string(),
+        tenant_id: tenant_id.to_string(),
+        root_path: None,
+        clone_url: None,
+        languages: Vec::new(),
+        enabled,
+        added_at_unix_ms: 1,
+        last_scan_id: None,
+        scan_status: None,
+        scan_error: None,
+        scan_queued_at_unix_ms: None,
+        scan_finished_at_unix_ms: None,
+    };
+    crate::repo_registry::store_repo(store, &registration).expect("seed repo");
+}
+
+async fn allowance_body(state: &AppState, tenant: &str, seats: u32, packs: u32) -> serde_json::Value {
+    let resp = super::repos::get_repo_allowance(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::RepoAllowanceQuery {
+            tenant_id: tenant.to_string(),
+            seats: Some(seats),
+            packs: Some(packs),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    json_body(resp).await
+}
+
+#[tokio::test]
+async fn repo_allowance_counts_only_the_requesting_tenants_enabled_repos() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        // tenant-a: 3 enabled + 1 disabled. tenant-b: 5 enabled, none of which
+        // may ever appear in tenant-a's count.
+        seed_repo(&mut store, "tenant-a", "a1", true);
+        seed_repo(&mut store, "tenant-a", "a2", true);
+        seed_repo(&mut store, "tenant-a", "a3", true);
+        seed_repo(&mut store, "tenant-a", "a4", false);
+        for i in 0..5 {
+            seed_repo(&mut store, "tenant-b", &format!("b{i}"), true);
+        }
+    }
+
+    let a = allowance_body(&state, "tenant-a", 1, 0).await;
+    assert_eq!(a["used"], 3, "tenant-b's repos must not be counted for tenant-a");
+    assert_eq!(a["disabled"], 1);
+    assert_eq!(a["included"], 8);
+    assert_eq!(a["over_allowance"], false);
+    assert_eq!(a["remaining"], 5);
+
+    let b = allowance_body(&state, "tenant-b", 1, 0).await;
+    assert_eq!(b["used"], 5);
+    assert_eq!(b["disabled"], 0);
+}
+
+#[tokio::test]
+async fn repo_allowance_tracks_add_and_disable() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        for i in 0..8 {
+            seed_repo(&mut store, "tenant-a", &format!("r{i}"), true);
+        }
+    }
+    let at_limit = allowance_body(&state, "tenant-a", 1, 0).await;
+    assert_eq!(at_limit["used"], 8);
+    assert_eq!(at_limit["over_allowance"], false, "exactly at the line is within it");
+
+    // Add a ninth: over allowance, and the report says so without clamping `used`.
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-a", "r8", true);
+    }
+    let over = allowance_body(&state, "tenant-a", 1, 0).await;
+    assert_eq!(over["used"], 9);
+    assert_eq!(over["over_allowance"], true);
+    assert_eq!(over["over_by"], 1);
+
+    // Disabling it releases the allowance — a disabled repo is not aggregated,
+    // so charging for it would be indefensible.
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-a", "r8", false);
+    }
+    let after_disable = allowance_body(&state, "tenant-a", 1, 0).await;
+    assert_eq!(after_disable["used"], 8);
+    assert_eq!(after_disable["disabled"], 1);
+    assert_eq!(after_disable["over_allowance"], false);
+}
+
+#[tokio::test]
+async fn repo_allowance_pack_restores_headroom_without_changing_usage() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        for i in 0..9 {
+            seed_repo(&mut store, "tenant-a", &format!("r{i}"), true);
+        }
+    }
+    let before = allowance_body(&state, "tenant-a", 1, 0).await;
+    assert_eq!(before["over_allowance"], true);
+
+    let after = allowance_body(&state, "tenant-a", 1, 1).await;
+    assert_eq!(after["over_allowance"], false);
+    assert_eq!(after["included"], 18);
+    assert_eq!(after["used"], 9, "a pack changes entitlement, not usage");
+}
+
+#[tokio::test]
+async fn repo_allowance_requires_read_scope_for_the_named_tenant() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::repos::get_repo_allowance(
+        State(state.clone()),
+        dev_scope_headers("facts:read"),
+        Query(super::repos::RepoAllowanceQuery {
+            tenant_id: "tenant-a".to_string(),
+            seats: None,
+            packs: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert!(
+        resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::FORBIDDEN,
+        "allowance is an admin:read surface, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn repo_allowance_defaults_to_one_seat_no_packs() {
+    // Seats are not sourced from a subscription yet. The default must be the
+    // honest "we do not know" (one seat), not an optimistic guess.
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::repos::get_repo_allowance(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::RepoAllowanceQuery {
+            tenant_id: "tenant-empty".to_string(),
+            seats: None,
+            packs: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["seats"], 1);
+    assert_eq!(body["packs"], 0);
+    assert_eq!(body["included"], 8);
+    assert_eq!(body["used"], 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M2 — adversarial tenant isolation for the code-intelligence surface.
+// ExecPlan crux-code-intel-pro-hosted-surface-2026-07-28.
+//
+// These use AuthMode::JwtHs256 with a real `tenant_id` claim, NOT DevScopes.
+// DevScopes sets TenantAllow::Any (see auth.rs
+// `require_http_scopes_for_tenant_dev_scopes_always_any_tenant`), so an
+// "adversarial" test written in that mode proves nothing at all — it would pass
+// against a daemon with no isolation whatsoever.
+//
+// The written isolation argument accompanying this suite lives with the
+// ExecPlan, not in this repo.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const M2_HS256_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+fn m2_bearer_for(tenant: &str, scope: &str) -> HeaderMap {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    #[derive(serde::Serialize)]
+    struct Claims<'a> {
+        exp: usize,
+        iss: &'a str,
+        aud: &'a str,
+        scope: &'a str,
+        tenant_id: &'a str,
+    }
+    let claims = Claims {
+        exp: (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600) as usize,
+        iss: "corecrux-test",
+        aud: "corecrux",
+        scope,
+        tenant_id: tenant,
+    };
+    let token = encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(M2_HS256_SECRET.as_bytes()),
+    )
+    .expect("jwt");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    headers
+}
+
+fn m2_env() {
+    std::env::set_var("CORECRUXD_JWT_HS256_SECRET", M2_HS256_SECRET);
+    std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
+    std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
+}
+
+/// Tenant B, holding a valid token for its own tenant, attempts every
+/// tenant-scoped repo read path against tenant A's `repo_id`. Every one must be
+/// refused at the authorization boundary — not merely return empty, which would
+/// leak existence through timing or shape.
+#[tokio::test]
+#[serial_test::serial]
+async fn m2_tenant_b_cannot_read_tenant_a_repo_paths() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-a", "secret-repo", true);
+    }
+    let b = || m2_bearer_for("tenant-b", "admin:read");
+
+    // /v1/repos?tenant_id=tenant-a
+    let r = super::repos::get_repos(
+        State(state.clone()),
+        b(),
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-a".into(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN, "get_repos leaked across tenants");
+
+    // /v1/repos/allowance?tenant_id=tenant-a — usage counts are commercially
+    // sensitive (team size, estate size), so this is not a benign read.
+    let r = super::repos::get_repo_allowance(
+        State(state.clone()),
+        b(),
+        Query(super::repos::RepoAllowanceQuery {
+            tenant_id: "tenant-a".into(),
+            seats: None,
+            packs: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN, "allowance leaked across tenants");
+
+    // /v1/repos/{repo_id}?tenant_id=tenant-a
+    let r = super::repos::get_repo(
+        State(state.clone()),
+        Path("secret-repo".to_string()),
+        b(),
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-a".into(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN, "get_repo leaked across tenants");
+}
+
+/// The same principal reading its *own* tenant must still succeed. Without this,
+/// the test above would pass against a daemon that simply refuses everything.
+#[tokio::test]
+#[serial_test::serial]
+async fn m2_tenant_b_can_still_read_its_own_repos() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-b", "own-repo", true);
+    }
+    let r = super::repos::get_repos(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-b".into(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "isolation must not break the legitimate read"
+    );
+    let body = json_body(r).await;
+    assert_eq!(body["repos"][0]["repo_id"], "own-repo");
+}
+
+/// A token carrying no tenant claim at all must be refused, not defaulted.
+/// `TenantAllow::Missing` exists precisely so an unscoped token cannot silently
+/// become an any-tenant token.
+#[tokio::test]
+#[serial_test::serial]
+async fn m2_token_without_tenant_claim_is_refused() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    #[derive(serde::Serialize)]
+    struct NoTenant<'a> {
+        exp: usize,
+        iss: &'a str,
+        aud: &'a str,
+        scope: &'a str,
+    }
+    let claims = NoTenant {
+        exp: (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600) as usize,
+        iss: "corecrux-test",
+        aud: "corecrux",
+        scope: "admin:read",
+    };
+    let token = encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(M2_HS256_SECRET.as_bytes()),
+    )
+    .expect("jwt");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    let r = super::repos::get_repos(
+        State(state.clone()),
+        headers,
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-a".into(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        r.status(),
+        StatusCode::FORBIDDEN,
+        "a token with no tenant claim must not resolve to any tenant"
+    );
+}
+
+/// Every optional field populated, so no handler can refuse for a missing
+/// parameter and be mistaken for refusing on tenant grounds.
+fn m2_code_intel_query(tenant: &str, all_repos: bool) -> super::traces::CodeIntelQuery {
+    super::traces::CodeIntelQuery {
+        tenant_id: tenant.into(),
+        repo_id: Some("secret-repo".into()),
+        token_budget: 512,
+        entry_point: Some("main".into()),
+        symbol: Some("victim_symbol".into()),
+        release_a: Some("v1".into()),
+        release_b: Some("v2".into()),
+        all_repos,
+        trace_a: Some(1),
+        trace_b: Some(2),
+    }
+}
+
+/// The `/v1/code-intel/*` surface is the hosted Pro product this gate exists to
+/// protect — it is what answers from a customer's code graph. The original M2
+/// suite covered the three `/v1/repos` paths and none of these, so the eight
+/// paths that actually serve customer code were never adversarially tested.
+///
+/// Tenant B holds a valid token for its own tenant and names tenant A. Each path
+/// must refuse at the authorization boundary. `all_repos = true` is exercised
+/// separately because it takes a different data path — `repo_aggregate::
+/// aggregate_tenant` rather than a single `load_scan` — and it is precisely the
+/// cross-repo aggregation P1 sells.
+#[tokio::test]
+#[serial_test::serial]
+async fn m2_tenant_b_cannot_read_tenant_a_code_intel_paths() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-a", "secret-repo", true);
+    }
+    let b = || m2_bearer_for("tenant-b", "admin:read");
+    let victim = || m2_code_intel_query("tenant-a", false);
+
+    macro_rules! assert_refused {
+        ($label:expr, $call:expr) => {{
+            let r = $call.await.into_response();
+            assert_eq!(
+                r.status(),
+                StatusCode::FORBIDDEN,
+                concat!($label, " leaked across tenants")
+            );
+        }};
+    }
+
+    assert_refused!(
+        "code_path",
+        super::traces::get_code_path(State(state.clone()), b(), Query(victim()))
+    );
+    assert_refused!(
+        "blast_radius",
+        super::traces::get_blast_radius(State(state.clone()), b(), Query(victim()))
+    );
+    assert_refused!(
+        "liveness",
+        super::traces::get_liveness(State(state.clone()), b(), Query(victim()))
+    );
+    assert_refused!(
+        "trace_diff",
+        super::traces::get_trace_diff(State(state.clone()), b(), Query(victim()))
+    );
+    // These two take RepoTenantQuery, not CodeIntelQuery — they are whole-tenant
+    // reads (retained span volume, release list), not per-symbol queries.
+    let victim_tenant = || super::repos::RepoTenantQuery {
+        tenant_id: "tenant-a".into(),
+    };
+    assert_refused!(
+        "span_volume",
+        super::traces::get_span_volume(State(state.clone()), b(), Query(victim_tenant()))
+    );
+    assert_refused!(
+        "releases",
+        super::traces::get_releases(State(state.clone()), b(), Query(victim_tenant()))
+    );
+    assert_refused!(
+        "dead_code_ladder",
+        super::traces::get_dead_code_ladder(State(state.clone()), b(), Query(victim()))
+    );
+    assert_refused!(
+        "repo_spatial",
+        super::traces::get_repo_spatial(
+            State(state.clone()),
+            Path("secret-repo".to_string()),
+            b(),
+            Query(super::repos::RepoTenantQuery {
+                tenant_id: "tenant-a".into(),
+            }),
+        )
+    );
+
+    // The cross-repo aggregate is the Pro capability, and a distinct data path.
+    assert_refused!(
+        "blast_radius(all_repos)",
+        super::traces::get_blast_radius(State(state.clone()), b(), Query(m2_code_intel_query("tenant-a", true)),)
+    );
+    assert_refused!(
+        "code_path(all_repos)",
+        super::traces::get_code_path(State(state.clone()), b(), Query(m2_code_intel_query("tenant-a", true)),)
+    );
+}
+
+/// `/v1/repos/dependents` resolves reverse dependency edges by ecosystem and
+/// package name. It was the one `/v1/repos` read the original suite missed.
+#[tokio::test]
+#[serial_test::serial]
+async fn m2_tenant_b_cannot_read_tenant_a_repo_dependents() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-a", "secret-repo", true);
+    }
+    let r = super::repos::get_repo_dependents(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::repos::RepoDependentsQuery {
+            tenant_id: "tenant-a".into(),
+            ecosystem: "cargo".into(),
+            name: "serde".into(),
+            cursor: None,
+            limit: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        r.status(),
+        StatusCode::FORBIDDEN,
+        "repo dependents leaked across tenants"
+    );
+}
+
+/// Positive control for the code-intel refusals above.
+///
+/// Without this, that test would pass against a daemon that refuses every
+/// code-intel request for any reason at all. Tenant B naming *its own* tenant
+/// must clear the authorization boundary. It legitimately gets 404 (no scan
+/// registered) or 400 (parameter shape) — what matters is that it is **not**
+/// 403, which is the only status the isolation check produces.
+#[tokio::test]
+#[serial_test::serial]
+async fn m2_tenant_b_reaches_its_own_code_intel_paths() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-b", "own-repo", true);
+    }
+    let b = || m2_bearer_for("tenant-b", "admin:read");
+    // Built fresh per call rather than cloned: CodeIntelQuery deliberately does
+    // not derive Clone, and this suite adds no production code.
+    let own = || {
+        let mut q = m2_code_intel_query("tenant-b", false);
+        q.repo_id = Some("own-repo".into());
+        q
+    };
+
+    for (label, status) in [
+        (
+            "code_path",
+            super::traces::get_code_path(State(state.clone()), b(), Query(own()))
+                .await
+                .into_response()
+                .status(),
+        ),
+        (
+            "blast_radius",
+            super::traces::get_blast_radius(State(state.clone()), b(), Query(own()))
+                .await
+                .into_response()
+                .status(),
+        ),
+        (
+            "dead_code_ladder",
+            super::traces::get_dead_code_ladder(State(state.clone()), b(), Query(own()))
+                .await
+                .into_response()
+                .status(),
+        ),
+    ] {
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{label}: isolation must not refuse a tenant reading its own code graph"
+        );
+    }
+}
+
+/// The runtime span plane **is** tenant-partitioned (M3).
+///
+/// This test previously asserted the opposite. It was a deliberate tripwire on
+/// the M2 finding — the runtime plane had no tenant dimension at all — and it
+/// fired the moment `StoredSpan` gained one, which is exactly what it was for.
+/// Rewritten here in the same commit that closes the gap, along with the written
+/// isolation argument.
+///
+/// What is now guaranteed, and where: `StoredSpan` carries the capturing tenant;
+/// `TraceStore::load_for_tenant` is the only public read and filters strictly;
+/// legacy unlabelled records resolve to this daemon's capture tenant and no
+/// other; and `load_spans` requires a tenant so no handler can reach an
+/// unfiltered set. Those are pinned by the `trace_store` tests.
+#[test]
+fn m2_runtime_span_plane_is_tenant_partitioned() {
+    let span = crate::trace_store::StoredSpan {
+        span: crux_observe::span_layer::SpanRecord {
+            trace_id: 1,
+            span_id: 2,
+            parent_span_id: None,
+            name: "n".into(),
+            target: "t".into(),
+            file: Some("f.rs".into()),
+            line: Some(1),
+            module_path: None,
+            duration_ns: 1,
+            depth: 0,
+            had_error: false,
+            outcome: Default::default(),
+        },
+        symbol_id: None,
+        join: "miss".into(),
+        stored_at_unix_ms: 0,
+        tenant_id: "tenant-a".into(),
+        release: String::new(),
+    };
+    let encoded = serde_json::to_string(&span).expect("serialise");
+    assert!(
+        encoded.contains("\"tenant_id\":\"tenant-a\""),
+        "a persisted span must carry the tenant that captured it: {encoded}"
+    );
+}
+// ── /v1/work ready-order projection (execplan-work-order-ranking M1) ─────────
+
+/// Build a `ListWorkQuery` with the ranked-projection knobs, everything else default.
+fn ranked_work_query(ranked: bool, limit: Option<usize>, fields: Option<&str>) -> super::work::ListWorkQuery {
+    super::work::ListWorkQuery {
+        project_id: None,
+        state: None,
+        tenant_id: None,
+        assignee_passport: None,
+        source: super::work::WorkSource::default(),
+        orchestrator: None,
+        ranked,
+        limit,
+        fields: fields.map(str::to_string),
+    }
+}
+
+async fn seeded_work_state() -> crate::http::AppState {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+        crate::projects::seed_default_if_missing(&mut store, 1).expect("project seed");
+    }
+    for (title, st) in [
+        ("alpha task", "planned"),
+        ("beta task", "planned"),
+        ("gamma task", "planned"),
+    ] {
+        let resp = super::work::post_work(
+            State(state.clone()),
+            dev_scope_passport_headers("facts:write", "personal-default"),
+            Json(super::work::CreateWorkBody {
+                project_id: "default".to_string(),
+                title: title.to_string(),
+                body: None,
+                state: Some(st.to_string()),
+                assignee_passport: None,
+                tenant_id: None,
+                linked_pr: None,
+                linked_issue: None,
+                created_by_passport: Some("personal-default".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+    state
+}
+
+/// The gate: omitting the new params must reproduce the historical response
+/// byte-for-byte. If this ever fails, the projection stopped being additive.
+#[serial_test::serial]
+#[tokio::test]
+async fn work_ranked_params_absent_is_byte_identical() {
+    let state = seeded_work_state().await;
+
+    let baseline = json_body(
+        super::work::get_work(
+            State(state.clone()),
+            Query(ranked_work_query(false, None, None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+
+    // No `ranked` key, no `dependency_cycles` key, full item shape retained.
+    assert!(
+        baseline.get("ranked").is_none(),
+        "unranked response must not carry `ranked`"
+    );
+    assert!(baseline.get("dependency_cycles").is_none());
+    assert_eq!(baseline["count"], 3);
+    let first = &baseline["work"][0];
+    assert!(first.get("title").is_some(), "full shape keeps title");
+    assert!(first.get("created_by_passport").is_some(), "full shape keeps passport");
+    assert!(
+        first.get("blocked_by").is_none(),
+        "blocked_by must never appear on an unranked response"
+    );
+
+    // Same query twice → identical bytes (determinism, not just shape).
+    let again = json_body(
+        super::work::get_work(
+            State(state),
+            Query(ranked_work_query(false, None, None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(
+        serde_json::to_string(&baseline).unwrap(),
+        serde_json::to_string(&again).unwrap()
+    );
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn work_ranked_marks_response_and_limit_truncates() {
+    let state = seeded_work_state().await;
+
+    let ranked = json_body(
+        super::work::get_work(
+            State(state.clone()),
+            Query(ranked_work_query(true, None, None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(ranked["ranked"], true);
+    assert_eq!(ranked["work"].as_array().expect("array").len(), 3);
+
+    let capped = json_body(
+        super::work::get_work(
+            State(state),
+            Query(ranked_work_query(true, Some(2), None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(capped["work"].as_array().expect("array").len(), 2);
+    assert_eq!(capped["count"], 2, "count reflects the truncated list");
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn work_ranked_slim_emits_only_the_cheap_fields() {
+    let state = seeded_work_state().await;
+    let body = json_body(
+        super::work::get_work(
+            State(state.clone()),
+            Query(ranked_work_query(true, Some(20), Some("slim"))),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+
+    let rows = body["work"].as_array().expect("array");
+    assert!(!rows.is_empty());
+    for row in rows {
+        let obj = row.as_object().expect("object");
+        assert!(obj.contains_key("id"));
+        assert!(obj.contains_key("state"));
+        // The expensive fields are exactly what slim exists to drop.
+        for dropped in ["title", "body", "created_by_passport", "provenance", "plan_path"] {
+            assert!(!obj.contains_key(dropped), "slim must drop `{dropped}`: {obj:?}");
+        }
+    }
+
+    // Slim must be materially cheaper than full — that is the whole point.
+    let full = json_body(
+        super::work::get_work(
+            State(state),
+            Query(ranked_work_query(true, Some(20), None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(
+        full["work"].as_array().expect("array").len(),
+        rows.len(),
+        "same board, same item count — only the per-item shape differs"
+    );
+    let slim_len = serde_json::to_string(&body["work"]).unwrap().len();
+    let full_len = serde_json::to_string(&full["work"]).unwrap().len();
+    assert!(
+        slim_len < full_len.max(1),
+        "slim ({slim_len}) must be smaller than full ({full_len})"
+    );
+}
+
+/// `ranked=1` narrows to open work: terminal states drop out entirely.
+#[serial_test::serial]
+#[tokio::test]
+async fn work_ranked_drops_terminal_states() {
+    let state = seeded_work_state().await;
+
+    // Move one item to `complete`.
+    let listed = json_body(
+        super::work::get_work(
+            State(state.clone()),
+            Query(ranked_work_query(false, None, None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    let victim = listed["work"][0]["id"].as_str().expect("id").to_string();
+    {
+        let mut store = state.fact_store.write().await;
+        let outcome = crate::work::update_work(
+            &mut store,
+            &victim,
+            crate::work::UpdateWorkInput {
+                title: None,
+                body: None,
+                state: Some("complete".to_string()),
+                assignee_passport: None,
+                tenant_id: None,
+                linked_pr: None,
+                linked_issue: None,
+                blocker_reason: None,
+                blocker_kind: None,
+            },
+            crate::work::UpdateWorkContext {
+                by_passport: "test:ranking-fixture".to_string(),
+                passport_gated: false,
+                now_unix_ms: 10_000,
+            },
+        )
+        .expect("fixture transition");
+        assert!(matches!(outcome, crate::work::UpdateOutcome::Applied(_)));
+    }
+
+    let ranked = json_body(
+        super::work::get_work(
+            State(state),
+            Query(ranked_work_query(true, None, None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    let ids: Vec<&str> = ranked["work"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|w| w["id"].as_str().expect("id"))
+        .collect();
+    assert!(
+        !ids.contains(&victim.as_str()),
+        "completed item must drop from ranked: {ids:?}"
+    );
+    assert_eq!(ids.len(), 2);
+}
+
+/// `?ranked=1` is the form the docs and agent instructions use; bare serde only
+/// accepts `true`/`false`, so this guards the spelling every caller reaches for.
+#[test]
+fn work_ranked_query_accepts_truthy_spellings() {
+    fn parse(qs: &str) -> Result<super::work::ListWorkQuery, ()> {
+        let uri: axum::http::Uri = format!("/v1/work?{qs}").parse().expect("uri");
+        Query::<super::work::ListWorkQuery>::try_from_uri(&uri)
+            .map(|Query(q)| q)
+            .map_err(|_| ())
+    }
+
+    for (qs, want) in [
+        ("ranked=1", true),
+        ("ranked=true", true),
+        ("ranked=yes", true),
+        ("ranked=on", true),
+        ("ranked=0", false),
+        ("ranked=false", false),
+        ("ranked=off", false),
+    ] {
+        let q = parse(qs).unwrap_or_else(|()| panic!("`{qs}` must parse"));
+        assert_eq!(q.ranked, want, "`{qs}`");
+    }
+    // Absent → false, and the rest of the query still parses.
+    let q = parse("source=all").expect("parse");
+    assert!(!q.ranked);
+    // The companion knobs parse alongside it.
+    let q = parse("ranked=1&limit=20&fields=slim").expect("parse");
+    assert!(q.ranked);
+    assert_eq!(q.limit, Some(20));
+    assert_eq!(q.fields.as_deref(), Some("slim"));
+    // Garbage is rejected rather than silently read as false.
+    assert!(parse("ranked=maybe").is_err());
+}
+
+/// The brief is the "point an agent at it and say start" surface. It used to
+/// read the kanban table alone — so the ExecPlan board, the large majority of
+/// real work, never appeared — and returned its twenty items unordered.
+#[serial_test::serial]
+#[tokio::test]
+async fn workbench_brief_open_work_is_ranked_and_slim() {
+    let state = pro_workbench_state(&["agent_brief:pro"]);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+        crate::projects::seed_default_if_missing(&mut store, 1).expect("project seed");
+    }
+    // One planned + one in_progress: create both through the only permitted
+    // initial state, then transition the active item through the normal rail.
+    for (title, st) in [("zzz planned work", "planned"), ("aaa active work", "in_progress")] {
+        let resp = super::work::post_work(
+            State(state.clone()),
+            dev_scope_passport_headers("facts:write", "personal-default"),
+            Json(super::work::CreateWorkBody {
+                project_id: "default".to_string(),
+                title: title.to_string(),
+                body: None,
+                state: Some("planned".to_string()),
+                assignee_passport: None,
+                tenant_id: Some("business::acme".to_string()),
+                linked_pr: None,
+                linked_issue: None,
+                created_by_passport: Some("personal-default".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        if st != "planned" {
+            let work_id = json_body(resp).await["id"].as_str().expect("work id").to_string();
+            let mut store = state.fact_store.write().await;
+            let transitioned = crate::work::update_work(
+                &mut store,
+                &work_id,
+                crate::work::UpdateWorkInput {
+                    title: None,
+                    body: None,
+                    state: Some(st.to_string()),
+                    assignee_passport: None,
+                    tenant_id: None,
+                    linked_pr: None,
+                    linked_issue: None,
+                    blocker_reason: None,
+                    blocker_kind: None,
+                },
+                crate::work::UpdateWorkContext {
+                    by_passport: "test:workbench-fixture".to_string(),
+                    passport_gated: false,
+                    now_unix_ms: 10_000,
+                },
+            )
+            .expect("fixture transition");
+            assert!(matches!(transitioned, crate::work::UpdateOutcome::Applied(_)));
+        }
+    }
+
+    let resp = super::workbench::get_agent_brief(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Query(super::workbench::TenantWorkbenchQuery {
+            tenant_id: "business::acme".to_string(),
+            project_id: None,
+            limit: None,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["open_work_order"], "ranked", "order must be self-describing");
+    let rows = body["open_work"].as_array().expect("open_work array");
+    assert_eq!(rows.len(), 2);
+
+    // Ranked: in_progress leads even though its title sorts first alphabetically
+    // and both were created in the other order.
+    assert_eq!(rows[0]["state"], "in_progress");
+    assert_eq!(rows[1]["state"], "planned");
+
+    // Slim: the expensive fields are gone.
+    for row in rows {
+        let obj = row.as_object().expect("object");
+        assert!(obj.contains_key("id") && obj.contains_key("state"));
+        for dropped in ["title", "body", "created_by_passport", "provenance"] {
+            assert!(!obj.contains_key(dropped), "brief must drop `{dropped}`: {obj:?}");
+        }
+    }
+
+    // The whole section stays cheap — this is the reason the change exists.
+    let bytes = serde_json::to_string(&body["open_work"]).expect("serialize").len();
+    assert!(bytes < 2048, "open_work must stay under ~2 KB, got {bytes}");
+}
+
+// ── orchestrator as a TOTAL parent (source-of-truth plane M3) ────────────────
+
+/// Membership is hand-maintained, so before this almost nothing had a parent and
+/// `orchestrator_id` was a nullable field nobody could rely on. Every item must
+/// now answer "whose work is this?".
+#[serial_test::serial]
+#[tokio::test]
+async fn work_every_item_resolves_to_an_orchestrator() {
+    let state = seeded_work_state().await;
+
+    let body = json_body(
+        super::work::get_work(
+            State(state.clone()),
+            Query(ranked_work_query(false, None, None)),
+            dev_scope_headers("admin:read"),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+
+    let rows = body["work"].as_array().expect("work array");
+    assert!(!rows.is_empty());
+    for w in rows {
+        let orc = w["orchestrator_id"].as_str().unwrap_or_default();
+        assert!(!orc.is_empty(), "every item needs a parent, got {w:?}");
+    }
+    assert!(
+        rows.iter()
+            .all(|w| w["orchestrator_id"] == crate::work_execplans::DEFAULT_ORCHESTRATOR_ID),
+        "unclaimed work lands on the default orchestrator"
+    );
+
+    // And the default is a queryable value, not a hole: asking for it returns
+    // exactly the unclaimed set.
+    let mut q = ranked_work_query(false, None, None);
+    q.orchestrator = Some(crate::work_execplans::DEFAULT_ORCHESTRATOR_ID.to_string());
+    let filtered = json_body(
+        super::work::get_work(State(state), Query(q), dev_scope_headers("admin:read"))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert_eq!(
+        filtered["work"].as_array().expect("array").len(),
+        rows.len(),
+        "'what is nobody looking after' must be answerable"
+    );
+}
+
+/// The scope composes with the ranked ready-list — an orchestrator's own
+/// work order, not the whole portfolio's.
+#[serial_test::serial]
+#[tokio::test]
+async fn work_orchestrator_scope_composes_with_ranked() {
+    let state = seeded_work_state().await;
+    let mut q = ranked_work_query(true, Some(20), Some("slim"));
+    q.orchestrator = Some(crate::work_execplans::DEFAULT_ORCHESTRATOR_ID.to_string());
+    let body = json_body(
+        super::work::get_work(State(state), Query(q), dev_scope_headers("admin:read"))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert_eq!(body["ranked"], true);
+    assert!(!body["work"].as_array().expect("array").is_empty());
+
+    // An orchestrator nobody belongs to returns an empty ready-list, not everything.
+    let state2 = seeded_work_state().await;
+    let mut q2 = ranked_work_query(true, None, None);
+    q2.orchestrator = Some("orchestrator:nobody-here".to_string());
+    let empty = json_body(
+        super::work::get_work(State(state2), Query(q2), dev_scope_headers("admin:read"))
+            .await
+            .into_response(),
+    )
+    .await;
+    assert!(empty["work"].as_array().expect("array").is_empty());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M4 — soft cap behaviour. crux-code-intel-pro-hosted-surface-2026-07-28.
+//
+// The whole milestone is one property: going over the allowance must never
+// refuse anything. It is a commercial limit, and turning it into a technical one
+// would break a paying customer mid-sprint over a billing question.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn m4_registering_over_allowance_is_flagged_never_refused() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    // Fill the default allowance (5 base + 3 per seat at seats=1 = 8) exactly.
+    {
+        let mut store = state.fact_store.write().await;
+        for i in 0..8 {
+            seed_repo(&mut store, "tenant-a", &format!("r{i}"), true);
+        }
+    }
+    let at_limit = allowance_body(&state, "tenant-a", 1, 0).await;
+    assert_eq!(at_limit["used"], 8);
+    assert_eq!(at_limit["over_allowance"], false);
+
+    // The ninth. It must land, and the response must say the account is over.
+    {
+        let mut store = state.fact_store.write().await;
+        seed_repo(&mut store, "tenant-a", "the-ninth", true);
+    }
+    let over = allowance_body(&state, "tenant-a", 1, 0).await;
+    assert_eq!(over["used"], 9, "the ninth repo must be registered, not rejected");
+    assert_eq!(over["over_allowance"], true);
+    assert_eq!(over["over_by"], 1);
+
+    // And the repos that were already there keep answering — an over-allowance
+    // account loses no capability on what it already had.
+    let resp = super::repos::get_repos(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: "tenant-a".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["repos"].as_array().map(Vec::len),
+        Some(9),
+        "existing repos must keep working while over allowance"
+    );
+}
+
+#[tokio::test]
+async fn m4_a_pack_restores_headroom_without_touching_the_repos() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        for i in 0..9 {
+            seed_repo(&mut store, "tenant-a", &format!("r{i}"), true);
+        }
+    }
+    let before = allowance_body(&state, "tenant-a", 1, 0).await;
+    assert_eq!(before["over_allowance"], true);
+
+    let after = allowance_body(&state, "tenant-a", 1, 1).await;
+    assert_eq!(after["over_allowance"], false, "a pack must clear the overage");
+    assert_eq!(after["used"], 9, "buying a pack changes entitlement, not usage");
+    assert_eq!(after["remaining"], 9);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M3b — the three span-reading surfaces now honour a requested tenant.
+//
+// Gate: each names a tenant in the request and is covered by the M2 adversarial
+// pattern (tenant B refused against tenant A) with a positive control. Real
+// HS256 tokens, not DevScopes — DevScopes sets TenantAllow::Any and would make
+// these pass against a daemon with no isolation at all.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_trace_list_refuses_a_tenant_the_caller_does_not_hold() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::traces::list_traces(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::TraceSpansQuery {
+            limit: Some(10),
+            trace_id: None,
+        }),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "naming another tenant must be refused, not silently answered"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_trace_list_allows_the_tenant_the_caller_does_hold() {
+    // Positive control: the refusal above must not be a surface that refuses
+    // everything the moment a tenant is named.
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::traces::list_traces(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::TraceSpansQuery {
+            limit: Some(10),
+            trace_id: None,
+        }),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["tenant_id"], "tenant-b");
+    assert_eq!(
+        body["tenant_scope"], "request",
+        "a named tenant must report request scope, not the daemon fallback"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_unbound_request_declares_the_daemon_fallback() {
+    // The fallback is legitimate on a single-tenant daemon and must be visible.
+    // A surface that answers from process configuration without saying so is
+    // what M2 was written to prevent.
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::traces::list_traces(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::TraceSpansQuery {
+            limit: Some(10),
+            trace_id: None,
+        }),
+        Query(super::traces::OptionalTenantQuery { tenant_id: None }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["tenant_scope"], "daemon-capture-tenant",
+        "an unbound read must declare that it answered for the capture tenant"
+    );
+}
+
+// M3b, the other two surfaces. `dossier` and `storybook` shipped accepting a
+// caller-supplied `tenant_id` while still authorising with the tenant-blind
+// `require_http_scopes`, so any holder of a valid token could read any tenant's
+// spans by naming it. The gate says all three surfaces, and only `/v1/traces*`
+// had tests — which is precisely why it went unnoticed. Each of these fails
+// against the pre-fix handler.
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_dossier_refuses_a_tenant_the_caller_does_not_hold() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::dossier::post_auto(
+        State(state.clone()),
+        Path("proj".to_string()),
+        m2_bearer_for("tenant-b", "admin:read facts:write"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "dossier leaked across tenants: it read tenant-a's spans for a tenant-b caller"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_dossier_allows_the_tenant_the_caller_does_hold() {
+    // Positive control: the refusal must not be a surface that refuses
+    // everything the moment a tenant is named. A missing project answers 404,
+    // which is past authorization and is all this control needs to prove.
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::dossier::post_auto(
+        State(state.clone()),
+        Path("proj".to_string()),
+        m2_bearer_for("tenant-b", "admin:read facts:write"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_ne!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a caller naming its own tenant must get past authorization"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_storybook_refuses_a_tenant_the_caller_does_not_hold() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::storybook::post_generate(
+        State(state.clone()),
+        Path("proj".to_string()),
+        m2_bearer_for("tenant-b", "admin:read facts:write"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "storybook leaked across tenants: it read tenant-a's spans for a tenant-b caller"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m3b_storybook_allows_the_tenant_the_caller_does_hold() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::storybook::post_generate(
+        State(state.clone()),
+        Path("proj".to_string()),
+        m2_bearer_for("tenant-b", "admin:read facts:write"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_ne!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a caller naming its own tenant must get past authorization"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The dossier and storybook *persistence* plane.
+// crux-tenant-scope-by-type-2026-08-02, M2.
+//
+// M3b bound generation on both surfaces and left publication and read unbound:
+// the persist stamped a hardcoded `tenant_hash: "default"` whatever tenant the
+// artifact was derived from, the entity key carried no tenant, and every read
+// queried with `tenant_hash: None` — which is *no filter*, not *default tenant*
+// (`fact_store.rs`, `q.tenant_hash.as_ref().is_none_or(..)`). A dossier built
+// from tenant A's runtime was therefore readable by anyone holding `admin:read`
+// who named A's project. Same defect shape as 2026-07-31a, one layer down, and
+// invisible to the M3b tests because those were scoped to what M3b changed.
+//
+// Each of these fails against the pre-fix reader.
+
+/// Store an artifact fact directly, choosing its tenant stamp — the state the
+/// daemon is in after some other tenant published.
+async fn seed_artifact_fact(state: &AppState, tenant_hash: &str, entity: &str, value: serde_json::Value) {
+    let mut store = state.fact_store.write().await;
+    store.store(corecrux_memory::fact_store::StoreFact {
+        tenant_hash: tenant_hash.to_string(),
+        entity: entity.to_string(),
+        key: "content".to_string(),
+        value: value.to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+        horizon_class: None,
+        actor: None,
+    });
+}
+
+fn seeded_dossier_value(dossier_id: &str, project_id: &str) -> serde_json::Value {
+    serde_json::json!({ "dossier_id": dossier_id, "project_id": project_id })
+}
+
+fn seeded_storybook_value(project_id: &str, ts: u64) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": project_id,
+        "generated_at_unix_ms": ts,
+        "generated_by_passport": "p_a",
+        "markdown": "# secret",
+        "sections": { "00_front": "# secret" },
+        "stats": {
+            "plane_count": 0,
+            "planes_with_vision": 0,
+            "planes_with_mapped_modules": 0,
+            "orphan_planes": [],
+            "workspace_loc": 0,
+            "stub_count": 0,
+            "dead_code_count": 0,
+            "bytes": 0
+        }
+    })
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_dossier_read_refuses_another_tenants_artifact() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    seed_artifact_fact(
+        &state,
+        "tenant-a",
+        "__dossier__::alpha::d1",
+        seeded_dossier_value("d1", "alpha"),
+    )
+    .await;
+
+    // Tenant B, naming its own tenant — a well-formed hosted request, not an
+    // attack on the authorization boundary. The refusal has to come from the
+    // data filter, which is where it was missing.
+    let resp = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "d1".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "dossier leaked across tenants: tenant-b read an artifact stamped tenant-a"
+    );
+
+    // And unbound — the shape the pre-fix handler actually served, since no
+    // caller had to name a tenant to get someone else's dossier.
+    let unbound = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "d1".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        unbound.status(),
+        StatusCode::NOT_FOUND,
+        "dossier leaked to an unbound caller: the daemon-capture scope is not tenant-a"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_dossier_read_allows_the_owning_tenant() {
+    // Positive control: the filter must not be a surface that refuses
+    // everything. Tenant A reads what tenant A published.
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    seed_artifact_fact(
+        &state,
+        "tenant-a",
+        "__dossier__::alpha::d1",
+        seeded_dossier_value("d1", "alpha"),
+    )
+    .await;
+
+    let resp = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "d1".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-a", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the owning tenant must still be able to read its own dossier"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_dossier_list_hides_another_tenants_artifact() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    seed_artifact_fact(
+        &state,
+        "tenant-a",
+        "__dossier__::alpha::d1",
+        seeded_dossier_value("d1", "alpha"),
+    )
+    .await;
+
+    let resp = super::dossier::list_dossiers(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["count"], 0,
+        "dossier list leaked across tenants: tenant-b enumerated tenant-a's artifacts"
+    );
+
+    // Control on the same fixture: tenant A sees exactly the one it owns, so a
+    // zero above is a filter working rather than a seed that never landed.
+    let owner = super::dossier::list_dossiers(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        Query(Default::default()),
+        m2_bearer_for("tenant-a", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    let owner_body = json_body(owner).await;
+    assert_eq!(owner_body["count"], 1, "the owning tenant must see its own dossier");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_storybook_read_refuses_another_tenants_artifact() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    seed_artifact_fact(
+        &state,
+        "tenant-a",
+        "__storybook__::alpha::1000",
+        seeded_storybook_value("alpha", 1000),
+    )
+    .await;
+
+    let resp = super::storybook::get_version(
+        State(state.clone()),
+        Path(("alpha".to_string(), 1000u64)),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "storybook leaked across tenants: tenant-b read a readout stamped tenant-a"
+    );
+
+    let owner = super::storybook::get_version(
+        State(state.clone()),
+        Path(("alpha".to_string(), 1000u64)),
+        Query(Default::default()),
+        m2_bearer_for("tenant-a", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        owner.status(),
+        StatusCode::OK,
+        "the owning tenant must still be able to read its own readout"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_storybook_versions_hides_another_tenants_artifact() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    seed_artifact_fact(
+        &state,
+        "tenant-a",
+        "__storybook__::alpha::1000",
+        seeded_storybook_value("alpha", 1000),
+    )
+    .await;
+
+    let resp = super::storybook::list_versions(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["count"], 0,
+        "storybook versions leaked across tenants: tenant-b enumerated tenant-a's readouts"
+    );
+
+    let owner = super::storybook::list_versions(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        m2_bearer_for("tenant-a", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    let owner_body = json_body(owner).await;
+    assert_eq!(owner_body["count"], 1, "the owning tenant must see its own readout");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_published_dossier_is_stamped_with_the_publishing_tenant() {
+    // The five tests above seed the store directly, so they pin the *read*
+    // filter and would all stay green if `persist_dossier` went back to stamping
+    // `"default"`. This one goes through the publish handler and then reads with
+    // the daemon-capture scope, which is what a `"default"` stamp would satisfy.
+    // Without it the suite would prove half the fix — the exact shape of defect
+    // this plan exists to stop shipping.
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+
+    let published = super::dossier::post_publish(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        m2_bearer_for("tenant-a", "admin:read facts:write"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+        Json(serde_json::from_value(seeded_dossier_value("d9", "alpha")).expect("dossier body")),
+    )
+    .await
+    .into_response();
+    assert_eq!(published.status(), StatusCode::CREATED, "publish should succeed");
+
+    let unbound = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "d9".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        unbound.status(),
+        StatusCode::NOT_FOUND,
+        "a dossier published by tenant-a was stamped so the capture tenant could read it"
+    );
+
+    let owner = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "d9".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-a", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-a".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        owner.status(),
+        StatusCode::OK,
+        "the publisher must be able to read it back"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn tenant_scope_legacy_default_rows_reach_the_capture_tenant_only() {
+    // Everything written before this change carries the fact store's default
+    // stamp. Those rows must keep working on a single-tenant daemon — that is
+    // Constraint 1 — without becoming readable by a named tenant that never
+    // owned them. Same rule `trace_store` applies to legacy unlabelled spans.
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    seed_artifact_fact(
+        &state,
+        crate::auth::LEGACY_FACT_TENANT,
+        "__dossier__::alpha::legacy",
+        seeded_dossier_value("legacy", "alpha"),
+    )
+    .await;
+
+    // Unbound request → the daemon's capture tenant → the legacy row is visible,
+    // exactly as it was before this change.
+    let capture = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "legacy".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery::default()),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        capture.status(),
+        StatusCode::OK,
+        "a legacy row must still reach the daemon's own capture tenant"
+    );
+
+    // The same row named by a tenant that never owned it: refused.
+    let named = super::dossier::get_dossier(
+        State(state.clone()),
+        Path(("alpha".to_string(), "legacy".to_string())),
+        Query(Default::default()),
+        m2_bearer_for("tenant-b", "admin:read"),
+        Query(super::traces::OptionalTenantQuery {
+            tenant_id: Some("tenant-b".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        named.status(),
+        StatusCode::NOT_FOUND,
+        "a legacy row must not become readable by a named tenant that never owned it"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constraint 3, re-scoped — the aggregate surface declares its tier and says
+// plainly that it does not enforce it.
+//
+// The value being protected is the HONESTY of the annotation, not a gate. A
+// response that carries `aggregate: true` without `tier_enforcement` invites a
+// client to infer that reaching it meant something.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn tier_advisory_declares_the_tier_and_that_it_is_not_enforced() {
+    let annotated = super::traces::with_tier_advisory(serde_json::json!({"aggregate": true}));
+    assert_eq!(annotated["required_tier"], super::traces::AGGREGATE_REQUIRED_TIER);
+    assert_eq!(
+        annotated["tier_enforcement"], "not_gated",
+        "the stamp must say the capability is not gated; a client that sees a tier and no \
+         enforcement note will assume a gate"
+    );
+    assert_eq!(annotated["aggregate"], true, "annotation must not disturb the payload");
+}
+
+#[test]
+fn the_aggregate_surface_is_not_advertised_as_a_paid_tier() {
+    // Operator decision 2026-08-03: `code_intel_multi_repo` was removed from Pro
+    // and Governance because it ships in the free local build and is
+    // self-providable, which the published vow says cannot be sold as a gated
+    // capability. The daemon must not go on advertising a paid tier the price
+    // list no longer charges for — that is the same "sold but not enforced"
+    // mismatch as before, pointing the other way.
+    //
+    // Pinned as a constant assertion rather than left to the response tests
+    // because the failure mode is someone restoring "pro" here to make a
+    // marketing page line up, without touching the price list.
+    assert_eq!(
+        super::traces::AGGREGATE_REQUIRED_TIER,
+        "free",
+        "cross-repo aggregation is sold at Free as of the 2026-08-03 price list. If this is being \
+         changed back to a paid tier, the signed price list has to change with it — and if the \
+         capability still ships in the local Apache-2.0 build, selling it contradicts the vow that \
+         the free/paid boundary is architectural and never a licence key."
+    );
+}
+
+#[test]
+fn every_aggregate_response_carries_the_advisory_stamp() {
+    // A source-level invariant rather than five near-identical response tests.
+    // The failure this guards is a SIXTH aggregate route added later without the
+    // stamp — which no test of the existing five would ever notice.
+    let src = include_str!("traces.rs");
+    let aggregate_bodies = src.matches("\"aggregate\": true").count();
+    let stamped = src.matches("with_tier_advisory(serde_json::json!(").count();
+    assert_eq!(
+        aggregate_bodies, stamped,
+        "every response body carrying `aggregate: true` must be wrapped in with_tier_advisory(); \
+         found {aggregate_bodies} aggregate bodies but {stamped} stamped. A new cross-repo route \
+         was probably added without the advisory annotation."
+    );
+}
+
+#[test]
+fn background_scopes_are_not_minted_in_handlers() {
+    // `TenantScope::background` is the one constructor that can name an
+    // arbitrary tenant, so it is the weak point in the argument the type makes.
+    // It exists for work with no request behind it — repo watching, retention,
+    // the flusher's resolver cache. A handler always has a request, and
+    // therefore always has a real authorization to derive its scope from;
+    // reaching for `background` there would launder an unauthorised read into a
+    // typed one that looks exactly like an authorised one.
+    //
+    // Source-level because that is the shape of the failure: not a wrong answer
+    // from an existing handler, but a *new* handler taking the shortcut.
+    const HTTP_SOURCES: &[(&str, &str)] = &[
+        ("traces.rs", include_str!("traces.rs")),
+        ("dossier.rs", include_str!("dossier.rs")),
+        ("storybook.rs", include_str!("storybook.rs")),
+        ("repos.rs", include_str!("repos.rs")),
+        ("mod.rs", include_str!("mod.rs")),
+    ];
+    for (name, src) in HTTP_SOURCES {
+        assert!(
+            !src.contains("TenantScope::background"),
+            "{name} mints a background TenantScope. Handlers must derive their scope from the \
+             authorization that admitted the request (require_http_scopes_for_tenant / \
+             runtime_tenant_for). If this is genuinely request-less work, move it out of the \
+             http module rather than widening the exception."
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M8 — enrichment behind a per-seat rate ceiling.
+// crux-code-intel-pro-hosted-surface-2026-07-28.
+//
+// Gate: the ceiling holds under a deliberate loop, and the counter is visible
+// before the limit rather than at it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn m8_enrich_query(tenant: &str, _seat: &str) -> super::traces::EnrichQuery {
+    super::traces::EnrichQuery {
+        tenant_id: tenant.to_string(),
+        repo_id: None,
+        symbol: Some("some_symbol".to_string()),
+        token_budget: Some(4000),
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m8_a_deliberate_loop_is_refused_with_429_not_402() {
+    // A rate ceiling is not a billing failure. 429 tells the caller to wait;
+    // 402 would tell them to buy credit they do not need, and they would.
+    std::env::set_var(crate::enrich_budget::SEAT_CEILING_ENV, "3");
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let mut statuses = Vec::new();
+    for _ in 0..12 {
+        let resp = super::traces::post_enrich_verdict(
+            State(state.clone()),
+            dev_scope_headers("admin:write"),
+            Query(m8_enrich_query("tenant-a", "seat-a")),
+        )
+        .await
+        .into_response();
+        statuses.push(resp.status());
+    }
+
+    let refused = statuses.iter().filter(|s| **s == StatusCode::TOO_MANY_REQUESTS).count();
+    assert!(
+        refused >= 8,
+        "a 12-call loop against a ceiling of 3 must be refused most of the time, got {statuses:?}"
+    );
+    assert!(
+        !statuses.iter().any(|s| *s == StatusCode::PAYMENT_REQUIRED),
+        "a rate ceiling must never present as a billing failure"
+    );
+    std::env::remove_var(crate::enrich_budget::SEAT_CEILING_ENV);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m8_the_budget_is_readable_before_the_ceiling_bites() {
+    std::env::set_var(crate::enrich_budget::SEAT_CEILING_ENV, "10");
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    // Reading the counter must never consume it, however often it is polled.
+    for _ in 0..5 {
+        let resp = super::traces::get_enrich_budget(
+            State(state.clone()),
+            dev_scope_headers("admin:read"),
+            Query(m8_enrich_query("tenant-a", "seat-a")),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["budget"]["used_in_window"], 0, "peeking must not spend budget");
+        assert_eq!(body["cost_cr_per_verdict"], 5);
+    }
+    std::env::remove_var(crate::enrich_budget::SEAT_CEILING_ENV);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m8_one_seat_exhausting_itself_leaves_another_working() {
+    // The reason the ceiling is per seat rather than per account: a runaway
+    // agent must not take the team down with it.
+    //
+    // Seats are distinguished by CREDENTIAL, not by a field the caller picks —
+    // so this test uses two distinct passports, which is what two colleagues
+    // actually have.
+    std::env::set_var(crate::enrich_budget::SEAT_CEILING_ENV, "2");
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    for _ in 0..4 {
+        let _ = super::traces::post_enrich_verdict(
+            State(state.clone()),
+            dev_scope_passport_headers("admin:write", "passport-noisy"),
+            Query(m8_enrich_query("tenant-a", "unused")),
+        )
+        .await
+        .into_response();
+    }
+    let noisy = super::traces::get_enrich_budget(
+        State(state.clone()),
+        dev_scope_passport_headers("admin:read", "passport-noisy"),
+        Query(m8_enrich_query("tenant-a", "unused")),
+    )
+    .await
+    .into_response();
+    let noisy_body = json_body(noisy).await;
+    assert_eq!(noisy_body["budget"]["at_ceiling"], true, "the looping seat is capped");
+
+    let quiet = super::traces::get_enrich_budget(
+        State(state.clone()),
+        dev_scope_passport_headers("admin:read", "passport-quiet"),
+        Query(m8_enrich_query("tenant-a", "unused")),
+    )
+    .await
+    .into_response();
+    let quiet_body = json_body(quiet).await;
+    assert_eq!(
+        quiet_body["budget"]["at_ceiling"], false,
+        "a colleague's seat must keep its own headroom"
+    );
+    assert_eq!(quiet_body["budget"]["remaining"], 2);
+    std::env::remove_var(crate::enrich_budget::SEAT_CEILING_ENV);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m8_enrichment_is_refused_across_tenants() {
+    m2_env();
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    let resp = super::traces::post_enrich_verdict(
+        State(state.clone()),
+        m2_bearer_for("tenant-b", "admin:write"),
+        Query(m8_enrich_query("tenant-a", "seat-a")),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "enrichment must honour tenant scoping like every other code-intel surface"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn m8_renaming_the_seat_cannot_mint_a_fresh_allowance() {
+    // Regression. seat_id was once a query parameter, so an agent that exhausted
+    // its allowance named a different seat and carried on — the ceiling was
+    // bypassable by exactly the caller it exists to stop. Seat identity is now
+    // taken from the verified credential.
+    std::env::set_var(crate::enrich_budget::SEAT_CEILING_ENV, "2");
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let mut admitted = 0;
+    for i in 0..20 {
+        let resp = super::traces::post_enrich_verdict(
+            State(state.clone()),
+            dev_scope_headers("admin:write"),
+            Query(m8_enrich_query("tenant-a", &format!("seat-{i}"))),
+        )
+        .await
+        .into_response();
+        // Past the ceiling means anything other than 429 — these return 404 for
+        // "no scan registered", which is still a call the ceiling did not stop.
+        if resp.status() != StatusCode::TOO_MANY_REQUESTS {
+            admitted += 1;
+        }
+    }
+    assert!(
+        admitted <= 3,
+        "renaming the seat must not mint a fresh allowance: {admitted} of 20 calls got \
+         past a ceiling of 2. Seat identity comes from the verified credential, so a \
+         caller cannot choose which bucket it spends from."
+    );
+    std::env::remove_var(crate::enrich_budget::SEAT_CEILING_ENV);
+}
+
+// ── attention roll-up (ExecPlan crux-hosted-relay-gateway M7a) ──────────────
+
+/// The endpoint agrees with `GET /v1/work` about what is on the board, and
+/// says nothing beyond the counts.
+///
+/// The classifier's truth table is exercised in `crate::attention`'s own tests;
+/// what is asserted here is the wiring those tests cannot see — that the same
+/// item set feeds both surfaces, and that the response body carries no
+/// identifier.
+#[tokio::test]
+async fn attention_summary_counts_the_board_without_naming_any_of_it() {
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    bind_test_state_to_root_passport_key(&mut state);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+        crate::projects::seed_default_if_missing(&mut store, 1).expect("project seed");
+        for (title, work_state) in [
+            ("a plan under way", "in_progress"),
+            ("a plan that is stuck", "blocked"),
+            ("a plan that is finished", "complete"),
+            ("a plan not started", "planned"),
+        ] {
+            let item = crate::work::create_work(
+                &mut store,
+                crate::work::CreateWorkInput {
+                    project_id: "default".to_string(),
+                    title: title.to_string(),
+                    body: None,
+                    state: None,
+                    assignee_passport: None,
+                    tenant_id: None,
+                    linked_pr: None,
+                    linked_issue: None,
+                    created_by_passport: "personal-default".to_string(),
+                },
+                1_000,
+            )
+            .expect("create");
+            crate::work::update_work(
+                &mut store,
+                &item.id,
+                crate::work::UpdateWorkInput {
+                    title: None,
+                    body: None,
+                    state: Some(work_state.to_string()),
+                    assignee_passport: None,
+                    tenant_id: None,
+                    linked_pr: None,
+                    linked_issue: None,
+                    // `blocked` is refused without a reason, so supply one; it
+                    // is also a second thing the response must not echo.
+                    blocker_reason: Some(Some("waiting on a decision".to_string())),
+                    blocker_kind: None,
+                },
+                crate::work::UpdateWorkContext {
+                    by_passport: "personal-default".to_string(),
+                    passport_gated: false,
+                    now_unix_ms: 1_001,
+                },
+            )
+            .expect("set state");
+        }
+    }
+
+    let resp = super::attention::get_attention_summary(
+        State(state),
+        Query(super::attention::SummaryQuery { project_id: None }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["needs_you"], 1, "the blocked plan");
+    assert_eq!(body["running"], 1, "the in_progress plan");
+    assert_eq!(body["done_review"], 1, "the complete plan");
+    assert_eq!(body["gate_pending"], 0, "no gate was queued");
+    assert!(body["now_unix_ms"].as_u64().is_some_and(|ms| ms > 0));
+
+    // The reason this endpoint exists rather than shipping `/v1/work` to a
+    // hosted viewer: the titles above are customer plan names.
+    let rendered = body.to_string();
+    for title in ["a plan under way", "a plan that is stuck", "a plan that is finished"] {
+        assert!(!rendered.contains(title), "a plan title reached the wire: {rendered}");
+    }
+}
+
+/// Reading the roll-up needs the same scope as reading the feeds behind it.
+/// Aggregating into counts must not become a way around authorization.
+#[tokio::test]
+async fn attention_summary_requires_admin_read() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let resp = super::attention::get_attention_summary(
+        State(state),
+        Query(super::attention::SummaryQuery { project_id: None }),
+        dev_scope_headers("facts:read"),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }

@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Agent dossier exchange — Phase 4 of the context graph.
 //!
@@ -37,24 +37,46 @@
 #![allow(clippy::unwrap_used)] // .unwrap on data we constructed in the same fn — panic-free by construction
 
 use serde::{Deserialize, Serialize};
+
+/// How many extractor false positives get their callers resolved before the
+/// dossier stops and says so.
+const FALSE_POSITIVE_CALLER_CAP: usize = 25;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// One agent's belief snapshot.
+///
+/// Every field except `dossier_id` and `project_id` is `#[serde(default)]` so an
+/// agent can publish `{dossier_id, project_id, claims}` and have it accepted.
+/// The two exceptions are the identity of the document, and the handler
+/// validates them explicitly so a caller gets a named error rather than a bare
+/// 422 from the deserialiser. `agent_passport` and `generated_at_unix_ms` are
+/// filled from the request when left empty; `stats` is always recomputed
+/// server-side (see `http::dossier::post_publish`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dossier {
     pub dossier_id: String,
     pub project_id: String,
+    #[serde(default)]
     pub agent_passport: String,
+    #[serde(default)]
     pub generated_at_unix_ms: u64,
     /// Anchors so consumers know which underlying state this dossier reflects.
+    #[serde(default)]
     pub based_on: BasedOn,
+    #[serde(default)]
     pub claims: Vec<Claim>,
+    #[serde(default)]
     pub uncertainties: Vec<Uncertainty>,
+    #[serde(default)]
     pub contradictions: Vec<Contradiction>,
+    #[serde(default)]
     pub open_questions: Vec<String>,
+    #[serde(default)]
     pub stats: DossierStats,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BasedOn {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storybook_ts: Option<u64>,
@@ -62,9 +84,51 @@ pub struct BasedOn {
     pub workspace_scan_id: Option<String>,
     pub plane_count: usize,
     pub graph_node_count: usize,
+    /// The runtime observation window any runtime-derived claim rests on.
+    ///
+    /// Present only when trace capture is on and spans exist. A claim whose
+    /// confidence came from a runtime tier is uncheckable later without the
+    /// window it was computed over — the same rule as corpus identity on a
+    /// benchmark number. `None` means no runtime tier spoke, which is
+    /// materially different from "the runtime tier saw nothing".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_window: Option<TraceWindow>,
+}
+
+/// A dossier-owned copy of `code_intel::Window`.
+///
+/// Deliberately not a re-export: `code_intel::Window` carries a
+/// `&'static str` caveat and is serialise-only, while a dossier round-trips
+/// through the fact store and must deserialise. Owning the shape also keeps the
+/// published wire format from moving whenever the code-intel internals do.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TraceWindow {
+    pub spans_examined: usize,
+    pub traces_examined: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub earliest_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_unix_ms: Option<u64>,
+    /// Carried verbatim from the code-intel window so a reader cannot mistake a
+    /// runtime negative for proof of death.
+    pub caveat: String,
+}
+
+impl From<&crate::code_intel::Window> for TraceWindow {
+    fn from(w: &crate::code_intel::Window) -> Self {
+        Self {
+            spans_examined: w.spans_examined,
+            traces_examined: w.traces_examined,
+            earliest_unix_ms: w.earliest_unix_ms,
+            latest_unix_ms: w.latest_unix_ms,
+            caveat: w.caveat.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DossierStats {
     pub claim_count: usize,
     pub claims_by_kind: BTreeMap<String, usize>,
@@ -79,12 +143,21 @@ pub struct Claim {
     pub claim_id: String,
     pub kind: String, // implements / owns / stub / dead_code_likely / member / module_exists / planning_target / vision_set / contradiction_with / ...
     pub subject: String, // canonical id like "plane:plancrux:corecrux"
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object: Option<String>,
+    /// Omitted means "unstated", which is not the same as certain. Defaults to
+    /// 0.5 rather than 1.0 so an unqualified claim cannot outrank a measured
+    /// one, and so a budget that drops lowest-confidence-first drops it early.
+    #[serde(default = "default_confidence")]
     pub confidence: f32,
+    #[serde(default)]
     pub evidence: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rationale: Option<String>,
+}
+
+fn default_confidence() -> f32 {
+    0.5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +181,10 @@ pub struct AutoInput<'a> {
     pub project_id: &'a str,
     pub agent_passport: &'a str,
     pub now_unix_ms: u64,
+    /// Runtime spans for the dead-code tier. Empty is the normal case —
+    /// `CORECRUXD_TRACE_CAPTURE` is default-off — and yields exactly the
+    /// pre-runtime behaviour, so this degrades rather than changing shape.
+    pub spans: &'a [crate::trace_store::StoredSpan],
 }
 
 /// Build a dossier deterministically by walking the storybook (if present),
@@ -138,6 +215,11 @@ pub fn generate_auto(store: &corecrux_memory::FactStore, input: AutoInput<'_>) -
             workspace_scan_id: workspace.as_ref().map(|w| w.scan_id.clone()),
             plane_count: planes.len(),
             graph_node_count: graph.nodes.len(),
+            // Only when a runtime tier actually had something to say. An empty
+            // window recorded as a window would read as "we looked and saw
+            // nothing", which is the confusion the caveat exists to prevent.
+            trace_window: (!input.spans.is_empty())
+                .then(|| TraceWindow::from(&crate::code_intel::Window::of(input.spans))),
         },
         claims: Vec::new(),
         uncertainties: Vec::new(),
@@ -235,19 +317,32 @@ pub fn generate_auto(store: &corecrux_memory::FactStore, input: AutoInput<'_>) -
         if let Some(ws) = &workspace {
             let pool_text = build_plane_text_pool(plane, &plane_layers);
             let plane_kws = crate::storybook::extract_keywords_pub(&pool_text);
-            let candidates = crate::storybook::match_plane_to_modules_pub(&plane_kws, ws);
+            let (candidates, source) = crate::storybook::resolve_plane_modules(&plane_layers, &plane_kws, ws);
+            let declared = source == crate::storybook::ModuleSource::Declared;
             for cname in candidates {
                 d.claims.push(Claim {
                     claim_id: next_claim_id(),
                     kind: "implements".into(),
                     subject: plane_subject.clone(),
                     object: Some(format!("module:{cname}")),
-                    confidence: 0.55,
+                    // A declaration by whoever owns the plane is testimony, not
+                    // inference — it can still be wrong, but it is not a guess
+                    // from word overlap and must not be ranked as one. 0.55 for
+                    // an inference is the pre-existing value and stays.
+                    confidence: if declared { 0.9 } else { 0.55 },
                     evidence: vec![
-                        "keyword_overlap_coefficient_>=0.30".into(),
+                        if declared {
+                            format!("__plane_layer__::{}::{}::modules", input.project_id, plane.id)
+                        } else {
+                            "keyword_overlap_coefficient_>=0.30".into()
+                        },
                         format!("workspace_scan({})", ws.scan_id),
                     ],
-                    rationale: Some("inferred from plane vision-text overlap with crate identity tokens".into()),
+                    rationale: Some(if declared {
+                        "declared in the plane's `modules` layer".into()
+                    } else {
+                        "inferred from plane vision-text overlap with crate identity tokens".to_string()
+                    }),
                 });
             }
         }
@@ -269,20 +364,156 @@ pub fn generate_auto(store: &corecrux_memory::FactStore, input: AutoInput<'_>) -
                 rationale: Some(stub.snippet.clone()),
             });
         }
-        // Dead-code candidates as inferred claims with the scanner's own
-        // confidence (currently 0.6 with a warning).
-        for dc in &ws.dead_code {
-            d.claims.push(Claim {
-                claim_id: next_claim_id(),
-                kind: "dead_code_likely".into(),
-                subject: format!("symbol:{}:{}", dc.file_rel_path, dc.line),
-                object: None,
-                confidence: dc.confidence,
-                evidence: vec![
-                    format!("regex_zero_references_in_workspace({})", dc.name),
-                    format!("workspace_scan({})", ws.scan_id),
-                ],
-                rationale: Some(dc.note.clone()),
+        // ── Dead code, graded across tiers ────────────────────────────
+        //
+        // The AST tier alone cannot tell "unreachable" from "called somewhere
+        // the reference extractor cannot see" — it does not read macro token
+        // streams and does not resolve method calls, so a symbol invoked only
+        // inside `tokio::select!` or only as `self.foo()` reads as
+        // unreferenced. `code_intel::dead_code_verdicts` joins it to the
+        // runtime tier; the three outcomes are genuinely different claims, and
+        // flattening them into one `dead_code_likely` was the old behaviour's
+        // real defect.
+        let verdicts = crate::code_intel::dead_code_verdicts(ws, input.spans);
+        let mut runtime_spoke = false;
+        // `blast_radius` walks every file's reference list per symbol, so
+        // enriching an unbounded number of false positives is an unbounded
+        // scan. Capped, and the cap is DECLARED in open_questions when it
+        // bites — a silent truncation would read as "these are all of them".
+        let mut enriched = 0usize;
+        let mut static_only = 0usize;
+        for v in &verdicts {
+            let subject = format!("symbol:{}:{}", v.file.as_deref().unwrap_or("?"), v.line.unwrap_or(0));
+            let evidence: Vec<String> = v
+                .evidence
+                .iter()
+                .map(|e| format!("{}:{} — {}", e.tier, e.says, e.detail))
+                .chain(std::iter::once(format!("workspace_scan({})", ws.scan_id)))
+                .collect();
+
+            match v.verdict {
+                // Observed executing. The static tier was WRONG, and emitting
+                // `dead_code_likely` here would hand the next agent a
+                // delete-list entry for live code. The useful claim is the
+                // opposite one, and it is near-certain: we watched it run.
+                "extractor_false_positive__static_dead_but_executed" => {
+                    runtime_spoke = true;
+                    let mut evidence = evidence;
+                    // Who actually called it. "Flagged dead but ran" is only
+                    // half an answer — the useful half is which call shape the
+                    // reference extractor could not see, and that is visible in
+                    // the callers. This is the bounded selection policy the
+                    // join assessment said did not exist: not "every symbol in
+                    // the workspace", but the handful the tiers disagree about.
+                    match enriched.cmp(&FALSE_POSITIVE_CALLER_CAP) {
+                        std::cmp::Ordering::Less => {
+                            enriched += 1;
+                            let br = crate::code_intel::blast_radius(ws, input.spans, &v.symbol, 400);
+                            let callers: Vec<String> = br
+                                .dependents
+                                .iter()
+                                .filter(|dep| dep.evidence != "static")
+                                .map(|dep| {
+                                    format!(
+                                        "caller:{}{}",
+                                        dep.name,
+                                        dep.file.as_deref().map_or(String::new(), |f| format!(" ({f})"))
+                                    )
+                                })
+                                .collect();
+                            if callers.is_empty() {
+                                evidence.push(
+                                    "no runtime caller resolved — the span was a root, or its parent did not join"
+                                        .into(),
+                                );
+                            } else {
+                                evidence.extend(callers);
+                            }
+                        }
+                        std::cmp::Ordering::Equal => {
+                            enriched += 1;
+                            d.open_questions.push(format!(
+                                "More than {FALSE_POSITIVE_CALLER_CAP} extractor false positives; \
+                             callers were resolved for the first {FALSE_POSITIVE_CALLER_CAP} only. \
+                             Query the rest with code_blast_radius."
+                            ));
+                        }
+                        std::cmp::Ordering::Greater => {}
+                    }
+                    d.claims.push(Claim {
+                        claim_id: next_claim_id(),
+                        kind: "extractor_false_positive".into(),
+                        subject,
+                        object: Some(format!("symbol_name:{}", v.symbol)),
+                        confidence: 0.95,
+                        evidence,
+                        rationale: Some(
+                            "flagged dead by static reachability but observed executing — \
+                             calibration signal for the extractor, not a deletion candidate"
+                                .into(),
+                        ),
+                    });
+                }
+                // Two independent tiers agree AND the symbol's own file ran, so
+                // the runtime silence is informative rather than incidental.
+                // `actionable` is the ladder's own bar; anything short of it
+                // keeps the extractor's confidence rather than inheriting
+                // certainty it has not earned.
+                "dead_candidate__static_and_runtime_agree" => {
+                    runtime_spoke = true;
+                    let conf = if v.actionable { 0.9 } else { 0.6 };
+                    d.claims.push(Claim {
+                        claim_id: next_claim_id(),
+                        kind: "dead_code_likely".into(),
+                        subject,
+                        object: Some(format!("symbol_name:{}", v.symbol)),
+                        confidence: conf,
+                        evidence,
+                        rationale: Some(if v.actionable {
+                            "static and runtime tiers agree, and the symbol's own file executed \
+                             in the window — the negative is evidence, not absence of evidence"
+                                .into()
+                        } else {
+                            "tiers agree, but the symbol's own file never executed in the window, \
+                             so the runtime tier never had a chance to see it"
+                                .to_string()
+                        }),
+                    });
+                }
+                // Empty window: unchanged from the pre-runtime behaviour.
+                _ => {
+                    static_only += 1;
+                    d.claims.push(Claim {
+                        claim_id: next_claim_id(),
+                        kind: "dead_code_likely".into(),
+                        subject,
+                        object: Some(format!("symbol_name:{}", v.symbol)),
+                        confidence: 0.6,
+                        evidence,
+                        rationale: Some("single static tier; no runtime observation window to corroborate it".into()),
+                    });
+                }
+            }
+        }
+
+        // The uncertainty is about what the tiers could NOT see, so it is only
+        // honest while a tier is actually missing. Once the runtime tier has
+        // spoken the claims carry their own graded evidence and repeating the
+        // blanket caveat would understate what is now known.
+        if static_only > 0 && !runtime_spoke {
+            d.uncertainties.push(Uncertainty {
+                topic: "dead_code_likely".into(),
+                question: format!(
+                    "Which of the {static_only} dead-code candidates are genuinely unreachable, \
+                     rather than called from a macro body or through a method call the reference \
+                     extractor cannot resolve?"
+                ),
+                best_guess: Some(
+                    "A single static tier. No runtime, binary-symbol or compiler-lint tier has \
+                     corroborated any of these, so none of them is safe to act on alone."
+                        .into(),
+                ),
+                confidence: 0.3,
             });
         }
     }
@@ -321,7 +552,13 @@ pub fn generate_auto(store: &corecrux_memory::FactStore, input: AutoInput<'_>) -
     Some(d)
 }
 
-fn compute_stats(claims: &[Claim], uncert: usize, contr: usize, open: usize) -> DossierStats {
+/// Roll up a dossier's stats from its own contents.
+///
+/// Public so `http::dossier::post_publish` can recompute them on every publish:
+/// stats are derived data, and letting a client assert numbers that disagree
+/// with the claims they describe would give the token-budget code a false
+/// total to report.
+pub fn compute_stats(claims: &[Claim], uncert: usize, contr: usize, open: usize) -> DossierStats {
     let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
     let mut by_conf: BTreeMap<String, usize> = BTreeMap::new();
     for c in claims {
@@ -620,9 +857,9 @@ fn read_plane_layers(store: &corecrux_memory::FactStore, project_id: &str, plane
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
         min_effective_confidence: None,
         tenant_hash: None,
-        query: Some(prefix.clone()),
+        query: None,
         entity: None,
-        entity_prefix: None,
+        entity_prefix: Some(prefix.clone()),
         top_k: 100,
         token_budget: None,
     });
@@ -659,9 +896,9 @@ fn latest_storybook_ts(store: &corecrux_memory::FactStore, project_id: &str) -> 
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
         min_effective_confidence: None,
         tenant_hash: None,
-        query: Some(prefix.clone()),
+        query: None,
         entity: None,
-        entity_prefix: None,
+        entity_prefix: Some(prefix.clone()),
         top_k: 100,
         token_budget: None,
     });
@@ -816,6 +1053,196 @@ mod tests {
         assert_eq!(d.removed_claims.len(), 0);
         assert_eq!(d.confidence_changes.len(), 1);
         assert_eq!(d.stats_delta.claim_delta, 1);
+    }
+
+    /// A dead-code claim set must arrive with a statement of what the tier
+    /// producing it cannot see. Without it, a consumer reads the claims as a
+    /// delete-list and deletes code that is called from a macro body or through
+    /// an unresolved method call.
+    #[test]
+    fn dead_code_claims_carry_an_uncertainty_about_the_extractor() {
+        let mut u: Vec<Uncertainty> = Vec::new();
+        // Mirrors the branch in generate_auto: emitted only when there are
+        // dead-code candidates to qualify.
+        let candidates = 10usize;
+        if candidates > 0 {
+            u.push(Uncertainty {
+                topic: "dead_code_likely".into(),
+                question: format!("Which of the {candidates} dead-code candidates are genuinely unreachable?"),
+                best_guess: Some("A single static tier.".into()),
+                confidence: 0.3,
+            });
+        }
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].topic, "dead_code_likely");
+        assert!(
+            u[0].confidence < 0.5,
+            "an unresolved known-unknown must not read as confident"
+        );
+    }
+
+    // ── The runtime dead-code tier (J1 of the codemap join) ──────────────
+
+    fn dead_symbol(name: &str, file: &str, line: usize) -> crate::workspace_scan::DeadSymbol {
+        crate::workspace_scan::DeadSymbol {
+            crate_name: "corecruxd".into(),
+            module_path: "m".into(),
+            file_rel_path: file.into(),
+            line,
+            kind: "fn".into(),
+            name: name.into(),
+            confidence: 0.6,
+            note: "no references found".into(),
+        }
+    }
+
+    fn span(name: &str, file: &str) -> crate::trace_store::StoredSpan {
+        crate::trace_store::StoredSpan {
+            span: crux_observe::span_layer::SpanRecord {
+                trace_id: 1,
+                span_id: 2,
+                parent_span_id: None,
+                name: name.into(),
+                target: "t".into(),
+                file: Some(file.into()),
+                line: Some(1),
+                module_path: None,
+                duration_ns: 10,
+                depth: 0,
+                had_error: false,
+                outcome: Default::default(),
+            },
+            symbol_id: None,
+            join: "extracted".into(),
+            tenant_id: String::new(),
+            release: String::new(),
+            stored_at_unix_ms: 1_000,
+        }
+    }
+
+    fn scan_with(dead: Vec<crate::workspace_scan::DeadSymbol>) -> crate::workspace_scan::WorkspaceScan {
+        let mut ws = crate::workspace_scan::WorkspaceScan::default();
+        ws.scan_id = "ws_test".into();
+        ws.dead_code = dead;
+        ws
+    }
+
+    /// An empty window must change nothing. Trace capture is default-off, so
+    /// this is the shape almost every install sees.
+    #[test]
+    fn an_empty_window_reproduces_the_pre_runtime_behaviour() {
+        let ws = scan_with(vec![dead_symbol("orphan", "src/a.rs", 10)]);
+        let v = crate::code_intel::dead_code_verdicts(&ws, &[]);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].verdict, "dead_candidate__static_only");
+        assert!(!v[0].actionable, "nothing is actionable without a window");
+    }
+
+    /// Observed executing ⇒ the static tier was wrong. Emitting
+    /// `dead_code_likely` here would put live code on a delete-list.
+    #[test]
+    fn a_symbol_observed_running_is_not_a_dead_code_claim() {
+        let ws = scan_with(vec![dead_symbol("actually_alive", "src/a.rs", 10)]);
+        let spans = vec![span("actually_alive", "src/a.rs")];
+        let v = crate::code_intel::dead_code_verdicts(&ws, &spans);
+        assert_eq!(v[0].verdict, "extractor_false_positive__static_dead_but_executed");
+    }
+
+    /// Two tiers agreeing is necessary but not sufficient: the symbol's own
+    /// file must have run, or the runtime tier never had a chance to see it.
+    /// This is the distinction #542's own M6 gate was opened to fix.
+    #[test]
+    fn tiers_agreeing_is_only_actionable_when_the_symbols_file_executed() {
+        let ws = scan_with(vec![dead_symbol("orphan", "src/quiet.rs", 10)]);
+
+        // A window that never touched src/quiet.rs: agreement, but not evidence.
+        let elsewhere = vec![span("something_else", "src/busy.rs")];
+        let v = crate::code_intel::dead_code_verdicts(&ws, &elsewhere);
+        assert_eq!(v[0].verdict, "dead_candidate__static_and_runtime_agree");
+        assert!(
+            !v[0].actionable,
+            "the symbol's file never executed — silence there proves nothing"
+        );
+
+        // A window that DID exercise the file, without hitting the symbol.
+        let same_file = vec![span("neighbour", "src/quiet.rs")];
+        let v = crate::code_intel::dead_code_verdicts(&ws, &same_file);
+        assert!(v[0].actionable, "file ran, symbol did not — now the negative counts");
+    }
+
+    /// The window travels with the claims it graded, or the confidences are
+    /// not re-derivable later.
+    #[test]
+    fn the_trace_window_is_recorded_only_when_a_runtime_tier_spoke() {
+        let none: BasedOn = BasedOn {
+            trace_window: None,
+            ..Default::default()
+        };
+        assert!(none.trace_window.is_none());
+
+        let spans = vec![span("x", "src/a.rs"), span("y", "src/a.rs")];
+        let w = TraceWindow::from(&crate::code_intel::Window::of(&spans));
+        assert_eq!(w.spans_examined, 2);
+        assert_eq!(w.traces_examined, 1);
+        assert!(!w.caveat.is_empty(), "the caveat must survive the conversion");
+        // Round-trips through the fact store, unlike code_intel::Window.
+        let json = serde_json::to_string(&w).unwrap();
+        assert_eq!(serde_json::from_str::<TraceWindow>(&json).unwrap(), w);
+    }
+
+    /// A false positive is only half an answer without its callers: the useful
+    /// half is which call shape the extractor could not see.
+    #[test]
+    fn a_false_positive_claim_carries_the_callers_that_refute_it() {
+        let mut ws = scan_with(vec![dead_symbol("looks_dead", "src/a.rs", 10)]);
+        // A caller the STATIC extractor did see, plus the runtime observation.
+        ws.files = vec![crate::workspace_scan::FileInfo {
+            rel_path: "src/caller.rs".into(),
+            crate_name: "c".into(),
+            module_path: "c::caller".into(),
+            loc: 20,
+            symbol_count: 1,
+            stub_count: 0,
+            doc_summary: None,
+            doc_full: None,
+            defines: vec![],
+            references: vec![crate::workspace_scan::FileReference {
+                to_file: "src/a.rs".into(),
+                to_symbol: "looks_dead".into(),
+                call_count: 1,
+                same_file: false,
+                from_symbol: Some("the_caller".into()),
+            }],
+            referenced_by: vec![],
+            is_test_file: false,
+        }];
+        let spans = vec![span("looks_dead", "src/a.rs")];
+
+        let v = crate::code_intel::dead_code_verdicts(&ws, &spans);
+        assert_eq!(v[0].verdict, "extractor_false_positive__static_dead_but_executed");
+
+        // blast_radius is what supplies the callers; assert it can see one.
+        let br = crate::code_intel::blast_radius(&ws, &spans, "looks_dead", 400);
+        assert!(
+            !br.dependents.is_empty(),
+            "a symbol with a reference and a runtime observation must have dependents"
+        );
+    }
+
+    /// The caller cap must be declared when it bites, never silent.
+    #[test]
+    fn the_false_positive_caller_cap_is_declared_not_silent() {
+        assert!(FALSE_POSITIVE_CALLER_CAP > 0);
+        // The message an over-cap dossier carries names the cap and the tool to
+        // use for the remainder, so a reader is never left thinking the list is
+        // complete.
+        let msg = format!(
+            "More than {FALSE_POSITIVE_CALLER_CAP} extractor false positives; \
+             callers were resolved for the first {FALSE_POSITIVE_CALLER_CAP} only. \
+             Query the rest with code_blast_radius."
+        );
+        assert!(msg.contains("code_blast_radius"));
+        assert!(msg.contains(&FALSE_POSITIVE_CALLER_CAP.to_string()));
     }
 
     #[test]

@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! `/v1/admin/control` state — valves (pause-ingest, throttle, read-only, etc.) persisted to `CONTROL.json`.
 
@@ -165,8 +165,12 @@ pub fn write_control_atomic(path: &Path, state: &ControlV1) -> std::io::Result<(
     let bytes = checkpoint_control_bytes_v1(state);
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
-    // Best-effort: establish durability for the parent directory.
+    // Best-effort: establish durability for the parent directory. This is a
+    // no-op off unix; bind the parameter so the workspace-wide
+    // `unused_variables = "deny"` does not fail the build there.
     if let Some(parent) = path.parent() {
+        #[cfg(not(unix))]
+        let _ = parent;
         #[cfg(unix)]
         {
             if let Ok(dir) = std::fs::File::open(parent) {

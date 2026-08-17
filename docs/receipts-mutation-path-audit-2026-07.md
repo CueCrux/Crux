@@ -21,7 +21,7 @@ Two guard tests in `crates/corecruxd/tests/mutation_path_receipt_audit.rs`:
 | # | Path | Symbol (file:line) | Classification | Notes |
 |---|------|--------------------|----------------|-------|
 | 1 | Store / update a fact | `try_store` / `store` ([fact_store.rs:965,978](../crates/corecrux-memory/src/fact_store.rs)) | (a) journaled-additive | Append-only, versioned, reversible. **Note:** the non-fallible `store`/`delete` wrappers log-and-swallow a journal-append error ([fact_store.rs:965](../crates/corecrux-memory/src/fact_store.rs)); durability-critical callers must use the `try_*` variants (which propagate). |
-| 2 | Bulk store | `try_store_bulk` / `store_bulk` ([fact_store.rs:1009,1014](../crates/corecrux-memory/src/fact_store.rs)) | (a) journaled-additive | As #1, batched. |
+| 2 | Bulk store | `try_store_bulk` / `try_store_bulk_durable` / `store_bulk` ([fact_store.rs](../crates/corecrux-memory/src/fact_store.rs)) | (a) journaled-additive | As #1, batched. `try_store_bulk_durable` uses the same replayable `StoreBatch` event and additionally fsyncs the journal before returning; approval paths use it to make the passport and terminal request facts one durable transaction. |
 | 3 | Synced insert (sync pull) | `store_synced` ([fact_store.rs:1643](../crates/corecrux-memory/src/fact_store.rs)) | (a) journaled-additive | Remote-origin fact; tenant re-stamped by caller. |
 | 4 | Soft delete (tombstone) | `try_delete` / `delete` ([fact_store.rs:1032,1053](../crates/corecrux-memory/src/fact_store.rs)) | (a) journaled, reversible | Reversible tombstone; content stays until #8 erases it. |
 | 5 | Supersede / clear | `mark_superseded` / `clear_superseded` ([fact_store.rs:805,827](../crates/corecrux-memory/src/fact_store.rs)) | (a) journaled, reversible | Reversible; also carried in the merge receipt (#7). |
@@ -32,7 +32,7 @@ Two guard tests in `crates/corecruxd/tests/mutation_path_receipt_audit.rs`:
 | 10 | **Ephemeral reserved-fact GC** | `run_sweep_once` / `sweep_and_receipt` / `spawn_ephemeral_gc` ([ephemeral_gc.rs:140,196,213](../crates/corecruxd/src/ephemeral_gc.rs)) | **(a) receipted (M6)** | Hourly sweep of `__session_binding__::*` / `__reverify_receipts__::*`. Mints a signed `crux.gc_receipt.v1` (durable append); failure bumps the debt counter + ERROR. |
 | 11 | **Tenant-mirror wipe** | `offboard_tenant_mirror` ([corecrux-memory/src/sync.rs:411](../crates/corecrux-memory/src/sync.rs)) → signed at the http layer | **KnownGapFollowUp** | Delete-then-sign: the wipe runs, then the caller signs the `TenantWipeReceipt`; a signer failure at the http layer leaves the wipe with no durable receipt and no debt signal. → follow-up F-3. |
 | 12 | Directory LSM compaction | `compact_directory_until_within_limits` / `compact_dir_run_pair_v1` ([corecrux-storage/src/compact.rs:54,97](../crates/corecrux-storage/src/compact.rs)) | **(c) justified maintenance** | Logically-lossless physical index run-merge; already emits a structured `DirCompactionEventV1` (counts). **Not wired into the daemon** (test-only, gated OFF); lives in the storage crate (no passport key). When wired, the corecruxd caller must mint over the returned events — same call-layer pattern as #8. See O-1. |
-| 13 | In-memory metadata | `set_horizon` / `reverify` / `record_access` ([fact_store.rs:771,785,887](../crates/corecrux-memory/src/fact_store.rs)) | **(c) justified maintenance** | No `append_journal`; derived/ephemeral fields only. (`set_horizon` not journaled = durability nit, out of scope → O-2.) |
+| 13 | In-memory metadata | `set_horizon[_for_tenant]` / `reverify[_for_tenant]` / `record_access` ([fact_store.rs:771,785,887](../crates/corecrux-memory/src/fact_store.rs)) | **(c) justified maintenance** | No `append_journal`; derived/ephemeral fields only. (`set_horizon_for_tenant` not journaled = durability nit, out of scope → O-2.) |
 
 ## M6 receipt design (paths 8, 9, 10) — as revised for the review
 
@@ -66,7 +66,7 @@ Interop limitation: the generic dataplane `receipt_verify` MCP tool reads the re
 ## Open questions for the operator
 
 - **O-1 (dir compaction):** confirm the justified-maintenance disposition (it is unwired + logically lossless), or direct a wire+receipt milestone. The call-layer minting hook is documented in row 12.
-- **O-2 (`set_horizon` durability):** `set_horizon` mutates `horizon_class` in memory without a journal event (lost on restart). Out of P4 scope; flagged.
+- **O-2 (`set_horizon_for_tenant` durability):** `set_horizon_for_tenant` mutates `horizon_class` in memory without a journal event (lost on restart). Out of P4 scope; flagged.
 - **O-3 (profile note):** the eu-ai-act line "every state mutation produces a CROWN receipt" (workspace-root `CLAUDE.md`, wizard-managed) overstates. After merge, regenerate to scope it to erasure/GC/merge and to say receipts are *loud-on-failure* (pending + counter), not *guaranteed-synchronous*, until F-1 lands.
 - **O-4 (cardinality decision):** confirmed — erasure receipts expose `facts_dropped` + `retention_marked` only; store-size (`facts_retained`) is not exposed. Say if a coarser bucketed count is preferred even for `facts_dropped`.
 </content>

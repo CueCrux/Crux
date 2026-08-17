@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 // CLI binary — printing to stdout/stderr is correct behaviour.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
@@ -16,17 +16,25 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use corecruxctl::verify_escrow;
 use corecruxctl::{
-    admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, compaction_sync, config_bundle, cost,
-    deploy_audit, evidence, explain, export, extensions, fixture_digest, gaps, hooks, identity_cli, incident, ingest,
-    inspect_receipt, learn, login, machine, memory, memory_pack, observe_ingest, openclaw, output_verify, parity,
-    projections, receipts, reconcile, replay, repo, session_sync, shard, shardmap, smoke, snapshot, stage1_import,
-    start, storage, structured_log, tooling_env, verify_store,
+    admin, agent_wiring, attest_companions, audit_export, audit_pack, c2pa_x509, code_chain, code_health,
+    compaction_sync, config_bundle, cost, deploy_audit, evidence, explain, export, extensions, fixture_digest, gaps,
+    hooks, identity_cli, incident, ingest, inspect_receipt, learn, login, machine, memory, memory_pack, observe_ingest,
+    openclaw, output_verify, parity, projections, rebuild_companions, receipts, reconcile, repair_manifest, replay,
+    repo, session_sync, shard, shardmap, smoke, snapshot, stage1_import, start, storage, structured_log, studio,
+    tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
 #[command(name = "corecruxctl")]
 #[command(about = "CoreCrux v3 control tool (Phase 0)")]
+// A packaged install has no checkout to compare against, so `--version` is the
+// only way a user can tell which `corecruxctl` they are running. `crux-hook`
+// and `corecruxd` both expose one; this crate did not, which left the M5
+// clean-install version check unable to cover the binary that carries the
+// `compaction-sync` activation surface.
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -74,6 +82,13 @@ enum Command {
         /// Static named token for CI / headless / air-gapped clients.
         #[arg(long)]
         token: Option<String>,
+        /// Wire one agent's config too: claude | codex | cursor.
+        ///
+        /// Claude Code is wired by `login` already; codex installs the stdio
+        /// bridge and registers it in ~/.codex/config.toml; cursor writes
+        /// ~/.cursor/mcp.json. All merges, never overwrites, and idempotent.
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
     },
 
     /// (advanced) Authenticate to a Crux Daemon, auto-selecting the lowest-friction secure rail.
@@ -99,6 +114,11 @@ enum Command {
         /// Skip the post-login tools/list + fact round-trip verification.
         #[arg(long, default_value_t = false)]
         no_verify: bool,
+        /// Exit non-zero if a post-login self-check RAN and FAILED. A check
+        /// that could not run at all (daemon unreachable) is still tolerated —
+        /// `corecruxctl login` is expected to work offline.
+        #[arg(long, default_value_t = false)]
+        strict_verify: bool,
         /// Skip installing the Claude Code hooks (banner + observe capture).
         #[arg(long, default_value_t = false)]
         no_hooks: bool,
@@ -281,6 +301,31 @@ enum Command {
     Receipts {
         #[command(subcommand)]
         command: ReceiptsCommand,
+    },
+
+    /// Prove that what a daemon stores for a vault cannot open that vault.
+    ///
+    /// Runs the same named checks as `scripts/verify-escrow.py` and
+    /// `docs/verify-key-escrow.md`, so an independent implementation can be
+    /// compared against this one.
+    #[command(name = "verify-escrow")]
+    VerifyEscrow {
+        /// Daemon base URL holding the vault (default http://127.0.0.1:14800).
+        #[arg(long, default_value = "http://127.0.0.1:14800")]
+        daemon: String,
+        /// Vault to verify.
+        #[arg(long)]
+        vault_id: String,
+        /// Bearer token with `admin:read` (or set CORECRUXD_TOKEN).
+        #[arg(long)]
+        token: Option<String>,
+        /// Also prove the blob opens for its owner. Reads the recovery code
+        /// from stdin — never from argv, which `ps` exposes to every process.
+        #[arg(long)]
+        with_recovery_code: bool,
+        /// Emit JSON instead of prose.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Verify on-disk shard store integrity (Phase 5 hardening surface).
@@ -577,6 +622,15 @@ enum Command {
         command: ExtensionsCommand,
     },
 
+    /// Central Studio template library — sync + browse + install boards, tile
+    /// designs, workspaces, and full packs from a curator-signed catalog
+    /// (L1/L2 of crux-integrations-and-template-library-2026-07-25).
+    #[command(name = "studio")]
+    Studio {
+        #[command(subcommand)]
+        command: StudioCommand,
+    },
+
     /// Readable / editable memory panel (agent-ux-01). Operates against the
     /// running daemon over HTTP; honours CRUX_AGENT_TOKEN.
     #[command(name = "memory")]
@@ -594,6 +648,72 @@ enum Command {
     Openclaw {
         #[command(subcommand)]
         command: OpenclawCommand,
+    },
+
+    /// Stamp companion provenance on segments sealed before attestation
+    /// existed (`.ccxatt` backfill).
+    ///
+    /// Signs what is already on disk with this daemon's own passport key, using
+    /// the same writer the seal path uses. A backfilled stamp says "this daemon
+    /// vouches for these bytes as they are now" — it is `local` provenance and
+    /// does NOT retroactively prove where the bytes came from. Settle that
+    /// before running it on a corpus that may hold companions from elsewhere.
+    #[command(name = "attest-companions")]
+    AttestCompanions {
+        /// Daemon data dir. Defaults to CORECRUXD_DATA_DIR.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict to one shard id.
+        #[arg(long)]
+        shard: Option<u32>,
+        /// Report what would be stamped, write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Re-sign segments that already carry a `.ccxatt`.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Rebuild a segment's dense companion under a different embedder, without
+    /// destroying the one it already has.
+    ///
+    /// Offline, idempotent and **additive**: the new vectors are written to
+    /// `<stem>.ccxe@<model-key>` alongside the existing companion, so the dense
+    /// lane keeps serving the old model throughout. Cutover is pointing the
+    /// query embedder at the new model; rollback is pointing it back. Nothing
+    /// here ever deletes — `--force` rewrites only the key being built.
+    ///
+    /// Re-running skips segments that already carry the key, so an interrupted
+    /// run costs only what is left. On a delegated embedder each chunk is one
+    /// metered call, and the report states the count.
+    #[command(name = "rebuild-companions")]
+    RebuildCompanions {
+        /// Daemon data dir. Defaults to CORECRUXD_DATA_DIR.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Companion type to rebuild. Only `ccxe` is supported.
+        #[arg(long = "type", default_value = "ccxe")]
+        companion_type: String,
+        /// Model id to embed with. Defaults to CORECRUXD_EMBEDDING_MODEL.
+        #[arg(long)]
+        model: Option<String>,
+        /// Embedding endpoint. Defaults to CORECRUXD_EMBEDDING_URL.
+        #[arg(long)]
+        embedding_url: Option<String>,
+        /// Restrict to one shard id.
+        #[arg(long)]
+        shard: Option<u32>,
+        /// Restrict to one segment sequence.
+        #[arg(long)]
+        segment: Option<u64>,
+        /// Re-embed and rewrite the companion for this model key if it exists.
+        /// Never touches another model's key.
+        #[arg(long)]
+        force: bool,
+        /// Report what would be rebuilt. Embeds nothing, writes nothing, spends
+        /// nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Identity-federation helpers — fingerprint card + link-statement
@@ -1368,6 +1488,70 @@ enum ExtensionsCommand {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Install one extension by id from the daemon's verified cached
+    /// registry index (`POST /v1/extensions/install-from-registry`).
+    /// Run `sync` first, then `list-registry` to review the entry.
+    Install {
+        /// Extension id exactly as published in the registry index.
+        id: String,
+        /// Daemon-side index override. Relative paths resolve under the
+        /// daemon's data dir; absolute paths are taken as-is. Defaults to
+        /// `<data-dir>/extensions/registry/index.json`.
+        #[arg(long)]
+        index_path: Option<PathBuf>,
+        /// Daemon HTTP base URL (defaults to CORECRUXD_HTTP_URL or localhost).
+        #[arg(long)]
+        http_url: Option<String>,
+        /// Bearer token (defaults to CRUX_AGENT_TOKEN).
+        #[arg(long)]
+        token: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum StudioCommand {
+    /// Download the curator-signed Studio library index, verify its signature
+    /// against the supplied curator public key, and cache the verified bytes
+    /// under `<data-dir>/studio/library/index.json`.
+    Sync {
+        /// HTTPS URL of the library index.
+        #[arg(long)]
+        url: String,
+        /// Curator passport fingerprint (the `passport_fpr` on the signed index).
+        #[arg(long)]
+        pubkey_fpr: String,
+        /// Curator public key, hex-encoded (64 lowercase chars).
+        #[arg(long)]
+        pubkey_hex: String,
+        /// Daemon data directory; the cache lands at
+        /// `<data-dir>/studio/library/index.json`.
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Pretty-print the cached library from
+    /// `<data-dir>/studio/library/index.json`. Run `sync` first.
+    ListLibrary {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Install one template by id from the daemon's verified cached library
+    /// index (`POST /v1/studio/library/{id}/install`). Run `sync`, then
+    /// `list-library` to review the entry, before installing.
+    Install {
+        /// Library id exactly as published in the index.
+        id: String,
+        /// Daemon-side index override. Relative paths resolve under the
+        /// daemon's data dir; absolute paths are taken as-is. Defaults to
+        /// `<data-dir>/studio/library/index.json`.
+        #[arg(long)]
+        index_path: Option<PathBuf>,
+        /// Daemon HTTP base URL (defaults to CORECRUXD_HTTP_URL or localhost).
+        #[arg(long)]
+        http_url: Option<String>,
+        /// Bearer token (defaults to CRUX_AGENT_TOKEN).
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1745,7 +1929,7 @@ enum CcxiCommand {
 
 #[derive(Debug, Subcommand)]
 enum ProjectionsCommand {
-    /// Rebuild all projections from genesis (pure replay) and write CCXS snapshots + meta.
+    /// Rebuild all projections from genesis (pure replay) and write CCXSNAP snapshots + meta.
     Rebuild {
         /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
         #[arg(long)]
@@ -1857,6 +2041,24 @@ enum StorageCommand {
         /// Optional node id for ops evidence events (defaults to CORECRUX_NODE_ID/HOSTNAME).
         #[arg(long)]
         node_id: Option<String>,
+    },
+    /// Report (and optionally repair) MANIFEST entries whose segment file is gone.
+    ///
+    /// One dangling entry makes the shard impossible to open, which fails every
+    /// write while reads carry on — see ExecPlan
+    /// `crux-erasure-manifest-repair-2026-08-08`. Repair appends `RemoveSegment`
+    /// tombstones; it never rewrites existing manifest bytes.
+    #[command(name = "repair-manifest")]
+    RepairManifest {
+        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Restrict to one shard. Default scans every shard.
+        #[arg(long)]
+        shard: Option<u32>,
+        /// Append the tombstones. Without this the command only reports.
+        #[arg(long, default_value_t = false)]
+        apply: bool,
     },
 }
 
@@ -2533,12 +2735,16 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             network_exposed,
             json,
         }),
-        Command::Start { url, token } => start::run(start::StartArgs { url, token }),
+        Command::Start { url, token, agent } => {
+            let agent = agent.as_deref().map(agent_wiring::Agent::parse).transpose()?;
+            start::run(start::StartArgs { url, token, agent })
+        }
         Command::Login {
             url,
             token,
             device,
             no_verify,
+            strict_verify,
             no_hooks,
             no_register,
         } => login::run(login::LoginArgs {
@@ -2546,6 +2752,7 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             token,
             device,
             no_verify,
+            strict_verify,
             no_hooks,
             no_register,
         }),
@@ -2683,6 +2890,27 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
             Err("either --pack or --input must be provided".into())
         }
+        Command::VerifyEscrow {
+            daemon,
+            vault_id,
+            token,
+            with_recovery_code,
+            json,
+        } => {
+            let token = token.or_else(|| std::env::var("CORECRUXD_TOKEN").ok());
+            let report = verify_escrow::verify_escrow(&verify_escrow::VerifyEscrowOptions {
+                daemon,
+                vault_id,
+                token,
+                with_recovery_code,
+                json,
+            })?;
+            let code = verify_escrow::render(&report, json);
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Command::VerifyStore {
             data_dir,
             shard,
@@ -2782,6 +3010,17 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     ops_grpc: grpc,
                     ops_scopes: scopes,
                     node_id,
+                })?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
+            StorageCommand::RepairManifest { data_dir, shard, apply } => {
+                let default_dir =
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string());
+                let report = repair_manifest::repair_manifest(&repair_manifest::RepairManifestOptions {
+                    data_dir: data_dir.unwrap_or_else(|| PathBuf::from(default_dir)),
+                    shard,
+                    apply,
                 })?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
@@ -4057,6 +4296,133 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 Ok(())
             }
+            ExtensionsCommand::Install {
+                id,
+                index_path,
+                http_url,
+                token,
+            } => {
+                let body = extensions::install(&extensions::InstallArgs {
+                    id: id.clone(),
+                    http_url,
+                    token,
+                    index_path,
+                })?;
+                println!("Installed {id} from the cached registry index.");
+                println!("  schema:          {}", body["schema"].as_str().unwrap_or("-"));
+                println!("  manifest_sha256: {}", body["manifest_sha256"].as_str().unwrap_or("-"));
+                println!(
+                    "  version:         {}",
+                    body["installed"]["manifest"]["version"].as_str().unwrap_or("-")
+                );
+                println!(
+                    "  trust_tier:      {}",
+                    body["installed"]["trust_tier"].as_str().unwrap_or("-")
+                );
+                println!("  grants:          none yet — POST /v1/extensions/{id}/grants to scope a passport");
+                Ok(())
+            }
+        },
+
+        // ── Central Studio template library (L1/L2) ─────────────────
+        Command::Studio { command } => match command {
+            StudioCommand::Sync {
+                url,
+                pubkey_fpr,
+                pubkey_hex,
+                data_dir,
+            } => {
+                let index = studio::sync(&url, &pubkey_fpr, &pubkey_hex, &data_dir)?;
+                println!("Verified Studio library index from {url}");
+                println!("  curator:        {}", index.curator_passport_fpr);
+                println!("  updated_at_ms:  {}", index.updated_at_unix_ms);
+                println!("  entries:        {}", index.entries.len());
+                println!("  cached at:      {}", studio::cached_index_path(&data_dir).display());
+                for entry in &index.entries {
+                    println!(
+                        "  - {:<32} v{:<10} {:<10} {}",
+                        entry.id,
+                        entry.version,
+                        entry.kind.as_str(),
+                        entry.required_tier_str().unwrap_or("-")
+                    );
+                }
+                Ok(())
+            }
+            StudioCommand::ListLibrary { data_dir } => {
+                let index = studio::list_library(&data_dir)?;
+                let path = studio::cached_index_path(&data_dir);
+                println!("Cached Studio library: {}", path.display());
+                println!("  curator:        {}", index.curator_passport_fpr);
+                println!("  updated_at_ms:  {}", index.updated_at_unix_ms);
+                println!("  entries:        {}", index.entries.len());
+                println!();
+                for entry in &index.entries {
+                    println!("• {} (v{})", entry.name, entry.version);
+                    println!("    id:            {}", entry.id);
+                    println!("    kind:          {}", entry.kind.as_str());
+                    println!("    publisher:     {}", entry.publisher_passport_fpr);
+                    println!("    summary:       {}", entry.summary);
+                    if !entry.tags.is_empty() {
+                        println!("    tags:          {}", entry.tags.join(", "));
+                    }
+                    // Advisory only: the catalog server enforces tiers, the daemon does not.
+                    println!(
+                        "    required_tier: {} (advisory — enforced by the catalog server, not the daemon)",
+                        entry.required_tier_str().unwrap_or("none")
+                    );
+                    if let Some(preview) = &entry.preview {
+                        println!("    preview:       {preview}");
+                    }
+                    if let Some(repo) = &entry.repo_url {
+                        println!("    repo:          {repo}");
+                    }
+                    println!("    pack_url:      {}", entry.pack_url);
+                    println!("    pack_sha256:   {}", entry.pack_sha256);
+                    println!();
+                }
+                Ok(())
+            }
+            StudioCommand::Install {
+                id,
+                index_path,
+                http_url,
+                token,
+            } => {
+                let body = studio::install(&studio::InstallArgs {
+                    id: id.clone(),
+                    http_url,
+                    token,
+                    index_path,
+                })?;
+                println!("Installed {id} from the cached Studio library index.");
+                println!("  schema:          {}", body["schema"].as_str().unwrap_or("-"));
+                println!("  version:         {}", body["version"].as_str().unwrap_or("-"));
+                println!("  pack_sha256:     {}", body["pack_sha256"].as_str().unwrap_or("-"));
+                println!("  signed:          {}", body["signed"].as_bool().unwrap_or(false));
+                println!(
+                    "  required_tier:   {} ({})",
+                    body["required_tier"].as_str().unwrap_or("none"),
+                    body["tier_enforcement"].as_str().unwrap_or("advisory")
+                );
+                for written in body["written"].as_array().unwrap_or(&Vec::new()) {
+                    println!(
+                        "  + {} {} (key {})",
+                        written["artifact"].as_str().unwrap_or("?"),
+                        written["entity"].as_str().unwrap_or("?"),
+                        written["key"].as_str().unwrap_or("?")
+                    );
+                }
+                for remap in body["remaps"].as_array().unwrap_or(&Vec::new()) {
+                    println!(
+                        "  ~ {} id remapped {} -> {} (existing artifact preserved)",
+                        remap["artifact"].as_str().unwrap_or("?"),
+                        remap["from"].as_str().unwrap_or("?"),
+                        remap["to"].as_str().unwrap_or("?")
+                    );
+                }
+                Ok(())
+            }
         },
 
         // ── OpenClaw memory funnel (W3 ICP-1) ───────────────────────
@@ -4190,6 +4556,117 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     Ok(())
                 }
             }
+        }
+
+        Command::AttestCompanions {
+            data_dir,
+            shard,
+            dry_run,
+            force,
+        } => {
+            let data_dir = data_dir
+                .or_else(|| std::env::var("CORECRUXD_DATA_DIR").ok().map(PathBuf::from))
+                .ok_or("attest-companions requires --data-dir or CORECRUXD_DATA_DIR")?;
+            let report = attest_companions::run(&attest_companions::Args {
+                data_dir,
+                shard,
+                dry_run,
+                force,
+            })?;
+            if dry_run {
+                println!("would attest: {}", report.would_attest);
+            } else {
+                println!(
+                    "attested: {} segment(s), {} companion(s) covered",
+                    report.attested, report.companions_covered
+                );
+            }
+            println!("already attested: {}", report.already_attested);
+            println!("no companions (nothing to attest): {}", report.no_companions);
+            // Failures are named, not just counted: a backfill that half-worked
+            // must say which segments are still unstamped.
+            if !report.failed.is_empty() {
+                println!("failed: {}", report.failed.len());
+                for (stem, err) in &report.failed {
+                    println!("  {stem}: {err}");
+                }
+                return Err(format!("{} segment(s) could not be attested", report.failed.len()).into());
+            }
+            Ok(())
+        }
+
+        Command::RebuildCompanions {
+            data_dir,
+            companion_type,
+            model,
+            embedding_url,
+            shard,
+            segment,
+            force,
+            dry_run,
+        } => {
+            let data_dir = data_dir
+                .or_else(|| std::env::var("CORECRUXD_DATA_DIR").ok().map(PathBuf::from))
+                .ok_or("rebuild-companions requires --data-dir or CORECRUXD_DATA_DIR")?;
+            let report = rebuild_companions::run(
+                &rebuild_companions::Args {
+                    data_dir,
+                    companion_type,
+                    model,
+                    embedding_url,
+                    shard,
+                    segment,
+                    force,
+                    dry_run,
+                },
+                |segment| {
+                    // Per-segment, because on a real corpus this runs for hours
+                    // and a summary at the end is not progress.
+                    use corecrux_storage::rebuild::RebuildStatus;
+                    match &segment.status {
+                        RebuildStatus::Rebuilt { vectors, dimensions } => {
+                            println!("  {} rebuilt ({vectors} vectors, dim {dimensions})", segment.stem);
+                        }
+                        RebuildStatus::AlreadyPresent => println!("  {} already present", segment.stem),
+                        RebuildStatus::Skipped { reason } => println!("  {} skipped: {reason}", segment.stem),
+                        RebuildStatus::Failed { error } => println!("  {} FAILED: {error}", segment.stem),
+                    }
+                },
+            )?;
+
+            let rebuild = &report.rebuild;
+            println!("model: {} (key {})", rebuild.model_id, rebuild.model_key);
+            println!("segments scanned: {}", rebuild.segments_scanned);
+            if dry_run {
+                println!("would rebuild: {}", rebuild.rebuilt);
+            } else {
+                println!(
+                    "rebuilt: {} segment(s), {} vector(s)",
+                    rebuild.rebuilt, rebuild.vectors_written
+                );
+                println!("attestations refreshed: {}", report.attestations_refreshed);
+            }
+            println!(
+                "already present (skipped, not re-embedded): {}",
+                rebuild.already_present
+            );
+            println!("skipped, no text payloads: {}", rebuild.skipped);
+            // The credit line. A delegated embedder bills one credit per call,
+            // so this is what the run cost, stated rather than inferred.
+            println!("embedding calls: {}", rebuild.embedding_calls);
+
+            let mut failures = rebuild.failed;
+            if !report.attestation_failures.is_empty() {
+                println!("attestation failures: {}", report.attestation_failures.len());
+                for (stem, err) in &report.attestation_failures {
+                    println!("  {stem}: {err}");
+                }
+                failures += report.attestation_failures.len();
+            }
+            if failures > 0 {
+                return Err(format!("{failures} segment(s) did not complete").into());
+            }
+            Ok(())
         }
 
         // ── identity federation (G4) ───────────────────────────────
@@ -4812,6 +5289,28 @@ mod tests {
     }
 
     // ── CLI parsing: top-level subcommands ──────────────────────────────
+
+    /// `corecruxctl --version` / `-V` must report the crate version.
+    ///
+    /// Regression for the M5 clean-install gap found on 2026-07-30: a fresh
+    /// signed-release install put `corecruxctl` on the box with no way to ask
+    /// which build it was, even though it carries `compaction-sync enable`.
+    /// clap surfaces `--version` as a `DisplayVersion` parse "error".
+    #[test]
+    fn version_flag_reports_the_crate_version() {
+        for flag in ["--version", "-V"] {
+            let err = Cli::try_parse_from(["corecruxctl", flag]).expect_err("--version short-circuits parsing");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayVersion,
+                "{flag} must be a version request, not an unknown-argument error"
+            );
+            assert!(
+                err.to_string().contains(env!("CARGO_PKG_VERSION")),
+                "{flag} must print the crate version, got: {err}"
+            );
+        }
+    }
 
     #[test]
     fn parse_verify_store_defaults() {

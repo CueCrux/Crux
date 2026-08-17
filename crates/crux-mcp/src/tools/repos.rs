@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Repository registry MCP loopback tools.
 
@@ -97,7 +97,14 @@ fn languages(args: &Value) -> Result<Vec<String>, JsonRpcError> {
     Ok(out)
 }
 
-async fn loopback_json(
+/// Proxy one request to the local corecruxd over the loopback surface and
+/// return its parsed JSON body.
+///
+/// Shared with [`super::context_graph`] and [`super::code_intel`] so those MCP
+/// tools are thin adapters over the very same HTTP routes rather than a second
+/// implementation: a divergence between the two surfaces would be a silent
+/// correctness bug.
+pub(super) async fn loopback_json(
     tool: &'static str,
     method: &'static str,
     url: String,
@@ -213,12 +220,21 @@ pub async fn handle_list_repos(args: &Value, ctx: &McpContext) -> Result<Value, 
     loopback_json("list_repos", "GET", url, None, "admin:read").await
 }
 
-fn encode_query(value: &str) -> String {
+/// Percent-encode one query-string value.
+///
+/// Shared with [`super::context_graph`] and [`super::code_intel`] — see
+/// [`loopback_json`].
+///
+/// Encodes UTF-8 *bytes*, not `char`s: `%XX` is a byte escape, so formatting a
+/// multi-byte code point as a single escape would emit an unparseable value.
+/// Reachable with non-ASCII input now that [`super::code_intel`] passes
+/// user-supplied symbol names through here.
+pub(super) fn encode_query(value: &str) -> String {
     value
-        .chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            _ => format!("%{:02X}", c as u32),
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
         })
         .collect()
 }

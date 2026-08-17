@@ -18,8 +18,14 @@ tokio = { workspace = true, features = ["sync", "rt"] }
 corecrux-memory = { path = "../corecrux-memory" }
 
 [dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "rt-multi-thread", "time"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json", "registry"] }
+
+# M2 gate: span-capture overhead (ExecPlan crux-runtime-codemap-2026-07-27).
+[[bench]]
+name = "span_capture"
+harness = false
 
 [lints]
 workspace = true

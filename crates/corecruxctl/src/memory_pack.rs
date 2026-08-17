@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! `corecruxctl memory export|import` — `.cruxpack` memory portability
 //! (ExecPlan `identity-memory-portability-2026-06-11`, G5; spec:
@@ -85,6 +85,11 @@ pub fn render_private_summary(summary: &PrivateSummary) -> String {
     }
     let _ = writeln!(
         out,
+        "  (daemon-control facts: {} — ALWAYS excluded)",
+        summary.protected_excluded
+    );
+    let _ = writeln!(
+        out,
         "  (deleted facts: {} — ALWAYS excluded, no flag overrides erasure)",
         summary.deleted_excluded
     );
@@ -102,7 +107,7 @@ pub fn run_memory_export(
     let store = FactStore::with_persistence(&args.data_dir)?;
     let sessions = SessionStore::with_persistence(&args.data_dir)?;
 
-    let scan = cruxpack::private_summary(&store);
+    let scan = cruxpack::private_summary_for_tenant(&store, &args.tenant);
     if args.include_private && !confirm_include_private(&scan) {
         return Err(MemoryPackError::ConfirmationDeclined);
     }
@@ -294,7 +299,7 @@ mod tests {
             horizon_class: None,
             actor: None,
         });
-        store.delete(&erased.fact_id);
+        store.delete("default", &erased.fact_id);
     }
 
     #[test]

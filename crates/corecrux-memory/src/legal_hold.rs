@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Durable legal holds over the fact store.
 //!
@@ -609,7 +609,7 @@ mod tests {
         assert!(!marked.contains(&held.fact_id));
         assert!(store.get(&held.fact_id).is_some());
 
-        assert!(store.delete(&held.fact_id));
+        assert!(store.delete(&held.tenant_hash, &held.fact_id));
         let err = store.compact_journal().unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(err.to_string().contains(&placed.hold.hold_id));
@@ -624,7 +624,7 @@ mod tests {
         let hold_id = "lh_unparsable_only";
         let malformed = store.store(malformed_hold_state("tenant-a", hold_id));
         assert_eq!(malformed.version, 1);
-        assert!(store.delete(&malformed.fact_id));
+        assert!(store.delete(&malformed.tenant_hash, &malformed.fact_id));
 
         let marker = store.legal_hold(hold_id).unwrap();
         assert_eq!(marker.hold_id, hold_id);
@@ -639,7 +639,7 @@ mod tests {
         assert!(!marked.contains(&held.fact_id));
         assert!(marked.contains(&other_tenant.fact_id));
 
-        assert!(store.delete(&held.fact_id));
+        assert!(store.delete(&held.tenant_hash, &held.fact_id));
         let err = store.compact_journal().unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(err.to_string().contains(hold_id));
@@ -660,7 +660,7 @@ mod tests {
         let state_fact_id = store.get_by_entity(&format!("{LEGAL_HOLD_ENTITY_PREFIX}{}", placed.hold.hold_id))[0]
             .fact_id
             .clone();
-        assert!(store.delete(&state_fact_id));
+        assert!(store.delete("tenant-a", &state_fact_id));
 
         assert_eq!(store.legal_hold(&placed.hold.hold_id), Some(placed.hold.clone()));
         assert_eq!(
@@ -685,7 +685,7 @@ mod tests {
                 actor: None,
             })
             .unwrap();
-        assert!(store.delete(&held.fact_id));
+        assert!(store.delete(&held.tenant_hash, &held.fact_id));
 
         let err = store.compact_journal().unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);

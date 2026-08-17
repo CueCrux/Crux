@@ -1,5 +1,5 @@
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 #
 # Supply-chain egress probe (ExecPlan crux-supply-chain-attestation-2026-06-11, M1).
 #
@@ -37,7 +37,7 @@ permissions:
 jobs:
   probe:
     name: Probe Sigstore + Trivy egress (self-hosted)
-    runs-on: [self-hosted, ci]
+    runs-on: [self-hosted, ci, Linux]
     timeout-minutes: 5
     steps:
       - name: Probe endpoints

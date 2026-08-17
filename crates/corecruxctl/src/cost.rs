@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! `corecruxctl session cost` — the **token-burn cost lens**.
 //!
@@ -383,6 +383,8 @@ fn render_table(r: &CostReport) -> String {
         fmt_k(r.measured.output)
     );
 
+    out.push_str(&render_model_axis(r));
+
     if !r.buckets.is_empty() {
         out.push_str("\n  Where it goes (carried context):\n");
         for b in &r.buckets {
@@ -428,6 +430,95 @@ fn render_table(r: &CostReport) -> String {
         }
     }
     out
+}
+
+/// The model/effort axis: which model, at which effort, burned the context.
+///
+/// Two rules this function exists to enforce, both about not misleading the
+/// reader rather than about arithmetic:
+///
+/// * **Every effort figure is printed with its coverage.** `effort` is absent on
+///   61% of the measured corpus and its absence correlates with model (100% /
+///   100% / 22.5% / 9.4%), so a bare per-effort number invites a cross-model
+///   comparison that is confounded at source. The coverage line says how much of
+///   that model's burn the effort rows actually account for.
+/// * **`<synthetic>` is not a model.** Shown on its own line, never ranked
+///   alongside real ones, so it can neither be charted nor silently dropped.
+fn render_model_axis(r: &CostReport) -> String {
+    use std::fmt::Write as _;
+    let Some(b) = r.breakdown.as_ref() else {
+        return String::new();
+    };
+    if b.models.is_empty() && b.synthetic.is_none() {
+        return String::new();
+    }
+    let mut out = String::from("\n  Which model burned it:\n");
+    for m in &b.models {
+        let pct = pct_of(m.context_total, r.headline.measured_context_total);
+        let _ = writeln!(
+            out,
+            "    {:<22} {} {:>4.0}%  {:>7}  {} turn{}",
+            m.model,
+            bar(pct),
+            pct,
+            fmt_k(m.context_total),
+            m.turns,
+            if m.turns == 1 { "" } else { "s" }
+        );
+        if m.efforts.is_empty() {
+            let _ = writeln!(out, "      effort: not recorded on any of these turns (0% coverage)");
+            continue;
+        }
+        let efforts = m
+            .efforts
+            .iter()
+            .map(|e| format!("{} {} ({} turns)", e.effort, fmt_k(e.context_total), e.turns))
+            .collect::<Vec<_>>()
+            .join("  ·  ");
+        let _ = writeln!(out, "      effort: {efforts}");
+        let _ = writeln!(
+            out,
+            "      \u{2514} {:.0}% effort coverage on this model — the rows above cover {} of its {} burn{}",
+            m.effort_coverage_pct,
+            fmt_k(m.efforts.iter().map(|e| e.context_total).sum::<u64>()),
+            fmt_k(m.context_total),
+            if m.effort_coverage_pct < 100.0 {
+                "; do not compare this against another model's effort"
+            } else {
+                ""
+            }
+        );
+    }
+    if let Some(s) = &b.synthetic {
+        let _ = writeln!(
+            out,
+            "    {:<22} {} turns, {} \u{2014} generated records, not a model (excluded above)",
+            s.model,
+            s.turns,
+            fmt_k(s.context_total)
+        );
+    }
+    if b.unattributed_context > 0 {
+        let _ = writeln!(
+            out,
+            "    {:<22} {} \u{2014} records with usage but no model id",
+            "(unattributed)",
+            fmt_k(b.unattributed_context)
+        );
+    }
+    out
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "token counts are < 2^53, exactly representable in f64"
+)]
+fn pct_of(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
+        0.0
+    } else {
+        100.0 * part as f64 / whole as f64
+    }
 }
 
 fn block_offender(r: &CostReport, coarse: &str) -> Option<String> {
@@ -517,6 +608,39 @@ mod tests {
         assert!(table.contains("Where it goes"));
         assert!(table.contains("What you can do") || table.contains("already lean"));
         assert!(table.contains("session_prefix"));
+    }
+
+    /// Gate 2 for the CLI surface: an effort number may never appear without
+    /// the coverage figure that qualifies it. This is a publishing hazard — it
+    /// will not fail any arithmetic test — so it gets its own assertion.
+    #[test]
+    fn every_effort_figure_is_rendered_with_its_coverage() {
+        let lines = [
+            r#"{"type":"assistant","sessionId":"s","effort":"xhigh","message":{"role":"assistant","model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":900},"content":[{"type":"text","text":"a"}]}}"#,
+            // Same model, second turn with NO effort → 50% coverage.
+            r#"{"type":"assistant","sessionId":"s","message":{"role":"assistant","model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":90},"content":[{"type":"text","text":"b"}]}}"#,
+            r#"{"type":"assistant","sessionId":"s","message":{"role":"assistant","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":5},"content":[{"type":"text","text":"c"}]}}"#,
+        ];
+        let r = crux_cost::analyze_str(&lines.join("\n"), "s.jsonl");
+        let table = render_table(&r);
+        assert!(table.contains("Which model burned it"));
+        assert!(table.contains("claude-opus-5"));
+        assert!(table.contains("xhigh"), "effort must be shown");
+        assert!(table.contains("effort coverage"), "…and never without its coverage");
+        assert!(
+            table.contains("do not compare this against another model"),
+            "sub-100% coverage must carry the confounding warning"
+        );
+        // `<synthetic>` appears, but named as not-a-model.
+        assert!(table.contains("not a model"));
+    }
+
+    #[test]
+    fn model_axis_is_absent_from_a_legacy_transcript() {
+        // No model on any record → no breakdown → no section at all, rather
+        // than an empty card implying "we looked and there was nothing".
+        let table = render_table(&fixture_report());
+        assert!(!table.contains("Which model burned it"));
     }
 
     #[test]

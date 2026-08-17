@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Read-time attribution of session **token-burn** cost reports to ExecPlans.
 //!
@@ -641,6 +641,7 @@ mod tests {
             superseded_by: None,
             depends_on: Vec::new(),
             extended_by: Vec::new(),
+            blocked_by: Vec::new(),
             open_decisions: Vec::new(),
             orchestrator_id: None,
             milestones_done: None,
@@ -673,6 +674,11 @@ mod tests {
                 started_at: Some(started.to_string()),
                 ended_at: Some(ended.to_string()),
                 execplan_slugs: Vec::new(),
+                model: None,
+                effort: None,
+                cwd: None,
+                git_branch: None,
+                breakdown: None,
                 headline: crux_cost::Headline {
                     assistant_turns: 10,
                     tasks: 2,

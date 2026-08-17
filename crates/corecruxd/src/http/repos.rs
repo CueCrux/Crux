@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! HTTP CRUD for tenant-scoped repository registrations.
 
@@ -61,8 +61,22 @@ pub(crate) struct RepoScanJob {
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub(super) struct RepoTenantQuery {
+pub(crate) struct RepoTenantQuery {
     pub tenant_id: String,
+}
+
+/// Query for the read-only allowance report.
+///
+/// `seats` and `packs` are supplied by the caller because neither is sourced from
+/// a subscription yet — that arrives with the entitlement work. Defaulting seats
+/// to one is the honest reading of "not known", not a claim about the account.
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct RepoAllowanceQuery {
+    pub tenant_id: String,
+    #[serde(default)]
+    pub seats: Option<u32>,
+    #[serde(default)]
+    pub packs: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -114,6 +128,7 @@ fn map_registry_error(err: crate::repo_registry::RepoRegistryError) -> axum::res
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_repo(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -235,9 +250,29 @@ pub(super) async fn post_repo(
         watcher.start_repo(registration.clone()).await;
     }
 
+    // M4 soft cap. Registration is NEVER refused for being over allowance: the
+    // allowance is a commercial limit, and turning it into a technical one would
+    // break a paying customer mid-sprint over a billing question. The overage is
+    // reported on the response that created it, so the signal arrives at the
+    // moment it becomes true rather than waiting to be polled.
+    //
+    // Computed at default seats/packs because neither is sourced from a
+    // subscription yet (see repo_allowance docs); `basis` says so on the wire
+    // rather than letting a caller mistake the default for the account's real
+    // entitlement.
+    let allowance = {
+        let store = state.fact_store.read().await;
+        crate::repo_allowance::allowance_for_tenant(&store, &tenant_id, 1, 0)
+    };
+
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "repo": registration, "note": note })),
+        Json(serde_json::json!({
+            "repo": registration,
+            "note": note,
+            "allowance": allowance,
+            "allowance_basis": "default seats=1 packs=0; not yet sourced from a subscription",
+        })),
     )
         .into_response()
 }
@@ -568,6 +603,7 @@ fn repo_scan_test_hook(repo_id: &str) -> Option<RepoScanTestOutcome> {
     })
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_repos(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -583,6 +619,28 @@ pub(super) async fn get_repos(
     (StatusCode::OK, Json(serde_json::json!({ "repos": repos }))).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_repo_allowance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RepoAllowanceQuery>,
+) -> impl IntoResponse {
+    let tenant_id = query.tenant_id.trim().to_string();
+    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &tenant_id) {
+        return problem.into_response();
+    }
+    let store = state.fact_store.read().await;
+    let allowance = crate::repo_allowance::allowance_for_tenant(
+        &store,
+        &tenant_id,
+        query.seats.unwrap_or(1),
+        query.packs.unwrap_or(0),
+    );
+    drop(store);
+    (StatusCode::OK, Json(serde_json::json!(allowance))).into_response()
+}
+
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_repo_scan_job(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -603,6 +661,7 @@ pub(super) async fn get_repo_scan_job(
 /// `GET /v1/repos/dependents` — daemon-owned package reverse-dependency
 /// lookup. Version requirements are returned as raw manifest strings only;
 /// version range semantics and filtering live in upstream clients/proxies.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_repo_dependents(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -725,6 +784,7 @@ fn repo_reverse_map(id_store: &crate::repo_codegraph::CodeGraphIdStore) -> BTree
         .collect()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_repo(
     State(state): State<AppState>,
     Path(repo_id): Path<String>,
@@ -753,10 +813,117 @@ pub(super) struct CodemapQuery {
     pub format: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct SymbolResolveQuery {
+    pub tenant_id: String,
+    /// Repo-relative path, exactly as `tracing::Metadata::file()` reports it.
+    pub file: String,
+    /// Symbol name. For `#[tracing::instrument]` spans this is the span name,
+    /// which defaults to the function name.
+    pub name: String,
+    /// Callsite line, when known. Optional because it is only needed to break
+    /// `(file, name)` collisions — 2.02% of symbols in the Crux workspace.
+    #[serde(default)]
+    pub line: Option<usize>,
+    /// Optional `fn` / `struct` / `enum` / … pre-filter.
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+/// `GET /v1/repos/{repo_id}/symbols/resolve` — map a `(file, name[, line])`
+/// callsite onto a stable `symbol_id`.
+///
+/// This is the runtime→static join the span layer (M2) depends on. It answers
+/// with an explicit confidence and **never guesses**: an unresolvable collision
+/// returns `confidence: "ambiguous"` with the candidate list, because
+/// mis-attributing a trace to the wrong symbol corrupts silently.
+///
+/// `404` means no symbol of that name exists in that file — a genuine miss,
+/// distinct from an ambiguous match, which is `200`.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_symbol_resolve(
+    State(state): State<AppState>,
+    Path(repo_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<SymbolResolveQuery>,
+) -> impl IntoResponse {
+    let tenant_id = query.tenant_id.trim().to_string();
+    let scope = match require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &tenant_id) {
+        Ok(scope) => scope,
+        Err(problem) => return problem.into_response(),
+    };
+
+    let store = state.fact_store.read().await;
+    if crate::repo_registry::get_repo(&store, &tenant_id, &repo_id).is_none() {
+        drop(store);
+        return problem_response(StatusCode::NOT_FOUND, "repo not found");
+    }
+    let scan_json = crate::repo_registry::load_scan_json(&store, &scope, &repo_id);
+    drop(store);
+
+    let Some(scan_json) = scan_json else {
+        return problem_response(
+            StatusCode::NOT_FOUND,
+            "no scan persisted for this repo. Register with root_path (POST /v1/repos) to run a scan.",
+        );
+    };
+    let scan: crate::workspace_scan::WorkspaceScan = match serde_json::from_str(&scan_json) {
+        Ok(scan) => scan,
+        Err(err) => {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("persisted scan failed to decode: {err}"),
+            )
+        }
+    };
+
+    let resolver = crate::symbol_resolve::SymbolResolver::from_scan(&scan);
+    if resolver.is_empty() {
+        // Distinguish "this scan indexed nothing" from "that symbol isn't here";
+        // otherwise an empty scan looks like a repo full of missing symbols.
+        return problem_response(
+            StatusCode::CONFLICT,
+            "the persisted scan contains no symbols; re-scan the repo before resolving callsites",
+        );
+    }
+    let Some(resolution) = resolver.resolve(&query.file, &query.name, query.line, query.kind.as_deref()) else {
+        return problem_response(
+            StatusCode::NOT_FOUND,
+            format!("no symbol named '{}' in '{}'", query.name, query.file),
+        );
+    };
+
+    let symbol = resolution.symbol_id().and_then(|id| resolver.get(id));
+    let clusters = resolver.collision_clusters().len();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "repo_id": repo_id,
+            "tenant_id": tenant_id,
+            "query": {
+                "file": query.file,
+                "name": query.name,
+                "line": query.line,
+                "kind": query.kind,
+            },
+            "resolution": resolution,
+            "symbol": symbol,
+            // How ambiguous this repo is overall — lets a caller judge how much
+            // to trust joins here without a second round trip.
+            "index": {
+                "symbols": resolver.len(),
+                "collision_clusters": clusters,
+            },
+        })),
+    )
+        .into_response()
+}
+
 /// `GET /v1/repos/{repo_id}/codemap` — serve the AST-derived code map the
 /// daemon persisted when the repo was registered (or last re-indexed by the
 /// watch loop). This is the read side of the `POST /v1/repos` scan: same
 /// tenant scoping, same auth as the sibling repo reads.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_repo_codemap(
     State(state): State<AppState>,
     Path(repo_id): Path<String>,
@@ -764,9 +931,10 @@ pub(super) async fn get_repo_codemap(
     Query(query): Query<CodemapQuery>,
 ) -> impl IntoResponse {
     let tenant_id = query.tenant_id.trim().to_string();
-    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &tenant_id) {
-        return problem.into_response();
-    }
+    let scope = match require_http_scopes_for_tenant(&state.auth, &headers, &["admin:read"], &tenant_id) {
+        Ok(scope) => scope,
+        Err(problem) => return problem.into_response(),
+    };
     let format = query.format.as_deref().unwrap_or("summary");
     if !matches!(format, "summary" | "full") {
         return problem_response(
@@ -780,7 +948,7 @@ pub(super) async fn get_repo_codemap(
         drop(store);
         return problem_response(StatusCode::NOT_FOUND, "repo not found");
     };
-    let scan_json = crate::repo_registry::load_scan_json(&store, &tenant_id, &repo_id);
+    let scan_json = crate::repo_registry::load_scan_json(&store, &scope, &repo_id);
     drop(store);
 
     let Some(scan_json) = scan_json else {
@@ -852,6 +1020,7 @@ pub(super) async fn get_repo_codemap(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_repo(
     State(state): State<AppState>,
     Path(repo_id): Path<String>,

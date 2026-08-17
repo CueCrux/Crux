@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Pro GPU-1 compute bridge.
 //!
@@ -317,6 +317,7 @@ pub(super) fn compute_posture(state: &AppState) -> Gpu1ComputeContract {
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_gpu1_contract(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["admin:read", "query:read"]) {
         return problem.into_response();
@@ -324,6 +325,7 @@ pub(super) async fn get_gpu1_contract(State(state): State<AppState>, headers: He
     Json(compute_posture(&state)).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_gpu1_answer(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -348,6 +350,7 @@ pub(super) async fn post_gpu1_answer(
     .await
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_gpu1_rerank(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -388,6 +391,7 @@ pub(super) async fn post_gpu1_rerank(
     .await
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_gpu1_enrich(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -414,6 +418,7 @@ pub(super) async fn post_gpu1_enrich(
     .await
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_gpu1_coverage(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -434,6 +439,7 @@ pub(super) async fn post_gpu1_coverage(
     .await
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_gpu1_developer(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1438,7 +1444,9 @@ mod credit_meter_tests {
             now.saturating_add(3600),
             |hash| signing_key.sign_hash(hash),
         );
-        state.rcx_router = Some(std::sync::Arc::new(crux_router::RcxRouter::new(token)));
+        state.rcx_router = Some(std::sync::Arc::new(
+            crux_router::RcxRouter::new_with_trusted_issuer_pubkey(token, signing_key.verifying_key_bytes()),
+        ));
 
         let mut meter = crate::credit_meter::CreditMeterStore::open(state.data_dir.join("credit-meter.jsonl"))
             .expect("open credit meter");
@@ -1731,17 +1739,20 @@ mod credit_meter_tests {
         let _env = Gpu1EnvGuard::clear();
         let mut state = metered_rerank_state(10);
         let now = current_unix_seconds();
-        state.rcx_router = Some(std::sync::Arc::new(crux_router::RcxRouter::new(
-            crux_router::mint_free_local_token(
-                "p_free_test",
-                "daemon-test",
-                "tenant-a",
-                vec!["corecrux.query.local".to_string()],
-                now.saturating_sub(60),
-                now.saturating_add(3600),
-                [0_u8; 64],
+        state.rcx_router = Some(std::sync::Arc::new(
+            crux_router::RcxRouter::new_with_trusted_issuer_pubkey(
+                crux_router::mint_free_local_token(
+                    "p_free_test",
+                    "daemon-test",
+                    "tenant-a",
+                    vec!["corecrux.query.local".to_string()],
+                    now.saturating_sub(60),
+                    now.saturating_add(3600),
+                    [0_u8; 64],
+                ),
+                [0_u8; 32],
             ),
-        )));
+        ));
         let shared = state.clone();
 
         let response = post_gpu1_rerank(
@@ -1754,7 +1765,10 @@ mod credit_meter_tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let body = body_json(response).await;
         assert_eq!(body["type"], "https://errors.cuecrux.com/rcx-lane-denied");
-        assert_eq!(body["reason_code"], "denied:capability_not_permitted");
+        // The free/local token is unsigned, so under the trusted-issuer router it
+        // fails issuer verification (not rcx-verified) before the lane-capability
+        // check — the metered lane is refused without reserving credits either way.
+        assert_eq!(body["reason_code"], "denied:token_invalid");
         let meter = shared
             .credit_meter
             .as_ref()
@@ -1903,19 +1917,22 @@ mod credit_meter_tests {
         let signing_key =
             crux_session::LocalPassportKey::from_path(&state.passport_key_path).expect("load test signing key");
         let now = current_unix_seconds();
-        state.rcx_router = Some(std::sync::Arc::new(crux_router::RcxRouter::new(
-            crux_router::mint_signed_paid_local_token(
-                signing_key.passport_fpr().to_string(),
-                "daemon-test",
-                "tenant-a",
-                Vec::new(),
-                2,
-                7,
-                now.saturating_sub(60),
-                now.saturating_add(3600),
-                |hash| signing_key.sign_hash(hash),
+        state.rcx_router = Some(std::sync::Arc::new(
+            crux_router::RcxRouter::new_with_trusted_issuer_pubkey(
+                crux_router::mint_signed_paid_local_token(
+                    signing_key.passport_fpr().to_string(),
+                    "daemon-test",
+                    "tenant-a",
+                    Vec::new(),
+                    2,
+                    7,
+                    now.saturating_sub(60),
+                    now.saturating_add(3600),
+                    |hash| signing_key.sign_hash(hash),
+                ),
+                signing_key.verifying_key_bytes(),
             ),
-        )));
+        ));
         let meter_path = state.data_dir.join("credit-meter.jsonl");
         let expected_quote = quote("router-insufficient");
 

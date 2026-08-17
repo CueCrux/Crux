@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 #
 # Crux daemon installer.
 #
@@ -17,8 +17,8 @@
 #   └─────────────────────────────────────────────────────────────────┘
 #
 # What it does (and nothing else):
-#   - downloads the crux + corecruxctl binaries for your platform from the
-#     pinned GitHub Release,
+#   - downloads the crux, corecruxctl, and crux-hook binaries for your platform
+#     from the pinned GitHub Release,
 #   - VERIFIES their cosign keyless signatures before installing (hard
 #     requirement — there is no skip flag),
 #   - installs them into PREFIX/bin (default: ~/.local),
@@ -91,7 +91,11 @@ esac
 # ── uninstall ───────────────────────────────────────────────────────────────
 if [ "$UNINSTALL" -eq 1 ]; then
   echo "Removing binaries from ${BIN_DIR} ..."
-  rm -f "${BIN_DIR}/crux" "${BIN_DIR}/corecruxd" "${BIN_DIR}/corecruxctl"
+  rm -f \
+    "${BIN_DIR}/crux" \
+    "${BIN_DIR}/corecruxd" \
+    "${BIN_DIR}/corecruxctl" \
+    "${BIN_DIR}/crux-hook"
   if [ "$OS" = "Linux" ]; then
     UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/crux.service"
     if [ -f "$UNIT" ]; then
@@ -168,7 +172,7 @@ verify() {
          exit 1; }
 }
 
-for artifact in "crux-${SUFFIX}" "corecruxctl-${SUFFIX}"; do
+for artifact in "crux-${SUFFIX}" "corecruxctl-${SUFFIX}" "crux-hook-${SUFFIX}"; do
   fetch "${artifact}"
   fetch "${artifact}.sig"
   fetch "${artifact}.pem"
@@ -179,6 +183,7 @@ done
 mkdir -p "${BIN_DIR}"
 install -m 0755 "${WORK}/crux-${SUFFIX}" "${BIN_DIR}/crux"
 install -m 0755 "${WORK}/corecruxctl-${SUFFIX}" "${BIN_DIR}/corecruxctl"
+install -m 0755 "${WORK}/crux-hook-${SUFFIX}" "${BIN_DIR}/crux-hook"
 # Same binary, service-manager-friendly name (matches release artifact set).
 ln -sf "${BIN_DIR}/crux" "${BIN_DIR}/corecruxd"
 
@@ -200,6 +205,7 @@ After=network.target
 ExecStart=${BIN_DIR}/corecruxd
 Environment=CORECRUXD_DATA_DIR=${DATA_DIR}
 Environment=CORECRUXD_AUTH_MODE=dev_scopes
+Environment=CORECRUXD_ROUTE_AUTH=enforce
 # Binary installs have no git checkout to compare against; keep the
 # no-phone-home posture explicit.
 Environment=CORECRUXD_UPDATE_CHECK_ENABLED=0
@@ -226,6 +232,7 @@ EOF
   <dict>
     <key>CORECRUXD_DATA_DIR</key><string>${DATA_DIR}</string>
     <key>CORECRUXD_AUTH_MODE</key><string>dev_scopes</string>
+    <key>CORECRUXD_ROUTE_AUTH</key><string>enforce</string>
     <key>CORECRUXD_UPDATE_CHECK_ENABLED</key><string>0</string>
   </dict>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
@@ -243,6 +250,7 @@ echo "Installed:"
 echo "  ${BIN_DIR}/crux          (the daemon)"
 echo "  ${BIN_DIR}/corecruxd     (same binary, service-manager name)"
 echo "  ${BIN_DIR}/corecruxctl   (admin CLI)"
+echo "  ${BIN_DIR}/crux-hook     (agent lifecycle hooks)"
 echo "  ${DATA_DIR}              (data dir, 0700)"
 case ":${PATH}:" in
   *":${BIN_DIR}:"*) : ;;
@@ -255,7 +263,7 @@ if [ "$WITH_SERVICE" -eq 1 ]; then
   echo "       ${SERVICE_HINT}"
 else
   echo "  1. Start the daemon:"
-  echo "       CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR='${DATA_DIR}' '${BIN_DIR}/crux'"
+  echo "       CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_ROUTE_AUTH=enforce CORECRUXD_DATA_DIR='${DATA_DIR}' '${BIN_DIR}/crux'"
 fi
 echo "  2. Open the console:    http://127.0.0.1:14800"
 echo "  3. Guided first fact:   '${BIN_DIR}/corecruxctl' quickstart"

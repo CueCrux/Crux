@@ -7,10 +7,10 @@ license.workspace = true
 description = "Daemon-side RCX Capability Token router primitives."
 
 [dependencies]
+ed25519-dalek = { workspace = true, features = ["std"] }
 rcx-capability-token = { path = "../rcx-capability-token" }
 
 [dev-dependencies]
-ed25519-dalek = { workspace = true, features = ["std"] }
 hex = { workspace = true }
 
 [lints]

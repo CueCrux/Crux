@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Per-passport grants for community extensions (M3 of the
 //! community-extensions ExecPlan).
@@ -28,7 +28,11 @@
 //!    in the same query is essentially free.
 
 use corecrux_memory::fact_store::{FactQuery, FactStore, StoreFact};
+use crux_integrations::{
+    append_audit_event, IntegrationAuditEvent, AUDIT_EXTENSION_GRANT_ADDED, AUDIT_EXTENSION_GRANT_REMOVED,
+};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 pub const GRANT_ENTITY_PREFIX: &str = "__extension_grant__";
 pub const GRANT_RECORD_KEY: &str = "record";
@@ -86,36 +90,7 @@ pub struct ExtensionGrant {
 /// authoritative regardless of grant; checking here means we surface the
 /// rejection at issue time instead of silently dropping writes at dispatch.
 fn is_prefix_grantable(prefix: &str) -> bool {
-    // Identical to the daemon's default-private list. Kept inline rather
-    // than imported from `fact_privacy` because that module is private.
-    const RESERVED: &[&str] = &[
-        "__ax__::",
-        "__ax_session::",
-        "__constraints__::",
-        "__project_layer__::",
-        "__plane__::",
-        "__plane_layer__::",
-        "__workspace__::",
-        "__workspace_scan__::",
-        "__repo_registry__::",
-        "__repo_scan__::",
-        "__repo_codegraph_ids__::",
-        "__repo_extdeps__::",
-        "__storybook__::",
-        "__dossier__::",
-        "__project_repo_link__::",
-        "__extension__::",
-        "__extension_grant__::",
-        "__work__::",
-        "__work_transition__::",
-        "__passport__::",
-        "__mint_request__::",
-        "__bootstrap__::",
-        "__project__::",
-        "decisions::",
-        "github::",
-    ];
-    !RESERVED.iter().any(|reserved| prefix.starts_with(reserved))
+    crate::fact_privacy::private_scope_intersection(prefix).is_none()
 }
 
 fn validate_extension_id(id: &str) -> Result<(), GrantError> {
@@ -150,7 +125,9 @@ pub struct IssueGrantInput {
 /// `extension_installed=false` flips the call into a clean error.
 pub fn issue_grant(
     store: &mut FactStore,
+    data_dir: impl AsRef<Path>,
     extension_installed: bool,
+    extension_version: Option<&str>,
     input: IssueGrantInput,
     now_unix_ms: u64,
 ) -> Result<ExtensionGrant, GrantError> {
@@ -198,13 +175,38 @@ pub fn issue_grant(
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);
+    append_audit_event(
+        data_dir,
+        &IntegrationAuditEvent::extension(
+            now_unix_ms,
+            AUDIT_EXTENSION_GRANT_ADDED,
+            grant.granted_by_passport.as_deref(),
+            &grant.extension_id,
+            extension_version,
+            "added",
+            serde_json::json!({
+                "passport_fpr": grant.passport_fpr,
+                "allowed_tool_names": grant.allowed_tool_names,
+                "allowed_prefixes_read": grant.allowed_prefixes_read,
+                "allowed_prefixes_write": grant.allowed_prefixes_write,
+                "rate_limit_per_min": grant.rate_limit_per_min,
+            }),
+        ),
+    );
     Ok(grant)
 }
 
-pub fn revoke_grant(store: &mut FactStore, extension_id: &str, passport_fpr: &str) -> Result<(), GrantError> {
-    if get_grant(store, extension_id, passport_fpr).is_none() {
-        return Err(GrantError::NotFound(extension_id.to_string(), passport_fpr.to_string()));
-    }
+pub fn revoke_grant(
+    store: &mut FactStore,
+    data_dir: impl AsRef<Path>,
+    extension_id: &str,
+    extension_version: Option<&str>,
+    passport_fpr: &str,
+    revoked_by_passport: Option<&str>,
+    now_unix_ms: u64,
+) -> Result<(), GrantError> {
+    let grant = get_grant(store, extension_id, passport_fpr)
+        .ok_or_else(|| GrantError::NotFound(extension_id.to_string(), passport_fpr.to_string()))?;
     let mut sf = StoreFact {
         tenant_hash: "default".to_string(),
         entity: entity_for(extension_id, passport_fpr),
@@ -218,6 +220,24 @@ pub fn revoke_grant(store: &mut FactStore, extension_id: &str, passport_fpr: &st
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);
+    append_audit_event(
+        data_dir,
+        &IntegrationAuditEvent::extension(
+            now_unix_ms,
+            AUDIT_EXTENSION_GRANT_REMOVED,
+            revoked_by_passport,
+            extension_id,
+            extension_version,
+            "removed",
+            serde_json::json!({
+                "passport_fpr": grant.passport_fpr,
+                "allowed_tool_names": grant.allowed_tool_names,
+                "allowed_prefixes_read": grant.allowed_prefixes_read,
+                "allowed_prefixes_write": grant.allowed_prefixes_write,
+                "rate_limit_per_min": grant.rate_limit_per_min,
+            }),
+        ),
+    );
     Ok(())
 }
 
@@ -232,9 +252,9 @@ pub fn list_grants_for_extension(store: &FactStore, extension_id: &str) -> Vec<E
     let result = store.query(&FactQuery {
         min_effective_confidence: None,
         tenant_hash: None,
-        query: Some(prefix.clone()),
+        query: None,
         entity: None,
-        entity_prefix: None,
+        entity_prefix: Some(prefix.clone()),
         top_k: 500,
         token_budget: None,
     });
@@ -259,9 +279,9 @@ pub fn list_grants_for_passport(store: &FactStore, passport_fpr: &str) -> Vec<Ex
     let result = store.query(&FactQuery {
         min_effective_confidence: None,
         tenant_hash: None,
-        query: Some(prefix.clone()),
+        query: None,
         entity: None,
-        entity_prefix: None,
+        entity_prefix: Some(prefix.clone()),
         top_k: 5_000,
         token_budget: None,
     });
@@ -298,50 +318,90 @@ mod tests {
 
     #[test]
     fn issue_then_get_then_revoke() {
+        let dir = tempfile::tempdir().expect("tempdir");
         let mut s = store();
-        let g = issue_grant(&mut s, true, input("ext.example.quote", "p_alice"), 1).expect("issue");
+        let g = issue_grant(
+            &mut s,
+            dir.path(),
+            true,
+            Some("0.1.0"),
+            input("ext.example.quote", "p_alice"),
+            1,
+        )
+        .expect("issue");
         assert_eq!(g.extension_id, "ext.example.quote");
         assert_eq!(g.rate_limit_per_min, Some(30));
 
         let got = get_grant(&s, "ext.example.quote", "p_alice").expect("get");
         assert_eq!(got.granted_by_passport.as_deref(), Some("agent-claude"));
 
-        revoke_grant(&mut s, "ext.example.quote", "p_alice").expect("revoke");
+        revoke_grant(
+            &mut s,
+            dir.path(),
+            "ext.example.quote",
+            Some("0.1.0"),
+            "p_alice",
+            Some("operator-passport"),
+            2,
+        )
+        .expect("revoke");
         assert!(get_grant(&s, "ext.example.quote", "p_alice").is_none());
+
+        let audit = crux_integrations::read_audit_tail(dir.path(), 50).expect("audit");
+        assert_eq!(audit.len(), 2);
+        assert_eq!(audit[0].action, AUDIT_EXTENSION_GRANT_ADDED);
+        assert_eq!(audit[0].actor, "agent-claude");
+        assert_eq!(audit[1].action, AUDIT_EXTENSION_GRANT_REMOVED);
+        assert_eq!(audit[1].actor, "operator-passport");
     }
 
     #[test]
     fn rejects_extension_not_installed() {
+        let dir = tempfile::tempdir().expect("tempdir");
         let mut s = store();
-        let err = issue_grant(&mut s, false, input("ext.example.quote", "p_alice"), 1).expect_err("not installed");
+        let err = issue_grant(
+            &mut s,
+            dir.path(),
+            false,
+            None,
+            input("ext.example.quote", "p_alice"),
+            1,
+        )
+        .expect_err("not installed");
         assert!(matches!(err, GrantError::ExtensionNotInstalled(_)));
     }
 
     #[test]
     fn rejects_duplicate_grant() {
+        let dir = tempfile::tempdir().expect("tempdir");
         let mut s = store();
-        issue_grant(&mut s, true, input("ext.example.quote", "p_alice"), 1).expect("first");
-        let err = issue_grant(&mut s, true, input("ext.example.quote", "p_alice"), 2).expect_err("dup");
+        issue_grant(&mut s, dir.path(), true, None, input("ext.example.quote", "p_alice"), 1).expect("first");
+        let err =
+            issue_grant(&mut s, dir.path(), true, None, input("ext.example.quote", "p_alice"), 2).expect_err("dup");
         assert!(matches!(err, GrantError::AlreadyGranted(_, _)));
     }
 
     #[test]
-    fn rejects_privacy_gated_prefix_in_grant() {
-        let mut s = store();
-        let mut bad = input("ext.example.quote", "p_alice");
-        bad.allowed_prefixes_write.push("__ax__::".to_string());
-        let err = issue_grant(&mut s, true, bad, 1).expect_err("forbidden");
-        match err {
-            GrantError::PrefixForbidden(p) => assert!(p.starts_with("__ax__::")),
-            other => panic!("unexpected error: {other}"),
+    fn rejects_exact_child_and_parent_scopes_intersecting_private_namespaces() {
+        for forbidden in ["__ax__::", "__ax__::child", "__", "github::owner/repo"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut s = store();
+            let mut bad = input("ext.example.quote", "p_alice");
+            bad.allowed_prefixes_write.push(forbidden.to_string());
+            let err = issue_grant(&mut s, dir.path(), true, None, bad, 1).expect_err("forbidden");
+            match err {
+                GrantError::PrefixForbidden(p) => assert_eq!(p, forbidden),
+                other => panic!("unexpected error: {other}"),
+            }
         }
     }
 
     #[test]
     fn list_for_extension_orders_by_passport() {
+        let dir = tempfile::tempdir().expect("tempdir");
         let mut s = store();
-        issue_grant(&mut s, true, input("ext.example.quote", "p_bob"), 1).expect("bob");
-        issue_grant(&mut s, true, input("ext.example.quote", "p_alice"), 2).expect("alice");
+        issue_grant(&mut s, dir.path(), true, None, input("ext.example.quote", "p_bob"), 1).expect("bob");
+        issue_grant(&mut s, dir.path(), true, None, input("ext.example.quote", "p_alice"), 2).expect("alice");
         let listed = list_grants_for_extension(&s, "ext.example.quote");
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].passport_fpr, "p_alice");
@@ -350,10 +410,11 @@ mod tests {
 
     #[test]
     fn list_for_passport_filters_correctly() {
+        let dir = tempfile::tempdir().expect("tempdir");
         let mut s = store();
-        issue_grant(&mut s, true, input("ext.one", "p_alice"), 1).expect("ext.one alice");
-        issue_grant(&mut s, true, input("ext.two", "p_alice"), 2).expect("ext.two alice");
-        issue_grant(&mut s, true, input("ext.one", "p_bob"), 3).expect("ext.one bob");
+        issue_grant(&mut s, dir.path(), true, None, input("ext.one", "p_alice"), 1).expect("ext.one alice");
+        issue_grant(&mut s, dir.path(), true, None, input("ext.two", "p_alice"), 2).expect("ext.two alice");
+        issue_grant(&mut s, dir.path(), true, None, input("ext.one", "p_bob"), 3).expect("ext.one bob");
         let alice = list_grants_for_passport(&s, "p_alice");
         assert_eq!(alice.len(), 2);
         assert_eq!(alice[0].extension_id, "ext.one");
@@ -364,15 +425,19 @@ mod tests {
 
     #[test]
     fn revoke_unknown_returns_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
         let mut s = store();
-        let err = revoke_grant(&mut s, "ext.example.quote", "p_alice").expect_err("not found");
+        let err =
+            revoke_grant(&mut s, dir.path(), "ext.example.quote", None, "p_alice", None, 1).expect_err("not found");
         assert!(matches!(err, GrantError::NotFound(_, _)));
     }
 
     #[test]
     fn rejects_empty_passport_fpr() {
+        let dir = tempfile::tempdir().expect("tempdir");
         let mut s = store();
-        let err = issue_grant(&mut s, true, input("ext.example.quote", ""), 1).expect_err("empty fpr");
+        let err =
+            issue_grant(&mut s, dir.path(), true, None, input("ext.example.quote", ""), 1).expect_err("empty fpr");
         assert!(matches!(err, GrantError::InvalidPassportFpr(_)));
     }
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 #
 # Knock-out proved: a non-private fact survives a daemon stop/start cycle, so
 # memory is durable and framework-independent rather than process-local state.

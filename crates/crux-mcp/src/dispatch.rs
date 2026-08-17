@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! MCP method dispatcher — routes JSON-RPC requests to handlers.
 
@@ -92,7 +92,28 @@ pub struct McpContext {
     /// learn it was revoked — M4). Wired from `corecruxd::main` off
     /// `CRUX_PASSPORT_REVOCATION` — **launch default ON**; `=0` disables enforcement.
     pub revocation_enforced: bool,
+    /// corecruxd-injected constructor for the CPU cosine dense lane
+    /// (`(index, query_embedding, expected_fingerprint, query_model_id) →
+    /// provider`). The `.ccxe` companion readers live in corecruxd, so the
+    /// daemon supplies this at wiring time; `None` (tests, stdio-only) keeps
+    /// `query` BM25-only — bit-identical pre-existing behaviour.
+    pub dense_provider_factory: Option<DenseProviderFactory>,
 }
+
+/// Constructor for the dense re-rank provider on the MCP `query` path.
+/// Returns `None` when the corpus has no usable vectors — the caller then
+/// stays BM25-only.
+///
+/// `query_model_id` is the embedder behind `query_embedding`. It carries the
+/// M7 fusion guard onto this surface: a segment may hold several model-keyed
+/// `.ccxe` companions, and the provider must score only against the one whose
+/// header model id is this. Passing `None` selects the unkeyed companion, which
+/// is the pre-M7 behaviour and correct for a node with no semantic profile.
+pub type DenseProviderFactory = Arc<
+    dyn Fn(&IndexManager, &[f32], Option<&str>, Option<&str>) -> Option<corecrux_retrieval::CosineDenseProvider>
+        + Send
+        + Sync,
+>;
 
 /// passport-revocation M3: read the `CRUX_PASSPORT_REVOCATION` flag. Launch
 /// default ON (proven live) — a revoked passport is reduced to read-only.
@@ -134,6 +155,7 @@ impl McpContext {
             passport_mint_requests_enabled: false,
             agent_passport_map: crate::agent_passport::AgentPassportMap::empty(),
             revocation_enforced: false,
+            dense_provider_factory: None,
         }
     }
 
@@ -168,6 +190,7 @@ impl McpContext {
             passport_mint_requests_enabled: false,
             agent_passport_map: crate::agent_passport::AgentPassportMap::empty(),
             revocation_enforced: false,
+            dense_provider_factory: None,
         }
     }
 
@@ -216,6 +239,7 @@ impl McpContext {
             passport_mint_requests_enabled: self.passport_mint_requests_enabled,
             agent_passport_map: self.agent_passport_map.clone(),
             revocation_enforced: self.revocation_enforced,
+            dense_provider_factory: self.dense_provider_factory.clone(),
         }
     }
 
@@ -245,6 +269,15 @@ impl McpContext {
         self
     }
 
+    /// Attach the corecruxd dense-provider constructor so the `query` tool
+    /// can run the CPU cosine re-rank (parity with `POST
+    /// /v1/query/text-search`). Unset → BM25-only, the pre-existing
+    /// behaviour.
+    pub fn with_dense_provider_factory(mut self, factory: DenseProviderFactory) -> Self {
+        self.dense_provider_factory = Some(factory);
+        self
+    }
+
     /// Resolve the *scope identity* used for private-fact ownership and
     /// visibility (agent-passport M5). This is the single string threaded into
     /// every `scope::*` call.
@@ -270,6 +303,40 @@ impl McpContext {
         } else {
             Some(name.to_string())
         }
+    }
+
+    /// Identity used when this MCP session exercises mutation authority through
+    /// daemon HTTP loopback.
+    ///
+    /// Private-fact ownership keeps the legacy raw token-name via
+    /// [`Self::scope_identity`]. Authority is deliberately stricter: an
+    /// unmapped agent is namespaced as `agent:<name>` so a token name cannot
+    /// collide with and inherit a real passport's policy. Only an explicit
+    /// agent-passport mapping resolves to a canonical passport id.
+    pub fn authority_identity(&self) -> Option<String> {
+        let name = self.agent.as_ref()?.name.as_str();
+        if self.agent_passports_enabled {
+            Some(
+                crate::agent_passport::resolve_agent_passport(name, &self.agent_passport_map)
+                    .unwrap_or_else(|| format!("agent:{name}")),
+            )
+        } else {
+            Some(format!("agent:{name}"))
+        }
+    }
+
+    /// Concrete tenant bound to the current MCP agent for loopback HTTP
+    /// authority. Mapped agent passports carry their configured collaboration
+    /// tenant; unmapped/flag-off callers are confined to `default`.
+    pub fn scope_tenant(&self) -> String {
+        if !self.agent_passports_enabled {
+            return "default".to_string();
+        }
+        self.agent
+            .as_ref()
+            .and_then(|agent| self.agent_passport_map.tenant_for(&agent.name))
+            .unwrap_or("default")
+            .to_string()
     }
 
     /// Back-compat alias names for the caller's private-fact ownership under
@@ -412,6 +479,21 @@ pub async fn dispatch(req: JsonRpcRequest, ctx: &McpContext, _agent: Option<&Age
         // ── Tool surface ───────────────────────────────────────────────
         "tools/list" => {
             let result = tools::list_tools_json_for_context(ctx, current_unix_seconds()).await;
+            // mcp-tool-usage-analytics M3: record the FINAL offered set so
+            // usage analysis can split "offered but ignored" from "never
+            // offered". Flag-gated, deduped per (passport, set-hash),
+            // fire-and-forget — never on the response path's error flow.
+            if crate::ledger::ledger_enabled() {
+                let names: Vec<String> = result["tools"]
+                    .as_array()
+                    .map(|ts| ts.iter().filter_map(|t| t["name"].as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                let passport = crate::scope::agent_name(ctx.agent.as_ref())
+                    .unwrap_or(crate::traces::ANON_PASSPORT)
+                    .to_string();
+                let mode = tools::surface::ToolSurfaceMode::from_env().as_str();
+                crate::ledger::emit_tools_offered(ctx.daemon_base_url.clone(), &passport, &names, mode);
+            }
             JsonRpcResponse::success(req.id, result)
         }
 
@@ -678,6 +760,7 @@ fn current_unix_seconds() -> u64 {
 mod tests {
     use super::*;
     use crux_router::{mint_free_local_token, RcxRouter};
+    use ed25519_dalek::{Signer, SigningKey};
     use rcx_capability_token::RCX_CT_SIGNATURE_LEN;
     use serde_json::json;
 
@@ -685,9 +768,27 @@ mod tests {
         McpContext::new_default("test-node")
     }
 
+    async fn seed_operator_fact(ctx: &McpContext, entity: &str, key: &str, value: &str) -> String {
+        let mut store = ctx.fact_store.write().await;
+        store
+            .store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: entity.to_string(),
+                key: key.to_string(),
+                value: value.to_string(),
+                source_receipt: Some("test:typed-operator-workflow".to_string()),
+                confidence: 1.0,
+                private: true,
+                horizon_class: None,
+                actor: Some("daemon:test".to_string()),
+            })
+            .fact_id
+    }
+
     fn rcx_ctx_with_capabilities(capabilities: Vec<&str>) -> McpContext {
         let now = current_unix_seconds();
-        McpContext::new_default("test-node").with_rcx_router(RcxRouter::new(mint_free_local_token(
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let mut token = mint_free_local_token(
             "p_0123456789abcdef0123456789abcdef",
             "daemon_01HV0000000000000000000000",
             "default",
@@ -695,7 +796,43 @@ mod tests {
             now.saturating_sub(60),
             now.saturating_add(3600),
             [0x22; RCX_CT_SIGNATURE_LEN],
-        )))
+        );
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+        McpContext::new_default("test-node").with_rcx_router(RcxRouter::new_with_trusted_issuer_pubkey(
+            token,
+            signing.verifying_key().to_bytes(),
+        ))
+    }
+
+    #[test]
+    fn authority_identity_namespaces_unmapped_agents_without_rekeying_private_scope() {
+        let agent = crate::agent::AgentIdentity {
+            name: "personal-default".to_string(),
+            token_hash: [0u8; 32],
+        };
+        let unmapped = McpContext::new_default("test-node").with_agent(agent.clone());
+        assert_eq!(unmapped.scope_identity().as_deref(), Some("personal-default"));
+        assert_eq!(unmapped.authority_identity().as_deref(), Some("agent:personal-default"));
+
+        let flag_on_unmapped = McpContext::new_default("test-node")
+            .with_agent_passports(true, crate::agent_passport::AgentPassportMap::empty())
+            .with_agent(agent.clone());
+        assert_eq!(flag_on_unmapped.scope_identity().as_deref(), Some("personal-default"));
+        assert_eq!(
+            flag_on_unmapped.authority_identity().as_deref(),
+            Some("agent:personal-default")
+        );
+
+        let mapped = McpContext::new_default("test-node")
+            .with_agent_passports(
+                true,
+                crate::agent_passport::AgentPassportMap::from_pairs_str(
+                    "personal-default:automation-passport:tenant-a",
+                ),
+            )
+            .with_agent(agent);
+        assert_eq!(mapped.scope_identity().as_deref(), Some("automation-passport"));
+        assert_eq!(mapped.authority_identity().as_deref(), Some("automation-passport"));
     }
 
     fn rpc(method: &str, params: serde_json::Value) -> JsonRpcRequest {
@@ -1274,34 +1411,30 @@ mod tests {
 
         // Seed one public + two reserved-prefix facts. Capture each fact_id
         // so we can pass them into the ack tool.
-        let mut ids: Vec<String> = Vec::new();
-        for (entity, key) in [
-            ("project-y", "status"),
-            ("__ops::config-audit", "sha256:ack"),
-            ("__bootstrap__::pattern:retry", "Retry"),
-        ] {
-            let resp = dispatch(
-                rpc(
-                    "tools/call",
-                    json!({
-                        "name": "store_fact",
-                        "arguments": {"entity": entity, "key": key, "value": "shipped-ack"}
-                    }),
-                ),
-                &ctx,
-                None,
-            )
-            .await;
-            let text = resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
-            // "stored fact f_xxx (entity=..., key=..., ..."
-            let id = text
-                .trim_start_matches("stored fact ")
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_string();
-            ids.push(id);
-        }
+        let public = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "project-y", "key": "status", "value": "shipped-ack"}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let text = public.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut ids = vec![text
+            .trim_start_matches("stored fact ")
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string()];
+        ids.push(seed_operator_fact(&ctx, "__ops::config-audit", "sha256:ack", "shipped-ack").await);
+        ids.push(seed_operator_fact(&ctx, "__bootstrap__::pattern:retry", "Retry", "shipped-ack").await);
 
         let resp = dispatch(
             rpc(
@@ -2291,6 +2424,10 @@ mod tests {
             "punch_in" | "punch_out" => json!({"resource": "res", "holder_passport": "p_stub"}),
             "check_punchcard" | "force_release" => json!({"resource": "res"}),
             "list_punchcards" => json!({"punchcard_id": "pc_stub", "confirm": true}),
+            "code_path" => json!({"tenant_id": "t", "entry_point": "handler", "token_budget": 500}),
+            "code_blast_radius" | "code_liveness" => json!({"tenant_id": "t", "symbol": "sym", "token_budget": 500}),
+            "code_trace_diff" => json!({"tenant_id": "t", "trace_a": 1, "trace_b": 2, "token_budget": 500}),
+            "code_dead_code" => json!({"tenant_id": "t", "token_budget": 2000}),
             // Tools with no required fields default to an empty object.
             _ => json!({}),
         }

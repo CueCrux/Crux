@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Aggregation and guarded mutation endpoints for the embedded Crux Console.
 
@@ -11,8 +11,8 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    problem_response, require_http_scopes, require_http_scopes_for_tenant, AppState, HeaderMap, IntoResponse, Json,
-    Path, Query, State, StatusCode,
+    problem_response, require_http_any_scope, require_http_scopes, require_http_scopes_for_tenant, AppState, HeaderMap,
+    IntoResponse, Json, Path, Query, State, StatusCode,
 };
 
 type BoostOverlay = BTreeMap<String, String>;
@@ -55,6 +55,7 @@ pub(super) struct CompleteOnboardingBody {
 
 const SUPPORTED_ONBOARDING_AUTH_MODES: &[&str] = &["off", "dev_scopes", "jwt_hs256", "jwt_jwks"];
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_onboarding(State(state): State<AppState>) -> impl IntoResponse {
     let onboarding = state.onboarding.read().await;
     (
@@ -71,6 +72,7 @@ pub(super) async fn get_console_onboarding(State(state): State<AppState>) -> imp
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_console_onboarding_complete(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -143,6 +145,7 @@ pub(super) struct UpdateSettingsBody {
     pub embedding_model: Option<String>,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_settings(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_console_read(&state, &headers) {
         return problem.into_response();
@@ -178,6 +181,7 @@ pub(super) async fn get_console_settings(State(state): State<AppState>, headers:
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn put_console_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -264,6 +268,7 @@ pub(super) struct ProbeEmbeddingBody {
 /// (`GET {url}/api/tags`) first, falls back to OpenAI-compatible
 /// (`GET {url}/v1/models`). Returns whichever shape parsed; the UI shows the
 /// flat list and lets the operator override manually if both probes fail.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_console_embedding_probe(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -342,6 +347,7 @@ fn default_true() -> bool {
     true
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_corecrux_lane_weights(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -370,6 +376,7 @@ pub(super) async fn get_console_corecrux_lane_weights(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn put_console_corecrux_lane_weights(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -417,6 +424,7 @@ pub(super) async fn put_console_corecrux_lane_weights(
 /// returning that scope to its process-env / inherited defaults. Other boost
 /// overlay keys are left untouched — this is intentionally narrower than
 /// CoreCrux's whole-overlay `DELETE /v1/admin/boost-config/tenant`.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_console_corecrux_lane_weights(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -445,11 +453,468 @@ pub(super) async fn delete_console_corecrux_lane_weights(
     }
 }
 
+// ── CoreCrux link-graph mediation proxy ──────────────────────────────────────
+//
+// ExecPlan `wikicrux-link-graph-explorer-2026-07-23` (M4, D-D / D2 / R5). GET-only,
+// read-only console → CoreCrux translation for the six-degrees link-graph pane.
+// The console is same-origin cookie/scope auth by design (generated `CruxApi`, no
+// bearer in the browser, T.3); it never talks to CoreCrux directly. These four
+// GET routes translate allowlisted query params into the upstream CoreCrux
+// `/v1/graph/*` JSON POST bodies (`stats` is GET-passthrough), exactly mirroring
+// the lane-weights / gpu1 shim env + timeout + error-mapping family.
+//
+// Upstream base URL + bearer token live in the daemon env ONLY. Client request
+// headers are NEVER forwarded upstream; the daemon injects its own graph scope +
+// token. When the graph base URL is unset the routes 503 with a build hint so the
+// console hides the pane (the capability plan gates visibility first; this is the
+// same-origin safety net). This is Crux CE (CPU-only) — no CoreCrux engine code
+// is compiled here; all graph work happens over the wire on the CoreCrux daemon.
+
+/// The console proxy caps `resolve` well under the upstream 10 000; the pane only
+/// resolves a handful of titles (two-article path search + a few ego seeds).
+const GRAPH_RESOLVE_MAX_TITLES: usize = 256;
+/// Mirror of the upstream `ego` seed cap (m2 contract: at most 256 seeds).
+const GRAPH_EGO_MAX_SEEDS: usize = 256;
+/// Mirror of the upstream `ego` budget maxima (m2 contract).
+const GRAPH_EGO_MAX_BUDGET_NODES: u64 = 50_000;
+const GRAPH_EGO_MAX_BUDGET_EDGES: u64 = 200_000;
+
+const GRAPH_RESOLVE_PARAMS: &[&str] = &["titles"];
+const GRAPH_EGO_PARAMS: &[&str] = &[
+    "seeds",
+    "hops",
+    "budget_nodes",
+    "budget_edges",
+    "kind",
+    "direction",
+    "degree_cap",
+];
+const GRAPH_PATH_PARAMS: &[&str] = &["src", "dst", "max_hops", "k", "context_edge_budget"];
+
+/// `GET /v1/console/corecrux/graph/stats` — GET-passthrough to upstream
+/// `GET /v1/graph/stats` (corpus counts, snapshot id, build digest, degree histogram).
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_console_corecrux_graph_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+    let base_url = match corecrux_graph_base_url_from_env() {
+        Ok(url) => url,
+        Err(err) => return problem_response(StatusCode::SERVICE_UNAVAILABLE, err),
+    };
+    let result = tokio::task::spawn_blocking(move || fetch_graph_stats(&base_url))
+        .await
+        .map_err(graph_join_error);
+    finish_graph_proxy(result)
+}
+
+/// `GET /v1/console/corecrux/graph/resolve?titles=A|B|C` — translated to upstream
+/// `POST /v1/graph/resolve {titles:[...]}`. `|` is the delimiter (invalid in ns0
+/// titles, so it can never appear inside one).
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_console_corecrux_graph_resolve(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+    if let Err(err) = reject_unknown_graph_params(&params, GRAPH_RESOLVE_PARAMS) {
+        return problem_response(StatusCode::BAD_REQUEST, err);
+    }
+    let titles: Vec<String> = params
+        .get("titles")
+        .map_or("", String::as_str)
+        .split('|')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if titles.is_empty() {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "titles is required: a '|'-separated list of article titles",
+        );
+    }
+    if titles.len() > GRAPH_RESOLVE_MAX_TITLES {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            format!("at most {GRAPH_RESOLVE_MAX_TITLES} titles per request"),
+        );
+    }
+    let base_url = match corecrux_graph_base_url_from_env() {
+        Ok(url) => url,
+        Err(err) => return problem_response(StatusCode::SERVICE_UNAVAILABLE, err),
+    };
+    let result = tokio::task::spawn_blocking(move || fetch_graph_resolve(&base_url, titles))
+        .await
+        .map_err(graph_join_error);
+    finish_graph_proxy(result)
+}
+
+/// `GET /v1/console/corecrux/graph/ego?seeds=1,2&hops=2&budget_nodes=5000&…` →
+/// upstream `POST /v1/graph/ego`. Budgets are mandatory (mirroring the upstream
+/// contract, R3); all params validated + capped server-side before any network
+/// call.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_console_corecrux_graph_ego(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+    if let Err(err) = reject_unknown_graph_params(&params, GRAPH_EGO_PARAMS) {
+        return problem_response(StatusCode::BAD_REQUEST, err);
+    }
+    let body = match build_graph_ego_body(&params) {
+        Ok(body) => body,
+        Err(err) => return problem_response(StatusCode::BAD_REQUEST, err),
+    };
+    let base_url = match corecrux_graph_base_url_from_env() {
+        Ok(url) => url,
+        Err(err) => return problem_response(StatusCode::SERVICE_UNAVAILABLE, err),
+    };
+    let result = tokio::task::spawn_blocking(move || fetch_graph_ego(&base_url, body))
+        .await
+        .map_err(graph_join_error);
+    finish_graph_proxy(result)
+}
+
+/// `GET /v1/console/corecrux/graph/path?src=1&dst=2&max_hops=6&…` → upstream
+/// `POST /v1/graph/path` (k-shortest bidirectional BFS + 1-hop context subgraph).
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_console_corecrux_graph_path(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+    if let Err(err) = reject_unknown_graph_params(&params, GRAPH_PATH_PARAMS) {
+        return problem_response(StatusCode::BAD_REQUEST, err);
+    }
+    let body = match build_graph_path_body(&params) {
+        Ok(body) => body,
+        Err(err) => return problem_response(StatusCode::BAD_REQUEST, err),
+    };
+    let base_url = match corecrux_graph_base_url_from_env() {
+        Ok(url) => url,
+        Err(err) => return problem_response(StatusCode::SERVICE_UNAVAILABLE, err),
+    };
+    let result = tokio::task::spawn_blocking(move || fetch_graph_path(&base_url, body))
+        .await
+        .map_err(graph_join_error);
+    finish_graph_proxy(result)
+}
+
+fn graph_join_error(err: tokio::task::JoinError) -> CoreCruxProxyError {
+    CoreCruxProxyError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("CoreCrux graph proxy join failed: {err}"),
+    )
+}
+
+fn finish_graph_proxy(
+    result: Result<Result<serde_json::Value, CoreCruxProxyError>, CoreCruxProxyError>,
+) -> axum::response::Response {
+    match result {
+        Ok(Ok(body)) => (StatusCode::OK, Json(body)).into_response(),
+        Ok(Err(err)) | Err(err) => problem_response(err.status, err.detail),
+    }
+}
+
+/// Reject any query key not in the per-endpoint allowlist (T.5 posture: the
+/// console proxy forwards a fixed, audited param surface — never an arbitrary
+/// passthrough).
+fn reject_unknown_graph_params(params: &HashMap<String, String>, allowed: &[&str]) -> Result<(), String> {
+    for key in params.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!(
+                "unknown query parameter '{key}' (allowed: {})",
+                allowed.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_graph_u32(raw: &str, name: &str) -> Result<u32, String> {
+    raw.trim()
+        .parse::<u32>()
+        .map_err(|_| format!("{name} must be a non-negative integer node id"))
+}
+
+/// Validate + translate the `ego` query params into the upstream POST body,
+/// mirroring the m2 contract's caps (seeds ≤ 256, hops clamp \[0,3\], mandatory
+/// budgets ≤ 50 000 nodes / 200 000 edges, kind/direction enums).
+fn build_graph_ego_body(params: &HashMap<String, String>) -> Result<serde_json::Value, String> {
+    let seeds_raw = params.get("seeds").map_or("", String::as_str).trim();
+    if seeds_raw.is_empty() {
+        return Err("seeds is required: a comma-separated list of node ids".to_string());
+    }
+    let mut seeds: Vec<u32> = Vec::new();
+    for tok in seeds_raw.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        seeds.push(parse_graph_u32(tok, "seeds")?);
+    }
+    if seeds.is_empty() {
+        return Err("seeds must not be empty".to_string());
+    }
+    if seeds.len() > GRAPH_EGO_MAX_SEEDS {
+        return Err(format!("at most {GRAPH_EGO_MAX_SEEDS} seeds per request"));
+    }
+
+    let hops = match params.get("hops") {
+        Some(raw) => parse_graph_u32(raw, "hops")?.min(3),
+        None => 1,
+    };
+
+    let budget_nodes = params
+        .get("budget_nodes")
+        .ok_or_else(|| "budget_nodes is required (> 0)".to_string())?
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "budget_nodes must be a positive integer".to_string())?;
+    let budget_edges = params
+        .get("budget_edges")
+        .ok_or_else(|| "budget_edges is required (> 0)".to_string())?
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "budget_edges must be a positive integer".to_string())?;
+    if budget_nodes == 0 || budget_edges == 0 {
+        return Err("budget_nodes and budget_edges must both be > 0".to_string());
+    }
+    if budget_nodes > GRAPH_EGO_MAX_BUDGET_NODES || budget_edges > GRAPH_EGO_MAX_BUDGET_EDGES {
+        return Err(format!(
+            "budget too large (max nodes {GRAPH_EGO_MAX_BUDGET_NODES}, max edges {GRAPH_EGO_MAX_BUDGET_EDGES})"
+        ));
+    }
+
+    let kind = match params.get("kind").map(String::as_str) {
+        None => "link",
+        Some(k @ ("link" | "category" | "both")) => k,
+        Some(other) => return Err(format!("kind must be 'link' | 'category' | 'both', got '{other}'")),
+    };
+    let direction = match params.get("direction").map(String::as_str) {
+        None => "both",
+        Some(d @ ("forward" | "reverse" | "both")) => d,
+        Some(other) => {
+            return Err(format!(
+                "direction must be 'forward' | 'reverse' | 'both', got '{other}'"
+            ))
+        }
+    };
+    let degree_cap = match params.get("degree_cap") {
+        Some(raw) => parse_graph_u32(raw, "degree_cap")?,
+        None => 0,
+    };
+
+    Ok(serde_json::json!({
+        "seeds": seeds,
+        "hops": hops,
+        "budget": { "nodes": budget_nodes, "edges": budget_edges },
+        "kind": kind,
+        "direction": direction,
+        "degree_cap": degree_cap,
+    }))
+}
+
+/// Validate + translate the `path` query params into the upstream POST body,
+/// mirroring the m2 contract (max_hops 1..=8, k clamp \[1,64\], context edge budget
+/// clamp \[0,20000\]).
+fn build_graph_path_body(params: &HashMap<String, String>) -> Result<serde_json::Value, String> {
+    let src = parse_graph_u32(params.get("src").ok_or_else(|| "src is required".to_string())?, "src")?;
+    let dst = parse_graph_u32(params.get("dst").ok_or_else(|| "dst is required".to_string())?, "dst")?;
+    let max_hops = match params.get("max_hops") {
+        Some(raw) => {
+            let mh = parse_graph_u32(raw, "max_hops")?;
+            if mh == 0 {
+                return Err("max_hops must be >= 1".to_string());
+            }
+            if mh > 8 {
+                return Err("max_hops must be <= 8".to_string());
+            }
+            mh
+        }
+        None => 6,
+    };
+    let k = match params.get("k") {
+        Some(raw) => parse_graph_u32(raw, "k")?.clamp(1, 64),
+        None => 4,
+    };
+    let context_edge_budget = match params.get("context_edge_budget") {
+        Some(raw) => parse_graph_u32(raw, "context_edge_budget")?.min(20_000),
+        None => 500,
+    };
+
+    Ok(serde_json::json!({
+        "src": src,
+        "dst": dst,
+        "max_hops": max_hops,
+        "k": k,
+        "context_edge_budget": context_edge_budget,
+    }))
+}
+
+/// Read the CoreCrux graph base URL from the daemon env (graph-specific first,
+/// then the un-prefixed fallback — same lookup family as `corecrux_base_url_from_env`).
+/// `pub(super)` so `/v1/version` (health.rs) can surface the `console_link_graph`
+/// runtime capability from the same source of truth.
+pub(super) fn corecrux_graph_base_url_from_env() -> Result<String, String> {
+    for key in ["CORECRUXD_CORECRUX_GRAPH_BASE_URL", "CORECRUX_GRAPH_BASE_URL"] {
+        if let Ok(raw) = std::env::var(key) {
+            let trimmed = raw.trim().trim_end_matches('/').to_string();
+            if !trimmed.is_empty() {
+                return Ok(trimmed);
+            }
+        }
+    }
+    Err(
+        "CoreCrux graph base URL is not configured; set CORECRUXD_CORECRUX_GRAPH_BASE_URL on the Crux daemon"
+            .to_string(),
+    )
+}
+
+/// Whether the CoreCrux graph mediation proxy is configured on this daemon — the
+/// `console_link_graph` runtime-capability signal the console gates its pane on.
+pub(super) fn corecrux_graph_base_url_configured() -> bool {
+    corecrux_graph_base_url_from_env().is_ok()
+}
+
+fn corecrux_graph_token_from_env() -> Option<String> {
+    std::env::var("CORECRUXD_CORECRUX_GRAPH_TOKEN")
+        .or_else(|_| std::env::var("CORECRUX_GRAPH_TOKEN"))
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn corecrux_graph_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(std::time::Duration::from_secs(15)))
+        .build()
+        .into()
+}
+
+/// Attach only the daemon-injected scope + bearer. Client request headers are
+/// never forwarded upstream (T.3); the graph endpoints are scope-only auth
+/// (`query:read`), tenant-agnostic (whole-corpus `.ccxg`, no tenant binding).
+fn apply_corecrux_graph_headers<S>(mut req: ureq::RequestBuilder<S>) -> ureq::RequestBuilder<S> {
+    req = req
+        .header("Accept", "application/json")
+        .header("X-Corecrux-Scopes", "query:read");
+    if let Some(token) = corecrux_graph_token_from_env() {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    req
+}
+
+/// Map an upstream CoreCrux graph HTTP status onto the status the console sees.
+/// Upstream auth failures (401/403 — a daemon-token misconfig, never the browser
+/// user's fault) and any 5xx collapse to 502 so no upstream auth signal leaks to
+/// the same-origin console. Upstream `404` (link-graph flag off) and `503` (no
+/// `.ccxg` loaded) both surface as `503` so the pane shows the enable/build hint.
+fn map_graph_upstream_status(upstream: u16) -> StatusCode {
+    match upstream {
+        400 => StatusCode::BAD_REQUEST,
+        404 | 503 => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::BAD_GATEWAY,
+    }
+}
+
+fn read_corecrux_graph_json(
+    mut response: ureq::http::Response<ureq::Body>,
+) -> Result<serde_json::Value, CoreCruxProxyError> {
+    let status = response.status().as_u16();
+    let text = response.body_mut().read_to_string().map_err(|err| {
+        CoreCruxProxyError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("CoreCrux graph response read failed: {err}"),
+        )
+    })?;
+    let body = if text.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str::<serde_json::Value>(&text).map_err(|err| {
+            CoreCruxProxyError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("CoreCrux graph returned non-JSON response ({status}): {err}"),
+            )
+        })?
+    };
+    if (200..300).contains(&status) {
+        return Ok(body);
+    }
+    // Surface the upstream problem+json `detail` when present (e.g. the build
+    // hint), otherwise a generic mapped message. Never echo upstream auth detail.
+    let mapped = map_graph_upstream_status(status);
+    let detail = if mapped == StatusCode::BAD_GATEWAY {
+        format!("CoreCrux graph endpoint returned {status}")
+    } else {
+        body.get("detail")
+            .and_then(|v| v.as_str())
+            .map_or_else(|| format!("CoreCrux graph endpoint returned {status}"), str::to_string)
+    };
+    Err(CoreCruxProxyError::new(mapped, detail))
+}
+
+fn corecrux_graph_get(agent: &ureq::Agent, url: &str) -> Result<serde_json::Value, CoreCruxProxyError> {
+    let response = apply_corecrux_graph_headers(agent.get(url)).call().map_err(|err| {
+        CoreCruxProxyError::new(StatusCode::BAD_GATEWAY, format!("CoreCrux graph request failed: {err}"))
+    })?;
+    read_corecrux_graph_json(response)
+}
+
+fn corecrux_graph_post(
+    agent: &ureq::Agent,
+    url: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, CoreCruxProxyError> {
+    let response = apply_corecrux_graph_headers(agent.post(url))
+        .send_json(body)
+        .map_err(|err| {
+            CoreCruxProxyError::new(StatusCode::BAD_GATEWAY, format!("CoreCrux graph request failed: {err}"))
+        })?;
+    read_corecrux_graph_json(response)
+}
+
+fn fetch_graph_stats(base_url: &str) -> Result<serde_json::Value, CoreCruxProxyError> {
+    let agent = corecrux_graph_agent();
+    corecrux_graph_get(&agent, &format!("{base_url}/v1/graph/stats"))
+}
+
+fn fetch_graph_resolve(base_url: &str, titles: Vec<String>) -> Result<serde_json::Value, CoreCruxProxyError> {
+    let agent = corecrux_graph_agent();
+    let body = serde_json::json!({ "titles": titles });
+    corecrux_graph_post(&agent, &format!("{base_url}/v1/graph/resolve"), &body)
+}
+
+fn fetch_graph_ego(base_url: &str, body: serde_json::Value) -> Result<serde_json::Value, CoreCruxProxyError> {
+    let agent = corecrux_graph_agent();
+    corecrux_graph_post(&agent, &format!("{base_url}/v1/graph/ego"), &body)
+}
+
+fn fetch_graph_path(base_url: &str, body: serde_json::Value) -> Result<serde_json::Value, CoreCruxProxyError> {
+    let agent = corecrux_graph_agent();
+    corecrux_graph_post(&agent, &format!("{base_url}/v1/graph/path"), &body)
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct ConsoleReviewQuery {
     pub limit: Option<usize>,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_review_contradictions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -458,10 +923,14 @@ pub(super) async fn get_console_review_contradictions(
     if let Err(problem) = require_console_read(&state, &headers) {
         return problem.into_response();
     }
+    let tenant_hash = match console_tenant(&state, &headers) {
+        Ok(tenant_hash) => tenant_hash,
+        Err(problem) => return problem.into_response(),
+    };
     let limit = query.limit.unwrap_or(50).min(250);
     let candidates = {
         let store = state.fact_store.read().await;
-        store.contradiction_candidates_v1(limit)
+        store.contradiction_candidates_v1(&tenant_hash, limit)
     };
     (
         StatusCode::OK,
@@ -482,6 +951,7 @@ pub(super) async fn get_console_review_contradictions(
 /// review body (contradiction + expiry proposals). This is the data the embedded
 /// `/console/review` page renders. Distinct from
 /// `GET /v1/console/review/contradictions`, which runs a LIVE contradiction pass.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_review_queue(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -490,12 +960,17 @@ pub(super) async fn get_console_review_queue(
     if let Err(problem) = require_console_read(&state, &headers) {
         return problem.into_response();
     }
+    let tenant_hash = match console_tenant(&state, &headers) {
+        Ok(tenant_hash) => tenant_hash,
+        Err(problem) => return problem.into_response(),
+    };
     let limit = query.limit.unwrap_or(50).min(250);
     let (runs, live_contradictions) = {
         let store = state.fact_store.read().await;
         // Confidence 1.0 on every review receipt ⇒ query_inner's confidence-desc,
         // stored_at-desc order already yields newest-first.
         let result = store.query(&corecrux_memory::fact_store::FactQuery {
+            tenant_hash: Some(tenant_hash.clone()),
             entity_prefix: Some(crate::consolidation_scheduler::REVIEW_ENTITY_PREFIX.to_string()),
             top_k: limit,
             ..Default::default()
@@ -517,7 +992,7 @@ pub(super) async fn get_console_review_queue(
         // Live contradiction pass so the console still shows current
         // contradictions even when the scheduler is OFF (nothing surfaced yet) —
         // repointing the page to the queue must not hide them (review finding 6).
-        let live = store.contradiction_candidates_v1(limit);
+        let live = store.contradiction_candidates_v1(&tenant_hash, limit);
         (runs, live)
     };
     (
@@ -562,6 +1037,7 @@ pub(super) struct ConsoleExpiryApplyRequest {
 /// deleted. There is no cutoff, so a future timestamp can no longer mass-delete.
 /// Deletion uses the fallible [`corecrux_memory::FactStore::try_delete`] so an
 /// unpersisted tombstone is reported as skipped, not expired (finding 3).
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_console_review_expiries(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -570,6 +1046,10 @@ pub(super) async fn post_console_review_expiries(
     if let Err(problem) = require_console_write(&state, &headers) {
         return problem.into_response();
     }
+    let (tenant_hash, actor) = match console_mutation_authority(&state, &headers) {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
     if body.fact_ids.is_empty() {
         return problem_response(
             StatusCode::BAD_REQUEST,
@@ -579,14 +1059,13 @@ pub(super) async fn post_console_review_expiries(
     if body.fact_ids.len() > MAX_EXPIRY_BATCH {
         return problem_response(StatusCode::BAD_REQUEST, "fact_ids exceeds the 500-id per-request cap");
     }
-    let actor = console_actor_from_headers(&headers);
     let (expired, skipped) = {
         let mut store = state.fact_store.write().await;
         // Recompute the live candidate set under the SAME write lock we delete
         // under — atomic revalidation, no TOCTOU. `select_expiry_candidates`
         // applies the protection + stale/low-confidence rules exactly as the
         // scheduler does at proposal time.
-        let facts: Vec<corecrux_memory::Fact> = store.all_facts().cloned().collect();
+        let facts: Vec<corecrux_memory::Fact> = store.all_facts_for_tenant(&tenant_hash).cloned().collect();
         let now = chrono::Utc::now();
         let policy = corecrux_projections::decay::DecayPolicy::from_env();
         let current: std::collections::HashMap<String, String> =
@@ -603,7 +1082,7 @@ pub(super) async fn post_console_review_expiries(
                 continue; // de-dup so a repeated id is counted once
             }
             match current.get(id) {
-                Some(reason) => match store.try_delete(id) {
+                Some(reason) => match store.try_delete(&tenant_hash, id) {
                     Ok(true) => expired.push(serde_json::json!({ "fact_id": id, "reason": reason })),
                     Ok(false) => {
                         skipped.push(serde_json::json!({ "fact_id": id, "reason": "not_found_or_already_deleted" }));
@@ -634,6 +1113,7 @@ pub(super) async fn post_console_review_expiries(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_console_review_consolidation(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -642,19 +1122,22 @@ pub(super) async fn post_console_review_consolidation(
     if let Err(problem) = require_console_write(&state, &headers) {
         return problem.into_response();
     }
+    let (tenant_hash, actor) = match console_mutation_authority(&state, &headers) {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
     if body.consolidation_id.trim().is_empty() {
         body.consolidation_id = format!("console-{}", uuid::Uuid::new_v4());
     }
-    if body.actor.as_deref().unwrap_or_default().trim().is_empty() {
-        body.actor = Some(console_actor_from_headers(&headers));
-    }
+    // Body fields are data, never authority. Always overwrite the legacy
+    // actor hint with the principal resolved from the verified request.
+    body.actor = Some(actor.clone());
     // Capture the audit fields before the request is moved into the store op.
     let entity = body.entity.clone();
     let key = body.key.clone();
-    let actor = body.actor.clone().unwrap_or_else(|| "console".to_string());
     let report = {
         let mut store = state.fact_store.write().await;
-        store.consolidate_facts_v1(body)
+        store.consolidate_facts_v1(&tenant_hash, body)
     };
     match report {
         Ok(report) => {
@@ -665,9 +1148,12 @@ pub(super) async fn post_console_review_consolidation(
                 &report.receipt,
                 &entity,
                 &key,
-                &actor,
-                "canonical_merge",
-                &now,
+                super::consolidation_receipt::ConsolidationReceiptContext {
+                    tenant_hash: &tenant_hash,
+                    actor: &actor,
+                    strategy: "canonical_merge",
+                    created_at: &now,
+                },
             );
             (
                 StatusCode::OK,
@@ -689,16 +1175,13 @@ pub(super) struct ConsolidationUndoRequest {
     pub canonical_fact_id: String,
     #[serde(default)]
     pub source_fact_ids: Vec<String>,
-    #[serde(default)]
-    pub entity: Option<String>,
-    #[serde(default)]
-    pub key: Option<String>,
 }
 
 /// `POST /v1/console/review/consolidations/undo` — atomically reverse a
 /// consolidation (retire the canonical, restore its sources) and emit a signed
 /// undo receipt (M2). Idempotent: undoing an already-undone consolidation
 /// returns `status = "already_undone"`.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_console_review_consolidation_undo(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -707,14 +1190,23 @@ pub(super) async fn post_console_review_consolidation_undo(
     if let Err(problem) = require_console_write(&state, &headers) {
         return problem.into_response();
     }
-    let actor = console_actor_from_headers(&headers);
+    let (tenant_hash, actor) = match console_mutation_authority(&state, &headers) {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
     let undo = {
         let mut store = state.fact_store.write().await;
-        store.consolidate_undo_v1(&req.canonical_fact_id, &req.source_fact_ids)
+        let target = store
+            .get_for_tenant_including_deleted(&req.canonical_fact_id, &tenant_hash)
+            .map(|fact| (fact.entity.clone(), fact.key.clone()));
+        store
+            .consolidate_undo_v1(&tenant_hash, &req.canonical_fact_id, &req.source_fact_ids)
+            .map(|undo| (undo, target))
     };
     match undo {
-        Ok(undo) => {
+        Ok((undo, target)) => {
             let now = chrono::Utc::now().to_rfc3339();
+            let (entity, key) = target.unwrap_or_default();
             let receipt = corecrux_memory::fact_store::ConsolidationReceiptV1 {
                 consolidation_id: format!("undo:{}", req.canonical_fact_id),
                 canonical_fact_id: undo.canonical_fact_id.clone(),
@@ -725,11 +1217,14 @@ pub(super) async fn post_console_review_consolidation_undo(
             let signed = super::consolidation_receipt::mint_consolidation_receipt(
                 &state,
                 &receipt,
-                req.entity.as_deref().unwrap_or(""),
-                req.key.as_deref().unwrap_or(""),
-                &actor,
-                "undo",
-                &now,
+                &entity,
+                &key,
+                super::consolidation_receipt::ConsolidationReceiptContext {
+                    tenant_hash: &tenant_hash,
+                    actor: &actor,
+                    strategy: "undo",
+                    created_at: &now,
+                },
             );
             (
                 StatusCode::OK,
@@ -747,26 +1242,62 @@ pub(super) async fn post_console_review_consolidation_undo(
     }
 }
 
-fn console_actor_from_headers(headers: &HeaderMap) -> String {
-    headers
-        .get("x-corecrux-passport-id")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("console")
-        .to_string()
+#[allow(clippy::result_large_err)]
+fn console_mutation_authority(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(String, String), axum::response::Response> {
+    let context = crate::auth::http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)?;
+    let tenant_hash = context
+        .resolve_authorized_tenant(None)
+        .map_err(IntoResponse::into_response)?;
+    let actor = if context.local_unverified_identity() {
+        format!(
+            "operator:unverified:{}",
+            context.passport_id.as_deref().unwrap_or("console")
+        )
+    } else {
+        if context.passport_override_used() {
+            return Err(problem_response(
+                StatusCode::FORBIDDEN,
+                "passport impersonation is not permitted for console review mutations",
+            ));
+        }
+        context.passport_id.clone().ok_or_else(|| {
+            problem_response(
+                StatusCode::FORBIDDEN,
+                "an authenticated passport is required for console review mutations",
+            )
+        })?
+    };
+    Ok((tenant_hash, actor))
+}
+
+#[allow(clippy::result_large_err)]
+fn console_tenant(state: &AppState, headers: &HeaderMap) -> Result<String, crate::problem::ProblemResponse> {
+    crate::auth::http_scope_context(&state.auth, headers)?.resolve_authorized_tenant(None)
 }
 
 fn consolidation_problem(err: corecrux_memory::fact_store::ConsolidationErrorV1) -> axum::response::Response {
     use corecrux_memory::fact_store::ConsolidationErrorV1;
     let status = match &err {
-        ConsolidationErrorV1::NoTargets | ConsolidationErrorV1::TargetOutsideEntityKey(_) => StatusCode::BAD_REQUEST,
+        ConsolidationErrorV1::NoTargets
+        | ConsolidationErrorV1::MissingConsolidationId
+        | ConsolidationErrorV1::TargetOutsideEntityKey(_)
+        | ConsolidationErrorV1::ImplicitPriorNotTarget(_)
+        | ConsolidationErrorV1::NoUndoSources
+        | ConsolidationErrorV1::NotConsolidationCanonical(_)
+        | ConsolidationErrorV1::UndoSourceMismatch(_) => StatusCode::BAD_REQUEST,
         ConsolidationErrorV1::TargetNotFound(_) => StatusCode::NOT_FOUND,
+        ConsolidationErrorV1::DuplicateTarget(_) => StatusCode::BAD_REQUEST,
         ConsolidationErrorV1::TargetDeleted(_)
+        | ConsolidationErrorV1::TargetAlreadySuperseded(_)
         | ConsolidationErrorV1::TargetPinned(_)
         | ConsolidationErrorV1::TargetPrivate(_)
         | ConsolidationErrorV1::TargetReceiptLinked(_)
-        | ConsolidationErrorV1::TargetHighConfidence { .. } => StatusCode::CONFLICT,
+        | ConsolidationErrorV1::TargetDaemonOwned { .. }
+        | ConsolidationErrorV1::TargetHighConfidence { .. }
+        | ConsolidationErrorV1::CanonicalSuperseded(_) => StatusCode::CONFLICT,
         ConsolidationErrorV1::Journal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     problem_response(status, err.to_string())
@@ -817,10 +1348,22 @@ fn canonical_lane_key(name: &str) -> Option<&'static str> {
         "cosine" | "dense" | "vec" | "vector" => Some("cosine"),
         "sparse" | "splade" => Some("sparse"),
         "hyde" => Some("hyde"),
-        "topology" => Some("topology"),
-        "vernacular" => Some("vernacular"),
+        // The companion extension is accepted as an alias for its lane, so an operator
+        // can name a lane by the artifact they can see on disk. `ccxdi`/`ccxev` were
+        // already aliased; `ccxf`/`ccxal`/`ccxs`/`ccxse` complete the set for the
+        // readers ported at M5 of the companion-vocabulary ExecPlan.
+        //
+        // `.ccxn` (entity) and `.ccxp` (projection) are deliberately absent: neither
+        // lane exists in `default_lane_weights`, and `normalize_lane_weights` rejects
+        // any key that is not a real lane. Aliasing them would let an operator set a
+        // weight the fusion path never reads — a silently ignored setting is worse
+        // than a rejected one. They arrive with the M6 scorer ruling.
+        "topology" | "ccxf" => Some("topology"),
+        "vernacular" | "ccxal" => Some("vernacular"),
         "indexing" | "ccxdi" => Some("indexing"),
-        "topology_trait_expansion" | "trait_expansion" | "ccxse_expansion" => Some("topology_trait_expansion"),
+        "topology_trait_expansion" | "trait_expansion" | "ccxse_expansion" | "ccxs" | "ccxse" => {
+            Some("topology_trait_expansion")
+        }
         "navtree" | "nav" | "ccxst" => Some("navtree"),
         "events" | "event" | "ccxev" => Some("events"),
         _ => None,
@@ -1566,6 +2109,7 @@ fn build_probe_candidates(url: &str) -> Vec<String> {
     out
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_storage_breakdown(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1629,6 +2173,7 @@ pub(super) async fn get_console_storage_breakdown(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_console_onboarding_restart(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1651,6 +2196,7 @@ pub(super) async fn post_console_onboarding_restart(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_summary(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_console_read(&state, &headers) {
         return problem.into_response();
@@ -1715,6 +2261,7 @@ pub(super) async fn get_console_summary(State(state): State<AppState>, headers: 
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_integrations(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_console_read(&state, &headers) {
         return problem.into_response();
@@ -1755,6 +2302,7 @@ pub(super) async fn get_console_integrations(State(state): State<AppState>, head
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_console_integration_install(
     State(state): State<AppState>,
     Path(pack_id): Path<String>,
@@ -1790,6 +2338,7 @@ pub(super) async fn post_console_integration_install(
     (StatusCode::CREATED, Json(descriptor)).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_console_integration_grant(
     State(state): State<AppState>,
     Path(pack_id): Path<String>,
@@ -1828,6 +2377,7 @@ pub(super) async fn post_console_integration_grant(
     (StatusCode::OK, Json(grant)).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_console_integration_disable(
     State(state): State<AppState>,
     Path(pack_id): Path<String>,
@@ -1852,6 +2402,7 @@ pub(super) async fn post_console_integration_disable(
     (StatusCode::OK, Json(grant)).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_passports(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_console_read(&state, &headers) {
         return problem.into_response();
@@ -1888,6 +2439,7 @@ pub(super) struct ConsoleSessionsQuery {
     pub include_archived: bool,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_sessions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1897,8 +2449,6 @@ pub(super) async fn get_console_sessions(
         return problem.into_response();
     }
 
-    let store = state.session_store.read().await;
-
     // A session is "active" if it was written within this window, "idle" beyond
     // it, "archived" if soft-archived. `updated_at` is refreshed on every
     // `put()`, so it is the authoritative last-activity signal — the console
@@ -1906,37 +2456,110 @@ pub(super) async fn get_console_sessions(
     const LIVE_WINDOW_MS: i64 = 15 * 60 * 1000; // 15 min (matches coord presence TTL)
     let now_ms = chrono::Utc::now().timestamp_millis();
 
-    // Build structured rows: friendly title (scoped prefix stripped), owning
-    // agent, the raw key (needed by the console to issue archive calls), the
-    // archive flag, plus last-active time + derived live state (the console
-    // sorts by recency, splits archived out, and time-filters on these).
-    // Archived rows are hidden unless `include_archived=true`.
-    let mut rows: Vec<serde_json::Value> = store
-        .list_filtered(query.include_archived)
+    // Snapshot the base rows from the session store, then release its lock
+    // before joining the fact store (bindings + coord) so we never hold two
+    // stores at once. `title` (the logical id, scoped prefix stripped) is the
+    // candidate key we join on — see `session_link_maps`.
+    let (base, total_count, archived_count): (Vec<SessionRowBase>, usize, usize) = {
+        let store = state.session_store.read().await;
+        let total_count = store.count();
+        let archived_count = store
+            .list_filtered(true)
+            .len()
+            .saturating_sub(store.list_filtered(false).len());
+        let rows = store
+            .list_filtered(query.include_archived)
+            .into_iter()
+            .filter_map(|raw_key| store.get(raw_key).map(|session| (raw_key.to_string(), session)))
+            .map(|(raw_key, session)| {
+                let (agent, title) = match crux_mcp::scope::split_scoped_session_id(&raw_key) {
+                    Some((owner, logical)) => (Some(owner.to_string()), logical.to_string()),
+                    None => (None, raw_key.clone()),
+                };
+                let last_active_ms = session.updated_at.timestamp_millis();
+                let live_state = if session.archived {
+                    "archived"
+                } else if now_ms.saturating_sub(last_active_ms) <= LIVE_WINDOW_MS {
+                    "active"
+                } else {
+                    "idle"
+                };
+                SessionRowBase {
+                    raw_key,
+                    title,
+                    agent,
+                    archived: session.archived,
+                    archived_at: session.archived_at.map(|t| t.to_rfc3339()),
+                    archive_reason: session.archive_reason.clone(),
+                    last_active_ms,
+                    updated_at: session.updated_at.to_rfc3339(),
+                    live_state,
+                    total_tokens: session.total_tokens,
+                    expires_at: session.expires_at.map(|t| t.to_rfc3339()),
+                    state_first_line: session_state_first_line(&session.state),
+                    // M21 — the conventional agent-authored name + summary
+                    // (`state.title` / `state.summary`, documented on the
+                    // `save_session` tool schema). Absent on every session written
+                    // before the convention existed; the console says so rather
+                    // than inventing a name.
+                    state_title: session_state_str(&session.state, "title"),
+                    state_summary: session_state_str(&session.state, "summary"),
+                    // M21 — identity stamped at write time (see SessionState::actor).
+                    actor: session.actor.clone(),
+                }
+            })
+            .collect();
+        (rows, total_count, archived_count)
+    };
+
+    // Passport (session binding) + live ExecPlan (coord intent) joins. The
+    // session store is keyed by the raw scoped id; bindings/coord are keyed by
+    // `session_id_hex` (a sealed-plan ULID). We join on the logical `title` the
+    // same way `principal::resolve_by_session` does — passing the id straight to
+    // `session_bindings::get_binding` / matching `coord::CoordIntent.session_id_hex`,
+    // with NO client-side hashing. Sessions whose id is not a sealed-plan hex
+    // (agent `save_session` ids) resolve to null — honest, not fabricated.
+    let (binding_by_hex, intent_by_hex) = {
+        let store = state.fact_store.read().await;
+        let bindings: HashMap<String, crate::session_bindings::SessionBinding> =
+            crate::session_bindings::list_bindings(&store)
+                .into_iter()
+                .map(|b| (b.session_id_hex.clone(), b))
+                .collect();
+        let now_u64 = now_ms.max(0) as u64;
+        let intents: HashMap<String, crate::coord::CoordIntent> = crate::coord::list_intents(&store, None)
+            .into_iter()
+            .filter(|i| i.is_live(now_u64))
+            .map(|i| (i.session_id_hex.clone(), i))
+            .collect();
+        (bindings, intents)
+    };
+
+    let mut rows: Vec<serde_json::Value> = base
         .into_iter()
-        .filter_map(|raw_key| store.get(raw_key).map(|session| (raw_key.to_string(), session)))
-        .map(|(raw_key, session)| {
-            let (agent, title) = match crux_mcp::scope::split_scoped_session_id(&raw_key) {
-                Some((owner, logical)) => (Some(owner.to_string()), logical.to_string()),
-                None => (None, raw_key.clone()),
-            };
-            let last_active_ms = session.updated_at.timestamp_millis();
-            let live_state = if session.archived {
-                "archived"
-            } else if now_ms.saturating_sub(last_active_ms) <= LIVE_WINDOW_MS {
-                "active"
-            } else {
-                "idle"
-            };
+        .map(|b| {
+            let binding = binding_by_hex.get(&b.title);
+            let intent = intent_by_hex.get(&b.title);
             serde_json::json!({
-                "session_id": title,
-                "agent": agent,
-                "raw_key": raw_key,
-                "archived": session.archived,
-                "archived_at": session.archived_at,
-                "last_active_unix_ms": last_active_ms,
-                "updated_at": session.updated_at.to_rfc3339(),
-                "state": live_state,
+                "session_id": b.title,
+                "agent": b.agent,
+                "raw_key": b.raw_key,
+                "archived": b.archived,
+                "archived_at": b.archived_at,
+                "archive_reason": b.archive_reason,
+                "last_active_unix_ms": b.last_active_ms,
+                "updated_at": b.updated_at,
+                "state": b.live_state,
+                "total_tokens": b.total_tokens,
+                "expires_at": b.expires_at,
+                "state_first_line": b.state_first_line,
+                "state_title": b.state_title,
+                "state_summary": b.state_summary,
+                "actor": b.actor,
+                "passport_id": binding.map(|x| x.passport_id.clone()),
+                "passport_category": binding.map(|x| x.passport_category.clone()),
+                "execplan_slug": intent.and_then(|x| x.execplan_slug.clone()),
+                "milestone": intent.and_then(|x| x.milestone.clone()),
             })
         })
         .collect();
@@ -1947,6 +2570,53 @@ pub(super) async fn get_console_sessions(
             .unwrap_or(0)
             .cmp(&a["last_active_unix_ms"].as_i64().unwrap_or(0))
     });
+    // M21 — SESSION ALLOCATION, counted server-side over every listed row (before
+    // the 100-row display truncation, so the numbers describe the store and not
+    // the page). This exists because the honest answer to "why do so many sessions
+    // lack a passport / plan?" needs a measurement, not an anecdote:
+    //
+    //  * `passport_id`/`execplan_slug` come from session BINDINGS and live coord
+    //    INTENTS, both keyed by a sealed-plan `session_id_hex` ULID minted by
+    //    POST /session. Agent `save_session` ids live in a DISJOINT key space
+    //    (`__agent_session::<agent>::<slug>`), so they can never match — this is a
+    //    key-space fact, not a bug, and the count makes it legible.
+    //  * `actor` is the write-time identity stamp. It is `None` for anonymous
+    //    callers (a daemon with no CRUX_AGENT_TOKENS — the default local posture)
+    //    and for every session written before the stamp existed. There is no
+    //    backfill pass, so `actor_pre_stamp_or_anonymous` will stay non-zero.
+    let alloc_total = rows.len();
+    let count_present =
+        |key: &str| -> usize { rows.iter().filter(|r| r.get(key).is_some_and(|v| !v.is_null())).count() };
+    let with_actor = count_present("actor");
+    let with_agent = count_present("agent");
+    let with_binding = count_present("passport_id");
+    let with_intent = count_present("execplan_slug");
+    let with_title = count_present("state_title");
+    let with_any_identity = rows
+        .iter()
+        .filter(|r| !r["actor"].is_null() || !r["agent"].is_null() || !r["passport_id"].is_null())
+        .count();
+    let with_any_plan_link = rows
+        .iter()
+        .filter(|r| !r["execplan_slug"].is_null() || !r["passport_id"].is_null())
+        .count();
+    let allocation = serde_json::json!({
+        "counted": alloc_total,
+        "with_actor": with_actor,
+        "with_agent_from_key_prefix": with_agent,
+        "with_any_identity": with_any_identity,
+        "no_identity": alloc_total.saturating_sub(with_any_identity),
+        "with_passport_binding": with_binding,
+        "with_live_execplan_intent": with_intent,
+        "with_any_plan_link": with_any_plan_link,
+        "no_plan_link": alloc_total.saturating_sub(with_any_plan_link),
+        "with_agent_title": with_title,
+        "no_agent_title": alloc_total.saturating_sub(with_title),
+        "why": "passport_id/execplan_slug are keyed by the sealed-plan session_id_hex minted by POST /session; \
+                agent save_session ids are a disjoint key space (__agent_session::<agent>::<slug>) and never match. \
+                actor is stamped at write time and is absent for anonymous callers and for sessions written before the stamp.",
+    });
+
     if rows.len() > 100 {
         rows.truncate(100);
     }
@@ -1954,25 +2624,310 @@ pub(super) async fn get_console_sessions(
     // Backward-compatible flat list of friendly ids (consumed by the classic
     // console and any older caller). Mirrors `session_rows` post-filter/sort.
     let session_ids: Vec<&str> = rows.iter().filter_map(|r| r["session_id"].as_str()).collect();
-    let archived_count = store
-        .list_filtered(true)
-        .len()
-        .saturating_sub(store.list_filtered(false).len());
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "count": rows.len(),
-            "total_count": store.count(),
+            "total_count": total_count,
             "archived_count": archived_count,
             "include_archived": query.include_archived,
             "sessions": session_ids,
             "session_rows": rows,
-            "state_preview": "ids_only",
+            "allocation": allocation,
+            "state_preview": "first_line",
             "raw_state_exposed": false
         })),
     )
         .into_response()
+}
+
+/// Owned snapshot of one session row taken while the session-store lock is held,
+/// so the lock is released before the fact-store (binding + coord) join.
+struct SessionRowBase {
+    raw_key: String,
+    /// Logical session id (scoped prefix stripped) — also the candidate key we
+    /// join to bindings / coord intents on.
+    title: String,
+    agent: Option<String>,
+    archived: bool,
+    archived_at: Option<String>,
+    archive_reason: Option<String>,
+    last_active_ms: i64,
+    updated_at: String,
+    live_state: &'static str,
+    total_tokens: usize,
+    expires_at: Option<String>,
+    state_first_line: Option<String>,
+    /// Conventional `state.title` — the agent-given human name for the session.
+    state_title: Option<String>,
+    /// Conventional `state.summary` — one paragraph on where the work stands.
+    state_summary: Option<String>,
+    /// Identity stamped onto the record at write time (`SessionState::actor`).
+    /// `None` for anonymous writers and for every session written before the
+    /// field existed — there is no backfill and none is invented.
+    actor: Option<String>,
+}
+
+/// Read one CONVENTIONAL top-level string field out of a session `state` blob,
+/// clipped like the first-line preview. Same redaction stance as
+/// [`session_state_first_line`]: named conventional keys only, never an
+/// arbitrary-leaf walk, so an agent's stashed secret can never ride the list.
+fn session_state_str(state: &serde_json::Value, field: &str) -> Option<String> {
+    let s = state.as_object()?.get(field)?.as_str()?;
+    clip_preview(s, 240)
+}
+
+/// Collapse whitespace and clip to `max` chars with an ellipsis. Empty → `None`.
+fn clip_preview(s: &str, max: usize) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let one_line: String = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(if one_line.chars().count() > max {
+        let mut out: String = one_line.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    } else {
+        one_line
+    })
+}
+
+/// Server-derived short (≤140 char) preview of a session `state` blob. Picks the
+/// first meaningful string among the CONVENTIONAL summary fields only
+/// (`decisions`/`decisions_made` first element, `note`, `context_summary`,
+/// `summary`). Returns `None` for a blob that carries none of those.
+///
+/// This is deliberately NOT a "first string leaf anywhere" walk: the sessions
+/// LIST is guarded by `console_redacts_private_facts_and_session_state` (state
+/// content must not transit the list), and an arbitrary-leaf preview would leak
+/// whatever an agent happened to stash (e.g. a `{"token": …}` blob). The
+/// convention fields are the human-authored session summary — the intended,
+/// safe preview. The full blob is exposed only by the admin-read detail route.
+fn session_state_first_line(state: &serde_json::Value) -> Option<String> {
+    fn clip140(s: &str) -> Option<String> {
+        clip_preview(s, 140)
+    }
+    // Convention-only: the fields agents write by habit (see session_store tests
+    // + CLAUDE.md fact conventions). No arbitrary-leaf fallback — see the doc note.
+    let obj = state.as_object()?;
+    for field in ["decisions", "decisions_made"] {
+        if let Some(first) = obj.get(field).and_then(|v| v.as_array()).and_then(|a| a.first()) {
+            if let Some(s) = first.as_str().and_then(clip140) {
+                return Some(s);
+            }
+        }
+    }
+    for field in ["note", "context_summary", "summary"] {
+        if let Some(s) = obj.get(field).and_then(|v| v.as_str()).and_then(clip140) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct ConsoleSessionDetailQuery {
+    /// The raw scoped session-store key (e.g. `__agent_session::openai::slug`).
+    /// A query param, not a path segment, because raw keys contain `/` and `::`.
+    pub key: String,
+}
+
+/// `GET /v1/console/sessions/detail?key=<raw_key>` — the full operator drawer for
+/// one session (console-surfaces-remediation M3). Same auth as the list
+/// (admin-read). DELIBERATELY exposes the full `state` blob — a plan decision for
+/// the operator console — which is why it does NOT flow through the canvas
+/// `renderSessionDetail` path (whose smoke gate forbids reading session state).
+///
+/// Joins (all honest-null when absent):
+///   * `binding` — passport via `session_bindings::get_binding` on the logical id.
+///   * `coord_intent` — live ExecPlan focus via `coord::list_intents` (TTL).
+///   * `gates` — cross-work `__work_transition__::` scan where `by_passport`
+///     matches the bound passport and the gate was decided (approved / rejected /
+///     auto_approved), newest first, capped at 50.
+///   * `linked_plans_heuristic` — `execplan:*` facts authored by the bound
+///     passport, grouped by entity, top 5 by latest write. Fact-authorship is a
+///     heuristic — journaled session↔plan linkage is a daemon follow-up.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_console_session_detail(
+    State(state): State<AppState>,
+    Query(query): Query<ConsoleSessionDetailQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+
+    // Resolve the session from the store by its raw key.
+    const LIVE_WINDOW_MS: i64 = 15 * 60 * 1000;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let session = {
+        let store = state.session_store.read().await;
+        store.get(&query.key).cloned()
+    };
+    let Some(session) = session else {
+        return problem_response(
+            StatusCode::NOT_FOUND,
+            format!("no session stored under key '{}'", query.key),
+        );
+    };
+
+    let (agent, title) = match crux_mcp::scope::split_scoped_session_id(&query.key) {
+        Some((owner, logical)) => (Some(owner.to_string()), logical.to_string()),
+        None => (None, query.key.clone()),
+    };
+    let last_active_ms = session.updated_at.timestamp_millis();
+    let live_state = if session.archived {
+        "archived"
+    } else if now_ms.saturating_sub(last_active_ms) <= LIVE_WINDOW_MS {
+        "active"
+    } else {
+        "idle"
+    };
+
+    // Fact-store joins under a single read lock.
+    let store = state.fact_store.read().await;
+    let binding = crate::session_bindings::get_binding(&store, &title);
+    let now_u64 = now_ms.max(0) as u64;
+    let coord_intent = crate::coord::list_intents(&store, None)
+        .into_iter()
+        .find(|i| i.session_id_hex == title && i.is_live(now_u64));
+
+    // Gates + linked plans require the bound passport as the actor key.
+    let (gates, linked_plans) = match binding.as_ref() {
+        Some(b) => (
+            gates_for_passport(&store, &b.passport_id),
+            linked_plans_for_passport(&store, &b.passport_id),
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
+    drop(store);
+
+    let binding_json = binding.as_ref().map(|b| {
+        serde_json::json!({
+            "passport_id": b.passport_id,
+            "passport_category": b.passport_category,
+            "project_id": b.project_id,
+        })
+    });
+    let coord_json = coord_intent.as_ref().map(|i| {
+        serde_json::json!({
+            "execplan_slug": i.execplan_slug,
+            "milestone": i.milestone,
+            "paths": i.paths,
+            "note": i.note,
+        })
+    });
+
+    let session_meta = serde_json::json!({
+        "session_id": title,
+        "agent": agent,
+        "raw_key": query.key,
+        "archived": session.archived,
+        "archived_at": session.archived_at.map(|t| t.to_rfc3339()),
+        "archive_reason": session.archive_reason,
+        "last_active_unix_ms": last_active_ms,
+        "updated_at": session.updated_at.to_rfc3339(),
+        "state": live_state,
+        "total_tokens": session.total_tokens,
+        "expires_at": session.expires_at.map(|t| t.to_rfc3339()),
+        "state_first_line": session_state_first_line(&session.state),
+        "state_title": session_state_str(&session.state, "title"),
+        "state_summary": session_state_str(&session.state, "summary"),
+        "actor": session.actor,
+        "passport_id": binding.as_ref().map(|b| b.passport_id.clone()),
+        "passport_category": binding.as_ref().map(|b| b.passport_category.clone()),
+        "execplan_slug": coord_intent.as_ref().and_then(|i| i.execplan_slug.clone()),
+        "milestone": coord_intent.as_ref().and_then(|i| i.milestone.clone()),
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "session": session_meta,
+            "state": session.state,
+            "binding": binding_json,
+            "coord_intent": coord_json,
+            "gates": gates,
+            "linked_plans_heuristic": linked_plans,
+        })),
+    )
+        .into_response()
+}
+
+/// Cross-work scan of `__work_transition__::` facts for the gates a passport
+/// decided (approved / rejected / auto_approved), newest first, capped at 50.
+/// Each row carries the work title when the work item is still readable.
+fn gates_for_passport(store: &corecrux_memory::fact_store::FactStore, passport_id: &str) -> Vec<serde_json::Value> {
+    let prefix = format!("{}::", crate::work::WORK_TRANSITION_ENTITY_PREFIX);
+    let mut transitions: Vec<crate::work::WorkTransition> = store
+        .all_facts()
+        .filter(|f| !f.deleted && f.key == crate::work::RECORD_KEY && f.entity.starts_with(&prefix))
+        .filter_map(|f| serde_json::from_str::<crate::work::WorkTransition>(&f.value).ok())
+        .filter(|t| {
+            t.by_passport == passport_id && matches!(t.gate_status.as_str(), "approved" | "rejected" | "auto_approved")
+        })
+        .collect();
+    transitions.sort_by(|a, b| b.at_unix_ms.cmp(&a.at_unix_ms));
+    transitions.truncate(50);
+
+    // Resolve work titles once per distinct work id (bounded by the 50 cap).
+    let mut titles: HashMap<String, Option<String>> = HashMap::new();
+    transitions
+        .into_iter()
+        .map(|t| {
+            let work_title = titles
+                .entry(t.work_id.clone())
+                .or_insert_with(|| crate::work::get_work(store, &t.work_id).map(|w| w.title))
+                .clone();
+            serde_json::json!({
+                "work_id": t.work_id,
+                "work_title": work_title,
+                "from_state": t.from_state,
+                "to_state": t.to_state,
+                "gate_status": t.gate_status,
+                "at_unix_ms": t.at_unix_ms,
+                "receipt_id": t.receipt_id,
+            })
+        })
+        .collect()
+}
+
+/// `execplan:*` facts authored by a passport, grouped by entity, top 5 by latest
+/// write. Heuristic linkage — fact authorship, not a journaled session↔plan edge.
+fn linked_plans_for_passport(
+    store: &corecrux_memory::fact_store::FactStore,
+    passport_id: &str,
+) -> Vec<serde_json::Value> {
+    // (matches, latest stored_at ms) per execplan entity.
+    let mut by_entity: BTreeMap<String, (u64, i64)> = BTreeMap::new();
+    for f in store.all_facts() {
+        if f.deleted || !f.entity.starts_with("execplan:") {
+            continue;
+        }
+        if f.actor.as_deref() != Some(passport_id) {
+            continue;
+        }
+        let at = f.stored_at.timestamp_millis();
+        let e = by_entity.entry(f.entity.clone()).or_insert((0, at));
+        e.0 += 1;
+        if at > e.1 {
+            e.1 = at;
+        }
+    }
+    let mut rows: Vec<(String, u64, i64)> = by_entity.into_iter().map(|(k, (n, at))| (k, n, at)).collect();
+    rows.sort_by(|a, b| b.2.cmp(&a.2));
+    rows.truncate(5);
+    rows.into_iter()
+        .map(|(entity, matches, latest_at)| {
+            serde_json::json!({
+                "entity": entity,
+                "matches": matches,
+                "latest_at": latest_at,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1997,6 +2952,7 @@ fn default_console_confidence() -> f32 {
     1.0
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_facts(
     State(state): State<AppState>,
     Query(query): Query<ConsoleFactsQuery>,
@@ -2005,7 +2961,6 @@ pub(super) async fn get_console_facts(
     if let Err(problem) = require_console_read(&state, &headers) {
         return problem.into_response();
     }
-
     let q = query
         .q
         .as_ref()
@@ -2013,6 +2968,13 @@ pub(super) async fn get_console_facts(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     let top_k = query.top_k.unwrap_or(50).clamp(1, 200);
+    if query.as_of_unix_ms.is_some_and(|as_of| as_of < 0) {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "as_of_unix_ms must not be negative; a cutoff that cannot be applied is refused, not ignored",
+        )
+        .into_response();
+    }
 
     let store = state.fact_store.read().await;
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
@@ -2028,7 +2990,14 @@ pub(super) async fn get_console_facts(
 
     // #6 — server-side as-of filter. We compare against `stored_at` (DateTime<Utc>)
     // converted to ms; facts created strictly after the cutoff are dropped.
-    if let Some(as_of) = query.as_of_unix_ms.filter(|t| *t > 0) {
+    //
+    // D-26: this was `.filter(|t| *t > 0)`, so `as_of_unix_ms=0` silently
+    // disabled the cutoff and returned ALL current facts while the response
+    // still echoed the parameter back — a client computing 0 was told it had
+    // time-travelled and had not. Zero is a valid epoch cutoff (nothing had
+    // been stored yet); a negative one is a broken client and is refused
+    // above, so the cutoff either applies or the request fails.
+    if let Some(as_of) = query.as_of_unix_ms {
         visible_facts.retain(|fact| fact.stored_at.timestamp_millis() <= as_of);
     }
 
@@ -2048,6 +3017,7 @@ pub(super) async fn get_console_facts(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_console_fact_add(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2060,7 +3030,6 @@ pub(super) async fn post_console_fact_add(
         Ok(ctx) => ctx,
         Err(problem) => return problem.into_response(),
     };
-
     let entity = body.entity.trim();
     let key = body.key.trim();
     let value = body.value.trim();
@@ -2069,6 +3038,17 @@ pub(super) async fn post_console_fact_add(
     }
     if !(0.0..=1.0).contains(&body.confidence) {
         return problem_response(StatusCode::BAD_REQUEST, "confidence must be in [0.0, 1.0]");
+    }
+    if let Some(prefix) = crate::fact_privacy::generic_create_reserved_entity_prefix(entity) {
+        return crate::problem::ProblemResponse(
+            corecrux_types::ProblemDetails::forbidden(format!("entity uses create-reserved prefix `{prefix}`"))
+                .with_extensions(serde_json::json!({
+                    "code": "RESERVED_ENTITY_PREFIX",
+                    "entity": entity,
+                    "reserved_prefix": prefix,
+                })),
+        )
+        .into_response();
     }
 
     let mut store = state.fact_store.write().await;
@@ -2102,6 +3082,7 @@ pub(super) struct ConsoleTenantsQuery {
     pub category: Option<String>,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_tenants(
     State(state): State<AppState>,
     Query(query): Query<ConsoleTenantsQuery>,
@@ -2174,6 +3155,7 @@ pub(super) async fn get_console_tenants(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_tenant_chunks(
     State(state): State<AppState>,
     Path(tenant_id): Path<String>,
@@ -2207,6 +3189,7 @@ pub(super) async fn get_console_tenant_chunks(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_chunk(
     State(state): State<AppState>,
     Path(chunk_digest): Path<String>,
@@ -2237,11 +3220,25 @@ pub(super) async fn get_console_chunk(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_chunk_preview(
     State(state): State<AppState>,
     Path(chunk_digest): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    // D-27: the lookup used to run BEFORE any scope check, so an
+    // unauthorized caller got 404 for an absent digest and 401 for a present
+    // one — an existence oracle over every chunk digest. Require the scope
+    // tenant-agnostically first; the tenant-bound check still follows once the
+    // owning tenant is known.
+    // Gate 1 is the SCOPE rail, checked before the lookup: a caller without
+    // `tenant:content:preview` at all is refused 403 without the digest ever
+    // being resolved, so it learns nothing about existence. `admin:read` does
+    // not buy this rail.
+    if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["tenant:content:preview"]) {
+        return problem.into_response();
+    }
+
     let Some(chunk) = (match crate::console_index::find_chunk(&state.data_dir, &chunk_digest) {
         Ok(chunk) => chunk,
         Err(err) => return problem_response(StatusCode::BAD_REQUEST, err.to_string()),
@@ -2249,10 +3246,13 @@ pub(super) async fn get_console_chunk_preview(
         return problem_response(StatusCode::NOT_FOUND, "chunk metadata not found");
     };
 
-    if let Err(problem) =
-        require_http_scopes_for_tenant(&state.auth, &headers, &["tenant:content:preview"], &chunk.tenant_id)
-    {
-        return problem.into_response();
+    // Gate 2 is the TENANT rail, checked after the lookup because it needs the
+    // owner. D-27, second half: a caller holding the preview scope for one
+    // tenant could still tell another tenant's existing digest (403) from an
+    // absent one (404). Past gate 1 the caller does hold the rail, so the only
+    // thing left to hide is the chunk itself — report it absent.
+    if require_http_scopes_for_tenant(&state.auth, &headers, &["tenant:content:preview"], &chunk.tenant_id).is_err() {
+        return problem_response(StatusCode::NOT_FOUND, "chunk metadata not found");
     }
 
     (
@@ -2272,6 +3272,121 @@ pub(super) async fn get_console_chunk_preview(
 #[allow(clippy::result_large_err)]
 fn require_console_read(state: &AppState, headers: &HeaderMap) -> Result<(), crate::problem::ProblemResponse> {
     require_http_scopes(&state.auth, headers, &["admin:read"])
+}
+
+/// Opt-in for returning the raw agent token from `GET /v1/console/connections`.
+///
+/// Default OFF, and it must stay that way. The console is publicly exposed
+/// (`crux.cuecrux.com`), and the agent token is the credential for the entire MCP
+/// surface — a route that hands it back is a credential-disclosure route, so the
+/// operator has to arm it deliberately on a daemon they administer.
+///
+/// Note for anyone tempted to replace this with a peer-address check: the public
+/// console is proxied by Caddy on the same host, so every public request arrives
+/// from loopback. `auth_rails::peer_identity_trusted` would return `true` for the
+/// open internet — an address gate here would leak the token while looking like a
+/// security control.
+const CONSOLE_REVEAL_AGENT_TOKEN_ENV: &str = "CORECRUXD_CONSOLE_REVEAL_AGENT_TOKEN";
+
+/// Non-reversible identifier for a token: first 8 hex of its SHA-256.
+///
+/// Enough for an operator to confirm the console, the daemon env, and their
+/// client all mean the same credential, without disclosing any of it. Deliberately
+/// a digest prefix rather than a slice of the token itself.
+fn token_fingerprint(token: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(token.as_bytes());
+    hex::encode(digest)[..8].to_string()
+}
+
+/// `GET /v1/console/connections` — how a client connects to this daemon.
+///
+/// Returns endpoint URLs plus the state of the agent-token rail. The token's raw
+/// value is included ONLY when `CORECRUXD_CONSOLE_REVEAL_AGENT_TOKEN=1`; otherwise
+/// the response carries a fingerprint and length so the operator can identify the
+/// credential without the route disclosing it.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_console_connections(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+
+    // Mirrors the resolution order in `crux_mcp::agent`: the multi-agent map
+    // wins, then the single-token var.
+    let named = std::env::var("CRUX_AGENT_TOKENS").ok().filter(|s| !s.trim().is_empty());
+    let single = std::env::var("CRUX_AGENT_TOKEN").ok().filter(|s| !s.trim().is_empty());
+
+    let reveal = super::auth_rails::env_flag_enabled(CONSOLE_REVEAL_AGENT_TOKEN_ENV);
+    let (source, token) = match (&named, &single) {
+        // `name:token,name:token` — report the names, never the secrets, and
+        // leave reveal to the single-token rail.
+        (Some(raw), _) => {
+            let names: Vec<&str> = raw
+                .split(',')
+                .filter_map(|pair| pair.split_once(':').map(|(name, _)| name.trim()))
+                .filter(|name| !name.is_empty())
+                .collect();
+            ("CRUX_AGENT_TOKENS", Some((names.join(", "), None::<String>)))
+        }
+        (None, Some(tok)) => ("CRUX_AGENT_TOKEN", Some((String::new(), Some(tok.clone())))),
+        (None, None) => ("", None),
+    };
+
+    let token_json = match token {
+        None => serde_json::json!({
+            "configured": false,
+            "hint": "no CRUX_AGENT_TOKEN or CRUX_AGENT_TOKENS in the daemon environment; \
+                     this daemon accepts MCP requests without a bearer token",
+        }),
+        Some((names, raw)) => {
+            let mut obj = serde_json::json!({
+                "configured": true,
+                "source_env": source,
+                "reveal_enabled": reveal,
+            });
+            if !names.is_empty() {
+                obj["agent_names"] = serde_json::json!(names);
+            }
+            if let Some(raw) = raw {
+                obj["fingerprint"] = serde_json::json!(token_fingerprint(&raw));
+                obj["length"] = serde_json::json!(raw.len());
+                if reveal {
+                    obj["token"] = serde_json::json!(raw);
+                } else {
+                    obj["hint"] = serde_json::json!(format!(
+                        "set {CONSOLE_REVEAL_AGENT_TOKEN_ENV}=1 on this daemon to reveal the \
+                         token here, or read {source} from the daemon's environment file"
+                    ));
+                }
+            } else {
+                obj["hint"] = serde_json::json!(
+                    "per-agent tokens are never revealed here; read CRUX_AGENT_TOKENS from the \
+                     daemon's environment file"
+                );
+            }
+            obj
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "mcp": {
+                "path": "/mcp",
+                "local_url": "http://127.0.0.1:14801/mcp",
+                "note": "the MCP port (14801) is separate from this HTTP port (14800); a public \
+                         deployment usually proxies /mcp on 443 instead of exposing 14801",
+            },
+            "agent_token": token_json,
+            "claude_desktop": {
+                "bundle_url": "/console-assets/crux.mcpb",
+                "filename": "crux.mcpb",
+                "install": "download, then drag onto Claude Desktop's Settings → Extensions pane",
+                "prompts_for": ["server_url", "agent_token"],
+            },
+        })),
+    )
+        .into_response()
 }
 
 #[allow(clippy::result_large_err)]
@@ -2295,6 +3410,7 @@ fn tenant_category_response(
     })
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_console_tenant_category(
     State(state): State<AppState>,
     Path(tenant_id): Path<String>,
@@ -2312,6 +3428,7 @@ pub(super) async fn get_console_tenant_category(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn patch_console_tenant_category(
     State(state): State<AppState>,
     Path(tenant_id): Path<String>,
@@ -2450,6 +3567,38 @@ mod lane_weight_tests {
         assert_eq!(canonical_lane_key("nav"), Some("navtree"));
         assert_eq!(canonical_lane_key("event"), Some("events"));
         assert_eq!(canonical_lane_key("nonsense"), None);
+    }
+
+    /// Every companion whose reader landed at M5 resolves to its lane by extension,
+    /// and every alias must land on a lane `default_lane_weights` actually carries —
+    /// `normalize_lane_weights` rejects anything else, so an alias to a non-lane would
+    /// be a setting the operator can name and the fusion path never reads.
+    #[test]
+    fn ported_companion_extensions_alias_to_real_lanes() {
+        let defaults = default_lane_weights();
+        for (ext, lane) in [
+            ("ccxdi", "indexing"),
+            ("ccxev", "events"),
+            ("ccxf", "topology"),
+            ("ccxal", "vernacular"),
+            ("ccxs", "topology_trait_expansion"),
+            ("ccxse", "topology_trait_expansion"),
+        ] {
+            assert_eq!(canonical_lane_key(ext), Some(lane), "{ext} must alias to {lane}");
+            assert!(defaults.contains_key(lane), "{lane} must be a real lane");
+        }
+    }
+
+    /// `.ccxn` and `.ccxp` have readers but no lane yet — the M6 scorer ruling decides
+    /// whether they get one. Until then, naming them must be an error the operator
+    /// sees, not a weight that is silently dropped.
+    #[test]
+    fn companions_without_a_lane_are_rejected_rather_than_silently_accepted() {
+        assert_eq!(canonical_lane_key("ccxn"), None);
+        assert_eq!(canonical_lane_key("ccxp"), None);
+        let mut raw = BTreeMap::new();
+        raw.insert("ccxn".to_string(), 1.0);
+        assert!(normalize_lane_weights(&raw).is_err());
     }
 
     #[test]
@@ -2672,5 +3821,2273 @@ mod lane_weight_tests {
             StatusCode::BAD_REQUEST,
             "empty target set is rejected, not laundered into 200"
         );
+    }
+
+    // ── CoreCrux link-graph mediation proxy (ExecPlan wikicrux-link-graph M4) ──
+
+    fn qmap(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn reject_unknown_graph_params_allows_known_rejects_extras() {
+        assert!(reject_unknown_graph_params(&qmap(&[("titles", "Dog|Cat")]), GRAPH_RESOLVE_PARAMS).is_ok());
+        // A cache-buster / arbitrary param is rejected (T.5: fixed audited surface).
+        assert!(reject_unknown_graph_params(&qmap(&[("titles", "Dog"), ("_", "9")]), GRAPH_RESOLVE_PARAMS).is_err());
+        assert!(reject_unknown_graph_params(&qmap(&[("tenant_id", "x")]), GRAPH_EGO_PARAMS).is_err());
+    }
+
+    #[test]
+    fn build_graph_ego_body_valid_and_caps() {
+        let body = build_graph_ego_body(&qmap(&[
+            ("seeds", "1,2,3"),
+            ("hops", "9"),
+            ("budget_nodes", "5000"),
+            ("budget_edges", "20000"),
+        ]))
+        .expect("valid ego body");
+        assert_eq!(body["seeds"], serde_json::json!([1, 2, 3]));
+        assert_eq!(
+            body["hops"],
+            serde_json::json!(3),
+            "hops clamps to the upstream max of 3"
+        );
+        assert_eq!(body["budget"]["nodes"], serde_json::json!(5000));
+        assert_eq!(body["kind"], serde_json::json!("link"), "kind defaults to link");
+        assert_eq!(body["direction"], serde_json::json!("both"));
+    }
+
+    #[test]
+    fn build_graph_ego_body_error_paths() {
+        assert!(
+            build_graph_ego_body(&qmap(&[("budget_nodes", "1"), ("budget_edges", "1")])).is_err(),
+            "seeds required"
+        );
+        assert!(
+            build_graph_ego_body(&qmap(&[("seeds", "1")])).is_err(),
+            "budgets required"
+        );
+        assert!(
+            build_graph_ego_body(&qmap(&[("seeds", "1"), ("budget_nodes", "0"), ("budget_edges", "1")])).is_err(),
+            "budget must be > 0"
+        );
+        assert!(
+            build_graph_ego_body(&qmap(&[
+                ("seeds", "1"),
+                ("budget_nodes", "999999"),
+                ("budget_edges", "1")
+            ]))
+            .is_err(),
+            "budget over the upstream max is rejected"
+        );
+        assert!(
+            build_graph_ego_body(&qmap(&[
+                ("seeds", "1"),
+                ("budget_nodes", "1"),
+                ("budget_edges", "1"),
+                ("kind", "nope")
+            ]))
+            .is_err(),
+            "bad kind rejected"
+        );
+        assert!(
+            build_graph_ego_body(&qmap(&[
+                ("seeds", "1"),
+                ("budget_nodes", "1"),
+                ("budget_edges", "1"),
+                ("direction", "sideways")
+            ]))
+            .is_err(),
+            "bad direction rejected"
+        );
+        assert!(build_graph_ego_body(&qmap(&[
+            ("seeds", "notanint"),
+            ("budget_nodes", "1"),
+            ("budget_edges", "1")
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn build_graph_path_body_valid_and_caps() {
+        let body = build_graph_path_body(&qmap(&[
+            ("src", "1"),
+            ("dst", "2"),
+            ("k", "999"),
+            ("context_edge_budget", "999999"),
+        ]))
+        .expect("valid path body");
+        assert_eq!(body["src"], serde_json::json!(1));
+        assert_eq!(body["dst"], serde_json::json!(2));
+        assert_eq!(body["max_hops"], serde_json::json!(6), "max_hops defaults to 6");
+        assert_eq!(body["k"], serde_json::json!(64), "k clamps to 64");
+        assert_eq!(
+            body["context_edge_budget"],
+            serde_json::json!(20000),
+            "context edge budget clamps to 20000"
+        );
+    }
+
+    #[test]
+    fn build_graph_path_body_error_paths() {
+        assert!(build_graph_path_body(&qmap(&[("dst", "2")])).is_err(), "src required");
+        assert!(build_graph_path_body(&qmap(&[("src", "1")])).is_err(), "dst required");
+        assert!(
+            build_graph_path_body(&qmap(&[("src", "1"), ("dst", "2"), ("max_hops", "0")])).is_err(),
+            "max_hops must be >= 1"
+        );
+        assert!(
+            build_graph_path_body(&qmap(&[("src", "1"), ("dst", "2"), ("max_hops", "9")])).is_err(),
+            "max_hops must be <= 8"
+        );
+    }
+
+    #[test]
+    fn map_graph_upstream_status_hides_auth_and_surfaces_availability() {
+        // Upstream flag-off (404) and graph-absent (503) both surface as 503 so the
+        // pane shows the enable/build hint.
+        assert_eq!(map_graph_upstream_status(404), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(map_graph_upstream_status(503), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(map_graph_upstream_status(400), StatusCode::BAD_REQUEST);
+        // Upstream auth failure (daemon-token misconfig) never leaks — collapses to 502.
+        assert_eq!(map_graph_upstream_status(401), StatusCode::BAD_GATEWAY);
+        assert_eq!(map_graph_upstream_status(403), StatusCode::BAD_GATEWAY);
+        assert_eq!(map_graph_upstream_status(500), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn corecrux_graph_base_url_env_unset_and_set() {
+        for k in ["CORECRUXD_CORECRUX_GRAPH_BASE_URL", "CORECRUX_GRAPH_BASE_URL"] {
+            std::env::remove_var(k);
+        }
+        assert!(corecrux_graph_base_url_from_env().is_err());
+        assert!(!corecrux_graph_base_url_configured());
+        std::env::set_var("CORECRUX_GRAPH_BASE_URL", "http://data-1:14800/");
+        assert_eq!(corecrux_graph_base_url_from_env().unwrap(), "http://data-1:14800");
+        assert!(corecrux_graph_base_url_configured());
+        std::env::remove_var("CORECRUX_GRAPH_BASE_URL");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn graph_handlers_503_without_upstream_and_400_on_bad_params() {
+        for k in ["CORECRUXD_CORECRUX_GRAPH_BASE_URL", "CORECRUX_GRAPH_BASE_URL"] {
+            std::env::remove_var(k);
+        }
+        let state = st();
+        // stats → 503 (graph upstream unconfigured; console hides / dims the pane).
+        let resp = get_console_corecrux_graph_stats(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(status_of(resp).await, StatusCode::SERVICE_UNAVAILABLE);
+
+        // resolve with no titles → 400 (validated before the env lookup).
+        let resp =
+            get_console_corecrux_graph_resolve(State(state.clone()), HeaderMap::new(), Query(qmap(&[("titles", "")])))
+                .await
+                .into_response();
+        assert_eq!(status_of(resp).await, StatusCode::BAD_REQUEST);
+
+        // ego with an unknown param → 400.
+        let resp = get_console_corecrux_graph_ego(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(qmap(&[("seeds", "1"), ("nope", "1")])),
+        )
+        .await
+        .into_response();
+        assert_eq!(status_of(resp).await, StatusCode::BAD_REQUEST);
+
+        // path with max_hops out of range → 400.
+        let resp = get_console_corecrux_graph_path(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(qmap(&[("src", "1"), ("dst", "2"), ("max_hops", "9")])),
+        )
+        .await
+        .into_response();
+        assert_eq!(status_of(resp).await, StatusCode::BAD_REQUEST);
+
+        // resolve with a real title but upstream unset → 503.
+        let resp =
+            get_console_corecrux_graph_resolve(State(state), HeaderMap::new(), Query(qmap(&[("titles", "Dog")])))
+                .await
+                .into_response();
+        assert_eq!(status_of(resp).await, StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod session_detail_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::response::Response;
+    use corecrux_memory::fact_store::StoreFact;
+    use serde_json::{json, Value};
+
+    fn st() -> AppState {
+        super::super::tests::test_app_state(16)
+    }
+
+    async fn body_json(resp: Response) -> Value {
+        let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("read body");
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    }
+
+    /// Store a work-transition fact the way `work::transition_store_fact` does,
+    /// so `gates_for_passport`'s prefix scan finds it.
+    fn store_transition(store: &mut corecrux_memory::fact_store::FactStore, tx: &crate::work::WorkTransition) {
+        let sf = StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: format!(
+                "{}::{}::{}-{}",
+                crate::work::WORK_TRANSITION_ENTITY_PREFIX,
+                tx.work_id,
+                tx.at_unix_ms,
+                tx.id
+            ),
+            key: crate::work::RECORD_KEY.to_string(),
+            value: serde_json::to_string(tx).unwrap(),
+            source_receipt: tx.receipt_id.clone(),
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: Some(tx.by_passport.clone()),
+        };
+        store.store(sf);
+    }
+
+    fn mk_transition(
+        work_id: &str,
+        passport: &str,
+        gate: &str,
+        at: u64,
+        receipt: Option<&str>,
+    ) -> crate::work::WorkTransition {
+        crate::work::WorkTransition {
+            id: format!("t_{at}"),
+            work_id: work_id.to_string(),
+            from_state: "in_progress".to_string(),
+            to_state: "done".to_string(),
+            by_passport: passport.to_string(),
+            gate_status: gate.to_string(),
+            at_unix_ms: at,
+            blocker_kind: None,
+            receipt_id: receipt.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn state_first_line_prefers_conventional_fields_then_leaf() {
+        assert_eq!(
+            session_state_first_line(&json!({ "decisions_made": ["chose canary"], "x": 1 })).as_deref(),
+            Some("chose canary")
+        );
+        assert_eq!(
+            session_state_first_line(&json!({ "note": "  wired M3  " })).as_deref(),
+            Some("wired M3")
+        );
+        assert_eq!(
+            session_state_first_line(&json!({ "context_summary": "building Crux" })).as_deref(),
+            Some("building Crux")
+        );
+        // NO arbitrary-leaf fallback: a non-conventional blob yields no preview,
+        // so the list can't leak an agent's stashed content (redaction invariant).
+        assert_eq!(
+            session_state_first_line(&json!({ "misc": { "deep": ["", "hello"] } })),
+            None
+        );
+        assert_eq!(
+            session_state_first_line(&json!({ "token": "secret-session-token" })),
+            None
+        );
+        // Empty / string-less blobs → None (honest).
+        assert_eq!(session_state_first_line(&json!({ "n": 42 })), None);
+        assert_eq!(session_state_first_line(&json!({})), None);
+        // Long lines are clipped to <=140 chars with an ellipsis.
+        let long = "x".repeat(300);
+        let clipped = session_state_first_line(&json!({ "note": long })).unwrap();
+        assert!(clipped.chars().count() <= 140, "got {}", clipped.chars().count());
+        assert!(clipped.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn list_rows_carry_new_fields() {
+        let state = st();
+        {
+            let mut store = state.session_store.write().await;
+            store.put(
+                "__agent_session::anthropic::plan-slug",
+                json!({ "decisions": ["shipped M3"] }),
+                Some(3600),
+            );
+        }
+        let resp = get_console_sessions(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(ConsoleSessionsQuery {
+                include_archived: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["state_preview"], "first_line");
+        let row = &body["session_rows"][0];
+        assert_eq!(row["session_id"], "plan-slug");
+        assert_eq!(row["agent"], "anthropic");
+        assert!(row["total_tokens"].as_u64().unwrap() > 0);
+        assert!(row["expires_at"].is_string());
+        assert_eq!(row["state_first_line"], "shipped M3");
+        // No binding / coord intent for this session → honest null.
+        assert!(row["passport_id"].is_null());
+        assert!(row["execplan_slug"].is_null());
+    }
+
+    #[tokio::test]
+    async fn list_carries_actor_title_summary_and_allocation() {
+        // M21 — the three new row fields plus the server-computed allocation
+        // block. The point of the block is that "why is so much unlinked?" has a
+        // measured answer: two of these three sessions carry no identity at all,
+        // and none of them can carry a plan link because agent session ids are a
+        // different key space from the sealed-plan hex the joins use.
+        let state = st();
+        {
+            let mut store = state.session_store.write().await;
+            // (a) titled + summarised + stamped, written through the actor path.
+            store.put_with_actor(
+                "__agent_session::anthropic::named",
+                json!({ "title": "M21 console round 10", "summary": "Accordion icons and the LOD anchor fix landed." }),
+                None,
+                Some("claude-work".to_string()),
+            );
+            // (b) anonymous, conventional first line only.
+            store.put("anon-one", json!({ "note": "resume here" }), None);
+            // (c) anonymous, nothing conventional at all.
+            store.put("anon-two", json!({ "n": 1 }), None);
+        }
+        let resp = get_console_sessions(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(ConsoleSessionsQuery {
+                include_archived: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+
+        let rows = body["session_rows"].as_array().unwrap();
+        let named = rows.iter().find(|r| r["session_id"] == "named").unwrap();
+        assert_eq!(named["actor"], "claude-work");
+        assert_eq!(named["state_title"], "M21 console round 10");
+        assert_eq!(named["state_summary"], "Accordion icons and the LOD anchor fix landed.");
+        assert_eq!(named["agent"], "anthropic");
+
+        let anon = rows.iter().find(|r| r["session_id"] == "anon-two").unwrap();
+        assert!(anon["actor"].is_null(), "anonymous writers stamp nothing");
+        assert!(anon["state_title"].is_null());
+        assert!(anon["state_summary"].is_null());
+        assert!(anon["state_first_line"].is_null());
+
+        let a = &body["allocation"];
+        assert_eq!(a["counted"], 3);
+        assert_eq!(a["with_actor"], 1);
+        assert_eq!(a["with_agent_from_key_prefix"], 1); // only the scoped key carries one
+        assert_eq!(a["with_any_identity"], 1);
+        assert_eq!(a["no_identity"], 2);
+        assert_eq!(a["with_agent_title"], 1);
+        assert_eq!(a["no_agent_title"], 2);
+        // Disjoint key spaces: no agent session id can match a sealed-plan hex.
+        assert_eq!(a["with_passport_binding"], 0);
+        assert_eq!(a["with_live_execplan_intent"], 0);
+        assert_eq!(a["no_plan_link"], 3);
+        assert!(a["why"].as_str().unwrap().contains("disjoint key space"));
+    }
+
+    #[tokio::test]
+    async fn detail_joins_binding_gates_and_plans() {
+        let state = st();
+        let hex = "abcdef0123456789abcdef0123456789";
+        let raw_key = format!("__agent_session::anthropic::{hex}");
+        {
+            let mut sstore = state.session_store.write().await;
+            sstore.put(&raw_key, json!({ "note": "resume here" }), None);
+        }
+        {
+            let mut fstore = state.fact_store.write().await;
+            // Binding keyed by the session's logical id (== hex here) → join works.
+            let binding = crate::session_bindings::SessionBinding {
+                session_id_hex: hex.to_string(),
+                project_id: Some("plancrux".to_string()),
+                tenant_id: "work::team".to_string(),
+                passport_id: "claude-work".to_string(),
+                passport_category: "work".to_string(),
+                agent_work_gate: true,
+                bound_at_unix_ms: 1000,
+            };
+            crate::session_bindings::write_binding(&mut fstore, &binding).unwrap();
+            // A decided gate by this passport (newest first) + an undecided one (filtered out).
+            store_transition(
+                &mut fstore,
+                &mk_transition("w_1", "claude-work", "approved", 2000, Some("ad_ga_1")),
+            );
+            store_transition(&mut fstore, &mk_transition("w_2", "claude-work", "queued", 3000, None));
+            store_transition(
+                &mut fstore,
+                &mk_transition("w_3", "someone-else", "approved", 4000, None),
+            );
+            // execplan authorship by this passport (heuristic plan linkage).
+            let mut ef = StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: "execplan:my-plan".to_string(),
+                key: "gate:M3".to_string(),
+                value: "{\"status\":\"pass\"}".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: Some("claude-work".to_string()),
+            };
+            crate::fact_privacy::enforce_global(&mut ef);
+            fstore.store(ef);
+        }
+        let resp = get_console_session_detail(
+            State(state.clone()),
+            Query(ConsoleSessionDetailQuery { key: raw_key.clone() }),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        // Full state blob is exposed (deliberate admin-read decision).
+        assert_eq!(body["state"], json!({ "note": "resume here" }));
+        assert_eq!(body["binding"]["passport_id"], "claude-work");
+        assert_eq!(body["binding"]["project_id"], "plancrux");
+        // Only the decided gate by this passport survives.
+        let gates = body["gates"].as_array().unwrap();
+        assert_eq!(gates.len(), 1);
+        assert_eq!(gates[0]["work_id"], "w_1");
+        assert_eq!(gates[0]["gate_status"], "approved");
+        assert_eq!(gates[0]["receipt_id"], "ad_ga_1");
+        // Heuristic plan linkage grouped by entity.
+        let plans = body["linked_plans_heuristic"].as_array().unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0]["entity"], "execplan:my-plan");
+        assert_eq!(plans[0]["matches"], 1);
+    }
+
+    #[tokio::test]
+    async fn detail_missing_session_is_404() {
+        let state = st();
+        let resp = get_console_session_detail(
+            State(state.clone()),
+            Query(ConsoleSessionDetailQuery {
+                key: "nope".to_string(),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn detail_without_binding_is_honest_empty() {
+        let state = st();
+        {
+            let mut sstore = state.session_store.write().await;
+            sstore.put("__agent_session::openai::unbound", json!({ "k": "v" }), None);
+        }
+        let resp = get_console_session_detail(
+            State(state.clone()),
+            Query(ConsoleSessionDetailQuery {
+                key: "__agent_session::openai::unbound".to_string(),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert!(body["binding"].is_null());
+        assert!(body["coord_intent"].is_null());
+        assert_eq!(body["gates"].as_array().unwrap().len(), 0);
+        assert_eq!(body["linked_plans_heuristic"].as_array().unwrap().len(), 0);
+        // State is still exposed even with no linkage.
+        assert_eq!(body["state"], json!({ "k": "v" }));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn st() -> AppState {
+        crate::http::tests::test_app_state(16)
+    }
+
+    /// `DevScopes` state — the only mode in which 401 (no credential) and 403
+    /// (credential without the scope) are distinguishable.
+    fn st_dev() -> AppState {
+        crate::http::tests::test_app_state_with_auth(16, crate::auth::AuthMode::DevScopes)
+    }
+
+    fn scoped(scopes: &str) -> HeaderMap {
+        crate::http::tests::dev_scope_headers(scopes)
+    }
+
+    async fn body_json(resp: axum::response::Response) -> Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 22)
+            .await
+            .expect("read response body");
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    }
+
+    fn seed(store: &mut corecrux_memory::FactStore, entity: &str, key: &str, value: &str, private: bool) {
+        seed_conf(store, entity, key, value, private, 1.0);
+    }
+
+    fn seed_conf(
+        store: &mut corecrux_memory::FactStore,
+        entity: &str,
+        key: &str,
+        value: &str,
+        private: bool,
+        confidence: f32,
+    ) -> String {
+        store
+            .try_store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: corecrux_memory::fact_store::default_tenant_hash(),
+                entity: entity.to_string(),
+                key: key.to_string(),
+                value: value.to_string(),
+                source_receipt: None,
+                confidence,
+                private,
+                horizon_class: None,
+                actor: None,
+            })
+            .expect("seed fact")
+            .fact_id
+    }
+
+    // ── Small pure helpers ───────────────────────────────────────────────
+
+    /// Replaces `console_actor_from_headers_defaults_trims_and_ignores_blank`.
+    ///
+    /// That test asserted the actor was read straight off `x-corecrux-passport-id`,
+    /// trimmed, defaulting to `console` when absent. That behaviour is what this
+    /// slice removes: an unauthenticated caller could name themselves as the
+    /// actor on a review mutation just by setting a header, and the attribution
+    /// on the resulting receipt would carry their claim as fact.
+    ///
+    /// `console_mutation_authority` derives both tenant and actor from the
+    /// authenticated context instead. Kept as a test rather than deleted so the
+    /// old behaviour cannot quietly return.
+    #[test]
+    fn console_mutation_authority_does_not_take_the_actor_from_a_bare_header() {
+        let state = st_dev();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-passport-id", "  claude-work ".parse().unwrap());
+
+        let denied = console_mutation_authority(&state, &headers);
+        assert!(
+            denied.is_err(),
+            "a passport header with no credential behind it must not authorise a review mutation"
+        );
+    }
+
+    /// The fingerprint is what the connections route publishes in place of the
+    /// credential. It must be a digest prefix, never a slice of the token.
+    #[test]
+    fn token_fingerprint_is_a_short_digest_not_the_token() {
+        let fp = token_fingerprint("super-secret-agent-token");
+        assert_eq!(fp.len(), 8);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(!"super-secret-agent-token".contains(&fp));
+        assert_eq!(fp, token_fingerprint("super-secret-agent-token"), "deterministic");
+        assert_ne!(fp, token_fingerprint("super-secret-agent-tokem"));
+    }
+
+    #[test]
+    fn clip_preview_collapses_whitespace_and_clips_with_an_ellipsis() {
+        assert_eq!(clip_preview("  a\n\t b  ", 140).as_deref(), Some("a b"));
+        assert_eq!(clip_preview("   ", 140), None);
+        let clipped = clip_preview(&"x".repeat(500), 10).unwrap();
+        assert_eq!(clipped.chars().count(), 10);
+        assert!(clipped.ends_with('…'));
+    }
+
+    #[test]
+    fn session_state_str_reads_only_conventional_string_fields() {
+        let state = json!({ "title": "  M4 gate  ", "summary": 7, "token": "leak-me" });
+        assert_eq!(session_state_str(&state, "title").as_deref(), Some("M4 gate"));
+        assert_eq!(session_state_str(&state, "summary"), None, "non-strings are skipped");
+        assert_eq!(session_state_str(&state, "missing"), None);
+        assert_eq!(session_state_str(&json!("not-an-object"), "title"), None);
+    }
+
+    #[test]
+    fn consolidation_problem_maps_every_error_variant() {
+        use corecrux_memory::fact_store::ConsolidationErrorV1 as E;
+        let cases: Vec<(E, StatusCode)> = vec![
+            (E::NoTargets, StatusCode::BAD_REQUEST),
+            (E::TargetOutsideEntityKey("f".into()), StatusCode::BAD_REQUEST),
+            (E::TargetNotFound("f".into()), StatusCode::NOT_FOUND),
+            (E::TargetDeleted("f".into()), StatusCode::CONFLICT),
+            (E::TargetPinned("f".into()), StatusCode::CONFLICT),
+            (E::TargetPrivate("f".into()), StatusCode::CONFLICT),
+            (E::TargetReceiptLinked("f".into()), StatusCode::CONFLICT),
+            (
+                E::TargetHighConfidence {
+                    fact_id: "f".into(),
+                    confidence: "0.99".into(),
+                },
+                StatusCode::CONFLICT,
+            ),
+            (E::Journal("disk".into()), StatusCode::INTERNAL_SERVER_ERROR),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(consolidation_problem(err).status(), expected);
+        }
+    }
+
+    #[test]
+    fn tenant_category_response_separates_derived_from_override() {
+        // No override → derived == effective.
+        let plain = tenant_category_response("acme", None);
+        assert_eq!(plain["derived"], "work");
+        assert_eq!(plain["effective"], "work");
+        assert!(plain["override"].is_null());
+        // An override changes `effective` while `derived` still reports the
+        // prefix-based classification.
+        let overridden = tenant_category_response("acme", Some(crux_mcp::tenant_category::TenantCategory::Personal));
+        assert_eq!(overridden["derived"], "work");
+        assert_eq!(overridden["override"], "personal");
+        assert_eq!(overridden["effective"], "personal");
+    }
+
+    #[test]
+    fn resolve_install_manifest_rejects_mismatched_or_unknown_packs() {
+        let builtin = crux_integrations::builtin_manifests()
+            .into_iter()
+            .next()
+            .expect("at least one builtin manifest");
+
+        // Inline manifest whose id disagrees with the path → 400.
+        let (status, _) = resolve_install_manifest(
+            "other.pack",
+            InstallIntegrationBody {
+                manifest: Some(builtin.clone()),
+                pack_id: None,
+                version: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Inline manifest matching the path → accepted verbatim.
+        let resolved = resolve_install_manifest(
+            &builtin.id,
+            InstallIntegrationBody {
+                manifest: Some(builtin.clone()),
+                pack_id: None,
+                version: None,
+            },
+        )
+        .expect("matching manifest");
+        assert_eq!(resolved.id, builtin.id);
+
+        // Builtin lookup by id+version.
+        let resolved = resolve_install_manifest(
+            &builtin.id,
+            InstallIntegrationBody {
+                manifest: None,
+                pack_id: Some(builtin.id.clone()),
+                version: Some(builtin.version.clone()),
+            },
+        )
+        .expect("builtin lookup");
+        assert_eq!(resolved.version, builtin.version);
+
+        // Body pack_id contradicting the path → 400, not a silent install of the
+        // path pack.
+        let (status, _) = resolve_install_manifest(
+            &builtin.id,
+            InstallIntegrationBody {
+                manifest: None,
+                pack_id: Some("someone-elses-pack".to_string()),
+                version: Some(builtin.version.clone()),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Unknown pack → 404.
+        let (status, _) = resolve_install_manifest(
+            "does.not.exist",
+            InstallIntegrationBody {
+                manifest: None,
+                pack_id: None,
+                version: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn manifest_trust_tier_requires_first_party_publisher_or_a_signature() {
+        let mut manifest = crux_integrations::builtin_manifests()
+            .into_iter()
+            .next()
+            .expect("builtin manifest");
+        manifest.publisher_passport_fpr = crux_integrations::FIRST_PARTY_PASSPORT.to_string();
+        assert_eq!(manifest_trust_tier(&manifest), crux_integrations::TrustTier::FirstParty);
+        manifest.publisher_passport_fpr = "p_someone_else".to_string();
+        manifest.signature = None;
+        assert_eq!(manifest_trust_tier(&manifest), crux_integrations::TrustTier::Unknown);
+    }
+
+    #[test]
+    fn apply_safe_mode_blocks_only_enabled_non_first_party_packs() {
+        let mut packs = crux_integrations::builtin_packs().expect("builtin packs");
+        assert!(!packs.is_empty());
+        for pack in &mut packs {
+            pack.trust_tier = crux_integrations::TrustTier::Unknown;
+            pack.install_state = crux_integrations::InstallState::Enabled;
+        }
+        let unchanged = apply_safe_mode(packs.clone(), false);
+        assert!(unchanged
+            .iter()
+            .all(|p| p.install_state == crux_integrations::InstallState::Enabled));
+
+        let blocked = apply_safe_mode(packs.clone(), true);
+        assert!(blocked
+            .iter()
+            .all(|p| p.install_state == crux_integrations::InstallState::Blocked));
+
+        // A first-party pack keeps its state even in safe mode.
+        for pack in &mut packs {
+            pack.trust_tier = crux_integrations::TrustTier::FirstParty;
+        }
+        let first_party = apply_safe_mode(packs, true);
+        assert!(first_party
+            .iter()
+            .all(|p| p.install_state == crux_integrations::InstallState::Enabled));
+    }
+
+    #[test]
+    fn integration_problem_maps_status_by_error_class() {
+        assert_eq!(
+            integration_problem(crux_integrations::IntegrationError::PackNotInstalled {
+                pack_id: "p".to_string(),
+                version: "0.1.0".to_string(),
+            })
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            integration_problem(crux_integrations::IntegrationError::ExternalHelperDisabled).status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            integration_problem(crux_integrations::IntegrationError::Io(std::io::Error::other("boom"))).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn now_unix_ms_is_a_plausible_wall_clock() {
+        assert!(now_unix_ms() > 1_700_000_000_000, "after 2023");
+    }
+
+    // ── Auth: 401 vs 403 across the console surface ──────────────────────
+
+    /// Every console READ route is `admin:read`. A missing credential must be
+    /// 401 and a wrong-scope credential 403 — collapsing them hides which of the
+    /// two rails broke.
+    #[tokio::test]
+    async fn console_read_routes_401_without_credential_and_403_with_wrong_scope() {
+        let state = st_dev();
+        let none = HeaderMap::new();
+        let wrong = scoped("facts:read");
+
+        for (label, status_none, status_wrong) in [
+            (
+                "summary",
+                get_console_summary(State(state.clone()), none.clone())
+                    .await
+                    .into_response()
+                    .status(),
+                get_console_summary(State(state.clone()), wrong.clone())
+                    .await
+                    .into_response()
+                    .status(),
+            ),
+            (
+                "settings",
+                get_console_settings(State(state.clone()), none.clone())
+                    .await
+                    .into_response()
+                    .status(),
+                get_console_settings(State(state.clone()), wrong.clone())
+                    .await
+                    .into_response()
+                    .status(),
+            ),
+            (
+                "passports",
+                get_console_passports(State(state.clone()), none.clone())
+                    .await
+                    .into_response()
+                    .status(),
+                get_console_passports(State(state.clone()), wrong.clone())
+                    .await
+                    .into_response()
+                    .status(),
+            ),
+            (
+                "connections",
+                get_console_connections(State(state.clone()), none.clone())
+                    .await
+                    .into_response()
+                    .status(),
+                get_console_connections(State(state.clone()), wrong.clone())
+                    .await
+                    .into_response()
+                    .status(),
+            ),
+            (
+                "storage_breakdown",
+                get_console_storage_breakdown(State(state.clone()), none.clone())
+                    .await
+                    .into_response()
+                    .status(),
+                get_console_storage_breakdown(State(state.clone()), wrong.clone())
+                    .await
+                    .into_response()
+                    .status(),
+            ),
+            (
+                "integrations",
+                get_console_integrations(State(state.clone()), none.clone())
+                    .await
+                    .into_response()
+                    .status(),
+                get_console_integrations(State(state.clone()), wrong.clone())
+                    .await
+                    .into_response()
+                    .status(),
+            ),
+        ] {
+            assert_eq!(status_none, StatusCode::UNAUTHORIZED, "{label} without a credential");
+            assert_eq!(status_wrong, StatusCode::FORBIDDEN, "{label} with the wrong scope");
+        }
+    }
+
+    #[tokio::test]
+    async fn console_query_read_routes_also_enforce_admin_read() {
+        let state = st_dev();
+        let facts_query = || {
+            Query(ConsoleFactsQuery {
+                q: None,
+                top_k: None,
+                as_of_unix_ms: None,
+            })
+        };
+        assert_eq!(
+            get_console_facts(State(state.clone()), facts_query(), HeaderMap::new())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_console_facts(State(state.clone()), facts_query(), scoped("facts:read"))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get_console_facts(State(state.clone()), facts_query(), scoped("admin:read"))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::OK
+        );
+
+        let tenants_query = || Query(ConsoleTenantsQuery { category: None });
+        assert_eq!(
+            get_console_tenants(State(state.clone()), tenants_query(), HeaderMap::new())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_console_tenants(State(state.clone()), tenants_query(), scoped("admin:read"))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_console_review_queue(
+                State(state.clone()),
+                HeaderMap::new(),
+                Query(ConsoleReviewQuery { limit: None })
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_console_tenant_category(State(state), Path("acme".to_string()), scoped("facts:read"))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// Console WRITE routes are `admin:write`; an `admin:read` credential is a
+    /// 403, not a pass.
+    #[tokio::test]
+    async fn console_write_routes_reject_a_read_only_credential() {
+        let state = st_dev();
+        let read_only = scoped("admin:read");
+
+        assert_eq!(
+            put_console_settings(
+                State(state.clone()),
+                read_only.clone(),
+                Json(UpdateSettingsBody {
+                    auth_mode: None,
+                    embedding_enabled: None,
+                    embedding_url: None,
+                    embedding_model: None,
+                })
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_console_onboarding_restart(State(state.clone()), read_only.clone())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_console_onboarding_restart(State(state.clone()), HeaderMap::new())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_console_review_expiries(
+                State(state.clone()),
+                read_only.clone(),
+                Json(ConsoleExpiryApplyRequest {
+                    fact_ids: vec!["f1".to_string()]
+                })
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_console_review_consolidation_undo(
+                State(state.clone()),
+                read_only.clone(),
+                Json(ConsolidationUndoRequest {
+                    canonical_fact_id: "f1".to_string(),
+                    source_fact_ids: Vec::new(),
+                })
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            patch_console_tenant_category(
+                State(state.clone()),
+                Path("acme".to_string()),
+                read_only.clone(),
+                Json(crate::tenant_metadata::PatchTenantCategoryBody {
+                    category: "personal".to_string()
+                })
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_console_embedding_probe(
+                State(state.clone()),
+                read_only.clone(),
+                Json(ProbeEmbeddingBody {
+                    url: "http://example.com".to_string()
+                })
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // Integration mutations ride their OWN scopes — `admin:write` alone is
+        // not enough, which is the point of splitting them out.
+        assert_eq!(
+            post_console_integration_install(
+                State(state.clone()),
+                Path("mcp.claude-desktop".to_string()),
+                scoped("admin:write"),
+                Json(InstallIntegrationBody {
+                    manifest: None,
+                    pack_id: None,
+                    version: None,
+                })
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_console_integration_grant(
+                State(state.clone()),
+                Path("mcp.claude-desktop".to_string()),
+                scoped("admin:write"),
+                Json(GrantIntegrationBody {
+                    version: "0.1.0".to_string(),
+                    capabilities: vec!["memory.read".to_string()],
+                    reason: None,
+                })
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_console_integration_disable(
+                State(state),
+                Path("mcp.claude-desktop".to_string()),
+                HeaderMap::new(),
+                Json(DisableIntegrationBody { reason: None })
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    // ── Onboarding ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn onboarding_get_reports_running_mode_and_supported_modes() {
+        let state = st();
+        let body = body_json(get_console_onboarding(State(state)).await.into_response()).await;
+        assert!(body["completed_at_unix_ms"].is_null());
+        assert_eq!(body["running_auth_mode"], "off");
+        assert_eq!(body["bind_is_loopback"], true);
+        assert_eq!(body["supported_auth_modes"].as_array().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn onboarding_complete_rejects_unknown_mode() {
+        let state = st();
+        let resp = post_console_onboarding_complete(
+            State(state),
+            HeaderMap::new(),
+            Json(CompleteOnboardingBody {
+                auth_mode: "  MAGIC ".to_string(),
+                hide_onboarding: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// `auth_mode=off` on a bind that is reachable off-host is the one
+    /// combination that leaves the daemon open; it must be refused unless the
+    /// operator armed the insecure-dev escape hatch.
+    #[tokio::test]
+    async fn onboarding_complete_refuses_auth_off_on_a_public_bind() {
+        let mut state = st();
+        state.http_bind_loopback = false;
+        let resp = post_console_onboarding_complete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(CompleteOnboardingBody {
+                auth_mode: "off".to_string(),
+                hide_onboarding: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // With the escape hatch armed it is allowed again.
+        state.allow_insecure_dev_auth_bind = true;
+        let resp = post_console_onboarding_complete(
+            State(state),
+            HeaderMap::new(),
+            Json(CompleteOnboardingBody {
+                auth_mode: "off".to_string(),
+                hide_onboarding: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "non-loopback still needs auth");
+    }
+
+    #[tokio::test]
+    async fn onboarding_complete_persists_choice_and_reports_restart() {
+        let state = st();
+        let resp = post_console_onboarding_complete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(CompleteOnboardingBody {
+                auth_mode: "dev_scopes".to_string(),
+                hide_onboarding: true,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["chosen_auth_mode"], "dev_scopes");
+        assert_eq!(body["running_auth_mode"], "off");
+        assert_eq!(body["restart_required"], true);
+        assert!(body["completed_at_unix_ms"].as_u64().unwrap() > 0);
+        // Persisted, not just echoed.
+        assert_eq!(
+            crate::onboarding::read_state(&state.data_dir)
+                .unwrap()
+                .chosen_auth_mode
+                .as_deref(),
+            Some("dev_scopes")
+        );
+
+        // Restart clears the completion stamp but keeps the chosen mode.
+        let resp = post_console_onboarding_restart(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert!(body["completed_at_unix_ms"].is_null());
+        assert_eq!(body["chosen_auth_mode"], "dev_scopes");
+    }
+
+    /// After first run, completing onboarding again is an authenticated
+    /// `admin:write` operation — the anonymous first-run allowance is one-shot.
+    #[tokio::test]
+    async fn onboarding_complete_after_first_run_requires_write_scope() {
+        let state = st_dev();
+        state.onboarding.write().await.completed_at_unix_ms = Some(1);
+        let resp = post_console_onboarding_complete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(CompleteOnboardingBody {
+                auth_mode: "dev_scopes".to_string(),
+                hide_onboarding: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = post_console_onboarding_complete(
+            State(state),
+            scoped("admin:write"),
+            Json(CompleteOnboardingBody {
+                auth_mode: "dev_scopes".to_string(),
+                hide_onboarding: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── Settings ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn put_settings_validates_mode_and_tracks_restart_required() {
+        let state = st();
+        let put = |state: AppState, body: UpdateSettingsBody| async move {
+            put_console_settings(State(state), HeaderMap::new(), Json(body))
+                .await
+                .into_response()
+        };
+
+        // Unknown mode → 400.
+        let resp = put(
+            state.clone(),
+            UpdateSettingsBody {
+                auth_mode: Some("magic".to_string()),
+                embedding_enabled: None,
+                embedding_url: None,
+                embedding_model: None,
+            },
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Same mode as the running one + new embedding intent → restart needed
+        // for the embedding change only.
+        let resp = put(
+            state.clone(),
+            UpdateSettingsBody {
+                auth_mode: Some("off".to_string()),
+                embedding_enabled: Some(true),
+                embedding_url: Some("  http://ollama:11434  ".to_string()),
+                embedding_model: Some("bge-m3".to_string()),
+            },
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["restart_required"], true);
+        assert_eq!(body["saved"]["chosen_embedding_url"], "http://ollama:11434");
+        assert_eq!(body["saved"]["chosen_auth_mode"], "off");
+
+        // Replaying the identical settings is a no-op — no phantom restart.
+        let resp = put(
+            state.clone(),
+            UpdateSettingsBody {
+                auth_mode: Some("off".to_string()),
+                embedding_enabled: Some(true),
+                embedding_url: Some("http://ollama:11434".to_string()),
+                embedding_model: Some("bge-m3".to_string()),
+            },
+        )
+        .await;
+        assert_eq!(body_json(resp).await["restart_required"], false);
+
+        // A blank URL clears the override rather than storing an empty string.
+        let resp = put(
+            state.clone(),
+            UpdateSettingsBody {
+                auth_mode: None,
+                embedding_enabled: None,
+                embedding_url: Some("   ".to_string()),
+                embedding_model: None,
+            },
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert!(body["saved"]["chosen_embedding_url"].is_null());
+        assert_eq!(body["restart_required"], true);
+
+        let settings = body_json(
+            get_console_settings(State(state), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(settings["auth"]["chosen_mode"], "off");
+        assert_eq!(settings["embedding"]["enabled_intent"], true);
+        assert_eq!(settings["embedding"]["chosen_model"], "bge-m3");
+    }
+
+    #[tokio::test]
+    async fn put_settings_refuses_auth_off_on_a_public_bind() {
+        let mut state = st();
+        state.http_bind_loopback = false;
+        let resp = put_console_settings(
+            State(state),
+            HeaderMap::new(),
+            Json(UpdateSettingsBody {
+                auth_mode: Some("off".to_string()),
+                embedding_enabled: None,
+                embedding_url: None,
+                embedding_model: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// SSRF guard: the probe route validates the target BEFORE any network work,
+    /// so private / link-local / malformed targets never reach the transport.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn embedding_probe_rejects_private_and_malformed_targets() {
+        std::env::remove_var("CORECRUXD_EMBEDDING_URL");
+        std::env::remove_var("CORECRUXD_EMBEDDING_PROBE_ALLOW_LOCAL");
+        let state = st();
+        for url in [
+            "not a url",
+            "ftp://example.com",
+            "http://169.254.169.254/latest",
+            "http://10.1.2.3:11434",
+            "http://127.0.0.1:11434",
+        ] {
+            let resp = post_console_embedding_probe(
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(ProbeEmbeddingBody { url: url.to_string() }),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{url} must be refused");
+        }
+    }
+
+    // ── Facts ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn console_facts_hide_private_rows_and_honour_the_as_of_cutoff() {
+        let state = st();
+        {
+            let mut store = state.fact_store.write().await;
+            seed(&mut store, "person:alice", "city", "NYC", false);
+            seed(&mut store, "person:bob", "ssn", "secret-value", true);
+        }
+        let fetch = |state: AppState, as_of: Option<i64>| async move {
+            body_json(
+                get_console_facts(
+                    State(state),
+                    Query(ConsoleFactsQuery {
+                        q: None,
+                        top_k: Some(10),
+                        as_of_unix_ms: as_of,
+                    }),
+                    HeaderMap::new(),
+                )
+                .await
+                .into_response(),
+            )
+            .await
+        };
+
+        let body = fetch(state.clone(), None).await;
+        assert_eq!(body["count"], 2, "count is the whole store");
+        assert_eq!(body["visible_count"], 1, "the private row is withheld");
+        assert_eq!(body["private_facts_hidden"], true);
+        assert!(
+            !serde_json::to_string(&body["facts"]).unwrap().contains("secret-value"),
+            "private fact text must not transit the console facts route"
+        );
+
+        // A cutoff before every write hides everything.
+        assert_eq!(fetch(state.clone(), Some(1)).await["visible_count"], 0);
+        // D-26 (inverted pin): `as_of_unix_ms = 0` used to be treated as "no
+        // cutoff" rather than "the epoch", so a client computing 0 silently got
+        // ALL current facts while the response echoed the parameter back. Zero
+        // is a valid epoch cutoff: nothing had been stored yet. Fixed in M7 of
+        // `crux-pinned-defect-remediation-2026-07-31`.
+        assert_eq!(fetch(state, Some(0)).await["visible_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn console_fact_add_validates_input_and_applies_the_privacy_policy() {
+        let state = st();
+        let add = |state: AppState, entity: &str, key: &str, value: &str, confidence: f32| {
+            let (entity, key, value) = (entity.to_string(), key.to_string(), value.to_string());
+            async move {
+                post_console_fact_add(
+                    State(state),
+                    HeaderMap::new(),
+                    Json(ConsoleAddFactBody {
+                        entity,
+                        key,
+                        value,
+                        confidence,
+                    }),
+                )
+                .await
+                .into_response()
+            }
+        };
+
+        for (entity, key, value) in [("", "k", "v"), ("e", "  ", "v"), ("e", "k", "")] {
+            assert_eq!(
+                add(state.clone(), entity, key, value, 1.0).await.status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        for confidence in [-0.1_f32, 1.1_f32] {
+            assert_eq!(
+                add(state.clone(), "e", "k", "v", confidence).await.status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        let resp = add(state.clone(), " person:alice ", " city ", " NYC ", 0.8).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let stored = body_json(resp).await;
+        assert_eq!(stored["entity"], "person:alice", "fields are trimmed before store");
+        assert_eq!(stored["value"], "NYC");
+        assert_eq!(stored["private"], false);
+
+        // A prefix on the always-private list is promoted regardless of what the
+        // caller asked for — the console cannot publish a private-class entity.
+        let resp = add(state, "github::CueCrux/Crux", "commit", "abc123", 1.0).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(
+            body_json(resp).await["private"],
+            true,
+            "github:: is force-promoted to private"
+        );
+    }
+
+    // ── Tenants + category ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn console_tenants_validates_the_category_filter() {
+        let state = st();
+        {
+            let mut store = state.fact_store.write().await;
+            seed(&mut store, "personal::notes", "k", "v", false);
+        }
+        let list = |state: AppState, category: Option<&str>| {
+            let category = category.map(str::to_string);
+            async move {
+                get_console_tenants(State(state), Query(ConsoleTenantsQuery { category }), HeaderMap::new())
+                    .await
+                    .into_response()
+            }
+        };
+
+        let resp = list(state.clone(), Some("nonsense")).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = body_json(list(state.clone(), None).await).await;
+        assert!(body["category_filter"].is_null());
+        let ids: Vec<&str> = body["tenants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["tenant_id"].as_str())
+            .collect();
+        assert!(ids.contains(&"local"), "the implicit local tenant is always listed");
+        assert!(ids.contains(&"personal"));
+
+        // "all" and "" are aliases for "no filter".
+        for alias in ["all", ""] {
+            let body = body_json(list(state.clone(), Some(alias)).await).await;
+            assert!(body["category_filter"].is_null());
+        }
+
+        let body = body_json(list(state, Some("personal")).await).await;
+        assert_eq!(body["category_filter"], "personal");
+        assert!(body["tenants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["category"] == "personal"));
+    }
+
+    #[tokio::test]
+    async fn tenant_category_patch_rejects_system_and_persists_the_override() {
+        let state = st();
+        let patch = |state: AppState, tenant: &str, category: &str| {
+            let (tenant, category) = (tenant.to_string(), category.to_string());
+            async move {
+                patch_console_tenant_category(
+                    State(state),
+                    Path(tenant),
+                    HeaderMap::new(),
+                    Json(crate::tenant_metadata::PatchTenantCategoryBody { category }),
+                )
+                .await
+                .into_response()
+            }
+        };
+
+        // `system` is runtime-derived and must not be settable through the API.
+        assert_eq!(
+            patch(state.clone(), "acme", "system").await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            patch(state.clone(), "acme", "nonsense").await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            patch(state.clone(), "", "personal").await.status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let resp = patch(state.clone(), "acme", "PERSONAL").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["override"], "personal");
+        assert_eq!(body["effective"], "personal");
+
+        // The GET reflects what is actually stored.
+        let resp = get_console_tenant_category(State(state.clone()), Path("acme".to_string()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(body_json(resp).await["effective"], "personal");
+
+        let resp = get_console_tenant_category(State(state), Path(String::new()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── Connections: credential disclosure ───────────────────────────────
+
+    /// `GET /v1/console/connections` is the one console route that can hand back
+    /// a live credential. Default posture must publish a fingerprint only; the
+    /// raw token appears only when the reveal env flag is deliberately armed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn console_connections_never_reveals_the_token_unless_armed() {
+        let restore: Vec<(&str, Option<String>)> =
+            ["CRUX_AGENT_TOKEN", "CRUX_AGENT_TOKENS", CONSOLE_REVEAL_AGENT_TOKEN_ENV]
+                .into_iter()
+                .map(|key| (key, std::env::var(key).ok()))
+                .collect();
+        for (key, _) in &restore {
+            std::env::remove_var(key);
+        }
+        let state = st();
+        let fetch = |state: AppState| async move {
+            body_json(
+                get_console_connections(State(state), HeaderMap::new())
+                    .await
+                    .into_response(),
+            )
+            .await
+        };
+
+        // No token configured → honest "configured: false", no fingerprint.
+        let body = fetch(state.clone()).await;
+        assert_eq!(body["agent_token"]["configured"], false);
+        assert!(body["agent_token"]["fingerprint"].is_null());
+        assert_eq!(body["mcp"]["path"], "/mcp");
+
+        // Single token, reveal OFF → fingerprint + length, never the token.
+        std::env::set_var("CRUX_AGENT_TOKEN", "super-secret-agent-token");
+        let body = fetch(state.clone()).await;
+        let token = &body["agent_token"];
+        assert_eq!(token["configured"], true);
+        assert_eq!(token["source_env"], "CRUX_AGENT_TOKEN");
+        assert_eq!(token["reveal_enabled"], false);
+        assert_eq!(token["length"], "super-secret-agent-token".len());
+        assert_eq!(token["fingerprint"], token_fingerprint("super-secret-agent-token"));
+        assert!(token["token"].is_null());
+        assert!(!serde_json::to_string(&body)
+            .unwrap()
+            .contains("super-secret-agent-token"));
+
+        // Reveal armed → the token is returned deliberately.
+        std::env::set_var(CONSOLE_REVEAL_AGENT_TOKEN_ENV, "1");
+        let body = fetch(state.clone()).await;
+        assert_eq!(body["agent_token"]["reveal_enabled"], true);
+        assert_eq!(body["agent_token"]["token"], "super-secret-agent-token");
+
+        // Multi-agent map wins and NEVER reveals, even with the flag armed.
+        std::env::set_var("CRUX_AGENT_TOKENS", "claude:tok-a,codex:tok-b");
+        let body = fetch(state).await;
+        let token = &body["agent_token"];
+        assert_eq!(token["source_env"], "CRUX_AGENT_TOKENS");
+        assert_eq!(token["agent_names"], "claude, codex");
+        assert!(token["token"].is_null(), "per-agent tokens are never revealed");
+        assert!(!serde_json::to_string(&body).unwrap().contains("tok-a"));
+
+        for (key, value) in restore {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    // ── Chunks ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn chunk_routes_404_when_the_metadata_index_is_empty() {
+        let state = st();
+        let resp = get_console_chunk(State(state.clone()), Path("deadbeef".to_string()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // D-27 (inverted pin): the preview route used to resolve the chunk
+        // BEFORE the scope check, so an unauthenticated caller could tell an
+        // unknown digest (404) from a known one — an existence oracle over
+        // every chunk digest. The scope is now required tenant-agnostically
+        // first. Fixed in M7 of
+        // `crux-pinned-defect-remediation-2026-07-31`.
+        let mut unauthenticated = st_dev();
+        unauthenticated.data_dir = state.data_dir.clone();
+        let resp = get_console_chunk_preview(State(unauthenticated), Path("deadbeef".to_string()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "presence must not be distinguishable without a credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_chunks_page_is_empty_and_reports_its_visibility_posture() {
+        let state = st();
+        let resp = get_console_tenant_chunks(
+            State(state),
+            Path("acme".to_string()),
+            Query(ConsoleChunksQuery {
+                limit: Some(5000),
+                cursor: None,
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["tenant_id"], "acme");
+        assert_eq!(body["page"]["limit"], 200, "limit clamps to the 200 ceiling");
+        assert_eq!(body["visibility"], "metadata_only");
+        assert!(body["chunks"].as_array().unwrap().is_empty());
+    }
+
+    // ── Review queue / expiries / consolidation undo ─────────────────────
+
+    #[tokio::test]
+    async fn review_queue_distinguishes_scheduler_off_from_genuinely_empty() {
+        let state = st();
+        {
+            let mut store = state.fact_store.write().await;
+            // Two live, opposite-polarity rows on the same (entity, key) — the
+            // shape `contradiction_candidates_v1` reports.
+            let first = seed_conf(&mut store, "service:api", "enabled", "enabled", false, 0.7);
+            seed_conf(&mut store, "service:api", "enabled", "disabled", false, 0.7);
+            assert!(
+                store.clear_superseded("default", &first),
+                "simulate an unresolved conflict"
+            );
+        }
+        let resp = get_console_review_queue(
+            State(state),
+            HeaderMap::new(),
+            Query(ConsoleReviewQuery { limit: Some(1000) }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["schema"], "crux.console.review.queue.v1");
+        assert_eq!(body["limit"], 250, "limit clamps to the 250 ceiling");
+        assert_eq!(
+            body["scheduler_enabled"], false,
+            "the page can say 'scheduler off' instead of implying a clean queue"
+        );
+        assert_eq!(body["count"], 0, "nothing surfaced by the scheduler");
+        // The live pass still runs, so contradictions are not hidden by the
+        // scheduler being off.
+        assert!(body["live_count"].as_u64().unwrap() >= 1);
+    }
+
+    /// The apply route recomputes the live candidate set under the write lock
+    /// and refuses anything that is not currently a candidate. A regression here
+    /// would turn an operator's stale selection into a mass delete.
+    #[tokio::test]
+    async fn review_expiries_refuse_ids_that_are_not_live_candidates() {
+        let state = st();
+        let fact_id = {
+            let mut store = state.fact_store.write().await;
+            seed(&mut store, "person:alice", "city", "NYC", false);
+            let id = store.all_facts().next().map(|f| f.fact_id.clone()).unwrap();
+            id
+        };
+
+        // Empty list → 400 (never "expire everything").
+        let resp = post_console_review_expiries(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(ConsoleExpiryApplyRequest { fact_ids: Vec::new() }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Over the per-request cap → 400.
+        let resp = post_console_review_expiries(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(ConsoleExpiryApplyRequest {
+                fact_ids: (0..=MAX_EXPIRY_BATCH).map(|n| format!("f{n}")).collect(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // A fresh, high-confidence fact is NOT a candidate — requesting it (twice,
+        // to exercise de-dup) is skipped, not deleted.
+        let resp = post_console_review_expiries(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(ConsoleExpiryApplyRequest {
+                fact_ids: vec![fact_id.clone(), fact_id.clone(), "does-not-exist".to_string()],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["expired_count"], 0);
+        assert_eq!(body["skipped_count"], 2, "the repeated id is counted once");
+        assert_eq!(body["skipped"][0]["reason"], "not_a_current_expiry_candidate");
+        // `operator:unverified:` prefix, not a bare `console`: this request
+        // carried no credential, and recording it as plain `console` made an
+        // unauthenticated caller indistinguishable from an authenticated one in
+        // the audit trail.
+        assert_eq!(body["actor"], "operator:unverified:console");
+        assert_eq!(state.fact_store.read().await.count(), 1, "nothing was deleted");
+    }
+
+    #[tokio::test]
+    async fn consolidation_undo_maps_an_unknown_canonical_to_404() {
+        let state = st();
+        let resp = post_console_review_consolidation_undo(
+            State(state),
+            HeaderMap::new(),
+            Json(ConsolidationUndoRequest {
+                canonical_fact_id: "no-such-fact".to_string(),
+                source_fact_ids: Vec::new(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn consolidation_merges_and_then_undoes_with_signed_receipts() {
+        let state = st();
+        // Confidence stays under the 0.99 protection floor; a 1.0 fact is
+        // deliberately un-consolidatable.
+        let (first, second) = {
+            let mut store = state.fact_store.write().await;
+            let first = seed_conf(&mut store, "person:alice", "city", "NYC", false, 0.6);
+            let second = seed_conf(&mut store, "person:alice", "city", "New York", false, 0.6);
+            // Seeding the same (entity, key) twice makes `second` supersede
+            // `first`, and consolidation now refuses an already-retired target
+            // (`TargetAlreadySuperseded`) rather than resurrecting it into a new
+            // canonical. Both targets have to be live for this test to be about
+            // merge-then-undo at all, which is why the edge is cleared here —
+            // the same setup the fact_store consolidation tests use.
+            assert!(store.clear_superseded("default", &first));
+            (first, second)
+        };
+        let request: corecrux_memory::fact_store::ConsolidationRequestV1 = serde_json::from_value(json!({
+            "consolidation_id": "",
+            "entity": "person:alice",
+            "key": "city",
+            "canonical_value": "New York City",
+            "target_fact_ids": [first.clone(), second.clone()],
+        }))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-passport-id", "claude-work".parse().unwrap());
+        let resp = post_console_review_consolidation(State(state.clone()), headers, Json(request))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["schema"], "crux.console.review.consolidation.v1");
+        let canonical = body["receipt"]["canonical_fact_id"].as_str().unwrap().to_string();
+
+        let resp = post_console_review_consolidation_undo(
+            State(state),
+            HeaderMap::new(),
+            // Two changes from the pre-slice shape of this request:
+            //
+            // `entity` / `key` are gone — the handler derives them from the
+            // canonical fact itself, so a caller cannot point an undo at one
+            // fact while naming another's entity/key.
+            //
+            // `source_fact_ids` is now required and checked against what the
+            // consolidation actually recorded (`UndoSourceMismatch`). An empty
+            // vec used to mean "restore whatever this canonical retired"; the
+            // caller now has to state what it believes it is reversing, so a
+            // stale client cannot blanket-restore a set that changed underneath
+            // it.
+            Json(ConsolidationUndoRequest {
+                canonical_fact_id: canonical.clone(),
+                source_fact_ids: vec![first, second],
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["schema"], "crux.console.review.consolidation_undo.v1");
+        assert_eq!(body["canonical_fact_id"], canonical);
+    }
+
+    // ── Aggregate read surfaces ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn storage_breakdown_reports_four_kinds_and_no_phantom_availability() {
+        let state = st();
+        let body = body_json(
+            get_console_storage_breakdown(State(state), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        let kinds: Vec<&str> = body["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|k| k["kind"].as_str())
+            .collect();
+        assert_eq!(kinds, vec!["text_search", "projections", "embedding", "graph"]);
+        // An empty daemon must report every kind as unavailable rather than
+        // reporting "available" with a zero count.
+        assert!(body["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|k| k["available"] == false && k["chunks"] == 0));
+    }
+
+    #[tokio::test]
+    async fn summary_reports_daemon_console_and_store_posture() {
+        let state = st();
+        {
+            let mut store = state.fact_store.write().await;
+            seed(&mut store, "person:alice", "city", "NYC", false);
+        }
+        state.session_store.write().await.put("s1", json!({ "k": 1 }), None);
+        let body = body_json(
+            get_console_summary(State(state), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(body["console"]["enabled"], true);
+        assert_eq!(
+            body["console"]["external_network_dependencies"], 0,
+            "the console promises a zero-egress posture"
+        );
+        assert_eq!(body["daemon"]["auth_mode"], "off");
+        assert_eq!(body["daemon"]["node_id"], "node-a");
+        assert_eq!(body["stores"]["facts"], 1);
+        assert_eq!(body["stores"]["sessions"], 1);
+        assert_eq!(body["routing"]["shard_count"].as_u64().unwrap() > 0, true);
+        assert_eq!(body["integrations"]["enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn passports_route_publishes_no_key_material() {
+        let state = st();
+        let body = body_json(
+            get_console_passports(State(state), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(body["passport"]["fingerprint"], "p_test");
+        assert_eq!(body["passport"]["private_key_exported"], false);
+        assert_eq!(body["agents"]["raw_tokens_exposed"], false);
+        assert_eq!(body["session_defaults"]["mcp_path"], "/mcp");
+    }
+
+    #[tokio::test]
+    async fn integrations_listing_reports_the_disabled_posture_honestly() {
+        let mut state = st();
+        state.integrations_enabled = false;
+        let body = body_json(
+            get_console_integrations(State(state.clone()), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(body["enabled"], false);
+        assert!(body["packs"].as_array().unwrap().is_empty());
+        assert!(!body["allowed_capabilities"].as_array().unwrap().is_empty());
+
+        // Mutations are refused with 403 while the subsystem is off.
+        let install = post_console_integration_install(
+            State(state.clone()),
+            Path("mcp.claude-desktop".to_string()),
+            HeaderMap::new(),
+            Json(InstallIntegrationBody {
+                manifest: None,
+                pack_id: None,
+                version: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(install.status(), StatusCode::FORBIDDEN);
+
+        // Safe mode blocks installs and grants even when integrations are on.
+        state.integrations_enabled = true;
+        state.integrations_safe_mode = true;
+        let install = post_console_integration_install(
+            State(state.clone()),
+            Path("mcp.claude-desktop".to_string()),
+            HeaderMap::new(),
+            Json(InstallIntegrationBody {
+                manifest: None,
+                pack_id: None,
+                version: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(install.status(), StatusCode::FORBIDDEN);
+        let grant = post_console_integration_grant(
+            State(state.clone()),
+            Path("mcp.claude-desktop".to_string()),
+            HeaderMap::new(),
+            Json(GrantIntegrationBody {
+                version: "0.1.0".to_string(),
+                capabilities: vec!["memory.read".to_string()],
+                reason: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(grant.status(), StatusCode::FORBIDDEN);
+
+        // An empty capability list is a 400 — a grant of nothing is a bug, not a
+        // silent success.
+        state.integrations_safe_mode = false;
+        let grant = post_console_integration_grant(
+            State(state.clone()),
+            Path("mcp.claude-desktop".to_string()),
+            HeaderMap::new(),
+            Json(GrantIntegrationBody {
+                version: "0.1.0".to_string(),
+                capabilities: Vec::new(),
+                reason: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(grant.status(), StatusCode::BAD_REQUEST);
+
+        // Disabling a pack that was never installed is a 404, not a no-op 200.
+        let disable = post_console_integration_disable(
+            State(state),
+            Path("never.installed".to_string()),
+            HeaderMap::new(),
+            Json(DisableIntegrationBody {
+                reason: Some("cleanup".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(disable.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn integrations_listing_enumerates_builtin_packs_when_enabled() {
+        let state = st();
+        let body = body_json(
+            get_console_integrations(State(state), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["safe_mode"], false);
+        assert!(!body["packs"].as_array().unwrap().is_empty());
+        assert!(body["grants"].is_array());
+        assert!(body["audit_tail"].is_array());
+    }
+
+    // ── Sessions listing ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sessions_list_separates_archived_rows_and_marks_live_state() {
+        let state = st();
+        {
+            let mut store = state.session_store.write().await;
+            store.put("live-one", json!({ "note": "working" }), None);
+            store.put("gone", json!({ "note": "done" }), None);
+            store.set_archived("gone", true, Some("superseded".to_string()));
+        }
+        let list = |state: AppState, include_archived: bool| async move {
+            body_json(
+                get_console_sessions(
+                    State(state),
+                    HeaderMap::new(),
+                    Query(ConsoleSessionsQuery { include_archived }),
+                )
+                .await
+                .into_response(),
+            )
+            .await
+        };
+
+        let body = list(state.clone(), false).await;
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["total_count"], 2);
+        assert_eq!(body["archived_count"], 1);
+        assert_eq!(body["raw_state_exposed"], false);
+        let row = &body["session_rows"][0];
+        assert_eq!(row["session_id"], "live-one");
+        assert_eq!(row["state"], "active", "a just-written session is live, not idle");
+        assert!(row["agent"].is_null(), "an unscoped key carries no agent");
+
+        let body = list(state, true).await;
+        assert_eq!(body["count"], 2);
+        let archived = body["session_rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["session_id"] == "gone")
+            .unwrap();
+        assert_eq!(archived["state"], "archived");
+        assert_eq!(archived["archive_reason"], "superseded");
+        assert!(archived["archived_at"].is_string());
+    }
+
+    // ── Chunk index: metadata + redacted preview ─────────────────────────
+
+    /// Seed one indexed chunk whose payload contains a secret-looking field, so
+    /// the preview route's redaction can be asserted rather than assumed.
+    fn index_one_chunk(state: &AppState, tenant_id: &str) -> String {
+        let events = vec![corecrux_proto::dataplane_v1::AppendEvent {
+            event_id: "evt-1".to_string(),
+            occurred_at: "2026-05-01T12:00:00Z".to_string(),
+            event_type: "test.event".to_string(),
+            content_type: "application/json".to_string(),
+            payload: br#"{"token":"top-secret-value","value":1}"#.to_vec(),
+        }];
+        crate::console_index::record_appended_events(&state.data_dir, tenant_id, "artifact", "s1", 10, &events, 1_000)
+            .expect("record chunk");
+        crate::console_index::list_chunks(&state.data_dir, tenant_id, 10, None)
+            .expect("list chunks")
+            .chunks
+            .first()
+            .expect("one chunk")
+            .chunk_digest
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn indexed_chunks_surface_as_metadata_and_a_redacted_preview() {
+        let state = st();
+        let digest = index_one_chunk(&state, "tenant-a");
+
+        // The tenant listing picks the tenant up from the chunk index.
+        let body = body_json(
+            get_console_tenants(
+                State(state.clone()),
+                Query(ConsoleTenantsQuery { category: None }),
+                HeaderMap::new(),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert!(body["tenants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["tenant_id"] == "tenant-a"));
+
+        // Page of one, no further cursor.
+        let body = body_json(
+            get_console_tenant_chunks(
+                State(state.clone()),
+                Path("tenant-a".to_string()),
+                Query(ConsoleChunksQuery {
+                    limit: Some(10),
+                    cursor: None,
+                }),
+                HeaderMap::new(),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(body["chunks"].as_array().unwrap().len(), 1);
+        assert!(body["page"]["next_cursor"].is_null());
+
+        // A malformed cursor is a 400, not a silent page-one.
+        let resp = get_console_tenant_chunks(
+            State(state.clone()),
+            Path("tenant-a".to_string()),
+            Query(ConsoleChunksQuery {
+                limit: Some(10),
+                cursor: Some("not-a-number".to_string()),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Metadata route: present, metadata-only, no payload bytes.
+        let resp = get_console_chunk(State(state.clone()), Path(digest.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["present"], true);
+        assert_eq!(body["visibility"], "metadata_only");
+        assert!(!serde_json::to_string(&body).unwrap().contains("top-secret-value"));
+
+        // Preview route: redacted, and the raw payload never appears.
+        let resp = get_console_chunk_preview(State(state.clone()), Path(digest.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["redacted"], true);
+        assert_eq!(body["tenant_id"], "tenant-a");
+        assert!(
+            !serde_json::to_string(&body).unwrap().contains("top-secret-value"),
+            "the console preview must never carry raw secret-like payload bytes"
+        );
+
+        // The preview scope is its own rail: `admin:read` does not buy it.
+        let mut dev = st_dev();
+        dev.data_dir = state.data_dir.clone();
+        let resp = get_console_chunk_preview(State(dev), Path(digest), scoped("admin:read"))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ── Live contradiction pass ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn review_contradictions_reports_live_opposite_polarity_rows() {
+        let state = st();
+        {
+            let mut store = state.fact_store.write().await;
+            let first = seed_conf(&mut store, "service:api", "enabled", "enabled", false, 0.7);
+            seed_conf(&mut store, "service:api", "enabled", "disabled", false, 0.7);
+            assert!(store.clear_superseded("default", &first));
+        }
+        let resp = get_console_review_contradictions(
+            State(state),
+            HeaderMap::new(),
+            Query(ConsoleReviewQuery { limit: Some(1000) }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["schema"], "crux.console.review.contradictions.v1");
+        assert_eq!(body["limit"], 250, "limit clamps to the 250 ceiling");
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["candidates"][0]["reason"], "opposite_polarity_same_entity_key");
+    }
+
+    // ── CoreCrux proxy plumbing (no network) ─────────────────────────────
+
+    #[test]
+    fn encode_query_component_percent_encodes_everything_unreserved() {
+        assert_eq!(encode_query_component("a-b_c.d~e"), "a-b_c.d~e");
+        assert_eq!(encode_query_component("work::team one"), "work%3A%3Ateam%20one");
+        assert_eq!(encode_query_component("&=?#"), "%26%3D%3F%23");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn corecrux_credentials_come_from_env_with_a_documented_precedence() {
+        for key in [
+            "CORECRUXD_CORECRUX_ADMIN_TOKEN",
+            "CORECRUX_ADMIN_TOKEN",
+            "CORECRUXD_CORECRUX_PASSPORT_ID",
+            "CORECRUX_PASSPORT_ID",
+            "CORECRUXD_CORECRUX_GRAPH_TOKEN",
+            "CORECRUX_GRAPH_TOKEN",
+        ] {
+            std::env::remove_var(key);
+        }
+        assert_eq!(bearer_token_from_env(), None);
+        assert_eq!(passport_id_from_env(), None);
+        assert_eq!(corecrux_graph_token_from_env(), None);
+
+        // A whitespace-only value is NOT a credential.
+        std::env::set_var("CORECRUX_ADMIN_TOKEN", "   ");
+        assert_eq!(bearer_token_from_env(), None, "blank env must not read as configured");
+        std::env::set_var("CORECRUX_ADMIN_TOKEN", "  tok-fallback ");
+        assert_eq!(bearer_token_from_env().as_deref(), Some("tok-fallback"));
+        // The CORECRUXD_-prefixed var wins over the bare one.
+        std::env::set_var("CORECRUXD_CORECRUX_ADMIN_TOKEN", "tok-primary");
+        assert_eq!(bearer_token_from_env().as_deref(), Some("tok-primary"));
+
+        std::env::set_var("CORECRUX_PASSPORT_ID", "p_fallback");
+        assert_eq!(passport_id_from_env().as_deref(), Some("p_fallback"));
+        std::env::set_var("CORECRUXD_CORECRUX_PASSPORT_ID", "p_primary");
+        assert_eq!(passport_id_from_env().as_deref(), Some("p_primary"));
+
+        for key in [
+            "CORECRUXD_CORECRUX_ADMIN_TOKEN",
+            "CORECRUX_ADMIN_TOKEN",
+            "CORECRUXD_CORECRUX_PASSPORT_ID",
+            "CORECRUX_PASSPORT_ID",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn finish_graph_proxy_maps_both_error_arms_to_the_carried_status() {
+        assert_eq!(
+            finish_graph_proxy(Ok(Ok(serde_json::json!({ "ok": true })))).status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            finish_graph_proxy(Ok(Err(CoreCruxProxyError::new(StatusCode::BAD_GATEWAY, "upstream")))).status(),
+            StatusCode::BAD_GATEWAY
+        );
+        // A panicking/cancelled blocking task surfaces as 500, not as a 200 with
+        // an empty body.
+        assert_eq!(
+            finish_graph_proxy(Err(CoreCruxProxyError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "join failed"
+            )))
+            .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_join_error_reports_an_internal_error() {
+        let handle = tokio::task::spawn_blocking(|| panic!("boom"));
+        let err = graph_join_error(handle.await.expect_err("join error"));
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.detail.contains("CoreCrux graph proxy join failed"));
+    }
+
+    #[test]
+    fn parse_graph_u32_rejects_non_numeric_ids() {
+        assert_eq!(parse_graph_u32(" 42 ", "src").unwrap(), 42);
+        assert!(parse_graph_u32("-1", "src").unwrap_err().contains("src"));
+        assert!(parse_graph_u32("", "dst").is_err());
     }
 }

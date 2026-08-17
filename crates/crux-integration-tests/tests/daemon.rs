@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Integration tests against a running corecruxd daemon.
 //! Run: ./scripts/run-integration-tests.sh -- --test-threads=1
@@ -41,8 +41,13 @@ fn mcp_tool_call(tool: &str, arguments: serde_json::Value) -> serde_json::Value 
 }
 
 fn mcp_text_json(body: &serde_json::Value) -> serde_json::Value {
-    let text = body["result"]["content"][0]["text"].as_str().unwrap();
-    serde_json::from_str(text).unwrap()
+    let text = body["result"]["content"][0]["text"].as_str().unwrap_or_else(|| {
+        // A JSON-RPC error, or a tool that skipped the `content` envelope, both
+        // land here. Printing the whole body turns "unwrap on None" into a
+        // message that names the actual failure.
+        panic!("tools/call did not return result.content[0].text; body was: {body:#}")
+    });
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("tools/call content was not JSON ({e}); text was: {text}"))
 }
 
 #[test]
@@ -125,9 +130,40 @@ fn console_integrations_api() {
         .any(|pack| { pack["manifest"]["id"] == "mcp.cursor" }));
 }
 
+/// Agent token for the dedicated daemon below. Must satisfy the strength
+/// policy (>= 32 bytes, safe charset) or the registry refuses it and MCP
+/// silently falls back to no-auth — see `crux_mcp::agent::is_safe_agent_token`.
+const WORK_FLOW_AGENT_TOKEN: &str = "crux_at_work_flow_0123456789abcdef";
+
 #[test]
 fn projects_work_and_coordination_tools_flow() {
-    let d = daemon();
+    // A dedicated daemon, not the shared one: MCP work mutations now require an
+    // authenticated authority, and the shared instance runs without an agent
+    // token. Tokenising the shared daemon instead would 401 the ~20 other MCP
+    // calls in this file that are legitimately testing the unauthenticated
+    // read surface, so the token is scoped to this test.
+    //
+    // HTTP behaviour is unchanged by the token: the daemon still runs
+    // `CORECRUXD_AUTH_MODE=off`, so the assertions below about unverified local
+    // identities still exercise that path.
+    let owned = crux_integration_tests::TestDaemon::start_with_agent_token(WORK_FLOW_AGENT_TOKEN);
+    let d = &owned;
+    let mcp_tool_call = |tool: &str, arguments: serde_json::Value| -> serde_json::Value {
+        owned
+            .mcp_post_json_with_token(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": unique_id("mcp"),
+                    "method": "tools/call",
+                    "params": { "name": tool, "arguments": arguments }
+                }),
+                WORK_FLOW_AGENT_TOKEN,
+            )
+            .unwrap()
+            .into_body()
+            .read_json()
+            .unwrap()
+    };
     let project_id = unique_id("coverage-project");
     let actor_passport = unique_id("coverage-actor");
     let gated_passport = unique_id("coverage-gate");
@@ -309,6 +345,35 @@ fn projects_work_and_coordination_tools_flow() {
         .unwrap();
     assert!(work_list["count"].as_u64().unwrap() >= 1);
 
+    // `fields=slim` is the projection the boot banner and every token-conscious
+    // agent reads (the full board is ~164k tokens; ranked slim is ~650). Assert
+    // its shape on the wire: the six load-bearing keys survive, the heavy ones
+    // stay out, and `stale` is omitted rather than null for a kanban row — the
+    // flag only means something for ExecPlan-projection items.
+    let slim_list: serde_json::Value = d
+        .get(&format!(
+            "/v1/work?project_id={project_id}&state=planned&tenant_id=tenant-a&fields=slim"
+        ))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let slim_rows = slim_list["work"].as_array().unwrap();
+    assert!(!slim_rows.is_empty(), "slim projection returned no rows");
+    let row = slim_rows[0].as_object().unwrap();
+    assert!(
+        row.contains_key("id") && row.contains_key("state"),
+        "slim row lost id/state"
+    );
+    assert!(
+        !row.contains_key("body") && !row.contains_key("provenance"),
+        "slim must not carry full-row fields"
+    );
+    assert!(
+        !row.contains_key("stale"),
+        "kanban rows have no staleness — the key must be absent, not null"
+    );
+
     let applied: serde_json::Value = d
         .patch_json(
             &format!("/v1/work/{work_id}"),
@@ -322,7 +387,21 @@ fn projects_work_and_coordination_tools_flow() {
         .into_body()
         .read_json()
         .unwrap();
-    assert_eq!(applied["applied"], true);
+    // This harness runs the daemon with `CORECRUXD_AUTH_MODE=off`, so the
+    // caller is a local *unverified* identity. Naming `actor_passport` in the
+    // body is an assertion about who you are, not proof of it — and it used to
+    // be enough to apply a transition directly whenever that passport happened
+    // to be ungated. Selecting an ungated passport was therefore a review
+    // bypass available to anyone who could reach the port.
+    //
+    // Both passports now queue under auth-off. The gated/ungated distinction is
+    // still live, but only for identities that are actually authenticated; it
+    // is no longer reachable by assertion. The `gated_passport` case below is
+    // kept because it now pins the same outcome for a second reason.
+    assert_eq!(
+        applied["applied"], false,
+        "an unverified local identity must not apply a work transition by naming an ungated passport"
+    );
 
     let comment: serde_json::Value = d
         .post_json(
@@ -366,8 +445,19 @@ fn projects_work_and_coordination_tools_flow() {
     assert_eq!(queued["applied"], false);
     let action_id = queued["queued"]["action_id"].as_str().unwrap();
 
+    // Queued actions record the actor as `operator:unverified:<passport>` under
+    // auth-off, not the bare passport: what was actually established is "someone
+    // unauthenticated claimed to be this passport". Filtering on the bare value
+    // now matches nothing, which is the intended shape — the prefix is the whole
+    // provenance signal and dropping it would make an assertion look like proof.
     let pending: serde_json::Value = d
-        .get(&format!("/v1/work/gate/pending?by_passport={gated_passport}"))
+        // `tenant_id` is now required to see this item: the gate queue is
+        // tenant-scoped, and without it the request resolves to `default` while
+        // the work item lives under `tenant-a`. An unscoped pending queue used
+        // to show every tenant's queued mutations to any reader.
+        .get(&format!(
+            "/v1/work/gate/pending?tenant_id=tenant-a&by_passport=operator:unverified:{gated_passport}"
+        ))
         .unwrap()
         .into_body()
         .read_json()
@@ -402,6 +492,17 @@ fn projects_work_and_coordination_tools_flow() {
     assert_ne!(approved_transition["by_passport"], actor_passport);
     assert_eq!(approved_transition["receipt_id"], approved["receipt_id"]);
 
+    // From here the actor is the *authenticated MCP agent*, not an asserted
+    // passport. `create_work` / `update_work_state` / `comment_on_work` now
+    // require the claimed passport to match the authority behind the token
+    // (`claimed_identity_matches`), so a caller can no longer attribute a work
+    // mutation to someone else simply by naming them. The single-token registry
+    // resolves to the agent identity `default`.
+    let mcp_passport = "default";
+    // Likewise the tenant: the agent answers for its own tenant, and naming
+    // another one is refused rather than honoured.
+    let mcp_tenant = "default";
+
     let mcp_projects = mcp_text_json(&mcp_tool_call("list_projects", json!({})));
     assert!(mcp_projects["projects"]
         .as_array()
@@ -419,15 +520,15 @@ fn projects_work_and_coordination_tools_flow() {
             "title": "MCP-created coverage work",
             "body": "Created through coordination tool",
             "state": "planned",
-            "tenant_id": "tenant-b",
-            "created_by_passport": actor_passport
+            "tenant_id": mcp_tenant,
+            "created_by_passport": mcp_passport
         }),
     ));
     let mcp_work_id = mcp_work["id"].as_str().unwrap();
 
     let mcp_list_work = mcp_text_json(&mcp_tool_call(
         "list_work",
-        json!({"project_id": project_id, "tenant_id": "tenant-b"}),
+        json!({"project_id": project_id, "tenant_id": mcp_tenant}),
     ));
     assert!(mcp_list_work["count"].as_u64().unwrap() >= 1);
 
@@ -436,17 +537,21 @@ fn projects_work_and_coordination_tools_flow() {
         json!({
             "work_id": mcp_work_id,
             "state": "blocked",
-            "by_passport": actor_passport,
+            "by_passport": mcp_passport,
             "blocker_reason": "waiting for CI"
         }),
     ));
-    assert_eq!(mcp_updated["applied"], true);
+    // Queued, not applied: the agent identity has no passport record, so it is
+    // treated as work-gated (`agent_work_gate` defaults on for an unknown
+    // passport). Authenticating proves who the caller is; it does not by itself
+    // grant the right to move someone's work item without review.
+    assert_eq!(mcp_updated["applied"], false);
 
     let mcp_comment = mcp_text_json(&mcp_tool_call(
         "comment_on_work",
         json!({
             "work_id": mcp_work_id,
-            "author_passport": actor_passport,
+            "author_passport": mcp_passport,
             "body": "MCP comment coverage"
         }),
     ));
@@ -1165,5 +1270,580 @@ fn receipt_not_found() {
             Ok(r) if [200, 400, 404, 412, 501].contains(&r.status().as_u16()) => {}
             other => panic!("{p}: {other:?}"),
         }
+    }
+}
+
+/// Context-graph MCP tools must return exactly what their HTTP counterparts do.
+///
+/// The whole design of `crux-mcp::tools::context_graph` is "thin adapter, one
+/// implementation" — the tools proxy to the same corecruxd routes rather than
+/// re-deriving anything. That claim is only worth making if it is checked: a
+/// divergence between the two surfaces would be a silent correctness bug, where
+/// an agent and an operator looking at the same project disagree about it.
+#[test]
+fn context_graph_mcp_tools_match_their_http_counterparts() {
+    let d = daemon();
+    let project_id = unique_id("ctxgraph");
+    let passport_id = unique_id("p-ctxgraph");
+
+    d.post_json(
+        "/v1/passports",
+        json!({ "id": passport_id, "category": "work", "name": "ctx graph parity" }),
+    )
+    .unwrap();
+    let created: serde_json::Value = d
+        .post_json(
+            "/v1/projects",
+            json!({
+                "id": project_id,
+                "name": "Context Graph Parity",
+                "planning_target": "github://cuecrux/crux",
+                "default_passport_id": passport_id,
+                "working_tenants": ["tenant-ctxgraph"]
+            }),
+        )
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(created["id"], project_id);
+
+    d.put_json(
+        &format!("/v1/projects/{project_id}/layers/vision"),
+        json!({ "content": "A daemon that remembers what every agent worked out." }),
+    )
+    .unwrap();
+
+    // ── Storybook ────────────────────────────────────────────────────────
+    let mcp_gen = mcp_text_json(&mcp_tool_call(
+        "generate_project_storybook",
+        json!({ "project_id": project_id }),
+    ));
+    assert_eq!(mcp_gen["project_id"], project_id.as_str());
+    let first_ts = mcp_gen["generated_at_unix_ms"].as_u64().unwrap();
+
+    let budget = 4000u64;
+    let http_story: serde_json::Value = d
+        .get(&format!("/v1/projects/{project_id}/storybook?token_budget={budget}"))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let mcp_story = mcp_text_json(&mcp_tool_call(
+        "get_project_storybook",
+        json!({ "project_id": project_id, "token_budget": budget }),
+    ));
+    assert_eq!(
+        http_story, mcp_story,
+        "get_project_storybook diverged from GET /v1/projects/{{id}}/storybook"
+    );
+    assert!(http_story["available_versions"]
+        .as_array()
+        .is_some_and(|v| v.contains(&json!(first_ts))));
+
+    // The section filter is the reason an agent would reach for this over
+    // reading the whole readout, so it is checked for parity too.
+    let http_alerts: serde_json::Value = d
+        .get(&format!(
+            "/v1/projects/{project_id}/storybook?token_budget=1500&section=60"
+        ))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let mcp_alerts = mcp_text_json(&mcp_tool_call(
+        "get_project_storybook",
+        json!({ "project_id": project_id, "token_budget": 1500, "section": "60" }),
+    ));
+    assert_eq!(http_alerts, mcp_alerts, "section filter diverged");
+    assert_eq!(http_alerts["truncated"], true);
+
+    // A budget is a contract, not a hint: what came back must fit it.
+    let sent = serde_json::to_string(&mcp_story).unwrap().len();
+    assert!(
+        sent.div_ceil(4) <= budget as usize,
+        "storybook overshot: {sent} bytes for a {budget}-token budget"
+    );
+
+    // Regenerate so there are two versions to diff.
+    let second = mcp_text_json(&mcp_tool_call(
+        "generate_project_storybook",
+        json!({ "project_id": project_id }),
+    ));
+    let second_ts = second["generated_at_unix_ms"].as_u64().unwrap();
+    if second_ts != first_ts {
+        let http_diff: serde_json::Value = d
+            .get(&format!(
+                "/v1/projects/{project_id}/storybook/diff?a={first_ts}&b={second_ts}"
+            ))
+            .unwrap()
+            .into_body()
+            .read_json()
+            .unwrap();
+        let mcp_diff = mcp_text_json(&mcp_tool_call(
+            "diff_project_storybook",
+            json!({ "project_id": project_id, "a": first_ts, "b": second_ts }),
+        ));
+        assert_eq!(http_diff, mcp_diff, "diff_project_storybook diverged");
+    }
+
+    // ── Dossiers ─────────────────────────────────────────────────────────
+    let auto = mcp_text_json(&mcp_tool_call(
+        "generate_project_dossier",
+        json!({ "project_id": project_id }),
+    ));
+    let auto_id = auto["dossier_id"].as_str().unwrap().to_string();
+    assert_eq!(auto["project_id"], project_id.as_str());
+
+    let published = mcp_text_json(&mcp_tool_call(
+        "publish_project_dossier",
+        json!({
+            "project_id": project_id,
+            "dossier": {
+                "dossier_id": "dsr-parity-peer",
+                "project_id": project_id,
+                "agent_passport": "p_peer_agent",
+                "claims": [{
+                    "claim_id": "c1",
+                    "kind": "implements",
+                    "subject": "plane:parity:core",
+                    "object": "crate:corecruxd",
+                    "confidence": 0.9,
+                    "evidence": ["crates/corecruxd/src/main.rs:1"]
+                }],
+                "open_questions": ["does the dense lane run on this build?"]
+            }
+        }),
+    ));
+    assert_eq!(published["stored"], true);
+    assert_eq!(published["claim_count"], 1);
+
+    let http_list: serde_json::Value = d
+        .get(&format!("/v1/projects/{project_id}/dossiers?token_budget=2000"))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let mcp_list = mcp_text_json(&mcp_tool_call(
+        "get_project_dossiers",
+        json!({ "project_id": project_id, "token_budget": 2000 }),
+    ));
+    assert_eq!(http_list, mcp_list, "get_project_dossiers (list) diverged");
+    assert!(http_list["count"].as_u64().unwrap() >= 2);
+
+    let http_one: serde_json::Value = d
+        .get(&format!(
+            "/v1/projects/{project_id}/dossiers/{auto_id}?token_budget=3000"
+        ))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let mcp_one = mcp_text_json(&mcp_tool_call(
+        "get_project_dossiers",
+        json!({ "project_id": project_id, "token_budget": 3000, "dossier_id": auto_id }),
+    ));
+    assert_eq!(http_one, mcp_one, "get_project_dossiers (single) diverged");
+
+    let http_rec: serde_json::Value = d
+        .get(&format!(
+            "/v1/projects/{project_id}/dossiers/reconcile?token_budget=2000"
+        ))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let mcp_rec = mcp_text_json(&mcp_tool_call(
+        "reconcile_project_dossiers",
+        json!({ "project_id": project_id, "token_budget": 2000 }),
+    ));
+    // `generated_at_unix_ms` is the report's own wall clock, stamped per call,
+    // so it differs between two requests by construction. Everything derived
+    // from stored state must match exactly.
+    let strip_clock = |mut v: serde_json::Value| {
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("generated_at_unix_ms");
+        }
+        v
+    };
+    assert_eq!(
+        strip_clock(http_rec.clone()),
+        strip_clock(mcp_rec),
+        "reconcile_project_dossiers diverged"
+    );
+    assert!(http_rec["agents"].as_array().is_some_and(|a| a.len() >= 2));
+
+    let http_ddiff: serde_json::Value = d
+        .get(&format!(
+            "/v1/projects/{project_id}/dossiers/diff?a={auto_id}&b=dsr-parity-peer"
+        ))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let mcp_ddiff = mcp_text_json(&mcp_tool_call(
+        "diff_project_dossiers",
+        json!({ "project_id": project_id, "a": auto_id, "b": "dsr-parity-peer" }),
+    ));
+    assert_eq!(http_ddiff, mcp_ddiff, "diff_project_dossiers diverged");
+}
+
+/// All eight context-graph tools must be listed by `tools/list` and reachable.
+#[test]
+fn context_graph_tools_are_listed_and_callable() {
+    let listed: serde_json::Value = daemon()
+        .mcp_post_json(json!({
+            "jsonrpc": "2.0",
+            "id": unique_id("mcp-list"),
+            "method": "tools/list",
+            "params": {}
+        }))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    for tool in [
+        "get_project_storybook",
+        "generate_project_storybook",
+        "diff_project_storybook",
+        "get_project_dossiers",
+        "generate_project_dossier",
+        "publish_project_dossier",
+        "reconcile_project_dossiers",
+        "diff_project_dossiers",
+    ] {
+        assert!(names.contains(&tool), "tools/list is missing {tool}");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Runtime code intelligence — MCP ↔ HTTP parity.
+//
+// The five `code_*` MCP tools are thin adapters over `GET /v1/code-intel/*`.
+// The failure this guards against is a future maintainer reimplementing any of
+// the logic on the MCP side: the two surfaces would then answer differently for
+// the same question and nothing would say so. Comparing whole payloads — not a
+// field or a status code — is what makes that impossible to do quietly.
+//
+// Trace capture is off in this daemon, so the runtime side of every answer is
+// empty. That is deliberate and does not weaken the test: parity is a property
+// of the adapter, not of the data, and an empty-window answer still exercises
+// argument mapping, encoding, scope and serialisation end to end.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A path that exists, is small enough to scan instantly, and is real Rust —
+/// this test crate's own source.
+const CODE_INTEL_REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+
+fn code_intel_repo() -> &'static str {
+    static REGISTERED: OnceLock<String> = OnceLock::new();
+    REGISTERED.get_or_init(|| {
+        let repo_id = unique_id("codeintel");
+        let raw = mcp_tool_call(
+            "register_repo",
+            json!({
+                "tenant_id": "local",
+                "repo_id": repo_id,
+                "root_path": CODE_INTEL_REPO_ROOT,
+                "languages": ["rust"],
+            }),
+        );
+        let body = mcp_payload(&raw);
+        assert_eq!(
+            body["repo"]["repo_id"], repo_id,
+            "register_repo did not return the registration: {raw}"
+        );
+        assert!(
+            body["repo"]["last_scan_id"].is_string(),
+            "registration did not trigger a scan, so the scan-backed tools have nothing to read: {raw}"
+        );
+        repo_id
+    })
+}
+
+fn http_json(path: &str) -> serde_json::Value {
+    daemon().get(path).unwrap().into_body().read_json().unwrap()
+}
+
+/// The tool's own payload, however this daemon chose to frame it.
+///
+/// Tool results arrive either as a bare `result` object or wrapped in the MCP
+/// `content[0].text` envelope depending on the negotiated shape. Which framing
+/// is in use is not what these tests are about, so normalise it away rather
+/// than pinning one and failing spuriously when the envelope flag flips.
+fn mcp_payload(body: &serde_json::Value) -> serde_json::Value {
+    assert!(body.get("error").is_none(), "MCP call returned an error: {body}");
+    if body["result"]["content"][0]["text"].is_string() {
+        mcp_text_json(body)
+    } else {
+        body["result"].clone()
+    }
+}
+
+#[test]
+fn code_intel_tools_are_listed_with_a_mandatory_token_budget() {
+    let body: serde_json::Value = daemon()
+        .mcp_post_json(json!({ "jsonrpc": "2.0", "id": unique_id("mcp"), "method": "tools/list" }))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let tools = body["result"]["tools"].as_array().unwrap();
+
+    for name in [
+        "code_path",
+        "code_blast_radius",
+        "code_liveness",
+        "code_trace_diff",
+        "code_dead_code",
+    ] {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} not listed by tools/list — registered but undiscoverable"));
+        let required: Vec<&str> = tool["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            required.contains(&"token_budget"),
+            "{name}: token_budget must be required over the wire, got {required:?}"
+        );
+        assert_eq!(
+            tool["inputSchema"]["x-crux-min-tier"], "free",
+            "{name}: tier floor missing from the listed schema"
+        );
+    }
+}
+
+#[test]
+fn code_intel_mcp_answers_match_http_exactly() {
+    let repo = code_intel_repo();
+    let budget = 500;
+
+    for (tool, args, http_path) in [
+        (
+            "code_path",
+            json!({ "tenant_id": "local", "entry_point": "post_query_text_search", "token_budget": budget }),
+            format!("/v1/code-intel/path?tenant_id=local&entry_point=post_query_text_search&token_budget={budget}"),
+        ),
+        (
+            "code_blast_radius",
+            json!({ "tenant_id": "local", "repo_id": repo, "symbol": "TestDaemon", "token_budget": budget }),
+            format!(
+                "/v1/code-intel/blast-radius?tenant_id=local&repo_id={repo}&symbol=TestDaemon&token_budget={budget}"
+            ),
+        ),
+        (
+            "code_liveness",
+            json!({ "tenant_id": "local", "repo_id": repo, "symbol": "TestDaemon", "token_budget": budget }),
+            format!("/v1/code-intel/liveness?tenant_id=local&repo_id={repo}&symbol=TestDaemon&token_budget={budget}"),
+        ),
+        (
+            "code_trace_diff",
+            json!({ "tenant_id": "local", "trace_a": 1, "trace_b": 2, "token_budget": budget }),
+            format!("/v1/code-intel/trace-diff?tenant_id=local&trace_a=1&trace_b=2&token_budget={budget}"),
+        ),
+        (
+            "code_dead_code",
+            json!({ "tenant_id": "local", "repo_id": repo, "token_budget": 2000 }),
+            format!("/v1/code-intel/dead-code?tenant_id=local&repo_id={repo}&token_budget=2000"),
+        ),
+    ] {
+        let via_mcp = mcp_payload(&mcp_tool_call(tool, args));
+        let via_http = http_json(&http_path);
+        assert_eq!(
+            via_mcp, via_http,
+            "{tool}: MCP and HTTP answers diverged — the adapter is no longer thin.\n  mcp:  {via_mcp}\n  http: {via_http}"
+        );
+    }
+}
+
+#[test]
+fn code_intel_rejects_a_missing_token_budget() {
+    // A tool that silently defaults to "everything" defeats the purpose of the
+    // surface, so the omission must be an error the caller can read, not a
+    // large answer they did not ask for.
+    let body = mcp_tool_call("code_path", json!({ "tenant_id": "local", "entry_point": "x" }));
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("token_budget"),
+        "expected a token_budget error, got: {body}"
+    );
+}
+
+#[test]
+fn code_liveness_never_reports_an_unseen_symbol_as_dead() {
+    // The window is part of the answer. With capture off the window is empty,
+    // so the only honest verdict is "not observed" — never "dead".
+    let repo = code_intel_repo();
+    let body = mcp_payload(&mcp_tool_call(
+        "code_liveness",
+        json!({ "tenant_id": "local", "repo_id": repo, "symbol": "TestDaemon", "token_budget": 300 }),
+    ));
+    assert_eq!(body["executed"], false);
+    assert!(body["window"].is_object(), "liveness must state its window: {body}");
+    let verdict = body["verdict"].as_str().unwrap_or_default();
+    assert!(
+        !verdict.eq_ignore_ascii_case("dead"),
+        "an empty observation window must not yield a `dead` verdict, got {verdict:?}"
+    );
+}
+
+// ── Tenant corpus erasure (ExecPlan crux-forget-tenant-corpus-erasure) ──────
+//
+// Its own daemon: the surface is flag-gated off by default, and the test
+// restarts the process to prove the mask is durable.
+
+fn ingest(daemon: &TestDaemon, tenant: &str, doc: &str, text: &str) {
+    let resp = daemon
+        .post_json(
+            "/v1/local/ingest",
+            json!({
+                "tenant_id": tenant,
+                "corpus_id": "erasure-it",
+                "documents": [{
+                    "doc_id": doc,
+                    "chunks": [{ "chunk_id": format!("{doc}-c0"), "text": text }]
+                }]
+            }),
+        )
+        .expect("local ingest");
+    assert_eq!(resp.status().as_u16(), 202, "ingest accepted");
+}
+
+fn search_hits(daemon: &TestDaemon, tenant: &str, query: &str) -> usize {
+    let body: serde_json::Value = daemon
+        .post_json(
+            "/v1/query/text-search",
+            json!({ "tenant_id": tenant, "query": query, "limit": 10 }),
+        )
+        .expect("text-search")
+        .into_body()
+        .read_json()
+        .expect("json");
+    body["results"].as_array().map(Vec::len).unwrap_or(0)
+}
+
+fn footprint(daemon: &TestDaemon, tenant: &str) -> serde_json::Value {
+    daemon
+        .get(&format!("/v1/admin/tenants/{tenant}/footprint"))
+        .expect("footprint")
+        .into_body()
+        .read_json()
+        .expect("json")
+}
+
+#[test]
+fn tenant_corpus_erasure_masks_survives_restart_and_reclaims() {
+    let mut daemon = TestDaemon::start_with_env(&[("CORECRUXD_TENANT_ERASURE", "1")]);
+
+    ingest(&daemon, "erasure-a", "a1", "peregrine falcon stoop velocity");
+    ingest(&daemon, "erasure-b", "b1", "peregrine falcon stoop velocity");
+
+    assert_eq!(search_hits(&daemon, "erasure-a", "peregrine falcon"), 1);
+    assert_eq!(search_hits(&daemon, "erasure-b", "peregrine falcon"), 1);
+
+    // The blast radius is inspectable before anything is erased.
+    let before = footprint(&daemon, "erasure-a");
+    assert_eq!(before["segment_count"], 1);
+    assert_eq!(before["docs"], 1);
+    assert!(before["bytes"].as_u64().unwrap() > 0, "on-disk group has size");
+
+    // Layer 1 — mask only.
+    let erased: serde_json::Value = daemon
+        .post_json("/v1/admin/forget-tenants", json!({ "tenant_ids": ["erasure-a"] }))
+        .expect("forget-tenants")
+        .into_body()
+        .read_json()
+        .expect("json");
+    assert_eq!(erased["per_tenant"][0]["corpus_erased"], true);
+    assert_eq!(erased["per_tenant"][0]["segments_reclaimed"], 0);
+
+    assert_eq!(search_hits(&daemon, "erasure-a", "peregrine falcon"), 0, "masked");
+    assert_eq!(
+        search_hits(&daemon, "erasure-b", "peregrine falcon"),
+        1,
+        "sibling tenant is untouched"
+    );
+
+    // Crash window: the mask is persisted, the files are not yet reclaimed.
+    daemon.restart();
+    assert_eq!(
+        search_hits(&daemon, "erasure-a", "peregrine falcon"),
+        0,
+        "the mask outlives the process"
+    );
+    assert_eq!(search_hits(&daemon, "erasure-b", "peregrine falcon"), 1);
+
+    // Layer 2 — physical reclaim, then another restart to prove nothing dangles.
+    let reclaimed: serde_json::Value = daemon
+        .post_json(
+            "/v1/admin/forget-tenants",
+            json!({ "tenant_ids": ["erasure-a"], "reclaim": true }),
+        )
+        .expect("reclaim")
+        .into_body()
+        .read_json()
+        .expect("json");
+    let row = &reclaimed["per_tenant"][0];
+    assert_eq!(row["segments_reclaimed"], 1);
+    assert_eq!(
+        row["bytes_reclaimed"].as_u64().unwrap(),
+        before["bytes"].as_u64().unwrap(),
+        "bytes freed match the footprint reported before the erase"
+    );
+
+    daemon.restart();
+    assert_eq!(footprint(&daemon, "erasure-a")["segment_count"], 0);
+    assert_eq!(search_hits(&daemon, "erasure-a", "peregrine falcon"), 0);
+    assert_eq!(
+        search_hits(&daemon, "erasure-b", "peregrine falcon"),
+        1,
+        "the co-tenant corpus is still served after a reclaim + restart"
+    );
+    assert_eq!(daemon.get("/readyz").unwrap().status().as_u16(), 200);
+
+    // The gap this test used to have. Reclaim unlinked the segment group and
+    // left its MANIFEST entry behind, so the *next* write — not this restart,
+    // not any read — was the thing that broke. `ShardStorage::open` runs per
+    // ingest and died on the dangling entry, which took host `crux` down for 38
+    // hours while every assertion above would still have passed.
+    // ExecPlan `crux-erasure-manifest-repair-2026-08-08`.
+    ingest(&daemon, "erasure-c", "c1", "gyrfalcon arctic plumage");
+    assert_eq!(
+        search_hits(&daemon, "erasure-c", "gyrfalcon arctic"),
+        1,
+        "ingest must still work after a reclaim"
+    );
+
+    // And it must survive a restart, i.e. the manifest on disk is coherent
+    // rather than merely tolerated by the running process.
+    daemon.restart();
+    assert_eq!(search_hits(&daemon, "erasure-c", "gyrfalcon arctic"), 1);
+    assert_eq!(search_hits(&daemon, "erasure-b", "peregrine falcon"), 1);
+    ingest(&daemon, "erasure-d", "d1", "saker falcon steppe range");
+    assert_eq!(search_hits(&daemon, "erasure-d", "saker falcon"), 1);
+    assert_eq!(daemon.get("/readyz").unwrap().status().as_u16(), 200);
+}
+
+#[test]
+fn tenant_corpus_erasure_routes_404_when_the_flag_is_off() {
+    // The shared daemon runs without CORECRUXD_TENANT_ERASURE.
+    match daemon().get("/v1/admin/tenants/anyone/footprint") {
+        Err(ureq::Error::StatusCode(404)) => {}
+        other => panic!("expected 404 with the flag off: {other:?}"),
+    }
+    match daemon().post_json("/v1/admin/forget-tenants", json!({ "tenant_ids": ["anyone"] })) {
+        Err(ureq::Error::StatusCode(404)) => {}
+        other => panic!("expected 404 with the flag off: {other:?}"),
     }
 }

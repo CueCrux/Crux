@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Native OS credential-store adapter.
 //!
@@ -231,6 +231,18 @@ fn credential_command(token_ref: &str) -> Result<CredentialInvocation, NativeCre
         .arg("-NonInteractive")
         .arg("-Command")
         .arg(LOOKUP_SCRIPT);
+    // `powershell.exe` is a console-subsystem binary, so spawning it from the
+    // GUI-subsystem shell pops a console window. Unlike the sidecar's, this one
+    // is brief — but it flashes on *every* credential read, i.e. every attach
+    // profile activation and retry. `-NonInteractive` governs the prompt, not
+    // the window; only this flag suppresses it.
+    {
+        use std::os::windows::process::CommandExt;
+        /// `CREATE_NO_WINDOW` (winbase.h). See the sidecar spawn in
+        /// `crux-shell-lifecycle` for the same fix and the reasoning behind it.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
     // The validated lookup reference is not a credential. Supplying it over a
     // dedicated pipe keeps the fixed script independent of PowerShell's
     // `-Command` argument reconstruction and never creates a token fallback.

@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Tenant-scoped repository registry stored as reserved daemon facts.
 
@@ -226,7 +226,12 @@ pub fn fail_incomplete_scans(
 /// Read back the latest persisted scan JSON for a registered repo — the
 /// mirror of [`store_scan_json`]. `None` when the repo was registered by
 /// `clone_url` only (scan deferred) or has never been scanned.
-pub fn load_scan_json(store: &FactStore, tenant_id: &str, repo_id: &str) -> Option<String> {
+/// Takes a [`TenantScope`](crate::auth::TenantScope) rather than a tenant
+/// string: the caller must have *obtained* the right to read this tenant, not
+/// merely be able to spell it. Background callers with no request behind them
+/// mint one through `TenantScope::background`, which records why.
+pub fn load_scan_json(store: &FactStore, scope: &crate::auth::TenantScope, repo_id: &str) -> Option<String> {
+    let tenant_id = scope.as_str();
     let entity = scan_entity(tenant_id, repo_id);
     let result = store.query(&FactQuery {
         min_effective_confidence: None,
@@ -271,9 +276,12 @@ pub fn delete_repo(store: &mut FactStore, tenant_id: &str, repo_id: &str) -> Res
         crate::repo_codegraph::extdeps_entity(tenant_id, repo_id),
     ] {
         let facts = store.get_by_entity(&entity);
-        let ids: Vec<String> = facts.into_iter().map(|fact| fact.fact_id.clone()).collect();
-        for fact_id in ids {
-            store.delete(&fact_id);
+        let ids: Vec<(String, String)> = facts
+            .into_iter()
+            .map(|fact| (fact.tenant_hash.clone(), fact.fact_id.clone()))
+            .collect();
+        for (tenant_hash, fact_id) in ids {
+            store.delete(&tenant_hash, &fact_id);
         }
     }
     Ok(())

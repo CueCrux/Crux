@@ -41,6 +41,8 @@ spec:
               value: "0.0.0.0"
             - name: CORECRUXD_AUTH_MODE
               value: {{ .Values.auth.mode | quote }}
+            - name: CORECRUXD_ROUTE_AUTH
+              value: {{ .Values.config.routeAuthMode | quote }}
             - name: CORECRUX_LOG_FORMAT
               value: {{ .Values.config.logFormat | quote }}
             - name: CORECRUXD_BUILD_CCXI

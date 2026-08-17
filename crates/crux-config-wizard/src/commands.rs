@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Library-side command implementations.
 //!
@@ -102,7 +102,7 @@ pub fn run_init(workspace: &Path, profile_names: &[String]) -> std::io::Result<C
 }
 
 pub fn run_regenerate(workspace: &Path, force: bool) -> std::io::Result<CommandReport> {
-    let cfg = AgentProfileConfig::load(workspace).map_err(std::io::Error::other)?;
+    let mut cfg = AgentProfileConfig::load(workspace).map_err(std::io::Error::other)?;
     let bundled = load_bundled_profiles().map_err(std::io::Error::other)?;
     let enabled: Vec<_> = bundled
         .into_iter()
@@ -124,6 +124,21 @@ pub fn run_regenerate(workspace: &Path, force: bool) -> std::io::Result<CommandR
                 return Ok(CommandReport::exit(1, stdout, format!("error: {e}\n")));
             }
         }
+    }
+    let mut pins_updated = 0;
+    for fragment in &enabled {
+        if let Some(entry) = cfg.profiles.get_mut(&fragment.frontmatter.name) {
+            if entry.version != fragment.frontmatter.version {
+                entry.version = fragment.frontmatter.version;
+                pins_updated += 1;
+            }
+        }
+    }
+    if pins_updated > 0 {
+        cfg.save(workspace).map_err(std::io::Error::other)?;
+        stdout.push_str(".crux/agent-profile.toml: updated=");
+        stdout.push_str(&pins_updated.to_string());
+        stdout.push('\n');
     }
     Ok(CommandReport::ok(stdout))
 }
@@ -258,6 +273,77 @@ mod tests {
     }
 
     #[test]
+    fn regenerate_migrates_profile_version_pin_after_target_writes() {
+        let ws = fresh_ws();
+        run_init(ws.path(), &["code-minimalism".into()]).unwrap();
+        let mut cfg = AgentProfileConfig::load(ws.path()).unwrap();
+        let entry = cfg.profiles.get_mut("code-minimalism").unwrap();
+        entry.version = 1;
+        let enabled_at = entry.enabled_at;
+        cfg.save(ws.path()).unwrap();
+        for filename in ["CLAUDE.md", "AGENTS.md"] {
+            std::fs::write(
+                ws.path().join(filename),
+                "<!-- BEGIN-CRUX-MANAGED:code-minimalism v1 -->\nlegacy body\n<!-- END-CRUX-MANAGED:code-minimalism -->\n",
+            )
+            .unwrap();
+        }
+
+        let before = run_check(ws.path(), false).unwrap();
+        assert_eq!(before.outcome, CommandOutcome::Exit(1));
+        assert!(before.stdout.contains("v1 in config but v2 in the crate"));
+
+        let refused = run_regenerate(ws.path(), false).unwrap();
+        assert_eq!(refused.outcome, CommandOutcome::Exit(1));
+        assert_eq!(
+            AgentProfileConfig::load(ws.path()).unwrap().profiles["code-minimalism"].version,
+            1
+        );
+
+        let regenerated = run_regenerate(ws.path(), true).unwrap();
+        assert_eq!(regenerated.outcome, CommandOutcome::Ok);
+        assert!(regenerated.stdout.contains("agent-profile.toml: updated=1"));
+        let migrated = AgentProfileConfig::load(ws.path()).unwrap();
+        assert_eq!(migrated.profiles["code-minimalism"].version, 2);
+        assert_eq!(migrated.profiles["code-minimalism"].enabled_at, enabled_at);
+        for filename in ["CLAUDE.md", "AGENTS.md"] {
+            let text = std::fs::read_to_string(ws.path().join(filename)).unwrap();
+            assert!(text.contains("BEGIN-CRUX-MANAGED:code-minimalism v2"));
+            assert!(!text.contains("legacy body"));
+        }
+        assert_eq!(run_check(ws.path(), false).unwrap().outcome, CommandOutcome::Ok);
+    }
+
+    #[test]
+    fn regenerate_does_not_advance_pins_when_a_target_write_fails() {
+        let ws = fresh_ws();
+        run_init(ws.path(), &["code-minimalism".into()]).unwrap();
+        let mut cfg = AgentProfileConfig::load(ws.path()).unwrap();
+        cfg.profiles.get_mut("code-minimalism").unwrap().version = 1;
+        cfg.save(ws.path()).unwrap();
+        std::fs::write(
+            ws.path().join("CLAUDE.md"),
+            "<!-- BEGIN-CRUX-MANAGED:code-minimalism v1 -->\nlegacy body\n<!-- END-CRUX-MANAGED:code-minimalism -->\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws.path().join("AGENTS.md"),
+            "<!-- BEGIN-CRUX-MANAGED:code-minimalism v1 -->\nunclosed section\n",
+        )
+        .unwrap();
+
+        let report = run_regenerate(ws.path(), true).unwrap();
+        assert_eq!(report.outcome, CommandOutcome::Exit(1));
+        assert!(std::fs::read_to_string(ws.path().join("CLAUDE.md"))
+            .unwrap()
+            .contains("BEGIN-CRUX-MANAGED:code-minimalism v2"));
+        assert_eq!(
+            AgentProfileConfig::load(ws.path()).unwrap().profiles["code-minimalism"].version,
+            1
+        );
+    }
+
+    #[test]
     fn check_clean_after_init() {
         let ws = fresh_ws();
         run_init(ws.path(), &["memory-practices".into()]).unwrap();
@@ -304,8 +390,8 @@ mod tests {
     fn list_without_init_shows_all_unchecked() {
         let ws = fresh_ws();
         let r = run_list(ws.path()).unwrap();
-        // 10 bundled, none enabled.
-        assert_eq!(r.stdout.matches("[ ]").count(), 10);
+        // 13 bundled, none enabled.
+        assert_eq!(r.stdout.matches("[ ]").count(), 13);
         assert_eq!(r.stdout.matches("[x]").count(), 0);
     }
 

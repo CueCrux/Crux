@@ -1,47 +1,59 @@
 # Non-test unwrap()/expect() baseline per crate.
-# Initially captured 2026-07-10 at commit 59e9f26 (main); refreshed 2026-07-11
-# 2026-07-12 +11 corecruxd: all in #[cfg(test)] code for the async repo-scan
-# feature (PR #373) — job-id/status assertions in http/tests.rs and registry
-# decode/recovery tests; zero production-path additions (verified by diff).
-# post-merge of main (10 corecruxd sites from pre-gate PRs #354-#360); lower counts are
-# ratcheted in place when sites are removed.
-# 2026-07-13 +1 corecruxd: one #[cfg(test)] assertion in http/tests.rs for the
-# legal-hold integrity tests (P1 Track B, PR #393) — reserved-prefix / override
-# attribution test setup; zero production-path additions (verified by diff).
-# 2026-07-15 +14 corecruxd: real-keypair sync mutual-auth handshake tests in
-# http/tests.rs (audit M2b, PR #408) — token/keypair construction + header
-# assembly in the 5 sync_mutual_auth_* tests; zero production-path additions
-# (the require_sync_peer / nonce handler paths use no unwrap/expect; verified by diff).
-# 2026-07-15 +10 corecruxd: OD-37 / audit-v2 closeout M1 write-tenant stamping
-# tests — the tenant_write_stamp_isolates_reads_end_to_end_m1 e2e test in
-# http/tests.rs (JWT/body/response assertions). Zero production-path additions:
-# the resolvers (resolve_write_tenant_flagged / resolve_read_tenant_flagged) and
-# facts.rs write/read hooks use Result/Option, no unwrap/expect (verified by diff).
+#
+# 2026-07-29 RE-BASELINED. The previous counts measured test code, not
+# production code, and the gate had a blind spot that hid real production
+# sites. Three defects, all fixed in scripts/unwrap-ratchet.sh in this change:
+#
+#   1. src/http/tests.rs (20,599 lines, 590 sites) and src/metrics.rs (2,429
+#      lines, 240 sites) were counted. tests.rs is #[cfg(test)] via an
+#      out-of-file #[path] mod decl, so it carries no in-file marker for the
+#      scan to key on; metrics.rs is the allowlisted Prometheus register!()
+#      surface. ~95% of the old corecruxd baseline of 857 was these two files,
+#      which is why every increment since 2026-07-12 was test code.
+#   2. The scan set intest=1 on the FIRST #[cfg(test)] in a file and never
+#      reset, exempting everything after it. This was not theoretical:
+#      corecrux-storage/src/lib.rs hid 6 production try_into().unwrap() sites
+#      in the binary frame decoder behind a #[cfg(test)] at line 1345, and
+#      corecruxd/src/main.rs hid the SIGTERM-handler expect() at line 2291.
+#      The scan now tracks brace depth so a #[cfg(test)] exempts only its item.
+#   3. Full-line // comments mentioning .unwrap() were counted as sites.
+#
+# Net effect: corecruxd 857 -> 50, corecrux-receipts 85 -> 0 (all 85 were in
+# src/tests.rs; receipts production code has zero unwrap/expect), and
+# corecrux-storage / crux-observe went UP as previously-hidden production
+# sites became visible. Per-PR increment history before this date is in git
+# history; it described test-code growth and no longer applies.
+#
 # Method: count lines containing .unwrap()/.expect( in crates/<crate>/**/*.rs,
-#   excluding */tests/* paths and lines after an inline #[cfg(test)] marker.
-# Consumer: scripts/unwrap-ratchet.sh (M5 of ExecPlan
-#   crux-external-findings-remediation-2026-07-10). CI fails if any crate
-#   exceeds its baseline; lowering a count updates this file in the same PR.
-# 2026-07-16 +3 corecruxd: audit-v2 M3 revoked-peer HTTP test in http/tests.rs
-#   (entity upsert + serde_json assertions seeding a revoked identity link);
-#   zero production-path additions (require_sync_peer uses Result/Option, no unwrap).
-# 2026-07-17 +3 corecruxd: PR #423 P2/P1 HTTP tests in http/tests.rs — the
-#   min_effective_confidence floor test + console review-queue/expiry tests
-#   (serde_json response-body assertions). tests.rs is #[cfg(test)] via an
-#   out-of-file #[path] mod decl so the ratchet counts its unwraps; zero
-#   production-path additions (the recall floor uses Option, no unwrap).
+#   excluding */tests/* paths, files named tests.rs or metrics.rs, full-line
+#   comments, and items under an inline #[cfg(test)] (brace-scoped).
+# Consumer: scripts/unwrap-ratchet.sh. CI fails if any crate exceeds its
+#   baseline; lowering a count updates this file in the same PR.
+# Self-test: scripts/unwrap-ratchet.sh --self-test (covers the mid-file
+#   #[cfg(test)] regression from defect 2 above).
+#
+# 2026-07-31: corecruxd 47 -> 45, corecrux-secrets 0 -> 2. Not new debt — the
+# corecruxd crate-split moved encrypted_secrets.rs into corecrux-secrets, and
+# its two infallible expect() sites (fixed-length XNonce conversion; an encrypt
+# that only fails on programmer error) moved with it. Whole-tree total is
+# unchanged at 369. corecrux-billing and corecrux-providers were added by the
+# same split and carry no non-test sites.
+corecrux-billing 0
 corecrux-frame 0
 corecrux-index 3
 corecrux-memory 0
-corecrux-projections 51
+corecrux-projections 49
 corecrux-proto 0
-corecrux-receipts 85
+corecrux-providers 0
+corecrux-receipts 0
 corecrux-retrieval 2
+corecrux-secrets 2
 corecrux-segment 32
-corecrux-storage 48
+corecrux-storage 47
 corecrux-types 1
+corecrux-workspace-scan 0
 corecruxctl 9
-corecruxd 774
+corecruxd 45
 crux-claude-hooks 1
 crux-config-wizard 8
 crux-contrib 0
@@ -50,9 +62,9 @@ crux-enterprise-shim 0
 crux-integration-tests 7
 crux-integrations 0
 crux-lens-features 0
-crux-mcp 114
+crux-mcp 172
+crux-observe 10
 crux-observe-api 0
-crux-observe 9
 crux-router 0
 crux-session 1
 crux-sync 0

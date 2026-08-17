@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 #
 # check-agent-docs.sh — keep the agent-facing docs (docs/agent/*) honest.
 #
@@ -57,6 +57,27 @@ check() {  # $1 = label, $2 = token, $3 = pass/fail bool
     fail=1
   fi
 }
+
+echo "==> workspace version parity"
+# The reference checks below only prove a name still resolves; they cannot see a
+# version that has gone stale. AGENTS.md and repo-manifest.yaml both restate the
+# workspace version, and both sat at 0.5.37 through sixteen releases because
+# nothing compared them to Cargo.toml.
+ws_version="$(awk -F'"' '/^version = "/ { print $2; exit }' "$ROOT/Cargo.toml")"
+if [[ -z "$ws_version" ]]; then
+  check version "could not read [workspace.package] version from Cargo.toml" miss
+else
+  if grep -q "workspace_version: \"$ws_version\"" "$ROOT/docs/agent/repo-manifest.yaml"; then
+    check version "repo-manifest.yaml workspace_version=$ws_version" ok
+  else
+    check version "repo-manifest.yaml workspace_version != $ws_version (Cargo.toml)" miss
+  fi
+  if grep -q "workspace version \*\*$ws_version\*\*\|workspace version $ws_version" "$ROOT/AGENTS.md"; then
+    check version "AGENTS.md workspace version=$ws_version" ok
+  else
+    check version "AGENTS.md workspace version != $ws_version (Cargo.toml)" miss
+  fi
+fi
 
 echo "==> crate dirs"
 while IFS= read -r c; do

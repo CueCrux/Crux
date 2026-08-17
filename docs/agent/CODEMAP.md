@@ -4,7 +4,7 @@
 > Anchored by **symbol name** (greppable), not line number (rots). Verified against
 > the tree by `scripts/check-agent-docs.sh` in CI.
 
-The workspace has **28 cargo crates** under `crates/`. (`crux-console-ui` is a built
+The workspace has **34 cargo crates** under `crates/`. (`crux-console-ui` is a built
 SPA — `dist/` only, not a cargo member — and is excluded below.)
 
 ## Trust core (read these first)
@@ -16,15 +16,17 @@ SPA — `dist/` only, not a cargo member — and is excluded below.)
 | `corecrux-receipts` | Receipt formats, Ed25519 signing, strict verification, witness anchoring, export bundles | `verify_receipt_v1`, `build_c2pa_manifest_v1`/`verify_c2pa_manifest_v1`, `build_bundle_v1`/`verify_bundle_v1`, `build_external_anchor_body_v1`/`verify_rfc6962_inclusion_proof_v1`, `sign_stream_v1` | crux-integrations, crux-mcp, corecruxctl, corecruxd | 12.0k |
 | `corecrux-frame` | Canonical v1 frame encoding + hash helpers (header / payload / stream) | `canonical_header_bytes_v1`, `compute_header_hash`, `compute_payload_hash`, `decode_canonical_header_bytes_v1` | corecrux-{index,projections,storage,segment}, corecruxctl, corecruxd | 0.3k |
 | `rcx-capability-token` | RCX capability token v1.0 (schema-lock, CBOR/JSON mirror, validation) | `RcxCapabilityToken`, `verify_token`, `validate_basic`, `RcxTier`, `ReceiptClass` | crux-enterprise-shim, crux-mcp, crux-router | 1.1k |
+| `rcx-revocation` | CRL feed behind `Revocation.crl_url`; tri-state freshness so callers fail closed | `RevocationSnapshot`, `authorize_when_known`, `RevocationFeed`, `CrlTransport`, `CrlDocument` | (relay accept path — M5) | 0.5k |
+| `crux-escrow` | Vault key recovery: recovery-code wrapped DEKs, Shamir 2-of-3 escrow, delayed cancellable share release | `RecoveryCode`, `WrappedDek`, `wrap_dek`/`unwrap_dek`, `VaultSetup::acknowledge`, `split_escrow`/`combine_shares`, `release::ReleaseRequest` | corecruxd | 0.7k |
 
 ## Memory & retrieval
 
 | Crate | Purpose | Key public symbols | Used by | ~LOC |
 |---|---|---|---|---|
-| `corecrux-memory` | Versioned fact store + session store; decay, supersession, CROWN receipts | `Fact`, `FactStore`, `mark_superseded`, `ContradictionCandidateV1`, `ConsolidationReceiptV1`, `consolidate_facts_v1` | crux-lens-features, crux-mcp, crux-observe, corecruxctl, corecruxd | 11.7k |
+| `corecrux-memory` | Versioned fact store + session store; decay, supersession, CROWN receipts | `Fact`, `FactStore`, `mark_superseded`, `DEFAULT_PRIVATE_PREFIXES`, `DAEMON_OWNED_ENTITY_PREFIXES`, `consolidate_facts_v1` | crux-lens-features, crux-mcp, crux-observe, corecruxctl, corecruxd | 11.7k |
 | `corecrux-index` | Companion inverted index (`.ccxi`) built at seal time; powers BM25 | `CcxiBuilder`, `CcxiReader`, `CcxiHeader`, `pfordelta_encode`/`pfordelta_decode` | corecrux-retrieval, crux-mcp, corecrux-storage, corecruxctl, corecruxd | 1.1k |
 | `corecrux-retrieval` | Fused retrieval — BM25 + graph-signal fusion over `.ccxi` | `fused_retrieve`, `IndexManager`, `FusionWeights`, `FusedHit` | corecruxd, crux-mcp | 2.1k |
-| `corecrux-projections` | Living-objects projections + snapshots (`.ccxs`) + deterministic parity harness | `ProjectionEventV1`, `CcxsProjectionId`, `build_cold_segment_v1`, `apply`/`apply_at` | corecrux-retrieval, corecruxctl, crux-mcp, crux-session, corecruxd | 12.4k |
+| `corecrux-projections` | Living-objects projections + snapshots (`.ccxsnap`) + deterministic parity harness | `ProjectionEventV1`, `CcxsnapProjectionId`, `build_cold_segment_v1`, `apply`/`apply_at` | corecrux-retrieval, corecruxctl, crux-mcp, crux-session, corecruxd | 12.4k |
 | `crux-lens-features` | Feature Registry lens over the memory substrate (coverage / gap reporting) | `compute_coverage_report`, `compute_gaps`, `compute_promise_coverage` | crux-mcp, corecruxd | 0.5k |
 
 ## Routing, identity, sessions
@@ -42,7 +44,7 @@ SPA — `dist/` only, not a cargo member — and is excluded below.)
 |---|---|---|---|---|
 | `corecruxd` | The Crux Daemon binary (HTTP / gRPC / MCP host, signing, auth) | *(binary)* — owns `build_segment_seal_receipt`, `sign_segment_seal_material` (`src/grpc.rs`) | — | 83.8k |
 | `corecruxctl` | CoreCrux CLI: `verify-store`, `replay`, `gaps` | *(binary)* — `verify_store`, `replay`, `gaps` modules (`src/`) | — | 33.1k |
-| `crux-mcp` | Agent-facing MCP server (JSON-RPC 2.0 + axum Streamable-HTTP); ~42 tool modules | `dispatch`, `router`/`with_rcx_router`/`with_agent_passports`, `crc_v1` | corecruxd | 33.1k |
+| `crux-mcp` | Agent-facing MCP server (JSON-RPC 2.0 + axum Streamable-HTTP); static-bearer/OAuth fail-closed auth; ~42 tool modules | `dispatch`, `router`/`with_rcx_router`/`with_agent_passports`, `mcp_authentication_configured`, `crc_v1` | corecruxd | 33.1k |
 | `crux-observe` | Self-observation layer: ops events + bootstrap docs → memory facts | `Redactor`/`redact_line`, `bootstrap_entity`/`ops_entity`, `self_observe_enabled` | crux-mcp, corecruxd | 2.7k |
 | `crux-observe-api` | Wire types for the agent audit-chain data contract | `NodeKind`, `RiskClass`, `StepStatus`, `ReasoningRef` | corecruxd | 0.8k |
 | `crux-integrations` | Declarative manifest contract for daemon integration packs | `IntegrationManifest`, `IntegrationEntry`, `EntryKind`, `SafetyPolicy` | corecruxctl, crux-mcp, corecruxd | 2.5k |

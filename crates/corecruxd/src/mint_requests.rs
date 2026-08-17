@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Daemon passport-mint request resolution.
 //!
@@ -12,13 +12,14 @@
 
 use std::path::Path;
 
-use corecrux_memory::FactStore;
+use corecrux_memory::{fact_store::StoreFact, FactStore};
 use serde::Serialize;
 
 pub use corecrux_memory::mint_request::{
-    file_mint_request, get_mint_request, list_pending_mint_requests, resolve_mint_request, MintRequestDecision,
-    MintRequestError, PendingMintRequest, MINT_REQUEST_ENTITY_PREFIX, MINT_REQUEST_RECORD_KEY,
-    MINT_REQUEST_STATUS_APPROVED, MINT_REQUEST_STATUS_PENDING, MINT_REQUEST_STATUS_REJECTED,
+    file_mint_request, get_mint_request, list_pending_mint_requests, prepare_mint_request_resolution,
+    resolve_mint_request, MintRequestDecision, MintRequestError, MintRequestResolutionMetadata, PendingMintRequest,
+    MINT_REQUEST_ENTITY_PREFIX, MINT_REQUEST_RECORD_KEY, MINT_REQUEST_STATUS_APPROVED, MINT_REQUEST_STATUS_PENDING,
+    MINT_REQUEST_STATUS_REJECTED,
 };
 
 /// Successful approval result returned by the HTTP surface.
@@ -29,6 +30,21 @@ pub struct ApprovedMintRequest {
     pub category: String,
     pub minted: bool,
     pub status: String,
+    pub passport_operation: String,
+    pub passport_record_hash: String,
+    pub passport_mutation_hash: String,
+}
+
+/// Exact, normalized approval mutation prepared before receipt persistence.
+/// The only side effect is a safely-created key file for a previously absent
+/// passport; callers must invoke `cleanup_uncommitted_key` if they do not
+/// proceed to `commit`.
+pub struct PreparedMintApproval {
+    pub approved: ApprovedMintRequest,
+    pub request: PendingMintRequest,
+    pub action_summary: String,
+    passport_write: crate::passports::PreparedPassportWrite,
+    request_fact: StoreFact,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -43,7 +59,7 @@ pub enum MintRequestResolutionError {
     Passport(#[from] crate::passports::PassportsError),
 }
 
-fn pending_request(store: &FactStore, request_id: &str) -> Result<PendingMintRequest, MintRequestError> {
+pub fn pending_request(store: &FactStore, request_id: &str) -> Result<PendingMintRequest, MintRequestError> {
     let request =
         get_mint_request(store, request_id).ok_or_else(|| MintRequestError::NotFound(request_id.to_string()))?;
     if request.status != MINT_REQUEST_STATUS_PENDING {
@@ -63,12 +79,118 @@ fn validated_approver(approver_passport: String) -> Result<String, MintRequestRe
     Ok(approver_passport)
 }
 
-/// Apply an explicit operator approval to a pending request.
+/// Prepare an explicit operator approval without mutating fact-store state.
 ///
-/// The request is checked before any passport mutation. The operator override
-/// wins exactly when present; otherwise the requested category is used. A
-/// successful passport create/update is required before the request can move
-/// to `approved`.
+/// The operator must submit the category explicitly. The requester's suggested
+/// category is display-only and is never silently accepted by the approval
+/// backend. The returned action summary binds the exact normalized passport
+/// record and is intended to be signed in an approval receipt before
+/// [`PreparedMintApproval::commit`] is called.
+#[allow(clippy::too_many_arguments)] // Each value is independently bound into the signed approval transaction.
+pub fn prepare_mint_request_approval(
+    data_dir: &Path,
+    store: &FactStore,
+    request_id: &str,
+    approver_passport: String,
+    category_override: Option<String>,
+    name: Option<String>,
+    receipt_id: &str,
+    now_unix_ms: u64,
+) -> Result<PreparedMintApproval, MintRequestResolutionError> {
+    let approver_passport = validated_approver(approver_passport)?;
+    let request = pending_request(store, request_id)?;
+    let final_category = category_override
+        .map(|category| category.trim().to_string())
+        .filter(|category| !category.is_empty())
+        .ok_or(MintRequestResolutionError::MissingCategory)?;
+    crate::passports::validate_category(&final_category)?;
+
+    let passport_write = crate::passports::prepare_mint_passport_write(
+        data_dir,
+        store,
+        &request.requester_id,
+        &final_category,
+        name,
+        &approver_passport,
+        receipt_id,
+        now_unix_ms,
+    )?;
+    let action_summary = format!(
+        "passport_mint_request:approve:requester={}:category={}:operation={}:passport_record_hash={}:passport_mutation_hash={}",
+        request.requester_id,
+        final_category,
+        passport_write.operation,
+        passport_write.record_hash,
+        passport_write.mutation_hash
+    );
+    let metadata = MintRequestResolutionMetadata {
+        receipt_id: Some(receipt_id.to_string()),
+        approved_category: Some(final_category.clone()),
+        passport_operation: Some(passport_write.operation.to_string()),
+        passport_record_hash: Some(passport_write.record_hash.clone()),
+        passport_mutation_hash: Some(passport_write.mutation_hash.clone()),
+    };
+    let (resolved, request_fact) = match prepare_mint_request_resolution(
+        store,
+        request_id,
+        approver_passport,
+        MintRequestDecision::Approved,
+        now_unix_ms,
+        metadata,
+    ) {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            let _ = passport_write.cleanup_uncommitted_key();
+            return Err(err.into());
+        }
+    };
+
+    Ok(PreparedMintApproval {
+        approved: ApprovedMintRequest {
+            request_id: resolved.request_id,
+            requester_id: resolved.requester_id,
+            category: final_category,
+            minted: true,
+            status: MINT_REQUEST_STATUS_APPROVED.to_string(),
+            passport_operation: passport_write.operation.to_string(),
+            passport_record_hash: passport_write.record_hash.clone(),
+            passport_mutation_hash: passport_write.mutation_hash.clone(),
+        },
+        request,
+        action_summary,
+        passport_write,
+        request_fact,
+    })
+}
+
+impl PreparedMintApproval {
+    /// Remove a key created while preparing a new passport when the caller
+    /// cannot persist the authorizing receipt.
+    pub fn cleanup_uncommitted_key(&self) -> std::io::Result<()> {
+        self.passport_write.cleanup_uncommitted_key()
+    }
+
+    /// Append all passport/default/request facts as one fsynced, replayable batch.
+    /// Fact-store memory remains unchanged if the journal append fails. A new
+    /// key is deliberately retained after that failure because the already
+    /// durable approval receipt binds it; retaining the key makes an exact
+    /// retry reproducible. Receipt-persistence failures clean it up earlier.
+    pub fn commit(self, store: &mut FactStore) -> Result<ApprovedMintRequest, MintRequestResolutionError> {
+        let Self {
+            approved,
+            mut passport_write,
+            request_fact,
+            ..
+        } = self;
+        let mut facts = std::mem::take(&mut passport_write.store_facts);
+        facts.push(request_fact);
+        store.try_store_bulk_durable(facts).map_err(MintRequestError::Store)?;
+        Ok(approved)
+    }
+}
+
+/// Apply a previously receipt-bound approval as one fact-store batch.
+#[allow(clippy::too_many_arguments)] // Mirrors the receipt-bound preparation API for direct callers.
 pub fn approve_mint_request(
     data_dir: &Path,
     store: &mut FactStore,
@@ -76,68 +198,25 @@ pub fn approve_mint_request(
     approver_passport: String,
     category_override: Option<String>,
     name: Option<String>,
+    receipt_id: &str,
     now_unix_ms: u64,
 ) -> Result<ApprovedMintRequest, MintRequestResolutionError> {
-    let approver_passport = validated_approver(approver_passport)?;
-    let request = pending_request(store, request_id)?;
-    let final_category = category_override
-        .or_else(|| request.requested_category.clone())
-        .ok_or(MintRequestResolutionError::MissingCategory)?;
-    crate::passports::validate_category(&final_category)?;
-
-    if crate::passports::get_passport(store, &request.requester_id).is_none() {
-        crate::passports::create_passport(
-            data_dir,
-            store,
-            crate::passports::CreatePassportInput {
-                id: request.requester_id.clone(),
-                category: final_category.clone(),
-                sponsor_id: None,
-                agent_work_gate: false,
-                is_default_for_category: false,
-                name,
-                owner: None,
-                position: None,
-                company: None,
-                notes: None,
-            },
-            now_unix_ms,
-        )?;
-    } else {
-        crate::passports::update_passport(
-            store,
-            &request.requester_id,
-            crate::passports::UpdatePassportInput {
-                category: Some(final_category.clone()),
-                agent_work_gate: None,
-                is_default_for_category: None,
-                sponsor_id: None,
-                reputation_tier: None,
-                receipt_count: None,
-                name: name.map(Some),
-                owner: None,
-                position: None,
-                company: None,
-                notes: None,
-            },
-        )?;
-    }
-
-    resolve_mint_request(
+    prepare_mint_request_approval(
+        data_dir,
         store,
         request_id,
         approver_passport,
-        MintRequestDecision::Approved,
+        category_override,
+        name,
+        receipt_id,
         now_unix_ms,
-    )?;
+    )?
+    .commit(store)
+}
 
-    Ok(ApprovedMintRequest {
-        request_id: request.request_id,
-        requester_id: request.requester_id,
-        category: final_category,
-        minted: true,
-        status: MINT_REQUEST_STATUS_APPROVED.to_string(),
-    })
+/// Stable receipt summary for a rejected request.
+pub fn mint_request_rejection_action_summary(request: &PendingMintRequest) -> String {
+    format!("passport_mint_request:reject:requester={}", request.requester_id)
 }
 
 /// Reject a pending request without creating or updating any passport.
@@ -145,16 +224,25 @@ pub fn reject_mint_request(
     store: &mut FactStore,
     request_id: &str,
     approver_passport: String,
+    receipt_id: &str,
     now_unix_ms: u64,
 ) -> Result<PendingMintRequest, MintRequestResolutionError> {
     let approver_passport = validated_approver(approver_passport)?;
-    Ok(resolve_mint_request(
+    let (request, fact) = prepare_mint_request_resolution(
         store,
         request_id,
         approver_passport,
         MintRequestDecision::Rejected,
         now_unix_ms,
-    )?)
+        MintRequestResolutionMetadata {
+            receipt_id: Some(receipt_id.to_string()),
+            ..MintRequestResolutionMetadata::default()
+        },
+    )?;
+    store
+        .try_store_bulk_durable(vec![fact])
+        .map_err(MintRequestError::Store)?;
+    Ok(request)
 }
 
 #[cfg(test)]
@@ -210,6 +298,11 @@ mod tests {
         assert_eq!(filed.requested_at_unix_ms, 1_234);
         assert_eq!(filed.resolved_at_unix_ms, None);
         assert_eq!(filed.resolved_by_passport, None);
+        assert_eq!(filed.resolution_receipt_id, None);
+        assert_eq!(filed.approved_category, None);
+        assert_eq!(filed.passport_operation, None);
+        assert_eq!(filed.passport_record_hash, None);
+        assert_eq!(filed.passport_mutation_hash, None);
         assert_eq!(list_pending_mint_requests(&store), vec![filed.clone()]);
         assert_eq!(get_mint_request(&store, &filed.request_id), Some(filed.clone()));
 
@@ -279,6 +372,7 @@ mod tests {
             "operator-passport".to_string(),
             Some("work".to_string()),
             Some("Approved Work Agent".to_string()),
+            &format!("ad_{}", pending.request_id),
             200,
         )
         .unwrap();
@@ -354,6 +448,7 @@ mod tests {
             "operator-passport".to_string(),
             Some("work".to_string()),
             Some("Operator Approved Name".to_string()),
+            &format!("ad_{}", pending.request_id),
             200,
         )
         .unwrap();
@@ -375,8 +470,14 @@ mod tests {
         let pending = file_request(&mut store, "rejected-requester", Some("work"));
         let passport_facts_before = passport_fact_count(&store, "rejected-requester");
 
-        let rejected =
-            reject_mint_request(&mut store, &pending.request_id, "rejecting-operator".to_string(), 300).unwrap();
+        let rejected = reject_mint_request(
+            &mut store,
+            &pending.request_id,
+            "rejecting-operator".to_string(),
+            &format!("ad_{}", pending.request_id),
+            300,
+        )
+        .unwrap();
 
         assert_eq!(rejected.status, MINT_REQUEST_STATUS_REJECTED);
         assert_eq!(rejected.resolved_by_passport.as_deref(), Some("rejecting-operator"));
@@ -402,6 +503,7 @@ mod tests {
             &mut store,
             &absent_pending.request_id,
             "first-operator".to_string(),
+            &format!("ad_{}", absent_pending.request_id),
             200,
         )
         .unwrap();
@@ -412,6 +514,7 @@ mod tests {
             "second-operator".to_string(),
             Some("public".to_string()),
             Some("Must Not Be Created".to_string()),
+            &format!("ad_{}", absent_pending.request_id),
             300,
         );
         assert!(matches!(
@@ -447,6 +550,7 @@ mod tests {
             &mut store,
             &existing_pending.request_id,
             "first-operator".to_string(),
+            &format!("ad_{}", existing_pending.request_id),
             200,
         )
         .unwrap();
@@ -459,6 +563,7 @@ mod tests {
             "second-operator".to_string(),
             Some("work".to_string()),
             Some("Must Not Update".to_string()),
+            &format!("ad_{}", existing_pending.request_id),
             300,
         );
         assert!(matches!(
@@ -480,7 +585,9 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let mut store = FactStore::new();
 
-        let missing_category = file_request(&mut store, "missing-category", None);
+        // The requester's category is only a UI suggestion. Approval must
+        // still carry an explicit operator-confirmed category.
+        let missing_category = file_request(&mut store, "missing-category", Some("work"));
         let facts_before_missing_category = store.count();
         let missing_category_result = approve_mint_request(
             data_dir.path(),
@@ -489,6 +596,7 @@ mod tests {
             "operator-passport".to_string(),
             None,
             Some("Must Not Be Applied".to_string()),
+            &format!("ad_{}", missing_category.request_id),
             200,
         );
         assert!(matches!(
@@ -512,13 +620,20 @@ mod tests {
             " \t ".to_string(),
             Some("work".to_string()),
             Some("Must Not Be Applied".to_string()),
+            &format!("ad_{}", empty_approver.request_id),
             300,
         );
         assert!(matches!(
             empty_approve,
             Err(MintRequestResolutionError::MissingApprover)
         ));
-        let empty_reject = reject_mint_request(&mut store, &empty_approver.request_id, "  ".to_string(), 300);
+        let empty_reject = reject_mint_request(
+            &mut store,
+            &empty_approver.request_id,
+            "  ".to_string(),
+            &format!("ad_{}", empty_approver.request_id),
+            300,
+        );
         assert!(matches!(empty_reject, Err(MintRequestResolutionError::MissingApprover)));
         assert_eq!(store.count(), facts_before_empty_approver);
         assert_eq!(

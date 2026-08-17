@@ -14,6 +14,10 @@ produces a CROWN-compatible receipt.
 - `HorizonClass` — freshness horizon per fact: `Volatile` (~24h) / `Medium` (~35d) / `Stable` (~365d) / `None`; defaulted per entity via `default_for_entity`.
 - `consolidate_facts_v1` / `ContradictionCandidateV1` — consolidation that supersedes targets, preserving history.
 - `CruxPack` / `build_manifest` / `verify_pack` (`cruxpack.rs`) — passport-signed memory-portability export envelope.
+- `DEFAULT_PRIVATE_PREFIXES` / `DAEMON_OWNED_ENTITY_PREFIXES` /
+  `GENERIC_CREATE_RESERVED_PREFIXES` (`fact_privacy.rs`) — canonical
+  privacy/export policy, daemon control namespaces, and physical wrappers that
+  generic callers cannot create.
 - `EntityStore` / `EdgeStore` / `KindRegistry` — the `(kind, id, payload)` + labelled-edge substrate behind `/v1/entities/*`.
 
 ## Invariants
@@ -33,7 +37,15 @@ produces a CROWN-compatible receipt.
 - `.cruxpack` export hygiene is a hard guard: `private: true` facts and
   `CRUXPACK_RESERVED_PREFIXES` entities stay home unless explicitly opted in; tombstoned/
   compacted facts are excluded *unconditionally* — do not add a flag that exports deleted facts.
+- Generic HTTP, MCP, extension, sync, and pack-import paths must reject
+  `DAEMON_OWNED_ENTITY_PREFIXES` plus direct creates in
+  `GENERIC_CREATE_RESERVED_PREFIXES`; only the owning typed daemon workflow may
+  write control records or assign physical private wrappers through the
+  low-level `FactStore`.
 - When adding a fact-write path, assign a `HorizonClass` (or let `default_for_entity`
   choose); `HorizonClass::None` is for identity/pinned facts, not a lazy default for new kinds.
-- New born-private entity prefixes must be added to `CRUXPACK_RESERVED_PREFIXES` too —
-  a corecruxd test asserts the daemon privacy policy stays a subset of that list.
+- Add new born-private namespaces to `DEFAULT_PRIVATE_PREFIXES`; the drift
+  test requires `CRUXPACK_RESERVED_PREFIXES` to cover that canonical slice.
+  Add daemon-owned control namespaces to `DAEMON_OWNED_ENTITY_PREFIXES` as well;
+  add storage wrappers to `GENERIC_CREATE_RESERVED_PREFIXES` without preventing
+  owner-authorized mutation of their visible logical entity.

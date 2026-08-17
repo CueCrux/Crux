@@ -23,6 +23,10 @@ proto/gen/
 # Environment
 .env
 .env.local
+
+# MCP client config. Clients write the daemon's agent bearer token into this
+# file at the repo root, so it must never be committable.
+.mcp.json
 sdks/typescript/node_modules/
 sdks/typescript/dist/
 sdks/python/dist/
@@ -61,3 +65,8 @@ crates/crux-console-ui/dist/
 
 # Coverage instrumentation artifacts (cargo-llvm-cov / -Cinstrument-coverage)
 *.profraw
+
+# Local `git worktree add .worktrees/<name>` checkouts. Untracked, but they made
+# `git status --porcelain` non-empty, which tripped the clean-tree guard in
+# scripts/cut-release.sh and blocked the supported release path outright.
+.worktrees/

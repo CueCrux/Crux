@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Tenant-aware sync endpoints for local/cloud mirror, explicit promotion, and
 //! business-tenant offboarding receipts.
@@ -13,6 +13,33 @@
 //! `x-crux-peer-pubkey` (32-byte hex), `x-crux-peer-nonce` (32-byte hex), and
 //! `x-crux-peer-sig` (64-byte hex). The authenticated token tenant must exactly
 //! equal the tenant path parameter.
+//!
+//! ## Recipient-bound delegation (`CORECRUXD_SYNC_DELEGATION_ENFORCE=1`, macaroon M3′)
+//!
+//! A peer may instead present a **delegated v1.1 token** (`rcx-ct/1.1`): a subject
+//! that holds a CruxEngine-issued `crux-sync` grant bound a strictly narrower
+//! one-hop delegation to a recipient key **offline** (`attenuate_for`). Such
+//! tokens are *contextual* — the base `verify_token` fails them closed
+//! everywhere — so they are honoured only here, and only with enforcement on.
+//!
+//! `require_sync_peer` routes any token whose `requires_contextual_verification()`
+//! is true through `verify_sync_delegation`. It reuses the same `x-crux-peer-*`
+//! headers, but now `pubkey` is the recipient key and `sig` is the recipient's
+//! `PresentationProof` over the full canonical wire token, the request context,
+//! and the nonce. The daemon builds the sync `AttenuationContext` (audience
+//! `crux-sync`, backend `crux-sync`, capability `corecrux.sync.pull` for reads /
+//! `corecrux.sync.push` for writes, attestation `passport_bound`), requires a
+//! fresh server nonce, calls `verify_token_attenuated`, and consumes the nonce
+//! only on success — so a replayed nonce fails closed. A plain v1.0 token keeps
+//! the existing subject-possession path unchanged, with the flag ON or OFF.
+//!
+//! **Fail-closed & rollout.** With `CORECRUXD_SYNC_DELEGATION_ENFORCE` OFF (the
+//! default) a contextual token is rejected outright — its caveats are never
+//! dropped to grant the broader base authority. Deploy verifiers with the flag
+//! enabled **before** the issuer (CruxEngine) mints any `rcx-ct/1.1`
+//! sync-delegation token (mint-before-verify): an old verifier rejecting a
+//! delegation token is the safe direction, a new mint against an old verifier is
+//! not.
 
 use super::*;
 use base64::Engine as _;
@@ -21,9 +48,13 @@ use corecrux_memory::sync::{
     apply_promoted_records, build_tenant_manifest, offboard_tenant_mirror, promotion_preview, sync_records_hash,
     tenant_collection_page, SyncCollectionRecord, TenantManifestInput,
 };
-use crux_sync::peer_handshake::{verify_peer_handshake, AuthenticatedPeer, PeerAuthError, PeerHandshake};
+use crux_sync::peer_handshake::{verify_peer_handshake, AuthenticatedPeer, NonceCache, PeerAuthError, PeerHandshake};
 use rand::TryRng as _;
-use rcx_capability_token::RcxCapabilityToken;
+use rcx_capability_token::{
+    verify_token_attenuated, AttenuatedOutcome, AttenuationContext, DelegationAudience, PresentationProof,
+    RcxCapabilityToken, RCX_SYNC_BACKEND_ID, RCX_SYNC_PASSPORT_ATTESTATION, RCX_SYNC_PULL_CAPABILITY,
+    RCX_SYNC_PUSH_CAPABILITY,
+};
 use serde_json::json;
 
 const PEER_TOKEN_HEADER: &str = "x-crux-peer-token";
@@ -120,8 +151,112 @@ fn peer_rejection_class(error: &PeerAuthError) -> &'static str {
     }
 }
 
+fn delegation_rejection_class(outcome: &AttenuatedOutcome) -> &'static str {
+    match outcome {
+        AttenuatedOutcome::Verified(_) => "peer_delegation_verified",
+        AttenuatedOutcome::Base(_) => "peer_token_rejected",
+        AttenuatedOutcome::ContextDenied => "peer_context_denied",
+        AttenuatedOutcome::DelegationNotPermitted => "peer_delegation_not_permitted",
+        AttenuatedOutcome::DelegatorMismatch => "peer_delegator_mismatch",
+        AttenuatedOutcome::DelegateMismatch => "peer_delegate_mismatch",
+        AttenuatedOutcome::SelfDelegation => "peer_self_delegation",
+        AttenuatedOutcome::PrincipalRevoked => "peer_revoked",
+        AttenuatedOutcome::BadPossessionProof => "peer_possession_rejected",
+        AttenuatedOutcome::MalformedEnvelope => "peer_malformed_envelope",
+        AttenuatedOutcome::BadDelegationSignature => "peer_delegation_signature_rejected",
+        AttenuatedOutcome::CaveatDenied => "peer_caveat_denied",
+    }
+}
+
+/// v1.0 subject-presented peer handshake (audit-v2 M2a/M2b), unchanged: issuer
+/// signature + subject possession + revocation + nonce, then tenant binding.
 #[allow(clippy::result_large_err)]
-async fn require_sync_peer(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<(), Response> {
+fn verify_sync_v1_peer(
+    handshake: &PeerHandshake,
+    trust_root: &[u8],
+    now: u64,
+    revoked_peer_fprs: &std::collections::HashSet<String>,
+    nonce_cache: &mut NonceCache,
+    tenant_id: &str,
+) -> Result<(), Response> {
+    let authenticated = verify_peer_handshake(handshake, trust_root, now, nonce_cache, |token| {
+        revoked_peer_fprs.contains(&token.subject.passport_fpr)
+    })
+    .map_err(|error| peer_auth_problem(peer_rejection_class(&error)))?;
+
+    let AuthenticatedPeer {
+        tenant_id: authenticated_tenant,
+        ..
+    } = authenticated;
+    if authenticated_tenant != tenant_id {
+        return Err(peer_tenant_problem());
+    }
+    Ok(())
+}
+
+/// Recipient-bound v1.1 delegation verification at the sync boundary (macaroon
+/// M3′). Flag-gated: with `sync_delegation_enforce` OFF a contextual token is
+/// rejected fail-closed (its restrictions are never dropped to grant base
+/// authority). The nonce is consumed only after the presentation proof and every
+/// context/caveat check pass, so a replayed nonce fails closed.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+fn verify_sync_delegation(
+    state: &AppState,
+    handshake: &PeerHandshake,
+    trust_root: &[u8],
+    now: u64,
+    revoked_peer_fprs: &std::collections::HashSet<String>,
+    nonce_cache: &mut NonceCache,
+    tenant_id: &str,
+    required_capability: &str,
+) -> Result<(), Response> {
+    if !state.sync_delegation_enforce {
+        return Err(peer_auth_problem("peer_delegation_disabled"));
+    }
+    if !nonce_cache.is_fresh(&handshake.nonce, now) {
+        return Err(peer_auth_problem("peer_nonce_rejected"));
+    }
+
+    let present_attestations = [RCX_SYNC_PASSPORT_ATTESTATION];
+    let context = AttenuationContext {
+        audience: DelegationAudience::CruxSync,
+        tenant_id,
+        backend_id: RCX_SYNC_BACKEND_ID,
+        capability: required_capability,
+        // Egress is not enforced at the sync boundary in v1 (convention
+        // 2026-07-22 Open Q3); tenant / capability / caveat checks are.
+        data_egress_classes: &[],
+        present_attestations: &present_attestations,
+    };
+    let proof = PresentationProof {
+        public_key: handshake.peer_public_key,
+        nonce: &handshake.nonce,
+        signature: handshake.nonce_signature,
+    };
+    match verify_token_attenuated(
+        &handshake.capability_token,
+        trust_root,
+        now,
+        &proof,
+        &handshake.nonce,
+        context,
+        |fpr| revoked_peer_fprs.contains(fpr),
+    ) {
+        AttenuatedOutcome::Verified(_) => {
+            nonce_cache.consume(&handshake.nonce);
+            Ok(())
+        }
+        other => Err(peer_auth_problem(delegation_rejection_class(&other))),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+async fn require_sync_peer(
+    state: &AppState,
+    headers: &HeaderMap,
+    tenant_id: &str,
+    required_capability: &str,
+) -> Result<(), Response> {
     let handshake = parse_peer_handshake(headers).map_err(|error| match error {
         PeerHandshakeParseError::Missing => peer_auth_problem("missing_peer_handshake"),
         PeerHandshakeParseError::Malformed => peer_auth_problem("malformed_peer_handshake"),
@@ -152,23 +287,35 @@ async fn require_sync_peer(state: &AppState, headers: &HeaderMap, tenant_id: &st
         .lock()
         .map_err(|_| peer_verification_unavailable())?;
 
-    let verification = verify_peer_handshake(&handshake, trust_root, now, &mut nonce_cache, |token| {
-        revoked_peer_fprs.contains(&token.subject.passport_fpr)
-    });
+    // A delegation-enabled (v1.1) token is contextual — the base `verify_token`
+    // fails it closed everywhere. Route it through recipient-bound delegation
+    // verification (flag-gated); a plain v1.0 token keeps the existing path.
+    let outcome = if handshake.capability_token.requires_contextual_verification() {
+        verify_sync_delegation(
+            state,
+            &handshake,
+            trust_root,
+            now,
+            &revoked_peer_fprs,
+            &mut nonce_cache,
+            tenant_id,
+            required_capability,
+        )
+    } else {
+        verify_sync_v1_peer(
+            &handshake,
+            trust_root,
+            now,
+            &revoked_peer_fprs,
+            &mut nonce_cache,
+            tenant_id,
+        )
+    };
     nonce_cache.sweep_expired(now);
-    let authenticated = verification.map_err(|error| peer_auth_problem(peer_rejection_class(&error)))?;
-    drop(nonce_cache);
-
-    let AuthenticatedPeer {
-        tenant_id: authenticated_tenant,
-        ..
-    } = authenticated;
-    if authenticated_tenant != tenant_id {
-        return Err(peer_tenant_problem());
-    }
-    Ok(())
+    outcome
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_handshake_nonce(State(state): State<AppState>) -> Response {
     if !state.sync_mutual_auth {
         return problem_response(StatusCode::NOT_FOUND, "sync mutual authentication is disabled");
@@ -261,31 +408,37 @@ fn validate_tenant_id(tenant_id: &str) -> Result<(), Response> {
 #[allow(clippy::result_large_err)]
 async fn require_sync_read(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<(), Response> {
     if state.sync_mutual_auth {
-        return require_sync_peer(state, headers, tenant_id).await;
+        return require_sync_peer(state, headers, tenant_id, RCX_SYNC_PULL_CAPABILITY).await;
     }
 
     let ctx = crate::auth::http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)?;
     if ctx.has_scope("admin:read") {
         return Ok(());
     }
+    // The scope is discarded here deliberately: sync reads go through the peer
+    // path below, not the tenant-scoped readers this type guards (M1 non-goal).
     require_http_scopes_for_tenant(&state.auth, headers, &["facts:read"], tenant_id)
+        .map(|_| ())
         .map_err(IntoResponse::into_response)
 }
 
 #[allow(clippy::result_large_err)]
 async fn require_sync_write(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<(), Response> {
     if state.sync_mutual_auth {
-        return require_sync_peer(state, headers, tenant_id).await;
+        return require_sync_peer(state, headers, tenant_id, RCX_SYNC_PUSH_CAPABILITY).await;
     }
 
     let ctx = crate::auth::http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)?;
     if ctx.has_scope("admin:write") {
         return Ok(());
     }
+    // Scope discarded for the same reason as the read side above.
     require_http_scopes_for_tenant(&state.auth, headers, &["facts:write"], tenant_id)
+        .map(|_| ())
         .map_err(IntoResponse::into_response)
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_tenant_manifest(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -312,6 +465,7 @@ pub(super) async fn get_tenant_manifest(
     Json(manifest).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_tenant_collection(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -338,6 +492,7 @@ pub(super) async fn get_tenant_collection(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_promotion_preview(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -355,6 +510,7 @@ pub(super) async fn post_promotion_preview(
     Json(preview).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_promotion_confirm(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -401,6 +557,7 @@ pub(super) async fn post_promotion_confirm(
     .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_tenant_offboard(
     State(state): State<AppState>,
     headers: HeaderMap,

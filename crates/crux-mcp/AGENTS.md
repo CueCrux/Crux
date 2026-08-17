@@ -4,8 +4,9 @@
 
 Agent-facing MCP server: JSON-RPC 2.0 transport, tool dispatch, and an axum server
 speaking MCP Streamable HTTP. Hosted inside `corecruxd` (port 14801). ~42 tool modules,
-~33k LOC — index only. Agents authenticate via `CRUX_AGENT_TOKEN` (validated in `agent`
-before any dispatch).
+~33k LOC — index only. Agents authenticate through registered bearer tokens or
+hosted-client OAuth introspection; `agent::mcp_authentication_configured` is the shared
+fail-closed predicate used before dispatch, in discovery, and for bind validation.
 
 ## Where to start
 - `src/tools/mod.rs` — `ToolDefinition` + `list_tools` / `list_tools_local_surface`:
@@ -32,6 +33,9 @@ before any dispatch).
   hash_matches && error_code == "OK"` (boolean-AND, fail-closed).
 - Observes I4: recall filters `superseded_by.is_none()` by default
   (`src/tools/facts.rs`); `include_superseded=true` exposes the chain.
+- Generic fact, memory-edit, consolidation, and forget tools cannot create,
+  overwrite, or delete daemon-owned control namespaces; those records are
+  reachable only through their typed daemon workflows.
 
 ## Test & verify
 - `cargo test -p crux-mcp` (includes the `t1_regression` tenant-isolation suite)
@@ -44,3 +48,5 @@ before any dispatch).
 - New tools register in `src/tools/mod.rs` AND get a tier entry in
   `vaultcrux-local::tool_surface::TOOL_SURFACE` (unknown names default to Local).
 - Changes touching tenant scoping must keep `t1_regression` green — it is the merge bar.
+- Namespace checks must use `corecrux_memory::fact_privacy`; do not grow a
+  second MCP-only control-prefix list.

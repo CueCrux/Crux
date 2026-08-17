@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! `GET/POST /v1/context` — provider-agnostic injection-bundle surface
 //! (`context_bundle/v1`).
@@ -137,6 +137,16 @@ async fn gather_facts(
 
     // 2. Keyword recall, effective-confidence ranked (spec §4 rule 2) —
     //    or the zero-hint default bundle (top facts overall).
+    //
+    //    UNDIRECTED recall excludes daemon-internal namespaces (`__*::`).
+    //    They are real records and they stay reachable — pass 1 above still
+    //    resolves them when the caller names one — but they are the daemon's
+    //    own bookkeeping and seeded documentation, not the user's memory, and
+    //    on a fresh node they swamp it: measured 2026-08-07 against a node
+    //    holding exactly one user fact, an authenticated `query=` returned 50
+    //    facts of which 49 were `__bootstrap__::` docs. A user asking "what
+    //    database do we use" got the daemon's own manual. `get_bootstrap` is
+    //    the intended door to that content.
     let keyword = req.query.as_deref().map(str::trim).filter(|q| !q.is_empty());
     if keyword.is_some() || req.entity.is_none() {
         let q = corecrux_memory::fact_store::FactQuery {
@@ -154,6 +164,9 @@ async fn gather_facts(
         };
         for fact in super::facts::query_visible_http_facts(&store, &q, ctx)? {
             if fact.superseded_by.is_some() || !seen.insert(fact.fact_id.clone()) {
+                continue;
+            }
+            if corecrux_memory::fact_privacy::is_internal_namespace(&fact.entity) {
                 continue;
             }
             out.push(fact_input(fact, false));
@@ -489,6 +502,7 @@ async fn handle_context(state: AppState, headers: HeaderMap, req: ContextRequest
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_context(
     State(state): State<AppState>,
     Query(req): Query<ContextRequest>,
@@ -511,6 +525,7 @@ pub(super) async fn get_context(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_context(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -649,6 +664,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn undirected_recall_excludes_daemon_internal_namespaces() {
+        // The regression this guards: on a fresh node the seeded
+        // `__bootstrap__::` docs outnumber the user's memory, so an
+        // undirected query answered with the daemon's own manual.
+        let state = enabled_state();
+        store_fact(&state, "project:atlas", "database", "Postgres 16").await;
+        store_fact(&state, "__bootstrap__::doc:api-append", "content", "how to append").await;
+        store_fact(&state, "__coord__::session", "state", "internal bookkeeping").await;
+
+        for request in [req(None, None, Some(4000)), req(None, Some("database"), Some(4000))] {
+            let bundle = get_bundle(&state, request).await;
+            let entities: Vec<String> = facts_items(&bundle)
+                .iter()
+                .map(|f| f["entity"].as_str().unwrap_or_default().to_string())
+                .collect();
+            assert!(
+                entities.iter().any(|e| e == "project:atlas"),
+                "user fact missing from undirected recall: {entities:?}"
+            );
+            assert!(
+                !entities.iter().any(|e| e.starts_with("__")),
+                "internal namespace leaked into undirected recall: {entities:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn addressing_an_internal_entity_still_returns_it() {
+        // Excluded from undirected recall, NOT hidden. A caller that names the
+        // entity still gets it, so nothing becomes unreachable.
+        let state = enabled_state();
+        store_fact(&state, "__bootstrap__::doc:api-append", "content", "how to append").await;
+
+        let bundle = get_bundle(&state, req(Some("__bootstrap__::doc:api-append"), None, Some(4000))).await;
+        let entities: Vec<String> = facts_items(&bundle)
+            .iter()
+            .map(|f| f["entity"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(entities, vec!["__bootstrap__::doc:api-append".to_string()]);
+    }
+
+    #[tokio::test]
     async fn stable_region_is_byte_stable_across_calls() {
         let state = enabled_state();
         store_fact(&state, "execplan:demo", "decision:arch", "exposed via /v1/context").await;
@@ -702,7 +759,10 @@ mod tests {
         let new = store_fact(&state, "bench:lme-s", "baseline-2026", "91.7%").await;
         {
             let mut s = state.fact_store.write().await;
-            assert!(s.mark_superseded(&old.fact_id, &new.fact_id), "mark superseded");
+            assert!(
+                s.mark_superseded("default", &old.fact_id, &new.fact_id),
+                "mark superseded"
+            );
         }
         let bundle = get_bundle(&state, req(Some("bench:lme-s"), None, Some(2000))).await;
         let items = facts_items(&bundle);

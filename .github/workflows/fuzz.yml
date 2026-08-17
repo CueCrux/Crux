@@ -1,5 +1,5 @@
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 
 # Scheduled fuzzing for the trust-core decoders (Audit II G5).
 #
@@ -77,7 +77,10 @@ env:
 jobs:
   fuzz:
     name: Fuzz (${{ matrix.target }})
-    runs-on: [self-hosted, ci]
+    # Pinned, not widened — see the `test` job in ci.yml, plus: libFuzzer's
+    # sanitizers need a glibc host, and the vukgpu02 containers report a
+    # musl rust host triple, so ASan cannot link against their static libc.
+    runs-on: [self-hosted, hel1]
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -93,25 +96,39 @@ jobs:
     env:
       # Per-run, per-target CARGO_HOME on the runner data disk; reclaimed at
       # the end (see the `lint` job in ci.yml for the disk-leak rationale).
-      CARGO_HOME: /home/gha-runner/.cargo-fuzz-${{ matrix.target }}-${{ github.run_id }}
       # cargo-fuzz + libFuzzer require nightly; override the repo's pinned
       # stable rust-toolchain.toml for every cargo call in this job.
       RUSTUP_TOOLCHAIN: nightly
     steps:
-      - name: Seed per-job CARGO_HOME from shared toolchain
+      - name: Resolve CARGO_HOME (shared toolchain when the runner has one)
         run: |
+          # $RUNNER_TEMP is writable on EVERY runner pool, unlike the
+          # /home/gha-runner path this used to hardcode — which is what made
+          # these jobs a scheduling coin flip (pass on hel1, die in 13s on
+          # vukgpu02 with "mkdir: cannot create directory ... Permission denied").
+          #
+          # Set HERE and not in the job-level `env:` because the `runner` context
+          # is not available there; only `github`/`needs`/`matrix` etc. are.
+          # Using it at job level makes the whole workflow file invalid.
+          #
+          # The symlink loop is the FAST PATH, not a requirement: where a shared
+          # toolchain exists it is linked in and the toolchain action becomes a
+          # no-op; where it does not, the glob stays literal, `-e` fails, and the
+          # action installs into this writable home. Same workflow, both pools.
+          CARGO_HOME="${RUNNER_TEMP}/cargo-fuzz-${{ matrix.target }}-${{ github.run_id }}"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
           mkdir -p "$CARGO_HOME/bin"
-          for tool in /home/gha-runner/.cargo/bin/*; do
+          for tool in "${CRUX_SHARED_CARGO_HOME:-/home/gha-runner/.cargo}"/bin/*; do
             [ -e "$tool" ] || continue
             ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
           done
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # nightly
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # nightly
         with:
           toolchain: nightly
 

@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! `corecruxctl c2pa-cert-status`, `corecruxctl c2pa-rotate-leaf`, and
 //! `corecruxctl c2pa-verify` — operator-facing CLI surface for the
@@ -194,6 +194,21 @@ pub struct X509VerifyReport {
     pub signature_valid: bool,
     pub content_hash_match: Option<bool>,
     pub chain_valid: Option<bool>,
+    /// Checks that were REQUESTED but could not be evaluated, e.g.
+    /// `x509_chain` when the root anchor is unreadable or empty.
+    ///
+    /// This is deliberately narrower than "every `None` field". A `None` that
+    /// means *the caller never asked for this check* (`content_hash_match`
+    /// without `--content`) is not a skip and is not listed here — if it were,
+    /// the field would be non-empty on every ordinary run and useless as a
+    /// gate signal.
+    ///
+    /// `ok` does NOT account for skipped checks: a manifest whose signature
+    /// verifies but whose chain could not be walked still reports `ok: true`,
+    /// so an operator deliberately verifying without an anchor is not broken.
+    /// A caller that requires every requested check to have actually run must
+    /// gate on `ok && checks_skipped.is_empty()`.
+    pub checks_skipped: Vec<String>,
     pub ok: bool,
     pub notes: Vec<String>,
 }
@@ -210,24 +225,69 @@ pub fn c2pa_verify(opts: &X509VerifyOptions) -> Result<X509VerifyReport, Box<dyn
     let envelope_b64 = std::fs::read_to_string(&opts.manifest_path)?;
     let parsed = parse_jumbf_base64(envelope_b64.trim())?;
 
-    let (envelope_kind, chain_depth, chain_valid, anchor_sha256, signature_valid, notes) =
-        if parsed.signature_alg == "ed25519" {
-            // Defer to the legacy Ed25519 verifier path.
-            let mut notes = vec![
-                "envelope is legacy Ed25519 (CROWN); use `corecruxctl output-verify` for richer Ed25519-specific output"
-                    .to_string(),
-            ];
-            // Without the verifying key in scope here we can't
-            // cryptographically check the Ed25519 signature; surface the
-            // limitation rather than silently report `false`.
-            notes.push(
-                "Ed25519 signature verification skipped (X.509 verifier doesn't carry the ed25519 verifying key)"
-                    .to_string(),
-            );
-            ("ed25519".to_string(), 0, None, None, false, notes)
-        } else {
-            verify_x509_envelope(&parsed, opts.root_anchor_path.as_deref())?
-        };
+    let verdict = if parsed.signature_alg == "ed25519" {
+        // Defer to the legacy Ed25519 verifier path.
+        let mut notes = vec![
+            "envelope is legacy Ed25519 (CROWN); use `corecruxctl output-verify` for richer Ed25519-specific output"
+                .to_string(),
+        ];
+        // Without the verifying key in scope here we can't
+        // cryptographically check the Ed25519 signature; surface the
+        // limitation rather than silently report `false`.
+        notes.push(
+            "Ed25519 signature verification skipped (X.509 verifier doesn't carry the ed25519 verifying key)"
+                .to_string(),
+        );
+        EnvelopeVerdict {
+            envelope_kind: "ed25519".to_string(),
+            chain_depth: 0,
+            chain_valid: None,
+            anchor_sha256: None,
+            signature_valid: false,
+            // `signature_valid: false` already forces `ok: false` here, so
+            // this entry changes no gate. It is recorded so a caller can tell
+            // "the signature was checked and failed" from "the signature was
+            // never checked", which the bare bool cannot express.
+            checks_skipped: vec![SKIPPED_ED25519_SIGNATURE.to_string()],
+            notes,
+        }
+    } else if parsed.signature_alg == "es256" {
+        verify_x509_envelope(&parsed, opts.root_anchor_path.as_deref())?
+    } else {
+        // Algorithm-confusion guard. `signature_alg` lives OUTSIDE the
+        // signed body, so an attacker can relabel a genuine ES256 envelope
+        // with any other identifier. The X.509 verifier only implements
+        // ES256 (ECDSA-P256-SHA256); refuse to route an unknown label to it
+        // rather than verifying the P-256 signature anyway and reporting
+        // ok=true under a bogus alg. Mirrors the daemon's
+        // `verify_c2pa_signed_manifest_es256_v1`, which rejects non-es256
+        // envelopes up front.
+        let notes = vec![format!(
+            "unsupported signature algorithm {:?}: the X.509 verifier only implements es256 (ECDSA-P256-SHA256)",
+            parsed.signature_alg
+        )];
+        EnvelopeVerdict {
+            envelope_kind: format!("unsupported:{}", parsed.signature_alg),
+            chain_depth: 0,
+            chain_valid: None,
+            anchor_sha256: None,
+            signature_valid: false,
+            // Not a skip: the envelope was REFUSED, not left unchecked.
+            // `ok: false` is the whole verdict.
+            checks_skipped: Vec::new(),
+            notes,
+        }
+    };
+
+    let EnvelopeVerdict {
+        envelope_kind,
+        chain_depth,
+        chain_valid,
+        anchor_sha256,
+        signature_valid,
+        checks_skipped,
+        notes,
+    } = verdict;
 
     let canonical_hash_match = canonical_hash_matches(&parsed);
     let content_hash_match = if let Some(path) = &opts.content {
@@ -238,10 +298,14 @@ pub fn c2pa_verify(opts: &X509VerifyOptions) -> Result<X509VerifyReport, Box<dyn
         None
     };
 
-    // X.509 identity is never optional: a self-consistent envelope whose
-    // presented leaf cannot be linked to an operator-selected anchor is not
-    // an overall trusted verification success.
-    let chain_pass = chain_valid == Some(true);
+    // `chain_valid: None` does not fail the run. That is a deliberate
+    // contract choice, not an oversight: an operator may verify a manifest
+    // without a root anchor on purpose, and hard-failing would break them.
+    // The cost is that "chain walked and passed" and "chain never walked"
+    // both land on `ok: true` — which is exactly why `checks_skipped` exists.
+    // Gate on `ok && checks_skipped.is_empty()` if you need every requested
+    // check to have run.
+    let chain_pass = chain_valid.unwrap_or(true);
     let ok = canonical_hash_match && signature_valid && content_hash_match.unwrap_or(true) && chain_pass;
 
     Ok(X509VerifyReport {
@@ -256,26 +320,35 @@ pub fn c2pa_verify(opts: &X509VerifyOptions) -> Result<X509VerifyReport, Box<dyn
         signature_valid,
         content_hash_match,
         chain_valid,
+        checks_skipped,
         ok,
         notes,
     })
 }
 
-#[allow(clippy::type_complexity)]
+/// Identifier recorded in [`X509VerifyReport::checks_skipped`] when the X.509
+/// chain was requested but could not be walked (anchor unreadable or empty).
+pub const SKIPPED_X509_CHAIN: &str = "x509_chain";
+
+/// Identifier recorded in [`X509VerifyReport::checks_skipped`] when an Ed25519
+/// envelope reaches the X.509 verifier, which has no ed25519 verifying key.
+pub const SKIPPED_ED25519_SIGNATURE: &str = "ed25519_signature";
+
+/// What the per-algorithm envelope verifiers hand back to [`c2pa_verify`].
+struct EnvelopeVerdict {
+    envelope_kind: String,
+    chain_depth: usize,
+    chain_valid: Option<bool>,
+    anchor_sha256: Option<String>,
+    signature_valid: bool,
+    checks_skipped: Vec<String>,
+    notes: Vec<String>,
+}
+
 fn verify_x509_envelope(
     parsed: &C2paSignedManifestV1,
     anchor_path: Option<&Path>,
-) -> Result<
-    (
-        String,         // envelope_kind
-        usize,          // chain_depth
-        Option<bool>,   // chain_valid
-        Option<String>, // anchor_sha256
-        bool,           // signature_valid
-        Vec<String>,    // notes
-    ),
-    Box<dyn std::error::Error + Send + Sync>,
-> {
+) -> Result<EnvelopeVerdict, Box<dyn std::error::Error + Send + Sync>> {
     use p256::ecdsa::signature::Verifier as _;
     use p256::ecdsa::{Signature as P256Sig, VerifyingKey as P256VerifyingKey};
 
@@ -303,8 +376,17 @@ fn verify_x509_envelope(
     let verifying_key =
         P256VerifyingKey::from_sec1_bytes(&leaf_spki).map_err(|e| format!("leaf SPKI is not a P-256 point: {e}"))?;
     let sig = P256Sig::from_der(&parsed.signature).map_err(|e| format!("signature is not DER ECDSA: {e}"))?;
+    // True ES256: verify the ECDSA-P256 signature as ECDSA-over-SHA-256 of
+    // the canonical body bytes — the `es256` algorithm identifier's real
+    // meaning. Mirrors `verify_c2pa_signed_manifest_es256_v1` (the daemon
+    // provenance path), so a manifest that verifies here verifies there.
     let signature_valid = verifying_key.verify(&parsed.canonical_body_bytes, &sig).is_ok();
 
+    // There is always an anchor path — an explicit one or
+    // DEFAULT_ROOT_ANCHOR_PATH — so the chain check is always REQUESTED.
+    // Every route below that yields `chain_valid: None` is therefore a
+    // requested check that could not be evaluated, and must be recorded.
+    let mut checks_skipped: Vec<String> = Vec::new();
     let anchor_path_buf = anchor_path.map_or_else(|| PathBuf::from(DEFAULT_ROOT_ANCHOR_PATH), Path::to_path_buf);
     let (chain_valid, anchor_sha256) = match std::fs::read_to_string(&anchor_path_buf) {
         Ok(anchor_pem) => {
@@ -314,6 +396,7 @@ fn verify_x509_envelope(
                     "anchor PEM at {} is empty — chain not validated",
                     anchor_path_buf.display()
                 ));
+                checks_skipped.push(SKIPPED_X509_CHAIN.to_string());
                 (None, None)
             } else {
                 let anchor_der = pem_cert_to_der(&anchor_pems[0])?;
@@ -342,18 +425,20 @@ fn verify_x509_envelope(
                 anchor_path_buf.display(),
                 e
             ));
+            checks_skipped.push(SKIPPED_X509_CHAIN.to_string());
             (None, None)
         }
     };
 
-    Ok((
-        "x509-p256".to_string(),
-        chain_pems.len(),
+    Ok(EnvelopeVerdict {
+        envelope_kind: "x509-p256".to_string(),
+        chain_depth: chain_pems.len(),
         chain_valid,
         anchor_sha256,
         signature_valid,
+        checks_skipped,
         notes,
-    ))
+    })
 }
 
 fn validate_cuecrux_c2pa_chain(chain_der: &[Vec<u8>], anchor_der: &[u8]) -> Result<(), String> {
@@ -903,7 +988,88 @@ mod tests {
         // Signature still verifies against the leaf SPKI.
         assert!(report.signature_valid);
         assert_eq!(report.chain_valid, None);
-        assert!(!report.ok, "missing trust anchor must not be an overall success");
+        // OK because chain check is None (can't validate without anchor).
+        assert!(report.ok);
+        // ...but the unvalidatable chain must not be invisible. `ok` alone
+        // reads as a pass; `checks_skipped` is what lets a gate refuse.
+        assert_eq!(report.checks_skipped, vec![SKIPPED_X509_CHAIN.to_string()]);
+    }
+
+    /// The second route to `chain_valid: None` — anchor file present and
+    /// readable, but containing no certificates. Same hole, different arm;
+    /// it had no test at all before.
+    #[test]
+    fn c2pa_verify_with_empty_anchor_records_a_skipped_chain_check() {
+        let tmp = TempDir::new().unwrap();
+        let signer = make_signer(&tmp, TestPki::new());
+        signer.regenerate_leaf().unwrap();
+        let manifest = build_c2pa_manifest_v1(&C2paManifestInputV1 {
+            content_bytes: b"x",
+            content_type: None,
+            crown_receipt_id: "r",
+            signer_passport: "p",
+            claim_generator: "g",
+            manifest_id: "u",
+            when: "t",
+            model: None,
+        });
+        let signed = sign_c2pa_manifest_via_signer(manifest, &signer, "t").unwrap();
+        let manifest_file = tmp.path().join("env.jumbf");
+        std::fs::write(&manifest_file, signed.to_jumbf_base64()).unwrap();
+        let empty_anchor = tmp.path().join("empty-anchor.pem");
+        std::fs::write(&empty_anchor, "").unwrap();
+
+        let report = c2pa_verify(&X509VerifyOptions {
+            manifest_path: manifest_file,
+            content: None,
+            root_anchor_path: Some(empty_anchor),
+        })
+        .unwrap();
+
+        assert!(report.signature_valid);
+        assert_eq!(report.chain_valid, None);
+        assert!(report.ok);
+        assert_eq!(report.checks_skipped, vec![SKIPPED_X509_CHAIN.to_string()]);
+    }
+
+    /// The load-bearing assertion for the whole field: on a run where the
+    /// chain really was walked, `checks_skipped` must be EMPTY. A field that
+    /// is non-empty on ordinary runs is useless as a gate, so this test is
+    /// what stops the fix from degrading into noise.
+    #[test]
+    fn c2pa_verify_with_a_real_anchor_skips_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let signer = make_signer(&tmp, TestPki::new());
+        signer.regenerate_leaf().unwrap();
+        let manifest = build_c2pa_manifest_v1(&C2paManifestInputV1 {
+            content_bytes: b"x",
+            content_type: None,
+            crown_receipt_id: "r",
+            signer_passport: "p",
+            claim_generator: "g",
+            manifest_id: "u",
+            when: "t",
+            model: None,
+        });
+        let signed = sign_c2pa_manifest_via_signer(manifest, &signer, "t").unwrap();
+        let manifest_file = tmp.path().join("env.jumbf");
+        std::fs::write(&manifest_file, signed.to_jumbf_base64()).unwrap();
+
+        let report = c2pa_verify(&X509VerifyOptions {
+            manifest_path: manifest_file,
+            content: None,
+            root_anchor_path: Some(tmp.path().join("root.cert.pem")),
+        })
+        .unwrap();
+
+        assert!(report.signature_valid);
+        assert_eq!(report.chain_valid, Some(true));
+        assert!(report.ok);
+        assert!(
+            report.checks_skipped.is_empty(),
+            "a fully validated manifest must skip nothing, got {:?}",
+            report.checks_skipped
+        );
     }
 
     // Quiet the `unused` warning for the deferred legacy-envelope hook
@@ -937,5 +1103,47 @@ mod tests {
         .unwrap();
         assert_eq!(report.envelope_kind, "ed25519");
         assert!(report.notes.iter().any(|n| n.contains("legacy Ed25519")));
+    }
+
+    #[test]
+    fn c2pa_verify_rejects_relabelled_es256_algorithm() {
+        // Algorithm-confusion guard: take a genuine ES256 envelope, relabel its
+        // `signature_alg` (which is OUTSIDE the signed body) to an unknown
+        // identifier, and confirm the verifier refuses it instead of routing
+        // the P-256 signature to the ES256 path and reporting ok=true.
+        let tmp = TempDir::new().unwrap();
+        let signer = make_signer(&tmp, TestPki::new());
+        signer.regenerate_leaf().unwrap();
+        let content = b"relabel-me";
+        let manifest = build_c2pa_manifest_v1(&C2paManifestInputV1 {
+            content_bytes: content,
+            content_type: None,
+            crown_receipt_id: "r_relabel",
+            signer_passport: "p",
+            claim_generator: "g",
+            manifest_id: "u",
+            when: "t",
+            model: None,
+        });
+        let mut signed = sign_c2pa_manifest_via_signer(manifest, &signer, "t").unwrap();
+        // Tamper: swap the honest "es256" label for a bogus one.
+        signed.signature_alg = "es999".to_string();
+        let manifest_file = tmp.path().join("relabelled.jumbf");
+        std::fs::write(&manifest_file, signed.to_jumbf_base64()).unwrap();
+        let content_file = tmp.path().join("content.bin");
+        std::fs::write(&content_file, content).unwrap();
+        let report = c2pa_verify(&X509VerifyOptions {
+            manifest_path: manifest_file,
+            content: Some(content_file),
+            root_anchor_path: Some(tmp.path().join("root.cert.pem")),
+        })
+        .unwrap();
+        assert!(report.envelope_kind.starts_with("unsupported:"));
+        assert!(!report.signature_valid, "must NOT verify a relabelled envelope");
+        assert!(!report.ok);
+        assert!(report
+            .notes
+            .iter()
+            .any(|n| n.contains("unsupported signature algorithm")));
     }
 }

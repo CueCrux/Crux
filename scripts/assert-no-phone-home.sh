@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 #
 # Tier-1 "no phone-home" egress assertion (threat ref T.5; free-tier trust
 # posture: no telemetry, no account requirement, no outbound dial on boot).

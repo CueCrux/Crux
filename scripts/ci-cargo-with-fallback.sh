@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 #
 # ci-cargo-with-fallback.sh — wrap a cargo invocation so a known-flaky
 # `sccache` crash (server disconnect mid-build) triggers exactly one

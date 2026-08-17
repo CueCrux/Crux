@@ -7,23 +7,30 @@ Each target bundle includes:
 - `corecruxd-<target>` as the canonical daemon binary.
 - `crux-<target>` as the user-facing alias for the same daemon binary.
 - `corecruxctl-<target>` for administrative checks and store verification.
-- `LICENCE.md` (code licence) and `TRUST-CONTRACT.md`. The code licence is
-  published to scanners as SPDX `LicenseRef-CCL-1.0` (crate manifests + `.rs`
+- `crux-hook-<target>` for agent lifecycle hooks, including encrypted
+  compaction snapshot sync.
+- `LICENSE` (code licence), `NOTICE` (attribution), and `TRUST-CONTRACT.md`. The code licence is
+  published to scanners as SPDX `Apache-2.0` (crate manifests + `.rs`
   headers); see [docs/LICENCE-FAQ.md](LICENCE-FAQ.md) → "machine-readable
   metadata".
 - `README.md` and `config.example.yaml`.
-- `content/MANIFEST.json`, `content/README.md`, and `content/LICENCE-CONTENT.md`
-  (the content licence, shipped with the assets it governs).
-- `RELEASE-MANIFEST-<target>.txt` with SHA-256 checksums for staged files.
+- `content/MANIFEST.json`, `content/CONTENT-README.md`, and
+  `content/LICENCE-CONTENT.md` (the content guide is renamed while staging so
+  its basename remains distinct in GitHub's flat release-asset namespace; the
+  content licence is shipped with the assets it governs).
+- `RELEASE-MANIFEST-<target>.txt` with SHA-256 checksums keyed by the flat
+  public release-asset basenames. Packaging and release creation both fail if
+  two staged files would share a basename.
 
 `scripts/assert-daemon-release-boundary.sh` verifies the required files, CUDA/GPU
-exclusion boundary, package-script artifact markers, and a package smoke test
-whenever release binaries already exist under `target/release`.
+exclusion boundary, package-script artifact markers, positive and negative
+basename-guard fixtures, and a package smoke test whenever release binaries
+already exist under `target/release`.
 
 The boundary script proves only the local daemon distribution shape:
 
-- required daemon, alias, CLI, licence, trust-contract, README, config, content,
-  and release-manifest files are present in the staged package
+- required daemon, alias, CLI, hook, licence, trust-contract, README, config,
+  content, and release-manifest files are present in the staged package
 - hosted GPU/CUDA surfaces are excluded from the daemon package
 - package-script smoke markers are produced for the staged binaries
 

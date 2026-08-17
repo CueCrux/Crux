@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Route authorization contract for the daemon HTTP surface, plus the
 //! deny-by-default enforcement middleware that promotes it from a test-only
@@ -14,11 +14,13 @@
 //!
 //! * `off` — pass-through.
 //! * `shadow` — evaluate the contract; on a would-deny, emit a structured
-//!   `route_auth_shadow_mismatch` warning and continue (DEFAULT).
+//!   `route_auth_shadow_mismatch` warning and continue. This is the derived
+//!   default only for an auth-off, loopback-only daemon.
 //! * `enforce` — Public routes pass with no auth; classified routes require the
 //!   contract's scopes via the same `auth.rs` primitive handlers use; an
 //!   unclassified route (or a request with no matched path) fails closed with
-//!   `403`.
+//!   `403`. This is the derived default whenever authentication is enabled or
+//!   the listener is non-loopback.
 //!
 //! Handler-level scope checks stay in place as defence in depth — this layer is
 //! a coarse deny-by-default gate in front of them, never a replacement.
@@ -29,7 +31,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
 use super::{problem_response, AppState};
-use crate::auth::require_http_any_scope;
+use crate::auth::{require_http_any_scope, AuthMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteAuthClass {
@@ -130,6 +132,59 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
     }
 
     if path.starts_with("/v1/projections/entity/") || path.starts_with("/v1/query/") {
+        return Some(RouteAuthContract::new(
+            RouteAuthClass::Read,
+            &["query:read", "admin:read"],
+        ));
+    }
+
+    // Semantic-read POSTs. These routes transform or retrieve caller-selected
+    // data and their handlers require read authority; classifying by HTTP
+    // method alone would make them unreachable once route auth defaults to
+    // enforce.
+    if method == "POST" && matches!(path, "/v1/projections/lookup" | "/v1/projections/batch_lookup") {
+        return Some(RouteAuthContract::new(RouteAuthClass::AdminRead, &["admin:read"]));
+    }
+    if method == "POST" && path == "/v1/relations/expand" {
+        return Some(RouteAuthContract::new(RouteAuthClass::AdminRead, &["admin:read"]));
+    }
+    if method == "POST"
+        && matches!(
+            path,
+            "/v1/rcx/publish/projects/{projectId}/preview" | "/v1/rcx/publish/passports/{passportId}/preview"
+        )
+    {
+        return Some(RouteAuthContract::new(RouteAuthClass::AdminRead, &["admin:read"]));
+    }
+    if method == "POST" && path == "/v1/console/engine/search" {
+        return Some(RouteAuthContract::new(RouteAuthClass::AdminRead, &["admin:read"]));
+    }
+    if method == "POST" && path == "/v1/actions/enrich" {
+        return Some(RouteAuthContract::new(
+            RouteAuthClass::Read,
+            &["query:read", "admin:read", "enrichers:first_party"],
+        ));
+    }
+
+    // Studio template library install (crux-integrations-and-template-library
+    // L2). This is the ONE /v1/studio/ route that mutates: it writes the
+    // installed pack's board / designs / workspaces / pages as console facts,
+    // so it must be write-class and must NOT be swept into the read-class
+    // prefix rule below (a read token must never authorize an install).
+    if method == "POST" && path.starts_with("/v1/studio/library/") {
+        return Some(RouteAuthContract::new(
+            RouteAuthClass::Write,
+            &["facts:write", "admin:write"],
+        ));
+    }
+
+    // Studio board packs (console-surfaces-remediation M15) + the read-only
+    // library browse. Read class: the pack routes are pure transforms /
+    // validators over a client-supplied payload (build = hash + optional sign;
+    // verify = schema/hash/signature verdict) and `GET /v1/studio/library`
+    // reads the verified cached index. None of them mutates the fact store;
+    // the console apply step reuses the gated /v1/console/facts/add write route.
+    if path.starts_with("/v1/studio/") {
         return Some(RouteAuthContract::new(
             RouteAuthClass::Read,
             &["query:read", "admin:read"],
@@ -326,8 +381,25 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
         return Some(RouteAuthContract::new(class, scopes));
     }
 
-    if method == "GET" && path == "/v1/passport/mint-requests/pending" {
+    // Runtime span capture (ExecPlan crux-runtime-codemap M2). Read-only, and
+    // admin-scoped: captured spans expose internal file paths and call
+    // structure, which is operator information rather than tenant data.
+    // M5 agent query API: same posture as /v1/traces — it exposes internal
+    // call structure and file paths, which is operator information.
+    if path.starts_with("/v1/code-intel") {
         return Some(RouteAuthContract::new(RouteAuthClass::AdminRead, &["admin:read"]));
+    }
+
+    if path.starts_with("/v1/traces") {
+        return Some(RouteAuthContract::new(RouteAuthClass::AdminRead, &["admin:read"]));
+    }
+
+    if method == "GET" && path == "/v1/passport/mint-requests/pending" {
+        return Some(RouteAuthContract::gated(
+            RouteAuthClass::FeatureGated,
+            &["admin:read"],
+            "CORECRUXD_FEATURE_PASSPORT_MINT_REQUESTS",
+        ));
     }
 
     if method == "POST"
@@ -347,7 +419,82 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
         return Some(RouteAuthContract::new(RouteAuthClass::AdminWrite, &["admin:write"]));
     }
 
+    // Structural governance mutations are admin-only. Keep this exact table
+    // ahead of the broader project/workspace/passport prefix contract so
+    // facts:write or integration scopes cannot satisfy the middleware while
+    // the handler requires admin:write.
+    if matches!(
+        (method, path),
+        ("PATCH", "/v1/passports/{passportId}")
+            | ("DELETE", "/v1/passports/{passportId}")
+            | ("POST", "/v1/projects")
+            | ("PATCH", "/v1/projects/{id}")
+            | ("DELETE", "/v1/projects/{id}")
+            | ("POST", "/v1/projects/{id}/passports")
+            | ("DELETE", "/v1/projects/{id}/passports/{passportId}")
+            | ("POST", "/v1/projects/{id}/tenants")
+            | ("DELETE", "/v1/projects/{id}/tenants/{tenantId}")
+            | ("POST", "/v1/projects/{id}/planes")
+            | ("DELETE", "/v1/projects/{id}/planes/{planeId}")
+            | ("POST", "/v1/projects/{id}/planes/{planeId}/passports")
+            | ("DELETE", "/v1/projects/{id}/planes/{planeId}/passports/{passportId}")
+            | ("POST", "/v1/projects/{id}/planes/{planeId}/tenants")
+            | ("DELETE", "/v1/projects/{id}/planes/{planeId}/tenants/{tenantId}")
+            | ("POST", "/v1/workspace/scan")
+    ) {
+        return Some(RouteAuthContract::new(RouteAuthClass::AdminWrite, &["admin:write"]));
+    }
+
+    // Pulling the git-backed ExecPlan replica rewrites the projection root. It
+    // mutates nothing the daemon owns, but it changes what every reader sees,
+    // so it is classified as an admin write rather than a read.
+    if method == "POST" && (path == "/v1/execplans/refresh" || path == "/v1/execplans") {
+        return Some(RouteAuthContract::new(RouteAuthClass::AdminWrite, &["admin:write"]));
+    }
+
+    if path.starts_with("/v1/workbench/") {
+        let scopes = if method == "GET" {
+            &[
+                "admin:read",
+                "query:read",
+                "agent_brief:pro",
+                "context_pack:budgeted",
+                "impact:preflight",
+                "ledger:history",
+                "audit:triage",
+                "reasoning:timeline",
+                "handoff:v2",
+                "route_probe:lab",
+                "api_drift:check",
+                "policy:simulate",
+            ][..]
+        } else {
+            &[
+                "admin:write",
+                "agent_brief:pro",
+                "context_pack:budgeted",
+                "impact:preflight",
+                "ledger:history",
+                "audit:triage",
+                "reasoning:timeline",
+                "handoff:v2",
+                "route_probe:lab",
+                "api_drift:check",
+                "policy:simulate",
+            ][..]
+        };
+        return Some(RouteAuthContract::gated(
+            RouteAuthClass::FeatureGated,
+            scopes,
+            "workbench product capability",
+        ));
+    }
+
     if path.starts_with("/v1/work")
+        // Counts-only roll-up over the work / gate / coord feeds. It reads the
+        // same surfaces as `/v1/work`, so it takes the same contract —
+        // aggregating into integers is not a reason to authorize it any lower.
+        || path.starts_with("/v1/attention/")
         || path.starts_with("/v1/status-feed")
         || path.starts_with("/v1/projects")
         || path.starts_with("/v1/rcx/publish/")
@@ -363,7 +510,6 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
         || path.starts_with("/v1/cost/")
         || path.starts_with("/v1/cloud/")
         || path.starts_with("/v1/actions/")
-        || path.starts_with("/v1/workbench/")
         || path.starts_with("/v1/mediation/")
         || path.starts_with("/v1/memory/")
     {
@@ -383,9 +529,21 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
     }
 
     if path.starts_with("/v1/gpu1/") {
+        let scopes = if method == "GET" {
+            &["query:read", "admin:read"][..]
+        } else {
+            &[
+                "gpu1:answer",
+                "gpu1:rerank",
+                "gpu1:enrich",
+                "gpu1:coverage",
+                "gpu1:developer",
+                "admin:write",
+            ][..]
+        };
         return Some(RouteAuthContract::gated(
             RouteAuthClass::FeatureGated,
-            &["query:read", "admin:read"],
+            scopes,
             "gpu1_compute",
         ));
     }
@@ -419,7 +577,13 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
     if path.starts_with("/v1/openai/") {
         return Some(RouteAuthContract::gated(
             RouteAuthClass::FeatureGated,
-            &["query:read", "admin:read", "admin:write"],
+            &[
+                "query:read",
+                "facts:write",
+                "sessions:write",
+                "admin:read",
+                "admin:write",
+            ],
             "CORECRUXD_OPENAI_SHIM",
         ));
     }
@@ -453,6 +617,15 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
         ));
     }
 
+    // Escrow holds customer key ciphertext and the custodian-share release
+    // lane; reads and writes are both admin-scoped, never public or query-read.
+    if path.starts_with("/v1/escrow/") {
+        return Some(if method == "GET" {
+            RouteAuthContract::new(RouteAuthClass::AdminRead, &["admin:read"])
+        } else {
+            RouteAuthContract::new(RouteAuthClass::AdminWrite, &["admin:write"])
+        });
+    }
     if path.starts_with("/v1/legal-holds") {
         return Some(RouteAuthContract::gated(
             RouteAuthClass::FeatureGated,
@@ -536,7 +709,7 @@ fn uses_sync_peer_handshake(path: &str) -> bool {
 pub(crate) enum RouteAuthMode {
     /// Pass-through: the middleware does nothing.
     Off,
-    /// Evaluate the contract and log would-denies, but never block. DEFAULT.
+    /// Evaluate the contract and log would-denies, but never block.
     Shadow,
     /// Deny by default: classified routes require their scopes; unclassified
     /// routes and requests with no matched route template fail closed.
@@ -544,18 +717,39 @@ pub(crate) enum RouteAuthMode {
 }
 
 impl RouteAuthMode {
-    /// Read `CORECRUXD_ROUTE_AUTH` once. `off` / `enforce` are explicit;
-    /// anything else (including unset) is the safe `shadow` default.
-    pub(crate) fn from_env() -> Self {
-        match std::env::var("CORECRUXD_ROUTE_AUTH")
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase())
-            .as_deref()
-        {
+    /// Resolve an explicit value or derive the secure default from daemon
+    /// exposure. Unknown and empty explicit values fail safe to `enforce`.
+    fn resolve(raw: Option<&str>, auth_mode: AuthMode, bind_loopback: bool) -> Self {
+        match raw.map(|value| value.trim().to_ascii_lowercase()).as_deref() {
             Some("off") => Self::Off,
+            Some("shadow") => Self::Shadow,
             Some("enforce") => Self::Enforce,
-            // "shadow", the empty string, an unknown value, or unset.
-            _ => Self::Shadow,
+            Some(_) => Self::Enforce,
+            None if auth_mode == AuthMode::Off && bind_loopback => Self::Shadow,
+            None => Self::Enforce,
+        }
+    }
+
+    /// Read `CORECRUXD_ROUTE_AUTH` once. Unset derives from auth/listener
+    /// posture; an invalid explicit value is logged and fails safe to enforce.
+    pub(crate) fn from_env(auth_mode: AuthMode, bind_loopback: bool) -> Self {
+        match std::env::var("CORECRUXD_ROUTE_AUTH") {
+            Ok(raw) => {
+                let mode = Self::resolve(Some(&raw), auth_mode, bind_loopback);
+                if !matches!(raw.trim().to_ascii_lowercase().as_str(), "off" | "shadow" | "enforce") {
+                    tracing::warn!(
+                        configured = %raw,
+                        fallback = "enforce",
+                        "invalid CORECRUXD_ROUTE_AUTH; failing safe"
+                    );
+                }
+                mode
+            }
+            Err(std::env::VarError::NotPresent) => Self::resolve(None, auth_mode, bind_loopback),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                tracing::warn!(fallback = "enforce", "non-Unicode CORECRUXD_ROUTE_AUTH; failing safe");
+                Self::Enforce
+            }
         }
     }
 
@@ -782,6 +976,65 @@ mod tests {
     }
 
     #[test]
+    fn route_auth_unset_derives_from_auth_and_listener_posture() {
+        let cases = [
+            (AuthMode::Off, true, RouteAuthMode::Shadow),
+            (AuthMode::Off, false, RouteAuthMode::Enforce),
+            (AuthMode::DevScopes, true, RouteAuthMode::Enforce),
+            (AuthMode::DevScopes, false, RouteAuthMode::Enforce),
+            (AuthMode::JwtHs256, true, RouteAuthMode::Enforce),
+            (AuthMode::JwtJwks, true, RouteAuthMode::Enforce),
+        ];
+        for (auth_mode, bind_loopback, expected) in cases {
+            assert_eq!(
+                RouteAuthMode::resolve(None, auth_mode, bind_loopback),
+                expected,
+                "auth={} loopback={bind_loopback}",
+                auth_mode.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn route_auth_explicit_modes_and_typos_are_deterministic() {
+        for auth_mode in [
+            AuthMode::Off,
+            AuthMode::DevScopes,
+            AuthMode::JwtHs256,
+            AuthMode::JwtJwks,
+        ] {
+            for bind_loopback in [true, false] {
+                assert_eq!(
+                    RouteAuthMode::resolve(Some("off"), auth_mode, bind_loopback),
+                    RouteAuthMode::Off
+                );
+                assert_eq!(
+                    RouteAuthMode::resolve(Some(" SHADOW "), auth_mode, bind_loopback),
+                    RouteAuthMode::Shadow
+                );
+                assert_eq!(
+                    RouteAuthMode::resolve(Some("Enforce"), auth_mode, bind_loopback),
+                    RouteAuthMode::Enforce
+                );
+                assert_eq!(
+                    RouteAuthMode::resolve(Some(""), auth_mode, bind_loopback),
+                    RouteAuthMode::Enforce
+                );
+                // A misspelled mode must fall back to Enforce, never silently
+                // disable route auth. The value is assembled from fragments so
+                // the spell-checker cannot "correct" the very input under test;
+                // adding it to `_typos.toml` instead would suppress a genuine
+                // instance of the same misspelling anywhere else in the tree.
+                let misspelled_mode = concat!("enf", "ore");
+                assert_eq!(
+                    RouteAuthMode::resolve(Some(misspelled_mode), auth_mode, bind_loopback),
+                    RouteAuthMode::Enforce
+                );
+            }
+        }
+    }
+
+    #[test]
     fn route_auth_matrix_is_complete() {
         let missing: Vec<String> = router_routes()
             .into_iter()
@@ -829,7 +1082,7 @@ mod tests {
                 "POST",
                 "/v1/gpu1/answer",
                 RouteAuthClass::FeatureGated,
-                &["query:read", "admin:read"][..],
+                &["gpu1:answer", "admin:write"][..],
             ),
             (
                 "POST",
@@ -852,7 +1105,7 @@ mod tests {
             (
                 "GET",
                 "/v1/passport/mint-requests/pending",
-                RouteAuthClass::AdminRead,
+                RouteAuthClass::FeatureGated,
                 &["admin:read"][..],
             ),
             (
@@ -901,14 +1154,92 @@ mod tests {
     }
 
     #[test]
-    fn passport_mint_resolution_routes_record_the_feature_gate() {
-        for path in [
-            "/v1/passport/mint-requests/{request_id}/approve",
-            "/v1/passport/mint-requests/{request_id}/reject",
+    fn structural_mutation_contracts_require_exact_admin_write() {
+        let mutations = [
+            ("PATCH", "/v1/passports/{passportId}"),
+            ("DELETE", "/v1/passports/{passportId}"),
+            ("POST", "/v1/projects"),
+            ("PATCH", "/v1/projects/{id}"),
+            ("DELETE", "/v1/projects/{id}"),
+            ("POST", "/v1/projects/{id}/passports"),
+            ("DELETE", "/v1/projects/{id}/passports/{passportId}"),
+            ("POST", "/v1/projects/{id}/tenants"),
+            ("DELETE", "/v1/projects/{id}/tenants/{tenantId}"),
+            ("POST", "/v1/projects/{id}/planes"),
+            ("DELETE", "/v1/projects/{id}/planes/{planeId}"),
+            ("POST", "/v1/projects/{id}/planes/{planeId}/passports"),
+            ("DELETE", "/v1/projects/{id}/planes/{planeId}/passports/{passportId}"),
+            ("POST", "/v1/projects/{id}/planes/{planeId}/tenants"),
+            ("DELETE", "/v1/projects/{id}/planes/{planeId}/tenants/{tenantId}"),
+            ("POST", "/v1/workspace/scan"),
+        ];
+        for (method, path) in mutations {
+            let contract = classify_route(method, path).expect("structural mutation contract");
+            assert_eq!(contract.class, RouteAuthClass::AdminWrite, "{method} {path}");
+            assert_eq!(contract.scopes, &["admin:write"], "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn semantic_post_and_capability_contracts_remain_reachable_in_enforce() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            ("POST", "/v1/projections/lookup", &["admin:read"]),
+            ("POST", "/v1/projections/batch_lookup", &["admin:read"]),
+            ("POST", "/v1/relations/expand", &["admin:read"]),
+            ("POST", "/v1/rcx/publish/projects/{projectId}/preview", &["admin:read"]),
+            (
+                "POST",
+                "/v1/rcx/publish/passports/{passportId}/preview",
+                &["admin:read"],
+            ),
+            ("POST", "/v1/console/engine/search", &["admin:read"]),
+            ("POST", "/v1/actions/enrich", &["query:read", "enrichers:first_party"]),
+            (
+                "POST",
+                "/v1/openai/invoke",
+                &["query:read", "facts:write", "sessions:write"],
+            ),
+            ("POST", "/v1/gpu1/rerank", &["gpu1:rerank", "admin:write"]),
+            (
+                "POST",
+                "/v1/workbench/context-pack",
+                &["context_pack:budgeted", "admin:write"],
+            ),
+            ("GET", "/v1/workbench/contract", &["query:read", "admin:read"]),
+            ("GET", "/v1/workbench/brief", &["agent_brief:pro", "admin:read"]),
+        ];
+        for (method, path, expected_scopes) in cases {
+            let contract = classify_route(method, path).expect("route contract");
+            for scope in *expected_scopes {
+                assert!(
+                    contract.scopes.contains(scope),
+                    "{method} {path} missing handler scope {scope}; got {:?}",
+                    contract.scopes
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn passport_mint_routes_record_the_feature_gate() {
+        for (method, path, scopes) in [
+            ("GET", "/v1/passport/mint-requests/pending", &["admin:read"][..]),
+            (
+                "POST",
+                "/v1/passport/mint-requests/{request_id}/approve",
+                &["admin:write"][..],
+            ),
+            (
+                "POST",
+                "/v1/passport/mint-requests/{request_id}/reject",
+                &["admin:write"][..],
+            ),
         ] {
-            let contract = classify_route("POST", path).expect("passport mint resolution route contract");
+            let Some(contract) = classify_route(method, path) else {
+                panic!("missing passport mint route contract for {method} {path}");
+            };
             assert_eq!(contract.class, RouteAuthClass::FeatureGated, "{path}");
-            assert_eq!(contract.scopes, &["admin:write"], "{path}");
+            assert_eq!(contract.scopes, scopes, "{path}");
             assert_eq!(
                 contract.feature_gate,
                 Some("CORECRUXD_FEATURE_PASSPORT_MINT_REQUESTS"),

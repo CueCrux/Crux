@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Top-level HTTP module: composes the axum `Router`, defines `AppState`, declares all `/v1/*` route handlers.
 
@@ -10,7 +10,9 @@ mod activity;
 mod admin;
 mod agent_usage;
 mod append;
-mod auth_device;
+mod approval_receipts;
+mod attention;
+pub(crate) mod auth_device;
 mod auth_rails;
 mod cases;
 // Hosted-service HTTP surface (ExecPlan crux-external-findings-remediation M4):
@@ -21,6 +23,7 @@ mod cloud;
 mod compute;
 mod console;
 mod consolidation_receipt;
+mod context_budget;
 mod context_surface;
 mod coord;
 mod cost;
@@ -39,6 +42,7 @@ mod memory_capture;
 // Pro GPU-1 compute bridge (`/v1/gpu1/*`). Compiled out of the default
 // Community Edition binary; see the `hosted-surfaces` feature.
 mod audit_verify;
+mod escrow;
 #[cfg(feature = "hosted-surfaces")]
 mod gpu1;
 mod health;
@@ -79,9 +83,14 @@ mod routing;
 pub mod session;
 mod storybook;
 mod stream_receipts;
+mod studio_library;
+mod studio_pack;
 mod sync;
+mod tenant_erasure;
+mod traces;
 mod witness;
 mod work;
+mod work_graph;
 mod workbench;
 mod workspace;
 // session_metrics: Prometheus register!() at init — safe, panics only on
@@ -213,6 +222,10 @@ pub struct AppState {
     pub sync_mutual_auth: bool,
     /// Issuer Ed25519 public key used to validate peer capability tokens.
     pub sync_peer_trust_root: Option<Vec<u8>>,
+    /// Accept recipient-bound v1.1 delegation tokens at the sync boundary
+    /// (macaroon M3′). Default OFF (`CORECRUXD_SYNC_DELEGATION_ENFORCE=1`); OFF
+    /// rejects contextual tokens fail-closed. v1.0 tokens are unaffected.
+    pub sync_delegation_enforce: bool,
     /// Shared single-use challenge state across cloned Axum application state.
     pub sync_handshake_nonces: Arc<std::sync::Mutex<crux_sync::peer_handshake::NonceCache>>,
     pub witness: crate::witness::WitnessRuntimeConfigV1,
@@ -238,6 +251,10 @@ pub struct AppState {
     /// Provider-agnostic injection-bundle surface (`/v1/context`). Default
     /// OFF (`CORECRUXD_CONTEXT_SURFACE=1`); when off, routes return 404.
     pub context_surface_enabled: bool,
+    /// Tenant corpus erasure (`/v1/admin/forget-tenants`,
+    /// `/v1/admin/tenants/{id}/footprint`). Default OFF
+    /// (`CORECRUXD_TENANT_ERASURE=1`); when off, the routes return 404.
+    pub tenant_erasure_enabled: bool,
     /// Authenticated daemon-to-daemon embedding provider
     /// (`POST /v1/compute/embed`). Default OFF
     /// (`CORECRUXD_COMPUTE_PROVIDER=1`); the route remains mounted while off
@@ -306,6 +323,12 @@ pub struct AppState {
     /// 500 until restart; recovering potentially inconsistent money-path state
     /// could otherwise permit an untracked debit or compute without a debit.
     pub credit_meter: Option<Arc<std::sync::Mutex<crate::credit_meter::CreditMeterStore>>>,
+    /// Per-seat rate ceiling on LLM-enriched verdicts (M8).
+    ///
+    /// Always present, unlike `credit_meter`: the ceiling is a safety limit and
+    /// must hold whether or not billing is switched on. A daemon with the meter
+    /// off still refuses a runaway loop.
+    pub enrich_budgets: Arc<std::sync::Mutex<crate::enrich_budget::EnrichBudgets>>,
     /// G21b assembly cache over
     /// `corecrux_projections::assembly_cache::AssemblyCache` — memoizes
     /// assembled `/v1/context` bundles keyed by
@@ -334,6 +357,14 @@ pub struct AppState {
     pub operating_mode: crate::product::OperatingMode,
     pub enabled_pro_services: Vec<String>,
     pub read_retry_failed_readyz_threshold: u64,
+    pub seal_failed_readyz_threshold: u64,
+    /// Consecutive local-ingest seal failures, with the most recent error. Reset
+    /// to `(0, None)` by any successful seal.
+    ///
+    /// The write path had no health signal at all until 2026-08-08: ingest 500'd
+    /// on every request for 38 hours while `/readyz` stayed green, because
+    /// readiness only ever asked about reads, locks and capacity.
+    pub seal_failed_streak: Arc<RwLock<(u64, Option<String>)>>,
     pub commit_level: CommitLevel,
     pub metrics: Metrics,
     pub node_id: String,
@@ -450,7 +481,8 @@ pub fn router(state: AppState, case_store: self::cases::SharedCaseStore) -> Rout
     // Route-authorization posture is read ONCE here, at router build time, not
     // per request. Tests build the router via `router_with_route_auth` to pin an
     // explicit mode without touching the process-global env.
-    router_with_route_auth(state, case_store, self::route_auth::RouteAuthMode::from_env())
+    let route_auth_mode = self::route_auth::RouteAuthMode::from_env(state.auth.mode(), state.http_bind_loopback);
+    router_with_route_auth(state, case_store, route_auth_mode)
 }
 
 pub(crate) fn router_with_route_auth(
@@ -482,6 +514,26 @@ pub(crate) fn router_with_route_auth(
                 axum::extract::DefaultBodyLimit::max(self::compute::COMPUTE_EMBED_MAX_REQUEST_BYTES),
             ),
         )
+        .route(
+            "/v1/escrow/vaults/{vault_id}",
+            axum::routing::put(self::escrow::put_wrapped_dek).get(self::escrow::get_wrapped_dek),
+        )
+        .route(
+            "/v1/escrow/vaults/{vault_id}/release",
+            axum::routing::post(self::escrow::post_release),
+        )
+        .route(
+            "/v1/escrow/releases/{request_id}",
+            axum::routing::get(self::escrow::get_release),
+        )
+        .route(
+            "/v1/escrow/releases/{request_id}/cancel",
+            axum::routing::post(self::escrow::post_release_cancel),
+        )
+        .route(
+            "/v1/escrow/releases/{request_id}/complete",
+            axum::routing::post(self::escrow::post_release_complete),
+        )
         .route("/v1/legal-holds", axum::routing::post(self::legal_holds::post_legal_hold))
         .route(
             "/v1/legal-holds/{id}",
@@ -496,6 +548,10 @@ pub(crate) fn router_with_route_auth(
             "/v1/incidents/{id}/export",
             axum::routing::post(self::incidents::export_incident),
         )
+        // Static `/list` MUST be registered before the `/{receiptId}` param route
+        // so matchit's static-beats-param precedence routes it to the listing
+        // handler, not the by-id 501/404 path (proven by a router test).
+        .route("/v1/receipts/list", get(self::observations::get_receipts_list))
         .route("/v1/receipts/{receiptId}", get(self::receipts::get_receipt_body_v1))
         .route(
             "/v1/receipts/{receiptId}/signature",
@@ -560,6 +616,23 @@ pub(crate) fn router_with_route_auth(
         .route("/v1/admin/segments/fingerprints", get(self::admin::get_segment_fingerprints))
         .route("/v1/admin/sharing/posture", get(self::admin::get_sharing_posture))
         .route("/v1/admin/sharing/backfill", axum::routing::post(self::admin::post_sharing_backfill))
+        .route(
+            "/v1/admin/tenants/{tenantId}/footprint",
+            get(self::tenant_erasure::get_tenant_footprint),
+        )
+        .route(
+            "/v1/admin/forget-tenants",
+            axum::routing::post(self::tenant_erasure::post_forget_tenants),
+        )
+        // Singular alias so CoreCrux's single-tenant runbook still reads true.
+        .route(
+            "/v1/admin/forget-tenant",
+            axum::routing::post(self::tenant_erasure::post_forget_tenants),
+        )
+        .route(
+            "/v1/admin/forget-tenants/{tenantId}",
+            axum::routing::delete(self::tenant_erasure::delete_forget_tenant),
+        )
         .route("/v1/admin/ops-log", get(self::admin::get_ops_log))
         .route("/v1/admin/valves", axum::routing::post(self::admin::post_valves))
         .route("/v1/admin/replication/status", get(self::admin::get_replication_status))
@@ -640,7 +713,10 @@ pub(crate) fn router_with_route_auth(
         )
         .route(
             "/v1/local/ingest",
-            axum::routing::post(self::local_ingest::post_local_ingest),
+            axum::routing::post(self::local_ingest::post_local_ingest)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    self::local_ingest::LOCAL_INGEST_MAX_REQUEST_BYTES,
+                )),
         )
         .route(
             "/v1/query/text-search",
@@ -649,6 +725,27 @@ pub(crate) fn router_with_route_auth(
         .route(
             "/v1/query/text-search/expand",
             axum::routing::post(self::query::post_query_text_search_expand),
+        )
+        // console-surfaces-remediation M15: Studio board packs — curated read
+        // POSTs (hash/sign a pack; verify an uploaded pack). Neither mutates the
+        // fact store; the apply step reuses the gated /v1/console/facts/add.
+        .route(
+            "/v1/studio/pack/build",
+            axum::routing::post(self::studio_pack::post_build_pack),
+        )
+        .route(
+            "/v1/studio/pack/verify",
+            axum::routing::post(self::studio_pack::post_verify_pack),
+        )
+        // crux-integrations-and-template-library L2: the CENTRAL Studio
+        // template library. Read-only browse over the verified cached
+        // curator-signed index (populated by `corecruxctl studio sync`), plus
+        // the operator-gated install that writes console facts. Static
+        // `library` segment, so it never shadows `/v1/studio/pack/*`.
+        .route("/v1/studio/library", get(self::studio_library::get_studio_library))
+        .route(
+            "/v1/studio/library/{id}/install",
+            axum::routing::post(self::studio_library::post_studio_library_install),
         )
         // Memory primitives (Phase 1.5)
         .route("/v1/facts", axum::routing::put(self::facts::put_fact))
@@ -666,6 +763,10 @@ pub(crate) fn router_with_route_auth(
             axum::routing::post(self::identity_links::post_identity_link_revoke),
         )
         .route(
+            "/v1/identity/candidates/propose",
+            axum::routing::post(self::identity_links::post_identity_candidates_propose),
+        )
+        .route(
             "/v1/identity/candidates/{candidateId}/confirm",
             axum::routing::post(self::identity_links::post_identity_candidate_confirm),
         )
@@ -681,6 +782,7 @@ pub(crate) fn router_with_route_auth(
         .route("/v1/facts/{factId}", axum::routing::delete(self::facts::delete_fact))
         .route("/v1/facts/entity/{entity}", get(self::facts::get_facts_by_entity))
         .route("/v1/facts/export", get(self::facts::export_facts))
+        .route("/v1/facts/list", get(self::facts::list_facts))
         // Substrate (M1: Crux as domain substrate).
         .route("/v1/entities", get(self::entities::list_entities))
         .route("/v1/entities/{kind}/{id}", get(self::entities::get_entity))
@@ -773,6 +875,7 @@ pub(crate) fn router_with_route_auth(
         )
         // Per-passport tool-usage rollup over the action ledger (action-ledger M3).
         .route("/v1/agents/{passport}/usage", get(self::agent_usage::get_agent_usage))
+        .route("/v1/mcp/tools/usage", get(self::agent_usage::get_mcp_tools_usage))
         // Token-burn cost lens — POST a ground-truth report, GET it for the console.
         .route("/v1/cost/report", get(self::cost::get_cost_report))
         .route("/v1/cost/report", axum::routing::post(self::cost::post_cost_report))
@@ -866,8 +969,21 @@ pub(crate) fn router_with_route_auth(
             "/v1/coord/announce",
             axum::routing::post(self::coord::post_coord_announce),
         )
+        // Counts-only attention roll-up over work + gates + coord sessions. The
+        // three feeds it aggregates are disqualified from the hosted read-only
+        // subset (plan names, local paths); four integers are not.
+        .route("/v1/attention/summary", get(self::attention::get_attention_summary))
         // Work coordination — kanban over `__work__::*` facts.
+        .route(
+            "/v1/execplans/refresh",
+            axum::routing::post(self::work::post_execplans_refresh),
+        )
+        .route("/v1/execplans", axum::routing::post(self::work::post_execplan))
         .route("/v1/work", get(self::work::get_work))
+        // Spatial projection of the open ExecPlan board (console Patchbay).
+        // Same source and scope as `/v1/work`; adds plane/services/blurb.
+        // Registered before `/v1/work/{id}` so the literal path wins the match.
+        .route("/v1/work/graph", get(self::work_graph::get_work_graph))
         .route("/v1/work", axum::routing::post(self::work::post_work))
         .route("/v1/work/gate/pending", get(self::work::get_pending_gates))
         .route(
@@ -917,6 +1033,7 @@ pub(crate) fn router_with_route_auth(
         // Tenant-scoped repository registry endpoints.
         .route("/v1/repos", get(self::repos::get_repos))
         .route("/v1/repos", axum::routing::post(self::repos::post_repo))
+        .route("/v1/repos/allowance", get(self::repos::get_repo_allowance))
         .route("/v1/repos/dependents", get(self::repos::get_repo_dependents))
         .route(
             "/v1/repos/scan-jobs/{job_id}",
@@ -933,6 +1050,32 @@ pub(crate) fn router_with_route_auth(
             "/v1/repos/{repo_id}/codemap",
             get(self::repos::get_repo_codemap),
         )
+        // Runtime→static join: map a (file, name[, line]) callsite onto a
+        // stable symbol_id. Consumed by the span layer; never guesses.
+        .route(
+            "/v1/repos/{repo_id}/symbols/resolve",
+            get(self::repos::get_symbol_resolve),
+        )
+        // Runtime span capture (M2): inert and honest about it when
+        // CORECRUXD_TRACE_CAPTURE is unset.
+        .route("/v1/traces", get(self::traces::list_traces))
+        .route("/v1/traces/stats", get(self::traces::get_trace_stats))
+        .route("/v1/traces/spans", get(self::traces::get_trace_spans))
+        .route("/v1/traces/{trace_id}", get(self::traces::get_trace))
+        // M5 agent query API — every route takes a mandatory token_budget.
+        .route("/v1/code-intel/path", get(self::traces::get_code_path))
+        .route("/v1/code-intel/blast-radius", get(self::traces::get_blast_radius))
+        .route("/v1/code-intel/liveness", get(self::traces::get_liveness))
+        .route("/v1/code-intel/trace-diff", get(self::traces::get_trace_diff))
+        .route("/v1/code-intel/volume", get(self::traces::get_span_volume))
+        .route("/v1/code-intel/enrich-budget", get(self::traces::get_enrich_budget))
+        .route(
+            "/v1/code-intel/enrich",
+            axum::routing::post(self::traces::post_enrich_verdict),
+        )
+        .route("/v1/code-intel/releases", get(self::traces::get_releases))
+        .route("/v1/code-intel/dead-code", get(self::traces::get_dead_code_ladder))
+        .route("/v1/repos/{repo_id}/spatial", get(self::traces::get_repo_spatial))
         .route(
             "/v1/projects/{id}/tenants/{tenantId}",
             axum::routing::delete(self::projects::delete_project_tenant),
@@ -1011,6 +1154,10 @@ pub(crate) fn router_with_route_auth(
         // Local MemoryCrux-compatible engram/session-procedure surfaces.
         .route("/v1/engrams", get(self::engrams::list_engrams))
         .route(
+            "/v1/engrams/{name}",
+            axum::routing::put(self::engrams::upsert_engram),
+        )
+        .route(
             "/v1/memory/session-init",
             axum::routing::post(self::engrams::memory_session_init),
         )
@@ -1032,6 +1179,13 @@ pub(crate) fn router_with_route_auth(
         .route(
             "/v1/extensions/install-from-registry",
             axum::routing::post(self::extensions::install_from_registry),
+        )
+        // Read-only catalog browse over the same verified cached index the
+        // install route consumes. Static segment, so it wins over
+        // `/v1/extensions/{id}` in the router's match order.
+        .route(
+            "/v1/extensions/registry",
+            get(self::extensions::list_registry_entries),
         )
         .route(
             "/v1/extensions/keys",
@@ -1299,6 +1453,10 @@ pub(crate) fn router_with_route_auth(
             axum::routing::post(self::relations::post_expand),
         )
         // Console settings (auth posture + embedding config).
+        .route(
+            "/v1/console/connections",
+            get(self::console::get_console_connections),
+        )
         .route("/v1/console/settings", get(self::console::get_console_settings))
         .route(
             "/v1/console/settings",
@@ -1313,6 +1471,26 @@ pub(crate) fn router_with_route_auth(
             get(self::console::get_console_corecrux_lane_weights)
                 .put(self::console::put_console_corecrux_lane_weights)
                 .delete(self::console::delete_console_corecrux_lane_weights),
+        )
+        // CoreCrux link-graph mediation proxy (ExecPlan
+        // wikicrux-link-graph-explorer-2026-07-23, M4). GET-only, read-only
+        // translation to the upstream CoreCrux `/v1/graph/*` endpoints; base URL +
+        // token in daemon env, no bearer in the browser (lane-weights/gpu1 precedent).
+        .route(
+            "/v1/console/corecrux/graph/stats",
+            get(self::console::get_console_corecrux_graph_stats),
+        )
+        .route(
+            "/v1/console/corecrux/graph/resolve",
+            get(self::console::get_console_corecrux_graph_resolve),
+        )
+        .route(
+            "/v1/console/corecrux/graph/ego",
+            get(self::console::get_console_corecrux_graph_ego),
+        )
+        .route(
+            "/v1/console/corecrux/graph/path",
+            get(self::console::get_console_corecrux_graph_path),
         )
         .route(
             "/v1/console/review/contradictions",
@@ -1372,6 +1550,10 @@ pub(crate) fn router_with_route_auth(
         )
         .route("/v1/console/passports", get(self::console::get_console_passports))
         .route("/v1/console/sessions", get(self::console::get_console_sessions))
+        .route(
+            "/v1/console/sessions/detail",
+            get(self::console::get_console_session_detail),
+        )
         .route("/v1/console/facts", get(self::console::get_console_facts))
         .route(
             "/v1/console/facts/add",
@@ -1493,7 +1675,32 @@ pub(crate) fn router_with_route_auth(
         .layer(CatchPanicLayer::custom(self::health::handle_panic))
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(30)))
         .layer(middleware::from_fn(traceparent_middleware))
+        .layer(middleware::from_fn(request_span_middleware))
         .layer(middleware::from_fn(request_id_middleware))
+}
+
+/// Opens one root span per HTTP request so every downstream span has a trace to
+/// belong to (ExecPlan crux-runtime-codemap M3).
+///
+/// This span deliberately carries the *route*, not a symbol: its `file`/`line`
+/// point here, at the middleware, not at the handler. Handler identity comes
+/// from `#[tracing::instrument]` on the handlers themselves, which nest beneath
+/// this root and resolve correctly through `symbol_resolve`. The root's job is
+/// to bound the request and name the entry point.
+///
+/// Uses the matched route pattern where axum exposes one, so `/v1/facts/{id}`
+/// aggregates rather than producing a distinct span name per id.
+async fn request_span_middleware(req: Request<axum::body::Body>, next: Next) -> impl IntoResponse {
+    use tracing::Instrument as _;
+
+    let method = req.method().clone();
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map_or_else(|| req.uri().path().to_string(), |m| m.as_str().to_string());
+
+    let span = tracing::info_span!("http_request", method = %method, route = %route);
+    next.run(req).instrument(span).await
 }
 
 /// Updates the presence tracker on every request that carries
@@ -1710,6 +1917,15 @@ fn problem_for_status(status: StatusCode, detail: impl Into<String>) -> ProblemR
             StatusCode::NO_CONTENT.as_u16(),
             "https://errors.cuecrux.com/no-content",
             "No Content",
+        )
+        .with_detail(detail),
+        // 425. A mandatory waiting period has not elapsed — distinct from a
+        // conflict, because the caller should retry later rather than give up.
+        // Used by the escrow custodian-share release delay.
+        StatusCode::TOO_EARLY => ProblemDetails::new(
+            StatusCode::TOO_EARLY.as_u16(),
+            "https://errors.cuecrux.com/too-early",
+            "Too Early",
         )
         .with_detail(detail),
         _ => ProblemDetails::internal(detail),

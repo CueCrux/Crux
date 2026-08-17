@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Storybook readout — Phase 3 of the context graph.
 //!
@@ -48,6 +48,10 @@ pub struct GenerateInput<'a> {
     pub project_id: &'a str,
     pub by_passport: &'a str,
     pub now_unix_ms: u64,
+    /// Runtime spans for the dead-code tier. Empty is the normal case —
+    /// `CORECRUXD_TRACE_CAPTURE` is default-off — and the readout then says
+    /// exactly what it said before the runtime tier existed.
+    pub spans: &'a [crate::trace_store::StoredSpan],
 }
 
 /// Build the storybook from current store state. Synchronous; no LLM calls.
@@ -174,9 +178,9 @@ pub fn generate(store: &corecrux_memory::FactStore, input: GenerateInput<'_>) ->
         }
         let plane_kws = extract_keywords(&pool);
 
-        let candidate_modules = match &workspace_scan {
-            Some(ws) => match_plane_to_modules(&plane_kws, ws),
-            None => Vec::new(),
+        let (candidate_modules, module_source) = match &workspace_scan {
+            Some(ws) => resolve_plane_modules(&plane_layers, &plane_kws, ws),
+            None => (Vec::new(), ModuleSource::KeywordOverlap),
         };
         if !candidate_modules.is_empty() {
             planes_with_modules += 1;
@@ -252,7 +256,12 @@ pub fn generate(store: &corecrux_memory::FactStore, input: GenerateInput<'_>) ->
         }
         if !candidate_modules.is_empty() {
             sec.push_str(&format!(
-                "- **Inferred matching crates** (keyword overlap, confidence ~0.5): {}\n",
+                "- **{}**: {}\n",
+                if module_source == ModuleSource::Declared {
+                    "Declared crates (plane `modules` layer)"
+                } else {
+                    "Inferred matching crates (keyword overlap, confidence ~0.5)"
+                },
                 candidate_modules
                     .iter()
                     .map(|m| format!("`{m}`"))
@@ -368,10 +377,31 @@ pub fn generate(store: &corecrux_memory::FactStore, input: GenerateInput<'_>) ->
             }
             let mut crates: Vec<_> = by_crate.iter().collect();
             crates.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
-            hs.push_str(&format!(
-                "### Dead-code candidates ({}, heuristic)\n\n*Regex-based; may miss macro / dynamic-dispatch usages. Confirm before removing.*\n\n",
-                ws.stats.dead_code_count
-            ));
+            // The heading grades the count across tiers when a runtime window
+            // exists. Previously it carried a permanent hedge — "Regex-based;
+            // may miss macro / dynamic-dispatch usages" — which is true of the
+            // static tier alone and stops being the whole story once runtime
+            // evidence is available. A caveat that never changes is one a
+            // reader learns to skip.
+            let verdicts = crate::code_intel::dead_code_verdicts(ws, input.spans);
+            let actionable = verdicts.iter().filter(|v| v.actionable).count();
+            let false_positives = verdicts
+                .iter()
+                .filter(|v| v.verdict == "extractor_false_positive__static_dead_but_executed")
+                .count();
+            if input.spans.is_empty() {
+                hs.push_str(&format!(
+                    "### Dead-code candidates ({}, static tier only)\n\n*One static tier: regex reachability, which does not read macro bodies or resolve method calls. No runtime window to corroborate it — none of these is safe to act on alone. Enable `CORECRUXD_TRACE_CAPTURE` to grade them.*\n\n",
+                    ws.stats.dead_code_count
+                ));
+            } else {
+                let w = crate::code_intel::Window::of(input.spans);
+                hs.push_str(&format!(
+                    "### Dead-code candidates ({} static · **{} actionable** · {} refuted)\n\n*Graded over a window of {} spans across {} traces. **Actionable** means two independent tiers agree AND the symbol's own file executed — a runtime negative from a file that never ran is not evidence. **Refuted** means the static tier flagged it and it was observed running.*\n\n",
+                    ws.stats.dead_code_count, actionable, false_positives,
+                    w.spans_examined, w.traces_examined
+                ));
+            }
             for (cname, items) in crates.iter().take(10) {
                 hs.push_str(&format!("- **`{}`** ({}):\n", cname, items.len()));
                 for d in items.iter().take(6) {
@@ -518,14 +548,55 @@ pub fn extract_keywords_pub(text: &str) -> HashSet<String> {
     extract_keywords(text)
 }
 
-/// Public alias for the keyword-overlap → matching crates routine, so the
-/// dossier auto-generator emits `implements` claims that are identical to
-/// the storybook's coverage matrix.
-pub fn match_plane_to_modules_pub(
+/// How a plane's crate set was arrived at. The two are not interchangeable and
+/// a consumer must be able to tell them apart: one is a statement by whoever
+/// owns the plane, the other is a guess from word overlap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleSource {
+    /// Read from the plane's `modules` layer.
+    Declared,
+    /// Derived from keyword overlap between the plane's prose and crate names.
+    KeywordOverlap,
+}
+
+/// Resolve a plane's crates, preferring a declaration over inference.
+///
+/// Replaces the old `match_plane_to_modules_pub` alias, which could only ever
+/// return the guess. The storybook and the dossier both call this, so their
+/// `implements` claims stay identical — that was the alias's purpose and it is
+/// preserved.
+///
+/// The plane-layer key is free-form (`PUT .../planes/{plane}/layers/{layer}`
+/// validates only non-empty and no `::`), so `modules` needs no schema change —
+/// it is a layer like `vision` and `goals`. An assessment of this join recorded
+/// it as blocked on "a plane→route schema decision"; that was wrong, the
+/// mechanism was already there.
+///
+/// Accepts comma-, newline- or whitespace-separated crate names, and keeps only
+/// names the scan actually knows so a typo cannot invent a crate. A declaration
+/// that matches nothing falls through to inference rather than silently
+/// emptying the plane: an all-typo declaration is a mistake, not an assertion
+/// that the plane owns no code.
+pub fn resolve_plane_modules(
+    plane_layers: &BTreeMap<String, String>,
     plane_kws: &HashSet<String>,
     scan: &crate::workspace_scan::WorkspaceScan,
-) -> Vec<String> {
-    match_plane_to_modules(plane_kws, scan)
+) -> (Vec<String>, ModuleSource) {
+    if let Some(raw) = plane_layers.get("modules") {
+        let known: BTreeSet<&str> = scan.crates.iter().map(|c| c.name.as_str()).collect();
+        let mut declared: Vec<String> = raw
+            .split([',', '\n', '\r', ' ', '\t'])
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && known.contains(t))
+            .map(str::to_string)
+            .collect();
+        declared.sort();
+        declared.dedup();
+        if !declared.is_empty() {
+            return (declared, ModuleSource::Declared);
+        }
+    }
+    (match_plane_to_modules(plane_kws, scan), ModuleSource::KeywordOverlap)
 }
 
 // ────────────────────────── Helpers ──────────────────────────
@@ -535,9 +606,9 @@ fn read_project_layers(store: &corecrux_memory::FactStore, project_id: &str) -> 
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
         min_effective_confidence: None,
         tenant_hash: None,
-        query: Some(prefix.clone()),
+        query: None,
         entity: None,
-        entity_prefix: None,
+        entity_prefix: Some(prefix.clone()),
         top_k: 200,
         token_budget: None,
     });
@@ -558,9 +629,9 @@ fn read_plane_layers(store: &corecrux_memory::FactStore, project_id: &str, plane
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
         min_effective_confidence: None,
         tenant_hash: None,
-        query: Some(prefix.clone()),
+        query: None,
         entity: None,
-        entity_prefix: None,
+        entity_prefix: Some(prefix.clone()),
         top_k: 100,
         token_budget: None,
     });
@@ -814,13 +885,22 @@ fn truncate_iso(iso: &str) -> String {
 fn truncate_for_quote(s: &str, max: usize) -> String {
     let cleaned: String = s.lines().take(3).collect::<Vec<_>>().join(" ");
     if cleaned.len() <= max {
-        cleaned
-    } else {
-        format!("{}…", &cleaned[..max])
+        return cleaned;
     }
+    // `max` is a byte budget, but slicing at it directly panics when a
+    // multi-byte character straddles the limit. Callers pass operator-supplied
+    // plane-vision text and source snippets, so an em-dash in a comment used
+    // to take down the whole readout. Retreat to the nearest char boundary at
+    // or below the budget.
+    let mut end = max;
+    while end > 0 && !cleaned.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &cleaned[..end])
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -919,6 +999,7 @@ mod tests {
                 project_id: "p1",
                 by_passport: "personal-default",
                 now_unix_ms: 1_700_000_000_000,
+                spans: &[],
             },
         )
         .expect("storybook should generate when project exists");
@@ -943,6 +1024,7 @@ mod tests {
                 project_id: "nope",
                 by_passport: "x",
                 now_unix_ms: 1,
+                spans: &[],
             },
         );
         assert!(doc.is_none());
@@ -952,7 +1034,7 @@ mod tests {
     fn match_plane_to_modules_via_pub_alias() {
         let scan = crate::workspace_scan::WorkspaceScan::default();
         let kws: HashSet<String> = ["daemon".to_string()].into_iter().collect();
-        let _ = match_plane_to_modules_pub(&kws, &scan);
+        let _ = match_plane_to_modules(&kws, &scan);
         let _ = extract_keywords_pub("hello daemon world");
     }
 
@@ -985,5 +1067,711 @@ mod tests {
         assert!(d.added_sections.contains(&"20_goals".to_string()));
         assert!(d.changed_sections.contains(&"00_front".to_string()));
         assert_eq!(d.bytes_delta, 5);
+    }
+
+    /// The workspace-health caveat must state which tiers actually spoke.
+    ///
+    /// Before the runtime join it carried a permanent hedge — "Regex-based; may
+    /// miss macro / dynamic-dispatch usages" — on every readout forever. A
+    /// caveat that never changes is one a reader learns to skip, and it
+    /// understates the answer once a runtime tier is available.
+    #[test]
+    fn the_dead_code_caveat_reflects_which_tiers_spoke() {
+        let mut ws = crate::workspace_scan::WorkspaceScan::default();
+        ws.scan_id = "ws_t".into();
+        ws.stats.dead_code_count = 1;
+        ws.dead_code = vec![crate::workspace_scan::DeadSymbol {
+            crate_name: "c".into(),
+            module_path: "m".into(),
+            file_rel_path: "src/quiet.rs".into(),
+            line: 3,
+            kind: "fn".into(),
+            name: "orphan".into(),
+            confidence: 0.6,
+            note: "no references".into(),
+        }];
+
+        // No window: one tier, and the readout says so.
+        let none = crate::code_intel::dead_code_verdicts(&ws, &[]);
+        assert_eq!(none[0].verdict, "dead_candidate__static_only");
+        assert!(!none[0].actionable);
+
+        // A window that exercised the symbol's own file: the negative counts.
+        let spans = vec![crate::trace_store::StoredSpan {
+            span: crux_observe::span_layer::SpanRecord {
+                trace_id: 7,
+                span_id: 8,
+                parent_span_id: None,
+                name: "neighbour".into(),
+                target: "t".into(),
+                file: Some("src/quiet.rs".into()),
+                line: Some(1),
+                module_path: None,
+                duration_ns: 5,
+                depth: 0,
+                had_error: false,
+                outcome: Default::default(),
+            },
+            symbol_id: None,
+            join: "extracted".into(),
+            tenant_id: String::new(),
+            release: String::new(),
+            stored_at_unix_ms: 10,
+        }];
+        let graded = crate::code_intel::dead_code_verdicts(&ws, &spans);
+        assert_eq!(graded[0].verdict, "dead_candidate__static_and_runtime_agree");
+        assert!(graded[0].actionable, "the symbol's file ran and it did not");
+
+        // And the window the grading rests on is reportable.
+        let w = crate::code_intel::Window::of(&spans);
+        assert_eq!(w.spans_examined, 1);
+        assert_eq!(w.traces_examined, 1);
+    }
+
+    /// A plane that declares its crates must not be treated as a guess.
+    ///
+    /// The join assessment recorded this as blocked on "a plane→route schema
+    /// decision". It was not: the plane-layer key is free-form, so `modules` is
+    /// a layer like `vision` and no schema change was needed. Recorded here
+    /// because a wrong "blocked" conclusion is the kind that stays believed.
+    #[test]
+    fn a_declared_modules_layer_outranks_keyword_overlap() {
+        let mut scan = crate::workspace_scan::WorkspaceScan::default();
+        scan.crates = vec![
+            crate::workspace_scan::CrateInfo {
+                name: "corecrux-retrieval".into(),
+                rel_path: "crates/corecrux-retrieval".into(),
+                internal_deps: vec![],
+                file_count: 1,
+                total_loc: 10,
+            },
+            crate::workspace_scan::CrateInfo {
+                name: "corecrux-index".into(),
+                rel_path: "crates/corecrux-index".into(),
+                internal_deps: vec![],
+                file_count: 1,
+                total_loc: 10,
+            },
+        ];
+        let kws = extract_keywords("nothing here matches any crate name at all");
+        let mut layers: BTreeMap<String, String> = BTreeMap::new();
+
+        // No declaration ⇒ inference.
+        assert_eq!(
+            resolve_plane_modules(&layers, &kws, &scan).1,
+            ModuleSource::KeywordOverlap
+        );
+
+        // Declared ⇒ used verbatim, and marked as declared.
+        layers.insert("modules".into(), "corecrux-index, corecrux-retrieval".into());
+        let (mods, src) = resolve_plane_modules(&layers, &kws, &scan);
+        assert_eq!(src, ModuleSource::Declared);
+        assert_eq!(mods, vec!["corecrux-index", "corecrux-retrieval"]);
+
+        // Newlines and stray whitespace: an operator writes this by hand.
+        layers.insert("modules".into(), "corecrux-index\n  corecrux-retrieval\n".into());
+        assert_eq!(resolve_plane_modules(&layers, &kws, &scan).0.len(), 2);
+
+        // A typo cannot invent a crate the scan has never seen. Built by
+        // transposition rather than written out, so the repo's spell-checker
+        // does not have to be taught to ignore a deliberate misspelling.
+        let transposed = "corecrux-retrieval".replace("ie", "ei");
+        layers.insert("modules".into(), format!("corecrux-index, {transposed}"));
+        let (mods, src) = resolve_plane_modules(&layers, &kws, &scan);
+        assert_eq!(src, ModuleSource::Declared);
+        assert_eq!(mods, vec!["corecrux-index"], "the misspelling is dropped, not invented");
+
+        // An all-typo declaration falls back rather than emptying the plane.
+        layers.insert("modules".into(), "not-a-crate, also-not-a-crate".into());
+        assert_eq!(
+            resolve_plane_modules(&layers, &kws, &scan).1,
+            ModuleSource::KeywordOverlap
+        );
+    }
+
+    // ────────────────────────── Fixtures ──────────────────────────
+
+    fn put_fact(store: &mut corecrux_memory::FactStore, entity: &str, key: &str, value: &str) {
+        store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: corecrux_memory::fact_store::default_tenant_hash(),
+            entity: entity.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+
+    fn put_project_layer(store: &mut corecrux_memory::FactStore, project: &str, layer: &str, value: &str) {
+        put_fact(
+            store,
+            &format!("__project_layer__::{project}::{layer}"),
+            "content",
+            value,
+        );
+    }
+
+    fn put_plane_layer(store: &mut corecrux_memory::FactStore, project: &str, plane: &str, layer: &str, value: &str) {
+        put_fact(
+            store,
+            &format!("__plane_layer__::{project}::{plane}::{layer}"),
+            "content",
+            value,
+        );
+    }
+
+    fn put_workspace_scan(store: &mut corecrux_memory::FactStore, scan: &crate::workspace_scan::WorkspaceScan) {
+        put_fact(
+            store,
+            crate::workspace_scan::LATEST_SCAN_ENTITY,
+            crate::workspace_scan::SCAN_KEY,
+            &serde_json::to_string(scan).expect("encode scan"),
+        );
+    }
+
+    fn crate_info(name: &str) -> crate::workspace_scan::CrateInfo {
+        crate::workspace_scan::CrateInfo {
+            name: name.to_string(),
+            rel_path: format!("crates/{name}"),
+            internal_deps: Vec::new(),
+            file_count: 1,
+            total_loc: 100,
+        }
+    }
+
+    fn dead_symbol(crate_name: &str, name: &str, line: usize) -> crate::workspace_scan::DeadSymbol {
+        crate::workspace_scan::DeadSymbol {
+            crate_name: crate_name.to_string(),
+            module_path: format!("{crate_name}::quiet"),
+            file_rel_path: format!("crates/{crate_name}/src/quiet.rs"),
+            line,
+            kind: "fn".into(),
+            name: name.to_string(),
+            confidence: 0.6,
+            note: "no references".into(),
+        }
+    }
+
+    /// A scan with two crates, a stub and seven dead symbols in one crate — the
+    /// seventh forces the "…and N more" roll-up in the workspace-health tier.
+    fn populated_scan() -> crate::workspace_scan::WorkspaceScan {
+        let mut scan = crate::workspace_scan::WorkspaceScan {
+            scan_id: "ws_fixture".into(),
+            root_path: "/repo".into(),
+            started_at_unix_ms: 1_700_000_000_000,
+            crates: vec![crate_info("corecrux-retrieval"), crate_info("corecrux-index")],
+            ..Default::default()
+        };
+        scan.stubs = vec![crate::workspace_scan::StubHit {
+            crate_name: "corecrux-retrieval".into(),
+            file_rel_path: "crates/corecrux-retrieval/src/lib.rs".into(),
+            line: 12,
+            kind: "todo".into(),
+            // Long enough to exercise the snippet truncation in the readout.
+            snippet: format!("todo!(\"{}\")", "x".repeat(200)),
+        }];
+        scan.dead_code = (0..7)
+            .map(|i| dead_symbol("corecrux-retrieval", &format!("orphan_{i}"), 10 + i))
+            .collect();
+        scan.stats.crate_count = 2;
+        scan.stats.file_count = 2;
+        scan.stats.total_loc = 200;
+        scan.stats.symbol_count = 9;
+        scan.stats.dep_count = 1;
+        scan.stats.stub_count = scan.stubs.len();
+        scan.stats.dead_code_count = scan.dead_code.len();
+        scan
+    }
+
+    fn seeded_project(dir: &std::path::Path) -> corecrux_memory::FactStore {
+        let mut store = corecrux_memory::FactStore::new();
+        crate::passports::seed_defaults_if_missing(dir, &mut store, 1).expect("seed passports");
+        crate::projects::create_project(
+            &mut store,
+            crate::projects::CreateProjectInput {
+                id: "p".into(),
+                name: "Project P".into(),
+                planning_target: Some("github://owner/repo".into()),
+                default_passport_id: "personal-default".into(),
+                working_tenants: vec![],
+            },
+            1_000,
+        )
+        .expect("create project");
+        store
+    }
+
+    fn generated(store: &corecrux_memory::FactStore, spans: &[crate::trace_store::StoredSpan]) -> StorybookDocument {
+        generate(
+            store,
+            GenerateInput {
+                project_id: "p",
+                by_passport: "personal-default",
+                now_unix_ms: 1_700_000_000_000,
+                spans,
+            },
+        )
+        .expect("project exists so a storybook must generate")
+    }
+
+    // ────────────────────────── Full readout ──────────────────────────
+
+    /// The whole readout in one pass: front matter with a scan summary, member
+    /// and tenant rollups, a plane that declares its crates, an orphan plane,
+    /// the coverage matrix, the workspace-health tier and the gap list.
+    ///
+    /// Guards the readout's structural promise — an operator reads it by section
+    /// header, so a section silently disappearing (rather than saying "none")
+    /// is the regression that matters.
+    #[test]
+    fn a_full_readout_renders_every_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = seeded_project(dir.path());
+        crate::projects::add_member(&mut store, "p", "work-default", "owner", 2_000).expect("member");
+        crate::projects::add_tenant(&mut store, "p", "work::p", None, 2_000).expect("tenant");
+        put_project_layer(&mut store, "p", "vision", "A local-first retrieval daemon for agents.");
+        // No project `goals` layer: the goals section must degrade to a notice
+        // and raise its own alert rather than vanishing.
+
+        crate::planes::create_plane(
+            &mut store,
+            crate::planes::CreatePlaneInput {
+                project_id: "p".into(),
+                id: "retrieval".into(),
+                name: "Retrieval".into(),
+                description: Some("retrieval and index plane".into()),
+                default_passport_id: None,
+            },
+            3_000,
+        )
+        .expect("plane");
+        crate::planes::add_member(&mut store, "p", "retrieval", "work-default", "owner", 3_100).expect("plane member");
+        crate::planes::add_tenant(&mut store, "p", "retrieval", "work::p::retrieval", None, 3_200)
+            .expect("plane tenant");
+        put_plane_layer(
+            &mut store,
+            "p",
+            "retrieval",
+            "vision",
+            &format!("Retrieval plane vision. {}", "detail ".repeat(80)),
+        );
+        put_plane_layer(&mut store, "p", "retrieval", "goals", "Ship the dense lane.");
+        put_plane_layer(&mut store, "p", "retrieval", "modules", "corecrux-retrieval");
+
+        crate::planes::create_plane(
+            &mut store,
+            crate::planes::CreatePlaneInput {
+                project_id: "p".into(),
+                id: "orphan".into(),
+                name: "Orphan".into(),
+                description: None,
+                default_passport_id: None,
+            },
+            4_000,
+        )
+        .expect("orphan plane");
+
+        put_workspace_scan(&mut store, &populated_scan());
+
+        let doc = generated(&store, &[]);
+        let md = &doc.markdown;
+
+        // Front matter: the scan summary line, members and tenants.
+        assert!(md.starts_with("# Storybook · p ·"), "front matter: {}", &md[..64]);
+        assert!(md.contains("2 crates · 2 files · 200 loc"), "scan summary missing");
+        assert!(md.contains("`work-default` (owner)"));
+        assert!(md.contains("`work::p`"));
+
+        // Narrative sections.
+        assert!(md.contains("## What this project is"));
+        assert!(md.contains("A local-first retrieval daemon for agents."));
+        assert!(md.contains("## What it's trying to achieve"));
+        assert!(md.contains("*No goals layer set.*"));
+
+        // Planes: the declared-crates wording must differ from the inferred one.
+        assert!(md.contains("## Planes"));
+        assert!(md.contains("### Retrieval `retrieval`"));
+        assert!(md.contains("**Declared crates (plane `modules` layer)**: `corecrux-retrieval`"));
+        assert!(md.contains("**Stubs in matching crates**: 1 · **Dead-code candidates**: 7"));
+        assert!(md.contains("- **Plane vision** (truncated):"));
+        assert!(md.contains('…'), "the long plane vision is truncated");
+        assert!(md.contains("### Orphan `orphan`"));
+        assert!(md.contains("- **Description**: *(none)*"));
+        assert!(md.contains("*none — this plane has no source mapping yet (gap)*"));
+
+        // Coverage matrix.
+        assert!(md.contains("## Coverage matrix"));
+        assert!(md.contains("| `retrieval` | ✓ | ✓ | `corecrux-retrieval` | 1 | 7 |"));
+        assert!(md.contains("| `orphan` | — | — | — | 0 | 0 | **no crates mapped** |"));
+
+        // Workspace health.
+        assert!(md.contains("## Workspace health"));
+        assert!(md.contains("### Stubs (1)"));
+        assert!(md.contains("### Dead-code candidates (7, static tier only)"));
+        assert!(md.contains("…and 1 more"), "the 7th dead symbol rolls up");
+
+        // Gaps.
+        assert!(md.contains("- ❗ Project has no **goals layer** set."));
+        assert!(!md.contains("- ❗ Project has no **vision layer** set."));
+        assert!(md.contains("- ⚠ **1 planes have no mapped crates**"));
+        assert!(md.contains("- ⚠ **1 planes have no vision layer**"));
+
+        // Footer + section index.
+        assert!(md.contains("*Storybook v1 — generated deterministically"));
+        for section in [
+            "00_front",
+            "10_vision",
+            "20_goals",
+            "30_planes_intro",
+            "30_plane_retrieval",
+            "30_plane_orphan",
+            "40_coverage",
+            "50_workspace_health",
+            "60_alerts",
+            "99_footer",
+        ] {
+            assert!(doc.sections.contains_key(section), "missing section {section}");
+        }
+
+        // Stats roll-up.
+        assert_eq!(doc.stats.plane_count, 2);
+        assert_eq!(doc.stats.planes_with_vision, 1);
+        assert_eq!(doc.stats.planes_with_mapped_modules, 1);
+        assert_eq!(doc.stats.orphan_planes, vec!["orphan".to_string()]);
+        assert_eq!(doc.stats.workspace_loc, 200);
+        assert_eq!(doc.stats.stub_count, 1);
+        assert_eq!(doc.stats.dead_code_count, 7);
+        assert_eq!(doc.stats.bytes, md.len());
+        assert_eq!(doc.project_id, "p");
+        assert_eq!(doc.generated_by_passport, "personal-default");
+    }
+
+    /// With a runtime window the dead-code heading must grade the candidates
+    /// instead of repeating the permanent static-only hedge.
+    #[test]
+    fn the_readout_grades_dead_code_when_a_runtime_window_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = seeded_project(dir.path());
+        put_workspace_scan(&mut store, &populated_scan());
+
+        let spans = vec![crate::trace_store::StoredSpan {
+            span: crux_observe::span_layer::SpanRecord {
+                trace_id: 1,
+                span_id: 2,
+                parent_span_id: None,
+                name: "neighbour".into(),
+                target: "t".into(),
+                file: Some("crates/corecrux-retrieval/src/quiet.rs".into()),
+                line: Some(1),
+                module_path: None,
+                duration_ns: 5,
+                depth: 0,
+                had_error: false,
+                outcome: Default::default(),
+            },
+            symbol_id: None,
+            join: "extracted".into(),
+            tenant_id: String::new(),
+            release: String::new(),
+            stored_at_unix_ms: 10,
+        }];
+
+        let md = generated(&store, &spans).markdown;
+        assert!(
+            md.contains("### Dead-code candidates (7 static · **7 actionable** · 0 refuted)"),
+            "graded heading missing: {md}"
+        );
+        assert!(md.contains("Graded over a window of 1 spans across 1 traces"));
+        assert!(!md.contains("static tier only"));
+    }
+
+    /// A bare project must still produce a readout, and every missing input has
+    /// to show up as a named gap rather than as a silently absent section.
+    #[test]
+    fn an_empty_project_lists_every_gap_it_has() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = seeded_project(dir.path());
+
+        let doc = generated(&store, &[]);
+        let md = &doc.markdown;
+        assert!(md.contains("(no scan run yet — POST /v1/workspace/scan to populate)"));
+        assert!(md.contains("*No vision layer set."));
+        assert!(md.contains("*No goals layer set.*"));
+        assert!(md.contains("*No planes provisioned."));
+        assert!(md.contains("- ❗ Project has no **vision layer** set."));
+        assert!(md.contains("- ❗ Project has no **goals layer** set."));
+        assert!(md.contains("- ⚠ No workspace scan has been run."));
+        // Without a scan there is nothing to build a coverage matrix from.
+        assert!(!md.contains("## Coverage matrix"));
+        assert!(!md.contains("## Workspace health"));
+        assert!(!doc.sections.contains_key("40_coverage"));
+        assert_eq!(doc.stats.plane_count, 0);
+        assert_eq!(doc.stats.workspace_loc, 0);
+        assert!(doc.stats.orphan_planes.is_empty());
+    }
+
+    /// The clean-bill-of-health branch: vision + goals set, a scan present and
+    /// no planes to orphan. Untested, "no gaps detected" would be indefinitely
+    /// unreachable without anyone noticing.
+    #[test]
+    fn a_project_with_no_gaps_says_so_explicitly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = seeded_project(dir.path());
+        put_project_layer(&mut store, "p", "vision", "Vision text.");
+        put_project_layer(&mut store, "p", "goals", "Goals text.");
+        let mut scan = crate::workspace_scan::WorkspaceScan::default();
+        scan.scan_id = "ws_clean".into();
+        scan.stats.crate_count = 1;
+        put_workspace_scan(&mut store, &scan);
+
+        let md = generated(&store, &[]).markdown;
+        assert!(md.contains("- ✓ No structural gaps detected."));
+        assert!(!md.contains("❗"));
+        // No stubs and no dead code ⇒ those sub-tiers are omitted, but the
+        // health section itself still renders.
+        assert!(md.contains("## Workspace health"));
+        assert!(!md.contains("### Stubs ("));
+        assert!(!md.contains("### Dead-code candidates"));
+    }
+
+    /// The >50 dead-code alert is its own tier and fires independently of the
+    /// per-plane gap alerts.
+    #[test]
+    fn a_large_dead_code_count_raises_its_own_alert() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = seeded_project(dir.path());
+        put_project_layer(&mut store, "p", "vision", "Vision text.");
+        put_project_layer(&mut store, "p", "goals", "Goals text.");
+        let mut scan = populated_scan();
+        scan.stats.dead_code_count = 51;
+        put_workspace_scan(&mut store, &scan);
+
+        let md = generated(&store, &[]).markdown;
+        assert!(md.contains("- ⚠ **51 dead-code candidates** across the workspace"));
+
+        // At exactly 50 the alert must not fire — the threshold is `> 50`.
+        let mut store = seeded_project(dir.path());
+        put_project_layer(&mut store, "p", "vision", "Vision text.");
+        put_project_layer(&mut store, "p", "goals", "Goals text.");
+        let mut scan = populated_scan();
+        scan.stats.dead_code_count = 50;
+        put_workspace_scan(&mut store, &scan);
+        assert!(!generated(&store, &[])
+            .markdown
+            .contains("dead-code candidates** across"));
+    }
+
+    /// A plane whose prose overlaps the project vision is marked aligned. The
+    /// marker is the only signal in the readout that a plane is pulling in the
+    /// same direction as the project, so it must be threshold-driven, not
+    /// always-on.
+    #[test]
+    fn the_vision_alignment_marker_is_threshold_driven() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let mut aligned = seeded_project(dir.path());
+        put_project_layer(&mut aligned, "p", "vision", "retrieval dense lane reranking");
+        crate::planes::create_plane(
+            &mut aligned,
+            crate::planes::CreatePlaneInput {
+                project_id: "p".into(),
+                id: "retrieval".into(),
+                name: "retrieval dense lane reranking".into(),
+                description: None,
+                default_passport_id: None,
+            },
+            3_000,
+        )
+        .expect("plane");
+        assert!(
+            generated(&aligned, &[]).markdown.contains("· vision-aligned ("),
+            "a plane echoing the project vision is marked aligned"
+        );
+
+        let mut unaligned = seeded_project(dir.path());
+        put_project_layer(&mut unaligned, "p", "vision", "retrieval dense lane reranking");
+        crate::planes::create_plane(
+            &mut unaligned,
+            crate::planes::CreatePlaneInput {
+                project_id: "p".into(),
+                id: "billing".into(),
+                name: "invoicing subscriptions".into(),
+                description: None,
+                default_passport_id: None,
+            },
+            3_000,
+        )
+        .expect("plane");
+        assert!(!generated(&unaligned, &[]).markdown.contains("vision-aligned"));
+    }
+
+    // ────────────────────────── Layer reads ──────────────────────────
+
+    /// Layer reads must ignore every fact that is not a non-empty `content`
+    /// value, and must take the newest version of the ones that are. A stale
+    /// version winning here means the readout describes a project as it was.
+    #[test]
+    fn layer_reads_take_the_latest_content_fact_and_ignore_the_rest() {
+        let mut store = corecrux_memory::FactStore::new();
+        put_project_layer(&mut store, "p", "vision", "first");
+        put_project_layer(&mut store, "p", "vision", "second");
+        put_project_layer(&mut store, "p", "empty", "");
+        put_fact(&mut store, "__project_layer__::p::meta", "not_content", "ignored");
+        put_plane_layer(&mut store, "p", "x", "vision", "plane first");
+        put_plane_layer(&mut store, "p", "x", "vision", "plane second");
+        put_plane_layer(&mut store, "p", "x", "blank", "");
+        put_fact(&mut store, "__plane_layer__::p::x::meta", "not_content", "ignored");
+
+        let project_layers = read_project_layers(&store, "p");
+        assert_eq!(project_layers.get("vision").map(String::as_str), Some("second"));
+        assert!(!project_layers.contains_key("empty"), "empty values are dropped");
+        assert!(!project_layers.contains_key("meta"), "non-content keys are dropped");
+
+        let plane_layers = read_plane_layers(&store, "p", "x");
+        assert_eq!(plane_layers.get("vision").map(String::as_str), Some("plane second"));
+        assert!(!plane_layers.contains_key("blank"));
+        assert!(!plane_layers.contains_key("meta"));
+
+        // A different plane's layers must not leak in.
+        assert!(read_plane_layers(&store, "p", "other").is_empty());
+    }
+
+    // ────────────────────────── Matching + helpers ──────────────────────────
+
+    /// The inference gate is deliberately narrow: at least two shared keywords
+    /// AND at least 30% of the crate's identity keywords present. Loosening
+    /// either turns the readout's "inferred crates" line into noise.
+    #[test]
+    fn module_inference_needs_two_shared_keywords_and_thirty_percent_coverage() {
+        let mut scan = crate::workspace_scan::WorkspaceScan::default();
+        scan.crates = vec![crate_info("corecrux-dense-retrieval"), crate_info("corecrux-index")];
+
+        // Only one shared keyword ("retrieval") ⇒ no match.
+        let one = extract_keywords("retrieval work happens somewhere else entirely");
+        assert!(match_plane_to_modules(&one, &scan).is_empty());
+
+        // Two shared keywords out of three crate tokens (dense, retrieval of
+        // {corecrux, dense, retrieval}) ⇒ 0.66 coverage ⇒ matched.
+        let two = extract_keywords("dense retrieval lane");
+        assert_eq!(match_plane_to_modules(&two, &scan), vec!["corecrux-dense-retrieval"]);
+
+        // An empty keyword set can never match anything.
+        assert!(match_plane_to_modules(&HashSet::new(), &scan).is_empty());
+
+        // A crate whose name yields no keywords is skipped rather than divided by zero.
+        let mut tiny = crate::workspace_scan::WorkspaceScan::default();
+        tiny.crates = vec![crate_info("ab")];
+        assert!(match_plane_to_modules(&two, &tiny).is_empty());
+    }
+
+    /// Module paths from the scan's files widen a crate's keyword identity, so
+    /// a plane can match a crate by what is inside it, not just by its name.
+    #[test]
+    fn module_paths_contribute_to_a_crates_keyword_identity() {
+        let mut scan = crate::workspace_scan::WorkspaceScan::default();
+        scan.crates = vec![crate_info("aaa")];
+        scan.files = vec![crate::workspace_scan::FileInfo {
+            rel_path: "crates/aaa/src/rerank_pipeline.rs".into(),
+            crate_name: "aaa".into(),
+            module_path: "aaa::rerank_pipeline".into(),
+            loc: 10,
+            symbol_count: 1,
+            stub_count: 0,
+            doc_summary: None,
+            doc_full: None,
+            defines: Vec::new(),
+            references: Vec::new(),
+            referenced_by: Vec::new(),
+            is_test_file: false,
+        }];
+        let kws = extract_keywords("rerank pipeline work");
+        assert_eq!(match_plane_to_modules(&kws, &scan), vec!["aaa"]);
+    }
+
+    #[test]
+    fn extract_keywords_drops_pure_numbers_but_keeps_symbol_shaped_tokens() {
+        let kws = extract_keywords("Release 2026 of corecrux_memory and dense-lane v2");
+        assert!(kws.contains("release"));
+        assert!(kws.contains("corecrux_memory"), "underscores are word characters");
+        assert!(kws.contains("dense-lane"), "hyphens are word characters");
+        assert!(!kws.contains("2026"), "pure numbers are dropped");
+        assert!(!kws.contains("v2"), "too short");
+    }
+
+    #[test]
+    fn truncate_for_quote_joins_the_first_three_lines_and_elides_the_rest() {
+        assert_eq!(truncate_for_quote("one\ntwo\nthree\nfour", 100), "one two three");
+        assert_eq!(truncate_for_quote("short", 100), "short");
+        let long = "a".repeat(50);
+        let out = truncate_for_quote(&long, 10);
+        assert_eq!(out, format!("{}…", "a".repeat(10)));
+    }
+
+    /// D-4 (inverted pin): `truncate_for_quote` sliced by byte index, so a
+    /// multi-byte character straddling the limit panicked rather than
+    /// truncating. `generate` calls it on operator-supplied plane-vision text
+    /// (limit 280) and on scan snippets (limit 80), so non-ASCII prose of the
+    /// wrong length took the whole readout down.
+    #[test]
+    fn truncate_for_quote_retreats_to_a_char_boundary_instead_of_panicking() {
+        // Nine 'é' (2 bytes each) = 18 bytes; byte 9 lands mid-character, so
+        // the cut retreats to byte 8 — four whole characters.
+        assert_eq!(truncate_for_quote(&"é".repeat(9), 9), format!("{}…", "é".repeat(4)));
+
+        // A budget that lands exactly on a boundary is unchanged.
+        assert_eq!(truncate_for_quote(&"é".repeat(9), 8), format!("{}…", "é".repeat(4)));
+
+        // Wider characters, and a budget smaller than the first character:
+        // the result is the ellipsis alone, never a panic and never invalid
+        // UTF-8.
+        assert_eq!(truncate_for_quote("日本語テキスト", 2), "…");
+        assert_eq!(truncate_for_quote("日本語テキスト", 3), "日…");
+
+        // The real caller budgets, over text that straddles them.
+        for max in [80usize, 280] {
+            let text = "—".repeat(max);
+            let out = truncate_for_quote(&text, max);
+            assert!(out.ends_with('…'));
+            assert!(out.len() <= max + '…'.len_utf8());
+        }
+    }
+
+    #[test]
+    fn unix_ms_to_iso_falls_back_when_the_timestamp_is_out_of_range() {
+        assert!(unix_ms_to_iso(0).starts_with("1970-01-01T00:00:00"));
+        assert_eq!(truncate_iso(&unix_ms_to_iso(0)), "1970-01-01");
+        let out_of_range = unix_ms_to_iso(u64::MAX);
+        assert!(
+            out_of_range.ends_with("ms-since-epoch"),
+            "an unrepresentable timestamp degrades to a literal, not a panic: {out_of_range}"
+        );
+        // `truncate_iso` on a value with no `T` returns it unchanged.
+        assert_eq!(truncate_iso("no-separator"), "no-separator");
+    }
+
+    #[test]
+    fn diff_reports_removed_sections_and_a_negative_byte_delta() {
+        let mut a_sections = BTreeMap::new();
+        a_sections.insert("00_front".to_string(), "front".to_string());
+        a_sections.insert("40_coverage".to_string(), "matrix".to_string());
+        let mut b_sections = BTreeMap::new();
+        b_sections.insert("00_front".to_string(), "front".to_string());
+        let doc = |sections: BTreeMap<String, String>, ts: u64, md: &str| StorybookDocument {
+            project_id: "p".into(),
+            generated_at_unix_ms: ts,
+            generated_by_passport: "x".into(),
+            markdown: md.into(),
+            sections,
+            stats: Default::default(),
+        };
+        let d = diff_documents(&doc(a_sections, 1, "abcdefgh"), &doc(b_sections, 2, "abc"));
+        assert_eq!(d.removed_sections, vec!["40_coverage".to_string()]);
+        assert!(d.added_sections.is_empty());
+        assert!(d.changed_sections.is_empty(), "identical sections are not 'changed'");
+        assert_eq!(d.bytes_delta, -5);
+        assert_eq!((d.from_ts, d.to_ts), (1, 2));
     }
 }

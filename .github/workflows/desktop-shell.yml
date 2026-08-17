@@ -1,9 +1,20 @@
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
+
 # Desktop shell (Tauri v2) — build gates for `shells/desktop/**`.
 #
 # The desktop app pulls the webkit2gtk / GTK stack and cannot build on the
-# headless CueCrux CI *self-hosted* runners or the WSL dev box, so this workflow
-# runs on GitHub-hosted `ubuntu-latest` and installs the Tauri v2 Linux
-# prerequisites itself. No release/deploy steps.
+# headless CueCrux CI *self-hosted* runners or the WSL dev box, so the Linux
+# jobs here run on GitHub-hosted `ubuntu-latest` and install the Tauri v2 Linux
+# prerequisites themselves. No release/deploy steps.
+#
+# One job is the exception: `desktop GUI smoke (windows, interactive session)`
+# runs on a self-hosted Windows runner that executes inside a real logged-on
+# desktop (labels `self-hosted, windows-gui`). It exists because compiling and
+# bundling cannot answer "does the app actually start" — a Tauri/WebView2 window
+# cannot be created in a headless or Session 0 context at all, so launch,
+# sidecar spawn, and installer behaviour are only observable on a box with a
+# desktop. See `docs/self-hosted-runner.md` for how that runner is provisioned.
 #
 # `desktop app compile gate (linux)` is a REQUIRED status check. To be requirable
 # without deadlocking the merge queue, the workflow must ALWAYS trigger (so the
@@ -38,7 +49,7 @@ jobs:
     outputs:
       desktop: ${{ steps.scope.outputs.desktop }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
       - name: Classify changed files
@@ -78,8 +89,10 @@ jobs:
     if: needs.changes.outputs.desktop == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
       - name: cargo test (lifecycle)
         run: cargo test --manifest-path shells/desktop/lifecycle/Cargo.toml --locked
 
@@ -91,8 +104,10 @@ jobs:
     if: needs.changes.outputs.desktop == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
 
       - name: install Tauri v2 Linux prerequisites
         run: |
@@ -141,8 +156,10 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
 
       - name: install Tauri v2 Linux prerequisites
         run: |
@@ -178,9 +195,578 @@ jobs:
         run: cargo tauri build
 
       - name: upload bundle artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: crux-desktop-shell-linux
           path: |
+            shells/desktop/app/target/release/bundle/**
+          if-no-files-found: warn
+
+  # 4) Windows GUI smoke: bundle the MSI, install it, launch the installed app,
+  #    and assert the things only a real desktop can show. Runs on the
+  #    operator-owned interactive runner (`self-hosted, windows-gui`).
+  #
+  #    Non-blocking on purpose. It depends on one VM, so an offline or busy box
+  #    must not gate the merge queue — but unlike the Linux jobs it can catch a
+  #    Windows-only regression (dbb3897 fixed three that no Linux runner could
+  #    see, and noted there was no Windows job to catch the next one).
+  #    KEEP EVERY `run:` BLOCK BELOW PURE ASCII. `shell: powershell` is Windows
+  #    PowerShell 5.1, which reads a BOM-less script as ANSI, not UTF-8. An em
+  #    dash (U+2014, `e2 80 94`) then decodes under CP1252 as `a-hat`, `euro`,
+  #    U+201D — and U+201D is a right *smart quote*, which PowerShell honours as
+  #    a string delimiter. One em dash inside a message string opens a string
+  #    that never closes: `TerminatorExpectedAtEndOfString`, before a single line
+  #    executes. YAML comments and step names are fine; only `run:` bodies parse.
+  windows-gui-smoke:
+    name: desktop GUI smoke (windows, interactive session)
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
+    runs-on: [self-hosted, windows-gui]
+    continue-on-error: true
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Fail loudly in 5 seconds rather than 40 minutes later at app launch.
+      # Session 0 is the failure this whole runner exists to avoid: a runner
+      # installed as a Windows service, or registered with
+      # `Register-ScheduledTask -User/-Password` (which forces
+      # LogonType=Password), runs where there is no desktop and WebView2 cannot
+      # create a window.
+      - name: preflight — interactive desktop + Windows build toolchain
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\windows-gui-evidence" | Out-Null
+          $fail = @()
+
+          $sid = (Get-Process -Id $PID).SessionId
+          Write-Host "runner session id : $sid"
+          if ($sid -eq 0) {
+            $fail += 'runner is in Session 0 (no desktop). It must run as a scheduled task with LogonType=Interactive under an autologon user, not as a Windows service.'
+          }
+          $explorer = Get-Process explorer -ErrorAction SilentlyContinue
+          Write-Host "explorer.exe      : $(if ($explorer) { 'session ' + $explorer[0].SessionId } else { 'NOT RUNNING' })"
+          if (-not $explorer) {
+            $fail += 'explorer.exe is not running: this is a Server Core image, or no user is logged on. Server Core cannot be converted to Desktop Experience.'
+          }
+
+          Add-Type -AssemblyName System.Windows.Forms
+          $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          Write-Host "virtual screen    : $($vs.Width)x$($vs.Height)"
+          if ($vs.Width -le 0 -or $vs.Height -le 0) { $fail += 'no display surface available' }
+
+          foreach ($t in 'cargo', 'rustc', 'git') {
+            $c = Get-Command $t -ErrorAction SilentlyContinue
+            Write-Host "$($t.PadRight(18)): $(if ($c) { $c.Source } else { 'MISSING' })"
+            if (-not $c) { $fail += "$t is not on PATH" }
+          }
+          if (-not (Get-Command cargo-tauri -ErrorAction SilentlyContinue)) {
+            $fail += 'cargo-tauri is not on PATH (cargo install tauri-cli --version "^2.0" --locked)'
+          }
+          $link = Get-ChildItem 'C:\Program Files*\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\link.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          Write-Host "MSVC link.exe     : $(if ($link) { $link.FullName } else { 'MISSING' })"
+          if (-not $link) { $fail += 'MSVC link.exe not found -- install Visual Studio Build Tools 2022 with the VCTools workload' }
+
+          $wvKeys = @(
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}',
+            'HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          )
+          $wv = $null
+          foreach ($k in $wvKeys) { if (-not $wv) { $wv = (Get-ItemProperty $k -ErrorAction SilentlyContinue).pv } }
+          Write-Host "WebView2 runtime  : $(if ($wv) { $wv } else { 'NOT INSTALLED' })"
+          if (-not $wv) { $fail += 'the WebView2 Evergreen runtime is not installed' }
+
+          if ($fail.Count) {
+            foreach ($f in $fail) { Write-Host "::error::$f" }
+            Write-Host "::error::Provision this runner with scripts/provision-windows-gui-runner.ps1 -- see docs/self-hosted-runner.md."
+            exit 1
+          }
+          Write-Host 'preflight OK: interactive desktop with a full Windows build toolchain'
+
+      # Icons are generated, not committed — see the app-compile job for why the
+      # proc macro needs them present before any cargo build.
+      - name: generate icon set from the CueCrux arc-loop art
+        run: cargo tauri icon crates/corecruxd/console/assets/CueCrux-Arc-Loop.png --output shells/desktop/app/icons
+
+      - name: build corecruxd sidecar (release, CPU-only)
+        run: cargo build --locked --release --bin corecruxd
+
+      # Tauri resolves the sidecar as `corecruxd.exe` beside the app binary
+      # (resolve_sidecar_binary in shells/desktop/app/src/main.rs), and strips
+      # the target triple at bundle time. The staged name must carry both the
+      # triple and the .exe suffix or the bundler will not find it.
+      - name: stage sidecar into the externalBin slot
+        run: |
+          $triple = ((rustc -vV) | Select-String '^host:').ToString().Split(' ')[1]
+          Write-Host "host triple: $triple"
+          New-Item -ItemType Directory -Force -Path 'shells\desktop\app\binaries' | Out-Null
+          Copy-Item 'target\release\corecruxd.exe' "shells\desktop\app\binaries\corecruxd-$triple.exe" -Force
+          Get-ChildItem 'shells\desktop\app\binaries' | Format-Table Name, Length -AutoSize
+
+      - name: bundle (cargo tauri build)
+        working-directory: shells/desktop/app
+        run: cargo tauri build
+
+      - name: install the MSI (per-machine, silent)
+        run: |
+          $ev  = "$env:GITHUB_WORKSPACE\windows-gui-evidence"
+          $built = Get-ChildItem 'shells\desktop\app\target\release\bundle\msi\*.msi' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $built) {
+            Write-Host '::error::cargo tauri build produced no .msi under target/release/bundle/msi'
+            exit 1
+          }
+
+          # Install from a STABLE path, not from the build output.
+          #
+          # Windows Installer caches the package source path of an installed
+          # product and resolves it again on a major upgrade. The update step
+          # below re-runs `cargo tauri build`, which replaces the contents of
+          # target/release/bundle/msi -- so a product installed from there has a
+          # cached source that no longer exists, and the upgrade dies at
+          # RegisterProduct with 1603, logging "SECREPAIR: Error determining
+          # package source type" and error 1302 (source needed). Copying to the
+          # evidence dir FIRST and installing from there keeps the source path
+          # valid for the whole job. Found the hard way; the msi-update.log
+          # artifact is what named it.
+          $msi = Copy-Item $built.FullName "$ev\v1.msi" -Force -PassThru
+          Write-Host "installing $($built.Name) as $($msi.FullName) ($([math]::Round($msi.Length/1MB,1)) MB)"
+          $log = "$ev\msi-install.log"
+          $p = Start-Process msiexec.exe -ArgumentList '/i', "`"$($msi.FullName)`"", '/qn', '/norestart', '/l*v', "`"$log`"" -Wait -PassThru
+          Write-Host "msiexec exit: $($p.ExitCode)"
+          # 0 = installed, 3010 = installed, reboot queued
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            Write-Host "::error::MSI install failed with exit $($p.ExitCode) -- see the msi-install.log artifact"
+            exit 1
+          }
+          # `productName` names the product, the install dir, and the Start Menu
+          # entry -- it is NOT the executable name. tauri.conf.json sets
+          # productName "Crux" but no mainBinaryName, so the shipped binary keeps
+          # the cargo bin name (crux-desktop-shell.exe). Read the product from
+          # config and the layout from the installer; hardcoding either is how
+          # this step failed the first time it ran for real.
+          $product = (Get-Content 'shells\desktop\app\tauri.conf.json' -Raw | ConvertFrom-Json).productName
+          $entry = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+                     Where-Object { $_.DisplayName -eq $product } | Select-Object -First 1
+          if (-not $entry) {
+            Write-Host "::error::msiexec reported success but registered no uninstall entry named '$product'"
+            exit 1
+          }
+
+          # Record teardown facts BEFORE any assertion below can exit, or the
+          # cleanup step has nothing to act on and the box stays dirty for the
+          # next run. Uninstall by ProductCode rather than .msi path, so teardown
+          # does not depend on the build tree still being there.
+          (Split-Path $entry.PSPath -Leaf) | Out-File "$ev\product-code.txt" -Encoding ascii
+          $product | Out-File "$ev\product-name.txt" -Encoding ascii
+
+          $dir = if ($entry.InstallLocation) { $entry.InstallLocation.TrimEnd('\') } else { Join-Path $env:ProgramFiles $product }
+          Write-Host "product     : $product"
+          Write-Host "install dir : $dir"
+          Get-ChildItem $dir -ErrorAction SilentlyContinue | Format-Table Name, Length -AutoSize
+
+          $app = Get-ChildItem (Join-Path $dir '*.exe') -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Name -ne 'corecruxd.exe' } | Select-Object -First 1
+          if (-not $app) {
+            Write-Host "::error::no application .exe found in $dir"
+            exit 1
+          }
+          Write-Host "app binary  : $($app.Name)"
+          $app.FullName | Out-File "$ev\app-exe.txt" -Encoding ascii
+
+          # The bundled sidecar must ship beside the app, de-tripled by the bundler.
+          if (-not (Test-Path (Join-Path $dir 'corecruxd.exe'))) {
+            Write-Host '::error::corecruxd.exe is missing from the install dir -- the externalBin sidecar was not bundled'
+            exit 1
+          }
+          Write-Host 'MSI OK: installed per-machine, sidecar present beside the app'
+
+      # The actual GUI assertions. Evidence (screenshot + process table) is
+      # written before any assertion can fail, so a red run still uploads the
+      # picture of what happened.
+      - name: launch the installed app and observe the desktop
+        run: |
+          $ev  = "$env:GITHUB_WORKSPACE\windows-gui-evidence"
+          $exe = (Get-Content "$ev\app-exe.txt" -Raw).Trim()
+          Write-Host "launching $exe"
+          $app = Start-Process $exe -PassThru
+
+          $window = $null; $webview = @(); $sidecar = @()
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 3
+            $p = Get-Process -Id $app.Id -ErrorAction SilentlyContinue
+            if (-not $p) { break }
+            $p.Refresh()
+            if (-not $window -and $p.MainWindowHandle -ne 0) { $window = $p.MainWindowTitle }
+            $webview = @(Get-Process msedgewebview2 -ErrorAction SilentlyContinue)
+            $sidecar = @(Get-Process corecruxd -ErrorAction SilentlyContinue)
+            if ($window -and $webview.Count -and $sidecar.Count) { break }
+          }
+
+          # Let the console settle before the screenshot. The loop above breaks the
+          # instant all three conditions hold, which can be ~3s in -- long before
+          # the webview has painted, making the artifact a picture of a blank
+          # window every time. This delay buys a representative image; it gates
+          # no assertion.
+          Start-Sleep -Seconds 10
+
+          # --- evidence first ---
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+          $vs  = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          $bmp = New-Object System.Drawing.Bitmap $vs.Width, $vs.Height
+          $g   = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.CopyFromScreen($vs.Location, [System.Drawing.Point]::Empty, $vs.Size)
+          $bmp.Save("$ev\desktop.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          $g.Dispose(); $bmp.Dispose()
+          Get-Process | Where-Object { $_.Name -match 'Crux|corecruxd|msedgewebview2' } |
+            Select-Object Name, Id, SessionId, MainWindowTitle |
+            Format-Table -AutoSize | Out-File "$ev\processes.txt" -Encoding utf8
+          Get-Content "$ev\processes.txt"
+
+          # --- assertions ---
+          $alive = [bool](Get-Process -Id $app.Id -ErrorAction SilentlyContinue)
+          $fail = @()
+          Write-Host "app process alive     : $alive"
+          if (-not $alive) { $fail += 'the app exited on its own after launch' }
+          Write-Host "main window title     : $(if ($window) { $window } else { 'NONE' })"
+          if (-not $window) { $fail += 'no top-level window appeared (setup_shell builds the main window with visible:true)' }
+          Write-Host "msedgewebview2 procs  : $($webview.Count)"
+          if (-not $webview.Count) { $fail += 'no msedgewebview2 process -- the WebView2 host never started, so nothing rendered' }
+          Write-Host "corecruxd sidecar     : $($sidecar.Count)"
+          if (-not $sidecar.Count) { $fail += 'the bundled corecruxd sidecar was never spawned (default profile is bundled on a fresh box)' }
+
+          # The sidecar must spawn windowless. corecruxd is a console-subsystem
+          # binary and the shell is a GUI-subsystem app (windows_subsystem =
+          # "windows") with no console to inherit, so without CREATE_NO_WINDOW
+          # Windows allocates a visible console for the child: a stray black box
+          # on the user's desktop for the app's lifetime. This lane found exactly
+          # that, spawn_sidecar now sets the flag, and this assertion is what
+          # stops it coming back. Invisible on Linux and to any compile-only job.
+          #
+          # Do NOT check (Get-Process corecruxd).MainWindowHandle -- it is 0 even
+          # when the console is plainly on screen, which cost a false "windowless"
+          # pass here once. Since Win11/Server 2025 the console window belongs to
+          # the console HOST (WindowsTerminal/conhost), not to the child, so the
+          # child owns no window at all. Enumerate top-level windows instead and
+          # match the host window the console host titles after the child's
+          # command line.
+          # Built by -join rather than a here-string: a here-string's body and its
+          # closing '@ must sit at column 0, which cannot survive a YAML block
+          # scalar's indentation.
+          $sig = @(
+            '[DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr p);',
+            '[DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder s, int n);',
+            '[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);',
+            '[DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr h, out int pid);',
+            'public delegate bool EnumWindowsProc(IntPtr h, IntPtr p);'
+          ) -join "`n"
+          Add-Type -Namespace Win32 -Name Wnd -MemberDefinition $sig
+          $found = New-Object System.Collections.ArrayList
+          $cb = [Win32.Wnd+EnumWindowsProc] {
+            param($h, $p)
+            if ([Win32.Wnd]::IsWindowVisible($h)) {
+              $sb = New-Object System.Text.StringBuilder 512
+              [void][Win32.Wnd]::GetWindowTextW($h, $sb, $sb.Capacity)
+              $title = $sb.ToString()
+              if ($title -like '*corecruxd*') {
+                $opid = 0; [void][Win32.Wnd]::GetWindowThreadProcessId($h, [ref]$opid)
+                $owner = (Get-Process -Id $opid -ErrorAction SilentlyContinue).Name
+                [void]$found.Add("'$title' owned by $owner (pid $opid)")
+              }
+            }
+            return $true
+          }
+          [void][Win32.Wnd]::EnumWindows($cb, [IntPtr]::Zero)
+          if ($found.Count) {
+            foreach ($f in $found) { Write-Host "sidecar console      : $f" }
+            $fail += 'the corecruxd sidecar has a visible console window: users see a stray console beside the app for its whole lifetime. spawn_sidecar must set CREATE_NO_WINDOW (0x08000000) via CommandExt::creation_flags.'
+          } else {
+            Write-Host 'sidecar console      : none (spawned windowless)'
+          }
+
+          if ($fail.Count) {
+            foreach ($f in $fail) { Write-Host "::error::$f" }
+            exit 1
+          }
+          Write-Host 'GUI smoke OK: window created, WebView2 rendering, bundled sidecar running'
+
+      # The lifecycle claim: a graceful close must reap the shell-owned sidecar
+      # (on_window_event -> shutdown_owned_resources). Killing the process would
+      # legitimately orphan it, so only assert the reap when the close was clean.
+      - name: graceful close reaps the bundled sidecar
+        run: |
+          $ev   = "$env:GITHUB_WORKSPACE\windows-gui-evidence"
+          $name = [IO.Path]::GetFileNameWithoutExtension((Get-Content "$ev\app-exe.txt" -Raw).Trim())
+          $proc = Get-Process $name -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $proc) {
+            Write-Host '::warning::the app was already gone; nothing to close'
+            exit 0
+          }
+          $closed = $proc.CloseMainWindow()
+          Write-Host "CloseMainWindow sent: $closed"
+          $gone = $proc.WaitForExit(30000)
+          Write-Host "app exited cleanly  : $gone"
+          if (-not $gone) {
+            Write-Host '::warning::the app did not exit within 30s of WM_CLOSE; killing it, so the sidecar reap is not asserted'
+            $proc.Kill()
+            exit 0
+          }
+          Start-Sleep -Seconds 5
+          $orphans = @(Get-Process corecruxd -ErrorAction SilentlyContinue)
+          Write-Host "corecruxd after exit: $($orphans.Count)"
+          if ($orphans.Count) {
+            Write-Host '::error::the bundled corecruxd survived a graceful app exit -- the lifecycle supervisor leaked a sidecar'
+            exit 1
+          }
+          Write-Host 'lifecycle OK: graceful close reaped the bundled sidecar'
+
+      # M6b gate: "clean install/update/downgrade/uninstall evidence". Install is
+      # asserted above; the three below are what a shipped installer has to survive
+      # and what no Linux job can observe. The app is already closed at this point,
+      # so these exercise the installer, not the running shell.
+      #
+      # The second MSI is built by bumping the patch version and re-bundling. Only
+      # the version metadata changes, so the sidecar and every dependency stay
+      # warm in the target dir and this costs a fraction of the first bundle.
+      - name: bundle a second MSI one patch version up
+        run: |
+          $ev   = "$env:GITHUB_WORKSPACE\windows-gui-evidence"
+          $conf = 'shells\desktop\app\tauri.conf.json'
+          $json = Get-Content $conf -Raw | ConvertFrom-Json
+          $v    = [version]$json.version
+          $next = "$($v.Major).$($v.Minor).$($v.Build + 1)"
+          Write-Host "base version : $($json.version)"
+          Write-Host "bumped to    : $next"
+          $json.version | Out-File "$ev\version-v1.txt" -Encoding ascii
+          $next         | Out-File "$ev\version-v2.txt" -Encoding ascii
+
+          # v1.msi is already in the evidence dir -- the install step put it
+          # there and installed FROM there precisely so this rebuild cannot
+          # invalidate the installed product's cached source path.
+          if (-not (Test-Path "$ev\v1.msi")) {
+            Write-Host '::error::v1.msi missing from the evidence dir; the install step should have placed it there'
+            exit 1
+          }
+
+          # NOT `Set-Content -Encoding utf8`. Windows PowerShell 5.1 writes
+          # UTF-8 WITH a BOM, and Tauri's Rust config parser then fails with
+          # "expected value at line 1 column 1" -- which reads like malformed
+          # JSON and is actually three invisible bytes. (PowerShell 7+ made
+          # -Encoding utf8 BOM-less; this job runs 5.1, same as the em-dash
+          # trap documented above.) UTF8Encoding($false) is BOM-less and says
+          # so at the call site.
+          $bumped = (Get-Content $conf -Raw) -replace
+            ('"version": "' + [regex]::Escape($json.version) + '"'), ('"version": "' + $next + '"')
+          [System.IO.File]::WriteAllText($conf, $bumped, (New-Object System.Text.UTF8Encoding $false))
+
+          # Prove the rewrite is still parseable before spending ~10 minutes
+          # discovering it is not. A failure here is the encoding, not the JSON.
+          try {
+            $check = Get-Content $conf -Raw | ConvertFrom-Json
+            Write-Host "config re-parsed OK, version now: $($check.version)"
+          } catch {
+            git checkout -- $conf
+            Write-Host "::error::the version rewrite produced unparseable JSON (encoding?): $_"
+            exit 1
+          }
+
+          Push-Location 'shells\desktop\app'
+          cargo tauri build
+          $code = $LASTEXITCODE
+          Pop-Location
+          # Restore the tracked file before anything can exit, so a failure here
+          # cannot leave a bumped version behind in the workspace.
+          git checkout -- $conf
+          if ($code -ne 0) {
+            Write-Host "::error::the second bundle failed with exit $code"
+            exit 1
+          }
+          # Select by the bumped version, NOT `Select-Object -First 1`.
+          # The bundle dir is never cleaned, so after this second build it holds
+          # BOTH MSIs. Get-ChildItem returns them name-ascending, so -First 1
+          # picks 0.5.34 over 0.5.35 -- v2.msi becomes a copy of v1. The MSI then
+          # carries an identical ProductVersion and therefore an identical
+          # ProductCode, so msiexec runs a maintenance repair instead of a major
+          # upgrade: exit 0, one uninstall entry, DisplayVersion unchanged. That
+          # is exactly the "update did not replace the installed build" failure,
+          # and the assertion catching it was right -- the MSI was the bug.
+          $msi2 = Get-ChildItem "shells\desktop\app\target\release\bundle\msi\*$next*.msi" |
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $msi2) {
+            $have = (Get-ChildItem 'shells\desktop\app\target\release\bundle\msi\*.msi' -ErrorAction SilentlyContinue).Name -join ', '
+            Write-Host "::error::the second bundle produced no MSI for version $next -- bundle dir holds: $have"
+            exit 1
+          }
+          Copy-Item $msi2.FullName "$ev\v2.msi" -Force
+          Write-Host "v1 msi : $($msi2.Name) -> v2.msi"
+
+          # Belt and braces: prove the two MSIs are genuinely different files
+          # before spending ~20 minutes discovering it in the update step. The
+          # original failure copied v1 over v2 silently, and every downstream
+          # symptom (exit 0, one entry, version unchanged) was consistent with a
+          # working installer -- so the only honest place to catch it is here.
+          $h1 = (Get-FileHash "$ev\v1.msi" -Algorithm SHA256).Hash
+          $h2 = (Get-FileHash "$ev\v2.msi" -Algorithm SHA256).Hash
+          if ($h1 -eq $h2) {
+            Write-Host "::error::v1.msi and v2.msi are byte-identical ($h1) -- the version bump did not reach the bundle, so the update step would run a maintenance repair instead of an upgrade"
+            exit 1
+          }
+          Write-Host "v1 sha256 : $h1"
+          Write-Host "v2 sha256 : $h2"
+
+      - name: update over the installed build
+        run: |
+          $ev      = "$env:GITHUB_WORKSPACE\windows-gui-evidence"
+          $product = (Get-Content "$ev\product-name.txt" -Raw).Trim()
+          $v2      = (Get-Content "$ev\version-v2.txt" -Raw).Trim()
+
+          $p = Start-Process msiexec.exe -ArgumentList '/i', "`"$ev\v2.msi`"", '/qn', '/norestart', '/l*v', "`"$ev\msi-update.log`"" -Wait -PassThru
+          Write-Host "msiexec exit: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            Write-Host "::error::updating over the installed build failed with exit $($p.ExitCode) -- see msi-update.log"
+            exit 1
+          }
+
+          $entries = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+                         Where-Object { $_.DisplayName -eq $product })
+          Write-Host "uninstall entries for '$product': $($entries.Count)"
+          foreach ($e in $entries) { Write-Host "  $($e.DisplayVersion)  $(Split-Path $e.PSPath -Leaf)" }
+
+          $fail = @()
+          # The failure this catches is a side-by-side install: the user ends up
+          # with two Start Menu entries and two copies on disk, and uninstalling
+          # "Crux" removes only one of them. That is an UpgradeCode regression in
+          # the WiX template, and it is invisible to a single-install test.
+          if ($entries.Count -ne 1) {
+            $fail += "expected exactly 1 uninstall entry after an update, found $($entries.Count) -- the MSI installed side-by-side instead of upgrading in place"
+          }
+          if ($entries.Count -eq 1 -and $entries[0].DisplayVersion -ne $v2) {
+            $fail += "the registered version is $($entries[0].DisplayVersion), expected $v2 -- the update did not replace the installed build"
+          }
+          # Record the post-update product code: an in-place major upgrade mints a
+          # new one, and teardown must uninstall what is actually installed now.
+          if ($entries.Count -ge 1) {
+            (Split-Path $entries[0].PSPath -Leaf) | Out-File "$ev\product-code.txt" -Encoding ascii
+          }
+          if ($fail.Count) {
+            foreach ($f in $fail) { Write-Host "::error::$f" }
+            exit 1
+          }
+          Write-Host 'update OK: upgraded in place, one entry, version advanced'
+
+      - name: downgrade is refused
+        run: |
+          $ev      = "$env:GITHUB_WORKSPACE\windows-gui-evidence"
+          $product = (Get-Content "$ev\product-name.txt" -Raw).Trim()
+          $v2      = (Get-Content "$ev\version-v2.txt" -Raw).Trim()
+
+          $p = Start-Process msiexec.exe -ArgumentList '/i', "`"$ev\v1.msi`"", '/qn', '/norestart', '/l*v', "`"$ev\msi-downgrade.log`"" -Wait -PassThru
+          Write-Host "msiexec exit: $($p.ExitCode)"
+
+          # 1638 = ERROR_PRODUCT_VERSION: another version of this product is
+          # already installed. That is the WiX default downgrade block doing its
+          # job and is the PASS condition, not a failure.
+          if ($p.ExitCode -eq 1638) {
+            Write-Host 'downgrade blocked by the installer (1638), as designed'
+          } elseif ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) {
+            Write-Host '::warning::the installer ACCEPTED a downgrade -- a stale MSI can silently replace a newer install'
+          } else {
+            Write-Host "::warning::downgrade returned an unclassified exit $($p.ExitCode) -- see msi-downgrade.log"
+          }
+
+          # Whatever the installer decided, the box must not be left holding two
+          # products or a version nobody asked for. That part IS asserted.
+          $entries = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+                         Where-Object { $_.DisplayName -eq $product })
+          Write-Host "uninstall entries: $($entries.Count)"
+          foreach ($e in $entries) { Write-Host "  $($e.DisplayVersion)" }
+          if ($entries.Count -ne 1) {
+            Write-Host "::error::after the downgrade attempt there are $($entries.Count) entries for '$product', expected 1"
+            exit 1
+          }
+          # Re-record the product code: if the installer DID accept the downgrade
+          # it minted a new one, and the uninstall step below must remove what is
+          # installed now rather than a code that no longer exists.
+          (Split-Path $entries[0].PSPath -Leaf) | Out-File "$ev\product-code.txt" -Encoding ascii
+          Write-Host "installed version now: $($entries[0].DisplayVersion) (was $v2 before the attempt)"
+
+      - name: uninstall leaves nothing behind
+        run: |
+          $ev      = "$env:GITHUB_WORKSPACE\windows-gui-evidence"
+          $product = (Get-Content "$ev\product-name.txt" -Raw).Trim()
+          $code    = (Get-Content "$ev\product-code.txt" -Raw).Trim()
+          $dir     = Join-Path $env:ProgramFiles $product
+
+          $p = Start-Process msiexec.exe -ArgumentList '/x', $code, '/qn', '/norestart', '/l*v', "`"$ev\msi-uninstall.log`"" -Wait -PassThru
+          Write-Host "msiexec exit: $($p.ExitCode)"
+          $fail = @()
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            $fail += "uninstall failed with exit $($p.ExitCode) -- see msi-uninstall.log"
+          }
+
+          $entries = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+                         Where-Object { $_.DisplayName -eq $product })
+          Write-Host "uninstall entries remaining: $($entries.Count)"
+          if ($entries.Count) { $fail += "'$product' still has $($entries.Count) uninstall entry after removal" }
+
+          # Teardown treated leftovers as a warning because its job is to get the
+          # box clean for the next run. Here it is the assertion: a shipped
+          # uninstaller that leaves the binary and the sidecar on disk is a defect,
+          # and the previous step already proved the install dir was populated.
+          if (Test-Path $dir) {
+            $left = @(Get-ChildItem $dir -Recurse -File -ErrorAction SilentlyContinue)
+            Write-Host "files left in ${dir}: $($left.Count)"
+            foreach ($f in ($left | Select-Object -First 10)) { Write-Host "  $($f.FullName)" }
+            if ($left.Count) { $fail += "$($left.Count) files remain in $dir after uninstall" }
+          } else {
+            Write-Host "install dir removed : $dir"
+          }
+
+          # The uninstaller must not leave the sidecar running either.
+          $orphans = @(Get-Process corecruxd -ErrorAction SilentlyContinue)
+          Write-Host "corecruxd processes : $($orphans.Count)"
+          if ($orphans.Count) { $fail += 'a corecruxd process survived the uninstall' }
+
+          if ($fail.Count) {
+            foreach ($f in $fail) { Write-Host "::error::$f" }
+            exit 1
+          }
+          # Teardown re-runs msiexec /x by product code; that is a harmless no-op
+          # once this step has removed the product, and it stays as the net for
+          # every path that fails before reaching here.
+          Write-Host 'uninstall OK: no registry entry, no files, no sidecar'
+
+      - name: uninstall and clean up
+        if: always()
+        run: |
+          $ev = "$env:GITHUB_WORKSPACE\windows-gui-evidence"
+          if (Test-Path "$ev\app-exe.txt") {
+            $name = [IO.Path]::GetFileNameWithoutExtension((Get-Content "$ev\app-exe.txt" -Raw).Trim())
+            Get-Process $name -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+          Get-Process corecruxd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+          if (Test-Path "$ev\product-code.txt") {
+            $code = (Get-Content "$ev\product-code.txt" -Raw).Trim()
+            $p = Start-Process msiexec.exe -ArgumentList '/x', $code, '/qn', '/norestart' -Wait -PassThru
+            Write-Host "uninstall $code exit: $($p.ExitCode)"
+          } else {
+            Write-Host '::warning::no product-code.txt recorded, so nothing was uninstalled'
+          }
+
+          if (Test-Path "$ev\product-name.txt") {
+            $leftover = Join-Path $env:ProgramFiles (Get-Content "$ev\product-name.txt" -Raw).Trim()
+            if (Test-Path $leftover) { Write-Host "::warning::$leftover still exists after uninstall" }
+          }
+
+      - name: upload GUI smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: crux-desktop-windows-gui-smoke
+          path: |
+            windows-gui-evidence/**
             shells/desktop/app/target/release/bundle/**
           if-no-files-found: warn

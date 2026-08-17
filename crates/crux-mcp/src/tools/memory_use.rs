@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! `memory_acknowledge_use` — agent-ux-02 free-tier acknowledgement tool.
 //!
@@ -186,6 +186,7 @@ pub async fn handle_memory_acknowledge_use(args: &Value, ctx: &McpContext) -> Re
     let aliases = ctx.scope_aliases();
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
 
+    let tenant_hash = ctx.scope_tenant();
     let store = ctx.fact_store.read().await;
     let now = chrono::Utc::now();
     let mut filtered_entries: Vec<AckFactEntry> = Vec::with_capacity(fact_ids.len());
@@ -194,7 +195,7 @@ pub async fn handle_memory_acknowledge_use(args: &Value, ctx: &McpContext) -> Re
     let mut not_visible_count = 0usize;
 
     for fid in &fact_ids {
-        let Some(fact) = store.get(fid) else {
+        let Some(fact) = store.get_for_tenant(fid, &tenant_hash) else {
             not_found_count += 1;
             continue;
         };
@@ -346,6 +347,23 @@ mod tests {
         })
     }
 
+    async fn seed_operator_fact(ctx: &McpContext, entity: &str, key: &str, value: &str) -> String {
+        let mut store = ctx.fact_store.write().await;
+        store
+            .store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: entity.to_string(),
+                key: key.to_string(),
+                value: value.to_string(),
+                source_receipt: Some("test:typed-operator-workflow".to_string()),
+                confidence: 1.0,
+                private: true,
+                horizon_class: None,
+                actor: Some("daemon:test".to_string()),
+            })
+            .fact_id
+    }
+
     // Serialise the env-var lock so concurrent tokio tests don't race
     // on CORECRUXD_FEATURE_MEMORY_ACK. Delegates to
     // `crate::test_env_lock` so every env-mutating test in this crate
@@ -410,18 +428,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let f_ops = handle_store_fact(
-            &json!({"entity": "__ops::config-audit", "key": "sha256:abc", "value": "shipped"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
-        let f_boot = handle_store_fact(
-            &json!({"entity": "__bootstrap__::pattern:x", "key": "Retry", "value": "shipped"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let id_ops = seed_operator_fact(&ctx, "__ops::config-audit", "sha256:abc", "shipped").await;
+        let id_boot = seed_operator_fact(&ctx, "__bootstrap__::pattern:x", "Retry", "shipped").await;
 
         fn extract_fact_id(v: &Value) -> String {
             let text = v["content"][0]["text"].as_str().unwrap();
@@ -431,9 +439,6 @@ mod tests {
         }
 
         let id_pub = extract_fact_id(&f_pub);
-        let id_ops = extract_fact_id(&f_ops);
-        let id_boot = extract_fact_id(&f_boot);
-
         let res = handle_memory_acknowledge_use(
             &json!({
                 "turn_id": "t-redact",

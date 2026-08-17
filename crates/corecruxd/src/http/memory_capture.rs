@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Gated auto-capture HTTP surface (ExecPlan
 //! `crux-daemon-buyer-fit-buildout-2026-07-13`, M1.4).
@@ -97,6 +97,7 @@ pub(super) struct ExtractResponse {
 }
 
 /// `POST /v1/memory/extract`
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_extract(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -180,6 +181,7 @@ pub(super) struct ListQuery {
 }
 
 /// `GET /v1/memory/candidates`
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_candidates(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -223,6 +225,7 @@ pub(super) struct PromoteRequest {
 }
 
 /// `POST /v1/memory/candidates/{id}/promote`
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_promote(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -261,6 +264,11 @@ pub(super) async fn post_promote(
             // 422: the request is well-formed but the fail-closed gate refuses it.
             problem_response(StatusCode::UNPROCESSABLE_ENTITY, format!("promotion refused: {why}")).into_response()
         }
+        Err(candidate_store::ReviewError::ReservedNamespace(prefix)) => problem_response(
+            StatusCode::FORBIDDEN,
+            format!("promotion targets create-reserved namespace `{prefix}`"),
+        )
+        .into_response(),
         Err(candidate_store::ReviewError::Store(e)) => {
             problem_response(StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
         }
@@ -273,6 +281,7 @@ pub(super) struct RejectRequest {
 }
 
 /// `POST /v1/memory/candidates/{id}/reject`
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_reject(
     State(state): State<AppState>,
     headers: HeaderMap,

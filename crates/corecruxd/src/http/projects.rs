@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! HTTP CRUD for projects + members + tenants.
 
@@ -47,6 +47,7 @@ fn now_unix_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_projects(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
@@ -57,6 +58,7 @@ pub(super) async fn get_projects(State(state): State<AppState>, headers: HeaderM
     (StatusCode::OK, Json(serde_json::json!({ "projects": projects }))).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_project(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -74,12 +76,13 @@ pub(super) async fn get_project(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_project(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<CreateProjectBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -131,13 +134,14 @@ where
     Option::<T>::deserialize(deserializer).map(Some)
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn patch_project(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<UpdateProjectBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -166,12 +170,13 @@ pub(super) async fn patch_project(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_project(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -186,13 +191,14 @@ pub(super) async fn delete_project(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_project_member(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<AddMemberBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -210,12 +216,13 @@ pub(super) async fn post_project_member(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_project_member(
     State(state): State<AppState>,
     Path((id, passport_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -227,13 +234,14 @@ pub(super) async fn delete_project_member(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_project_tenant(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<AddTenantBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -254,12 +262,13 @@ pub(super) async fn post_project_tenant(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_project_tenant(
     State(state): State<AppState>,
     Path((id, tenant_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
@@ -300,6 +309,7 @@ fn link_now_unix_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_project_repos(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -322,6 +332,7 @@ pub(super) async fn get_project_repos(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_project_repo(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -356,6 +367,7 @@ pub(super) async fn post_project_repo(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_project_repo(
     State(state): State<AppState>,
     Path((project_id, owner, repo)): Path<(String, String, String)>,
@@ -374,6 +386,7 @@ pub(super) async fn delete_project_repo(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_plane_repos(
     State(state): State<AppState>,
     Path((project_id, plane_id)): Path<(String, String)>,
@@ -418,6 +431,7 @@ pub(super) struct PutLayerBody {
     pub content: String,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_project_layers(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -433,9 +447,9 @@ pub(super) async fn get_project_layers(
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
         min_effective_confidence: None,
         tenant_hash: None,
-        query: Some(prefix.clone()),
+        query: None,
         entity: None,
-        entity_prefix: None,
+        entity_prefix: Some(prefix.clone()),
         top_k: 200,
         token_budget: None,
     });
@@ -483,6 +497,7 @@ pub(super) async fn get_project_layers(
         .into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn put_project_layer(
     State(state): State<AppState>,
     Path((id, layer)): Path<(String, String)>,
@@ -543,6 +558,7 @@ pub(super) struct GraphQuery {
 /// this project. Phase 1A is extracted-only (project / planes / tenants /
 /// passports / layers / github). Phase 2 adds modules / files / symbols /
 /// stubs / dead_code via `?include_workspace=true`.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_context_graph(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -565,6 +581,7 @@ pub(super) async fn get_context_graph(
     (StatusCode::OK, Json(graph)).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_project_layer(
     State(state): State<AppState>,
     Path((id, layer)): Path<(String, String)>,

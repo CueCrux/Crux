@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Work coordination — six-state kanban (Planned · In Progress · Blocked ·
 //! Archive · Complete · Deployed) with comments, transitions audit log, and
@@ -56,6 +56,8 @@ pub const WORK_STATES: &[&str] = &[
 pub enum WorkError {
     #[error("invalid work state '{0}'")]
     InvalidState(String),
+    #[error("work must be created in the planned state and transitioned separately")]
+    InvalidInitialState,
     #[error("blocked items must carry a non-empty blocker_reason")]
     MissingBlockerReason,
     #[error("work item '{0}' not found")]
@@ -68,6 +70,8 @@ pub enum WorkError {
     GateAlreadyResolved(String),
     #[error("gated action '{0}' tenant no longer matches its work item")]
     GateTenantChanged(String),
+    #[error("a work item's tenant is immutable")]
+    TenantImmutable,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -151,6 +155,12 @@ pub struct WorkItem {
     pub depends_on: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extended_by: Vec<String>,
+    /// Ready-order projection only (`/v1/work?ranked=1`): the subset of
+    /// `depends_on` that is still *open*, i.e. what is actually holding this
+    /// item back. Empty = ready to start now. Never populated on an unranked
+    /// response, so the default board stays byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by: Vec<String>,
     /// Unresolved Open-Decision ids (`OD-<n>`) this plan references, per the
     /// registry — overdue first. Empty unless the daemon has the registry path
     /// (`CRUX_OPEN_DECISIONS_PATH`) set and the plan cites a still-open OD.
@@ -288,6 +298,13 @@ pub fn validate_state(state: &str) -> Result<(), WorkError> {
     }
 }
 
+/// Concrete tenant for legacy and current work rows. Pre-tenant records omit
+/// `tenant_id` and belong to `default`; new authority-sensitive HTTP writes
+/// always persist an explicit tenant.
+pub fn work_tenant_id(item: &WorkItem) -> &str {
+    item.tenant_id.as_deref().unwrap_or("default")
+}
+
 pub struct CreateWorkInput {
     pub project_id: String,
     pub title: String,
@@ -306,6 +323,9 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
     }
     let state = input.state.as_deref().unwrap_or("planned").to_string();
     validate_state(&state)?;
+    if state != "planned" {
+        return Err(WorkError::InvalidInitialState);
+    }
     let id = format!("w_{}", Uuid::new_v4().simple());
     let item = WorkItem {
         id: id.clone(),
@@ -329,6 +349,7 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
         superseded_by: None,
         depends_on: Vec::new(),
         extended_by: Vec::new(),
+        blocked_by: Vec::new(),
         open_decisions: Vec::new(),
         orchestrator_id: None,
         milestones_done: None,
@@ -338,20 +359,23 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
         stale: None,
         token_burn: None,
     };
-    write_record(store, &item)?;
-    write_transition(
+    write_record_with_attribution(store, &item, Some(&input.created_by_passport), None)?;
+    write_transition_with_attribution(
         store,
         &WorkTransition {
             id: format!("tx_{}", Uuid::new_v4().simple()),
             work_id: id,
             from_state: "(none)".to_string(),
             to_state: state,
-            by_passport: input.created_by_passport,
+            by_passport: input.created_by_passport.clone(),
             gate_status: "allowed".to_string(),
             at_unix_ms: now_unix_ms,
             blocker_kind: None,
             receipt_id: None,
         },
+        work_tenant_id(&item),
+        Some(&input.created_by_passport),
+        None,
     )?;
     Ok(item)
 }
@@ -383,7 +407,7 @@ pub fn list_work(
         }
         if let Ok(item) = serde_json::from_str::<WorkItem>(&fact.value) {
             if state_filter.is_none_or(|s| item.state == s)
-                && tenant_filter.is_none_or(|t| item.tenant_id.as_deref() == Some(t))
+                && tenant_filter.is_none_or(|t| work_tenant_id(&item) == t)
                 && assignee_filter.is_none_or(|a| item.assignee_passport.as_deref() == Some(a))
             {
                 out.push(item);
@@ -435,6 +459,13 @@ pub fn update_work(
     ctx: UpdateWorkContext,
 ) -> Result<UpdateOutcome, WorkError> {
     let mut item = get_work(store, id).ok_or_else(|| WorkError::NotFound(id.to_string()))?;
+    if input
+        .tenant_id
+        .as_ref()
+        .is_some_and(|tenant| tenant.as_deref().unwrap_or("default") != work_tenant_id(&item))
+    {
+        return Err(WorkError::TenantImmutable);
+    }
     let prev_state = item.state.clone();
 
     // State changes are gateable; non-state field updates always go through.
@@ -467,11 +498,11 @@ pub fn update_work(
                 resolved_by_passport: None,
                 receipt_id: None,
             };
-            write_gate(store, &pending)?;
+            write_gate_with_attribution(store, &pending, Some(&ctx.by_passport), None)?;
             // Apply non-state fields, leave state untouched.
             apply_non_state_fields(&mut item, &input);
             item.updated_at_unix_ms = ctx.now_unix_ms;
-            write_record(store, &item)?;
+            write_record_with_attribution(store, &item, Some(&ctx.by_passport), None)?;
             return Ok(UpdateOutcome::Queued(Box::new(pending)));
         }
     }
@@ -491,23 +522,26 @@ pub fn update_work(
         }
     }
     item.updated_at_unix_ms = ctx.now_unix_ms;
-    write_record(store, &item)?;
+    write_record_with_attribution(store, &item, Some(&ctx.by_passport), None)?;
 
     if let Some(new_state) = input.state {
         if new_state != prev_state {
-            write_transition(
+            write_transition_with_attribution(
                 store,
                 &WorkTransition {
                     id: format!("tx_{}", Uuid::new_v4().simple()),
                     work_id: item.id.clone(),
                     from_state: prev_state,
                     to_state: new_state,
-                    by_passport: ctx.by_passport,
+                    by_passport: ctx.by_passport.clone(),
                     gate_status: "allowed".to_string(),
                     at_unix_ms: ctx.now_unix_ms,
                     blocker_kind: item.blocker_kind,
                     receipt_id: None,
                 },
+                work_tenant_id(&item),
+                Some(&ctx.by_passport),
+                None,
             )?;
         }
     }
@@ -524,9 +558,9 @@ fn apply_non_state_fields(item: &mut WorkItem, input: &UpdateWorkInput) {
     if let Some(a) = &input.assignee_passport {
         item.assignee_passport = a.clone();
     }
-    if let Some(t) = &input.tenant_id {
-        item.tenant_id = t.clone();
-    }
+    // Tenant ownership is immutable. `update_work` validates an explicitly
+    // repeated value above, then intentionally leaves the stored representation
+    // unchanged so legacy `None == default` rows remain byte-compatible.
     if let Some(p) = &input.linked_pr {
         item.linked_pr = p.clone();
     }
@@ -560,6 +594,10 @@ pub fn add_comment(
     };
     let value = serde_json::to_string(&comment)?;
     let mut sf = StoreFact {
+        // Physical re-keying is a separate migration (M5/M16). Keep the
+        // existing work-family chain under `default`; authority is enforced
+        // against the serialized work tenant so legacy and current versions do
+        // not split into two live chains.
         tenant_hash: "default".to_string(),
         entity: format!("{WORK_COMMENT_ENTITY_PREFIX}::{}::{}", work_id, comment.id),
         key: RECORD_KEY.to_string(),
@@ -568,7 +606,7 @@ pub fn add_comment(
         confidence: 1.0,
         private: false,
         horizon_class: None,
-        actor: None,
+        actor: Some(author_passport.to_string()),
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);
@@ -631,7 +669,11 @@ pub fn list_transitions(store: &FactStore, work_id: &str) -> Vec<WorkTransition>
     out
 }
 
-pub fn list_pending_gates(store: &FactStore, by_passport_filter: Option<&str>) -> Vec<PendingGateAction> {
+pub fn list_pending_gates(
+    store: &FactStore,
+    tenant_filter: Option<&str>,
+    by_passport_filter: Option<&str>,
+) -> Vec<PendingGateAction> {
     let result = store.query(&FactQuery {
         min_effective_confidence: None,
         tenant_hash: None,
@@ -647,7 +689,10 @@ pub fn list_pending_gates(store: &FactStore, by_passport_filter: Option<&str>) -
             continue;
         }
         if let Ok(p) = serde_json::from_str::<PendingGateAction>(&fact.value) {
-            if p.status == "pending" && by_passport_filter.is_none_or(|f| p.requested_by_passport == f) {
+            if p.status == "pending"
+                && tenant_filter.is_none_or(|tenant| p.tenant_id.as_deref().unwrap_or("default") == tenant)
+                && by_passport_filter.is_none_or(|f| p.requested_by_passport == f)
+            {
                 out.push(p);
             }
         }
@@ -671,6 +716,7 @@ pub fn resolve_gate(
     if target.gate.status != "pending" {
         return Err(WorkError::GateAlreadyResolved(action_id.to_string()));
     }
+    let tenant_id = target.tenant_id;
     let mut pending = target.gate;
     let item = target.work;
 
@@ -696,7 +742,7 @@ pub fn resolve_gate(
             blocker_kind: item.blocker_kind,
             receipt_id: Some(receipt_id.to_string()),
         };
-        let transition_fact = transition_store_fact(&rejected, Some(approver_passport), Some(receipt_id))?;
+        let transition_fact = transition_store_fact(&rejected, &tenant_id, Some(approver_passport), Some(receipt_id))?;
         store.try_store_bulk(vec![gate_fact, transition_fact])?;
         return Ok(item);
     }
@@ -729,7 +775,8 @@ pub fn resolve_gate(
                 receipt_id: Some(receipt_id.to_string()),
             };
             let work_fact = record_store_fact(&updated, Some(approver_passport), Some(receipt_id))?;
-            let transition_fact = transition_store_fact(&transition, Some(approver_passport), Some(receipt_id))?;
+            let transition_fact =
+                transition_store_fact(&transition, &tenant_id, Some(approver_passport), Some(receipt_id))?;
             store.try_store_bulk(vec![gate_fact, work_fact, transition_fact])?;
             return Ok(updated);
         }
@@ -773,16 +820,10 @@ fn get_gate(store: &FactStore, action_id: &str) -> Option<PendingGateAction> {
     None
 }
 
-/// Public re-write of an existing work item record. Used by the orchestrator
-/// surface to stamp / clear `orchestrator_id` without going through the full
-/// `update_work` state-machine (which would emit a spurious transition). The
-/// caller is responsible for having loaded a current copy via `get_work`.
-pub fn write_work_record(store: &mut FactStore, item: &WorkItem) -> Result<(), WorkError> {
-    write_record(store, item)
-}
-
-fn write_record(store: &mut FactStore, item: &WorkItem) -> Result<(), WorkError> {
-    write_record_with_attribution(store, item, None, None)
+/// Attributed variant for governance surfaces that update non-state work
+/// metadata after authorizing the target under the same storage guard.
+pub fn write_work_record_with_actor(store: &mut FactStore, item: &WorkItem, actor: &str) -> Result<(), WorkError> {
+    write_record_with_attribution(store, item, Some(actor), None)
 }
 
 fn write_record_with_attribution(
@@ -813,23 +854,21 @@ fn record_store_fact(item: &WorkItem, actor: Option<&str>, receipt_id: Option<&s
     Ok(fact)
 }
 
-fn write_transition(store: &mut FactStore, tx: &WorkTransition) -> Result<(), WorkError> {
-    write_transition_with_attribution(store, tx, None, None)
-}
-
 fn write_transition_with_attribution(
     store: &mut FactStore,
     tx: &WorkTransition,
+    tenant_id: &str,
     actor: Option<&str>,
     receipt_id: Option<&str>,
 ) -> Result<(), WorkError> {
-    let sf = transition_store_fact(tx, actor, receipt_id)?;
+    let sf = transition_store_fact(tx, tenant_id, actor, receipt_id)?;
     store.store(sf);
     Ok(())
 }
 
 fn transition_store_fact(
     tx: &WorkTransition,
+    _tenant_id: &str,
     actor: Option<&str>,
     receipt_id: Option<&str>,
 ) -> Result<StoreFact, WorkError> {
@@ -850,10 +889,6 @@ fn transition_store_fact(
     };
     crate::fact_privacy::enforce_global(&mut fact);
     Ok(fact)
-}
-
-fn write_gate(store: &mut FactStore, gate: &PendingGateAction) -> Result<(), WorkError> {
-    write_gate_with_attribution(store, gate, None, None)
 }
 
 fn write_gate_with_attribution(
@@ -1059,7 +1094,7 @@ mod tests {
         };
         let still_planned = get_work(&store, &item.id).expect("item");
         assert_eq!(still_planned.state, "planned");
-        assert_eq!(list_pending_gates(&store, None).len(), 1);
+        assert_eq!(list_pending_gates(&store, None, None).len(), 1);
         let approved = resolve_gate(
             &mut store,
             &pending.action_id,
@@ -1070,7 +1105,7 @@ mod tests {
         )
         .expect("resolve");
         assert_eq!(approved.state, "in_progress");
-        assert!(list_pending_gates(&store, None).is_empty(), "no longer pending");
+        assert!(list_pending_gates(&store, None, None).is_empty(), "no longer pending");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

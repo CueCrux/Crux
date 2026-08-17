@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Session state tool handlers: `get_session`, `save_session`,
 //! `session_checkpoint`, `list_sessions`, `delete_session`.
@@ -47,9 +47,18 @@ pub async fn handle_save_session(args: &Value, ctx: &McpContext) -> Result<Value
     let ttl_seconds = args.get("ttl_seconds").and_then(|v| v.as_u64());
     let stored_session_id = scope::scoped_session_id(scope::agent_name(ctx.agent.as_ref()), session_id);
 
+    // Stamp the authenticated writer onto the record itself. Until now the ONLY
+    // identity trace on a saved session was the `__agent_session::<agent>::` key
+    // prefix — which an unauthenticated caller never gets, so every such session
+    // read back as agent-unknown. `scope_identity()` is the same resolution
+    // `store_fact` uses for its `actor` (raw token-name, upgraded to a passport_id
+    // when CORECRUXD_AGENT_PASSPORTS is on) and is `None` for an anonymous caller,
+    // which is stored as absent rather than guessed.
+    let actor = ctx.scope_identity();
+
     let mut store = ctx.session_store.write().await;
     let session = store
-        .try_put(&stored_session_id, state, ttl_seconds)
+        .try_put_with_actor(&stored_session_id, state, ttl_seconds, actor)
         .map_err(|err| JsonRpcError {
             code: INTERNAL_ERROR,
             message: "session journal append failed".to_string(),
@@ -93,9 +102,10 @@ pub async fn handle_session_checkpoint(args: &Value, ctx: &McpContext) -> Result
         "token_budget": token_budget,
     });
 
+    let actor = ctx.scope_identity();
     let mut store = ctx.session_store.write().await;
     let session = store
-        .try_put(&stored_session_id, state, ttl_seconds)
+        .try_put_with_actor(&stored_session_id, state, ttl_seconds, actor)
         .map_err(|err| JsonRpcError {
             code: INTERNAL_ERROR,
             message: "session journal append failed".to_string(),

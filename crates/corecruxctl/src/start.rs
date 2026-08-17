@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! `corecruxctl start` — the one canonical zero→first-loop on-ramp (Open Engine
 //! M4).
@@ -21,6 +21,8 @@
 //! `login`, and `docker compose up` remain for the specific rails they serve;
 //! `start` is just the one we point newcomers at.
 
+use crate::agent_wiring::{self, Agent};
+
 type DynErr = Box<dyn std::error::Error + Send + Sync>;
 
 /// Parsed arguments for `corecruxctl start`.
@@ -31,6 +33,9 @@ pub struct StartArgs {
     pub url: Option<String>,
     /// Static named token (`--token`) for CI / headless / air-gapped clients.
     pub token: Option<String>,
+    /// Which agent to wire (`claude` | `codex` | `cursor`). Omit to bring the
+    /// daemon connection up without touching any agent's config.
+    pub agent: Option<Agent>,
 }
 
 /// Run the canonical on-ramp.
@@ -47,16 +52,65 @@ pub fn run(args: StartArgs) -> Result<(), DynErr> {
         token: args.token.clone(),
         device: false,
         no_verify: false,
+        // `start` is the operator-facing happy path, not CI: a failed
+        // self-check is printed loudly but must not fail the command.
+        strict_verify: false,
         no_hooks: false,
         no_register: false,
     });
 
     match result {
         Ok(()) => {
+            // Agent wiring runs after login so it can use the endpoint login
+            // resolved, and is reported separately: a failure here means the
+            // daemon is live but one client is not pointed at it yet, which is
+            // a different (and much smaller) problem than login failing.
+            if let Some(agent) = args.agent {
+                let mcp = mcp_url_for(args.url.as_deref())?;
+                match agent_wiring::wire(agent, &mcp) {
+                    Ok(lines) => {
+                        println!("\nagent: {}", agent.as_str());
+                        for line in lines {
+                            println!("  {line}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("\nagent: {} — wiring FAILED: {e}", agent.as_str());
+                        eprintln!("  the daemon is up; re-run once the config path is writable");
+                        return Err(e);
+                    }
+                }
+            }
             print!("{}", live_summary(args.url.as_deref()));
+            if let Some(agent) = args.agent {
+                println!("\nNext: restart {} and ask it to recall something.", agent.as_str());
+            }
             Ok(())
         }
         Err(e) => Err(daemon_unreachable_hint(&e).into()),
+    }
+}
+
+/// The MCP endpoint to hand an agent.
+///
+/// Prefers what `login` just resolved and persisted to
+/// `~/.config/cuecrux/env`, because that is the endpoint actually in use.
+/// Falls back to deriving it from `--url` (the daemon's convention puts MCP on
+/// a fixed port regardless of the HTTP port), then to the loopback default.
+fn mcp_url_for(url: Option<&str>) -> Result<String, DynErr> {
+    if let Some(cfg_dir) = crate::login::config_dir() {
+        let path = crate::login::env_path(&cfg_dir);
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Some(mcp) = crate::login::parse_env_file(&contents).get("CRUX_MCP_URL") {
+                if !mcp.trim().is_empty() {
+                    return Ok(mcp.clone());
+                }
+            }
+        }
+    }
+    match url {
+        Some(u) => crate::login::derive_mcp_url(u).map_err(Into::into),
+        None => Ok("http://127.0.0.1:14801/mcp".to_string()),
     }
 }
 
@@ -95,6 +149,7 @@ fn daemon_unreachable_hint(err: &DynErr) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -113,6 +168,43 @@ mod tests {
     fn live_summary_honours_explicit_url() {
         let s = live_summary(Some("https://crux.example.com"));
         assert!(s.contains("https://crux.example.com"));
+    }
+
+    #[test]
+    #[serial_test::serial] // HOME is process-global
+    fn mcp_url_prefers_what_login_persisted_over_rederiving() {
+        // A re-derivation can disagree with the endpoint login actually
+        // resolved; the agent must be pointed at the latter.
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home.path());
+
+        let cfg = crate::login::config_dir().unwrap();
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            crate::login::env_path(&cfg),
+            "CRUX_HTTP_URL=http://example:14800
+CRUX_MCP_URL=http://example:19999/mcp
+",
+        )
+        .unwrap();
+
+        assert_eq!(
+            mcp_url_for(Some("http://example:14800")).unwrap(),
+            "http://example:19999/mcp"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn mcp_url_falls_back_to_derivation_when_nothing_is_persisted() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home.path());
+
+        let derived = mcp_url_for(Some("http://example:14800")).unwrap();
+        assert!(derived.starts_with("http://example:"), "{derived}");
+        assert!(derived.ends_with("/mcp"), "{derived}");
+
+        assert_eq!(mcp_url_for(None).unwrap(), "http://127.0.0.1:14801/mcp");
     }
 
     #[test]

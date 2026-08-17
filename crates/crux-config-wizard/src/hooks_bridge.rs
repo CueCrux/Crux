@@ -1,23 +1,29 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
-//! Binary-side bridge to `corecruxctl hooks install`.
+//! Post-compose hook installation for `init` / `regenerate --hooks`.
 //!
-//! After the wizard composes the managed CLAUDE.md / AGENTS.md sections, it hands
-//! off to the co-installed `corecruxctl` so a single `crux-config-wizard init`
-//! sets up **both** the profiles and the Claude Code hooks (banner, observe, cost,
-//! scratchpad-survival). Kept out of the library crate — it shells out to a
-//! sibling binary — so the composer stays pure + unit-testable, and the lean
-//! wizard doesn't take on corecruxctl's dependency tree.
+//! This used to shell out to `corecruxctl hooks install` and print a "run it
+//! yourself" note when that binary was absent. On client machines it usually
+//! *is* absent, and the note was easy to miss — so workspaces ended up with a
+//! composed CLAUDE.md documenting a three-channel banner (see the `boot-banner`
+//! profile) while the two channels a human can actually see were never
+//! installed. The failure was silent in the only direction that matters.
 //!
-//! Everything here is best-effort: a missing or failing `corecruxctl` prints a
-//! one-line "run it yourself" note and never fails the wizard (the profiles are
-//! already written).
+//! The install now lives in this crate (`hooks_install`), so we call it directly
+//! and it cannot fail for want of a sibling binary. `corecruxctl hooks install`
+//! still exists and additionally configures the daemon endpoint; that extra step
+//! is the one thing we cannot do from here, so it stays the recommended entry
+//! point when `corecruxctl` is present — we just no longer *depend* on it.
+//!
+//! Still best-effort: a hooks problem prints and never fails the wizard, because
+//! the profiles are already written by the time we run.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
+
+use crux_config_wizard::hooks_install;
 
 /// How to run the hooks step.
 #[derive(Clone, Copy)]
@@ -28,57 +34,43 @@ pub enum Mode {
     Auto,
 }
 
-/// Locate the co-installed `corecruxctl`: PATH first, then the conventional
-/// user bin dirs (`~/.local/bin`, `$CARGO_HOME/bin`). `None` ⇒ not installed.
-fn locate_corecruxctl() -> Option<PathBuf> {
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let p = dir.join("corecruxctl");
-            if p.is_file() {
-                return Some(p);
+/// Install / refresh the Claude Code hooks into the user settings.
+/// Best-effort and non-fatal.
+pub fn ensure_hooks(mode: Mode) {
+    if matches!(mode, Mode::Prompt) && !crate::interactive::confirm_install_hooks() {
+        println!("Skipped Claude Code hooks — run `crux-config-wizard hooks install --user` when you're ready.");
+        return;
+    }
+
+    println!("\nInstalling Claude Code hooks…");
+    match hooks_install::install(true, None) {
+        Ok(summary) => {
+            println!("{summary}");
+            // The endpoint the hooks resolve at runtime is corecruxctl's to
+            // configure; say so once here rather than failing for its absence.
+            if !endpoint_configured() {
+                println!(
+                    "  note: no daemon endpoint configured yet — hooks fall back to the local default. \
+                     Set one with `corecruxctl login --url <url>` (or `corecruxctl hooks install --endpoint <url>`)."
+                );
             }
         }
+        Err(e) => eprintln!(
+            "could not install Claude Code hooks ({e}); run `crux-config-wizard hooks install --user` manually."
+        ),
     }
-    let candidates = [
-        std::env::var_os("HOME").map(|h| Path::new(&h).join(".local").join("bin")),
-        std::env::var_os("CARGO_HOME").map(|c| Path::new(&c).join("bin")),
-    ];
-    for base in candidates.into_iter().flatten() {
-        let p = base.join("corecruxctl");
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    None
 }
 
-/// Install / refresh the Claude Code hooks via `corecruxctl hooks install --user`.
-/// Best-effort and non-fatal — prints a manual-fallback note on any problem.
-pub fn ensure_hooks(mode: Mode) {
-    let Some(ctl) = locate_corecruxctl() else {
-        println!(
-            "\nClaude Code hooks: `corecruxctl` not found on PATH — run \
-             `corecruxctl hooks install` to enable the banner / observe / cost / \
-             scratchpad-survival hooks."
-        );
-        return;
+/// Has an operator written a daemon endpoint to `~/.config/cuecrux/env`?
+/// Read-only probe — we never write that file from here (it is `corecruxctl
+/// login`'s, and it holds the bearer token).
+fn endpoint_configured() -> bool {
+    let Some(home) = std::env::var_os("HOME") else {
+        return false;
     };
-
-    if matches!(mode, Mode::Prompt) && !crate::interactive::confirm_install_hooks() {
-        println!("Skipped Claude Code hooks — run `corecruxctl hooks install` when you're ready.");
-        return;
-    }
-
-    println!("\nInstalling Claude Code hooks via corecruxctl…");
-    match Command::new(&ctl).args(["hooks", "install", "--user"]).status() {
-        Ok(status) if status.success() => {}
-        Ok(status) => eprintln!(
-            "corecruxctl hooks install exited with {status}; run `{} hooks install` manually.",
-            ctl.display()
-        ),
-        Err(e) => eprintln!(
-            "could not run corecruxctl ({e}); run `{} hooks install` manually.",
-            ctl.display()
-        ),
-    }
+    let env = PathBuf::from(home).join(".config").join("cuecrux").join("env");
+    std::fs::read_to_string(env).is_ok_and(|s| {
+        s.lines()
+            .any(|l| l.trim_start().starts_with("CRUX_HTTP_URL") || l.trim_start().starts_with("CORECRUXD_URL"))
+    })
 }

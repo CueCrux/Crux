@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Retrieval routes — `/v1/query/text-search`, `/text-search/expand`, `/graph-expand`, `/time-range`.
 //!
@@ -500,10 +500,11 @@ pub(super) async fn post_query_text_search(
         tenant_filter,
         &corecrux_retrieval::bm25::Bm25Params::default(),
         body.min_score,
+        tenant_filter.and_then(|h| index.forgotten_watermark(h)),
     );
 
     // Dense re-rank (buyer-fit M3.2): when the node has an embedder (the
-    // pure-Rust LocalHashEmbedder by default) AND this corpus has `.ccxv`
+    // pure-Rust LocalHashEmbedder by default) AND this corpus has `.ccxe`
     // companions, embed the query and re-rank the BM25 candidate pool by a fused
     // score = 0.7*bm25_norm + 0.3*cosine. Absent an embedder or vectors the lane
     // stays inert — bit-identical BM25. BM25 coverage reporting is preserved.
@@ -555,6 +556,7 @@ pub(super) async fn post_query_text_search(
                 &state.data_dir,
                 query_embedding,
                 &expected_fingerprint.hash,
+                semantic_profile.as_ref().map(|profile| profile.model.as_str()),
             ) {
                 Ok(provider) => {
                     state.fact_store.read().await.clear_semantic_profile_mismatch();
@@ -574,6 +576,7 @@ pub(super) async fn post_query_text_search(
                 embedding_fingerprint
                     .as_ref()
                     .map(|fingerprint| fingerprint.hash.as_str()),
+                semantic_profile.as_ref().map(|profile| profile.model.as_str()),
             )
         }
     } else {
@@ -650,6 +653,12 @@ pub(super) async fn post_query_text_search(
         result_id: String,
         rank: usize,
         segment_index: usize,
+        /// The sealed segment's own sequence — the value `/v1/local/ingest`
+        /// returned as `segment_seq` in its receipt. `segment_index` is a
+        /// position in the loaded-reader list and is NOT the same number, so a
+        /// consumer joining a receipt to a result joins on this
+        /// (ExecPlan `corecrux-ingest-dense-silent-failure-2026-08-07`, B2).
+        segment_seq: Option<u64>,
         doc_id: u32,
         score: f32,
         source_label: &'static str,
@@ -667,6 +676,7 @@ pub(super) async fn post_query_text_search(
             result_id: format!("{}:{}", h.segment_index, h.doc_id),
             rank: idx + 1,
             segment_index: h.segment_index,
+            segment_seq: readers.get(h.segment_index).map(|r| r.header.segment_seq),
             doc_id: h.doc_id,
             score: h.score,
             source_label: "local_tenant_index",
@@ -678,6 +688,11 @@ pub(super) async fn post_query_text_search(
         })
         .collect();
 
+    // Surface 3 of 4: provenance of the segments behind THIS answer, not of the
+    // corpus. Always present, clean or not — an absent block cannot be told
+    // apart from a daemon too old to check.
+    let provenance = index.provenance_tally_for_reader_indices(results.iter().map(|h| h.segment_index));
+
     let mut response = serde_json::json!({
         "results": result_items,
         "coverage": {
@@ -687,6 +702,7 @@ pub(super) async fn post_query_text_search(
         },
         "meta": {
             "backend": "corecrux-v5-bm25",
+            "provenance": provenance,
             "took_ms": took_ms,
             "segments_searched": readers.len(),
             "total_docs": index.total_docs(),
@@ -880,6 +896,9 @@ pub(super) async fn post_query_text_search_expand(
 
         chunks.push(serde_json::json!({
             "segment_index": rid.segment_index,
+            // B2: the ingest receipt's `segment_seq`, so an expand result joins
+            // back to the ingest that produced it without a positional guess.
+            "segment_seq": reader.header.segment_seq,
             "doc_id": rid.doc_id,
             "source_label": "local_tenant_index",
             "score_space": SCORE_SPACE_BM25_LEXICAL,
@@ -1060,6 +1079,84 @@ mod query_tests {
             .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
         std::env::remove_var("CORECRUXD_QUERY_TIME_RANGE");
+    }
+
+    /// B2: every result carries the `segment_seq` its ingest receipt returned,
+    /// so a consumer joins on that value instead of guessing at the positional
+    /// `segment_index`. Two separate ingests → seqs 1 and 2 at indices 0 and 1.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn text_search_results_carry_the_ingest_segment_seq() {
+        std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
+        let state = enabled();
+
+        let mut sealed_seqs = Vec::new();
+        for (doc, text) in [("d1", "peregrine falcon dives"), ("d2", "peregrine falcon nests")] {
+            let documents = vec![crate::local_ingest::ProseDocument {
+                doc_id: doc.to_string(),
+                chunks: vec![crate::local_ingest::ProseChunk {
+                    chunk_id: format!("{doc}::0"),
+                    text: text.to_string(),
+                    dense_vector: None,
+                }],
+            }];
+            let summary = crate::local_ingest::seal_prose_documents(
+                &state.data_dir,
+                0,
+                1,
+                "t1",
+                "corpus",
+                "2026-08-07T00:00:00Z",
+                &documents,
+                None,
+            )
+            .unwrap();
+            sealed_seqs.push(summary.segment_seq);
+        }
+        state
+            .retrieval_index
+            .write()
+            .await
+            .scan_and_load(&state.data_dir.join("shards").join("shard-0000").join("segments"))
+            .unwrap();
+
+        let response = post_query_text_search(
+            State(state),
+            HeaderMap::new(),
+            Json(TextSearchBody {
+                tenant_id: "t1".to_string(),
+                query: "peregrine falcon".to_string(),
+                limit: 10,
+                token_budget: None,
+                min_score: None,
+                mode: None,
+                include_receipt: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let results = json["results"].as_array().expect("results");
+        assert_eq!(results.len(), 2, "both sealed chunks retrieved");
+
+        let mut seen = std::collections::HashSet::new();
+        for hit in results {
+            let seq = hit["segment_seq"].as_u64().expect("segment_seq present on every hit");
+            assert!(
+                sealed_seqs.contains(&seq),
+                "segment_seq {seq} must be a value an ingest receipt returned (receipts: {sealed_seqs:?})"
+            );
+            assert!(seen.insert(seq), "each hit's segment must resolve distinctly");
+            // Deliberately NOT asserting `seq == segment_index + 1`. It happens
+            // to hold on this fixture — one tenant, two segments, nothing else
+            // loaded — and asserting it would enshrine an offset that is a
+            // position in the daemon-wide reader list: measured at 1, then 18,
+            // then 17 on one host within hours as unrelated segments came and
+            // went. The join key is the contract; the offset is not.
+            assert!(hit["segment_index"].is_u64(), "segment_index still reported");
+        }
     }
 
     #[tokio::test]

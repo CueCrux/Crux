@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! G20 daemon wiring — `GET /v1/quota` + per-surface request-quota
 //! middleware over [`crux_router::quota::QuotaLedger`].
@@ -70,6 +70,7 @@ fn hosted_surface_for(path: &str, prefixes: &[String]) -> Option<String> {
 /// `CORECRUXD_QUOTA` is off; `LocalCompute` requests are admitted with no
 /// accounting; hosted requests draw one token and carry the quota headers
 /// on the response, or are refused with `429` + `Retry-After`.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn quota_middleware(
     State(state): State<AppState>,
     req: Request<axum::body::Body>,
@@ -131,6 +132,7 @@ pub(super) async fn quota_middleware(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_quota(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !state.quota_enabled {
         return problem_response(

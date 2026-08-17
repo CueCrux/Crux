@@ -1,6 +1,6 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 //
 // Unified Shell Console v2 — service worker (ExecPlan unified-shell-console-2026-07-03, M5).
 // No-build, vanilla service worker. It gives the console an installable, offline-
@@ -19,7 +19,7 @@
 // build step to inject a content hash, so the discipline is manual — bump BOTH
 // this line and shell.html's copy whenever any app-shell asset changes, and the
 // old cache is dropped on the next activate.
-const SW_REV = 'ushell-v2-r13';
+const SW_REV = 'ushell-v2-r16';
 const CACHE_NAME = 'crux-console-v2::' + SW_REV;
 
 // The EXACT app-shell precache set. Cache-first with background refresh. Keep this

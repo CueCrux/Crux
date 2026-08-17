@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Prometheus metrics registry + helpers — emits `corecruxd_*` counters and histograms.
 
@@ -62,6 +62,7 @@ pub struct Metrics {
     append_latency_seconds: HistogramVec,
     stream_read_latency_seconds: HistogramVec,
     read_retry_total: CounterVec,
+    local_ingest_seal_failed_total: Counter,
     store_lock_wait_seconds: HistogramVec,
     store_lock_hold_seconds: HistogramVec,
     store_service_seconds: HistogramVec,
@@ -630,6 +631,18 @@ impl Metrics {
         registry
             .register(Box::new(read_retry_total.clone()))
             .expect("register corecrux_read_retry_total");
+
+        // The write path's alertable signal. Until 2026-08-08 a seal failure was
+        // a log line and an HTTP 500 and nothing else, so a total ingest outage
+        // was invisible to monitoring for 38 hours.
+        let local_ingest_seal_failed_total = Counter::new(
+            "corecrux_local_ingest_seal_failed_total",
+            "Local ingest requests that failed at seal",
+        )
+        .expect("corecrux_local_ingest_seal_failed_total counter");
+        registry
+            .register(Box::new(local_ingest_seal_failed_total.clone()))
+            .expect("register corecrux_local_ingest_seal_failed_total");
 
         let store_lock_wait_seconds = HistogramVec::new(
             prometheus::HistogramOpts::new(
@@ -1494,6 +1507,7 @@ impl Metrics {
             append_latency_seconds,
             stream_read_latency_seconds,
             read_retry_total,
+            local_ingest_seal_failed_total,
             store_lock_wait_seconds,
             store_lock_hold_seconds,
             store_service_seconds,
@@ -1806,6 +1820,14 @@ impl Metrics {
 
     pub fn inc_read_retry(&self, op: &str, reason: &str, outcome: &str) {
         self.read_retry_total.with_label_values(&[op, reason, outcome]).inc();
+    }
+
+    pub fn inc_local_ingest_seal_failed(&self) {
+        self.local_ingest_seal_failed_total.inc();
+    }
+
+    pub fn local_ingest_seal_failed_total(&self) -> u64 {
+        self.local_ingest_seal_failed_total.get().max(0.0).round() as u64
     }
 
     pub fn read_retry_failed_total(&self, reason: &str) -> u64 {
@@ -2425,5 +2447,596 @@ mod tests {
         m.inc_read_retry("tail", "corruption", "failed");
         let count = m.read_retry_failed_total("corruption");
         assert_eq!(count, 1);
+    }
+
+    // ── registry / render plumbing ────────────────────────────────────────
+
+    #[test]
+    fn registry_is_shared_and_gathers_externally_registered_metrics() {
+        let m = test_metrics();
+        let registry = m.registry();
+        let external = prometheus::Gauge::new("external_side_channel_gauge", "external").unwrap();
+        registry.register(Box::new(external.clone())).unwrap();
+        external.set(7.0);
+        // A metric registered through `registry()` must show up in `render()`.
+        assert!(m.render().unwrap().contains("external_side_channel_gauge 7"));
+    }
+
+    #[test]
+    fn render_of_a_fresh_registry_is_valid_utf8_text_exposition() {
+        let m = test_metrics();
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains("# TYPE corecrux_build_info gauge"));
+    }
+
+    // ── shard state (exclusive one-hot gauge) ─────────────────────────────
+
+    #[test]
+    fn set_shard_state_is_one_hot_across_all_states() {
+        let m = test_metrics();
+        m.set_shard_state("shard-0001", "draining");
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains(r#"corecrux_shard_state{shardId="shard-0001",state="draining"} 1"#));
+        assert!(rendered.contains(r#"corecrux_shard_state{shardId="shard-0001",state="active"} 0"#));
+        assert!(rendered.contains(r#"corecrux_shard_state{shardId="shard-0001",state="retired"} 0"#));
+    }
+
+    #[test]
+    fn set_shard_state_with_unknown_state_zeroes_every_known_state() {
+        let m = test_metrics();
+        // Absent-signal guard: an unrecognised state must NOT light up any gauge.
+        m.set_shard_state("shard-0002", "not-a-real-state");
+        let rendered = m.render().unwrap();
+        for state in ["active", "draining", "retired"] {
+            assert!(
+                rendered.contains(&format!(
+                    r#"corecrux_shard_state{{shardId="shard-0002",state="{state}"}} 0"#
+                )),
+                "expected {state} to be 0 for an unknown state"
+            );
+        }
+    }
+
+    // ── HTTP ingress ──────────────────────────────────────────────────────
+
+    #[test]
+    fn http_inflight_gauge_clone_shares_the_registered_atomic() {
+        let m = test_metrics();
+        let gauge = m.http_inflight_gauge();
+        gauge.inc();
+        gauge.inc();
+        // Clones of a prometheus Gauge share one atomic — the clone must move
+        // the value the registry renders.
+        assert!(m.render().unwrap().contains("corecrux_http_inflight 2"));
+        gauge.dec();
+        assert!(m.render().unwrap().contains("corecrux_http_inflight 1"));
+    }
+
+    #[test]
+    fn inc_http_rate_limited_separates_key_kinds() {
+        let m = test_metrics();
+        m.inc_http_rate_limited("passport");
+        m.inc_http_rate_limited("ip");
+        m.inc_http_rate_limited("ip");
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains(r#"corecrux_http_rate_limited_total{key_kind="passport"} 1"#));
+        assert!(rendered.contains(r#"corecrux_http_rate_limited_total{key_kind="ip"} 2"#));
+    }
+
+    // ── clamping + degenerate inputs ──────────────────────────────────────
+
+    #[test]
+    fn set_throttle_ratio_clamps_out_of_range_inputs() {
+        let m = test_metrics();
+        m.set_throttle_ratio(9.5);
+        assert!(m.render().unwrap().contains("corecrux_throttle_ratio 1"));
+        m.set_throttle_ratio(-3.0);
+        assert!(m.render().unwrap().contains("corecrux_throttle_ratio 0"));
+    }
+
+    #[test]
+    fn set_data_dir_space_zero_total_reports_zero_ratio_not_nan() {
+        let m = test_metrics();
+        // Division guard: total=0 must not render NaN into the exposition.
+        m.set_data_dir_space(0, 0);
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains("corecrux_data_dir_free_ratio 0"));
+        assert!(!rendered.contains("corecrux_data_dir_free_ratio NaN"));
+    }
+
+    #[test]
+    fn set_data_dir_space_clamps_free_above_total() {
+        let m = test_metrics();
+        m.set_data_dir_space(100, 400);
+        assert!(m.render().unwrap().contains("corecrux_data_dir_free_ratio 1"));
+    }
+
+    #[test]
+    fn set_dir_dead_extent_ratio_clamps() {
+        let m = test_metrics();
+        m.set_dir_dead_extent_ratio("shard-0001", 4.2);
+        m.set_dir_dead_extent_ratio("shard-0002", -1.0);
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains(r#"corecrux_dir_dead_extent_ratio{shard="shard-0001"} 1"#));
+        assert!(rendered.contains(r#"corecrux_dir_dead_extent_ratio{shard="shard-0002"} 0"#));
+    }
+
+    #[test]
+    fn write_confirmation_sign_duration_rejects_negative_and_non_finite() {
+        let m = test_metrics();
+        m.observe_write_confirmation_sign_duration_ms(5.0);
+        m.observe_write_confirmation_sign_duration_ms(-1.0);
+        m.observe_write_confirmation_sign_duration_ms(f64::NAN);
+        m.observe_write_confirmation_sign_duration_ms(f64::INFINITY);
+        let rendered = m.render().unwrap();
+        // Only the single valid observation is recorded.
+        assert!(
+            rendered.contains("corecrux_write_confirmation_sign_duration_ms_count 1"),
+            "expected exactly one recorded observation, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn write_confirmation_sign_duration_accepts_zero() {
+        let m = test_metrics();
+        m.observe_write_confirmation_sign_duration_ms(0.0);
+        assert!(m
+            .render()
+            .unwrap()
+            .contains("corecrux_write_confirmation_sign_duration_ms_count 1"));
+    }
+
+    #[test]
+    fn write_confirmation_labels_signed_and_unsigned_separately() {
+        let m = test_metrics();
+        m.inc_write_confirmation(true);
+        m.inc_write_confirmation(false);
+        m.inc_write_confirmation(false);
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains(r#"corecrux_write_confirmations_total{signed="true"} 1"#));
+        assert!(rendered.contains(r#"corecrux_write_confirmations_total{signed="false"} 2"#));
+    }
+
+    #[test]
+    fn set_write_confirmation_unsigned_queue_depth_records_value() {
+        let m = test_metrics();
+        m.set_write_confirmation_unsigned_queue_depth(17);
+        assert!(m
+            .render()
+            .unwrap()
+            .contains("corecrux_write_confirmation_unsigned_queue_depth 17"));
+    }
+
+    // ── operator / valve counters ─────────────────────────────────────────
+
+    #[test]
+    fn throttle_reject_brake_and_write_reject_counters() {
+        let m = test_metrics();
+        m.inc_tenant_throttle_reject("hash-abc");
+        m.inc_emergency_brake("admin_http");
+        m.inc_write_reject("read_only");
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains(r#"corecrux_tenant_throttle_rejected_total{tenant_id_hash="hash-abc"} 1"#));
+        assert!(rendered.contains(r#"corecrux_emergency_brake_total{source="admin_http"} 1"#));
+        assert!(rendered.contains(r#"corecrux_write_rejects_total{reason="read_only"} 1"#));
+    }
+
+    #[test]
+    fn set_backpressure_active_toggles_off_again() {
+        let m = test_metrics();
+        m.set_backpressure_active(true);
+        assert!(m.render().unwrap().contains("corecrux_backpressure_active_gauge 1"));
+        m.set_backpressure_active(false);
+        assert!(m.render().unwrap().contains("corecrux_backpressure_active_gauge 0"));
+    }
+
+    // ── integrity / scrub ─────────────────────────────────────────────────
+
+    #[test]
+    fn replay_and_corruption_counters() {
+        let m = test_metrics();
+        m.inc_replay_total("ok");
+        m.inc_replay_mismatch("payload_drift");
+        m.inc_segment_corrupt("crc");
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains(r#"corecrux_replay_total{result="ok"} 1"#));
+        assert!(rendered.contains(r#"corecrux_replay_mismatch_total{drift_class="payload_drift"} 1"#));
+        assert!(rendered.contains(r#"corecrux_segment_corrupt_total{reason="crc"} 1"#));
+    }
+
+    #[test]
+    fn verify_store_and_scrub_histograms() {
+        let m = test_metrics();
+        m.observe_verify_store_seconds(1.25);
+        m.observe_segment_scrub_seconds(0.5);
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains("corecrux_verify_store_seconds_count 1"));
+        assert!(rendered.contains("corecrux_segment_scrub_seconds_count 1"));
+    }
+
+    // ── checkpoints + tombstones ──────────────────────────────────────────
+
+    #[test]
+    fn checkpoint_and_tombstone_metrics() {
+        let m = test_metrics();
+        m.inc_checkpoints_installed("shard-0001", "receipts");
+        m.set_checkpoint_min_live_seq("shard-0001", "receipts", 900);
+        m.inc_stream_tombstones("shard-0001");
+        m.inc_stream_tombstone_rejects("shard-0001");
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains("corecrux_checkpoints_installed_total"));
+        assert!(rendered.contains(r#"corecrux_checkpoint_min_live_seq{shard="shard-0001",stream_type="receipts"} 900"#));
+        assert!(rendered.contains(r#"corecrux_stream_tombstones_total{shard="shard-0001"} 1"#));
+        assert!(rendered.contains(r#"corecrux_stream_tombstone_rejects_total{shard="shard-0001"} 1"#));
+    }
+
+    // ── storage latency / lane instrumentation ────────────────────────────
+
+    #[test]
+    fn stream_read_and_store_lock_histograms() {
+        let m = test_metrics();
+        m.observe_stream_read_latency_seconds("shard-0001", "tail", 0.02);
+        m.observe_store_lock_wait_seconds("append", 0.001);
+        m.observe_store_lock_hold_seconds("append", 0.002);
+        m.observe_store_service_seconds("append", 0.003);
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains("corecrux_stream_read_latency_seconds_count"));
+        assert!(rendered.contains("corecrux_store_lock_wait_seconds_count"));
+        assert!(rendered.contains("corecrux_store_lock_hold_seconds_count"));
+        assert!(rendered.contains("corecrux_store_service_seconds_count"));
+    }
+
+    #[test]
+    fn append_lane_gauges_and_buckets() {
+        let m = test_metrics();
+        m.set_append_lane_waiters(3);
+        m.set_append_lane_waiters_peak(9);
+        m.observe_append_lane_queue_depth(12);
+        m.inc_append_lane_selected_bucket(2);
+        m.observe_append_lane_wait_seconds_bucket(2, 0.05);
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains("corecrux_append_lane_waiters 3"));
+        assert!(rendered.contains("corecrux_append_lane_waiters_peak 9"));
+        assert!(rendered.contains("corecrux_append_lane_queue_depth_count 1"));
+        assert!(rendered.contains(r#"corecrux_append_lane_selected_total{bucket="2"} 1"#));
+        assert!(rendered.contains(r#"corecrux_append_lane_wait_seconds_by_bucket_count{bucket="2"} 1"#));
+    }
+
+    #[test]
+    fn append_fence_histograms() {
+        let m = test_metrics();
+        m.observe_append_fence_wait_seconds("shard-0001", 0.004);
+        m.observe_append_fence_fsync_seconds("shard-0001", 0.008);
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains("corecrux_append_fence_wait_seconds_count"));
+        assert!(rendered.contains("corecrux_append_fence_fsync_seconds_count"));
+    }
+
+    #[test]
+    fn storage_stage_and_tail_counters() {
+        let m = test_metrics();
+        m.observe_storage_tail_stage_seconds("decode", 0.001);
+        m.observe_storage_append_stage_seconds("fsync", 0.002);
+        m.add_storage_tail_bytes("hot", 4096);
+        m.add_storage_tail_items("hot", 12);
+        m.inc_storage_tail_path("cache", "hit");
+        m.add_storage_head_frames_scanned(64);
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains("corecrux_storage_tail_stage_seconds_count"));
+        assert!(rendered.contains("corecrux_storage_append_stage_seconds_count"));
+        assert!(rendered.contains(r#"corecrux_storage_tail_bytes_total{kind="hot"} 4096"#));
+        assert!(rendered.contains(r#"corecrux_storage_tail_items_total{kind="hot"} 12"#));
+        assert!(rendered.contains(r#"corecrux_storage_tail_path_total{outcome="hit",path="cache"} 1"#));
+        assert!(rendered.contains("corecrux_storage_head_frames_scanned_total 64"));
+    }
+
+    #[test]
+    fn read_amplification_gauges() {
+        let m = test_metrics();
+        m.set_read_amplification_p50("shard-0001", 1.5);
+        m.set_read_amplification_p95("shard-0001", 4.5);
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains(r#"corecrux_read_amplification_p50{shard="shard-0001"} 1.5"#));
+        assert!(rendered.contains(r#"corecrux_read_amplification_p95{shard="shard-0001"} 4.5"#));
+    }
+
+    #[test]
+    fn kernel_launch_counter() {
+        let m = test_metrics();
+        m.inc_kernel_launch("bm25", "ok");
+        assert!(m
+            .render()
+            .unwrap()
+            .contains(r#"corecrux_kernel_launch_total{kernel="bm25",result="ok"} 1"#));
+    }
+
+    // ── grpc / replay streaming ───────────────────────────────────────────
+
+    #[test]
+    fn grpc_and_replay_stream_metrics() {
+        let m = test_metrics();
+        m.inc_grpc_messages_sent("Replay", 5);
+        m.observe_grpc_send_seconds("Replay", 0.01);
+        m.observe_grpc_send_blocked_seconds("Replay", 0.02);
+        m.add_replay_events("Replay", 100);
+        m.add_replay_bytes("Replay", 2048);
+        m.observe_replay_build_response_seconds("Replay", 0.03);
+        m.observe_replay_encode_seconds("Replay", 0.04);
+        m.observe_rpc_total_seconds("Replay", 0.05);
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains(r#"corecrux_grpc_messages_sent_total{rpc="Replay"} 5"#));
+        assert!(rendered.contains("corecrux_grpc_send_seconds_count"));
+        assert!(rendered.contains("corecrux_grpc_send_blocked_seconds_count"));
+        assert!(rendered.contains(r#"corecrux_replay_events_total{rpc="Replay"} 100"#));
+        assert!(rendered.contains(r#"corecrux_replay_bytes_total{rpc="Replay"} 2048"#));
+        assert!(rendered.contains("corecrux_replay_build_response_seconds_count"));
+        assert!(rendered.contains("corecrux_replay_encode_seconds_count"));
+        assert!(rendered.contains("corecrux_rpc_total_seconds_count"));
+    }
+
+    // ── routing ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn routing_lookup_metrics() {
+        let m = test_metrics();
+        m.inc_routing_lookup("append", "hit");
+        m.observe_routing_lookup_seconds("append", 0.0001);
+        m.inc_shard_request("shard-0001", "append");
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains(r#"corecrux_routing_lookup_total{op="append",outcome="hit"} 1"#));
+        assert!(rendered.contains("corecrux_routing_lookup_seconds_count"));
+        assert!(rendered.contains(r#"corecrux_shard_requests_total{op="append",shardId="shard-0001"} 1"#));
+    }
+
+    // ── replication derived gauges ────────────────────────────────────────
+
+    #[test]
+    fn replicated_commit_acks_derives_deficit_and_saturates_at_zero() {
+        let m = test_metrics();
+        m.set_replicated_commit_acks("shard-0001", 3, 1);
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains(r#"corecrux_replicated_commit_required_acks{shardId="shard-0001"} 3"#));
+        assert!(rendered.contains(r#"corecrux_replicated_commit_actual_acks{shardId="shard-0001"} 1"#));
+        assert!(rendered.contains(r#"corecrux_replicated_commit_ack_deficit{shardId="shard-0001"} 2"#));
+
+        // More acks than required must not underflow into a huge usize.
+        m.set_replicated_commit_acks("shard-0002", 1, 4);
+        assert!(m
+            .render()
+            .unwrap()
+            .contains(r#"corecrux_replicated_commit_ack_deficit{shardId="shard-0002"} 0"#));
+    }
+
+    #[test]
+    fn replication_follower_targets_drives_topology_ok() {
+        let m = test_metrics();
+        m.set_replication_follower_targets("shard-0001", 2);
+        m.set_replication_follower_targets("shard-0002", 0);
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains(r#"corecrux_replication_follower_targets{shardId="shard-0001"} 2"#));
+        assert!(rendered.contains(r#"corecrux_replication_topology_ok{shardId="shard-0001"} 1"#));
+        // Zero followers = topology NOT ok. Absent-signal guard.
+        assert!(rendered.contains(r#"corecrux_replication_topology_ok{shardId="shard-0002"} 0"#));
+    }
+
+    #[test]
+    fn replication_lag_saturates_when_follower_is_ahead() {
+        let m = test_metrics();
+        m.set_replication_lag_segments("shard-0001", 5, 12);
+        assert!(m
+            .render()
+            .unwrap()
+            .contains(r#"corecrux_replication_lag_segments{shardId="shard-0001"} 0"#));
+    }
+
+    // ── projections ───────────────────────────────────────────────────────
+
+    #[test]
+    fn observe_projection_tick_fans_out_to_every_projection() {
+        let m = test_metrics();
+        m.observe_projection_tick("shard-0001", 10, 0.25, 99, 7, 512, 1, 2, 3, 4);
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains(r#"corecrux_projections_commit_id{shard="shard-0001"} 99"#));
+        assert!(rendered.contains(r#"corecrux_projections_tick_frames_total{shard="shard-0001"} 10"#));
+        assert!(rendered.contains("corecrux_projections_tick_seconds_count"));
+        for (projection, rows) in [
+            ("artifact_living_state", 1),
+            ("artifact_relations", 2),
+            ("pressure_events", 3),
+            ("artifact_dependents", 4),
+        ] {
+            assert!(
+                rendered.contains(&format!(
+                    r#"corecrux_projections_row_count{{projection="{projection}",shard="shard-0001"}} {rows}"#
+                )),
+                "missing row count for {projection}"
+            );
+            assert!(rendered.contains(&format!(
+                r#"corecrux_projections_cursor_segment_seq{{projection="{projection}",shard="shard-0001"}} 7"#
+            )));
+            assert!(rendered.contains(&format!(
+                r#"corecrux_projections_cursor_offset{{projection="{projection}",shard="shard-0001"}} 512"#
+            )));
+        }
+    }
+
+    #[test]
+    fn observe_projection_tick_floors_negative_duration_at_zero() {
+        let m = test_metrics();
+        m.observe_projection_tick("shard-0001", 0, -5.0, 1, 0, 0, 0, 0, 0, 0);
+        assert!(m.render().unwrap().contains("corecrux_projections_tick_seconds_count"));
+    }
+
+    #[test]
+    fn shard_open_and_lock_contention_counters() {
+        let m = test_metrics();
+        m.inc_shard_open_attempts("append");
+        m.inc_lock_contention("append");
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains(r#"corecrux_shard_open_attempts_total{caller="append"} 1"#));
+        assert!(rendered.contains(r#"corecrux_lock_contention_total{caller="append"} 1"#));
+    }
+
+    #[test]
+    fn projection_snapshot_valid_can_go_false() {
+        let m = test_metrics();
+        m.set_projection_snapshot_valid("artifact_living_state", false);
+        assert!(m
+            .render()
+            .unwrap()
+            .contains(r#"corecrux_projection_snapshot_valid{projection="artifact_living_state"} 0"#));
+    }
+
+    // ── knowledge authority (one-hot state machines) ──────────────────────
+
+    fn knowledge_state(
+        mode: KnowledgeAuthorityModeV1,
+        stage: KnowledgeRolloutStageV1,
+        outcome: Option<KnowledgeParityOutcomeV1>,
+        rollback: bool,
+    ) -> KnowledgeAuthorityV1 {
+        KnowledgeAuthorityV1 {
+            mode,
+            rollout_stage: stage,
+            last_parity_outcome: outcome,
+            rollback_triggered: rollback,
+            ..KnowledgeAuthorityV1::default()
+        }
+    }
+
+    #[test]
+    fn sync_knowledge_authority_is_one_hot_for_mode_and_stage() {
+        let m = test_metrics();
+        m.sync_knowledge_authority(&knowledge_state(
+            KnowledgeAuthorityModeV1::DualWrite,
+            KnowledgeRolloutStageV1::InternalAuthority,
+            None,
+            false,
+        ));
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains(&format!(
+            r#"corecrux_knowledge_authority_mode{{mode="{}"}} 1"#,
+            KnowledgeAuthorityModeV1::DualWrite.as_str()
+        )));
+        assert!(rendered.contains(&format!(
+            r#"corecrux_knowledge_authority_mode{{mode="{}"}} 0"#,
+            KnowledgeAuthorityModeV1::Authoritative.as_str()
+        )));
+        assert!(rendered.contains(&format!(
+            r#"corecrux_knowledge_rollout_stage{{stage="{}"}} 1"#,
+            KnowledgeRolloutStageV1::InternalAuthority.as_str()
+        )));
+        assert!(rendered.contains(&format!(
+            r#"corecrux_knowledge_rollout_stage{{stage="{}"}} 0"#,
+            KnowledgeRolloutStageV1::FullProductionAuthority.as_str()
+        )));
+        assert!(rendered.contains("corecrux_knowledge_rollback_triggered 0"));
+    }
+
+    #[test]
+    fn sync_knowledge_authority_surfaces_rollback_and_parity_outcome() {
+        let m = test_metrics();
+        m.sync_knowledge_authority(&knowledge_state(
+            KnowledgeAuthorityModeV1::Authoritative,
+            KnowledgeRolloutStageV1::FullProductionAuthority,
+            Some(KnowledgeParityOutcomeV1 {
+                status: KnowledgeParityStatusV1::Fail,
+                checked_at_unix_ms: 1,
+                mismatch_count: 12,
+                cursor_missing_count: 3,
+                pass_ratio_bps: 8_500,
+                projection_lag_ms: 250,
+                detail: Some("mismatch".to_string()),
+            }),
+            true,
+        ));
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains("corecrux_knowledge_rollback_triggered 1"));
+        assert!(rendered.contains(&format!(
+            r#"corecrux_knowledge_parity_status{{status="{}"}} 1"#,
+            KnowledgeParityStatusV1::Fail.as_str()
+        )));
+        assert!(rendered.contains("corecrux_knowledge_parity_mismatch_count 12"));
+        assert!(rendered.contains("corecrux_knowledge_parity_cursor_missing_count 3"));
+        assert!(rendered.contains("corecrux_knowledge_parity_pass_ratio_bps 8500"));
+        assert!(rendered.contains("corecrux_knowledge_parity_projection_lag_ms 250"));
+    }
+
+    #[test]
+    fn parity_outcome_none_reports_unknown_and_zeroes_not_stale_values() {
+        let m = test_metrics();
+        m.set_knowledge_parity_outcome(Some(&KnowledgeParityOutcomeV1 {
+            status: KnowledgeParityStatusV1::Pass,
+            checked_at_unix_ms: 1,
+            mismatch_count: 44,
+            cursor_missing_count: 5,
+            pass_ratio_bps: 10_000,
+            projection_lag_ms: 99,
+            detail: None,
+        }));
+        // Absent-signal guard: clearing the outcome must reset the counters,
+        // not leave the previous (passing) numbers standing.
+        m.set_knowledge_parity_outcome(None);
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains(&format!(
+            r#"corecrux_knowledge_parity_status{{status="{}"}} 1"#,
+            KnowledgeParityStatusV1::Unknown.as_str()
+        )));
+        assert!(rendered.contains(&format!(
+            r#"corecrux_knowledge_parity_status{{status="{}"}} 0"#,
+            KnowledgeParityStatusV1::Pass.as_str()
+        )));
+        assert!(rendered.contains("corecrux_knowledge_parity_mismatch_count 0"));
+        assert!(rendered.contains("corecrux_knowledge_parity_cursor_missing_count 0"));
+        assert!(rendered.contains("corecrux_knowledge_parity_pass_ratio_bps 0"));
+        assert!(rendered.contains("corecrux_knowledge_parity_projection_lag_ms 0"));
+    }
+
+    // ── witness + seal ────────────────────────────────────────────────────
+
+    #[test]
+    fn set_witness_unwitnessed_heads_records_value() {
+        let m = test_metrics();
+        m.set_witness_unwitnessed_heads(4);
+        assert!(m.render().unwrap().contains("crux_witness_unwitnessed_heads 4"));
+    }
+
+    #[test]
+    fn observe_seal_duration_floors_negative_input() {
+        let m = test_metrics();
+        m.observe_seal_duration("seal", -1.0);
+        assert!(m.render().unwrap().contains("corecrux_seal_duration_seconds_count"));
+    }
+
+    // ── query histograms with degenerate inputs ───────────────────────────
+
+    #[test]
+    fn query_histograms_floor_negative_durations() {
+        let m = test_metrics();
+        m.observe_graph_expand(-1.0, 0);
+        m.observe_time_range(-1.0, 0);
+        let rendered = m.render().unwrap();
+        assert!(rendered.contains("corecrux_query_graph_expand_duration_seconds_sum 0"));
+        assert!(rendered.contains("corecrux_query_time_range_duration_seconds_sum 0"));
+    }
+
+    // ── read_retry rollup ─────────────────────────────────────────────────
+
+    #[test]
+    fn read_retry_failed_total_sums_tail_and_range_only() {
+        let m = test_metrics();
+        m.inc_read_retry("tail", "corruption", "failed");
+        m.inc_read_retry("range", "corruption", "failed");
+        // "other" op and non-failed outcomes must NOT be counted.
+        m.inc_read_retry("other", "corruption", "failed");
+        m.inc_read_retry("tail", "corruption", "recovered");
+        assert_eq!(m.read_retry_failed_total("corruption"), 2);
+    }
+
+    #[test]
+    fn read_retry_failed_total_is_scoped_per_reason() {
+        let m = test_metrics();
+        m.inc_read_retry("tail", "corruption", "failed");
+        assert_eq!(m.read_retry_failed_total("timeout"), 0);
     }
 }

@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! BYO Audit Trail (agent-ux-11) — `audit_export_bundle` MCP tool.
 //!
@@ -165,7 +165,8 @@ pub async fn handle_audit_export_bundle(args: &Value, ctx: &McpContext) -> Resul
         let mut out: Vec<Fact> = Vec::new();
         let mut tokens_used = 0usize;
         // Sort by (stored_at, fact_id) for deterministic bundles.
-        let mut all: Vec<&Fact> = store.all_facts().collect();
+        let tenant_hash = ctx.scope_tenant();
+        let mut all: Vec<&Fact> = store.all_facts_for_tenant(&tenant_hash).collect();
         all.sort_by(|a, b| a.stored_at.cmp(&b.stored_at).then_with(|| a.fact_id.cmp(&b.fact_id)));
         for fact in all {
             if let Some(since) = since_dt {
@@ -369,6 +370,21 @@ mod tests {
         })
     }
 
+    async fn seed_operator_fact(ctx: &McpContext, entity: &str, key: &str, value: &str) {
+        let mut store = ctx.fact_store.write().await;
+        store.store(corecrux_memory::fact_store::StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: entity.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+            source_receipt: Some("test:typed-operator-workflow".to_string()),
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: Some("daemon:test".to_string()),
+        });
+    }
+
     fn redirect_export_dir(td: &tempfile::TempDir) {
         env::set_var(EXPORT_DIR_ENV, td.path());
     }
@@ -429,18 +445,8 @@ mod tests {
         handle_store_fact(&json!({"entity": "project-x", "key": "k", "value": "v1"}), &ctx)
             .await
             .unwrap();
-        handle_store_fact(
-            &json!({"entity": "__ops::config-audit", "key": "sha256:abc", "value": "audited"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
-        handle_store_fact(
-            &json!({"entity": "__bootstrap__::pattern:retry", "key": "Retry", "value": "exp"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        seed_operator_fact(&ctx, "__ops::config-audit", "sha256:abc", "audited").await;
+        seed_operator_fact(&ctx, "__bootstrap__::pattern:retry", "Retry", "exp").await;
 
         let resp = handle_audit_export_bundle(
             &json!({"token_budget": 1000, "scope": {"include_reserved": true}}),
@@ -485,12 +491,7 @@ mod tests {
         handle_store_fact(&json!({"entity": "project-x", "key": "k", "value": "v"}), &ctx)
             .await
             .unwrap();
-        handle_store_fact(
-            &json!({"entity": "__ops::config-audit", "key": "sha256:abc", "value": "ok"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        seed_operator_fact(&ctx, "__ops::config-audit", "sha256:abc", "ok").await;
 
         let resp = handle_audit_export_bundle(
             &json!({"token_budget": 1000, "scope": {"include_reserved": true}}),

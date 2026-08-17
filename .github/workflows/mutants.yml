@@ -1,5 +1,5 @@
-# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-# Licensed under the CueCrux Community Licence (CCL v1.0).
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
 #
 # Mutation testing for the tamper-evidence trust core.
 #
@@ -53,7 +53,9 @@ env:
 jobs:
   mutants:
     name: shard ${{ matrix.shard }}
-    runs-on: [self-hosted, ci]
+    # Pinned, not widened — see the `test` job in ci.yml. This job runs the
+    # workspace test suite, which fails on the vukgpu02 container pool.
+    runs-on: [self-hosted, hel1]
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -62,20 +64,36 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
     env:
-      CARGO_HOME: /home/gha-runner/.cargo-mutants-${{ matrix.shard }}-${{ github.run_id }}
       CARGO_BUILD_JOBS: "4"
     steps:
-      - name: Seed per-job CARGO_HOME from shared toolchain
+      - name: Resolve CARGO_HOME (shared toolchain when the runner has one)
         run: |
+          # $RUNNER_TEMP is writable on EVERY runner pool, unlike the
+          # /home/gha-runner path this used to hardcode — which is what made
+          # these jobs a scheduling coin flip (pass on hel1, die in 13s on
+          # vukgpu02 with "mkdir: cannot create directory ... Permission denied").
+          #
+          # Set HERE and not in the job-level `env:` because the `runner` context
+          # is not available there; only `github`/`needs`/`matrix` etc. are.
+          # Using it at job level makes the whole workflow file invalid.
+          #
+          # The symlink loop is the FAST PATH, not a requirement: where a shared
+          # toolchain exists it is linked in and the toolchain action becomes a
+          # no-op; where it does not, the glob stays literal, `-e` fails, and the
+          # action installs into this writable home. Same workflow, both pools.
+          CARGO_HOME="${RUNNER_TEMP}/cargo-mutants-${{ matrix.shard }}-${{ github.run_id }}"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
           mkdir -p "$CARGO_HOME/bin"
-          for tool in /home/gha-runner/.cargo/bin/*; do
+          for tool in "${CRUX_SHARED_CARGO_HOME:-/home/gha-runner/.cargo}"/bin/*; do
             [ -e "$tool" ] || continue
             ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
           done
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
         with:
           # Pinned: cargo-mutants documents that its mutants.out format may
           # change between versions; scripts/mutants-report.py parses it.
@@ -101,7 +119,7 @@ jobs:
           fi
       - name: Upload shard report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: mutants-shard-${{ matrix.shard }}
           path: mutants.out/
@@ -115,12 +133,14 @@ jobs:
     name: merge + ratchet
     needs: mutants
     if: always()
-    runs-on: [self-hosted, ci]
+    # Pinned, not widened — see the `test` job in ci.yml. This job runs the
+    # workspace test suite, which fails on the vukgpu02 container pool.
+    runs-on: [self-hosted, hel1]
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Download shard reports
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: mutants-shard-*
           path: shard-reports

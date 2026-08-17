@@ -14,6 +14,7 @@
 | EPOCH_MISMATCH | 412 | FAILED_PRECONDITION | Yes | Shard epoch changed | Retry with updated epoch |
 | BACKPRESSURE | 429 | RESOURCE_EXHAUSTED | Yes | System under load | Wait, retry with backoff |
 | TIMEOUT | 504 | DEADLINE_EXCEEDED | Yes | Operation exceeded deadline | Retry, check disk latency |
+| TOO_EARLY | 425 | FAILED_PRECONDITION | Yes | A mandatory waiting period has not elapsed (e.g. the escrow custodian-share release delay) | Retry after the time given in the response detail; there is no override |
 | INTERNAL | 500 | INTERNAL | No | Unexpected error | Report at github.com/CueCrux/Crux |
 
 ## MCP Tool Errors

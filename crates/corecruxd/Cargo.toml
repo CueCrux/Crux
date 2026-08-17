@@ -56,10 +56,12 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 toml = { workspace = true }
 syn = { workspace = true, features = ["full", "visit"] }
+proc-macro2 = { workspace = true }
 xxhash-rust = { workspace = true, features = ["xxh64"] }
 tar = { workspace = true }
 tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "signal", "time"] }
 tokio-stream = { workspace = true, features = ["sync"] }
+tokio-tungstenite = { workspace = true }
 tonic = { workspace = true }
 tower = { workspace = true, features = ["limit", "load-shed", "util"] }
 tower-http = { version = "0.7.0", features = ["catch-panic", "cors", "limit", "timeout", "trace"] }
@@ -75,10 +77,16 @@ uuid = { workspace = true, features = ["v4"] }
 url = { workspace = true }
 zeroize = { version = "1.8", features = ["serde"] }
 zstd = { workspace = true }
-zip = { workspace = true, features = ["default"] }
+zip = { workspace = true }
 
 corecrux-frame = { path = "../corecrux-frame" }
+corecrux-index = { path = "../corecrux-index" }
+crux-escrow = { path = "../crux-escrow" }
+corecrux-billing = { path = "../corecrux-billing" }
 corecrux-memory = { path = "../corecrux-memory" }
+corecrux-providers = { path = "../corecrux-providers" }
+corecrux-secrets = { path = "../corecrux-secrets" }
+corecrux-workspace-scan = { path = "../corecrux-workspace-scan" }
 corecrux-projections = { path = "../corecrux-projections" }
 corecrux-proto = { path = "../corecrux-proto" }
 corecrux-retrieval = { path = "../corecrux-retrieval" }
@@ -99,7 +107,7 @@ crux-session = { path = "../crux-session" }
 crux-enterprise-shim = { path = "../crux-enterprise-shim" }
 vaultcrux-local = { path = "../vaultcrux-local" }
 
-wasmtime = { version = "46", default-features = false, features = ["cranelift", "runtime"], optional = true }
+wasmtime = { version = "47", default-features = false, features = ["cranelift", "runtime"], optional = true }
 sha2 = { workspace = true }
 # Witness (Track W / G1): Sigstore Rekor's hashedrekord verification requires
 # ECDSA P-256 (the daemon seal key is Ed25519), so the witness signs entries
@@ -119,7 +127,6 @@ tree-sitter-swift = "=0.7.3"
 tree-sitter-php = "=0.24.2"
 
 [dev-dependencies]
-corecrux-index = { path = "../corecrux-index" }
 rcgen = { workspace = true }
 serial_test = { workspace = true }
 tempfile = { workspace = true }

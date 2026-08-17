@@ -27,9 +27,9 @@ cargo clippy --workspace -- -D warnings  # Lint
 
 - **No GPU/CUDA code.** Crux Daemon is CPU-only. No `--features cuda`, no CUDA imports, no GPU readiness checks.
 - **No proprietary crates.** `corecrux-analytics`, `corecrux-decision`, `corecrux-coordinator` do NOT exist in this repo.
-- **Licence headers.** Every `.rs` file must start with the CCL header. Run `grep -rL "Licensed under" crates/**/*.rs` to check.
+- **Licence headers.** Every `.rs` file must start with the Apache-2.0 header (copyright + `SPDX-License-Identifier: Apache-2.0`). Run `./scripts/check-licence-headers.sh` to check.
 - **Port 14800.** The Crux Daemon HTTP port. Do not change this default.
 
 ## Licence
 
-CueCrux Community Licence (CCL v1.0). See `LICENCE.md`. Source-available, not open-source.
+Apache License, Version 2.0. See `LICENSE`. Open source (OSI-approved).

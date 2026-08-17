@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! ExecPlan aggregator — read-time projection of `*.md` plan files under
 //! `$CRUX_EXECPLANS_ROOT` plus per-slug facts into the same [`WorkItem`] shape
@@ -23,20 +23,27 @@
 //! State derivation rules (in order; first match wins):
 //!
 //! 1. a recognised leading `Status:` token declares state (never trailing prose);
-//!    leading non-terminal tokens (`Blocked`, `In progress`, `Planned`, and
-//!    `Parked`) deliberately short-circuit before fact-derived rules because
-//!    the human declaration outranks facts
+//!    leading non-terminal tokens (`Blocked`, `Planned`, and `Parked`)
+//!    deliberately short-circuit before fact-derived rules because the human
+//!    declaration outranks facts. `In progress` is the one exception: a
+//!    *terminal fact signal* (see rule 4) outranks a stale `In progress` pin, so
+//!    a finished plan whose author forgot to flip its Status line still reads
+//!    `complete`/`archive` instead of being pinned `in_progress` forever.
 //! 2. `parsed.superseded_by` is set                       → `archive` + `superseded_by`
 //!    (including when the leading status is a completion token)
 //! 3. `Parked` always maps to `archive`, including when milestone facts exist;
 //!    this matches the 2026-07-10 corrected-audit parking of 21 plans
-//! 4. all declared milestones have a gate fact `status=complete` → `complete`
+//! 4. terminal completion — an explicit `decision:close*` fact (→ `complete`, or
+//!    → `archive` when the plan also names a superseding plan), OR all declared
+//!    milestones done (gate `status` a done-synonym / every markdown checkbox
+//!    ticked) → `complete`. Applied both on fall-through AND ahead of an
+//!    `In progress` pin (rule 1), via the shared `terminal_completion` check.
 //! 5. highest milestone with a fact has gate `status=blocked`    → `blocked`
 //! 6. any milestone/gate fact exists                      → `in_progress`
 //! 7. no facts, file mtime ≤ 90 days old                  → `planned`
 //! 8. no facts, file mtime > 90 days old                  → `archive`
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -189,6 +196,16 @@ pub struct ParsedPlan {
     pub deploys_to: Vec<String>,
     /// Distinct `OD-<n>` Open-Decision ids referenced anywhere in the plan body.
     pub open_decision_refs: Vec<String>,
+    /// `OD-<n>` ids the plan *declares* are holding it up, via a `Blocked by
+    /// OD-<n>` declaration line. Distinct from `open_decision_refs`, which is
+    /// every OD the prose happens to mention.
+    ///
+    /// This is the opt-in blocking signal. A plan citing an OD is not the same
+    /// claim as a plan waiting on one — and OD ids are a single global namespace
+    /// (`docs/master-plan/tracking/open-decisions.md`) while plans have
+    /// historically numbered decisions locally, so a bare mention collides across
+    /// unrelated plans. Only a declaration blocks.
+    pub blocked_by_od_refs: Vec<String>,
 }
 
 /// Rollup of facts stored under `entity = "execplan:<slug>"`. Fields cover the
@@ -217,6 +234,11 @@ pub struct ExecplanFactSummary {
     /// Earliest `stored_at` across all related facts (ms since epoch).
     pub first_fact_at_unix_ms: Option<u64>,
     pub decision_count: usize,
+    /// True when a `decision:close*` fact exists for this plan — an explicit
+    /// operator "this plan is done" decision. A terminal fact signal that
+    /// outranks a stale non-terminal `Status:` line (e.g. a plan left pinned
+    /// `In progress` whose milestones aren't each individually gate-recorded).
+    pub close_decision: bool,
     /// Distinct commit SHAs pulled from `decision:*` fact values (`commit_sha`
     /// field; QC.1 guarantees decisions carry one). Insertion order, deduped.
     pub commit_shas: Vec<String>,
@@ -324,10 +346,18 @@ pub fn parse_plan(md: &str) -> ParsedPlan {
         }
 
         if out.status_line.is_none() {
-            if let Some(rest) = trimmed.strip_prefix("Status:") {
-                out.status_line = Some(rest.trim().to_string());
-            } else if let Some(rest) = trimmed.strip_prefix("> **Status:**") {
-                out.status_line = Some(rest.trim().to_string());
+            // Enumerating spellings has now failed twice. `> Status:` was added
+            // 2026-08-03 after 117 of 1,115 plans turned out to use it; the very
+            // next audit found `**Status:**` and `- **Status:**` missing too.
+            // `status_declaration` instead accepts whatever `strip_markup`
+            // accepts, which is the same markup set the rest of this module has
+            // always tolerated — so the extractor can no longer be narrower than
+            // its own consumers. Case-sensitivity is preserved deliberately: a
+            // lowercase `status: draft` in YAML frontmatter is metadata, not a
+            // declaration, and matching it would shadow the real `Status:` line
+            // below (three plans do exactly this).
+            if let Some(rest) = status_declaration(line) {
+                out.status_line = Some(rest.to_string());
             }
         }
 
@@ -360,6 +390,21 @@ pub fn parse_plan(md: &str) -> ParsedPlan {
         }
 
         collect_od_refs(trimmed, &mut out.open_decision_refs);
+
+        // Opt-in blocking: `Blocked by OD-12` / `Blocked by [[OD-12, OD-13]]`.
+        // Reuses the shared declaration parser so it inherits the keyword-anchor
+        // and separator discipline — mid-sentence prose ("…which is blocked by
+        // the vault work…") never matches. Non-`OD-` targets are dropped so a
+        // plan-slug typo can't land on this axis.
+        for target in extract_ref_slugs(trimmed, "Blocked by") {
+            let mut ids = Vec::new();
+            collect_od_refs(&target, &mut ids);
+            for id in ids {
+                if !out.blocked_by_od_refs.contains(&id) {
+                    out.blocked_by_od_refs.push(id);
+                }
+            }
+        }
 
         if trimmed.starts_with("## ") {
             let heading = trimmed.trim_start_matches("## ").trim().to_ascii_lowercase();
@@ -448,8 +493,15 @@ fn declared_status(value: &str) -> Option<DeclaredStatus> {
         ("code-complete", DeclaredStatus::Complete),
         ("in_progress", DeclaredStatus::InProgress),
         ("in progress", DeclaredStatus::InProgress),
+        // 17 plans lead with `Active — …`; it was falling through to
+        // fact-inference. Unambiguously live work, so it reads as InProgress —
+        // which `terminal_completion` can still override for a finished plan.
+        ("active", DeclaredStatus::InProgress),
         ("superseded", DeclaredStatus::Superseded),
         ("completed", DeclaredStatus::Complete),
+        // `Closed <date> — …` is how a closing session spells Complete when it
+        // is thinking in board terms rather than plan terms.
+        ("closed", DeclaredStatus::Complete),
         ("complete", DeclaredStatus::Complete),
         ("deployed", DeclaredStatus::Complete),
         ("shipped", DeclaredStatus::Complete),
@@ -482,6 +534,22 @@ fn declared_status(value: &str) -> Option<DeclaredStatus> {
 /// declarations like `"Status: Superseded by \[\[next-plan\]\]"` or
 /// `"> **Status:** Superseded by \[\[next-plan\]\]"`.
 fn strip_leading_markup(line: &str) -> &str {
+    let s = strip_markup(line);
+    // Optional `Status:` (case-insensitive). ASCII-only, so byte-indexing
+    // into `s` after measuring against `lower` is safe.
+    let lower = s.to_ascii_lowercase();
+    if lower.starts_with("status:") {
+        return s[7..].trim_start_matches([' ', '*']);
+    }
+    s
+}
+
+/// The markup half of [`strip_leading_markup`]: leading whitespace, blockquote
+/// arrows, list markers and bold asterisks, but *not* a `Status:` prefix.
+/// Split out so [`status_declaration`] can ask "was there a `Status:` token
+/// here?" — a question [`strip_leading_markup`] cannot answer, because it
+/// strips the token and returns the remainder either way.
+fn strip_markup(line: &str) -> &str {
     let mut s = line.trim_start();
     // Blockquote arrows, possibly nested or separated by whitespace.
     while let Some(rest) = s.strip_prefix('>') {
@@ -499,14 +567,39 @@ fn strip_leading_markup(line: &str) -> &str {
         }
     }
     // Bold markers around the next token.
-    s = s.trim_start_matches('*');
-    // Optional `Status:` (case-insensitive). ASCII-only, so byte-indexing
-    // into `s` after measuring against `lower` is safe.
-    let lower = s.to_ascii_lowercase();
-    if lower.starts_with("status:") {
-        s = s[7..].trim_start_matches([' ', '*']);
-    }
-    s
+    s.trim_start_matches('*')
+}
+
+/// Match a `Status:` *declaration* at the start of a line and return its value.
+///
+/// Accepts every leading-markup form [`strip_markup`] handles, so `Status: X`,
+/// `**Status:** X`, `- **Status:** X` and `> **Status:**  X` all read alike.
+/// This is the whole point: the extractor used to accept exactly two literal
+/// prefixes while everything downstream already tolerated the full set, so a
+/// bold or list-item Status line parsed as *absent* and its plan silently fell
+/// through to fact-derived state. Sixty plans in the working corpus declared a
+/// status the board could not see, twenty-three of them terminal.
+///
+/// Deliberately CASE-SENSITIVE on `Status:`, matching the pre-existing
+/// contract: a lowercase `status: draft` in YAML frontmatter must not shadow
+/// the real declaration below it. Every real declaration in the corpus
+/// capitalises it.
+fn status_declaration(line: &str) -> Option<&str> {
+    let s = strip_markup(line);
+    // `trim_start_matches('*')` BEFORE `trim()`, deliberately, and not
+    // `trim_start_matches([' ', '*'])`. It is what the bare-`Status:` arm has
+    // always done, and the ordering carries meaning:
+    //   `Status: **Complete**`      -> value starts with a space, so the `*`
+    //                                  strip is a no-op and the operator's bold
+    //                                  survives intact as `**Complete**`.
+    //   `- **Status:** Complete`    -> `strip_markup` already ate the opening
+    //                                  `**`, leaving `** Complete` after the
+    //                                  token; the `*` strip removes the orphaned
+    //                                  closing pair, and `trim` the gap.
+    // Without the strip, `declared_status` would lowercase `** Complete` to a
+    // value with a leading space and match no token at all.
+    s.strip_prefix("Status:")
+        .map(|rest| rest.trim_start_matches('*').trim())
 }
 
 /// Match a "Superseded by …" *declaration* at the start of a line, after
@@ -534,7 +627,10 @@ fn extract_superseded_slug(line: &str) -> Option<String> {
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
         .collect();
-    if token.is_empty() {
+    // Bare tokens must look like a plan slug (hyphenated) — see the same guard in
+    // `extract_ref_slugs`. Higher stakes here: a phantom supersession target flips
+    // a live plan to `archive` and hides it from the board.
+    if token.is_empty() || !token.contains('-') {
         None
     } else {
         Some(token)
@@ -583,7 +679,14 @@ fn extract_ref_slugs(line: &str, keyword: &str) -> Vec<String> {
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
             .collect();
-        if !token.is_empty() {
+        // A bare token must *look like* a plan slug (kebab-case, so it contains a
+        // hyphen). Without this, ordinary prose that merely begins with the
+        // keyword mints a phantom edge target: `Depends on nothing merged.` →
+        // `nothing`, `Depends on: M1 complete` → `M1`, `Extended by declaration:
+        // none.` → `declaration`. Every real plan slug is hyphenated, so the
+        // check costs no true edges. The `[[…]]` form above is left unguarded so
+        // an explicit reference to a missing plan still surfaces as dangling.
+        if !token.is_empty() && token.contains('-') {
             slugs.push(token);
         }
     }
@@ -718,8 +821,18 @@ pub fn summarise_facts(facts: &[(String, String, DateTime<Utc>)]) -> ExecplanFac
                 })
                 .unwrap_or_default();
             summary.deps_by_id.insert(id.to_string(), after);
-        } else if key.starts_with("decision:") {
+        } else if let Some(topic) = key.strip_prefix("decision:") {
             summary.decision_count += 1;
+            // A `decision:close` / `decision:close-<date>` fact is an explicit
+            // operator close. Match the exact token or the `close-` prefix only,
+            // so unrelated topics (`close-beta-pricing`) never silently complete
+            // a live plan. Key presence is the signal (audited convention:
+            // `decision:close-<date>`, value `complete`).
+            // ponytail: key-based — we don't parse the value for a "reopened"
+            // close; upgrade to value-aware if that convention ever appears.
+            if topic == "close" || topic.starts_with("close-") {
+                summary.close_decision = true;
+            }
             // QC.1: decision facts carry a `commit_sha`. Collect distinct ones
             // (insertion order) for the provenance rollup.
             if let Some(sha) = serde_json::from_str::<serde_json::Value>(value)
@@ -783,6 +896,58 @@ fn compute_next_ready(
     ready.first().map(|id| (*id).clone())
 }
 
+/// Terminal-completion check shared by the leading `In progress` Status arm and
+/// the fact-only fall-through (Rule 4). Returns `Some(item)` when the plan has
+/// crossed a terminal signal that outranks any *non-terminal* state — including
+/// a stale `Status: In progress` pin:
+///   - an explicit `decision:close*` fact, or
+///   - every declared milestone gate-complete (any `is_complete_status` synonym)
+///     OR every declared milestone's markdown checkbox ticked.
+///
+/// Either way, a plan that also names a superseding plan in its markdown
+/// archives with that pointer instead of `complete` — mirroring the
+/// `DeclaredStatus::Complete` arm so a plan projects the same terminal state on
+/// the In-progress-pin path and the fall-through path.
+///
+/// Returns `None` when no terminal signal is present, so the caller continues
+/// with its own state derivation. Factored out so the two call sites can't drift
+/// apart (the bug this guards against: a finished plan pinned `In progress`
+/// forever because the In-progress arm returned before the Rule-4 check).
+fn terminal_completion(file: &ExecplanFile, parsed: &ParsedPlan, facts: &ExecplanFactSummary) -> Option<WorkItem> {
+    // Is the plan terminally done? Either an explicit operator close (even
+    // without every gate recorded) OR all declared milestones done — via gate
+    // facts (any "done" synonym) OR every markdown checkbox ticked. Empty
+    // `milestones_declared` never trips the all-done branch (vacuous truth).
+    let all_milestones_done = !parsed.milestones_declared.is_empty() && {
+        let all_gated = parsed
+            .milestones_declared
+            .iter()
+            .all(|n| facts.gate_statuses.get(n).is_some_and(|s| is_complete_status(s)));
+        let all_checked = parsed
+            .milestones_declared
+            .iter()
+            .all(|n| parsed.milestones_checked.contains(n));
+        all_gated || all_checked
+    };
+    if !facts.close_decision && !all_milestones_done {
+        return None;
+    }
+    // Terminal. A plan that also names its replacement archives with the graph
+    // edge (mirrors the `DeclaredStatus::Complete` arm and the Rule-2 back-compat
+    // fall-through), so both call sites agree regardless of entry path.
+    if parsed.superseded_by.is_some() {
+        return Some(mk_item(
+            file,
+            parsed,
+            "archive",
+            None,
+            parsed.superseded_by.clone(),
+            facts,
+        ));
+    }
+    Some(mk_item(file, parsed, "complete", None, None, facts))
+}
+
 /// Deterministic state derivation. See module docs for the rule list.
 pub fn derive_state(
     file: &ExecplanFile,
@@ -800,8 +965,10 @@ pub fn derive_state(
         return mk_item(file, parsed, "drafting", None, None, facts);
     }
 
-    // Rules 1–3: only the leading Status token is authoritative. In particular,
-    // `Status: In progress — M0 complete` remains live.
+    // Rules 1–3: the leading Status token is authoritative for non-terminal
+    // tokens (`Status: In progress — M0 complete` stays live). The one exception
+    // is `In progress`, which yields to a terminal fact signal (rule 4 /
+    // `terminal_completion`) so a stale pin can't outlive a finished plan.
     match declared {
         Some(DeclaredStatus::Archived | DeclaredStatus::Parked | DeclaredStatus::Superseded) => {
             return mk_item(file, parsed, "archive", None, parsed.superseded_by.clone(), facts);
@@ -826,6 +993,13 @@ pub fn derive_state(
             return item;
         }
         Some(DeclaredStatus::InProgress) => {
+            // Terminal fact signals outrank a stale `In progress` pin: an
+            // explicit close decision, or all declared milestones done. Without
+            // this the arm returned in_progress before the fall-through Rule 4,
+            // pinning finished plans in_progress forever.
+            if let Some(item) = terminal_completion(file, parsed, facts) {
+                return item;
+            }
             let current = facts.highest_milestone_with_fact.map(|n| format!("M{n}"));
             let mut item = mk_item(file, parsed, "in_progress", current, None, facts);
             let last_activity = facts
@@ -847,22 +1021,12 @@ pub fn derive_state(
         return mk_item(file, parsed, "archive", None, parsed.superseded_by.clone(), facts);
     }
 
-    // Rule 4: all declared milestones complete — via gate facts (any "done"
-    // synonym, see is_complete_status) OR every milestone's markdown checkbox
-    // ticked. Either signal flips the board so a finished plan stops reading as
-    // in_progress.
-    if !parsed.milestones_declared.is_empty() {
-        let all_gated = parsed
-            .milestones_declared
-            .iter()
-            .all(|n| facts.gate_statuses.get(n).is_some_and(|s| is_complete_status(s)));
-        let all_checked = parsed
-            .milestones_declared
-            .iter()
-            .all(|n| parsed.milestones_checked.contains(n));
-        if all_gated || all_checked {
-            return mk_item(file, parsed, "complete", None, None, facts);
-        }
+    // Rule 4: terminal completion — an explicit `decision:close*` fact, OR all
+    // declared milestones done (gate synonyms / ticked checkboxes). Shared with
+    // the `In progress` arm above via `terminal_completion` so the two can't
+    // drift apart.
+    if let Some(item) = terminal_completion(file, parsed, facts) {
+        return item;
     }
 
     // Rule 5: blocked gate on the highest fact'd milestone.
@@ -994,6 +1158,7 @@ fn mk_item(
         superseded_by,
         depends_on: parsed.depends_on.clone(),
         extended_by: parsed.extended_by.clone(),
+        blocked_by: Vec::new(),
         // Raw OD refs; apply_open_decisions refines these to the open subset.
         open_decisions: parsed.open_decision_refs.clone(),
         orchestrator_id: None,
@@ -1015,6 +1180,15 @@ fn mk_item(
 ///
 /// Returns plain `io::Error` for filesystem failures; callers can decide
 /// whether to fall back to an empty list or 500.
+/// Is this slug a scratch plan (leading `_`), excluded from the projection?
+///
+/// Exposed so a second enumerator of the same directory (the Patchbay facet
+/// cache's stat-only walk) filters to the SAME file set rather than duplicating
+/// the rule and silently drifting from it.
+pub fn is_scratch_slug(stem: &str) -> bool {
+    stem.starts_with(SCRATCH_PREFIX)
+}
+
 pub fn walk_execplans_root(root: &Path) -> std::io::Result<Vec<ExecplanFile>> {
     let mut out = Vec::new();
     if !root.exists() {
@@ -1030,7 +1204,7 @@ pub fn walk_execplans_root(root: &Path) -> std::io::Result<Vec<ExecplanFile>> {
             Some(s) => s.to_string(),
             None => continue,
         };
-        if stem.starts_with(SCRATCH_PREFIX) {
+        if is_scratch_slug(&stem) {
             continue;
         }
         let content = std::fs::read_to_string(&path)?;
@@ -1105,6 +1279,7 @@ pub fn list_execplans(store: &FactStore, root: &Path, now_unix_ms: u64) -> std::
         .and_then(|p| std::fs::read_to_string(&p).ok())
         .map(|s| parse_open_decisions(&s));
     let mut out = Vec::with_capacity(files.len());
+    let mut declared_blockers: HashMap<String, Vec<String>> = HashMap::new();
     for file in files {
         let parsed = parse_plan(&file.content);
         let facts = facts_by_slug.remove(&file.slug).unwrap_or_default();
@@ -1120,10 +1295,13 @@ pub fn list_execplans(store: &FactStore, root: &Path, now_unix_ms: u64) -> std::
         // Surface attached notes (work comments keyed by the item id).
         let n = crate::work::list_comments(store, &item.id).len() as u32;
         item.notes_count = (n > 0).then_some(n);
+        if !parsed.blocked_by_od_refs.is_empty() {
+            declared_blockers.insert(item.id.clone(), parsed.blocked_by_od_refs.clone());
+        }
         out.push(item);
     }
     apply_reciprocal_refs(&mut out);
-    apply_open_decisions(&mut out, od_registry.as_ref(), now_unix_ms);
+    apply_open_decisions(&mut out, od_registry.as_ref(), &declared_blockers, now_unix_ms);
     out.sort_by(|a, b| b.updated_at_unix_ms.cmp(&a.updated_at_unix_ms));
     Ok(out)
 }
@@ -1180,6 +1358,221 @@ fn apply_reciprocal_refs(items: &mut [WorkItem]) {
         it.depends_on.dedup();
         it.extended_by.sort();
         it.extended_by.dedup();
+    }
+}
+
+// ── Ready-order ranking ──────────────────────────────────────────────────────
+//
+// The lineage edges above answer "what depends on what". They do not answer
+// "what should I pick up next", so every agent re-derived that from the full
+// board — 190k+ tokens for a question whose answer is twenty slugs. `rank_open`
+// is the missing sort key: a pure, deterministic function over items the
+// projection already built. It mutates nothing and reads no facts.
+
+/// Marker that names a plan as an **orchestrator** — a parent that other plans
+/// hang off, never one that hangs off them.
+///
+/// Operator rule, 2026-07-29: "anything that has `orchestrat` in will be
+/// parent". Encoded here rather than left as a convention because a convention
+/// that only lives in prose is one the graph cannot honour: when two plans
+/// declare `Depends on` each other, *something* has to choose a direction, and
+/// choosing alphabetically (the previous behaviour) is arbitrary where this is
+/// meaningful.
+pub const ORCHESTRATOR_SLUG_MARKER: &str = "orchestrat";
+
+/// `true` when a slug names an orchestrator plan.
+pub fn is_orchestrator_slug(slug: &str) -> bool {
+    slug.to_ascii_lowercase().contains(ORCHESTRATOR_SLUG_MARKER)
+}
+
+/// States that count as unfinished work. `deployed` is terminal-ish (shipped)
+/// and `complete`/`archive` are terminal, so none of them are rankable.
+pub const OPEN_WORK_STATES: &[&str] = &["planned", "in_progress", "blocked", "drafting"];
+
+/// Is this item still open work?
+pub fn is_open_state(state: &str) -> bool {
+    OPEN_WORK_STATES.contains(&state)
+}
+
+/// Result of ranking the open subset of a merged work list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RankedOpen {
+    /// Indices into the input slice, in recommended work order.
+    pub order: Vec<usize>,
+    /// For each ranked item (parallel to `order`), the open dependency slugs
+    /// that are holding it back. Empty = ready to start now.
+    pub blocked_by: Vec<Vec<String>>,
+    /// Slugs participating in a dependency cycle, sorted + deduped. A cycle
+    /// makes "foundations first" undefined, so it is reported rather than
+    /// silently resolved; ranking still returns every item.
+    pub cycles: Vec<String>,
+    /// Orchestrator plans that were found depending *outward* inside a cycle.
+    /// An orchestrator is a parent, so this names the plan whose `Depends on`
+    /// line should become `Extended by` — an actionable fix, not just "there is
+    /// a cycle somewhere".
+    pub inverted_orchestrator_edges: Vec<String>,
+}
+
+/// Rank the open items of a merged work list into a recommended order.
+///
+/// Sort key, in order of precedence:
+///
+/// 1. **Unblocked before blocked** — an item whose `depends_on` names another
+///    *open* plan cannot be started, so it sinks.
+/// 2. **`in_progress` before everything else** — finish what is already open
+///    before starting more. This is the whole reason the board has 56 active
+///    plans.
+/// 3. **Dependency depth ascending** — foundations before the work that builds
+///    on them.
+/// 4. **Stale before fresh** — a stale `in_progress` plan is either
+///    finished-but-unmarked or stalled; both need a decision.
+/// 5. **Oldest `updated_at` first**, then **id** — total, deterministic order.
+///
+/// Only `depends_on` edges to *open* items constrain the order. An edge to a
+/// completed plan is satisfied history, and an edge to an unknown slug (a
+/// dangling reference) cannot be evaluated, so neither blocks.
+pub fn rank_open(items: &[WorkItem]) -> RankedOpen {
+    let slug_to_idx: HashMap<&str, usize> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, it)| it.id.strip_prefix(EXECPLAN_ENTITY_PREFIX).map(|s| (s, i)))
+        .collect();
+
+    let open: Vec<usize> = (0..items.len()).filter(|&i| is_open_state(&items[i].state)).collect();
+    if open.is_empty() {
+        return RankedOpen::default();
+    }
+    let is_open_idx: HashSet<usize> = open.iter().copied().collect();
+
+    // Open dependency targets, by item index. Edges to terminal plans and to
+    // unknown slugs are dropped here, so everything downstream sees only real
+    // constraints.
+    let open_deps: HashMap<usize, Vec<usize>> = open
+        .iter()
+        .map(|&i| {
+            let deps = items[i]
+                .depends_on
+                .iter()
+                .filter_map(|slug| slug_to_idx.get(slug.as_str()).copied())
+                .filter(|j| is_open_idx.contains(j))
+                .collect::<Vec<_>>();
+            (i, deps)
+        })
+        .collect();
+
+    // Depth = longest chain of open dependencies beneath an item. Iterative DFS
+    // with an explicit on-stack set: a back edge is a cycle, and contributes no
+    // depth rather than recursing forever.
+    let mut depth: HashMap<usize, u32> = HashMap::new();
+    let mut cycles: HashSet<&str> = HashSet::new();
+    for &root in &open {
+        if depth.contains_key(&root) {
+            continue;
+        }
+        // (node, deps-already-visited) — the second element makes this a
+        // post-order walk without recursion.
+        let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
+        let mut on_stack: HashSet<usize> = HashSet::from([root]);
+        while let Some(&mut (node, ref mut cursor)) = stack.last_mut() {
+            let deps = open_deps.get(&node).map_or(&[][..], Vec::as_slice);
+            if *cursor < deps.len() {
+                let next = deps[*cursor];
+                *cursor += 1;
+                if on_stack.contains(&next) {
+                    // Back edge. Record both endpoints; the cycle is real and
+                    // gets reported either way. Which edge we DROP is the
+                    // question, and the orchestrator rule answers it: an
+                    // orchestrator is a parent, so `X depends on <orchestrator>`
+                    // is the edge that survives and the reverse is the
+                    // inversion. Only the reported set is affected — ranking
+                    // still returns every item.
+                    for idx in [node, next] {
+                        if let Some(sl) = items[idx].id.strip_prefix(EXECPLAN_ENTITY_PREFIX) {
+                            cycles.insert(sl);
+                        }
+                    }
+                    continue;
+                }
+                if !depth.contains_key(&next) {
+                    stack.push((next, 0));
+                    on_stack.insert(next);
+                }
+                continue;
+            }
+            // All dependencies resolved — this node's depth is now computable.
+            let d = deps
+                .iter()
+                .filter_map(|j| depth.get(j).copied())
+                .max()
+                .map_or(0, |m| m + 1);
+            depth.insert(node, d);
+            on_stack.remove(&node);
+            stack.pop();
+        }
+    }
+
+    let mut order = open;
+    order.sort_by_key(|&i| {
+        let it = &items[i];
+        let blocked = !open_deps.get(&i).is_none_or(Vec::is_empty);
+        (
+            u8::from(blocked),
+            u8::from(it.state != "in_progress"),
+            depth.get(&i).copied().unwrap_or(0),
+            u8::from(it.stale != Some(true)),
+            it.updated_at_unix_ms,
+            it.id.clone(),
+        )
+    });
+
+    let blocked_by = order
+        .iter()
+        .map(|&i| {
+            let mut slugs: Vec<String> = open_deps
+                .get(&i)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .filter_map(|&j| items[j].id.strip_prefix(EXECPLAN_ENTITY_PREFIX).map(str::to_string))
+                .collect();
+            slugs.sort();
+            slugs
+        })
+        .collect();
+
+    // Which edge to REVERSE, computed over the recorded cycle rather than at the
+    // back edge: a 2-cycle contains both directions, so whichever endpoint the
+    // DFS happens to reach first would otherwise decide the answer.
+    //
+    // Operator rule: an orchestrator is a parent. So an orchestrator inside a
+    // cycle that depends on a NON-orchestrator in the same cycle is the
+    // inversion — that `Depends on` should read `Extended by`.
+    let mut inverted: Vec<String> = cycles
+        .iter()
+        .filter(|slug| is_orchestrator_slug(slug))
+        .filter(|slug| {
+            let Some(&i) = slug_to_idx.get(*slug) else {
+                return false;
+            };
+            open_deps.get(&i).is_some_and(|deps| {
+                deps.iter().any(|&j| {
+                    items[j]
+                        .id
+                        .strip_prefix(EXECPLAN_ENTITY_PREFIX)
+                        .is_some_and(|d| cycles.contains(d) && !is_orchestrator_slug(d))
+                })
+            })
+        })
+        .map(|s| (*s).to_string())
+        .collect();
+    inverted.sort();
+
+    let mut cycles: Vec<String> = cycles.into_iter().map(str::to_string).collect();
+    cycles.sort();
+    RankedOpen {
+        order,
+        blocked_by,
+        cycles,
+        inverted_orchestrator_edges: inverted,
     }
 }
 
@@ -1379,14 +1772,27 @@ fn od_num(id: &str) -> u32 {
 
 /// Cross-reference each item's referenced `OD-<n>` ids (populated raw by
 /// `mk_item`) against the registry and keep only the *unresolved* ones, overdue
-/// first. An **overdue** open OD soft-blocks an otherwise-active
-/// (`planned`/`in_progress`) plan — flipping it to `blocked` with a
-/// `blocker_reason` — because the registry carries no per-OD blocker flag, so
-/// "past its decides-by date and still open" is the strongest available signal.
-/// Non-overdue open ODs annotate `open_decisions` without changing state.
+/// first. Non-blocking open ODs annotate `open_decisions` without changing state.
 /// `registry == None` (path unset/unreadable) → clears `open_decisions`, since
 /// without the registry we can't assert any are still open.
-fn apply_open_decisions(items: &mut [WorkItem], registry: Option<&HashMap<String, OpenDecision>>, now_unix_ms: u64) {
+///
+/// An open OD soft-blocks an otherwise-active (`planned`/`in_progress`) plan —
+/// flipping it to `blocked` with a `blocker_reason` — **only when that plan
+/// declares it** via `Blocked by OD-<n>`, supplied here as `declared_blockers`
+/// (item id → declared OD ids).
+///
+/// This used to block on "open and past its decides-by date" instead. That was a
+/// proxy for a missing signal and it misfired: OD ids are a single global
+/// namespace, plans have historically numbered decisions locally, so one overdue
+/// global OD silently blocked every unrelated plan that happened to write the
+/// same id. `check-od-refs.mjs` cannot catch it — it checks that an id exists,
+/// never that two plans mean the same decision by it.
+fn apply_open_decisions(
+    items: &mut [WorkItem],
+    registry: Option<&HashMap<String, OpenDecision>>,
+    declared_blockers: &HashMap<String, Vec<String>>,
+    now_unix_ms: u64,
+) {
     for item in items.iter_mut() {
         let Some(reg) = registry else {
             item.open_decisions.clear();
@@ -1411,12 +1817,19 @@ fn apply_open_decisions(items: &mut [WorkItem], registry: Option<&HashMap<String
         open.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| od_num(&a.0).cmp(&od_num(&b.0))));
         item.open_decisions = open.iter().map(|(id, _, _)| id.clone()).collect();
 
-        // An overdue open OD soft-blocks an active plan.
-        if let Some((id, decides_by, _)) = open.iter().find(|(_, _, overdue)| *overdue) {
+        // A DECLARED open OD soft-blocks an active plan. Overdue ones sort first
+        // so the reason names the most pressing of them.
+        let declared = declared_blockers.get(&item.id);
+        if let Some((id, decides_by, overdue)) = open.iter().find(|(id, _, _)| declared.is_some_and(|d| d.contains(id)))
+        {
             if item.state == "planned" || item.state == "in_progress" {
                 item.state = "blocked".to_string();
-                item.blocker_reason = Some(format!("Overdue open decision {id} (decides-by {decides_by})"));
-                // An overdue decision is waiting on an owner's call → HUMAN_HOLD.
+                item.blocker_reason = Some(if *overdue {
+                    format!("Declared blocker {id} still open (decides-by {decides_by}, overdue)")
+                } else {
+                    format!("Declared blocker {id} still open (decides-by {decides_by})")
+                });
+                // A pending decision is waiting on an owner's call → HUMAN_HOLD.
                 item.blocker_kind = Some(BlockerKind::NeedsApproval);
             }
         }
@@ -1442,8 +1855,140 @@ pub fn stamp_orchestrator_id(
     }
 }
 
+/// Orchestrator that owns work nobody has explicitly parented.
+///
+/// Overridable via `CRUX_DEFAULT_ORCHESTRATOR`.
+pub const DEFAULT_ORCHESTRATOR_ENV: &str = "CRUX_DEFAULT_ORCHESTRATOR";
+pub const DEFAULT_ORCHESTRATOR_ID: &str = "orchestrator:unassigned";
+
+/// The configured default orchestrator id.
+pub fn default_orchestrator_id() -> String {
+    std::env::var(DEFAULT_ORCHESTRATOR_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_ORCHESTRATOR_ID.to_string())
+}
+
+/// Give every item a parent.
+///
+/// Orchestrator membership is a hand-maintained list, so in practice almost
+/// nothing had a parent and "orchestration is the parent" was aspirational: a
+/// nullable field nobody could rely on. Falling back to a named default makes
+/// the relationship **total** — every item answers "whose work is this?", and
+/// `orchestrator:unassigned` is an honest answer that can be filtered on and
+/// counted, where `null` was merely absent.
+///
+/// Explicit membership always wins; this only fills the gap.
+pub fn apply_default_orchestrator(items: &mut [WorkItem], default_id: &str) {
+    for item in items.iter_mut() {
+        if item.orchestrator_id.as_deref().is_none_or(str::is_empty) {
+            item.orchestrator_id = Some(default_id.to_string());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// `> Status:` — blockquote, no bold — is a live spelling: 117 of 1,115
+    /// plans used it on 2026-08-03 and every one of those declarations was
+    /// invisible to the board, which fell through to fact-inference instead.
+    #[test]
+    fn status_is_read_from_all_three_spellings() {
+        for md in [
+            "# P\n\nStatus: Complete\n",
+            "# P\n\n> **Status:** Complete\n",
+            "# P\n\n> Status: Complete\n",
+        ] {
+            let parsed = parse_plan(md);
+            assert_eq!(
+                parsed.status_line.as_deref(),
+                Some("Complete"),
+                "failed to read status from: {md:?}"
+            );
+        }
+    }
+
+    /// The extractor must accept every leading-markup form `strip_markup`
+    /// accepts, not an enumerated subset. Enumerating failed twice: `> Status:`
+    /// was added after 117 plans turned out to use it, and the next audit found
+    /// `**Status:**` (bold, no blockquote) and `- **Status:**` (list item)
+    /// equally invisible — 71 plans in the corpus, 28 of them declaring a
+    /// terminal state the board was ignoring.
+    #[test]
+    fn status_is_read_through_any_leading_markup() {
+        for md in [
+            "# P\n\n**Status:** Complete\n",
+            "# P\n\n- **Status:** Complete\n",
+            "# P\n\n* **Status:** Complete\n",
+            "# P\n\n1. **Status:** Complete\n",
+            "# P\n\n>**Status:** Complete\n",
+            "# P\n\n> > **Status:**   Complete\n",
+            "# P\n\n  - Status:  Complete  \n",
+        ] {
+            assert_eq!(
+                parse_plan(md).status_line.as_deref(),
+                Some("Complete"),
+                "failed to read status from: {md:?}"
+            );
+        }
+    }
+
+    /// Trailing bold must survive: `Status: Complete — landed in **PR #429**`
+    /// must not have its closing `**` eaten, or the prose the operator reads on
+    /// the board loses the reference.
+    #[test]
+    fn status_value_keeps_trailing_bold() {
+        let parsed = parse_plan("# P\n\n- **Status:** Complete — landed in **PR #429**\n");
+        assert_eq!(parsed.status_line.as_deref(), Some("Complete — landed in **PR #429**"));
+        assert_eq!(
+            declared_status(parsed.status_line.as_deref().unwrap()),
+            Some(DeclaredStatus::Complete)
+        );
+    }
+
+    /// `Active` and `Closed` are in live use as leading declaration tokens (17
+    /// and 1 plans respectively) and used to fall through to fact-inference.
+    #[test]
+    fn active_and_closed_are_declaration_tokens() {
+        assert_eq!(
+            declared_status("Active — M0–M4 landed, M5 next"),
+            Some(DeclaredStatus::InProgress)
+        );
+        assert_eq!(
+            declared_status("Closed 2026-08-03 — all milestones merged"),
+            Some(DeclaredStatus::Complete)
+        );
+        // Boundary discipline is unchanged: a longer word that merely starts
+        // with a token is not that token.
+        assert_eq!(declared_status("Activewear taxonomy audit"), None);
+        assert_eq!(declared_status("Closedown checklist"), None);
+    }
+
+    /// A bold Status line in the body must not be able to declare on behalf of
+    /// a plan whose header already declared. First declaration wins, as before.
+    #[test]
+    fn first_status_declaration_still_wins() {
+        let md =
+            "# P\n\nStatus: In progress — M2 next\n\n## Notes\n\n- **Status:** Complete (an example of the format)\n";
+        assert_eq!(parse_plan(md).status_line.as_deref(), Some("In progress — M2 next"));
+    }
+
+    /// A lowercase `status:` in YAML frontmatter is metadata, not a declaration.
+    /// Matching it would shadow the real `Status:` line below — three plans
+    /// (`corecrux-kv-*`, `llm-gate-*`) carry `status: draft` in frontmatter while
+    /// declaring `Status: Parked` / `Status: Archived` further down.
+    #[test]
+    fn frontmatter_status_does_not_shadow_the_real_declaration() {
+        let md = "---\nstatus: draft\n---\n\n# P\n\nStatus: Parked — superseded by the follow-up\n";
+        let parsed = parse_plan(md);
+        assert!(
+            parsed.status_line.as_deref().unwrap_or("").starts_with("Parked"),
+            "frontmatter shadowed the declaration: {:?}",
+            parsed.status_line
+        );
+    }
     use super::*;
     use chrono::TimeZone;
     use corecrux_memory::fact_store::StoreFact;
@@ -1485,6 +2030,7 @@ mod tests {
             superseded_by: None,
             depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
             extended_by: extended_by.iter().map(|s| s.to_string()).collect(),
+            blocked_by: Vec::new(),
             open_decisions: Vec::new(),
             orchestrator_id: None,
             milestones_done: None,
@@ -1838,38 +2384,102 @@ mod tests {
         let reg = parse_open_decisions(REGISTRY);
         let now = 1_750_000_000_000u64; // before OD-1's 2099 date
         let mut items = vec![wi_od("a", &["OD-1", "OD-9", "OD-3"])];
-        apply_open_decisions(&mut items, Some(&reg), now);
-        // OD-9 resolved → dropped; OD-1 + OD-3 open; neither overdue → no block.
+        apply_open_decisions(&mut items, Some(&reg), &HashMap::new(), now);
+        // OD-9 resolved → dropped; OD-1 + OD-3 open; undeclared → no block.
         assert_eq!(items[0].open_decisions, vec!["OD-1".to_string(), "OD-3".to_string()]);
         assert_eq!(items[0].state, "planned");
         assert!(items[0].blocker_reason.is_none());
     }
 
     #[test]
-    fn apply_open_decisions_overdue_blocks_active_plan() {
+    fn apply_open_decisions_overdue_alone_does_not_block() {
+        // Regression: this is the collision that blocked three unrelated
+        // production-readiness plans off one overdue global OD they merely
+        // mentioned. Mentioning an OD is not declaring a dependency on it.
         let reg = parse_open_decisions(REGISTRY);
         let now = 1_750_000_000_000u64; // after OD-2's 2000-01-01
         let mut items = vec![wi_od("a", &["OD-1", "OD-2"])];
-        apply_open_decisions(&mut items, Some(&reg), now);
-        // OD-2 overdue → sorted first, plan flips to blocked with a reason.
+        apply_open_decisions(&mut items, Some(&reg), &HashMap::new(), now);
+        // Overdue still sorts first for display, but state is untouched.
         assert_eq!(items[0].open_decisions, vec!["OD-2".to_string(), "OD-1".to_string()]);
+        assert_eq!(items[0].state, "planned");
+        assert!(items[0].blocker_reason.is_none());
+    }
+
+    #[test]
+    fn apply_open_decisions_declared_blocker_blocks_active_plan() {
+        let reg = parse_open_decisions(REGISTRY);
+        let now = 1_750_000_000_000u64;
+        let mut items = vec![wi_od("a", &["OD-1", "OD-2"])];
+        let declared = HashMap::from([("execplan:a".to_string(), vec!["OD-2".to_string()])]);
+        apply_open_decisions(&mut items, Some(&reg), &declared, now);
         assert_eq!(items[0].state, "blocked");
-        assert!(items[0].blocker_reason.as_deref().unwrap().contains("OD-2"));
+        let reason = items[0].blocker_reason.as_deref().unwrap();
+        assert!(reason.contains("OD-2"), "names the declared blocker: {reason}");
+        assert!(reason.contains("overdue"), "OD-2 is past its date: {reason}");
+        assert_eq!(items[0].blocker_kind, Some(BlockerKind::NeedsApproval));
+    }
+
+    #[test]
+    fn apply_open_decisions_declared_but_not_overdue_still_blocks() {
+        // A declared dependency on a decision that has not been made holds the
+        // plan up whether or not the date has passed.
+        let reg = parse_open_decisions(REGISTRY);
+        let mut items = vec![wi_od("a", &["OD-1"])];
+        let declared = HashMap::from([("execplan:a".to_string(), vec!["OD-1".to_string()])]);
+        apply_open_decisions(&mut items, Some(&reg), &declared, 1_750_000_000_000);
+        assert_eq!(items[0].state, "blocked");
+        let reason = items[0].blocker_reason.as_deref().unwrap();
+        assert!(reason.contains("OD-1") && !reason.contains("overdue"), "{reason}");
+    }
+
+    #[test]
+    fn apply_open_decisions_declaring_a_resolved_od_does_not_block() {
+        let reg = parse_open_decisions(REGISTRY);
+        let mut items = vec![wi_od("a", &["OD-9"])];
+        let declared = HashMap::from([("execplan:a".to_string(), vec!["OD-9".to_string()])]);
+        apply_open_decisions(&mut items, Some(&reg), &declared, 1_750_000_000_000);
+        assert_eq!(items[0].state, "planned", "OD-9 is resolved");
+        assert!(items[0].blocker_reason.is_none());
     }
 
     #[test]
     fn apply_open_decisions_unknown_ref_is_dropped() {
         let reg = parse_open_decisions(REGISTRY);
         let mut items = vec![wi_od("a", &["OD-999"])];
-        apply_open_decisions(&mut items, Some(&reg), 1_750_000_000_000);
+        apply_open_decisions(&mut items, Some(&reg), &HashMap::new(), 1_750_000_000_000);
         assert!(items[0].open_decisions.is_empty(), "unregistered OD dropped");
     }
 
     #[test]
     fn apply_open_decisions_none_registry_clears() {
         let mut items = vec![wi_od("a", &["OD-1"])];
-        apply_open_decisions(&mut items, None, 1_750_000_000_000);
+        apply_open_decisions(&mut items, None, &HashMap::new(), 1_750_000_000_000);
         assert!(items[0].open_decisions.is_empty());
+    }
+
+    #[test]
+    fn parse_plan_reads_blocked_by_declarations_and_ignores_mentions() {
+        let md = "# T\n\nThis plan discusses OD-3 at length and cites OD-7.\n\
+                  Blocked by OD-12\n\
+                  Blocked by [[OD-13, OD-14]]\n\
+                  It is not blocked by the vault work, which is prose.\n";
+        let p = parse_plan(md);
+        // Every mention is still annotated…
+        assert!(p.open_decision_refs.contains(&"OD-3".to_string()));
+        assert!(p.open_decision_refs.contains(&"OD-7".to_string()));
+        // …but only declarations block.
+        assert_eq!(
+            p.blocked_by_od_refs,
+            vec!["OD-12".to_string(), "OD-13".to_string(), "OD-14".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_plan_blocked_by_ignores_non_od_targets() {
+        let md = "# T\n\nBlocked by [[some-other-plan]]\nBlocked by OD-5\n";
+        let p = parse_plan(md);
+        assert_eq!(p.blocked_by_od_refs, vec!["OD-5".to_string()]);
     }
 
     #[test]
@@ -2361,6 +2971,146 @@ mod tests {
         let s = summarise_facts(&[("milestone:M1".to_string(), "{}".to_string(), ts(2_000))]);
         let item = derive_state(&f, &p, &s, 4_000);
         assert_eq!(item.state, "in_progress");
+    }
+
+    // ── Board-drift guard: terminal fact signals outrank a stale `In progress` pin ──
+
+    #[test]
+    fn in_progress_pin_yields_to_all_gates_complete() {
+        // The drift class this milestone fixes: a plan left pinned `In progress`
+        // whose declared milestones are all gate-complete must read `complete`,
+        // not stay in_progress forever.
+        let f = file(
+            "finished",
+            1_000,
+            "# Finished\n\nStatus: In progress\n## Milestones\n- M1\n- M2\n",
+        );
+        let p = parse_plan(&f.content);
+        let s = summarise_facts(&[
+            (
+                "gate:M1".to_string(),
+                r#"{"status":"passed+merged"}"#.to_string(),
+                ts(2_000),
+            ),
+            ("gate:M2".to_string(), r#"{"status":"complete"}"#.to_string(), ts(3_000)),
+        ]);
+        assert_eq!(derive_state(&f, &p, &s, 4_000).state, "complete");
+    }
+
+    #[test]
+    fn in_progress_pin_with_partial_gates_stays_in_progress() {
+        // Unchanged behaviour: not every milestone gated → still in_progress.
+        let f = file(
+            "midflight",
+            1_000,
+            "# Midflight\n\nStatus: In progress\n## Milestones\n- M1\n- M2\n",
+        );
+        let p = parse_plan(&f.content);
+        let s = summarise_facts(&[("gate:M1".to_string(), r#"{"status":"complete"}"#.to_string(), ts(2_000))]);
+        assert_eq!(derive_state(&f, &p, &s, 4_000).state, "in_progress");
+    }
+
+    #[test]
+    fn in_progress_reopens_when_a_new_milestone_is_declared_after_gates() {
+        // Self-correcting: a plan that was all-gated but then grows a new,
+        // ungated milestone reverts to in_progress on the next projection.
+        let f = file(
+            "reopened",
+            1_000,
+            "# Reopened\n\nStatus: In progress\n## Milestones\n- M1\n- M2\n- M3\n",
+        );
+        let p = parse_plan(&f.content);
+        assert_eq!(p.milestones_declared, vec![1, 2, 3]);
+        // M1+M2 gated, M3 newly declared with no gate yet.
+        let s = summarise_facts(&[
+            ("gate:M1".to_string(), r#"{"status":"complete"}"#.to_string(), ts(2_000)),
+            ("gate:M2".to_string(), r#"{"status":"complete"}"#.to_string(), ts(3_000)),
+        ]);
+        assert_eq!(derive_state(&f, &p, &s, 4_000).state, "in_progress");
+    }
+
+    #[test]
+    fn close_decision_completes_a_pinned_in_progress_plan() {
+        // An explicit `decision:close*` fact closes the plan even when its
+        // per-milestone gates aren't all individually recorded.
+        let f = file(
+            "closed",
+            1_000,
+            "# Closed\n\nStatus: In progress\n## Milestones\n- M1\n- M2\n",
+        );
+        let p = parse_plan(&f.content);
+        let s = summarise_facts(&[
+            ("gate:M1".to_string(), r#"{"status":"complete"}"#.to_string(), ts(2_000)),
+            (
+                "decision:close-2026-07-23".to_string(),
+                r#"{"outcome":"complete","commit_sha":"abc123"}"#.to_string(),
+                ts(3_000),
+            ),
+        ]);
+        assert!(s.close_decision);
+        assert_eq!(derive_state(&f, &p, &s, 4_000).state, "complete");
+    }
+
+    #[test]
+    fn close_decision_with_superseder_archives_with_pointer() {
+        // Close + a named superseding plan archives and keeps the graph edge,
+        // even under a stale `In progress` pin.
+        let f = file(
+            "closed-super",
+            1_000,
+            "# ClosedSuper\n\nStatus: In progress\n\nSuperseded by [[next-plan]]\n## Milestones\n- M1\n",
+        );
+        let p = parse_plan(&f.content);
+        let s = summarise_facts(&[(
+            "decision:close-2026-07-23".to_string(),
+            r#"{"outcome":"complete","commit_sha":"abc123"}"#.to_string(),
+            ts(3_000),
+        )]);
+        let item = derive_state(&f, &p, &s, 4_000);
+        assert_eq!(item.state, "archive");
+        assert_eq!(item.superseded_by.as_deref(), Some("next-plan"));
+    }
+
+    #[test]
+    fn in_progress_all_gated_with_superseder_archives_with_pointer() {
+        // The In-progress-pin path must agree with the fall-through path: an
+        // all-gated plan that also names a superseder archives with the edge,
+        // not bare `complete`.
+        let f = file(
+            "done-super",
+            1_000,
+            "# DoneSuper\n\nStatus: In progress\n\nSuperseded by [[next-plan]]\n## Milestones\n- M1\n- M2\n",
+        );
+        let p = parse_plan(&f.content);
+        let s = summarise_facts(&[
+            ("gate:M1".to_string(), r#"{"status":"complete"}"#.to_string(), ts(2_000)),
+            ("gate:M2".to_string(), r#"{"status":"complete"}"#.to_string(), ts(3_000)),
+        ]);
+        let item = derive_state(&f, &p, &s, 4_000);
+        assert_eq!(item.state, "archive");
+        assert_eq!(item.superseded_by.as_deref(), Some("next-plan"));
+    }
+
+    #[test]
+    fn unrelated_close_prefixed_decision_topic_is_not_a_close() {
+        // `decision:closed-beta-pricing` must NOT read as an operator close and
+        // must not complete a live pinned plan.
+        let f = file(
+            "live-pricing",
+            1_000,
+            "# Live\n\nStatus: In progress\n## Milestones\n- M1\n- M2\n",
+        );
+        let p = parse_plan(&f.content);
+        let s = summarise_facts(&[
+            ("gate:M1".to_string(), r#"{"status":"complete"}"#.to_string(), ts(2_000)),
+            (
+                "decision:closed-beta-pricing".to_string(),
+                r#"{"commit_sha":"abc123"}"#.to_string(),
+                ts(3_000),
+            ),
+        ]);
+        assert!(!s.close_decision);
+        assert_eq!(derive_state(&f, &p, &s, 4_000).state, "in_progress");
     }
 
     // ---- walker ----
@@ -2912,5 +3662,302 @@ mod tests {
         std::env::remove_var(NEXT_READY_MILESTONE_FLAG_ENV);
         assert!(!drafting_state_enabled(), "A4 flag must default OFF");
         assert!(!next_ready_milestone_enabled(), "A3 flag must default OFF");
+    }
+
+    // ── rank_open: pure ordering logic ──
+
+    /// `wi` with an explicit state.
+    fn wis(slug: &str, state: &str, depends_on: &[&str]) -> WorkItem {
+        let mut w = wi(slug, depends_on, &[]);
+        w.state = state.to_string();
+        w
+    }
+
+    /// Ranked slugs, in order.
+    fn ranked_slugs(items: &[WorkItem]) -> Vec<String> {
+        rank_open(items)
+            .order
+            .into_iter()
+            .map(|i| items[i].id.trim_start_matches(EXECPLAN_ENTITY_PREFIX).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn rank_open_excludes_terminal_states() {
+        let items = vec![
+            wis("done", "complete", &[]),
+            wis("gone", "archive", &[]),
+            wis("shipped", "deployed", &[]),
+            wis("live", "planned", &[]),
+        ];
+        assert_eq!(ranked_slugs(&items), vec!["live".to_string()]);
+    }
+
+    #[test]
+    fn rank_open_empty_board_is_empty() {
+        assert_eq!(rank_open(&[]), RankedOpen::default());
+        assert_eq!(rank_open(&[wis("done", "complete", &[])]), RankedOpen::default());
+    }
+
+    #[test]
+    fn rank_open_in_progress_before_planned() {
+        let items = vec![wis("b-planned", "planned", &[]), wis("a-active", "in_progress", &[])];
+        assert_eq!(ranked_slugs(&items), vec!["a-active", "b-planned"]);
+    }
+
+    #[test]
+    fn rank_open_blocked_by_open_dep_sinks() {
+        // `needs-x` depends on open `x` → sinks below the unblocked `later` even
+        // though both are planned and `needs-x` sorts first alphabetically.
+        let items = vec![
+            wis("needs-x", "planned", &["x-foundation"]),
+            wis("x-foundation", "planned", &[]),
+            wis("later", "planned", &[]),
+        ];
+        let r = rank_open(&items);
+        let slugs: Vec<&str> = r
+            .order
+            .iter()
+            .map(|&i| items[i].id.trim_start_matches(EXECPLAN_ENTITY_PREFIX))
+            .collect();
+        assert_eq!(*slugs.last().unwrap(), "needs-x", "blocked item must sink: {slugs:?}");
+        let pos = r.order.iter().position(|&i| items[i].id.ends_with("needs-x")).unwrap();
+        assert_eq!(r.blocked_by[pos], vec!["x-foundation".to_string()]);
+    }
+
+    #[test]
+    fn rank_open_dep_on_complete_plan_does_not_block() {
+        // History is satisfied, not a constraint.
+        let items = vec![
+            wis("builds-on-history", "planned", &["ancient"]),
+            wis("ancient", "complete", &[]),
+        ];
+        let r = rank_open(&items);
+        assert_eq!(r.order.len(), 1);
+        assert!(r.blocked_by[0].is_empty(), "completed dep must not block");
+    }
+
+    #[test]
+    fn rank_open_dangling_dep_does_not_block() {
+        // An edge we cannot evaluate is not a reason to sink real work.
+        let items = vec![wis("solo", "planned", &["no-such-plan-2026-01-01"])];
+        let r = rank_open(&items);
+        assert_eq!(r.order.len(), 1);
+        assert!(r.blocked_by[0].is_empty(), "unknown dep target must not block");
+    }
+
+    #[test]
+    fn rank_open_foundations_before_dependents() {
+        // c depends on b depends on a — all unblocked-at-root ordering aside,
+        // depth must put a first, then b, then c.
+        let items = vec![
+            wis("c", "in_progress", &["b"]),
+            wis("b", "in_progress", &["a"]),
+            wis("a", "in_progress", &[]),
+        ];
+        // Only `a` is unblocked, so it leads; b and c follow by depth.
+        assert_eq!(ranked_slugs(&items), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn rank_open_stale_before_fresh_and_oldest_first() {
+        let mut stale = wis("stale-one", "in_progress", &[]);
+        stale.stale = Some(true);
+        stale.updated_at_unix_ms = 500;
+        let mut fresh = wis("fresh-one", "in_progress", &[]);
+        fresh.stale = Some(false);
+        fresh.updated_at_unix_ms = 100;
+        // Stale wins on key 4 even though `fresh` has an older updated_at.
+        assert_eq!(
+            ranked_slugs(&[fresh.clone(), stale.clone()]),
+            vec!["stale-one", "fresh-one"]
+        );
+
+        // With staleness equal, oldest updated_at leads.
+        let mut older = wis("older", "in_progress", &[]);
+        older.updated_at_unix_ms = 10;
+        let mut newer = wis("newer", "in_progress", &[]);
+        newer.updated_at_unix_ms = 900;
+        assert_eq!(ranked_slugs(&[newer, older]), vec!["older", "newer"]);
+    }
+
+    #[test]
+    fn rank_open_cycle_terminates_and_is_reported() {
+        // a → b → a. Must not hang, must keep both items, must name the cycle.
+        let items = vec![wis("a", "planned", &["b"]), wis("b", "planned", &["a"])];
+        let r = rank_open(&items);
+        assert_eq!(r.order.len(), 2, "cycle must not drop items");
+        assert_eq!(r.cycles, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// Operator rule: anything with `orchestrat` in the slug is a parent. When a
+    /// cycle has exactly one orchestrator, the orchestrator's outward
+    /// dependency is the inversion — naming it turns "there is a cycle" into
+    /// "change this line in this file".
+    #[test]
+    fn rank_open_names_the_inverted_orchestrator_edge() {
+        let items = vec![
+            wis(
+                "crux-pro-entitlement-orchestration-2026-07-27",
+                "planned",
+                &["crux-pro-capabilities-rcx-entitled-2026-07-27"],
+            ),
+            wis(
+                "crux-pro-capabilities-rcx-entitled-2026-07-27",
+                "planned",
+                &["crux-pro-entitlement-orchestration-2026-07-27"],
+            ),
+        ];
+        let r = rank_open(&items);
+        assert_eq!(r.cycles.len(), 2, "the cycle is still reported: {:?}", r.cycles);
+        assert_eq!(
+            r.inverted_orchestrator_edges,
+            vec!["crux-pro-entitlement-orchestration-2026-07-27".to_string()],
+            "the orchestrator depending outward is the edge to reverse"
+        );
+        assert_eq!(r.order.len(), 2, "reporting an inversion must not drop items");
+    }
+
+    #[test]
+    fn rank_open_two_orchestrators_in_a_cycle_names_neither() {
+        // Both sides are parents, so the rule cannot choose — say nothing rather
+        // than point at an arbitrary one.
+        let items = vec![
+            wis(
+                "alpha-orchestration-2026-01-01",
+                "planned",
+                &["beta-orchestrator-2026-01-02"],
+            ),
+            wis(
+                "beta-orchestrator-2026-01-02",
+                "planned",
+                &["alpha-orchestration-2026-01-01"],
+            ),
+        ];
+        let r = rank_open(&items);
+        assert_eq!(r.cycles.len(), 2);
+        assert!(
+            r.inverted_orchestrator_edges.is_empty(),
+            "{:?}",
+            r.inverted_orchestrator_edges
+        );
+    }
+
+    #[test]
+    fn rank_open_cycle_without_an_orchestrator_names_no_inversion() {
+        let items = vec![
+            wis("plain-a", "planned", &["plain-b"]),
+            wis("plain-b", "planned", &["plain-a"]),
+        ];
+        let r = rank_open(&items);
+        assert_eq!(r.cycles.len(), 2);
+        assert!(r.inverted_orchestrator_edges.is_empty());
+    }
+
+    #[test]
+    fn orchestrator_slug_marker_matches_the_operator_rule() {
+        for yes in [
+            "crux-pro-entitlement-orchestration-2026-07-27",
+            "portfolio-burn-down-orchestration-2026-07-10",
+            "Some-Orchestrator-Plan",
+            "multi-orchestrated-thing",
+        ] {
+            assert!(is_orchestrator_slug(yes), "{yes} should read as an orchestrator");
+        }
+        for no in [
+            "crux-pro-capabilities-rcx-entitled-2026-07-27",
+            "orchestra-seating-plan",
+            "plain-plan",
+        ] {
+            assert_eq!(
+                is_orchestrator_slug(no),
+                no.contains("orchestra") && no.contains("orchestrat"),
+                "{no}"
+            );
+        }
+        assert!(
+            !is_orchestrator_slug("orchestra-seating-plan"),
+            "'orchestra' alone is not 'orchestrat'"
+        );
+    }
+
+    #[test]
+    fn rank_open_self_cycle_terminates() {
+        let items = vec![wis("loop-plan", "planned", &["loop-plan"])];
+        let r = rank_open(&items);
+        assert_eq!(r.order.len(), 1);
+        assert_eq!(r.cycles, vec!["loop-plan".to_string()]);
+    }
+
+    #[test]
+    fn rank_open_is_deterministic() {
+        // Same board, two input orders → same ranked slugs.
+        let a = wis("alpha", "planned", &[]);
+        let b = wis("beta", "planned", &[]);
+        let c = wis("gamma", "planned", &[]);
+        let one = ranked_slugs(&[a.clone(), b.clone(), c.clone()]);
+        let two = ranked_slugs(&[c, b, a]);
+        assert_eq!(one, two);
+    }
+
+    #[test]
+    fn rank_open_diamond_depth_orders_correctly() {
+        // top depends on left+right, both depend on base.
+        let items = vec![
+            wis("top", "planned", &["left", "right"]),
+            wis("left", "planned", &["base"]),
+            wis("right", "planned", &["base"]),
+            wis("base", "planned", &[]),
+        ];
+        let slugs = ranked_slugs(&items);
+        assert_eq!(slugs[0], "base", "base is the only unblocked item: {slugs:?}");
+        let pos = |s: &str| slugs.iter().position(|x| x == s).unwrap();
+        assert!(pos("left") < pos("top") && pos("right") < pos("top"), "{slugs:?}");
+    }
+
+    // ── bare-token lineage guard (phantom-node fix) ──
+
+    #[test]
+    fn parse_rejects_bare_prose_tokens_as_lineage() {
+        // Observed live on the 2026-07-29 board: lines that *begin* with the
+        // keyword but continue in prose used to mint phantom edge targets.
+        for (md, what) in [
+            ("# T\n\nDepends on nothing merged. Follow-up track later.\n", "nothing"),
+            ("# T\n\n**Depends on lever 1** (Chain-of-Note notes)\n", "lever"),
+            ("# T\n\n**Depends on:** M1 complete\n", "M1"),
+            ("# T\n\n> Depends on: M2 (VaultCrux AS metadata + DCR)\n", "M2"),
+        ] {
+            let p = parse_plan(md);
+            assert!(p.depends_on.is_empty(), "must not capture '{what}': {:?}", p.depends_on);
+        }
+        let p = parse_plan("# T\n\nExtended by declaration: none.\n");
+        assert!(
+            p.extended_by.is_empty(),
+            "must not capture 'declaration': {:?}",
+            p.extended_by
+        );
+    }
+
+    #[test]
+    fn parse_still_accepts_hyphenated_bare_slug() {
+        let p = parse_plan("# T\n\nDepends on real-plan-2026-05-01\n");
+        assert_eq!(p.depends_on, vec!["real-plan-2026-05-01".to_string()]);
+    }
+
+    #[test]
+    fn parse_superseded_rejects_bare_prose_token() {
+        // Higher stakes: a phantom target here flips a live plan to `archive`.
+        let p = parse_plan("# T\n\nSuperseded by nothing\n");
+        assert_eq!(p.superseded_by, None);
+        let ok = parse_plan("# T\n\nSuperseded by real-plan-2026-05-01\n");
+        assert_eq!(ok.superseded_by.as_deref(), Some("real-plan-2026-05-01"));
+    }
+
+    #[test]
+    fn parse_explicit_bracket_ref_survives_even_if_unhyphenated() {
+        // `[[…]]` is an explicit author declaration — keep it so the drift check
+        // can still report it as dangling rather than silently dropping it.
+        let p = parse_plan("# T\n\nDepends on [[weird]]\n");
+        assert_eq!(p.depends_on, vec!["weird".to_string()]);
     }
 }

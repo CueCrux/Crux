@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! HTTP surface for the Crux substrate: `/v1/entities/*`, `/v1/edges/*`,
 //! `/v1/kinds/*`.
@@ -40,6 +40,7 @@ pub(super) struct UpsertEntityBody {
     pub payload: Value,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_entity(
     State(state): State<AppState>,
     Path((kind, id)): Path<(String, String)>,
@@ -48,6 +49,12 @@ pub(super) async fn get_entity(
     if let Err(p) = require_http_any_scope(&state.auth, &headers, &["facts:read", "admin:read"]) {
         return p.into_response();
     }
+    if crux_mcp::tools::entities::is_governed_entity_kind(&kind) {
+        return problem_response(
+            StatusCode::FORBIDDEN,
+            format!("entity kind '{kind}' is governed by its typed API"),
+        );
+    }
     let store = state.entity_store.read().await;
     match store.get(&kind, &id) {
         Some(rec) => (StatusCode::OK, Json(json!({"entity": rec}))).into_response(),
@@ -55,6 +62,7 @@ pub(super) async fn get_entity(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_entities(
     State(state): State<AppState>,
     Query(q): Query<ListEntitiesQuery>,
@@ -63,17 +71,37 @@ pub(super) async fn list_entities(
     if let Err(p) = require_http_any_scope(&state.auth, &headers, &["facts:read", "admin:read"]) {
         return p.into_response();
     }
+    if q.kind
+        .as_deref()
+        .is_some_and(crux_mcp::tools::entities::is_governed_entity_kind)
+    {
+        return problem_response(StatusCode::FORBIDDEN, "entity kind is governed by its typed API");
+    }
+    let requested_kind = q.kind;
+    let requested_limit = q.limit;
     let query = EntityQuery {
-        kind: q.kind,
-        limit: q.limit,
+        kind: requested_kind.clone(),
+        // An unfiltered listing must hide governed rows before truncation.
+        limit: requested_kind.as_ref().and(requested_limit),
         include_deleted: q.include_deleted,
     };
     let store = state.entity_store.read().await;
-    let entities: Vec<_> = store.list(&query).into_iter().cloned().collect();
+    let mut entities: Vec<_> = store
+        .list(&query)
+        .into_iter()
+        .filter(|record| !crux_mcp::tools::entities::is_governed_entity_kind(&record.kind))
+        .cloned()
+        .collect();
+    if requested_kind.is_none() {
+        if let Some(limit) = requested_limit {
+            entities.truncate(limit);
+        }
+    }
     let count = entities.len();
     (StatusCode::OK, Json(json!({"entities": entities, "count": count}))).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn put_entity(
     State(state): State<AppState>,
     Path((kind, id)): Path<(String, String)>,
@@ -82,6 +110,12 @@ pub(super) async fn put_entity(
 ) -> impl IntoResponse {
     if let Err(p) = require_http_any_scope(&state.auth, &headers, &["facts:write", "admin:write"]) {
         return p.into_response();
+    }
+    if crux_mcp::tools::entities::is_governed_entity_kind(&kind) {
+        return problem_response(
+            StatusCode::FORBIDDEN,
+            format!("entity kind '{kind}' is governed by its typed API"),
+        );
     }
     let actor = actor_from_headers(&state, &headers);
     let registry = state.kind_registry.read().await;
@@ -97,6 +131,7 @@ pub(super) async fn put_entity(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_entity_history(
     State(state): State<AppState>,
     Path((kind, id)): Path<(String, String)>,
@@ -105,12 +140,19 @@ pub(super) async fn get_entity_history(
     if let Err(p) = require_http_any_scope(&state.auth, &headers, &["facts:read", "admin:read"]) {
         return p.into_response();
     }
+    if crux_mcp::tools::entities::is_governed_entity_kind(&kind) {
+        return problem_response(
+            StatusCode::FORBIDDEN,
+            format!("entity kind '{kind}' is governed by its typed API"),
+        );
+    }
     let store = state.entity_store.read().await;
     let versions: Vec<_> = store.history(&kind, &id).into_iter().cloned().collect();
     let count = versions.len();
     (StatusCode::OK, Json(json!({"versions": versions, "count": count}))).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_entity(
     State(state): State<AppState>,
     Path((kind, id)): Path<(String, String)>,
@@ -118,6 +160,12 @@ pub(super) async fn delete_entity(
 ) -> impl IntoResponse {
     if let Err(p) = require_http_any_scope(&state.auth, &headers, &["facts:write", "admin:write"]) {
         return p.into_response();
+    }
+    if crux_mcp::tools::entities::is_governed_entity_kind(&kind) {
+        return problem_response(
+            StatusCode::FORBIDDEN,
+            format!("entity kind '{kind}' is governed by its typed API"),
+        );
     }
     let actor = actor_from_headers(&state, &headers);
     let mut store = state.entity_store.write().await;
@@ -161,6 +209,7 @@ pub(super) struct DeleteEdgeBody {
     pub to_id: String,
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_edges(
     State(state): State<AppState>,
     Query(q): Query<ListEdgesQuery>,
@@ -184,6 +233,7 @@ pub(super) async fn list_edges(
     (StatusCode::OK, Json(json!({"edges": edges, "count": count}))).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn put_edge(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -208,6 +258,7 @@ pub(super) async fn put_edge(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_edge(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -233,6 +284,7 @@ pub(super) async fn delete_edge(
 
 // ── Kinds ────────────────────────────────────────────────────────────
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_kinds(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(p) = require_http_any_scope(&state.auth, &headers, &["facts:read", "admin:read"]) {
         return p.into_response();
@@ -243,6 +295,7 @@ pub(super) async fn list_kinds(State(state): State<AppState>, headers: HeaderMap
     (StatusCode::OK, Json(json!({"kinds": kinds, "count": count}))).into_response()
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_kind(
     State(state): State<AppState>,
     Path(kind): Path<String>,

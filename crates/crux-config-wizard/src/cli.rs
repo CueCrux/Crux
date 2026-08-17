@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! CLI definitions (clap).
 
@@ -39,6 +39,11 @@ pub enum Command {
         /// `init` installs them so one command sets up the whole workspace.
         #[arg(long)]
         no_hooks: bool,
+        /// Don't install the bundled Claude Code skills (e.g. `execplan-run`)
+        /// into `~/.claude/skills/`. By default `init` installs them alongside
+        /// the hooks, for the same reason: one command sets up the workspace.
+        #[arg(long)]
+        no_skills: bool,
     },
     /// Re-compose CLAUDE.md and AGENTS.md from the saved .crux/agent-profile.toml.
     /// Refuses to overwrite hand-edited managed sections unless --force.
@@ -49,6 +54,11 @@ pub enum Command {
         /// (e.g. after a corecruxctl upgrade adds a new hook). Off by default.
         #[arg(long)]
         hooks: bool,
+        /// Also refresh the bundled Claude Code skills in `~/.claude/skills/`
+        /// (e.g. after an upgrade revises the `execplan-run` procedure).
+        /// Off by default.
+        #[arg(long)]
+        skills: bool,
     },
     /// CI mode: exit 0 if files match what regenerate would produce, non-zero otherwise.
     Check {
@@ -67,5 +77,53 @@ pub enum Command {
         /// Treat advisory warnings (free-span duplication, oversize) as failures (exit 1).
         #[arg(long)]
         strict: bool,
+    },
+    /// Install or inspect the Claude Code hooks and banner stack.
+    ///
+    /// Self-contained: the assets ship inside this binary, so a client machine
+    /// needs nothing else installed. `corecruxctl hooks install` remains
+    /// available and additionally configures the daemon endpoint the hooks read.
+    Hooks {
+        #[command(subcommand)]
+        action: HooksAction,
+    },
+    /// Install or inspect the bundled Claude Code skills.
+    ///
+    /// Skills are files under `~/.claude/skills/<name>/` — no `settings.json`
+    /// wiring, so unlike `hooks` this is purely a write-and-verify operation.
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillsAction {
+    /// Write the bundled skills into `~/.claude/skills/`. Idempotent: unchanged
+    /// files are not rewritten, and an operator edit is backed up to `.bak`
+    /// before being replaced.
+    Install,
+    /// Report which bundled skill files are installed and whether each matches
+    /// the bytes this binary ships (a present-but-stale file looks installed).
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HooksAction {
+    /// Write the hook scripts + banner stack and wire them into settings.json.
+    /// Idempotent: unchanged files are not rewritten, foreign hooks are
+    /// preserved, and an existing `statusLine` is never overwritten.
+    Install {
+        /// Target the user settings (`~/.claude/settings.json`) instead of the
+        /// project-local `.claude/settings.local.json`.
+        #[arg(long)]
+        user: bool,
+    },
+    /// Report which hooks are wired, and whether the banner stack on disk
+    /// matches the bytes this binary ships.
+    Status {
+        /// Inspect the user settings rather than the project-local file.
+        #[arg(long)]
+        user: bool,
     },
 }

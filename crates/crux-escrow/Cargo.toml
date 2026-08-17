@@ -1,0 +1,25 @@
+[package]
+name = "crux-escrow"
+publish.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vault key recovery: recovery-code wrapped DEKs, Shamir 2-of-3 escrow, and delayed cancellable share release."
+
+[dependencies]
+blake3 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+chrono = { workspace = true, features = ["clock", "serde"] }
+data-encoding = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+vsss-rs = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

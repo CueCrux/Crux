@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Governance-tier legal-hold HTTP surface.
 //!
@@ -153,6 +153,7 @@ async fn persist_signed_receipt(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_legal_hold(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -210,6 +211,7 @@ pub(super) async fn post_legal_hold(
     ),
     security(("bearer_auth" = []))
 )]
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_legal_hold(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -303,7 +305,8 @@ mod tests {
             .unwrap();
 
         // An empty, read-only observation file lets chain-tip resolution and
-        // receipt minting succeed, then forces the append itself to fail.
+        // receipt minting succeed, then forces the durable journal path to
+        // fail either during pre-append tail repair or the append itself.
         let observation_file =
             super::super::observations::observation_file_path(&state.data_dir, GOVERNANCE_RECEIPT_SESSION);
         std::fs::create_dir_all(observation_file.parent().unwrap()).unwrap();
@@ -317,7 +320,12 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let error_body = axum::body::to_bytes(err.into_body(), usize::MAX).await.unwrap();
-        assert!(String::from_utf8_lossy(&error_body).contains("append observation"));
+        let error_body = String::from_utf8_lossy(&error_body);
+        assert!(
+            error_body.contains("legal-hold receipt signing or persistence failed")
+                && error_body.contains("observation"),
+            "unexpected failure body: {error_body}"
+        );
         let hold = state.fact_store.read().await.legal_hold(&placed.hold.hold_id).unwrap();
         assert!(hold.active());
         assert!(hold.released_at.is_none());

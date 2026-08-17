@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! HTTP CRUD for community extensions (M2 of the community-extensions
 //! ExecPlan) — the contributor-facing surface of the registry.
@@ -25,7 +25,10 @@ use std::io::Read as _;
 use std::path::{Path as FsPath, PathBuf};
 
 use super::{problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, State, StatusCode};
-use crux_integrations::{CommunityExtensionsIndex, IntegrationManifest, TrustTier, TrustedKeyEntry, TrustedKeyring};
+use crux_integrations::{
+    append_audit_event, CommunityExtensionsIndex, IntegrationAuditEvent, IntegrationManifest, TrustTier,
+    TrustedKeyEntry, TrustedKeyring, AUDIT_TRUSTED_KEY_ADDED, AUDIT_TRUSTED_KEY_REMOVED,
+};
 use sha2::Digest as _;
 
 const ALLOW_UNSIGNED_ENV: &str = "CORECRUXD_EXTENSIONS_ALLOW_UNSIGNED";
@@ -70,6 +73,7 @@ pub(super) struct InstallFromRegistryBody {
 }
 
 /// `GET /v1/extensions` — list every installed extension.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_extensions(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
@@ -89,6 +93,7 @@ pub(super) async fn list_extensions(State(state): State<AppState>, headers: Head
 }
 
 /// `GET /v1/extensions/{id}` — fetch one installed extension.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_extension(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -115,6 +120,7 @@ pub(super) async fn get_extension(
 /// persisted manifest to use the cached path form. Once cached, the
 /// daemon never re-fetches; an extension that wants a new module
 /// version is uninstalled + re-installed.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn register_extension(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -215,11 +221,71 @@ pub(super) async fn register_extension(
     }
 }
 
+/// `GET /v1/extensions/registry` — browse the VERIFIED cached community
+/// index so a console can render the catalog before anyone installs.
+///
+/// Read-only twin of `install_from_registry`: same cache path, same
+/// signature verification, no network. Entries are joined against the
+/// installed set so the caller can render "installed / update available"
+/// without a second round-trip.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn list_registry_entries(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    let index_path = registry_index_path(&state.data_dir, None);
+    let index = match load_and_verify_registry_index(&state.data_dir, &index_path) {
+        Ok(index) => index,
+        // The no-cache case is the common one on a fresh daemon; name the
+        // command that populates it rather than leaking a bare io error.
+        Err((StatusCode::NOT_FOUND, msg)) => {
+            return problem_response(
+                StatusCode::NOT_FOUND,
+                format!("{msg} (run `corecruxctl extensions sync` to populate the cached registry index)"),
+            );
+        }
+        Err((status, msg)) => return problem_response(status, msg),
+    };
+
+    let store = state.fact_store.read().await;
+    let installed = crate::extension_registry::list_extensions(&store);
+    drop(store);
+
+    let entries: Vec<serde_json::Value> = index
+        .entries
+        .iter()
+        .map(|entry| {
+            let installed_version = installed
+                .iter()
+                .find(|record| record.manifest.id == entry.id)
+                .map(|record| record.manifest.version.clone());
+            let mut value = serde_json::to_value(entry).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("installed".to_string(), serde_json::json!(installed_version.is_some()));
+                obj.insert("installed_version".to_string(), serde_json::json!(installed_version));
+            }
+            value
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "schema": "crux.extensions.registry_list.v1",
+            "curator_passport_fpr": index.curator_passport_fpr,
+            "updated_at_unix_ms": index.updated_at_unix_ms,
+            "entries": entries,
+        })),
+    )
+        .into_response()
+}
+
 /// `POST /v1/extensions/install-from-registry` — install by id from a
 /// verified cached community-extension index. The daemon re-verifies the
 /// signed index against the local trusted-keyring, fetches the manifest URL,
 /// enforces the curator-published `manifest_sha256`, then delegates to the
 /// same signed-manifest installer as `/v1/extensions/register`.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn install_from_registry(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -400,6 +466,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// `DELETE /v1/extensions/{id}` — uninstall.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_extension(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -408,8 +475,15 @@ pub(super) async fn delete_extension(
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
         return problem.into_response();
     }
+    let deleted_by = extract_passport_id(&headers);
     let mut store = state.fact_store.write().await;
-    let result = crate::extension_registry::delete_extension(&mut store, &id);
+    let result = crate::extension_registry::delete_extension(
+        &mut store,
+        &state.data_dir,
+        &id,
+        deleted_by.as_deref(),
+        now_unix_ms(),
+    );
     drop(store);
     match result {
         Ok(()) => (StatusCode::NO_CONTENT, ()).into_response(),
@@ -432,6 +506,7 @@ pub(super) struct AddTrustedKeyBody {
 }
 
 /// `GET /v1/extensions/keys` — list trusted signing keys.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_trusted_keys(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
@@ -451,6 +526,7 @@ pub(super) async fn list_trusted_keys(State(state): State<AppState>, headers: He
 }
 
 /// `POST /v1/extensions/keys` — add a trusted signing key.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn add_trusted_key(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -460,6 +536,9 @@ pub(super) async fn add_trusted_key(
         return problem.into_response();
     }
     let path = crate::extension_registry::trusted_keys_path(&state.data_dir);
+    let actor = extract_passport_id(&headers);
+    let added_at_unix_ms = now_unix_ms();
+    let trust_tier = body.trust_tier;
     let mut keyring = match TrustedKeyring::load(&path) {
         Ok(k) => k,
         Err(err) => {
@@ -470,14 +549,26 @@ pub(super) async fn add_trusted_key(
         body.passport_fpr.clone(),
         TrustedKeyEntry {
             public_key_hex: body.public_key_hex,
-            trust_tier: body.trust_tier,
-            added_at_unix_ms: now_unix_ms(),
+            trust_tier,
+            added_at_unix_ms,
             added_by: body.added_by,
         },
     );
     if let Err(err) = keyring.save(&path) {
         return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
     }
+    append_audit_event(
+        &state.data_dir,
+        &IntegrationAuditEvent::extension(
+            added_at_unix_ms,
+            AUDIT_TRUSTED_KEY_ADDED,
+            actor.as_deref(),
+            &body.passport_fpr,
+            None,
+            "added",
+            serde_json::json!({ "trust_tier": trust_tier }),
+        ),
+    );
     (
         StatusCode::CREATED,
         Json(serde_json::json!({ "passport_fpr": body.passport_fpr })),
@@ -501,6 +592,7 @@ pub(super) struct IssueGrantBody {
 }
 
 /// `GET /v1/extensions/{id}/grants` — list grants for one extension.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn list_grants(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -524,6 +616,7 @@ pub(super) async fn list_grants(
 }
 
 /// `POST /v1/extensions/{id}/grants` — issue a grant to a passport.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn issue_grant(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -538,14 +631,17 @@ pub(super) async fn issue_grant(
     // Check the extension is installed *before* delegating; the grant
     // module also asserts this but we surface a 404 (more specific than
     // 400) here for clarity.
-    let installed = crate::extension_registry::get_extension(&store, &id).is_some();
-    if !installed {
+    let installed = crate::extension_registry::get_extension(&store, &id);
+    let Some(installed) = installed else {
         drop(store);
         return problem_response(StatusCode::NOT_FOUND, format!("extension '{id}' not installed"));
-    }
+    };
+    let version = installed.manifest.version;
     let result = crate::extension_grants::issue_grant(
         &mut store,
+        &state.data_dir,
         true,
+        Some(&version),
         crate::extension_grants::IssueGrantInput {
             extension_id: id.clone(),
             passport_fpr: body.passport_fpr,
@@ -597,6 +693,7 @@ fn make_request_id() -> String {
 /// surface for an installed extension. Branches on `manifest.entry.kind`:
 /// `ExternalTool` → Phase A HTTPS path; `Wasm` → Phase B in-process
 /// wasmtime path (M6.3, requires `--features wasm-extensions`).
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn invoke_extension_tool(
     State(state): State<AppState>,
     Path((extension_id, tool_name)): Path<(String, String)>,
@@ -681,12 +778,14 @@ pub(super) async fn invoke_extension_tool(
     let grant_clone = grant.clone();
     let calling_clone = calling_passport.clone();
     let rid = request_id.clone();
+    let data_dir = state.data_dir.clone();
     let dispatch_result = tokio::task::spawn_blocking(move || {
         let transport = crate::extension_outbound::UreqTransport;
         crate::extension_outbound::dispatch_external_tool(
             &transport,
             &rate_table,
             &cfg,
+            &data_dir,
             &manifest_clone,
             &grant_clone,
             &tool_name,
@@ -722,7 +821,9 @@ pub(super) async fn invoke_extension_tool(
     if outcome.accepted_fact_writes > 0 {
         let mut store = state.fact_store.write().await;
         for w in &parsed.fact_writes {
-            if !grant.allowed_prefixes_write.iter().any(|p| w.entity.starts_with(p)) {
+            if crate::fact_privacy::generic_create_reserved_entity_prefix(&w.entity).is_some()
+                || !grant.allowed_prefixes_write.iter().any(|p| w.entity.starts_with(p))
+            {
                 continue; // already counted as dropped
             }
             let mut sf = corecrux_memory::fact_store::StoreFact {
@@ -746,6 +847,7 @@ pub(super) async fn invoke_extension_tool(
 }
 
 /// `DELETE /v1/extensions/{id}/grants/{passport_fpr}` — revoke a grant.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn revoke_grant(
     State(state): State<AppState>,
     Path((id, passport_fpr)): Path<(String, String)>,
@@ -754,8 +856,19 @@ pub(super) async fn revoke_grant(
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
         return problem.into_response();
     }
+    let revoked_by = extract_passport_id(&headers);
     let mut store = state.fact_store.write().await;
-    let result = crate::extension_grants::revoke_grant(&mut store, &id, &passport_fpr);
+    let extension_version =
+        crate::extension_registry::get_extension(&store, &id).map(|installed| installed.manifest.version);
+    let result = crate::extension_grants::revoke_grant(
+        &mut store,
+        &state.data_dir,
+        &id,
+        extension_version.as_deref(),
+        &passport_fpr,
+        revoked_by.as_deref(),
+        now_unix_ms(),
+    );
     drop(store);
     match result {
         Ok(()) => (StatusCode::NO_CONTENT, ()).into_response(),
@@ -768,6 +881,7 @@ pub(super) async fn revoke_grant(
 }
 
 /// `DELETE /v1/extensions/keys/{passport_fpr}` — revoke a trusted key.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn delete_trusted_key(
     State(state): State<AppState>,
     Path(passport_fpr): Path<String>,
@@ -776,6 +890,7 @@ pub(super) async fn delete_trusted_key(
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
         return problem.into_response();
     }
+    let actor = extract_passport_id(&headers);
     let path = crate::extension_registry::trusted_keys_path(&state.data_dir);
     let mut keyring = match TrustedKeyring::load(&path) {
         Ok(k) => k,
@@ -792,6 +907,18 @@ pub(super) async fn delete_trusted_key(
     if let Err(err) = keyring.save(&path) {
         return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
     }
+    append_audit_event(
+        &state.data_dir,
+        &IntegrationAuditEvent::extension(
+            now_unix_ms(),
+            AUDIT_TRUSTED_KEY_REMOVED,
+            actor.as_deref(),
+            &passport_fpr,
+            None,
+            "removed",
+            serde_json::json!({}),
+        ),
+    );
     (StatusCode::NO_CONTENT, ()).into_response()
 }
 

@@ -7,6 +7,10 @@ license.workspace = true
 build = "build.rs"
 
 [dependencies]
+# Owns the client-side hook + banner-stack install (assets, settings.json merge).
+# corecruxctl is the front door; the wizard crate holds the logic so `crux-hook`,
+# which already depends on it, carries the assets to client machines too.
+crux-config-wizard = { path = "../crux-config-wizard" }
 base64 = { workspace = true }
 blake3 = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
@@ -23,6 +27,7 @@ syn = { workspace = true, features = ["full", "visit"] }
 thiserror = { workspace = true }
 hex = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 serde_yaml = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "time"] }
@@ -32,7 +37,7 @@ url = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 xxhash-rust = { workspace = true, features = ["xxh64"] }
-zip = { workspace = true, default-features = false, features = ["deflate-flate2"] }
+zip = { workspace = true, default-features = false, features = ["deflate-flate2-zlib-rs"] }
 rand = { workspace = true }
 sha2 = { workspace = true }
 
@@ -43,6 +48,7 @@ x509-cert = { workspace = true, default-features = false, features = ["std", "pe
 x509-parser = { version = "0.18.1", features = ["verify"] }
 
 corecrux-frame = { path = "../corecrux-frame" }
+crux-escrow = { path = "../crux-escrow" }
 corecrux-index = { path = "../corecrux-index" }
 corecrux-memory = { path = "../corecrux-memory" }
 corecrux-projections = { path = "../corecrux-projections" }

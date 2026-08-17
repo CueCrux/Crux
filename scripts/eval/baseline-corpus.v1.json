@@ -23,7 +23,7 @@
     { "id": "f17", "entity": "sdk:surface", "key": "rest", "value": "two REST SDKs cover facts, sessions, and query against the daemon" },
     { "id": "f18", "entity": "bench:corpus", "key": "identity", "value": "every benchmark result must name its corpus by identity or the number is unattributable" },
     { "id": "f19", "entity": "deploy:host", "key": "crux", "value": "the production daemon is deployed on host crux under /opt/crux and tracks tagged releases" },
-    { "id": "f20", "entity": "licence:ccl", "key": "posture", "value": "the daemon is source-available under the CueCrux Community Licence, not open-source" }
+    { "id": "f20", "entity": "licence:apache-2.0", "key": "posture", "value": "the daemon is open source under the Apache License, Version 2.0" }
   ],
   "stale_contradiction_pairs": [
     {

@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Session observation capture with Ed25519-signed receipts.
 //!
@@ -204,50 +204,12 @@ struct CloudWitnessRecordV1 {
     test_upstream: bool,
 }
 
-/// Receipt envelope returned to the caller.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(super) struct ReceiptEnvelopeV1 {
-    pub alg: String,
-    pub signed_by: String,
-    pub body_hash: String,
-    pub signature: String,
-}
-
-/// Persisted record (one JSONL line). Phase 2 M5e: carries `seq` + `prev_hash`
-/// so the JSONL is sequence-level tamper-evident — removing or reordering any
-/// line breaks the chain. `prev_hash` is `None` for the first record of a
-/// chain (`seq == Some(0)`); subsequent records carry the previous record's
-/// `body_hash` (the hex part after the `blake3:` prefix).
-///
-/// **Backwards compatibility**: both fields are `Option`-typed with
-/// `skip_serializing_if = "Option::is_none"`. Pre-M5e records on disk had
-/// neither field; re-reading them yields `seq == None, prev_hash == None`
-/// and re-serialising omits both, so the original signature remains valid.
-/// A session's chain may therefore have a "legacy prefix" of unchained
-/// records followed by a "chained suffix" starting at `seq == Some(0)`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct ObservationRecordV1 {
-    pub observation_id: String,
-    pub session_id: String,
-    pub ts: DateTime<Utc>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_ts: Option<DateTime<Utc>>,
-    pub provider: String,
-    pub principal: String,
-    pub kind: String,
-    pub payload: serde_json::Value,
-    /// Monotonic 0-based index of this record within the chained suffix of
-    /// the session's JSONL. `None` for pre-M5e legacy records. Verifiers
-    /// reject gaps within a chained suffix (`seq` must be contiguous).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seq: Option<u64>,
-    /// `body_hash` of the previous record in this session (hex, no prefix).
-    /// `None` iff this is the first record of a chained suffix, or the
-    /// record is a pre-M5e legacy record.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prev_hash: Option<String>,
-    pub receipt: ReceiptEnvelopeV1,
-}
+/// Receipt envelope and persisted record now live in `corecrux-receipts` so
+/// `corecruxctl` can verify them too — `corecruxd` is a bin-only crate, so a
+/// CLI verifier would otherwise need a second copy of the signature check.
+/// The canonicalisation these depend on is wire format; see
+/// `corecrux_receipts::observation_envelope`.
+pub(super) use corecrux_receipts::{ObservationRecordV1, ReceiptEnvelopeV1};
 
 /// POST response (singleton).
 #[derive(Debug, Clone, Serialize)]
@@ -478,11 +440,7 @@ fn should_stream_observation_to_dataplane(scoped_session_id: &str) -> bool {
 /// only thing that travels through the hash is the bytes produced by this
 /// same operation.
 pub(super) fn canonical_body_bytes(record: &ObservationRecordV1) -> Result<Vec<u8>, String> {
-    let mut value = serde_json::to_value(record).map_err(|err| format!("to_value: {err}"))?;
-    if let serde_json::Value::Object(obj) = &mut value {
-        obj.remove("receipt");
-    }
-    serde_json::to_vec(&value).map_err(|err| format!("canonicalise observation body: {err}"))
+    corecrux_receipts::canonical_body_bytes(record)
 }
 
 fn mint_receipt(state: &AppState, body_bytes: &[u8]) -> Result<ReceiptEnvelopeV1, (StatusCode, String)> {
@@ -526,7 +484,92 @@ fn append_observation(file_path: &Path, line: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn sync_observation(file_path: &Path) -> std::io::Result<()> {
+/// Quarantine an unterminated observation tail before the next append. A
+/// missing JSONL delimiter means the previous append did not complete, even
+/// when the bytes happen to parse as JSON; treating it as committed could
+/// produce a receipt the prior caller observed as failed.
+fn repair_torn_observation_tail_unlocked(file_path: &Path) -> std::io::Result<()> {
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+    let mut file = match std::fs::OpenOptions::new().read(true).write(true).open(file_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last_byte = [0_u8; 1];
+    file.read_exact(&mut last_byte)?;
+    if last_byte[0] == b'\n' {
+        return Ok(());
+    }
+
+    let mut cursor = len;
+    let mut tail_start = 0_u64;
+    let mut block = vec![0_u8; 8 * 1024];
+    while cursor > 0 {
+        let start = cursor.saturating_sub(block.len() as u64);
+        let width = (cursor - start) as usize;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut block[..width])?;
+        if let Some(index) = block[..width].iter().rposition(|byte| *byte == b'\n') {
+            tail_start = start + index as u64 + 1;
+            break;
+        }
+        cursor = start;
+    }
+    let tail_len = len.saturating_sub(tail_start);
+    const MAX_RECOVERY_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+    if tail_len > MAX_RECOVERY_TAIL_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unterminated observation tail is {tail_len} bytes"),
+        ));
+    }
+    let mut tail = vec![0_u8; tail_len as usize];
+    file.seek(SeekFrom::Start(tail_start))?;
+    file.read_exact(&mut tail)?;
+
+    let quarantine = file_path.with_extension(format!("jsonl.torn.{}", uuid::Uuid::new_v4().simple()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut torn = options.open(&quarantine)?;
+    torn.write_all(&tail)?;
+    torn.sync_all()?;
+    file.set_len(tail_start)?;
+    file.sync_all()?;
+    if let Some(parent) = file_path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    tracing::error!(
+        observation = %file_path.display(),
+        quarantine = %quarantine.display(),
+        bytes = tail.len(),
+        "quarantined torn observation tail before append"
+    );
+    Ok(())
+}
+
+pub(super) fn repair_observation_tail(file_path: &Path) -> std::io::Result<()> {
+    let _guard = OBSERVATION_APPEND_LOCK
+        .lock()
+        .map_err(|_| std::io::Error::other("observation append lock poisoned"))?;
+    repair_torn_observation_tail_unlocked(file_path)
+}
+
+pub(super) fn sync_observation(file_path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if file_path.with_extension("sync-fail").exists() {
+        return Err(std::io::Error::other("injected post-append observation sync failure"));
+    }
     std::fs::OpenOptions::new().write(true).open(file_path)?.sync_all()?;
 
     // On Unix, fsync the directory entries as well as the file contents. The
@@ -700,6 +743,13 @@ pub(super) fn append_one(
             "observation append lock poisoned".to_string(),
         )
     })?;
+    let file_path = observation_file_path(&state.data_dir, scoped_session_id);
+    repair_torn_observation_tail_unlocked(&file_path).map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("repair torn observation tail: {err}"),
+        )
+    })?;
     append_one_unlocked(state, scoped_session_id, principal, body, chain_tip)
 }
 
@@ -846,16 +896,45 @@ pub(super) fn append_one_durable(
     body: PostObservationBody,
     chain_tip: Option<ChainTip>,
 ) -> Result<(PostObservationResponse, ChainTip), (StatusCode, String)> {
-    let _guard = OBSERVATION_APPEND_LOCK.lock().map_err(|_| {
-        (
+    append_one_durable_tracked(state, scoped_session_id, principal, body, chain_tip).map_err(|failure| failure.error)
+}
+
+/// Failure from a durable append with the ambiguity boundary made explicit.
+/// `appended=true` means the signed line was written but a later fsync failed;
+/// callers must retain any receipt-bound preparation and retry durability.
+pub(super) struct DurableAppendFailure {
+    pub appended: bool,
+    pub error: (StatusCode, String),
+}
+
+pub(super) fn append_one_durable_tracked(
+    state: &AppState,
+    scoped_session_id: &str,
+    principal: &str,
+    body: PostObservationBody,
+    chain_tip: Option<ChainTip>,
+) -> Result<(PostObservationResponse, ChainTip), DurableAppendFailure> {
+    let _guard = OBSERVATION_APPEND_LOCK.lock().map_err(|_| DurableAppendFailure {
+        appended: false,
+        error: (
             StatusCode::INTERNAL_SERVER_ERROR,
             "observation append lock poisoned".to_string(),
-        )
+        ),
     })?;
-    let appended = append_one_unlocked(state, scoped_session_id, principal, body, chain_tip)?;
     let file_path = observation_file_path(&state.data_dir, scoped_session_id);
-    sync_observation(&file_path)
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("sync observation: {err}")))?;
+    repair_torn_observation_tail_unlocked(&file_path).map_err(|err| DurableAppendFailure {
+        appended: false,
+        error: (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("repair torn observation tail: {err}"),
+        ),
+    })?;
+    let appended = append_one_unlocked(state, scoped_session_id, principal, body, chain_tip)
+        .map_err(|error| DurableAppendFailure { appended: false, error })?;
+    sync_observation(&file_path).map_err(|err| DurableAppendFailure {
+        appended: true,
+        error: (StatusCode::INTERNAL_SERVER_ERROR, format!("sync observation: {err}")),
+    })?;
     Ok(appended)
 }
 
@@ -1034,6 +1113,7 @@ pub(super) fn validate_chain(records: &[ObservationRecordV1]) -> ChainStatus {
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_observation(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1055,6 +1135,7 @@ pub(super) async fn post_observation(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_observations_batch(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1521,6 +1602,7 @@ pub(super) fn handle_witness_receipt(state: &AppState, headers: &HeaderMap, raw:
 /// recognized before top-level `kind` dispatch, strictly verified against
 /// their inline Ed25519 public key, and retained as daemon-signed mediation
 /// observations. Invalid signatures are rejected before any append.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_mediation_receipt(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1625,6 +1707,7 @@ pub(super) async fn post_mediation_receipt(
     }
 }
 
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_observations(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1677,6 +1760,7 @@ pub(super) async fn get_observations(
 /// `limit`. Each session's chain status is included so callers can spot
 /// "the feed is fresh, but session X's chain is broken on disk" without
 /// a follow-up call.
+#[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_observations_aggregate(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1783,6 +1867,338 @@ pub(super) async fn get_observations_aggregate(
         }),
     )
         .into_response()
+}
+
+// ── Receipts listing (console-surfaces-remediation M6) ─────────────────────
+//
+// `GET /v1/receipts/list` — a CE-local, newest-first, cursor-paginated listing
+// over the on-disk observation journals (the only receipt source a CPU-only
+// daemon holds: it has no dataplane pool, so the by-id receipt family 501s for
+// everything except the local `ad_ga_*` gate-approval receipts). Each
+// observation carries a CROWN-style receipt envelope (`ReceiptEnvelopeV1`); this
+// route surfaces the envelope summary plus whether a full body/signature/
+// verification is dereferenceable via `/v1/receipts/{id}` (the `ad_ga_*` class,
+// stored in the reserved gate-receipt journal) versus envelope-only (a regular
+// session observation, whose body lives only in the hosted-tier dataplane).
+//
+// Contract mirrors `/v1/activity`'s infinite-scroll: `before` (opaque cursor
+// from a prior page's `next_cursor`) + `limit`, newest-first, per-session `seq`
+// as the tiebreak. Auth reuses the by-id receipt read guard (`receipts:read`).
+
+/// Console cap for a single `/v1/receipts/list` page.
+const RECEIPTS_LIST_DEFAULT_LIMIT: usize = 100;
+const RECEIPTS_LIST_MAX_LIMIT: usize = 1000;
+
+/// The `ad_ga_*` receipt-id class: the ONLY receipts whose full CROWN body,
+/// signature, and verification are dereferenceable on a CPU-only daemon (via the
+/// local approval-receipt fallback in `receipts.rs`). Everything else is
+/// envelope-only here.
+const FETCHABLE_RECEIPT_ID_PREFIX: &str = "ad_ga_";
+
+fn default_receipts_list_tenant() -> String {
+    "default".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ReceiptsListQuery {
+    /// Tenant scope for the read guard — mirrors the by-id receipt routes'
+    /// `tenant_id`. Defaults to `default` so the console (loopback, auth-off)
+    /// need not carry it; the guard still runs against this tenant.
+    #[serde(default = "default_receipts_list_tenant")]
+    pub tenant_id: String,
+    /// Opaque cursor (`<ts_ms>:<seq>:<observation_id>`) from a prior page's
+    /// `next_cursor`. The next page returns rows strictly older than it.
+    #[serde(default)]
+    pub before: Option<String>,
+    /// Page size. Defaults to [`RECEIPTS_LIST_DEFAULT_LIMIT`], capped at
+    /// [`RECEIPTS_LIST_MAX_LIMIT`].
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Optional observation-kind filter (`tool_use`, the gate approval-decision
+    /// kind, …).
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Optional principal filter (signing passport fpr).
+    #[serde(default)]
+    pub principal: Option<String>,
+    /// Optional session filter (matches the record's `session_id`, raw or
+    /// filesystem-sanitised).
+    #[serde(default)]
+    pub session: Option<String>,
+}
+
+/// Envelope summary for one listed receipt — the CROWN fields a caller needs to
+/// eyeball provenance without pulling the full body. Short forms are precomputed
+/// for the list row; full forms feed the detail drawer.
+#[derive(Debug, Serialize)]
+pub(super) struct ReceiptEnvelopeSummaryV1 {
+    pub alg: String,
+    pub signed_by: String,
+    pub signed_by_short: String,
+    pub body_hash: String,
+    pub body_hash_short: String,
+}
+
+/// One row of `GET /v1/receipts/list`.
+#[derive(Debug, Serialize)]
+pub(super) struct ReceiptListRowV1 {
+    pub observation_id: String,
+    pub session_id: String,
+    pub session_short: String,
+    pub ts: DateTime<Utc>,
+    pub principal: String,
+    pub kind: String,
+    pub receipt: ReceiptEnvelopeSummaryV1,
+    /// Per-session chain sequence (`None` for pre-M5e legacy records).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    /// True iff the full CROWN body/signature/verification is dereferenceable via
+    /// `/v1/receipts/{id}` on this daemon (the `ad_ga_*` gate-approval class).
+    pub fetchable: bool,
+    /// The dereferenceable receipt id (present iff `fetchable`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt_id: Option<String>,
+    /// Opaque pagination cursor for this row — pass back as `before`.
+    pub cursor: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct ReceiptsListResponse {
+    pub rows: Vec<ReceiptListRowV1>,
+    /// Rows returned in this page (after cursor + limit).
+    pub returned: usize,
+    /// Total rows matching the filters, before cursor/limit truncation.
+    pub matched: usize,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+    /// Exact kind/principal histograms over the full matched set, so the console
+    /// can render filter chips without guessing labels from a sampled page.
+    pub kind_counts: std::collections::BTreeMap<String, usize>,
+    pub principal_counts: std::collections::BTreeMap<String, usize>,
+}
+
+fn short_hex(value: &str, keep: usize) -> String {
+    if value.chars().count() <= keep {
+        value.to_string()
+    } else {
+        value.chars().take(keep).collect()
+    }
+}
+
+/// A tuple that totally orders receipts newest-first: `(ts_ms, seq, obs_id)`
+/// compared in reverse. `seq` breaks ties inside one session's chain; the
+/// observation id is the final, always-present tiebreak.
+type ReceiptOrderKey = (i64, u64, String);
+
+fn receipt_order_key(record: &ObservationRecordV1) -> ReceiptOrderKey {
+    (
+        record.ts.timestamp_millis(),
+        record.seq.unwrap_or(0),
+        record.observation_id.clone(),
+    )
+}
+
+fn encode_receipt_cursor(key: &ReceiptOrderKey) -> String {
+    format!("{}:{}:{}", key.0, key.1, key.2)
+}
+
+/// Parse a `before` cursor back into an order key. Malformed cursors are a
+/// client error (400) rather than a silent full-scan-from-newest.
+fn parse_receipt_cursor(raw: &str) -> Option<ReceiptOrderKey> {
+    let mut parts = raw.splitn(3, ':');
+    let ts_ms = parts.next()?.parse::<i64>().ok()?;
+    let seq = parts.next()?.parse::<u64>().ok()?;
+    let obs_id = parts.next()?.to_string();
+    Some((ts_ms, seq, obs_id))
+}
+
+/// Does this observation dereference to a full CROWN receipt on a CPU-only
+/// daemon? True only for the `ad_ga_*` gate-approval receipts, whose id lives in
+/// the record payload. Returns that id so the console can fetch it.
+fn fetchable_receipt_id(record: &ObservationRecordV1) -> Option<String> {
+    record
+        .payload
+        .get("receipt_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| id.starts_with(FETCHABLE_RECEIPT_ID_PREFIX))
+        .map(str::to_string)
+}
+
+/// `GET /v1/receipts/list` — CE-local receipt listing. See the module comment
+/// above `ReceiptsListQuery`. Scans every session journal plus the reserved
+/// gate-receipt journal, applies the optional `kind`/`principal`/`session`
+/// filters, orders newest-first, and pages via the `before` cursor + `limit`.
+#[utoipa::path(
+    get,
+    path = "/v1/receipts/list",
+    tag = "Receipts",
+    params(
+        ("tenant_id" = Option<String>, Query, description = "Tenant scope for the read guard (default 'default')"),
+        ("before" = Option<String>, Query, description = "Opaque cursor from a prior page's next_cursor; returns strictly-older rows"),
+        ("limit" = Option<usize>, Query, description = "Page size (default 100, max 1000)"),
+        ("kind" = Option<String>, Query, description = "Filter by observation kind"),
+        ("principal" = Option<String>, Query, description = "Filter by signing principal (passport fpr)"),
+        ("session" = Option<String>, Query, description = "Filter by session id (raw or sanitised)"),
+    ),
+    responses(
+        (status = 200, description = "Newest-first, cursor-paginated CE-local receipt listing over the observation journals"),
+        (status = 400, description = "Malformed cursor"),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []))
+)]
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_receipts_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ReceiptsListQuery>,
+) -> Response {
+    if let Err(problem) =
+        super::require_http_scopes_for_tenant(&state.auth, &headers, &["receipts:read"], &params.tenant_id)
+    {
+        return problem.into_response();
+    }
+
+    let cursor = match params.before.as_deref() {
+        None => None,
+        Some(raw) => match parse_receipt_cursor(raw) {
+            Some(key) => Some(key),
+            None => {
+                return problem_response(StatusCode::BAD_REQUEST, format!("malformed `before` cursor: {raw}"));
+            }
+        },
+    };
+    let limit = params
+        .limit
+        .unwrap_or(RECEIPTS_LIST_DEFAULT_LIMIT)
+        .clamp(1, RECEIPTS_LIST_MAX_LIMIT);
+
+    // Every regular session journal, PLUS the reserved gate-receipt journal
+    // (`list_observation_files` deliberately skips the latter, but it is exactly
+    // where the fetchable `ad_ga_*` receipts live, so add it explicitly).
+    let mut files = match list_observation_files(&state.data_dir) {
+        Ok(files) => files,
+        Err(err) => {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("list observation files: {err}"),
+            );
+        }
+    };
+    let gate_journal = observation_file_path(&state.data_dir, super::work::WORK_GATE_RECEIPT_SESSION);
+    if gate_journal.is_file() {
+        files.push(gate_journal);
+    }
+
+    let session_filter = params
+        .session
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(sanitize_session_id_for_filename);
+
+    let mut rows: Vec<ReceiptListRowV1> = Vec::new();
+    let mut kind_counts: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut principal_counts: std::collections::BTreeMap<String, usize> = Default::default();
+
+    for path in files {
+        let records = match read_observations(&path) {
+            Ok(records) => records,
+            Err(err) => {
+                tracing::warn!(
+                    target = "receipts",
+                    file = %path.display(),
+                    error = %err,
+                    "skipping unreadable observation file for receipts listing"
+                );
+                continue;
+            }
+        };
+        for record in records {
+            if let Some(kind) = params.kind.as_deref() {
+                if record.kind != kind {
+                    continue;
+                }
+            }
+            if let Some(principal) = params.principal.as_deref() {
+                if record.principal != principal {
+                    continue;
+                }
+            }
+            if let Some(target) = session_filter.as_deref() {
+                if sanitize_session_id_for_filename(&record.session_id) != target {
+                    continue;
+                }
+            }
+            count_observation_field(&mut kind_counts, &record.kind, "(missing)");
+            count_observation_field(&mut principal_counts, &record.principal, "(missing)");
+
+            let key = receipt_order_key(&record);
+            let receipt_id = fetchable_receipt_id(&record);
+            let body_hash = &record.receipt.body_hash;
+            let body_hash_hex = body_hash.strip_prefix("blake3:").unwrap_or(body_hash);
+            rows.push(ReceiptListRowV1 {
+                observation_id: record.observation_id.clone(),
+                session_short: short_hex(&record.session_id, 12),
+                session_id: record.session_id.clone(),
+                ts: record.ts,
+                principal: record.principal.clone(),
+                kind: record.kind.clone(),
+                receipt: ReceiptEnvelopeSummaryV1 {
+                    alg: record.receipt.alg.clone(),
+                    signed_by_short: short_hex(&record.receipt.signed_by, 12),
+                    signed_by: record.receipt.signed_by.clone(),
+                    body_hash: body_hash.clone(),
+                    body_hash_short: short_hex(body_hash_hex, 12),
+                },
+                seq: record.seq,
+                fetchable: receipt_id.is_some(),
+                receipt_id,
+                cursor: encode_receipt_cursor(&key),
+            });
+        }
+    }
+
+    // Newest-first: (ts_ms, seq, obs_id) descending.
+    rows.sort_by_key(|row| std::cmp::Reverse(receipt_order_key_of_row(row)));
+    let matched = rows.len();
+
+    // Cursor: drop everything at-or-newer than `before` (strictly-older page).
+    if let Some(ref cur) = cursor {
+        rows.retain(|row| receipt_order_key_of_row(row) < *cur);
+    }
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    let next_cursor = if has_more {
+        rows.last().map(|row| row.cursor.clone())
+    } else {
+        None
+    };
+    let returned = rows.len();
+
+    (
+        StatusCode::OK,
+        Json(ReceiptsListResponse {
+            rows,
+            returned,
+            matched,
+            next_cursor,
+            has_more,
+            kind_counts,
+            principal_counts,
+        }),
+    )
+        .into_response()
+}
+
+/// Reconstruct the order key from a built row (avoids re-borrowing the source
+/// record after the row is moved into the vector).
+fn receipt_order_key_of_row(row: &ReceiptListRowV1) -> ReceiptOrderKey {
+    (
+        row.ts.timestamp_millis(),
+        row.seq.unwrap_or(0),
+        row.observation_id.clone(),
+    )
 }
 
 // ── Dataplane stream writer (M5f.3) ───────────────────────────────────────
@@ -2029,6 +2445,19 @@ mod tests {
             },
         };
         let bytes = canonical_body_bytes(&record).unwrap();
+
+        // GOLDEN VECTOR. These bytes are what every observation signature on
+        // disk was computed over, so this hash is a wire-format constant, not
+        // an implementation detail. If a refactor changes it — field order, a
+        // skip_serializing_if, moving the type to another crate — every
+        // receipt ever minted stops verifying. Never "fix" this by updating
+        // the constant.
+        assert_eq!(
+            format!("blake3:{}", hex::encode(blake3::hash(&bytes).as_bytes())),
+            "blake3:13c40869de39a4a8702082024ef6bf01ab3af149edd4966302f69716bbe4f287",
+            "observation canonical body bytes changed — existing signatures would break"
+        );
+
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(parsed.get("receipt").is_none(), "receipt must not be in canonical body");
         assert_eq!(parsed["observation_id"], "obs-1");
@@ -2954,6 +3383,235 @@ mod tests {
         assert_eq!(body["provider_counts"]["openai"], 2);
     }
 
+    // ── Receipts listing (M6) ──────────────────────────────────────────────
+
+    fn receipts_list_query() -> ReceiptsListQuery {
+        ReceiptsListQuery {
+            tenant_id: "default".to_string(),
+            before: None,
+            limit: None,
+            kind: None,
+            principal: None,
+            session: None,
+        }
+    }
+
+    /// Pagination walks the full multi-session set exactly once — no dupes, no
+    /// omissions — across `before`-cursor pages, newest-first.
+    #[tokio::test]
+    async fn receipts_list_pagination_walk_covers_all_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("passport.key");
+        let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        // 3 sessions × 3 records = 9 receipts across journals.
+        let mut expected: std::collections::BTreeSet<String> = Default::default();
+        for sess in ["rl-a", "rl-b", "rl-c"] {
+            for i in 0..3 {
+                let (resp, _tip) = append_one(
+                    &state,
+                    sess,
+                    key.passport_fpr(),
+                    PostObservationBody {
+                        kind: "tool_use".to_string(),
+                        provider: "claude-code".to_string(),
+                        client_ts: None,
+                        payload: serde_json::json!({ "i": i }),
+                    },
+                    None,
+                )
+                .unwrap();
+                expected.insert(resp.observation_id);
+            }
+        }
+
+        // Page with limit=2; thread next_cursor as `before` until drained.
+        let mut seen: Vec<String> = Vec::new();
+        let mut before: Option<String> = None;
+        let mut prev_key: Option<(i64, u64, String)> = None;
+        for _ in 0..100 {
+            let mut q = receipts_list_query();
+            q.limit = Some(2);
+            q.before = before.clone();
+            let resp = get_receipts_list(State(state.clone()), HeaderMap::new(), Query(q)).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = response_to_json(resp).await;
+            assert_eq!(body["matched"], 9);
+            let rows = body["rows"].as_array().unwrap();
+            assert!(rows.len() <= 2);
+            for row in rows {
+                let obs_id = row["observation_id"].as_str().unwrap().to_string();
+                seen.push(obs_id);
+                // Strictly-descending order key across the whole walk.
+                let key_now = (
+                    row["ts"]
+                        .as_str()
+                        .map(|s| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp_millis())
+                        .unwrap(),
+                    row["seq"].as_u64().unwrap_or(0),
+                    row["observation_id"].as_str().unwrap().to_string(),
+                );
+                if let Some(prev) = &prev_key {
+                    assert!(key_now < *prev, "rows must be strictly newest-first across pages");
+                }
+                prev_key = Some(key_now);
+            }
+            if body["has_more"].as_bool().unwrap() {
+                before = body["next_cursor"].as_str().map(str::to_string);
+                assert!(before.is_some());
+            } else {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 9, "walk visited every receipt exactly once");
+        let unique: std::collections::BTreeSet<String> = seen.iter().cloned().collect();
+        assert_eq!(unique.len(), 9, "no duplicate rows across pages");
+        assert_eq!(unique, expected, "walk covered exactly the fixture set");
+    }
+
+    /// `kind` and `session` filters narrow the matched set; a fetchable
+    /// `ad_ga_*` gate-journal receipt is flagged and carries its receipt id.
+    #[tokio::test]
+    async fn receipts_list_filters_and_fetchable_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("passport.key");
+        let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        append_one(
+            &state,
+            "flt-a",
+            key.passport_fpr(),
+            PostObservationBody {
+                kind: "tool_use".to_string(),
+                provider: "claude-code".to_string(),
+                client_ts: None,
+                payload: serde_json::Value::Null,
+            },
+            None,
+        )
+        .unwrap();
+        append_one(
+            &state,
+            "flt-b",
+            key.passport_fpr(),
+            PostObservationBody {
+                kind: "model_response".to_string(),
+                provider: "openai".to_string(),
+                client_ts: None,
+                payload: serde_json::Value::Null,
+            },
+            None,
+        )
+        .unwrap();
+        // A record in the reserved gate-receipt journal carrying an ad_ga_* id:
+        // the fetchable class. `list_observation_files` skips this journal, so the
+        // listing route must add it back explicitly.
+        append_one(
+            &state,
+            crate::http::work::WORK_GATE_RECEIPT_SESSION,
+            key.passport_fpr(),
+            PostObservationBody {
+                kind: "approval_decision".to_string(),
+                provider: "corecruxd".to_string(),
+                client_ts: None,
+                payload: serde_json::json!({ "receipt_id": "ad_ga_test123", "decision": "approve" }),
+            },
+            None,
+        )
+        .unwrap();
+
+        // No filter → all 3 (2 session journals + 1 gate-journal record).
+        let resp = get_receipts_list(State(state.clone()), HeaderMap::new(), Query(receipts_list_query())).await;
+        let body = response_to_json(resp).await;
+        assert_eq!(body["matched"], 3);
+        let fetchable: Vec<&serde_json::Value> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["fetchable"].as_bool() == Some(true))
+            .collect();
+        assert_eq!(fetchable.len(), 1, "only the ad_ga_* gate receipt is fetchable");
+        assert_eq!(fetchable[0]["receipt_id"], "ad_ga_test123");
+
+        // kind filter.
+        let mut q = receipts_list_query();
+        q.kind = Some("model_response".to_string());
+        let resp = get_receipts_list(State(state.clone()), HeaderMap::new(), Query(q)).await;
+        let body = response_to_json(resp).await;
+        assert_eq!(body["matched"], 1);
+        assert_eq!(body["rows"][0]["kind"], "model_response");
+
+        // session filter (raw id → sanitised match).
+        let mut q = receipts_list_query();
+        q.session = Some("flt-a".to_string());
+        let resp = get_receipts_list(State(state.clone()), HeaderMap::new(), Query(q)).await;
+        let body = response_to_json(resp).await;
+        assert_eq!(body["matched"], 1);
+        assert_eq!(body["rows"][0]["kind"], "tool_use");
+        // Envelope summary is present with a short form derived from the full one.
+        assert_eq!(body["rows"][0]["receipt"]["alg"], "ed25519");
+        assert!(body["rows"][0]["receipt"]["signed_by_short"].as_str().unwrap().len() <= 12);
+
+        // Malformed cursor → 400.
+        let mut q = receipts_list_query();
+        q.before = Some("not-a-cursor".to_string());
+        let resp = get_receipts_list(State(state), HeaderMap::new(), Query(q)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Router precedence: matchit resolves static `/v1/receipts/list` to the
+    /// listing handler, NOT the `/{receiptId}` param route (which would 501 on a
+    /// dataplane-less CE). Mounts both in mod.rs order and drives them.
+    #[tokio::test]
+    async fn receipts_list_static_route_beats_by_id_param() {
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("passport.key");
+        let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        let app = Router::new()
+            .route("/v1/receipts/list", get(get_receipts_list))
+            .route(
+                "/v1/receipts/{receiptId}",
+                get(crate::http::receipts::get_receipt_body_v1),
+            )
+            .with_state(state);
+
+        // /list → the listing handler (200 + rows array), never the by-id 501.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/receipts/list?tenant_id=default")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_to_json(resp).await;
+        assert!(body["rows"].is_array(), "static /list hits the listing handler");
+
+        // A genuine by-id lookup (non ad_ga_*) still falls to the param route,
+        // which 501s with the dataplane disabled — proving the two are distinct.
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/receipts/some-random-id?tenant_id=default")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
     #[tokio::test]
     async fn end_to_end_chain_is_built_by_repeated_appends() {
         // Set up an AppState with a real passport key + scoped data_dir.
@@ -3451,5 +4109,1089 @@ mod tests {
         let records = read_observations(&path).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].observation_id, "ok");
+    }
+
+    // ── Strict receipt reader ────────────────────────────────────────────
+
+    /// The general query reader skips malformed lines; the **strict** reader
+    /// used for security-sensitive receipt chains must not. A skipped line in a
+    /// receipt chain is exactly the "absent signal reads as pass" failure the
+    /// strict reader exists to prevent.
+    #[test]
+    fn read_observations_strict_rejects_what_the_lenient_reader_skips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mixed.jsonl");
+        let good = "{\"observation_id\":\"ok\",\"session_id\":\"s\",\"ts\":\"2026-05-13T00:00:00Z\",\"provider\":\"p\",\"principal\":\"pr\",\"kind\":\"k\",\"payload\":null,\"receipt\":{\"alg\":\"ed25519\",\"signed_by\":\"x\",\"body_hash\":\"blake3:0\",\"signature\":\"00\"}}";
+        std::fs::write(&path, format!("{good}\n{{not json\n")).unwrap();
+
+        assert_eq!(read_observations(&path).unwrap().len(), 1, "lenient reader skips");
+        let err = read_observations_strict(&path).expect_err("strict reader must refuse the chain");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("malformed receipt observation"));
+    }
+
+    #[test]
+    fn read_observations_strict_tolerates_blank_lines_and_missing_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("absent.jsonl");
+        assert!(read_observations_strict(&missing).unwrap().is_empty());
+
+        let path = tmp.path().join("padded.jsonl");
+        let good = "{\"observation_id\":\"ok\",\"session_id\":\"s\",\"ts\":\"2026-05-13T00:00:00Z\",\"provider\":\"p\",\"principal\":\"pr\",\"kind\":\"k\",\"payload\":null,\"receipt\":{\"alg\":\"ed25519\",\"signed_by\":\"x\",\"body_hash\":\"blake3:0\",\"signature\":\"00\"}}";
+        std::fs::write(&path, format!("\n   \n{good}\n\n")).unwrap();
+        assert_eq!(read_observations_strict(&path).unwrap().len(), 1);
+    }
+
+    // ── Torn-tail quarantine ─────────────────────────────────────────────
+
+    /// A JSONL line without its terminating newline means the previous append
+    /// did not complete. Even when those bytes happen to parse as JSON they
+    /// must be quarantined, not treated as committed — otherwise a caller that
+    /// observed a failed write finds a receipt on disk anyway.
+    #[test]
+    fn repair_observation_tail_quarantines_a_parseable_but_unterminated_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("torn.jsonl");
+        let good = "{\"observation_id\":\"committed\",\"session_id\":\"s\",\"ts\":\"2026-05-13T00:00:00Z\",\"provider\":\"p\",\"principal\":\"pr\",\"kind\":\"k\",\"payload\":null,\"receipt\":{\"alg\":\"ed25519\",\"signed_by\":\"x\",\"body_hash\":\"blake3:0\",\"signature\":\"00\"}}";
+        let torn = "{\"observation_id\":\"torn\",\"session_id\":\"s\",\"ts\":\"2026-05-13T00:00:01Z\",\"provider\":\"p\",\"principal\":\"pr\",\"kind\":\"k\",\"payload\":null,\"receipt\":{\"alg\":\"ed25519\",\"signed_by\":\"x\",\"body_hash\":\"blake3:1\",\"signature\":\"00\"}}";
+        std::fs::write(&path, format!("{good}\n{torn}")).unwrap();
+
+        repair_observation_tail(&path).expect("repair must succeed");
+
+        let survivors = read_observations(&path).unwrap();
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].observation_id, "committed");
+
+        let quarantined: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".torn."))
+            .collect();
+        assert_eq!(quarantined.len(), 1, "exactly one quarantine file: {quarantined:?}");
+        let salvaged = std::fs::read_to_string(tmp.path().join(&quarantined[0])).unwrap();
+        assert_eq!(salvaged, torn, "quarantined bytes are preserved verbatim");
+    }
+
+    /// A torn tail on a file with no prior newline at all must still be
+    /// quarantined, leaving an empty (not deleted) session file.
+    #[test]
+    fn repair_observation_tail_quarantines_a_lone_unterminated_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("lone.jsonl");
+        std::fs::write(&path, "{\"partial\": tr").unwrap();
+
+        repair_observation_tail(&path).expect("repair must succeed");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        assert!(read_observations(&path).unwrap().is_empty());
+    }
+
+    /// Repair is a no-op on the healthy shapes it will meet most often —
+    /// a missing file, an empty file, and a correctly terminated file.
+    #[test]
+    fn repair_observation_tail_is_a_noop_on_healthy_files() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let missing = tmp.path().join("absent.jsonl");
+        repair_observation_tail(&missing).expect("missing file is not an error");
+        assert!(!missing.exists(), "repair must not create the file");
+
+        let empty = tmp.path().join("empty.jsonl");
+        std::fs::write(&empty, "").unwrap();
+        repair_observation_tail(&empty).expect("empty file is not an error");
+        assert_eq!(std::fs::read(&empty).unwrap().len(), 0);
+
+        let terminated = tmp.path().join("terminated.jsonl");
+        let good = "{\"observation_id\":\"ok\",\"session_id\":\"s\",\"ts\":\"2026-05-13T00:00:00Z\",\"provider\":\"p\",\"principal\":\"pr\",\"kind\":\"k\",\"payload\":null,\"receipt\":{\"alg\":\"ed25519\",\"signed_by\":\"x\",\"body_hash\":\"blake3:0\",\"signature\":\"00\"}}\n";
+        std::fs::write(&terminated, good).unwrap();
+        repair_observation_tail(&terminated).expect("terminated file is healthy");
+        assert_eq!(std::fs::read_to_string(&terminated).unwrap(), good);
+        assert!(std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().contains(".torn.")));
+    }
+
+    /// An unterminated tail larger than the recovery cap is refused rather than
+    /// buffered into memory; the caller sees the append fail loudly.
+    #[test]
+    fn repair_observation_tail_refuses_an_oversized_unterminated_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("huge.jsonl");
+        let mut bytes = vec![b'x'; 4 * 1024 * 1024 + 16];
+        bytes[0] = b'\n';
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = repair_observation_tail(&path).expect_err("oversized tail must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("unterminated observation tail"));
+    }
+
+    // ── Chain tip ────────────────────────────────────────────────────────
+
+    #[test]
+    fn read_chain_tip_returns_none_for_missing_and_empty_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(read_chain_tip(&tmp.path().join("absent.jsonl")).unwrap().is_none());
+        let empty = tmp.path().join("empty.jsonl");
+        std::fs::write(&empty, "").unwrap();
+        assert!(read_chain_tip(&empty).unwrap().is_none());
+    }
+
+    /// The tip is the **last parseable** record, so trailing junk (a partially
+    /// flushed line the lenient reader skips) must not be mistaken for the tip
+    /// and must not silently reset the chain.
+    #[test]
+    fn read_chain_tip_walks_back_past_unparsable_trailing_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tip.jsonl");
+        let record = |id: &str, seq: u64, hash: &str| {
+            format!(
+                "{{\"observation_id\":\"{id}\",\"session_id\":\"s\",\"ts\":\"2026-05-13T00:00:00Z\",\"provider\":\"p\",\"principal\":\"pr\",\"kind\":\"k\",\"payload\":null,\"seq\":{seq},\"receipt\":{{\"alg\":\"ed25519\",\"signed_by\":\"x\",\"body_hash\":\"blake3:{hash}\",\"signature\":\"00\"}}}}"
+            )
+        };
+        std::fs::write(
+            &path,
+            format!("{}\n{}\n{{junk\n", record("a", 0, "aa"), record("b", 1, "bb")),
+        )
+        .unwrap();
+
+        let (seq, hash) = read_chain_tip(&path).unwrap().expect("tip present");
+        assert_eq!(seq, Some(1));
+        assert_eq!(hash, "bb", "the blake3: prefix is stripped for the next prev_hash");
+    }
+
+    /// A single record wider than the 64KB tail window forces the full-file
+    /// fallback; without it the chain would silently restart at seq 0.
+    #[test]
+    fn read_chain_tip_falls_back_to_a_full_read_for_oversized_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wide.jsonl");
+        let filler = "y".repeat(200 * 1024);
+        let line = format!(
+            "{{\"observation_id\":\"wide\",\"session_id\":\"s\",\"ts\":\"2026-05-13T00:00:00Z\",\"provider\":\"p\",\"principal\":\"pr\",\"kind\":\"k\",\"payload\":\"{filler}\",\"seq\":4,\"receipt\":{{\"alg\":\"ed25519\",\"signed_by\":\"x\",\"body_hash\":\"blake3:cc\",\"signature\":\"00\"}}}}"
+        );
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        let (seq, hash) = read_chain_tip(&path).unwrap().expect("tip via full-read fallback");
+        assert_eq!(seq, Some(4));
+        assert_eq!(hash, "cc");
+    }
+
+    /// A pre-M5e legacy record has no `seq`; the tip reports `None` so the next
+    /// append starts a fresh chain rather than extending an unchained record.
+    #[test]
+    fn read_chain_tip_reports_legacy_records_as_unchained() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("legacy.jsonl");
+        std::fs::write(
+            &path,
+            "{\"observation_id\":\"legacy\",\"session_id\":\"s\",\"ts\":\"2026-05-13T00:00:00Z\",\"provider\":\"p\",\"principal\":\"pr\",\"kind\":\"k\",\"payload\":null,\"receipt\":{\"alg\":\"ed25519\",\"signed_by\":\"x\",\"body_hash\":\"nopfx\",\"signature\":\"00\"}}\n",
+        )
+        .unwrap();
+
+        let (seq, hash) = read_chain_tip(&path).unwrap().expect("tip present");
+        assert_eq!(seq, None);
+        assert_eq!(hash, "nopfx", "a hash without the prefix is passed through as-is");
+    }
+
+    // ── File enumeration ─────────────────────────────────────────────────
+
+    /// Gate-approval receipts are reachable only through the tenant-authorized
+    /// `/v1/receipts` route. They must never appear in aggregate reads even if
+    /// their filename stops being dot-prefixed.
+    #[test]
+    fn list_observation_files_excludes_the_reserved_work_gate_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("observations");
+        std::fs::create_dir_all(&dir).unwrap();
+        let gate_name = sanitize_session_id_for_filename(super::super::work::WORK_GATE_RECEIPT_SESSION);
+        std::fs::write(dir.join(format!("{gate_name}.jsonl")), "").unwrap();
+        std::fs::write(dir.join("normal.jsonl"), "").unwrap();
+
+        let files = list_observation_files(tmp.path()).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert_eq!(names, vec!["normal.jsonl".to_string()]);
+        assert!(is_reserved_work_gate_receipt_session(
+            super::super::work::WORK_GATE_RECEIPT_SESSION
+        ));
+        assert!(!should_stream_observation_to_dataplane(
+            super::super::work::WORK_GATE_RECEIPT_SESSION
+        ));
+    }
+
+    /// A directory whose name ends in `.jsonl` (the future `.archived/`
+    /// sibling shape) must be skipped, not opened as a session file.
+    #[test]
+    fn list_observation_files_skips_directories_that_look_like_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("observations");
+        std::fs::create_dir_all(dir.join("looks-like-a-session.jsonl")).unwrap();
+        std::fs::write(dir.join("real.jsonl"), "").unwrap();
+        std::fs::write(dir.join("notes.JSONL"), "").unwrap();
+
+        let names: Vec<String> = list_observation_files(tmp.path())
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["notes.JSONL".to_string(), "real.jsonl".to_string()],
+            "extension match is case-insensitive; directories are skipped"
+        );
+    }
+
+    /// A passport key that cannot be loaded must fail the mint, not fall
+    /// through to an unsigned record.
+    #[test]
+    fn mint_receipt_fails_when_the_passport_key_cannot_be_loaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let mut state = stub_state_with_passport(tmp.path(), &key);
+        // A directory can never be read as a key file.
+        state.passport_key_path = tmp.path().join("key-is-a-directory");
+        std::fs::create_dir_all(&state.passport_key_path).unwrap();
+
+        let (status, detail) = mint_receipt(&state, b"body").expect_err("unloadable key must fail");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(detail.contains("passport key load failed"), "{detail}");
+    }
+
+    /// A payload that cannot be encoded is audit debt too — the counter must
+    /// move even though nothing ever reached the append path.
+    #[test]
+    fn mint_governance_receipt_counts_debt_for_an_unencodable_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        // serde_json cannot encode a map with non-string keys.
+        let mut unencodable: std::collections::BTreeMap<(u8, u8), u8> = std::collections::BTreeMap::new();
+        unencodable.insert((1, 2), 3);
+
+        let before = receipt_mint_failures();
+        assert!(
+            mint_governance_receipt(&state, "__governance__::gc", "operator", "gc_swept", &unencodable).is_none(),
+            "an unencodable payload must not report a receipt id"
+        );
+        assert!(receipt_mint_failures() > before, "encode failure must be counted");
+        assert!(!observation_file_path(&state.data_dir, "__governance__::gc").exists());
+    }
+
+    // ── Retention pass edges ─────────────────────────────────────────────
+
+    /// Nothing to scan is `(0, 0)`, and a session file holding no parseable
+    /// records is left in place rather than archived on an empty timestamp set
+    /// — archiving on "no records" would silently retire live sessions whose
+    /// file is momentarily unreadable.
+    #[test]
+    fn run_retention_pass_skips_empty_and_recordless_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            run_retention_pass(tmp.path(), chrono::Duration::seconds(1)).unwrap(),
+            (0, 0),
+            "no observations directory ⇒ nothing scanned"
+        );
+
+        let dir = tmp.path().join("observations");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("blank.jsonl"), "\n\n").unwrap();
+        std::fs::write(dir.join("junk.jsonl"), "{not json\n").unwrap();
+
+        let (archived, scanned) = run_retention_pass(tmp.path(), chrono::Duration::seconds(1)).unwrap();
+        assert_eq!(scanned, 2);
+        assert_eq!(archived, 0, "recordless sessions are kept, not archived");
+        assert!(dir.join("blank.jsonl").exists());
+        assert!(dir.join("junk.jsonl").exists());
+    }
+
+    #[test]
+    fn read_all_observations_merges_every_live_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("observations");
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = |id: &str| {
+            format!(
+                "{{\"observation_id\":\"{id}\",\"session_id\":\"s\",\"ts\":\"2026-05-13T00:00:00Z\",\"provider\":\"p\",\"principal\":\"pr\",\"kind\":\"k\",\"payload\":null,\"receipt\":{{\"alg\":\"ed25519\",\"signed_by\":\"x\",\"body_hash\":\"blake3:0\",\"signature\":\"00\"}}}}\n"
+            )
+        };
+        std::fs::write(dir.join("one.jsonl"), record("a")).unwrap();
+        std::fs::write(dir.join("two.jsonl"), record("b")).unwrap();
+        std::fs::write(dir.join("ignored.txt"), record("c")).unwrap();
+
+        let mut ids: Vec<String> = read_all_observations(tmp.path())
+            .unwrap()
+            .into_iter()
+            .map(|record| record.observation_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+        assert!(read_all_observations(&tmp.path().join("nowhere")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn count_observation_field_buckets_blank_values_under_the_missing_label() {
+        let mut counts = std::collections::BTreeMap::new();
+        count_observation_field(&mut counts, "claude-code", "(unknown)");
+        count_observation_field(&mut counts, "  claude-code  ", "(unknown)");
+        count_observation_field(&mut counts, "", "(unknown)");
+        count_observation_field(&mut counts, "   ", "(unknown)");
+        assert_eq!(counts["claude-code"], 2, "surrounding whitespace is trimmed");
+        assert_eq!(counts["(unknown)"], 2);
+    }
+
+    #[test]
+    fn session_id_from_file_uses_the_file_stem() {
+        assert_eq!(
+            session_id_from_file(Path::new("/tmp/observations/agent_sess-1.jsonl")),
+            Some("agent_sess-1".to_string())
+        );
+        assert_eq!(session_id_from_file(Path::new("/")), None);
+    }
+
+    // ── Receipt minting failure boundaries ───────────────────────────────
+
+    /// If the on-disk passport key stops matching the fingerprint the state
+    /// advertises, minting must fail loudly. Signing under an identity the
+    /// daemon does not claim would produce a receipt nobody can verify.
+    #[test]
+    fn mint_receipt_rejects_a_passport_signer_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let mut state = stub_state_with_passport(tmp.path(), &key);
+        state.passport_fpr = "fpr-that-does-not-match".to_string();
+
+        let (status, detail) = mint_receipt(&state, b"body").expect_err("mismatch must fail");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(detail.contains("passport signer mismatch"), "{detail}");
+    }
+
+    #[test]
+    fn mint_receipt_signs_with_the_state_fingerprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        let envelope = mint_receipt(&state, b"body").expect("mint");
+        assert_eq!(envelope.alg, "ed25519");
+        assert_eq!(envelope.signed_by, state.passport_fpr);
+        assert_eq!(
+            envelope.body_hash,
+            format!("blake3:{}", hex::encode(blake3::hash(b"body").as_bytes()))
+        );
+
+        let verifying = VerifyingKey::from_bytes(
+            &<[u8; 32]>::try_from(hex::decode(&state.passport_public_key_hex).unwrap().as_slice()).unwrap(),
+        )
+        .unwrap();
+        let signature =
+            Signature::from_bytes(&<[u8; 64]>::try_from(hex::decode(&envelope.signature).unwrap().as_slice()).unwrap());
+        verifying
+            .verify_strict(blake3::hash(b"body").as_bytes(), &signature)
+            .expect("receipt signature must verify against the advertised public key");
+    }
+
+    /// A governance receipt that cannot be minted must return `None` **and**
+    /// increment the audit-debt counter. Returning `None` silently would be the
+    /// exact silent audit gap this counter exists to make loud.
+    #[test]
+    fn mint_governance_receipt_records_audit_debt_on_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let mut state = stub_state_with_passport(tmp.path(), &key);
+        state.passport_fpr = "fpr-mismatch-forces-failure".to_string();
+
+        let before = receipt_mint_failures();
+        let minted = mint_governance_receipt(
+            &state,
+            "__governance__::erasure",
+            "operator",
+            "erasure_applied",
+            &serde_json::json!({ "erased": 3 }),
+        );
+        assert!(minted.is_none(), "failure must not report a receipt id");
+        assert!(
+            receipt_mint_failures() > before,
+            "audit debt must be counted, not swallowed"
+        );
+    }
+
+    #[test]
+    fn mint_governance_receipt_returns_an_observation_id_on_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        let observation_id = mint_governance_receipt(
+            &state,
+            "__governance__::gc",
+            "operator",
+            "gc_swept",
+            &serde_json::json!({ "swept": 1 }),
+        )
+        .expect("governance receipt must mint");
+        let records = read_observations(&observation_file_path(&state.data_dir, "__governance__::gc")).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].observation_id, observation_id);
+        assert_eq!(records[0].kind, "gc_swept");
+        assert_eq!(records[0].principal, "operator");
+    }
+
+    // ── Governance receipt verification (CE, no dataplane) ───────────────
+
+    /// Mint a real governance receipt and resolve it back through the
+    /// verifier a CPU-only deployment actually uses.
+    #[test]
+    fn governance_receipt_resolves_and_verifies_without_a_dataplane() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        let receipt_id = mint_governance_receipt(
+            &state,
+            "__governance__::erasure",
+            "operator",
+            "erasure.forget_tenant_corpus",
+            &serde_json::json!({ "tenant_id": "MarketResearch", "docs_masked": 7075 }),
+        )
+        .expect("governance receipt must mint");
+
+        let found = super::super::receipts::local_governance_receipt_verification(&state, &receipt_id)
+            .expect("resolver must not error")
+            .expect("the receipt it just minted must resolve");
+
+        assert!(
+            found.verification.signature_valid,
+            "{:?}",
+            found.verification.failure_reason
+        );
+        assert!(found.verification.chain_valid);
+        assert_eq!(found.tenant_id, "MarketResearch");
+        assert_eq!(found.verification.kind, "erasure.forget_tenant_corpus");
+        assert_eq!(found.verification.receipt_id, receipt_id);
+        assert_eq!(found.verification.signed_by, state.passport_fpr);
+    }
+
+    /// A tampered body must come back as an unverified *report*, not an
+    /// error and never a silent pass — this is the whole point of the
+    /// receipt.
+    #[test]
+    fn governance_receipt_with_a_tampered_body_fails_verification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        let receipt_id = mint_governance_receipt(
+            &state,
+            "__governance__::erasure",
+            "operator",
+            "erasure.forget_tenant_corpus",
+            &serde_json::json!({ "tenant_id": "MarketResearch", "docs_masked": 7075 }),
+        )
+        .expect("governance receipt must mint");
+
+        // Rewrite the docs count, leaving the signature untouched.
+        let path = observation_file_path(&state.data_dir, "__governance__::erasure");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, raw.replace("7075", "1")).unwrap();
+
+        let found = super::super::receipts::local_governance_receipt_verification(&state, &receipt_id)
+            .expect("resolver must not error")
+            .expect("the record is still present");
+        assert!(!found.verification.signature_valid);
+        assert!(found.verification.failure_reason.is_some());
+    }
+
+    #[test]
+    fn governance_receipt_lookup_of_an_unknown_id_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+        mint_governance_receipt(
+            &state,
+            "__governance__::erasure",
+            "operator",
+            "erasure.forget_tenant_corpus",
+            &serde_json::json!({ "tenant_id": "t" }),
+        )
+        .expect("governance receipt must mint");
+
+        assert!(
+            super::super::receipts::local_governance_receipt_verification(&state, "no-such-receipt")
+                .expect("resolver must not error")
+                .is_none()
+        );
+    }
+
+    /// The scan is bounded to `__governance__*` on purpose: a production
+    /// node carries tens of thousands of per-session observation logs
+    /// (59,022 against 5 mediation logs on host crux), so walking them all
+    /// on an audit lookup would be a denial-of-service surface.
+    ///
+    /// Asserted by planting a corrupt session log that `read_observations_strict`
+    /// would error on. If the resolver ever widens its filter, this stops
+    /// returning `None` and starts returning `Err`.
+    #[test]
+    fn governance_receipt_scan_never_opens_a_non_governance_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        let obs_dir = state.data_dir.join("observations");
+        std::fs::create_dir_all(&obs_dir).unwrap();
+        std::fs::write(
+            obs_dir.join("__agent_session__agent_anthropic__decoy.jsonl"),
+            "{ this is not a valid observation record\n",
+        )
+        .unwrap();
+
+        assert!(
+            super::super::receipts::local_governance_receipt_verification(&state, "anything")
+                .expect("a corrupt NON-governance log must never be read, so this must not error")
+                .is_none()
+        );
+    }
+
+    /// The durable append distinguishes "nothing was written" from "the line
+    /// landed but fsync failed". Collapsing the two would let a caller retry a
+    /// receipt-bound mutation that is in fact already on disk.
+    #[test]
+    fn append_one_durable_tracked_reports_appended_when_only_the_sync_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+        let file_path = observation_file_path(&state.data_dir, "sync-fail-session");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        // Trip the cfg(test) sync-failure injection hook.
+        std::fs::write(file_path.with_extension("sync-fail"), "").unwrap();
+
+        let failure = append_one_durable_tracked(
+            &state,
+            "sync-fail-session",
+            "principal",
+            PostObservationBody {
+                kind: "tool_use".to_string(),
+                provider: "claude-code".to_string(),
+                client_ts: None,
+                payload: serde_json::json!({ "tool": "Read" }),
+            },
+            None,
+        )
+        .err()
+        .expect("injected sync failure");
+        assert!(failure.appended, "the signed line was written before the fsync failed");
+        assert_eq!(failure.error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(failure.error.1.contains("sync observation"), "{}", failure.error.1);
+        assert_eq!(read_observations(&file_path).unwrap().len(), 1);
+    }
+
+    /// An oversize payload is rejected before any chain state is touched, and
+    /// the failure reports `appended: false` so the caller may safely retry.
+    #[test]
+    fn append_one_durable_tracked_reports_not_appended_for_an_oversize_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        let failure = append_one_durable_tracked(
+            &state,
+            "oversize-session",
+            "principal",
+            PostObservationBody {
+                kind: "tool_use".to_string(),
+                provider: "claude-code".to_string(),
+                client_ts: None,
+                payload: serde_json::json!({ "blob": "z".repeat(*MAX_PAYLOAD_BYTES + 1) }),
+            },
+            None,
+        )
+        .err()
+        .expect("oversize payload must be rejected");
+        assert!(!failure.appended);
+        assert_eq!(failure.error.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!observation_file_path(&state.data_dir, "oversize-session").exists());
+    }
+
+    // ── Cloud-witness envelope verification ──────────────────────────────
+
+    fn witness_envelope_field(envelope: &mut serde_json::Value, field: &str, value: serde_json::Value) {
+        envelope["witness"][field] = value;
+    }
+
+    /// Every envelope-level rejection, one row per guard. A gap here admits an
+    /// unverifiable witness proof into the signed observation stream.
+    #[test]
+    fn verify_cloud_witness_envelope_rejects_every_malformed_proof() {
+        let key = SigningKey::from_bytes(&[9_u8; 32]);
+        let base = || signed_cloud_witness_envelope(cloud_request_record(), &key, &key);
+
+        // Sanity: the unmodified envelope verifies.
+        verify_cloud_witness_envelope(&base()).expect("baseline envelope must verify");
+
+        let cases: Vec<(&str, Box<dyn Fn(&mut serde_json::Value)>, &str)> = vec![
+            (
+                "missing witness block",
+                Box::new(|envelope: &mut serde_json::Value| {
+                    envelope.as_object_mut().expect("object envelope").remove("witness");
+                }),
+                "malformed cloud-witness envelope",
+            ),
+            (
+                "non-ed25519 alg",
+                Box::new(|envelope: &mut serde_json::Value| {
+                    witness_envelope_field(envelope, "alg", serde_json::json!("rsa"));
+                }),
+                "witness.alg must be 'ed25519'",
+            ),
+            (
+                "blank kid",
+                Box::new(|envelope: &mut serde_json::Value| {
+                    witness_envelope_field(envelope, "kid", serde_json::json!("   "));
+                }),
+                "witness.kid must not be empty",
+            ),
+            (
+                "public key is not base64",
+                Box::new(|envelope: &mut serde_json::Value| {
+                    witness_envelope_field(envelope, "public_key_b64", serde_json::json!("!!!not base64!!!"));
+                }),
+                "invalid witness public-key base64",
+            ),
+            (
+                "public key is the wrong length",
+                Box::new(|envelope: &mut serde_json::Value| {
+                    witness_envelope_field(
+                        envelope,
+                        "public_key_b64",
+                        serde_json::json!(base64::engine::general_purpose::STANDARD.encode([1_u8; 16])),
+                    );
+                }),
+                "expected 32",
+            ),
+            (
+                "kid does not match the inline key",
+                Box::new(|envelope: &mut serde_json::Value| {
+                    witness_envelope_field(envelope, "kid", serde_json::json!("wit_0000000000000000"));
+                }),
+                "witness kid does not match the inline public key",
+            ),
+            (
+                "signature is not base64",
+                Box::new(|envelope: &mut serde_json::Value| {
+                    witness_envelope_field(envelope, "sig_b64", serde_json::json!("!!!"));
+                }),
+                "invalid witness signature base64",
+            ),
+            (
+                "signature is the wrong length",
+                Box::new(|envelope: &mut serde_json::Value| {
+                    witness_envelope_field(
+                        envelope,
+                        "sig_b64",
+                        serde_json::json!(base64::engine::general_purpose::STANDARD.encode([1_u8; 32])),
+                    );
+                }),
+                "expected 64",
+            ),
+        ];
+
+        for (label, mutate, fragment) in cases {
+            let mut envelope = base();
+            mutate(&mut envelope);
+            match verify_cloud_witness_envelope(&envelope) {
+                Err(CloudWitnessVerifyError::InvalidEnvelope(detail)) => {
+                    assert!(detail.contains(fragment), "{label}: {detail:?} missing {fragment:?}");
+                }
+                other => panic!("{label} must be rejected as InvalidEnvelope, got {other:?}"),
+            }
+        }
+    }
+
+    /// A well-formed proof signed by a *different* key must be reported as a
+    /// signature failure, distinct from a malformed envelope, so the operator
+    /// can tell forgery from a producer bug.
+    #[test]
+    fn verify_cloud_witness_envelope_separates_forgery_from_malformation() {
+        let claimed = SigningKey::from_bytes(&[1_u8; 32]);
+        let attacker = SigningKey::from_bytes(&[2_u8; 32]);
+        let envelope = signed_cloud_witness_envelope(cloud_request_record(), &claimed, &attacker);
+        assert!(matches!(
+            verify_cloud_witness_envelope(&envelope),
+            Err(CloudWitnessVerifyError::SignatureInvalid)
+        ));
+    }
+
+    /// The canonical record is signature material; an oversize one is refused
+    /// before `verify_strict` so a huge body cannot be used to burn CPU.
+    #[test]
+    fn verify_cloud_witness_envelope_rejects_an_oversize_canonical_record() {
+        let key = SigningKey::from_bytes(&[3_u8; 32]);
+        let mut record = cloud_request_record();
+        record["model"] = serde_json::json!("m".repeat(*MAX_PAYLOAD_BYTES + 64));
+        let envelope = signed_cloud_witness_envelope(record, &key, &key);
+        match verify_cloud_witness_envelope(&envelope) {
+            Err(CloudWitnessVerifyError::InvalidEnvelope(detail)) => {
+                assert!(detail.contains("exceeds"), "{detail}");
+            }
+            other => panic!("oversize record must be rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn witness_kid_is_derived_from_the_spki_digest() {
+        let key = SigningKey::from_bytes(&[4_u8; 32]);
+        let kid = witness_kid(&key.verifying_key()).expect("kid");
+        assert!(kid.starts_with("wit_"));
+        assert_eq!(kid.len(), "wit_".len() + WITNESS_KID_HEX_CHARS);
+        assert_eq!(kid, witness_kid(&key.verifying_key()).expect("kid"), "stable");
+        assert_ne!(
+            kid,
+            witness_kid(&SigningKey::from_bytes(&[5_u8; 32]).verifying_key()).expect("kid"),
+            "distinct keys must not collide"
+        );
+    }
+
+    // ── Cloud-witness record validation ──────────────────────────────────
+
+    fn witness_record(value: serde_json::Value) -> CloudWitnessRecordV1 {
+        serde_json::from_value(value).expect("witness record must deserialise")
+    }
+
+    /// Every record-level rejection, one row per guard. These are the only
+    /// checks standing between the signed-observation stream and a witness
+    /// record carrying prompt/response content or unbounded operator text.
+    #[test]
+    fn validate_cloud_witness_record_rejects_every_invalid_field() {
+        validate_cloud_witness_record(&witness_record(cloud_request_record())).expect("baseline request is valid");
+        validate_cloud_witness_record(&witness_record(cloud_response_record())).expect("baseline response is valid");
+
+        let cases: Vec<(&str, serde_json::Value, &str)> = vec![
+            (
+                "wrong schema",
+                {
+                    let mut r = cloud_request_record();
+                    r["schema"] = serde_json::json!("cuecrux.mediation.witness.v99");
+                    r
+                },
+                "record.schema must be",
+            ),
+            (
+                "unpersisted kind",
+                {
+                    let mut r = cloud_request_record();
+                    r["kind"] = serde_json::json!("cloud_something_else");
+                    r
+                },
+                "not a persisted cloud-witness kind",
+            ),
+            (
+                "blank receipt id",
+                {
+                    let mut r = cloud_request_record();
+                    r["receipt_id"] = serde_json::json!("   ");
+                    r
+                },
+                "record.receipt_id",
+            ),
+            (
+                "nonce of the wrong width",
+                {
+                    let mut r = cloud_request_record();
+                    r["nonce"] = serde_json::json!("abc");
+                    r
+                },
+                "record.nonce",
+            ),
+            (
+                "uppercase-hex nonce",
+                {
+                    let mut r = cloud_request_record();
+                    r["nonce"] = serde_json::json!("AA".repeat(16));
+                    r
+                },
+                "record.nonce",
+            ),
+            (
+                "blank provider",
+                {
+                    let mut r = cloud_request_record();
+                    r["provider"] = serde_json::json!(" ");
+                    r
+                },
+                "record.provider",
+            ),
+            (
+                "oversize path",
+                {
+                    let mut r = cloud_request_record();
+                    r["path"] = serde_json::json!("/".repeat(129));
+                    r
+                },
+                "record.path",
+            ),
+            (
+                "provider/path outside the allowlist",
+                {
+                    let mut r = cloud_request_record();
+                    r["path"] = serde_json::json!("/v1/complete");
+                    r
+                },
+                "outside the cloud-witness allowlist",
+            ),
+            (
+                "oversize model",
+                {
+                    let mut r = cloud_request_record();
+                    r["model"] = serde_json::json!("m".repeat(257));
+                    r
+                },
+                "record.model exceeds 256 bytes",
+            ),
+            (
+                "blank session hint",
+                {
+                    let mut r = cloud_request_record();
+                    r["session_hint"] = serde_json::json!("  ");
+                    r
+                },
+                "record.session_hint",
+            ),
+            (
+                "too many tool names",
+                {
+                    let mut r = cloud_request_record();
+                    r["tool_names"] = serde_json::json!(vec!["t"; 129]);
+                    r
+                },
+                "record.tool_names",
+            ),
+            (
+                "blank tool name",
+                {
+                    let mut r = cloud_request_record();
+                    r["tool_names"] = serde_json::json!([" "]);
+                    r
+                },
+                "record.tool_names",
+            ),
+            (
+                "non-token usage key",
+                {
+                    let mut r = cloud_response_record();
+                    r["usage"] = serde_json::json!({ "prompt_text": 1 });
+                    r
+                },
+                "numeric token counters only",
+            ),
+            (
+                "non-numeric usage value",
+                {
+                    let mut r = cloud_response_record();
+                    r["usage"] = serde_json::json!({ "input_tokens": "seventeen" });
+                    r
+                },
+                "numeric token counters only",
+            ),
+            (
+                "oversize stop reason",
+                {
+                    let mut r = cloud_response_record();
+                    r["stop_reason"] = serde_json::json!("s".repeat(257));
+                    r
+                },
+                "response metadata exceeds its size cap",
+            ),
+            (
+                "oversize finish reason",
+                {
+                    let mut r = cloud_response_record();
+                    r["finish_reason"] = serde_json::json!("f".repeat(257));
+                    r
+                },
+                "response metadata exceeds its size cap",
+            ),
+            (
+                "oversize end state",
+                {
+                    let mut r = cloud_response_record();
+                    r["end_state"] = serde_json::json!("e".repeat(33));
+                    r
+                },
+                "response metadata exceeds its size cap",
+            ),
+            (
+                "request without a digest",
+                {
+                    let mut r = cloud_request_record();
+                    r["request_digest"] = serde_json::Value::Null;
+                    r
+                },
+                "requires request_digest",
+            ),
+            (
+                "request digest without the sha256 prefix",
+                {
+                    let mut r = cloud_request_record();
+                    r["request_digest"] = serde_json::json!("11".repeat(32));
+                    r
+                },
+                "sha256:<hex> form",
+            ),
+            (
+                "request digest of the wrong width",
+                {
+                    let mut r = cloud_request_record();
+                    r["request_digest"] = serde_json::json!("sha256:abcd");
+                    r
+                },
+                "64 lowercase hexadecimal digits",
+            ),
+            (
+                "request digest in uppercase hex",
+                {
+                    let mut r = cloud_request_record();
+                    r["request_digest"] = serde_json::json!(format!("sha256:{}", "AB".repeat(32)));
+                    r
+                },
+                "64 lowercase hexadecimal digits",
+            ),
+            (
+                "response without a request receipt id",
+                {
+                    let mut r = cloud_response_record();
+                    r["request_receipt_id"] = serde_json::Value::Null;
+                    r
+                },
+                "requires request_receipt_id",
+            ),
+            (
+                "response with a blank request receipt id",
+                {
+                    let mut r = cloud_response_record();
+                    r["request_receipt_id"] = serde_json::json!("");
+                    r
+                },
+                "record.request_receipt_id",
+            ),
+            (
+                "malformed output digest",
+                {
+                    let mut r = cloud_response_record();
+                    r["output_digest"] = serde_json::json!("sha256:zz");
+                    r
+                },
+                "record.output_digest",
+            ),
+            (
+                "unknown end state",
+                {
+                    let mut r = cloud_response_record();
+                    r["end_state"] = serde_json::json!("exploded");
+                    r
+                },
+                "record.end_state is invalid",
+            ),
+        ];
+
+        for (label, value, fragment) in cases {
+            let detail = validate_cloud_witness_record(&witness_record(value))
+                .err()
+                .unwrap_or_else(|| panic!("{label} must be rejected"));
+            assert!(detail.contains(fragment), "{label}: {detail:?} missing {fragment:?}");
+        }
+    }
+
+    /// The OpenAI paths are in the allowlist alongside Anthropic's; a
+    /// regression here silently stops witnessing an entire provider.
+    #[test]
+    fn validate_cloud_witness_record_accepts_the_whole_provider_allowlist() {
+        for (provider, path) in [
+            ("anthropic", "/v1/messages"),
+            ("openai", "/v1/chat/completions"),
+            ("openai", "/v1/responses"),
+        ] {
+            let mut record = cloud_request_record();
+            record["provider"] = serde_json::json!(provider);
+            record["path"] = serde_json::json!(path);
+            validate_cloud_witness_record(&witness_record(record))
+                .unwrap_or_else(|err| panic!("{provider}{path} must be accepted: {err}"));
+        }
+    }
+
+    #[test]
+    fn validate_cloud_witness_record_accepts_every_documented_end_state() {
+        for state in ["completed", "aborted", "upstream_error"] {
+            let mut record = cloud_response_record();
+            record["end_state"] = serde_json::json!(state);
+            validate_cloud_witness_record(&witness_record(record))
+                .unwrap_or_else(|err| panic!("end_state {state} must be accepted: {err}"));
+        }
+    }
+
+    /// `deny_unknown_fields` is the content-exclusion boundary: an extra signed
+    /// key must fail to deserialise rather than be copied into the payload.
+    #[test]
+    fn cloud_witness_record_rejects_unknown_signed_fields() {
+        let mut record = cloud_request_record();
+        record["prompt"] = serde_json::json!("secret content");
+        let parsed: Result<CloudWitnessRecordV1, _> = serde_json::from_value(record);
+        assert!(parsed.is_err(), "unknown signed fields must not deserialise");
+    }
+
+    // ── Problem responses ────────────────────────────────────────────────
+
+    /// The 503 branch carries a different title from the 4xx branch: a client
+    /// must be able to tell "your envelope is wrong" (do not retry) from
+    /// "verification is unavailable" (retry / spool).
+    #[tokio::test]
+    async fn cloud_witness_problem_titles_separate_client_and_server_faults() {
+        let unavailable = cloud_witness_problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "witness_verification_unavailable",
+            "try later",
+        );
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_to_json(unavailable).await;
+        assert_eq!(body["title"], "Witness Verification Unavailable");
+        assert_eq!(body["code"], "witness_verification_unavailable");
+
+        let invalid = cloud_witness_problem(StatusCode::BAD_REQUEST, "witness_envelope_invalid", "bad kid");
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let body = response_to_json(invalid).await;
+        assert_eq!(body["title"], "Invalid Cloud-Witness Envelope");
+        assert_eq!(body["detail"], "bad kid");
+    }
+
+    // ── ChainStatus → JSON projection ────────────────────────────────────
+
+    /// The wire projection must not leak a "broken" chain as `ok` by omission:
+    /// each variant maps to exactly one status string with its own fields set.
+    #[test]
+    fn chain_status_json_projects_each_variant_distinctly() {
+        let no_chain = ChainStatusJson::from(ChainStatus::NoChain);
+        assert_eq!(no_chain.status, "no_chain");
+        assert!(no_chain.chained_len.is_none() && no_chain.broken_at_index.is_none());
+
+        let ok = ChainStatusJson::from(ChainStatus::Ok {
+            legacy_prefix_len: 2,
+            chained_len: 5,
+        });
+        assert_eq!(ok.status, "ok");
+        assert_eq!(ok.legacy_prefix_len, Some(2));
+        assert_eq!(ok.chained_len, Some(5));
+        assert!(ok.broken_at_index.is_none() && ok.reason.is_none());
+
+        let broken = ChainStatusJson::from(ChainStatus::Broken {
+            at_index: 3,
+            reason: "seq gap".to_string(),
+        });
+        assert_eq!(broken.status, "broken");
+        assert_eq!(broken.broken_at_index, Some(3));
+        assert_eq!(broken.reason.as_deref(), Some("seq gap"));
+        assert!(broken.chained_len.is_none());
     }
 }

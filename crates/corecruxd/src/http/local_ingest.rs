@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! `POST /v1/local/ingest` — local CPU prose-ingest door.
 //!
@@ -24,13 +24,71 @@ use super::{
     problem_response, AppState, HeaderMap, IntoResponse, Json, ProblemDetails, ProblemResponse, Response, State,
     StatusCode,
 };
-use crate::local_ingest::{seal_prose_documents, ProseChunk, ProseDocument};
+use crate::local_ingest::{ingest_prose_documents, LocalIngestHandles, ProseChunk, ProseDocument};
 use corecrux_memory::embeddings::SemanticProfile;
 
-/// Single-node local ingest writes to shard 0 at a fixed epoch. Segment
-/// sequence auto-increments within the shard and persists via the MANIFEST.
-const LOCAL_INGEST_SHARD_ID: u32 = 0;
-const LOCAL_INGEST_EPOCH: u64 = 1;
+/// Whether this ingest's dense lane came out whole, and if not, how it failed.
+///
+/// ExecPlan `corecrux-ingest-dense-silent-failure-2026-08-07` (B1): before this,
+/// an embed failure was a WARN in the daemon log and nothing else — the response
+/// was an ordinary 202 with `sealed: true`, a full `frame_count` and
+/// `dense_vectors: 0`. BM25 still indexes, so the tenant looked healthy while
+/// retrieval had silently degraded to lexical-only. A caller can now assert
+/// `dense_status == "ok"` (or compare `dense_vectors` to `dense_expected`)
+/// without knowing anything about this node's embedder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DenseStatus {
+    /// Every chunk that should carry a vector has one.
+    Ok,
+    /// Some chunks were embedded and some were not.
+    Partial,
+    /// Vectors were expected for this ingest and none were written — the embed
+    /// step failed (see the `local-ingest-embedding-failed` WARN for the cause).
+    Skipped,
+    /// No vectors were expected: the caller supplied none and the node has no
+    /// embedder. A BM25-only corpus by configuration, not by failure.
+    NotConfigured,
+    /// Nothing was sealed (an idempotent re-ingest of already-stored chunks), so
+    /// there are no new frames whose dense lane could be whole or missing.
+    NotApplicable,
+}
+
+impl DenseStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            DenseStatus::Ok => "ok",
+            DenseStatus::Partial => "partial",
+            DenseStatus::Skipped => "skipped",
+            DenseStatus::NotConfigured => "not_configured",
+            DenseStatus::NotApplicable => "not_applicable",
+        }
+    }
+}
+
+/// Classify the dense outcome of one ingest. `expected` is how many chunks
+/// should carry a vector (every chunk for a server-embedded ingest; the chunks
+/// that carried one for a caller-supplied batch; zero otherwise), `written` is
+/// how many the seal actually persisted to the `.ccxe` companion.
+pub(super) fn dense_status(sealed: bool, expected: usize, written: usize) -> DenseStatus {
+    if !sealed {
+        return DenseStatus::NotApplicable;
+    }
+    match (expected, written) {
+        (0, _) => DenseStatus::NotConfigured,
+        (e, w) if w == e => DenseStatus::Ok,
+        (_, 0) => DenseStatus::Skipped,
+        _ => DenseStatus::Partial,
+    }
+}
+
+/// Request-body ceiling for this route, matching the daemon-wide
+/// `CORECRUXD_MAX_REQUEST_BODY_BYTES` default that the 413 problem response
+/// names ([`crate::http::ingress`]).
+///
+/// Without this the route inherits axum's 2 MiB `DefaultBodyLimit`, so an ingest
+/// of ~2 MiB was refused with a 413 whose detail claimed a 16 MiB limit — the
+/// numbers a harness author reads to size their batches were wrong by 8×.
+pub(super) const LOCAL_INGEST_MAX_REQUEST_BYTES: usize = crate::config::DEFAULT_MAX_REQUEST_BODY_BYTES;
 
 /// Max documents accepted in a single request.
 const MAX_DOCUMENTS_PER_REQUEST: usize = 4096;
@@ -185,6 +243,15 @@ pub(super) fn validate_payload(body: &LocalIngestBody) -> Result<AcceptedCounts,
     })
 }
 
+/// Project the request state onto the handles the shared write path needs.
+fn local_ingest_handles(state: &AppState) -> LocalIngestHandles {
+    LocalIngestHandles {
+        data_dir: state.data_dir.clone(),
+        ingest_lock: state.local_ingest_lock.clone(),
+        retrieval_index: state.retrieval_index.clone(),
+    }
+}
+
 fn local_ingest_disabled_response() -> Response {
     problem_response(
         StatusCode::NOT_FOUND,
@@ -217,7 +284,7 @@ pub(super) async fn post_local_ingest(
 
     // Server-side local embedding (buyer-fit M3.2): when the caller supplied no
     // dense vectors at all and the node has an embedder (the pure-Rust
-    // LocalHashEmbedder by default), embed every chunk here so the `.ccxv`
+    // LocalHashEmbedder by default), embed every chunk here so the `.ccxe`
     // companion is written and prose dense recall works offline with zero
     // external service. If the caller supplied ANY vector we respect theirs and
     // do not mix a local 256-dim vector into a foreign-dimension batch (the seal
@@ -332,7 +399,7 @@ pub(super) async fn post_local_ingest(
         }
     }
 
-    // The profile to persist alongside the `.ccxv` companion: the node embedder's
+    // The profile to persist alongside the `.ccxe` companion: the node embedder's
     // for server-embedded ingests; the caller's declared profile for supplied
     // vectors (or a dimension-only marker when undeclared, so a later query with a
     // different embedder can still tell the space apart).
@@ -406,6 +473,7 @@ pub(super) async fn post_local_ingest(
                 &state.data_dir,
                 probe_embedding,
                 &profile.embedding_fingerprint.hash,
+                Some(profile.model.as_str()),
             )
         };
         match compatibility {
@@ -419,6 +487,20 @@ pub(super) async fn post_local_ingest(
             }
         }
     }
+
+    // B1: how many chunks this ingest expects to carry a vector — every chunk
+    // when the node embeds server-side, the caller-vectored subset otherwise.
+    // Compared against what the seal actually wrote, this is what turns a silent
+    // dense gap into a reported one.
+    let dense_expected = if server_embed {
+        body.documents.iter().map(|d| d.chunks.len()).sum::<usize>()
+    } else {
+        body.documents
+            .iter()
+            .flat_map(|d| &d.chunks)
+            .filter(|c| c.dense_vector.is_some())
+            .count()
+    };
 
     // Map the wire payload to the seal-core document model.
     let documents: Vec<ProseDocument> = if server_embed {
@@ -456,103 +538,71 @@ pub(super) async fn post_local_ingest(
             .collect()
     };
 
-    let data_dir = state.data_dir.clone();
-    let tenant = body.tenant_id.clone();
-    let corpus = body.corpus_id.clone();
-    let ingested_at = chrono::Utc::now().to_rfc3339();
-    let now_ms = crate::ops_events::now_unix_ms();
-
-    // Serialize ingests (each seal takes the shard's exclusive lock), then run
-    // the blocking seal + timeline write off the async runtime.
-    let _guard = state.local_ingest_lock.lock().await;
-    let seal_result = tokio::task::spawn_blocking(move || -> Result<SealOutcome, String> {
-        let summary = seal_prose_documents(
-            &data_dir,
-            LOCAL_INGEST_SHARD_ID,
-            LOCAL_INGEST_EPOCH,
-            &tenant,
-            &corpus,
-            &ingested_at,
-            &documents,
-            dense_profile.as_ref(),
-        )
-        .map_err(|e| e.to_string())?;
-
-        // T.4: record a timeline row per document (same console index the
-        // `/v1/append` path writes). Best-effort — a timeline miss never fails
-        // an otherwise-durable ingest.
-        for doc in &documents {
-            let events: Vec<corecrux_proto::dataplane_v1::AppendEvent> = doc
-                .chunks
-                .iter()
-                .map(|c| corecrux_proto::dataplane_v1::AppendEvent {
-                    event_id: c.chunk_id.clone(),
-                    occurred_at: ingested_at.clone(),
-                    event_type: crate::local_ingest::PROSE_CHUNK_EVENT_TYPE.to_string(),
-                    content_type: crate::local_ingest::PROSE_CHUNK_CONTENT_TYPE.to_string(),
-                    payload: c.text.as_bytes().to_vec(),
-                })
-                .collect();
-            if let Err(err) = crate::console_index::record_appended_events(
-                &data_dir,
-                &tenant,
-                &corpus,
-                &doc.doc_id,
-                0,
-                &events,
-                now_ms,
-            ) {
-                tracing::warn!(?err, doc_id = %doc.doc_id, "local-ingest timeline indexing failed");
-            }
+    // Seal + timeline + index reload run through the shared write path so the
+    // in-process producers (the vault watcher) are byte-identical to this route.
+    let summary = match ingest_prose_documents(
+        &local_ingest_handles(&state),
+        &body.tenant_id,
+        &body.corpus_id,
+        documents,
+        dense_profile,
+    )
+    .await
+    {
+        Ok(summary) => {
+            let mut streak = state.seal_failed_streak.write().await;
+            *streak = (0, None);
+            summary
         }
-
-        Ok(SealOutcome {
-            segment_seq: summary.segment_seq,
-            frame_count: summary.frame_count,
-            documents: summary.documents,
-            chunks: summary.chunks,
-            sealed: summary.sealed,
-            receipt_id: summary.receipt_material_hash.map(hex32),
-            dense_dim: summary.dense_dim,
-            dense_vectors: summary.dense_vectors,
-        })
-    })
-    .await;
-
-    let outcome = match seal_result {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(msg)) => {
-            tracing::error!(error = %msg, "local-ingest seal failed");
+        Err(msg) => {
+            // Count the streak so `/readyz` can report a dead write path. A 500
+            // per request and nothing else is what let host `crux` sit broken
+            // for 38 hours: reads were fine, so every probe stayed green.
+            let streak = {
+                let mut streak = state.seal_failed_streak.write().await;
+                streak.0 = streak.0.saturating_add(1);
+                streak.1 = Some(msg.clone());
+                streak.0
+            };
+            state.metrics.inc_local_ingest_seal_failed();
+            tracing::error!(
+                error = %msg,
+                consecutive_failures = streak,
+                "local-ingest seal failed"
+            );
             return problem_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("local ingest seal failed: {msg}"),
             );
         }
-        Err(join_err) => {
-            tracing::error!(error = %join_err, "local-ingest seal task panicked");
-            return problem_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "local ingest seal task failed".to_string(),
-            );
-        }
     };
-
-    // Load-at-runtime wiring: hot-reload the retrieval index so the freshly
-    // sealed `.ccxi` is queryable immediately (idempotent — scan skips
-    // already-loaded segments).
-    {
-        let mut guard = state.retrieval_index.write().await;
-        let shards_dir = state.data_dir.join("shards");
-        if let Ok(entries) = std::fs::read_dir(&shards_dir) {
-            for entry in entries.flatten() {
-                let seg_dir = entry.path().join("segments");
-                if let Err(err) = guard.scan_and_load(&seg_dir) {
-                    tracing::warn!(?err, dir = ?seg_dir, "local-ingest ccxi reload failed");
-                }
-            }
-        }
+    let dense = dense_status(summary.sealed, dense_expected, summary.dense_vectors);
+    // A segment must never seal with a silent dense gap: the response says so
+    // (below) and the daemon says so here, at WARN, with the numbers that let an
+    // operator find the affected segment.
+    if matches!(dense, DenseStatus::Skipped | DenseStatus::Partial) {
+        tracing::warn!(
+            tenant_id = %body.tenant_id,
+            corpus_id = %body.corpus_id,
+            segment_seq = summary.segment_seq,
+            dense_status = dense.as_str(),
+            dense_expected,
+            dense_written = summary.dense_vectors,
+            "local-ingest-dense-gap-sealed"
+        );
     }
-    drop(_guard);
+    let outcome = SealOutcome {
+        segment_seq: summary.segment_seq,
+        frame_count: summary.frame_count,
+        documents: summary.documents,
+        chunks: summary.chunks,
+        sealed: summary.sealed,
+        receipt_id: summary.receipt_material_hash.map(hex32),
+        dense_dim: summary.dense_dim,
+        dense_vectors: summary.dense_vectors,
+        dense_expected,
+        dense_status: dense,
+    };
 
     (
         StatusCode::ACCEPTED,
@@ -565,6 +615,8 @@ pub(super) async fn post_local_ingest(
             "receipt_id": outcome.receipt_id,
             "dense_vectors": outcome.dense_vectors,
             "dense_dim": outcome.dense_dim,
+            "dense_expected": outcome.dense_expected,
+            "dense_status": outcome.dense_status.as_str(),
         })),
     )
         .into_response()
@@ -580,6 +632,8 @@ struct SealOutcome {
     receipt_id: Option<String>,
     dense_dim: Option<usize>,
     dense_vectors: usize,
+    dense_expected: usize,
+    dense_status: DenseStatus,
 }
 
 /// Lower-hex encode a 32-byte digest.
@@ -596,6 +650,34 @@ fn hex32(bytes: [u8; 32]) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// A configured, NON-delegating embedder that always fails — an Ollama-style
+    /// [`corecrux_memory::embeddings::EmbeddingClient`] whose service is down, or
+    /// (the B1 case) whose response overflowed the client's body limit. This path
+    /// keeps its sparse-only fallback by contract; the point of the assertions
+    /// below is that the fallback is now *reported*.
+    #[derive(Debug)]
+    struct FailingLocalEmbedder;
+
+    impl corecrux_memory::embeddings::Embedder for FailingLocalEmbedder {
+        fn embed_batch(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, corecrux_memory::embeddings::EmbeddingError> {
+            Err(corecrux_memory::embeddings::EmbeddingError::Deserialize(
+                "json: the response body is larger than request limit: 10485760".to_string(),
+            ))
+        }
+
+        fn dimensions(&self) -> usize {
+            1024
+        }
+
+        fn model(&self) -> &str {
+            "bge-m3"
+        }
+
+        fn semantic_profile(&self) -> SemanticProfile {
+            SemanticProfile::from_parts("bge-m3", 1024, "model_default", "none", "none")
+        }
+    }
 
     #[derive(Debug)]
     struct DegradedDelegation;
@@ -684,6 +766,144 @@ mod tests {
             }],
             semantic_profile: None,
         }
+    }
+
+    /// The route must accept a body up to the daemon-wide limit its own 413
+    /// message advertises. Without the explicit `DefaultBodyLimit` the route
+    /// inherited axum's 2 MiB default and refused a 3 MiB ingest while claiming
+    /// a 16 MiB ceiling — mis-sizing every harness that reads that number.
+    #[tokio::test]
+    async fn ingest_route_accepts_a_body_over_the_axum_default_limit() {
+        use tower::ServiceExt as _;
+
+        let mut state = super::super::tests::test_app_state(16);
+        state.local_ingest_enabled = true;
+        let app = super::super::router(state, super::super::tests::test_case_store());
+
+        // ~3 MiB of payload: over axum's 2 MiB default, under the 16 MiB
+        // daemon limit.
+        let filler = "lorem ipsum dolor sit amet ".repeat(4_000);
+        let body = serde_json::json!({
+            "tenant_id": "tenant-bodylimit",
+            "corpus_id": "docs",
+            "documents": [{
+                "doc_id": "big",
+                "chunks": (0..30)
+                    .map(|i| serde_json::json!({
+                        "chunk_id": format!("big::{i}"),
+                        "text": format!("{i} {filler}"),
+                    }))
+                    .collect::<Vec<_>>(),
+            }],
+        })
+        .to_string();
+        assert!(
+            body.len() > 2 * 1024 * 1024 && body.len() < LOCAL_INGEST_MAX_REQUEST_BYTES,
+            "fixture must straddle the two limits (was {} bytes)",
+            body.len()
+        );
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::post("/v1/local/ingest")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::ACCEPTED,
+            "a 3 MiB ingest must not be refused as payload-too-large"
+        );
+    }
+
+    // ── B1: dense outcome reporting ──────────────────────────────────────
+
+    #[test]
+    fn dense_status_classifies_every_outcome() {
+        assert_eq!(dense_status(true, 10, 10), DenseStatus::Ok);
+        assert_eq!(dense_status(true, 10, 0), DenseStatus::Skipped);
+        assert_eq!(dense_status(true, 10, 4), DenseStatus::Partial);
+        assert_eq!(dense_status(true, 0, 0), DenseStatus::NotConfigured);
+        // An idempotent re-ingest seals nothing, so there is no gap to report.
+        assert_eq!(dense_status(false, 10, 0), DenseStatus::NotApplicable);
+    }
+
+    /// B1 negative: a configured embedder that fails keeps the sparse-only
+    /// fallback — but the response now says `skipped`, carries `dense_expected`,
+    /// and never looks like a healthy dense ingest.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_embedding_reports_skipped_dense_status() {
+        let mut state = super::super::tests::test_app_state(16);
+        state.local_ingest_enabled = true;
+        state
+            .fact_store
+            .write()
+            .await
+            .set_embedder(Box::new(FailingLocalEmbedder));
+
+        let resp = post_local_ingest(State(state), HeaderMap::new(), Json(valid_body()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED, "sparse fallback still seals");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["sealed"], serde_json::json!(true));
+        assert_eq!(json["dense_vectors"], serde_json::json!(0));
+        assert_eq!(
+            json["dense_expected"],
+            serde_json::json!(2),
+            "both chunks were expected to embed"
+        );
+        assert_eq!(
+            json["dense_status"], "skipped",
+            "a silent dense gap must be reported to the caller"
+        );
+    }
+
+    /// B1 positive: a healthy server-embedded ingest reports `ok`, and
+    /// `dense_expected` equals the chunks sent — the equality a harness asserts.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn server_embedded_ingest_reports_ok_dense_status() {
+        let mut state = super::super::tests::test_app_state(16);
+        state.local_ingest_enabled = true;
+        state
+            .fact_store
+            .write()
+            .await
+            .set_embedder(Box::new(corecrux_memory::embeddings::LocalHashEmbedder::default()));
+
+        let resp = post_local_ingest(State(state), HeaderMap::new(), Json(valid_body()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["dense_status"], "ok");
+        assert_eq!(json["dense_expected"], serde_json::json!(2));
+        assert_eq!(json["dense_vectors"], serde_json::json!(2));
+    }
+
+    /// A node with no embedder is BM25-only by configuration, not by failure —
+    /// it must not be reported as a dense gap.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn no_embedder_reports_not_configured_not_a_gap() {
+        let mut state = super::super::tests::test_app_state(16);
+        state.local_ingest_enabled = true;
+
+        let resp = post_local_ingest(State(state), HeaderMap::new(), Json(valid_body()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["dense_status"], "not_configured");
+        assert_eq!(json["dense_expected"], serde_json::json!(0));
     }
 
     #[test]
@@ -903,10 +1123,10 @@ mod tests {
                 dense_vector: Some(vec![0.0, 1.0]),
             }],
         }];
-        seal_prose_documents(
+        crate::local_ingest::seal_prose_documents(
             &state.data_dir,
-            LOCAL_INGEST_SHARD_ID,
-            LOCAL_INGEST_EPOCH,
+            crate::local_ingest::LOCAL_INGEST_SHARD_ID,
+            crate::local_ingest::LOCAL_INGEST_EPOCH,
             "t1",
             "mediacrux-archive",
             "2026-07-20T00:00:00Z",
@@ -1025,8 +1245,16 @@ mod tests {
         assert_eq!(guard.total_docs(), 2);
         let th = Some(tenant_hash("tenant-m2h"));
         let p = Bm25Params::default();
-        assert_eq!(bm25_search(&readers, "aurora borealis", 10, th, &p, None).hits.len(), 1);
-        assert_eq!(bm25_search(&readers, "anglerfish", 10, th, &p, None).hits.len(), 1);
+        assert_eq!(
+            bm25_search(&readers, "aurora borealis", 10, th, &p, None, None)
+                .hits
+                .len(),
+            1
+        );
+        assert_eq!(
+            bm25_search(&readers, "anglerfish", 10, th, &p, None, None).hits.len(),
+            1
+        );
 
         // The .ccxi landed exactly where the daemon startup scan looks.
         let seg_dir = data_dir.join("shards").join("shard-0000").join("segments");
@@ -1071,8 +1299,11 @@ mod tests {
         let readers = cold.readers();
         let th = Some(tenant_hash("tenant-restart"));
         let p = Bm25Params::default();
-        assert_eq!(bm25_search(&readers, "quartz", 10, th, &p, None).hits.len(), 1);
-        assert_eq!(bm25_search(&readers, "arctic terns", 10, th, &p, None).hits.len(), 1);
+        assert_eq!(bm25_search(&readers, "quartz", 10, th, &p, None, None).hits.len(), 1);
+        assert_eq!(
+            bm25_search(&readers, "arctic terns", 10, th, &p, None, None).hits.len(),
+            1
+        );
     }
 
     /// M4 (daemon side): a MediaCrux-scale backfill — 357 prose documents in one
@@ -1118,7 +1349,7 @@ mod tests {
         let p = Bm25Params::default();
         // Spot-check a few individual articles are retrievable by their token.
         for i in [0usize, 42, 200, 356] {
-            let hits = bm25_search(&readers, &format!("articletoken{i}"), 10, th, &p, None).hits;
+            let hits = bm25_search(&readers, &format!("articletoken{i}"), 10, th, &p, None, None).hits;
             assert_eq!(hits.len(), 1, "article {i} must be BM25-served");
         }
     }
@@ -1157,11 +1388,11 @@ mod tests {
 
     /// buyer-fit M3.2 (Track B): with the node's local embedder wired and NO
     /// client-supplied vectors, ingest embeds every chunk server-side, writes the
-    /// `.ccxv` companion, and the prose text-search path dense-re-ranks the query
+    /// `.ccxe` companion, and the prose text-search path dense-re-ranks the query
     /// — all with no external embedding service.
     #[tokio::test]
     #[serial_test::serial]
-    async fn m3_server_side_local_embedding_writes_ccxv_and_query_dense_reranks() {
+    async fn m3_server_side_local_embedding_writes_ccxe_and_query_dense_reranks() {
         std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
         let mut state = super::super::tests::test_app_state(16);
         state.local_ingest_enabled = true;
@@ -1199,13 +1430,13 @@ mod tests {
             "local embedder dimension persisted"
         );
 
-        // The `.ccxv` companion landed next to the sealed segment.
+        // The `.ccxe` companion landed next to the sealed segment.
         let seg_dir = data_dir.join("shards").join("shard-0000").join("segments");
-        let has_ccxv = std::fs::read_dir(&seg_dir)
+        let has_ccxe = std::fs::read_dir(&seg_dir)
             .unwrap()
             .flatten()
-            .any(|e| e.file_name().to_string_lossy().ends_with(".ccxv"));
-        assert!(has_ccxv, ".ccxv dense companion must be written at ingest");
+            .any(|e| e.file_name().to_string_lossy().ends_with(".ccxe"));
+        assert!(has_ccxe, ".ccxe dense companion must be written at ingest");
 
         // Text-search now dense-re-ranks: the fused score space is reported and
         // the dense lane is active — with no external embedder configured.
@@ -1239,7 +1470,7 @@ mod tests {
         );
     }
 
-    /// A prose ingest with NO embedder wired stays BM25-only: no `.ccxv`, and the
+    /// A prose ingest with NO embedder wired stays BM25-only: no `.ccxe`, and the
     /// query path leaves the dense lane inert (bit-identical to the prior path).
     #[tokio::test]
     #[serial_test::serial]
@@ -1259,11 +1490,11 @@ mod tests {
         assert_eq!(json["dense_vectors"], serde_json::json!(0), "no embedder ⇒ no vectors");
 
         let seg_dir = data_dir.join("shards").join("shard-0000").join("segments");
-        let has_ccxv = std::fs::read_dir(&seg_dir)
+        let has_ccxe = std::fs::read_dir(&seg_dir)
             .unwrap()
             .flatten()
-            .any(|e| e.file_name().to_string_lossy().ends_with(".ccxv"));
-        assert!(!has_ccxv, "no .ccxv without an embedder");
+            .any(|e| e.file_name().to_string_lossy().ends_with(".ccxe"));
+        assert!(!has_ccxe, "no .ccxe without an embedder");
 
         let ts_body = crate::http::query::TextSearchBody {
             tenant_id: "tenant-noemb".to_string(),
@@ -1335,11 +1566,11 @@ mod tests {
         );
     }
 
-    /// buyer-fit M3.3: a server-embedded ingest writes the `.ccxp` profile sidecar
-    /// recording the node embedder, next to the `.ccxv`.
+    /// buyer-fit M3.3: a server-embedded ingest writes the `.ccxprof` profile sidecar
+    /// recording the node embedder, next to the `.ccxe`.
     #[tokio::test]
     #[serial_test::serial]
-    async fn m3_ccxp_profile_sidecar_written_on_server_embed() {
+    async fn m3_ccxprof_profile_sidecar_written_on_server_embed() {
         let mut state = super::super::tests::test_app_state(16);
         state.local_ingest_enabled = true;
         state
@@ -1349,21 +1580,21 @@ mod tests {
             .set_embedder(Box::new(corecrux_memory::embeddings::LocalHashEmbedder::default()));
         let data_dir = state.data_dir.clone();
 
-        let body = body_with("tenant-ccxp", "docs", &[("d1", "profile sidecar coverage prose")]);
+        let body = body_with("tenant-ccxprof", "docs", &[("d1", "profile sidecar coverage prose")]);
         let resp = post_local_ingest(State(state), HeaderMap::new(), Json(body))
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
         let seg_dir = data_dir.join("shards").join("shard-0000").join("segments");
-        let ccxp = std::fs::read_dir(&seg_dir)
+        let ccxprof = std::fs::read_dir(&seg_dir)
             .unwrap()
             .flatten()
             .map(|e| e.path())
-            .find(|p| p.extension().is_some_and(|x| x == "ccxp"))
-            .expect(".ccxp sidecar must be written");
+            .find(|p| p.extension().is_some_and(|x| x == "ccxprof"))
+            .expect(".ccxprof sidecar must be written");
         let profile: corecrux_memory::embeddings::SemanticProfile =
-            serde_json::from_slice(&std::fs::read(&ccxp).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(&ccxprof).unwrap()).unwrap();
         assert_eq!(profile.model, corecrux_memory::embeddings::LOCAL_HASH_EMBEDDER_MODEL);
         assert_eq!(profile.dimensions, 256);
     }

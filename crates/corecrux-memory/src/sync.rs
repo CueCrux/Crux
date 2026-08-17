@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Sync client — pull facts from a remote CoreCrux instance and push local
 //! facts back. Uses cursor-based pagination and best-effort error handling.
@@ -397,6 +397,9 @@ pub fn apply_promoted_records(store: &mut FactStore, records: &[SyncCollectionRe
         if fact.private {
             continue;
         }
+        if crate::fact_privacy::generic_create_reserved_entity_prefix(&fact.entity).is_some() {
+            continue;
+        }
         fact.source_receipt = Some(format!(
             "sync-promotion:{}:{}",
             remote_url.trim_end_matches('/'),
@@ -431,7 +434,7 @@ pub fn offboard_tenant_mirror(store: &mut FactStore, tenant_id: &str, membership
         let pre_wipe_hash = hash_facts(tenant_id, &facts);
         let mut deleted_this_collection = 0usize;
         for fact in facts {
-            if store.delete(&fact.fact_id) {
+            if store.delete(&fact.tenant_hash, &fact.fact_id) {
                 deleted_this_collection += 1;
                 deleted_fact_ids.push(fact.fact_id.clone());
                 let tombstone = store.store(crate::fact_store::StoreFact {
@@ -1012,6 +1015,17 @@ impl SyncClient {
             let facts: Vec<Fact> =
                 serde_json::from_value(body["facts"].clone()).map_err(|e| format!("sync facts parse: {e}"))?;
 
+            // Reject the whole remote page before the first local mutation.
+            // Otherwise a safe first fact followed by a protected record
+            // leaves a partial page behind while the cursor remains stale.
+            for fact in &facts {
+                if let Some(prefix) = crate::fact_privacy::generic_create_reserved_entity_prefix(&fact.entity) {
+                    return Err(format!(
+                        "sync pull rejected fact '{}' in create-reserved namespace `{prefix}`",
+                        fact.fact_id
+                    ));
+                }
+            }
             for mut fact in facts {
                 // Tag as synced so we don't push it back
                 fact.source_receipt = Some(format!("sync:{}:{}", self.remote_url, fact.fact_id));
@@ -1095,10 +1109,18 @@ impl SyncClient {
                     .read_json()
                     .map_err(|e| format!("tenant collection page parse error: {e}"))?;
 
-                for record in page.records {
-                    let Some(mut fact) = record.fact else {
-                        continue;
-                    };
+                let facts: Vec<Fact> = page.records.into_iter().filter_map(|record| record.fact).collect();
+                // Page-atomic protected-namespace validation, matching the
+                // default pull surface above.
+                for fact in &facts {
+                    if let Some(prefix) = crate::fact_privacy::generic_create_reserved_entity_prefix(&fact.entity) {
+                        return Err(format!(
+                            "tenant sync pull rejected fact '{}' in create-reserved namespace `{prefix}`",
+                            fact.fact_id
+                        ));
+                    }
+                }
+                for mut fact in facts {
                     fact.source_receipt = Some(format!("sync:{}:{}", self.remote_url, fact.fact_id));
                     fact.tenant_hash = tenant_id.to_string();
                     store.store_synced(fact);
@@ -1495,6 +1517,107 @@ mod tests {
                 .as_str(),
             "default"
         );
+    }
+
+    #[test]
+    fn pull_rejects_daemon_owned_control_records_page_atomically() {
+        let safe_fact = synced_fact("f_safe_before_forgery", "project::safe");
+        let remote_fact = synced_fact("f_forged_passport", "__passport__::victim");
+        let (remote_url, server) = start_json_mock_server(vec![serde_json::json!({
+            "facts": [safe_fact, remote_fact],
+            "has_more": false,
+            "next_cursor": null
+        })]);
+        let dir = tempfile::tempdir().expect("create sync cursor directory");
+        let client = SyncClient::new(&remote_url, "test-key", dir.path());
+        let mut store = FactStore::new();
+
+        let err = client.pull(&mut store).expect_err("control record must be rejected");
+        server.join().expect("join mock sync server");
+        assert!(err.contains("create-reserved namespace"));
+        assert!(
+            store.get("f_safe_before_forgery").is_none(),
+            "a rejected page must not partially store its safe prefix"
+        );
+        assert!(store.get("f_forged_passport").is_none());
+    }
+
+    #[test]
+    fn tenant_pull_rejects_daemon_owned_control_records_page_atomically() {
+        let safe = synced_fact("f_tenant_safe", "project::safe");
+        let forged = synced_fact("f_tenant_forged", "__passport__::victim");
+        let updated_at = safe.stored_at.to_rfc3339();
+        let (remote_url, server) = start_json_mock_server(vec![
+            serde_json::json!({
+                "schema": TENANT_SYNC_MANIFEST_SCHEMA,
+                "tenant_id": "tenant-acme",
+                "tenant_category": "personal",
+                "owner_hash": "blake3:owner",
+                "membership_epoch": 1,
+                "membership_hash": "blake3:membership",
+                "role_grant_hash": "blake3:roles",
+                "generated_at": "2026-07-15T00:00:00Z",
+                "collections": [{
+                    "collection": SYNC_COLLECTION_FACTS,
+                    "cursor": null,
+                    "updated_since": null,
+                    "record_count": 2,
+                    "tombstone_count": 0,
+                    "content_hash": "blake3:facts"
+                }],
+                "manifest_hash": "blake3:manifest"
+            }),
+            serde_json::json!({
+                "schema": TENANT_COLLECTION_PAGE_SCHEMA,
+                "tenant_id": "tenant-acme",
+                "collection": SYNC_COLLECTION_FACTS,
+                "records": [
+                    {
+                        "collection": SYNC_COLLECTION_FACTS,
+                        "record_id": "f_tenant_safe",
+                        "entity": "project::safe",
+                        "key": "status",
+                        "value_hash": "blake3:safe",
+                        "updated_at": updated_at,
+                        "deleted": false,
+                        "fact": safe
+                    },
+                    {
+                        "collection": SYNC_COLLECTION_FACTS,
+                        "record_id": "f_tenant_forged",
+                        "entity": "__passport__::victim",
+                        "key": "status",
+                        "value_hash": "blake3:forged",
+                        "updated_at": updated_at,
+                        "deleted": false,
+                        "fact": forged
+                    }
+                ],
+                "next_cursor": null,
+                "has_more": false,
+                "collection_hash": "blake3:page"
+            }),
+        ]);
+        let dir = tempfile::tempdir().expect("create sync cursor directory");
+        let client = SyncClient::new(&remote_url, "test-key", dir.path());
+        let mut store = FactStore::new();
+
+        let err = client
+            .pull_tenant_mirror(&mut store, "tenant-acme")
+            .expect_err("protected tenant record must reject the page");
+        server.join().expect("join mock sync server");
+        assert!(err.contains("create-reserved namespace"));
+        assert!(store.get("f_tenant_safe").is_none());
+        assert!(store.get("f_tenant_forged").is_none());
+    }
+
+    #[test]
+    fn promoted_sync_records_skip_daemon_owned_control_state() {
+        let forged = synced_fact("f_promoted_forgery", "__work__::project::item");
+        let records = vec![record_from_fact("tenant-a", &forged, SYNC_COLLECTION_FACTS, true)];
+        let mut store = FactStore::new();
+        assert_eq!(apply_promoted_records(&mut store, &records, "https://sync.test"), 0);
+        assert!(store.get("f_promoted_forgery").is_none());
     }
 
     #[test]

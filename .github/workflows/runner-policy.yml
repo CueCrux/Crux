@@ -1,0 +1,51 @@
+# Copyright (c) 2026 CueCrux Ltd.
+# Licensed under the Apache License, Version 2.0.
+#
+# Workflow supply-chain policy gate.
+#
+# Enforces what the rest of this directory was just brought into line with:
+# explicit least-privilege tokens, immutable SHA pins, explicit Rust
+# toolchain channels, and no untrusted trigger on the self-hosted pool.
+# See scripts/check_workflow_policy.py for the rules and their rationale.
+#
+# Runs on GitHub-hosted runners deliberately. It is a few seconds of Python
+# with no Rust in it, so it has no business occupying a slot in the CI pool.
+#
+# No paths filter: the whole point is that a workflow added or edited in a
+# way that bypasses the policy gets caught, and a filter is one more thing
+# that can be wrong. It also keeps the check eligible to be made required
+# later without hitting the never-triggers-so-stays-pending trap that
+# ci.yml documents.
+
+name: Workflow Policy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Required-check safety: if this is ever promoted to required, it must
+  # report on the speculative queue ref or the merge queue hangs.
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    name: Workflow supply-chain policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+      - run: pip install --disable-pip-version-check pyyaml
+      - name: Unit tests for the policy checker
+        run: python3 -m unittest scripts.check_workflow_policy_test -v
+      - name: Check workflows
+        run: python3 scripts/check_workflow_policy.py

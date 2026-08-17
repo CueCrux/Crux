@@ -1,6 +1,6 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 //
 // @generated — DO NOT EDIT BY HAND.
 // Source of truth: the ROUTES manifest in crates/corecruxd/src/http/openapi.rs.
@@ -10,12 +10,12 @@
 // Customer-safe posture: CruxApi (below) exposes only GET (read) routes; its
 // generic get(path) is allowlist-guarded to literal manifest GET paths. The ONLY
 // writes this console can perform live in the separate CruxApiGated object at the
-// bottom — exactly 24 curated, operator-posture-gated mutation(s), no more.
+// bottom — exactly 42 curated, operator-posture-gated mutation(s), no more.
 //
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
 //
-// 163 read endpoints, generated from the route manifest.
+// 194 read endpoints, generated from the route manifest.
 
 /**
  * Append a plain query object to a path as a URL search string.
@@ -50,9 +50,23 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/admin/segments/fingerprints': true,
   '/v1/admin/sharing/posture': true,
   '/v1/admin/version': true,
+  '/v1/attention/summary': true,
   '/v1/auth/whoami': true,
   '/v1/bootstrap/status': true,
   '/v1/cloud/access-contract': true,
+  '/v1/code-intel/blast-radius': true,
+  '/v1/code-intel/dead-code': true,
+  '/v1/code-intel/enrich-budget': true,
+  '/v1/code-intel/liveness': true,
+  '/v1/code-intel/path': true,
+  '/v1/code-intel/releases': true,
+  '/v1/code-intel/trace-diff': true,
+  '/v1/code-intel/volume': true,
+  '/v1/console/connections': true,
+  '/v1/console/corecrux/graph/ego': true,
+  '/v1/console/corecrux/graph/path': true,
+  '/v1/console/corecrux/graph/resolve': true,
+  '/v1/console/corecrux/graph/stats': true,
   '/v1/console/corecrux/lane-weights': true,
   '/v1/console/engine/bench': true,
   '/v1/console/engine/spend': true,
@@ -65,6 +79,7 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/console/review/contradictions': true,
   '/v1/console/review/queue': true,
   '/v1/console/sessions': true,
+  '/v1/console/sessions/detail': true,
   '/v1/console/settings': true,
   '/v1/console/storage-breakdown': true,
   '/v1/console/summary': true,
@@ -78,8 +93,10 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/events/stream': true,
   '/v1/extensions': true,
   '/v1/extensions/keys': true,
+  '/v1/extensions/registry': true,
   '/v1/facts': true,
   '/v1/facts/export': true,
+  '/v1/facts/list': true,
   '/v1/features/capabilities': true,
   '/v1/features/capabilities/analysis/coverage': true,
   '/v1/features/capabilities/analysis/gaps': true,
@@ -95,6 +112,7 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/integrations/openai/status': true,
   '/v1/kinds': true,
   '/v1/mcp/tools': true,
+  '/v1/mcp/tools/usage': true,
   '/v1/memory/candidates': true,
   '/v1/observations/aggregate': true,
   '/v1/openai/tools.json': true,
@@ -114,9 +132,11 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/projects': true,
   '/v1/punchcards': true,
   '/v1/quota': true,
+  '/v1/receipts/list': true,
   '/v1/relations': true,
   '/v1/relations/incoming': true,
   '/v1/repos': true,
+  '/v1/repos/allowance': true,
   '/v1/repos/dependents': true,
   '/v1/route': true,
   '/v1/routing/route': true,
@@ -125,10 +145,15 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/shard-map': true,
   '/v1/shards': true,
   '/v1/status-feed': true,
+  '/v1/studio/library': true,
+  '/v1/traces': true,
+  '/v1/traces/spans': true,
+  '/v1/traces/stats': true,
   '/v1/version': true,
   '/v1/witness/smoke': true,
   '/v1/work': true,
   '/v1/work/gate/pending': true,
+  '/v1/work/graph': true,
   '/v1/workbench/api-drift': true,
   '/v1/workbench/audit-triage': true,
   '/v1/workbench/brief': true,
@@ -212,11 +237,17 @@ const CruxApi = Object.freeze({
   adminSharingPosture(query) {
     return fetch(withQuery(`/v1/admin/sharing/posture`, query), { credentials: 'same-origin' });
   },
+  adminTenantsByTenantIdFootprint(tenantId, query) {
+    return fetch(withQuery(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/footprint`, query), { credentials: 'same-origin' });
+  },
   adminVersion(query) {
     return fetch(withQuery(`/v1/admin/version`, query), { credentials: 'same-origin' });
   },
   agentsByPassportUsage(passport, query) {
     return fetch(withQuery(`/v1/agents/${encodeURIComponent(passport)}/usage`, query), { credentials: 'same-origin' });
+  },
+  attentionSummary(query) {
+    return fetch(withQuery(`/v1/attention/summary`, query), { credentials: 'same-origin' });
   },
   authWhoami(query) {
     return fetch(withQuery(`/v1/auth/whoami`, query), { credentials: 'same-origin' });
@@ -227,11 +258,50 @@ const CruxApi = Object.freeze({
   cloudAccessContract(query) {
     return fetch(withQuery(`/v1/cloud/access-contract`, query), { credentials: 'same-origin' });
   },
+  codeIntelBlastRadius(query) {
+    return fetch(withQuery(`/v1/code-intel/blast-radius`, query), { credentials: 'same-origin' });
+  },
+  codeIntelDeadCode(query) {
+    return fetch(withQuery(`/v1/code-intel/dead-code`, query), { credentials: 'same-origin' });
+  },
+  codeIntelEnrichBudget(query) {
+    return fetch(withQuery(`/v1/code-intel/enrich-budget`, query), { credentials: 'same-origin' });
+  },
+  codeIntelLiveness(query) {
+    return fetch(withQuery(`/v1/code-intel/liveness`, query), { credentials: 'same-origin' });
+  },
+  codeIntelPath(query) {
+    return fetch(withQuery(`/v1/code-intel/path`, query), { credentials: 'same-origin' });
+  },
+  codeIntelReleases(query) {
+    return fetch(withQuery(`/v1/code-intel/releases`, query), { credentials: 'same-origin' });
+  },
+  codeIntelTraceDiff(query) {
+    return fetch(withQuery(`/v1/code-intel/trace-diff`, query), { credentials: 'same-origin' });
+  },
+  codeIntelVolume(query) {
+    return fetch(withQuery(`/v1/code-intel/volume`, query), { credentials: 'same-origin' });
+  },
   consoleChunksByChunkDigest(chunkDigest, query) {
     return fetch(withQuery(`/v1/console/chunks/${encodeURIComponent(chunkDigest)}`, query), { credentials: 'same-origin' });
   },
   consoleChunksByChunkDigestPreview(chunkDigest, query) {
     return fetch(withQuery(`/v1/console/chunks/${encodeURIComponent(chunkDigest)}/preview`, query), { credentials: 'same-origin' });
+  },
+  consoleConnections(query) {
+    return fetch(withQuery(`/v1/console/connections`, query), { credentials: 'same-origin' });
+  },
+  consoleCorecruxGraphEgo(query) {
+    return fetch(withQuery(`/v1/console/corecrux/graph/ego`, query), { credentials: 'same-origin' });
+  },
+  consoleCorecruxGraphPath(query) {
+    return fetch(withQuery(`/v1/console/corecrux/graph/path`, query), { credentials: 'same-origin' });
+  },
+  consoleCorecruxGraphResolve(query) {
+    return fetch(withQuery(`/v1/console/corecrux/graph/resolve`, query), { credentials: 'same-origin' });
+  },
+  consoleCorecruxGraphStats(query) {
+    return fetch(withQuery(`/v1/console/corecrux/graph/stats`, query), { credentials: 'same-origin' });
   },
   consoleCorecruxLaneWeights(query) {
     return fetch(withQuery(`/v1/console/corecrux/lane-weights`, query), { credentials: 'same-origin' });
@@ -268,6 +338,9 @@ const CruxApi = Object.freeze({
   },
   consoleSessions(query) {
     return fetch(withQuery(`/v1/console/sessions`, query), { credentials: 'same-origin' });
+  },
+  consoleSessionsDetail(query) {
+    return fetch(withQuery(`/v1/console/sessions/detail`, query), { credentials: 'same-origin' });
   },
   consoleSettings(query) {
     return fetch(withQuery(`/v1/console/settings`, query), { credentials: 'same-origin' });
@@ -311,6 +384,12 @@ const CruxApi = Object.freeze({
   entitiesByKindByIdHistory(kind, id, query) {
     return fetch(withQuery(`/v1/entities/${encodeURIComponent(kind)}/${encodeURIComponent(id)}/history`, query), { credentials: 'same-origin' });
   },
+  escrowReleasesByRequestId(request_id, query) {
+    return fetch(withQuery(`/v1/escrow/releases/${encodeURIComponent(request_id)}`, query), { credentials: 'same-origin' });
+  },
+  escrowVaultsByVaultId(vault_id, query) {
+    return fetch(withQuery(`/v1/escrow/vaults/${encodeURIComponent(vault_id)}`, query), { credentials: 'same-origin' });
+  },
   eventsStream(query) {
     return fetch(withQuery(`/v1/events/stream`, query), { credentials: 'same-origin' });
   },
@@ -319,6 +398,9 @@ const CruxApi = Object.freeze({
   },
   extensionsKeys(query) {
     return fetch(withQuery(`/v1/extensions/keys`, query), { credentials: 'same-origin' });
+  },
+  extensionsRegistry(query) {
+    return fetch(withQuery(`/v1/extensions/registry`, query), { credentials: 'same-origin' });
   },
   extensionsById(id, query) {
     return fetch(withQuery(`/v1/extensions/${encodeURIComponent(id)}`, query), { credentials: 'same-origin' });
@@ -334,6 +416,9 @@ const CruxApi = Object.freeze({
   },
   factsExport(query) {
     return fetch(withQuery(`/v1/facts/export`, query), { credentials: 'same-origin' });
+  },
+  factsList(query) {
+    return fetch(withQuery(`/v1/facts/list`, query), { credentials: 'same-origin' });
   },
   factsByFactId(factId, query) {
     return fetch(withQuery(`/v1/facts/${encodeURIComponent(factId)}`, query), { credentials: 'same-origin' });
@@ -394,6 +479,9 @@ const CruxApi = Object.freeze({
   },
   mcpTools(query) {
     return fetch(withQuery(`/v1/mcp/tools`, query), { credentials: 'same-origin' });
+  },
+  mcpToolsUsage(query) {
+    return fetch(withQuery(`/v1/mcp/tools/usage`, query), { credentials: 'same-origin' });
   },
   memoryCandidates(query) {
     return fetch(withQuery(`/v1/memory/candidates`, query), { credentials: 'same-origin' });
@@ -518,6 +606,9 @@ const CruxApi = Object.freeze({
   quota(query) {
     return fetch(withQuery(`/v1/quota`, query), { credentials: 'same-origin' });
   },
+  receiptsList(query) {
+    return fetch(withQuery(`/v1/receipts/list`, query), { credentials: 'same-origin' });
+  },
   receiptsByReceiptId(receiptId, query) {
     return fetch(withQuery(`/v1/receipts/${encodeURIComponent(receiptId)}`, query), { credentials: 'same-origin' });
   },
@@ -554,6 +645,9 @@ const CruxApi = Object.freeze({
   repos(query) {
     return fetch(withQuery(`/v1/repos`, query), { credentials: 'same-origin' });
   },
+  reposAllowance(query) {
+    return fetch(withQuery(`/v1/repos/allowance`, query), { credentials: 'same-origin' });
+  },
   reposDependents(query) {
     return fetch(withQuery(`/v1/repos/dependents`, query), { credentials: 'same-origin' });
   },
@@ -565,6 +659,12 @@ const CruxApi = Object.freeze({
   },
   reposByRepoIdCodemap(repo_id, query) {
     return fetch(withQuery(`/v1/repos/${encodeURIComponent(repo_id)}/codemap`, query), { credentials: 'same-origin' });
+  },
+  reposByRepoIdSpatial(repo_id, query) {
+    return fetch(withQuery(`/v1/repos/${encodeURIComponent(repo_id)}/spatial`, query), { credentials: 'same-origin' });
+  },
+  reposByRepoIdSymbolsResolve(repo_id, query) {
+    return fetch(withQuery(`/v1/repos/${encodeURIComponent(repo_id)}/symbols/resolve`, query), { credentials: 'same-origin' });
   },
   route(query) {
     return fetch(withQuery(`/v1/route`, query), { credentials: 'same-origin' });
@@ -596,11 +696,26 @@ const CruxApi = Object.freeze({
   statusFeed(query) {
     return fetch(withQuery(`/v1/status-feed`, query), { credentials: 'same-origin' });
   },
+  studioLibrary(query) {
+    return fetch(withQuery(`/v1/studio/library`, query), { credentials: 'same-origin' });
+  },
   syncTenantsByTenantIdCollectionsByCollection(tenantId, collection, query) {
     return fetch(withQuery(`/v1/sync/tenants/${encodeURIComponent(tenantId)}/collections/${encodeURIComponent(collection)}`, query), { credentials: 'same-origin' });
   },
   syncTenantsByTenantIdManifest(tenantId, query) {
     return fetch(withQuery(`/v1/sync/tenants/${encodeURIComponent(tenantId)}/manifest`, query), { credentials: 'same-origin' });
+  },
+  traces(query) {
+    return fetch(withQuery(`/v1/traces`, query), { credentials: 'same-origin' });
+  },
+  tracesSpans(query) {
+    return fetch(withQuery(`/v1/traces/spans`, query), { credentials: 'same-origin' });
+  },
+  tracesStats(query) {
+    return fetch(withQuery(`/v1/traces/stats`, query), { credentials: 'same-origin' });
+  },
+  tracesByTraceId(trace_id, query) {
+    return fetch(withQuery(`/v1/traces/${encodeURIComponent(trace_id)}`, query), { credentials: 'same-origin' });
   },
   version(query) {
     return fetch(withQuery(`/v1/version`, query), { credentials: 'same-origin' });
@@ -613,6 +728,9 @@ const CruxApi = Object.freeze({
   },
   workGatePending(query) {
     return fetch(withQuery(`/v1/work/gate/pending`, query), { credentials: 'same-origin' });
+  },
+  workGraph(query) {
+    return fetch(withQuery(`/v1/work/graph`, query), { credentials: 'same-origin' });
   },
   workById(id, query) {
     return fetch(withQuery(`/v1/work/${encodeURIComponent(id)}`, query), { credentials: 'same-origin' });
@@ -674,6 +792,7 @@ const GATED_MUTATIONS = Object.freeze([
   Object.freeze(['POST', '/v1/passports']),
   Object.freeze(['POST', '/v1/console/review/consolidations']),
   Object.freeze(['POST', '/v1/identity/candidates/{candidateId}/confirm']),
+  Object.freeze(['POST', '/v1/identity/candidates/propose']),
   Object.freeze(['PUT', '/v1/console/corecrux/lane-weights']),
   Object.freeze(['DELETE', '/v1/console/corecrux/lane-weights']),
   Object.freeze(['POST', '/v1/admin/restart']),
@@ -688,6 +807,23 @@ const GATED_MUTATIONS = Object.freeze([
   Object.freeze(['POST', '/v1/workbench/policy-simulation']),
   Object.freeze(['POST', '/v1/workbench/route-probe']),
   Object.freeze(['POST', '/v1/features/capabilities/{id}/audit']),
+  Object.freeze(['POST', '/v1/console/facts/add']),
+  Object.freeze(['POST', '/v1/integrations/github/disconnect']),
+  Object.freeze(['POST', '/v1/integrations/github/sync']),
+  Object.freeze(['POST', '/v1/integrations/openai/connect']),
+  Object.freeze(['POST', '/v1/integrations/openai/disconnect']),
+  Object.freeze(['POST', '/v1/console/integrations/{packId}/install']),
+  Object.freeze(['POST', '/v1/console/integrations/{packId}/grant']),
+  Object.freeze(['POST', '/v1/console/integrations/{packId}/disable']),
+  Object.freeze(['POST', '/v1/extensions/install-from-registry']),
+  Object.freeze(['DELETE', '/v1/extensions/{id}']),
+  Object.freeze(['POST', '/v1/extensions/{id}/grants']),
+  Object.freeze(['DELETE', '/v1/extensions/{id}/grants/{passport_fpr}']),
+  Object.freeze(['DELETE', '/v1/extensions/keys/{passport_fpr}']),
+  Object.freeze(['POST', '/v1/extensions/{id}/tools/{tool_name}/invoke']),
+  Object.freeze(['POST', '/v1/studio/library/{id}/install']),
+  Object.freeze(['POST', '/v1/projects/{id}/storybook']),
+  Object.freeze(['POST', '/v1/projects/{id}/dossiers/auto']),
 ]);
 
 const CruxApiGated = Object.freeze({
@@ -720,6 +856,9 @@ const CruxApiGated = Object.freeze({
   },
   identityCandidateConfirm(candidateId, body) {
     return fetch(`/v1/identity/candidates/${encodeURIComponent(candidateId)}/confirm`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  identityCandidatePropose(body) {
+    return fetch(`/v1/identity/candidates/propose`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
   },
   laneWeightsApply(body) {
     return fetch(`/v1/console/corecrux/lane-weights`, { method: 'PUT', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
@@ -763,6 +902,57 @@ const CruxApiGated = Object.freeze({
   featureCapabilityAudit(id, body) {
     return fetch(`/v1/features/capabilities/${encodeURIComponent(id)}/audit`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
   },
+  consoleFactsAdd(body) {
+    return fetch(`/v1/console/facts/add`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  githubDisconnect(body) {
+    return fetch(`/v1/integrations/github/disconnect`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  githubSync(body) {
+    return fetch(`/v1/integrations/github/sync`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  openaiConnect(body) {
+    return fetch(`/v1/integrations/openai/connect`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  openaiDisconnect(body) {
+    return fetch(`/v1/integrations/openai/disconnect`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  integrationPackInstall(packId, body) {
+    return fetch(`/v1/console/integrations/${encodeURIComponent(packId)}/install`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  integrationPackGrant(packId, body) {
+    return fetch(`/v1/console/integrations/${encodeURIComponent(packId)}/grant`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  integrationPackDisable(packId, body) {
+    return fetch(`/v1/console/integrations/${encodeURIComponent(packId)}/disable`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  extensionInstallFromRegistry(body) {
+    return fetch(`/v1/extensions/install-from-registry`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  extensionUninstall(id, body) {
+    return fetch(`/v1/extensions/${encodeURIComponent(id)}`, { method: 'DELETE', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  extensionGrantAdd(id, body) {
+    return fetch(`/v1/extensions/${encodeURIComponent(id)}/grants`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  extensionGrantRemove(id, passport_fpr, body) {
+    return fetch(`/v1/extensions/${encodeURIComponent(id)}/grants/${encodeURIComponent(passport_fpr)}`, { method: 'DELETE', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  extensionRemoveKey(passport_fpr, body) {
+    return fetch(`/v1/extensions/keys/${encodeURIComponent(passport_fpr)}`, { method: 'DELETE', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  extensionInvoke(id, tool_name, body) {
+    return fetch(`/v1/extensions/${encodeURIComponent(id)}/tools/${encodeURIComponent(tool_name)}/invoke`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  studioLibraryInstall(id, body) {
+    return fetch(`/v1/studio/library/${encodeURIComponent(id)}/install`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  projectStorybookGenerate(id, body) {
+    return fetch(`/v1/projects/${encodeURIComponent(id)}/storybook`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  projectDossierGenerate(id, body) {
+    return fetch(`/v1/projects/${encodeURIComponent(id)}/dossiers/auto`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -786,6 +976,8 @@ const READ_POST_ROUTES = Object.freeze([
   Object.freeze(['POST', '/v1/query/graph-expand']),
   Object.freeze(['POST', '/v1/query/time-range']),
   Object.freeze(['POST', '/v1/console/engine/search']),
+  Object.freeze(['POST', '/v1/studio/pack/build']),
+  Object.freeze(['POST', '/v1/studio/pack/verify']),
 ]);
 
 const CruxApiRead = Object.freeze({
@@ -803,6 +995,12 @@ const CruxApiRead = Object.freeze({
   },
   engineSearch(body) {
     return fetch(`/v1/console/engine/search`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  studioPackBuild(body) {
+    return fetch(`/v1/studio/pack/build`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  studioPackVerify(body) {
+    return fetch(`/v1/studio/pack/verify`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
   },
 });
 
@@ -840,4 +1038,8 @@ if (typeof window !== 'undefined') {
   window.CruxSession = CruxSession;
   window.CRUX_GATED_MUTATIONS = GATED_MUTATIONS;
   window.CRUX_READ_POST_ROUTES = READ_POST_ROUTES;
+  // Known literal (query-less) GET routes — the validated source for the
+  // Canvas Studio API-tile route picker (M14). An API tile may bind ONLY to a
+  // route in this list; arbitrary strings are rejected before any fetch.
+  window.CRUX_GET_ROUTES = Object.freeze(Object.keys(LITERAL_GET_PATHS));
 }

@@ -1,7 +1,7 @@
-// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
-// SPDX-License-Identifier: LicenseRef-CCL-1.0
-// Licensed under the CueCrux Community Licence (CCL v1.0).
-// See LICENCE.md in the repository root.
+// Copyright (c) 2026 CueCrux Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE in the repository root.
 
 //! Multi-agent coordination plane — "who is live on this project right now,
 //! what is each session doing" for concurrent agent sessions sharing one
@@ -79,6 +79,19 @@ pub struct CoordIntent {
     /// `deploy_target` warning — advisory, mirroring the execplan-slug overlap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deploy_target: Option<String>,
+    /// Absolute path of the git worktree this session is working in, when it is
+    /// working in one. Optional + `skip_serializing_if` so an intent that
+    /// declares none stays byte-identical on the wire.
+    ///
+    /// `paths` says what will be touched; this says *where the checkout lives*,
+    /// which is the thing that outlives the work. A worktree whose plan has
+    /// closed is an orphan, and until now nothing recorded the association — the
+    /// reaper had to rediscover it by walking every repo and testing each branch
+    /// against `origin/main`. That walk cannot see a worktree whose branch is
+    /// unmerged but whose plan is finished, and it cannot tell a session's own
+    /// live worktree from an abandoned one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
     /// Repo-relative paths (files or directory prefixes) the session expects
     /// to touch. Informational — enforceable leases are punchcards.
     #[serde(default)]
@@ -183,8 +196,20 @@ fn lease_resource_path(resource: &str) -> &str {
 pub struct OverlapWarning {
     pub peer_session_id_hex: String,
     pub peer_passport_id: String,
-    /// `execplan` | `intent_path` | `lease`
+    /// `execplan` | `deploy_target` | `intent_path` | `lease` | `plan_paths`
     pub kind: String,
+    /// Which evidence class produced this warning, so a reader can weigh it.
+    /// Signals differ in directness, and a warning that hides its provenance
+    /// invites treating a weak one as strong:
+    ///
+    /// * `lease` — a punchcard someone actually holds. Since the auto-punch
+    ///   hook, this is acquired from real edits rather than remembered.
+    /// * `announced` — a declared intent. Accurate, but only exists if the peer
+    ///   remembered to announce.
+    /// * `plan` — two open plans naming the same file. Always available and
+    ///   needs no announcement, but it is a statement about documents, not
+    ///   about what anyone is doing right now.
+    pub signal: String,
     /// The peer's overlapping thing (slug, path, or lease resource).
     pub theirs: String,
     /// The announced thing it overlaps with.
@@ -211,6 +236,7 @@ pub fn find_overlaps(
                     peer_session_id_hex: peer.session_id_hex.clone(),
                     peer_passport_id: peer.passport_id.clone(),
                     kind: "execplan".to_string(),
+                    signal: "announced".to_string(),
                     theirs: theirs.to_string(),
                     yours: mine.to_string(),
                 });
@@ -225,6 +251,7 @@ pub fn find_overlaps(
                     peer_session_id_hex: peer.session_id_hex.clone(),
                     peer_passport_id: peer.passport_id.clone(),
                     kind: "deploy_target".to_string(),
+                    signal: "announced".to_string(),
                     theirs: theirs.to_string(),
                     yours: mine.to_string(),
                 });
@@ -237,6 +264,7 @@ pub fn find_overlaps(
                         peer_session_id_hex: peer.session_id_hex.clone(),
                         peer_passport_id: peer.passport_id.clone(),
                         kind: "intent_path".to_string(),
+                        signal: "announced".to_string(),
                         theirs: theirs.clone(),
                         yours: mine.clone(),
                     });
@@ -255,12 +283,70 @@ pub fn find_overlaps(
                     peer_session_id_hex: String::new(),
                     peer_passport_id: lease.holder_passport.clone(),
                     kind: "lease".to_string(),
+                    signal: "lease".to_string(),
                     theirs: lease.resource.clone(),
                     yours: mine.clone(),
                 });
             }
         }
     }
+    out
+}
+
+/// A peer's open plan and the files it declares, for the plan-paths signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanPathClaim {
+    pub execplan_slug: String,
+    /// Repo-relative paths the plan's own text names.
+    pub paths: Vec<String>,
+}
+
+/// Fourth collision signal: two OPEN plans naming the same file.
+///
+/// The weakest of the four and deliberately so. It says nothing about what
+/// anyone is doing right now — it is a statement about documents — but it is
+/// the only signal that needs no announcement and no lease, so it is the only
+/// one that sees a session which never announced and never edited yet.
+///
+/// This is the salvage from the rejected code-graph dependency backfill
+/// (`edge-proposal-2026-07-29.md`): file co-occurrence was never good enough to
+/// infer that one plan *depends on* another, because it cannot tell a
+/// dependency from two siblings of a shared ancestor. It is exactly right for
+/// "these two plans name the same file", which is a coordination question, not
+/// a lineage one.
+///
+/// The announcing session's own plan is excluded — a plan overlapping itself is
+/// not news.
+pub fn find_plan_path_overlaps(announced: &CoordIntent, peer_plans: &[PlanPathClaim]) -> Vec<OverlapWarning> {
+    let Some(mine_slug) = announced.execplan_slug.as_deref() else {
+        return Vec::new();
+    };
+    let Some(mine) = peer_plans.iter().find(|p| p.execplan_slug == mine_slug) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for peer in peer_plans {
+        if peer.execplan_slug == mine_slug {
+            continue;
+        }
+        for my_path in &mine.paths {
+            for their_path in &peer.paths {
+                if paths_overlap(my_path, their_path) {
+                    out.push(OverlapWarning {
+                        // No session holds this — it is a property of two documents.
+                        peer_session_id_hex: String::new(),
+                        peer_passport_id: String::new(),
+                        kind: "plan_paths".to_string(),
+                        signal: "plan".to_string(),
+                        theirs: format!("{}:{}", peer.execplan_slug, their_path),
+                        yours: my_path.clone(),
+                    });
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.theirs.cmp(&b.theirs).then(a.yours.cmp(&b.yours)));
+    out.dedup();
     out
 }
 
@@ -423,6 +509,7 @@ mod tests {
             execplan_slug: Some(slug.to_string()),
             milestone: None,
             deploy_target: None,
+            worktree: None,
             paths: vec![],
             note: None,
             announced_at_unix_ms: 0,
@@ -687,5 +774,114 @@ mod tests {
         presence.insert("p2".to_string(), now - 1_000);
         let view = assemble_active(&bindings, &presence, &[], &[], vec![], None, 900, now);
         assert_eq!(view.active_sessions[0].session_id_hex, "bbbb");
+    }
+}
+
+#[cfg(test)]
+mod collision_signal_tests {
+    use super::*;
+
+    fn intent(session: &str, passport: &str, slug: Option<&str>, paths: &[&str]) -> CoordIntent {
+        CoordIntent {
+            project_id: "p".into(),
+            session_id_hex: session.into(),
+            passport_id: passport.into(),
+            execplan_slug: slug.map(str::to_string),
+            milestone: None,
+            deploy_target: None,
+            worktree: None,
+            paths: paths.iter().map(|s| s.to_string()).collect(),
+            note: None,
+            announced_at_unix_ms: 1_000,
+            expires_at_unix_ms: u64::MAX,
+        }
+    }
+
+    fn claim(slug: &str, paths: &[&str]) -> PlanPathClaim {
+        PlanPathClaim {
+            execplan_slug: slug.into(),
+            paths: paths.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Every warning must name the evidence class that produced it. Signals
+    /// differ in directness, and one that hides its provenance invites a weak
+    /// signal being read as a strong one.
+    #[test]
+    fn every_warning_carries_its_signal() {
+        let mine = intent("aaa", "me", Some("plan-a"), &["src/lib.rs"]);
+        let peer = intent("bbb", "peer", Some("plan-a"), &["src/lib.rs"]);
+        let leases = vec![LeaseSummary {
+            punchcard_id: "pc_1".into(),
+            resource: "file://src/lib.rs".into(),
+            mode: "modify".into(),
+            holder_passport: "peer".into(),
+            reason: None,
+            expires_at_unix_ms: i64::MAX,
+        }];
+        let out = find_overlaps(&mine, &[peer], &leases, 2_000);
+        assert!(!out.is_empty());
+        for w in &out {
+            assert!(!w.signal.is_empty(), "unsigned warning: {w:?}");
+            assert!(
+                matches!(w.signal.as_str(), "announced" | "lease" | "plan"),
+                "unknown signal {:?}",
+                w.signal
+            );
+        }
+        assert!(out.iter().any(|w| w.signal == "announced"));
+        assert!(out.iter().any(|w| w.signal == "lease"));
+    }
+
+    /// The plan signal is the one that works when nobody announced and nobody
+    /// has a lease yet — a session that has not touched a file still collides
+    /// on paper.
+    #[test]
+    fn plan_paths_collide_without_announcement_or_lease() {
+        let mine = intent("aaa", "me", Some("plan-a"), &[]);
+        let plans = vec![
+            claim("plan-a", &["crates/corecruxd/src/http/work.rs"]),
+            claim("plan-b", &["crates/corecruxd/src/http/work.rs"]),
+            claim("plan-c", &["totally/unrelated.rs"]),
+        ];
+        let out = find_plan_path_overlaps(&mine, &plans);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].kind, "plan_paths");
+        assert_eq!(out[0].signal, "plan");
+        assert!(out[0].theirs.starts_with("plan-b:"), "{:?}", out[0].theirs);
+        // No live session is implicated — this is a property of two documents.
+        assert!(out[0].peer_session_id_hex.is_empty());
+    }
+
+    #[test]
+    fn plan_paths_never_reports_a_plan_against_itself() {
+        let mine = intent("aaa", "me", Some("plan-a"), &[]);
+        let plans = vec![claim("plan-a", &["src/x.rs", "src/y.rs"])];
+        assert!(
+            find_plan_path_overlaps(&mine, &plans).is_empty(),
+            "self-overlap is not news"
+        );
+    }
+
+    #[test]
+    fn plan_paths_is_silent_without_a_declared_plan() {
+        let mine = intent("aaa", "me", None, &[]);
+        let plans = vec![claim("plan-a", &["src/x.rs"]), claim("plan-b", &["src/x.rs"])];
+        assert!(
+            find_plan_path_overlaps(&mine, &plans).is_empty(),
+            "no announced plan ⇒ nothing to compare against"
+        );
+    }
+
+    /// Directory-prefix overlap, same rule the other signals use.
+    #[test]
+    fn plan_paths_uses_prefix_overlap_not_string_equality() {
+        let mine = intent("aaa", "me", Some("plan-a"), &[]);
+        let plans = vec![
+            claim("plan-a", &["crates/corecruxd/src"]),
+            claim("plan-b", &["crates/corecruxd/src/http/work.rs"]),
+        ];
+        let out = find_plan_path_overlaps(&mine, &plans);
+        assert_eq!(out.len(), 1, "a directory claim must catch a file inside it: {out:?}");
     }
 }
