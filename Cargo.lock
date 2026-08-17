@@ -978,6 +978,7 @@ dependencies = [
  "crux-cost",
  "crux-escrow",
  "crux-integrations",
+ "crux-observe",
  "crux-session",
  "ed25519-dalek",
  "fs2",

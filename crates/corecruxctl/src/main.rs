@@ -21,9 +21,9 @@ use corecruxctl::{
     admin, agent_wiring, attest_companions, audit_export, audit_pack, c2pa_x509, code_chain, code_health,
     compaction_sync, config_bundle, cost, deploy_audit, evidence, explain, export, extensions, fixture_digest, gaps,
     hooks, identity_cli, incident, ingest, inspect_receipt, learn, login, machine, memory, memory_pack, observe_ingest,
-    openclaw, output_verify, parity, projections, rebuild_companions, receipts, reconcile, repair_manifest, replay,
-    repo, session_sync, shard, shardmap, smoke, snapshot, stage1_import, start, storage, structured_log, studio,
-    tooling_env, verify_store,
+    openclaw, output_verify, parity, projections, rebuild_companions, receipts, reconcile, redact_sweep,
+    repair_manifest, replay, repo, session_sync, shard, shardmap, smoke, snapshot, stage1_import, start, storage,
+    structured_log, studio, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -789,6 +789,36 @@ enum Command {
         /// that proves the tree head is the log operator's, not fabricated.
         #[arg(long)]
         rekor_pubkey: Option<PathBuf>,
+    },
+
+    /// One-time secret sweep over ops-namespace facts (`__ops__::*`,
+    /// `__ops::*`) — ExecPlan crux-log-redaction-2026-06-11 design item 6.
+    /// DRY-RUN BY DEFAULT: reports matched facts with scrubbed previews and
+    /// changes nothing. The delete pass additionally requires `--delete`,
+    /// `--confirm delete-matched-ops-facts`, a STOPPED daemon (the tool takes
+    /// corecruxd's LOCK file exclusively), and a prior data-dir snapshot per
+    /// the ExecPlan's M4 gate package. Deletion is the normal journal
+    /// soft-delete path (durable tombstone), never the raw filesystem.
+    #[command(name = "redact-sweep")]
+    RedactSweep {
+        /// Data directory (defaults to CORECRUXD_DATA_DIR).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Entity prefix to scan (repeatable). Default: __ops__:: and __ops::.
+        #[arg(long = "entity-prefix")]
+        entity_prefixes: Vec<String>,
+        /// Run the delete pass (requires --confirm and a stopped daemon).
+        #[arg(long, default_value_t = false)]
+        delete: bool,
+        /// Confirmation phrase for the delete pass: delete-matched-ops-facts
+        #[arg(long)]
+        confirm: Option<String>,
+        /// Print the full report as JSON to stdout.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Also write the JSON report to this path (operator review artifact).
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 
     /// Print the active C2PA leaf certificate's subject, issuer, validity
@@ -4866,6 +4896,60 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
             Ok(())
         }
+        Command::RedactSweep {
+            data_dir,
+            entity_prefixes,
+            delete,
+            confirm,
+            json,
+            out,
+        } => {
+            let data_dir = data_dir
+                .or_else(|| std::env::var("CORECRUXD_DATA_DIR").ok().map(PathBuf::from))
+                .ok_or("redact-sweep requires --data-dir or CORECRUXD_DATA_DIR")?;
+            let report = redact_sweep::run_redact_sweep(redact_sweep::RedactSweepArgs {
+                data_dir,
+                entity_prefixes,
+                delete,
+                confirm,
+            })?;
+            let report_json = serde_json::to_string_pretty(&report)?;
+            if let Some(out) = &out {
+                std::fs::write(out, &report_json)?;
+            }
+            if json {
+                println!("{report_json}");
+            } else {
+                for f in &report.findings {
+                    println!(
+                        "match fact_id={} entity={} key={} rules={} preview={}",
+                        f.fact_id,
+                        f.entity,
+                        f.key,
+                        f.rules.join(","),
+                        f.preview
+                    );
+                }
+                println!(
+                    "redact-sweep {}: scanned={} matched={} deleted={}{}",
+                    report.mode,
+                    report.scanned,
+                    report.matched,
+                    report.deleted,
+                    out.as_ref()
+                        .map(|p| format!(" report={}", p.display()))
+                        .unwrap_or_default()
+                );
+                if report.mode == "dry-run" && report.matched > 0 {
+                    println!(
+                        "dry-run only — nothing was deleted. The delete pass is operator-gated: \
+                         snapshot the data dir, stop corecruxd, then re-run with --delete --confirm {}",
+                        redact_sweep::DELETE_CONFIRM_PHRASE
+                    );
+                }
+            }
+            Ok(())
+        }
         Command::AuditVerify {
             bundle,
             json,
@@ -7498,6 +7582,67 @@ mod tests {
                 assert_eq!(since, Some("2026-01-01T00:00:00Z".to_string()));
                 assert_eq!(max_events, Some(50));
                 assert!(node_id.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    // ── Parse: redact-sweep ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_redact_sweep_defaults_to_dry_run() {
+        let cli = Cli::try_parse_from(["corecruxctl", "redact-sweep", "--data-dir", "/tmp/data"]).unwrap();
+        match cli.command {
+            Command::RedactSweep {
+                data_dir,
+                entity_prefixes,
+                delete,
+                confirm,
+                json,
+                out,
+            } => {
+                assert_eq!(data_dir, Some(PathBuf::from("/tmp/data")));
+                assert!(entity_prefixes.is_empty(), "default prefixes resolved at run time");
+                assert!(!delete, "dry-run is the default");
+                assert!(confirm.is_none());
+                assert!(!json);
+                assert!(out.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_redact_sweep_delete_pass_flags() {
+        let cli = Cli::try_parse_from([
+            "corecruxctl",
+            "redact-sweep",
+            "--data-dir",
+            "/tmp/data",
+            "--entity-prefix",
+            "__ops__::",
+            "--delete",
+            "--confirm",
+            "delete-matched-ops-facts",
+            "--json",
+            "--out",
+            "/tmp/report.json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::RedactSweep {
+                entity_prefixes,
+                delete,
+                confirm,
+                json,
+                out,
+                ..
+            } => {
+                assert_eq!(entity_prefixes, vec!["__ops__::".to_string()]);
+                assert!(delete);
+                assert_eq!(confirm.as_deref(), Some(redact_sweep::DELETE_CONFIRM_PHRASE));
+                assert!(json);
+                assert_eq!(out, Some(PathBuf::from("/tmp/report.json")));
             }
             other => panic!("unexpected command: {other:?}"),
         }
