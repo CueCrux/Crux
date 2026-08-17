@@ -175,24 +175,27 @@ pub fn list_tools_with_flags(
         // ── Reuse check (minimalism plane M3) ──────────────────────
         ToolDefinition {
             name: "reuse_check".to_string(),
-            description: "Before writing new code, ask whether it already exists: returns ranked \
-                          reuse candidates for a short description of what you are about to \
-                          build, fused from the tenant retrieval index (BM25 pointers, expand \
-                          via query_expand) and the Features lens (capabilities + files). \
-                          Verdict is 'reuse-candidate-found' or 'nothing-found'. Flag-gated by \
+            description: "Before writing new code, ask whether it already exists: returns a \
+                          ranked `candidates` list for a short description of what you are \
+                          about to build, fused from the tenant retrieval index (BM25 \
+                          pointers, expand via query_expand) and the Features lens \
+                          (capabilities + files, with `path`/`file_line` pointers). Verdict is \
+                          'reuse-candidate-found' or 'nothing-found'. Pass `token_budget` \
+                          (QC.2) to cap the emitted rows. Flag-gated by \
                           CORECRUXD_FEATURE_REUSE_CHECK (off by default)."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "tenant_id":   { "type": "string",  "description": "Tenant identifier for scoped search" },
-                    "description": { "type": "string",  "description": "What you are about to build, in one line" },
-                    "limit":       { "type": "integer", "description": "Max candidates per source", "default": 5 },
-                    "min_score":   { "type": "number",  "description": "Minimum BM25 relevance threshold" }
+                    "tenant_id":    { "type": "string",  "description": "Tenant identifier for scoped search" },
+                    "description":  { "type": "string",  "description": "What you are about to build, in one line" },
+                    "limit":        { "type": "integer", "description": "Max candidates per source", "default": 5 },
+                    "min_score":    { "type": "number",  "description": "Minimum BM25 relevance threshold" },
+                    "token_budget": { "type": "integer", "description": "Token ceiling for the emitted candidate rows (QC.2). At least the top candidate is always returned; `budget_truncated` reports a hit ceiling." }
                 },
                 "required": ["tenant_id", "description"],
                 "examples": [
-                    { "tenant_id": "my-project", "description": "debounced file watcher for config reload" }
+                    { "tenant_id": "my-project", "description": "debounced file watcher for config reload", "token_budget": 500 }
                 ]
             }),
         },
@@ -2851,7 +2854,7 @@ pub fn tool_output_docs() -> Value {
     let mut rows = match json!([
         { "tool": "cuecrux_session",    "output": "SessionPlan (see agents.cuecrux.com/schemas/SessionPlan.v1). Contains plan_id, session_id, passport, channels {bulk?, mcp}, capability_graph[], receipt {hash, signature?, signer_kid?, mode}, budget, minted_at, session_ttl_s." },
         { "tool": "autonomy_contract",  "output": "{ feature_enabled, passport_id, tier, token_id, token_hash, capabilities: [{name, allowed, scope, backend_id, mode, cost_credits, why_denied?}], summary: {total_tools, returned, allowed, denied, truncated_by_token_budget} }. Disabled when CORECRUXD_FEATURE_AUTONOMY_CONTRACT is off (feature_enabled=false, empty capabilities)." },
-        { "tool": "reuse_check",        "output": "{ schema, verdict: 'reuse-candidate-found'|'nothing-found', retrieval_candidates: [{result_id, rank, score, doc_length_tokens}], capability_candidates: [{id, name, system, maturity, files, overlap_terms}], guidance }. CAPABILITY_DENIED when CORECRUXD_FEATURE_REUSE_CHECK is off (default)." },
+        { "tool": "reuse_check",        "output": "{ schema, verdict: 'reuse-candidate-found'|'nothing-found', candidates: [{kind: 'capability'|'retrieval_pointer', path, file_line, score|overlap_terms, ...}], retrieval_candidates: [{kind, result_id, rank, score, doc_length_tokens, path: null, file_line: null}], capability_candidates: [{kind, id, name, system, maturity, files, overlap_terms, path, file_line}], token_budget, tokens_returned, budget_truncated, guidance }. `file_line` comes from Features-lens `files` entries with a `<path>:<line>` suffix; retrieval hits are pointers (expand via query_expand). CAPABILITY_DENIED when CORECRUXD_FEATURE_REUSE_CHECK is off (default)." },
         { "tool": "engram_resolve",     "output": "manifest mode: { schema, capability_class, engram_manifest }; resolve mode: { schema, capability_class, engrams: [{name, version, intent_bucket, content, prompt_hash, applicable_why}], engram_set_hash, manifest_hash }. CAPABILITY_DENIED when CORECRUXD_FEATURE_ENGRAM_MCP is off (default)." },
         { "tool": "query",              "output": "{ results: [{doc_id, score, segment_index, token_count}], coverage: {score, gaps, below_floor}, meta: {backend, took_ms, segments_searched} }" },
         { "tool": "query_scan",         "output": "{ results: [{doc_id, score, token_count}], meta: {took_ms, segments_searched} }" },
