@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "/v1/session/schemas/session_context.in.json",
+  "title": "session_context input",
+  "description": "Request envelope for a session-context snapshot (catalog shape `Snapshot`). Advertise-only per RCX Session-Handshake v1: the daemon does not validate invocations against this document, and the field set is open (additive).",
+  "type": "object",
+  "properties": {
+    "session_id": {
+      "type": "string",
+      "description": "Session to snapshot. Defaults to the session bound to the calling plan."
+    },
+    "scope": {
+      "type": "string",
+      "description": "Optional scope selector narrowing the snapshot to one state namespace."
+    }
+  },
+  "additionalProperties": true
+}

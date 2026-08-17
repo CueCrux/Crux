@@ -888,6 +888,12 @@ pub(crate) fn router_with_route_auth(
         .route("/v1/bootstrap/status", get(self::observe::get_bootstrap_status))
         // Session handshake (master-plan §5.1): Crux Daemon uses /session, not /v1/session.
         .route("/session", axum::routing::post(self::session::post_session))
+        // Advertised capability-schema documents (capability-graph M2). The
+        // served bytes BLAKE3-match the `SchemaRef.hash` pinned in the graph.
+        .route(
+            "/v1/session/schemas/{file}",
+            get(self::session::get_session_schema),
+        )
         .route("/v1/sessions/active", get(self::session::get_active_sessions))
         .route("/v1/sessions/{sessionId}/plan", get(self::session::get_session_plan))
         // Invocation verification (master-plan §8).

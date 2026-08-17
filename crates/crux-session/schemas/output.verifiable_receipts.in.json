@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "/v1/session/schemas/output.verifiable_receipts.in.json",
+  "title": "output.verifiable_receipts input",
+  "description": "Request envelope for attesting an output artifact (catalog shape `Receipt`; mirrors the `output_attest` tool arguments — exactly one content source is required). Advertise-only per RCX Session-Handshake v1; the field set is open (additive).",
+  "type": "object",
+  "properties": {
+    "content_bytes_base64": {
+      "type": "string",
+      "description": "The output content to attest, base64-encoded. Mutually exclusive with `content_path`."
+    },
+    "content_path": {
+      "type": "string",
+      "description": "Absolute path of a local file whose bytes are attested. Mutually exclusive with `content_bytes_base64`; a local-debug ergonomic, not a production input path."
+    }
+  },
+  "anyOf": [
+    { "required": ["content_bytes_base64"] },
+    { "required": ["content_path"] }
+  ],
+  "additionalProperties": true
+}

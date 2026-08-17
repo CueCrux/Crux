@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "/v1/session/schemas/journal_append.in.json",
+  "title": "journal_append input",
+  "description": "Request envelope for appending one entry to the append-only journal (catalog shape `Receipt`). Advertise-only per RCX Session-Handshake v1; the field set is open (additive).",
+  "type": "object",
+  "required": ["entry"],
+  "properties": {
+    "entry": {
+      "type": "object",
+      "description": "The journal entry payload. Keys are surface-defined; values are JSON.",
+      "additionalProperties": true
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Optional retrieval tags attached to the entry."
+    }
+  },
+  "additionalProperties": true
+}

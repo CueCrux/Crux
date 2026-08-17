@@ -671,6 +671,8 @@ mod tests {
             ce_path: None,
             core_path: None,
             feature_flag: Some("beta_flag"),
+            input_schema: None,
+            output_schema: None,
         }];
         let pp = passport("pro", &["retrieval"]);
         let flags: HashSet<String> = HashSet::new(); // flag OFF
@@ -738,5 +740,69 @@ mod tests {
         assert!(hidden.excluded.is_empty());
         assert_eq!(shown.hash, hidden.hash);
         assert_eq!(shown.hash, hash_capability_graph_with_intent(&shown.capabilities, None));
+    }
+
+    // ── M2: node schemas (advertise-only, hash-pinned) ──────────────────────
+
+    #[test]
+    fn local_wildcard_graph_surfaces_hash_pinned_schema_refs() {
+        // M2 gate: the chosen high-value nodes surface non-null
+        // input_schema/output_schema whose uri resolves (via the catalog
+        // lookup the daemon route uses) to bytes that BLAKE3-match the
+        // pinned hash.
+        let pp = passport("local", &["*"]);
+        let flags = HashSet::new();
+        let g = generate_default(&pp, &GraphHints::default(), None, &flags);
+        for cap_name in [
+            "session_context",
+            "journal_append",
+            "proof_verify",
+            "output.verifiable_receipts",
+        ] {
+            let cap = g
+                .capabilities
+                .iter()
+                .find(|c| c.cap == cap_name)
+                .unwrap_or_else(|| panic!("`{cap_name}` missing from local wildcard graph"));
+            for (dir, sref) in [("in", &cap.input_schema), ("out", &cap.output_schema)] {
+                let sref = sref
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("`{cap_name}` must advertise a non-null {dir} schema"));
+                assert_eq!(sref.kind, crate::catalog::SCHEMA_KIND_JSON_SCHEMA);
+                let file = format!("{cap_name}.{dir}.json");
+                assert_eq!(sref.uri, format!("{}{file}", crate::catalog::SCHEMA_ROUTE_PREFIX));
+                let doc = crate::catalog::schema_document(&file)
+                    .unwrap_or_else(|| panic!("`{file}` must be a served document"));
+                assert_eq!(
+                    sref.hash,
+                    *blake3::hash(doc.bytes).as_bytes(),
+                    "pinned hash must be BLAKE3 of the served bytes for `{file}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn schema_refs_do_not_feed_the_capability_graph_hash() {
+        // Additivity proof (M2 ships hash-stable; folding schemas into the
+        // graph hash is the gated M3): stripping every schema ref from the
+        // generated capabilities must not change the graph hash.
+        let pp = passport("local", &["*"]);
+        let flags = HashSet::new();
+        let g = generate_default(&pp, &GraphHints::default(), None, &flags);
+        assert!(
+            g.capabilities.iter().any(|c| c.input_schema.is_some()),
+            "test needs schema-advertising caps in the graph"
+        );
+        let mut stripped = g.capabilities.clone();
+        for cap in &mut stripped {
+            cap.input_schema = None;
+            cap.output_schema = None;
+        }
+        assert_eq!(
+            g.hash,
+            hash_capability_graph_with_intent(&stripped, None),
+            "capability graph hash must be independent of schema refs until M3"
+        );
     }
 }

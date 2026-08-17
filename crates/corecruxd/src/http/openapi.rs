@@ -437,6 +437,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/route", methods: &["GET"], tag: "Routing", auth: "admin-read", summary: "Route" },
     RouteEntry { path: "/v1/routing/route", methods: &["GET"], tag: "Routing", auth: "admin-read", summary: "Routing route" },
     RouteEntry { path: "/v1/routing/status", methods: &["GET"], tag: "Routing", auth: "admin-read", summary: "Routing status" },
+    RouteEntry { path: "/v1/session/schemas/{file}", methods: &["GET"], tag: "Sessions", auth: "public", summary: "Advertised capability schema document (hash-pinned)" },
     RouteEntry { path: "/v1/sessions/active", methods: &["GET"], tag: "Sessions", auth: "read", summary: "Sessions active" },
     RouteEntry { path: "/v1/sessions/{sessionId}/archive", methods: &["POST"], tag: "Sessions", auth: "write", summary: "Sessions {sessionId} archive" },
     RouteEntry { path: "/v1/sessions/{sessionId}/observations", methods: &["GET", "POST"], tag: "Sessions", auth: "read-write", summary: "Sessions {sessionId} observations" },
