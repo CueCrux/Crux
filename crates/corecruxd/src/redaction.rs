@@ -82,6 +82,61 @@ mod tests {
         );
     }
 
+    /// M4 soak-evidence discharge (ExecPlan crux-log-redaction-2026-06-11):
+    /// prod `/metrics` shows NO `corecrux_log_redactions_total` family after a
+    /// long audit-mode soak. This test pins why that is the healthy signal —
+    /// the prometheus text encoder skips a `CounterVec` family with zero
+    /// children, so "family absent" == "zero rule hits", not "not wired" —
+    /// and that one secret-shaped line makes the family render.
+    #[test]
+    fn family_absent_from_text_encode_until_first_hit() {
+        use prometheus::{Encoder, TextEncoder};
+
+        fn render(registry: &prometheus::Registry) -> String {
+            let mut buf = Vec::new();
+            TextEncoder::new().encode(&registry.gather(), &mut buf).expect("encode");
+            String::from_utf8(buf).expect("utf8")
+        }
+
+        // A fresh CounterVec with the prod family name (the shared static may
+        // already carry hits from sibling tests in this process).
+        #[allow(clippy::expect_used)]
+        let counter = CounterVec::new(
+            Opts::new("corecrux_log_redactions_total", "test twin of the prod family"),
+            &["rule"],
+        )
+        .expect("construct");
+        let registry = prometheus::Registry::new();
+        registry.register(Box::new(counter.clone())).expect("register");
+
+        assert!(
+            !render(&registry).contains("corecrux_log_redactions_total"),
+            "zero-child CounterVec family must be skipped by the text encoder"
+        );
+
+        // Seed one secret-shaped line through a redactor counting into it
+        // (audit mode — same as the prod default — counts without mutating).
+        let hook_counter = counter.clone();
+        let hook: RedactionHook = Arc::new(move |rule: &str| {
+            hook_counter.with_label_values(&[rule]).inc();
+        });
+        let mut redactor = Redactor::with_mode(crux_observe::redact::RedactMode::Audit);
+        redactor.set_hook(hook);
+        let line = r#"call failed api_key="sk-fixtureSYNTHETIC0000000000""#;
+        let scrubbed = redactor.redact_line(line);
+        assert_eq!(scrubbed, line, "audit mode never mutates output");
+
+        let rendered = render(&registry);
+        assert!(
+            rendered.contains("corecrux_log_redactions_total"),
+            "family renders after the first hit: {rendered}"
+        );
+        assert!(
+            rendered.contains("rule=\"fld.api_key\"") || rendered.contains("rule=\"sk\""),
+            "hit carries its rule label: {rendered}"
+        );
+    }
+
     #[test]
     fn redactor_is_shared_and_hook_counts() {
         let r1 = redactor();

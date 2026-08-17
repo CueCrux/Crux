@@ -248,6 +248,15 @@ impl Redactor {
         }
     }
 
+    /// Build with a forced mode but the operator's env-configured extra
+    /// patterns (`CORECRUXD_REDACT_EXTRA_PATTERNS`). Used by offline tools
+    /// (e.g. the `corecruxctl redact-sweep` ops-fact scanner) that must scan
+    /// with the full rule set regardless of the `CORECRUXD_REDACT` mode.
+    pub fn with_mode_and_env_extras(mode: RedactMode) -> Self {
+        let extras = std::env::var("CORECRUXD_REDACT_EXTRA_PATTERNS").unwrap_or_default();
+        Self::build(mode, parse_extra_patterns(&extras), None)
+    }
+
     /// Build with explicit extra `(id, regex)` patterns (test/bench helper).
     pub fn with_mode_and_extras(mode: RedactMode, extras: &[(String, String)]) -> Self {
         let joined = extras

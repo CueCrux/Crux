@@ -58,6 +58,7 @@ corecrux-storage = { path = "../corecrux-storage" }
 corecrux-types = { path = "../corecrux-types" }
 crux-cost = { path = "../crux-cost" }
 crux-integrations = { path = "../crux-integrations" }
+crux-observe = { path = "../crux-observe" }
 crux-session = { path = "../crux-session" }
 
 [features]

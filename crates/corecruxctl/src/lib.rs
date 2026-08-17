@@ -57,6 +57,7 @@ pub mod quickstart;
 pub mod rebuild_companions;
 pub mod receipts;
 pub mod reconcile;
+pub mod redact_sweep;
 pub mod repair_manifest;
 pub mod replay;
 pub mod repo;
