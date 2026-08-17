@@ -427,6 +427,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/repos/scan-jobs/{job_id}", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Repos scan jobs {job_id}" },
     RouteEntry { path: "/v1/repos/{repo_id}", methods: &["GET", "DELETE"], tag: "Repos", auth: "admin", summary: "Repos {repo_id}" },
     RouteEntry { path: "/v1/repos/{repo_id}/codemap", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Repos {repo_id} codemap" },
+    RouteEntry { path: "/v1/repos/{repo_id}/scan", methods: &["POST"], tag: "Repos", auth: "admin-write", summary: "In-place rescan; the current map keeps serving until the new scan succeeds" },
     RouteEntry { path: "/v1/repos/{repo_id}/spatial", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Deterministic spatial layout (districts, buildings, bundles)" },
     RouteEntry { path: "/v1/repos/{repo_id}/symbols/resolve", methods: &["GET"], tag: "Repos", auth: "admin-read", summary: "Resolve a (file, name[, line]) callsite to a stable symbol_id" },
     RouteEntry { path: "/v1/traces", methods: &["GET"], tag: "Traces", auth: "admin-read", summary: "List persisted runtime traces" },

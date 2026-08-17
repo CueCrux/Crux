@@ -1043,6 +1043,13 @@ pub(crate) fn router_with_route_auth(
             "/v1/repos/{repo_id}",
             axum::routing::delete(self::repos::delete_repo),
         )
+        // In-place rescan (async scan-job): preserves the currently persisted
+        // map when the rescan fails, commits the replacement atomically on
+        // success. Replaces the destructive delete-and-re-register loop.
+        .route(
+            "/v1/repos/{repo_id}/scan",
+            axum::routing::post(self::repos::post_repo_rescan),
+        )
         // AST-derived code map for a registered repo — the read side of the
         // registration-time scan (dogfood: register this repo, serve its map).
         .route(

@@ -277,6 +277,145 @@ pub(super) async fn post_repo(
         .into_response()
 }
 
+/// `POST /v1/repos/{repo_id}/scan` — in-place rescan of an already-registered
+/// repo. Replaces the legacy delete-and-re-register loop, which destroyed the
+/// registration and persisted map before the new scan had produced anything.
+///
+/// Always runs through the async scan-job path (`run_repo_scan_job`), so the
+/// response is `202 Accepted` with a `job_id` for
+/// `GET /v1/repos/scan-jobs/{job_id}`. Two properties this endpoint exists to
+/// guarantee:
+///
+///   * **Failure preserves the current map.** The persisted scan is only ever
+///     written by `persist_successful_repo_scan` after a fully successful
+///     scan; a failed rescan records `scan_status="failed"` + `scan_error` on
+///     the registration and leaves the previously persisted scan (and
+///     `last_scan_id`) untouched, still serving.
+///   * **Replacement is atomic.** The new scan JSON, `last_scan_id`, and
+///     `scan_status="done"` are committed under one fact-store write lock, so
+///     readers see either the old complete map or the new complete map, never
+///     a partial state.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn post_repo_rescan(
+    State(state): State<AppState>,
+    Path(repo_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<RepoTenantQuery>,
+) -> impl IntoResponse {
+    let tenant_id = query.tenant_id.trim().to_string();
+    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["admin:write"], &tenant_id) {
+        return problem.into_response();
+    }
+
+    let registration = {
+        let store = state.fact_store.read().await;
+        crate::repo_registry::get_repo(&store, &tenant_id, &repo_id)
+    };
+    let Some(registration) = registration else {
+        return problem_response(StatusCode::NOT_FOUND, "repo not found");
+    };
+    let Some(root_path) = registration.root_path.clone() else {
+        return problem_response(
+            StatusCode::CONFLICT,
+            "repo is registered by clone_url only; in-place rescan requires a root_path registration",
+        );
+    };
+    let path_buf = PathBuf::from(&root_path);
+    if !path_buf.exists() {
+        return problem_response(
+            StatusCode::CONFLICT,
+            format!("registered root_path '{root_path}' no longer exists; the persisted map is preserved"),
+        );
+    }
+
+    let queued_at = now_unix_ms();
+    let job_id = format!("repo_scan_{}", uuid::Uuid::new_v4());
+    let job = RepoScanJob {
+        job_id: job_id.clone(),
+        tenant_id: tenant_id.clone(),
+        repo_id: repo_id.clone(),
+        status: RepoScanJobStatus::Submitted,
+        submitted_at_unix_ms: queued_at,
+        started_at_unix_ms: None,
+        finished_at_unix_ms: None,
+        error: None,
+        root_path: path_buf.display().to_string(),
+    };
+
+    // Same lock order as enqueue_repo_scan: the jobs map first, then the fact
+    // store, so the two paths can never deadlock against each other.
+    let mut jobs = state.repo_scan_jobs.write().await;
+    if let Some(existing) = jobs.values().find(|rec| {
+        rec.tenant_id == tenant_id
+            && rec.repo_id == repo_id
+            && matches!(rec.status, RepoScanJobStatus::Submitted | RepoScanJobStatus::Running)
+    }) {
+        // One in-flight scan per repo: two concurrent rescans would race on
+        // the persisted-map commit and the loser's result would silently
+        // vanish. Surfacing the existing job lets the caller poll it instead.
+        return problem_response(
+            StatusCode::CONFLICT,
+            format!(
+                "a scan job for this repo is already in flight (job_id {})",
+                existing.job_id
+            ),
+        );
+    }
+    let pending_count = jobs
+        .values()
+        .filter(|r| matches!(r.status, RepoScanJobStatus::Submitted | RepoScanJobStatus::Running))
+        .count();
+    if pending_count >= state.repo_scan_max_pending {
+        return problem_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "repo scan queue is full (pending={pending_count}, limit={})",
+                state.repo_scan_max_pending
+            ),
+        );
+    }
+
+    // Mark the registration pending under the write lock, re-reading it so a
+    // concurrent delete between the earlier read and now surfaces as 404
+    // instead of resurrecting a deleted repo. `last_scan_id` and the persisted
+    // scan are deliberately untouched: the current map keeps serving until a
+    // new scan commits.
+    let registration = {
+        let mut store = state.fact_store.write().await;
+        let Some(mut registration) = crate::repo_registry::get_repo(&store, &tenant_id, &repo_id) else {
+            return problem_response(StatusCode::NOT_FOUND, "repo not found");
+        };
+        registration.scan_status = Some("pending".to_string());
+        registration.scan_error = None;
+        registration.scan_queued_at_unix_ms = Some(queued_at);
+        registration.scan_finished_at_unix_ms = None;
+        if let Err(err) = crate::repo_registry::store_repo(&mut store, &registration) {
+            return map_registry_error(err);
+        }
+        registration
+    };
+
+    jobs.insert(job_id.clone(), job);
+    gc_finished_repo_scan_jobs(&mut jobs, state.repo_scan_max_pending);
+    drop(jobs);
+
+    let task_state = state.clone();
+    let task_job_id = job_id.clone();
+    tokio::spawn(async move {
+        run_repo_scan_job(task_state, task_job_id).await;
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "repo": registration,
+            "job_id": job_id,
+            "note": "rescan queued; the current map keeps serving until the new scan succeeds",
+        })),
+    )
+        .into_response()
+}
+
 async fn enqueue_repo_scan(
     state: AppState,
     tenant_id: String,
