@@ -1047,14 +1047,30 @@ async fn resolve_gate_http(
     if target.gate.status != "pending" {
         return gate_error_response(crate::work::WorkError::GateAlreadyResolved(action_id.to_string()));
     }
-    if target.gate.requested_by_passport == asserted_approver || target.gate.requested_by_passport == approver_actor {
+    // How many DISTINCT PASSPORTS this deployment requires on a gate decision.
+    //
+    // A hard ban on self-resolution does not produce four-eyes on a deployment
+    // with one human in it — it produces a second passport created solely to
+    // approve one's own work, which passes this check while making the audit
+    // trail *less* honest than admitting single-party approval. So the count is
+    // the operator's to set, and whichever way it is set the receipt records
+    // what actually happened.
+    let required_approvers = required_gate_approvers();
+    let self_resolution =
+        target.gate.requested_by_passport == asserted_approver || target.gate.requested_by_passport == approver_actor;
+    if self_resolution && required_approvers >= 2 {
         return problem_response(
             StatusCode::FORBIDDEN,
-            "the requesting passport cannot resolve its own gate",
+            "the requesting passport cannot resolve its own gate (CORECRUXD_WORK_GATE_APPROVERS=2); \
+             set it to 1 to permit single-party approval, which is recorded as such on the receipt",
         );
     }
 
-    let receipt = match mint_gate_receipt(state, &target, &approver_actor, approve) {
+    let separation = GateSeparation {
+        required_approvers,
+        self_resolution,
+    };
+    let receipt = match mint_gate_receipt(state, &target, &approver_actor, approve, separation) {
         Ok(receipt) => receipt,
         Err((status, detail)) => return problem_response(status, detail),
     };
@@ -1101,11 +1117,64 @@ fn gate_error_response(err: crate::work::WorkError) -> axum::response::Response 
     }
 }
 
+/// Env naming the number of distinct passports a gate decision requires.
+pub(super) const WORK_GATE_APPROVERS_ENV: &str = "CORECRUXD_WORK_GATE_APPROVERS";
+
+/// Distinct passports required to resolve a gate: `1` or `2`.
+///
+/// Anything unset, malformed, or out of range resolves to **2** — the shipped
+/// behaviour. A typo must never silently relax a human-oversight boundary, so
+/// this fails safe upward rather than towards permissiveness.
+pub(super) fn required_gate_approvers() -> u8 {
+    match std::env::var(WORK_GATE_APPROVERS_ENV) {
+        Ok(raw) => match raw.trim() {
+            "1" => 1,
+            _ => 2,
+        },
+        Err(_) => 2,
+    }
+}
+
+/// What the daemon actually established about separation of duties on one
+/// decision. Recorded on the receipt so an auditor never has to infer it.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct GateSeparation {
+    pub required_approvers: u8,
+    pub self_resolution: bool,
+}
+
+impl GateSeparation {
+    /// Distinct passports that took part: 1 when the requester resolved their
+    /// own gate, otherwise 2.
+    fn parties(self) -> u8 {
+        if self.self_resolution {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// The evidence class, worded for an auditor.
+    ///
+    /// `distinct_passports` is deliberately NOT called "four eyes": the daemon
+    /// verifies that two passports differ, and cannot establish that they belong
+    /// to two people. Claiming separation of duties it never proved is the
+    /// failure this wording exists to prevent.
+    fn evidence(self) -> &'static str {
+        if self.self_resolution {
+            "none:self_approved"
+        } else {
+            "distinct_passports"
+        }
+    }
+}
+
 fn mint_gate_receipt(
     state: &AppState,
     target: &crate::work::GateResolutionTarget,
     approver_passport: &str,
     approve: bool,
+    separation: GateSeparation,
 ) -> Result<super::approval_receipts::MintedApprovalReceipt, (StatusCode, String)> {
     use corecrux_receipts::ApprovalDecisionV1;
 
@@ -1116,12 +1185,37 @@ fn mint_gate_receipt(
         ApprovalDecisionV1::Reject
     };
     let target_state = target.gate.target_state.as_deref().unwrap_or("unchanged");
+    // The separation facts ride the SIGNED `action_summary`, not the envelope:
+    // envelope fields are documented as non-authoritative, and "was this really
+    // two-party?" is exactly the question an auditor must be able to answer from
+    // tamper-evident material. (`action_summary` is also the retry binding, so a
+    // policy change between attempts correctly reads as a different decision
+    // rather than silently reusing the earlier receipt.)
     let action_summary = format!(
-        "work:{}:{}:{}",
-        target.work.id, target.gate.requested_action, target_state
+        "work:{}:{}:{}:approvers={}:parties={}:sep={}",
+        target.work.id,
+        target.gate.requested_action,
+        target_state,
+        separation.required_approvers,
+        separation.parties(),
+        separation.evidence(),
     );
     let mut envelope_fields = serde_json::Map::new();
     envelope_fields.insert("work_id".to_string(), serde_json::Value::String(target.work.id.clone()));
+    // Mirrored for readability; the signed summary above is authoritative.
+    envelope_fields.insert(
+        "required_approvers".to_string(),
+        serde_json::Value::from(separation.required_approvers),
+    );
+    envelope_fields.insert("parties".to_string(), serde_json::Value::from(separation.parties()));
+    envelope_fields.insert(
+        "separation_evidence".to_string(),
+        serde_json::Value::String(separation.evidence().to_string()),
+    );
+    envelope_fields.insert(
+        "self_approved".to_string(),
+        serde_json::Value::Bool(separation.self_resolution),
+    );
     super::approval_receipts::mint_or_load_approval_receipt(
         state,
         &super::approval_receipts::ApprovalReceiptSpec {
@@ -1350,5 +1444,82 @@ pub(super) async fn post_execplan(
             .into_response(),
         Ok(Err(crate::execplan_git::WriteError::Failed(m))) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, m),
         Err(e) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, format!("write task failed: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod gate_approver_policy_tests {
+    use super::*;
+
+    // The policy is read from process env, so these serialise.
+
+    #[test]
+    #[serial_test::serial]
+    fn default_is_two_distinct_passports() {
+        std::env::remove_var(WORK_GATE_APPROVERS_ENV);
+        assert_eq!(required_gate_approvers(), 2);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn one_is_honoured_for_a_single_human_deployment() {
+        std::env::set_var(WORK_GATE_APPROVERS_ENV, " 1 ");
+        assert_eq!(required_gate_approvers(), 1);
+        std::env::remove_var(WORK_GATE_APPROVERS_ENV);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn junk_fails_safe_upward_never_towards_permissiveness() {
+        // A typo must not silently relax a human-oversight boundary. Every
+        // unparseable value resolves to the stricter setting, including "0",
+        // which would otherwise read as "no approver required at all".
+        for raw in ["0", "", "   ", "3", "one", "true", "-1", "2x"] {
+            std::env::set_var(WORK_GATE_APPROVERS_ENV, raw);
+            assert_eq!(required_gate_approvers(), 2, "input {raw:?} must fail safe to 2");
+        }
+        std::env::remove_var(WORK_GATE_APPROVERS_ENV);
+    }
+
+    // ── what the receipt records ──────────────────────────────────────────
+
+    #[test]
+    fn a_two_party_decision_records_distinct_passports_and_never_claims_four_eyes() {
+        let sep = GateSeparation {
+            required_approvers: 2,
+            self_resolution: false,
+        };
+        assert_eq!(sep.parties(), 2);
+        assert_eq!(sep.evidence(), "distinct_passports");
+        // The daemon cannot establish that two passports are two people, so the
+        // wording must never imply it.
+        assert!(!sep.evidence().contains("four"));
+        assert!(!sep.evidence().contains("human"));
+        assert!(!sep.evidence().contains("person"));
+    }
+
+    #[test]
+    fn a_single_party_decision_is_recorded_as_self_approved_not_hidden() {
+        // The whole point: a solo deployment gets an honest receipt instead of
+        // an operator minting a second passport to defeat the check, which
+        // would record `distinct_passports` for what is really one human.
+        let sep = GateSeparation {
+            required_approvers: 1,
+            self_resolution: true,
+        };
+        assert_eq!(sep.parties(), 1);
+        assert_eq!(sep.evidence(), "none:self_approved");
+    }
+
+    #[test]
+    fn a_one_policy_deployment_still_records_two_parties_when_two_acted() {
+        // Policy 1 is a ceiling on what is REQUIRED, not a claim about what
+        // happened: if a second passport did approve, the receipt says so.
+        let sep = GateSeparation {
+            required_approvers: 1,
+            self_resolution: false,
+        };
+        assert_eq!(sep.parties(), 2);
+        assert_eq!(sep.evidence(), "distinct_passports");
     }
 }

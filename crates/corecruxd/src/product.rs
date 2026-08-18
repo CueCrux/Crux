@@ -389,6 +389,10 @@ pub struct GateResolutionInputs {
     /// The daemon can mint (a JWT-mode HS256 secret is present). Both issuance
     /// rails 503 without it.
     pub can_mint: bool,
+    /// Distinct passports this deployment requires on a gate decision (1 or 2).
+    /// Surfaced so an operator can see the policy in force without reading env,
+    /// and so a single-party deployment is visibly single-party.
+    pub required_approvers: u8,
 }
 
 /// The evidence rung a deployment resolves gates by, strongest first.
@@ -486,7 +490,14 @@ fn work_gate_resolution_capability(inputs: GateResolutionInputs) -> RuntimeCapab
     let mut capability = match selection {
         GateResolutionSelection::Selected(rung) => {
             let mut c = RuntimeCapability::available(stages);
-            c.detail = Some(serde_json::json!({ "rung": rung.as_str() }));
+            c.detail = Some(serde_json::json!({
+                "rung": rung.as_str(),
+                "required_approvers": inputs.required_approvers,
+                // Named for what the daemon can actually establish. Two distinct
+                // passports is not proof of two people, and the declaration must
+                // not imply it.
+                "separation": if inputs.required_approvers >= 2 { "distinct_passports" } else { "single_party" },
+            }));
             c
         }
         GateResolutionSelection::Blocked {
@@ -1542,6 +1553,7 @@ mod gate_resolution_ladder_tests {
         // asserted in both directions rather than spot-checked.
         for bits in 0u8..32 {
             let i = GateResolutionInputs {
+                required_approvers: 2,
                 auth_off: bits & 1 != 0,
                 identity_rail_enabled: bits & 2 != 0,
                 identity_rail_has_passport: bits & 4 != 0,

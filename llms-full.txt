@@ -4361,6 +4361,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The number of distinct passports a work gate requires is now the operator's
+  to set.** `CORECRUXD_WORK_GATE_APPROVERS` takes `1` or `2`, default `2` — the
+  shipped behaviour, where a requester may not resolve their own gate.
+
+  A hard ban does not produce separation of duties on a deployment with one
+  human in it. It produces a second passport minted solely to approve one's own
+  work — which passes the check while recording `distinct_passports` for what is
+  really one person. That is a *worse* audit trail than admitting single-party
+  approval, so the count is configurable and the receipt records the truth
+  either way.
+
+  The separation facts ride the **signed** `action_summary`, not the envelope
+  (envelope fields are documented as non-authoritative, and "was this really
+  two-party?" is exactly the question that needs tamper-evident material):
+
+  ```
+  work:<id>:<action>:<state>:approvers=<policy>:parties=<1|2>:sep=<evidence>
+  ```
+
+  `sep` is `distinct_passports` or `none:self_approved`. **`distinct_passports`
+  means exactly that** — the daemon verifies two passports differ and cannot
+  establish they belong to two people; the receipt never claims otherwise, and
+  nothing in it says "four eyes". The `work_gate_resolution` capability also
+  reports the policy, so a single-party deployment is visibly single-party.
+
+  Anything unset, malformed, or out of range resolves to `2`: a typo must never
+  silently relax a human-oversight boundary. (#705)
+
 ### Security
 
 - **A device-grant approver could grant scopes it did not itself hold.**
