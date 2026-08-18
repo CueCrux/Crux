@@ -1172,6 +1172,65 @@ fn test_rcx_router(capabilities: Vec<&str>) -> std::sync::Arc<crux_router::RcxRo
 /// `X-Corecrux-Scopes` header for [`AuthMode::DevScopes`] handler tests.
 /// `pub(super)` so sibling `http::*` modules with inline test blocks share one
 /// builder instead of re-declaring it per file.
+/// M5 adversarial (issue #705): an approver may not grant a device scopes it
+/// does not itself hold.
+///
+/// This was live on main. The module contract promised the issued scopes were
+/// "a concrete subset of the authenticated approver's verified grants", but
+/// nothing enforced it, and `missing_scopes` is exact-match — so `admin:write`
+/// does NOT imply `facts:write`. An approver holding only `admin:write` could
+/// mint a device credential carrying authority it never had; M1's passport
+/// binding then let that credential resolve work gates.
+#[tokio::test]
+#[serial_test::serial]
+async fn attack_device_approve_cannot_grant_scopes_the_approver_lacks() {
+    std::env::set_var("CORECRUXD_DEVICE_GRANT_ENABLED", "1");
+    let state = test_app_state_with_auth(4, AuthMode::DevScopes);
+
+    let escalate = super::auth_device::post_device_approve(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        Json(super::auth_device::DeviceApproveReq {
+            user_code: "AAAA-BBBB".to_string(),
+            tenant_id: "acme".to_string(),
+            scopes: vec!["facts:write".to_string()],
+            deny: false,
+            bind_passport: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        escalate.status(),
+        StatusCode::FORBIDDEN,
+        "an admin:write-only approver must not be able to grant facts:write"
+    );
+
+    // Positive control: the SAME call from an approver that does hold the scope
+    // gets past attenuation (and then fails on the unknown user_code, which is
+    // the next check — proving the refusal above was the scope one, not a
+    // blanket rejection).
+    let allowed = super::auth_device::post_device_approve(
+        State(state),
+        dev_scope_headers("admin:write facts:write"),
+        Json(super::auth_device::DeviceApproveReq {
+            user_code: "AAAA-BBBB".to_string(),
+            tenant_id: "acme".to_string(),
+            scopes: vec!["facts:write".to_string()],
+            deny: false,
+            bind_passport: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        allowed.status(),
+        StatusCode::NOT_FOUND,
+        "a properly-scoped approver should reach the user_code lookup"
+    );
+    std::env::remove_var("CORECRUXD_DEVICE_GRANT_ENABLED");
+}
+
 pub(super) fn dev_scope_headers(scopes: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(

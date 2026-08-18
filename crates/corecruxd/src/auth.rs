@@ -4163,6 +4163,113 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         }
     }
 
+    // ── M5 adversarial pass (issue #705) ──────────────────────────────────
+    // Each test is an ATTACK on the shipped path, named for what it attempts.
+    // Two attacks are deliberately absent because they succeed by design and are
+    // written up as accepted risks instead of being dressed as refusals — see
+    // docs/design/gate-oversight-adversarial-2026-08-18.md.
+
+    fn rail_token(passport: Option<&str>, scopes: &[&str], tenant: &str, ttl: u64, issued_at: u64) -> String {
+        use crux_mcp::tools::loopback_auth::{mint_scoped_jwt_inner, ScopedClaims};
+        mint_scoped_jwt_inner(
+            issued_at,
+            TEST_HS256_SECRET.as_bytes(),
+            Some("corecrux-test"),
+            Some("corecrux"),
+            &ScopedClaims {
+                sub: "ts:alice@example.com",
+                passport_id: passport,
+                scopes,
+                tenant_id: tenant,
+                ttl_secs: ttl,
+            },
+        )
+        .expect("mint")
+    }
+
+    #[test]
+    fn attack_replay_after_ttl_is_refused() {
+        // A captured token replayed after its 300s life. `exp` validation carries
+        // a 30s leeway, so age it well past both.
+        let auth = hs256_authz();
+        let token = rail_token(Some("p_alice"), &["facts:write"], "acme", 300, now_secs() - 4_000);
+        assert!(
+            passport_bound_context(&auth, &bearer(&token)).is_err(),
+            "an expired rail token must not authenticate"
+        );
+    }
+
+    #[test]
+    fn attack_token_minted_for_another_audience_is_refused() {
+        use crux_mcp::tools::loopback_auth::{mint_scoped_jwt_inner, ScopedClaims};
+        let auth = hs256_authz();
+        let token = mint_scoped_jwt_inner(
+            now_secs(),
+            TEST_HS256_SECRET.as_bytes(),
+            Some("someone-else"),
+            Some("someone-else"),
+            &ScopedClaims {
+                sub: "ts:alice@example.com",
+                passport_id: Some("p_alice"),
+                scopes: &["facts:write"],
+                tenant_id: "acme",
+                ttl_secs: 300,
+            },
+        )
+        .expect("mint");
+        assert!(
+            passport_bound_context(&auth, &bearer(&token)).is_err(),
+            "iss/aud pinning must refuse a token minted for another issuer"
+        );
+    }
+
+    #[test]
+    fn attack_gate_token_cannot_reach_an_admin_route() {
+        // The rail issues exactly what the approver granted. A gate-resolution
+        // token carries `facts:write` and must not become a general admin
+        // credential — scope matching is exact, with no implied hierarchy.
+        let auth = hs256_authz();
+        let token = rail_token(Some("p_alice"), &["facts:write"], "acme", 300, now_secs());
+        let context = passport_bound_context(&auth, &bearer(&token)).expect("context");
+        assert!(context.has_scope("facts:write"));
+        for denied in ["admin:write", "admin:read", "passport:impersonate"] {
+            assert!(!context.has_scope(denied), "gate token must not hold {denied}");
+        }
+    }
+
+    #[test]
+    fn attack_cross_tenant_resolution_is_refused() {
+        // A token bound to `acme` attempting to resolve a gate whose work item
+        // lives in another tenant — the authorization `resolve_gate_http`
+        // performs on the gate's own tenant.
+        let auth = hs256_authz();
+        let token = rail_token(Some("p_alice"), &["facts:write"], "acme", 300, now_secs());
+        let context = passport_bound_context(&auth, &bearer(&token)).expect("context");
+        assert_eq!(context.resolve_authorized_tenant(Some("acme")).unwrap(), "acme");
+        let denied = context.resolve_authorized_tenant(Some("other-tenant")).unwrap_err();
+        assert_eq!(problem_code(&denied), "TENANT_FORBIDDEN");
+    }
+
+    #[test]
+    fn attack_passport_header_cannot_override_a_rail_tokens_identity() {
+        // Presenting someone else's passport alongside a rail token. Without an
+        // override scope this is refused outright; `resolve_gate_http` also
+        // refuses any context where an override WAS used, so the two-layer
+        // defence is asserted here rather than assumed.
+        let auth = hs256_authz();
+        let token = rail_token(Some("p_alice"), &["facts:write"], "acme", 300, now_secs());
+        let mut headers = bearer(&token);
+        headers.insert("x-corecrux-passport-id", "p_victim".parse().unwrap());
+        match passport_bound_context(&auth, &headers) {
+            Err(problem) => assert_eq!(problem_code(&problem), "PASSPORT_HEADER_MISMATCH"),
+            Ok(context) => panic!(
+                "a mismatched passport header must not authenticate (got passport {:?}, override_used={})",
+                context.passport_id,
+                context.passport_override_used()
+            ),
+        }
+    }
+
     // ── Issuance rails ⇄ the Art.14 gate boundary (issue #705, M1) ────────
     // The seam this closes: the login rails shipped 2026-06-16 minting
     // `passport_id: None`; `resolve_gate_http` began requiring a canonical
