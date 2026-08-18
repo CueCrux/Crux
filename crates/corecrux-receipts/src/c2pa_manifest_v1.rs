@@ -1304,6 +1304,33 @@ mod tests {
     }
 
     #[test]
+    fn x5chain_der_decodes_the_es256_envelope_chain_leaf_first() {
+        let (key_pem, cert_pem) = byok_material();
+        let signer = ByokP256Signer::from_pem(&key_pem, &cert_pem, "byok-leaf-1").unwrap();
+        let manifest = build_c2pa_manifest_v1(&byok_input(b"x5chain-der"));
+        let signed = sign_c2pa_manifest_via_signer(manifest, &signer, "2026-07-17T00:00:00Z").unwrap();
+        let chain = c2pa_x5chain_der_v1(&signed).unwrap();
+        assert_eq!(chain.len(), 1, "BYOK material embeds exactly the leaf");
+        assert_eq!(
+            chain[0],
+            pem_cert_to_der(&cert_pem).unwrap(),
+            "decoded DER must be the exact presented PEM leaf"
+        );
+    }
+
+    #[test]
+    fn x5chain_der_fails_closed_on_a_non_es256_envelope() {
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let manifest = build_c2pa_manifest_v1(&fixture_input(b"legacy", "r_legacy"));
+        let signed = sign_c2pa_manifest_v1(manifest, &sk, "key_legacy", "2026-05-27T12:00:00Z").unwrap();
+        let err = c2pa_x5chain_der_v1(&signed).unwrap_err();
+        assert!(
+            format!("{err}").contains("expected an es256 envelope"),
+            "must fail closed on alg, got: {err}"
+        );
+    }
+
+    #[test]
     fn leaf_inspection_reports_expired_certificate_without_assigning_trust() {
         use rcgen::{date_time_ymd, CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 

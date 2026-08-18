@@ -227,3 +227,164 @@ fn verify_certificate_link(
         .verify_signature(Some(issuer.public_key()))
         .map_err(|_| format!("{label} certificate signature verification failed"))
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+        PKCS_ECDSA_P256_SHA256,
+    };
+
+    /// Well inside the rcgen default validity window (1975-01-01..4096-01-01).
+    const NOW: u64 = 1_753_000_000;
+    /// Past the rcgen default `not_after` (4096-01-01), so every test
+    /// certificate is outside its validity window at this instant.
+    const AFTER_EXPIRY: u64 = 70_000_000_000;
+
+    struct TestPki {
+        leaf: Vec<u8>,
+        intermediate: Vec<u8>,
+        root: Vec<u8>,
+    }
+
+    fn ca_params(common_name: &str, constraint: BasicConstraints) -> CertificateParams {
+        let mut params = CertificateParams::new(vec![format!("{common_name}.test")]).unwrap();
+        params.distinguished_name.push(rcgen::DnType::CommonName, common_name);
+        params.is_ca = IsCa::Ca(constraint);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params
+    }
+
+    fn leaf_params() -> CertificateParams {
+        let mut params = CertificateParams::new(vec!["leaf.test".to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "CueCrux C2PA Leaf TEST");
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::EmailProtection];
+        params
+    }
+
+    /// Root signs the intermediate, the intermediate signs the leaf. The
+    /// intermediate always carries pathLenConstraint=0, which is exactly
+    /// satisfied with zero CA certificates below it — so off-by-one drift in
+    /// the depth arithmetic flips the validation result.
+    fn build_pki(root_constraint: BasicConstraints, leaf: CertificateParams) -> TestPki {
+        let root_params = ca_params("CueCrux C2PA Root TEST", root_constraint);
+        let root_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let root_der = root_params.self_signed(&root_kp).unwrap().der().to_vec();
+        let root_issuer = rcgen::Issuer::new(root_params, root_kp);
+
+        let inter_params = ca_params("CueCrux C2PA Intermediate TEST", BasicConstraints::Constrained(0));
+        let inter_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let intermediate_der = inter_params.signed_by(&inter_kp, &root_issuer).unwrap().der().to_vec();
+        let inter_issuer = rcgen::Issuer::new(inter_params, inter_kp);
+
+        let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let leaf_der = leaf.signed_by(&leaf_kp, &inter_issuer).unwrap().der().to_vec();
+
+        TestPki {
+            leaf: leaf_der,
+            intermediate: intermediate_der,
+            root: root_der,
+        }
+    }
+
+    fn default_pki() -> TestPki {
+        build_pki(BasicConstraints::Unconstrained, leaf_params())
+    }
+
+    #[test]
+    fn accepts_a_valid_leaf_intermediate_chain_to_the_anchor() {
+        let pki = default_pki();
+        let chain = vec![pki.leaf.clone(), pki.intermediate.clone()];
+        assert_eq!(validate_c2pa_chain_to_anchor_v1(&chain, &pki.root, NOW), Ok(()));
+    }
+
+    #[test]
+    fn accepts_a_chain_that_presents_the_anchor_as_its_terminal_certificate() {
+        let pki = default_pki();
+        let chain = vec![pki.leaf.clone(), pki.intermediate.clone(), pki.root.clone()];
+        assert_eq!(validate_c2pa_chain_to_anchor_v1(&chain, &pki.root, NOW), Ok(()));
+    }
+
+    #[test]
+    fn rejects_the_anchor_out_of_order_in_the_presented_chain() {
+        let pki = default_pki();
+        let chain = vec![pki.root.clone(), pki.leaf.clone()];
+        let err = validate_c2pa_chain_to_anchor_v1(&chain, &pki.root, NOW).unwrap_err();
+        assert!(err.contains("out of order"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_chain_whose_anchor_path_length_is_exceeded() {
+        // The root pins pathLen=0 but one intermediate CA sits below it.
+        let pki = build_pki(BasicConstraints::Constrained(0), leaf_params());
+        let chain = vec![pki.leaf.clone(), pki.intermediate.clone()];
+        let err = validate_c2pa_chain_to_anchor_v1(&chain, &pki.root, NOW).unwrap_err();
+        assert!(err.contains("path length is exceeded"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_leaf_missing_digital_signature_key_usage() {
+        let mut leaf = leaf_params();
+        leaf.key_usages = vec![KeyUsagePurpose::ContentCommitment];
+        let pki = build_pki(BasicConstraints::Unconstrained, leaf);
+        let chain = vec![pki.leaf.clone(), pki.intermediate.clone()];
+        let err = validate_c2pa_chain_to_anchor_v1(&chain, &pki.root, NOW).unwrap_err();
+        assert!(err.contains("digitalSignature"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_leaf_asserting_key_cert_sign() {
+        let mut leaf = leaf_params();
+        leaf.key_usages = vec![KeyUsagePurpose::DigitalSignature, KeyUsagePurpose::KeyCertSign];
+        let pki = build_pki(BasicConstraints::Unconstrained, leaf);
+        let chain = vec![pki.leaf.clone(), pki.intermediate.clone()];
+        let err = validate_c2pa_chain_to_anchor_v1(&chain, &pki.root, NOW).unwrap_err();
+        assert!(err.contains("digitalSignature"), "{err}");
+    }
+
+    #[test]
+    fn rejects_certificates_outside_their_validity_window() {
+        let pki = default_pki();
+        let chain = vec![pki.leaf.clone(), pki.intermediate.clone()];
+        let err = validate_c2pa_chain_to_anchor_v1(&chain, &pki.root, AFTER_EXPIRY).unwrap_err();
+        assert!(err.contains("not currently valid"), "{err}");
+    }
+
+    #[test]
+    fn rejects_an_unsupported_critical_extension_fail_closed() {
+        let mut leaf = leaf_params();
+        // A private-arc extension this verifier has no handler for, marked
+        // critical: RFC 5280 demands rejection.
+        let mut extension = rcgen::CustomExtension::from_oid_content(&[1, 3, 6, 1, 4, 1, 99999, 1], vec![0x05, 0x00]);
+        extension.set_criticality(true);
+        leaf.custom_extensions.push(extension);
+        let pki = build_pki(BasicConstraints::Unconstrained, leaf);
+        let chain = vec![pki.leaf.clone(), pki.intermediate.clone()];
+        let err = validate_c2pa_chain_to_anchor_v1(&chain, &pki.root, NOW).unwrap_err();
+        assert!(err.contains("unsupported critical extension"), "{err}");
+    }
+
+    #[test]
+    fn rejects_trailing_der_bytes_on_a_presented_certificate() {
+        let pki = default_pki();
+        let mut padded = pki.leaf.clone();
+        padded.push(0x00);
+        let chain = vec![padded, pki.intermediate.clone()];
+        let err = validate_c2pa_chain_to_anchor_v1(&chain, &pki.root, NOW).unwrap_err();
+        assert!(err.contains("leaf certificate has trailing DER bytes"), "{err}");
+    }
+
+    #[test]
+    fn rejects_an_anchor_that_is_not_self_issued() {
+        let pki = default_pki();
+        let chain = vec![pki.leaf.clone()];
+        let err = validate_c2pa_chain_to_anchor_v1(&chain, &pki.intermediate, NOW).unwrap_err();
+        assert!(err.contains("not self-issued"), "{err}");
+    }
+}
