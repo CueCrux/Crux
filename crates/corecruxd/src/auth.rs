@@ -4163,6 +4163,70 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         }
     }
 
+    // ── Issuance rails ⇄ the Art.14 gate boundary (issue #705, M1) ────────
+    // The seam this closes: the login rails shipped 2026-06-16 minting
+    // `passport_id: None`; `resolve_gate_http` began requiring a canonical
+    // passport six weeks later. These two tests are the contract between them,
+    // asserted in BOTH directions so neither side can drift silently.
+
+    #[test]
+    fn a_rail_minted_token_with_a_passport_satisfies_the_gate_boundary() {
+        use crux_mcp::tools::loopback_auth::{mint_scoped_jwt_inner, ScopedClaims};
+        let auth = hs256_authz();
+        let token = mint_scoped_jwt_inner(
+            now_secs(),
+            TEST_HS256_SECRET.as_bytes(),
+            Some("corecrux-test"),
+            Some("corecrux"),
+            &ScopedClaims {
+                sub: "ts:alice@example.com",
+                passport_id: Some("p_alice"),
+                scopes: &["facts:write"],
+                tenant_id: "acme",
+                ttl_secs: 300,
+            },
+        )
+        .expect("mint");
+        let context = passport_bound_context(&auth, &bearer(&token)).expect("context");
+        // Every property `resolve_gate_http` checks for a non-local credential.
+        assert!(
+            context.canonical_passport_claim_verified(),
+            "a rail token carrying passport_id must satisfy the canonical-passport check"
+        );
+        assert_eq!(context.passport_id.as_deref(), Some("p_alice"));
+        assert!(context.has_scope("facts:write"));
+        assert!(!context.credential_is_agent_token());
+        assert!(!context.passport_override_used());
+        assert_eq!(context.resolve_authorized_tenant(Some("acme")).unwrap(), "acme");
+    }
+
+    #[test]
+    fn a_rail_minted_token_without_a_passport_still_cannot_resolve_a_gate() {
+        use crux_mcp::tools::loopback_auth::{mint_scoped_jwt_inner, ScopedClaims};
+        let auth = hs256_authz();
+        let token = mint_scoped_jwt_inner(
+            now_secs(),
+            TEST_HS256_SECRET.as_bytes(),
+            Some("corecrux-test"),
+            Some("corecrux"),
+            &ScopedClaims {
+                sub: "ts:alice@example.com",
+                passport_id: None,
+                scopes: &["facts:write"],
+                tenant_id: "acme",
+                ttl_secs: 300,
+            },
+        )
+        .expect("mint");
+        let context = passport_bound_context(&auth, &bearer(&token)).expect("context");
+        // The regression that matters: binding a passport on the rails must not
+        // become a way for an UNBOUND token to slip through. `sub` is an
+        // identity fallback for ordinary routes and is deliberately not enough
+        // here.
+        assert!(!context.canonical_passport_claim_verified());
+        assert!(context.has_scope("facts:write"));
+    }
+
     // ── resolve_authorized_tenant_scope (issue #703) ──────────────────────
     // A read-only oversight queue answers for every tenant the credential is
     // authorized for. Collapsing a wildcard token to `default` is what rendered

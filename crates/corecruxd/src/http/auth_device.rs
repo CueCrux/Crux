@@ -67,7 +67,11 @@ fn now_secs() -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GrantState {
     Pending,
-    Approved { tenant_id: String, scopes: Vec<String> },
+    Approved {
+        tenant_id: String,
+        scopes: Vec<String>,
+        passport_id: Option<String>,
+    },
     Denied,
     Consumed,
 }
@@ -99,6 +103,11 @@ struct RefreshCred {
     scopes: Vec<String>,
     secret_hash: blake3::Hash,
     revoked: bool,
+    /// Canonical passport the paired device acts as, when the approving admin
+    /// bound their own. Carried on refresh so a re-minted token keeps the
+    /// binding — otherwise a device would quietly lose the ability to resolve a
+    /// gate five minutes after pairing.
+    passport_id: Option<String>,
 }
 
 impl RefreshCred {
@@ -147,6 +156,10 @@ struct PersistedCred {
     scopes: Vec<String>,
     secret_hash: String,
     revoked: bool,
+    /// `default` so credentials persisted before this field existed rehydrate
+    /// as unbound rather than failing to decode and silently unpairing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    passport_id: Option<String>,
 }
 
 impl PersistedCred {
@@ -157,6 +170,7 @@ impl PersistedCred {
             scopes: cred.scopes.clone(),
             secret_hash: cred.secret_hash.to_hex().to_string(),
             revoked: cred.revoked,
+            passport_id: cred.passport_id.clone(),
         }
     }
 
@@ -170,6 +184,7 @@ impl PersistedCred {
                 scopes: self.scopes,
                 secret_hash: blake3::Hash::from(raw),
                 revoked: self.revoked,
+                passport_id: self.passport_id,
             },
         ))
     }
@@ -370,7 +385,11 @@ enum PollDecision {
     Pending,
     Denied,
     Expired,
-    Issue { tenant_id: String, scopes: Vec<String> },
+    Issue {
+        tenant_id: String,
+        scopes: Vec<String>,
+        passport_id: Option<String>,
+    },
 }
 
 /// Advance the poll state machine for one `device/token` call. Mutates the
@@ -390,10 +409,15 @@ fn decide_poll(grant: &mut DeviceGrant, now: u64) -> PollDecision {
         GrantState::Pending => PollDecision::Pending,
         GrantState::Denied => PollDecision::Denied,
         GrantState::Consumed => PollDecision::Expired, // one-time: replay rejected
-        GrantState::Approved { tenant_id, scopes } => {
+        GrantState::Approved {
+            tenant_id,
+            scopes,
+            passport_id,
+        } => {
             let decision = PollDecision::Issue {
                 tenant_id: tenant_id.clone(),
                 scopes: scopes.clone(),
+                passport_id: passport_id.clone(),
             };
             grant.state = GrantState::Consumed;
             decision
@@ -506,6 +530,17 @@ pub(super) struct DeviceApproveReq {
     /// Set true to deny instead of approve.
     #[serde(default)]
     pub deny: bool,
+    /// Bind the issued token to **the approving admin's own** canonical
+    /// passport, so the paired device can satisfy an Art.14 human-approval
+    /// boundary (issue #705).
+    ///
+    /// Deliberately a flag and not a passport string. Letting an approver name
+    /// an arbitrary passport would be impersonation-by-admin — precisely what
+    /// `resolve_gate_http`'s passport-override check refuses — and it would
+    /// hollow out non-self-review, since the approver could mint someone else's
+    /// identity. Approve your own second machine; do not vend identities.
+    #[serde(default)]
+    pub bind_passport: bool,
 }
 
 #[tracing::instrument(level = "info", skip_all)]
@@ -521,6 +556,44 @@ pub(super) async fn post_device_approve(
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
+    // The passport, when requested, is the APPROVER'S OWN verified identity —
+    // never a value the request names. Refuse loudly rather than issuing an
+    // unbound token the operator believes is bound.
+    let approver_passport = if req.bind_passport && !req.deny {
+        let context = match crate::auth::passport_bound_context(&state.auth, &headers) {
+            Ok(context) => context,
+            Err(problem) => return problem.into_response(),
+        };
+        if context.passport_override_used() {
+            return problem_response(
+                StatusCode::FORBIDDEN,
+                "a passport-header override cannot bind a device grant; approve with your own credential",
+            );
+        }
+        if context.credential_is_agent_token() {
+            return problem_response(
+                StatusCode::FORBIDDEN,
+                "an MCP agent token cannot bind a human passport to a device grant",
+            );
+        }
+        if !context.canonical_passport_claim_verified() {
+            return problem_response(
+                StatusCode::FORBIDDEN,
+                "binding a passport requires approving with a credential carrying a canonical passport_id claim",
+            );
+        }
+        match context.passport_id.clone() {
+            Some(passport) => Some(passport),
+            None => {
+                return problem_response(
+                    StatusCode::FORBIDDEN,
+                    "no authenticated passport to bind to this device grant",
+                )
+            }
+        }
+    } else {
+        None
+    };
     let user_code = req.user_code.trim().to_ascii_uppercase();
     let tenant_id = req.tenant_id.trim().to_string();
     if tenant_id.is_empty() {
@@ -554,12 +627,14 @@ pub(super) async fn post_device_approve(
         return problem_response(StatusCode::CONFLICT, "device grant is no longer pending");
     }
     let client_name = grant.client_name.clone();
+    let bound_passport = approver_passport.clone();
     grant.state = if req.deny {
         GrantState::Denied
     } else {
         GrantState::Approved {
             tenant_id: tenant_id.clone(),
             scopes: scopes.clone(),
+            passport_id: approver_passport,
         }
     };
     (
@@ -569,6 +644,12 @@ pub(super) async fn post_device_approve(
             "user_code": user_code,
             "client_name": client_name,
             "decision": if req.deny { "denied" } else { "approved" },
+            "passport_id": bound_passport,
+            "gate_resolution": if bound_passport.is_some() {
+                "available — this device acts as the approving admin's passport"
+            } else {
+                "unavailable — approve with bind_passport to let this device resolve work gates"
+            },
         })),
     )
         .into_response()
@@ -615,19 +696,29 @@ pub(super) async fn post_device_token(State(state): State<AppState>, Json(req): 
             "expired_token",
             "the device_code has expired or was already used",
         ),
-        PollDecision::Issue { tenant_id, scopes } => issue_device_tokens(&state, &tenant_id, &scopes).await,
+        PollDecision::Issue {
+            tenant_id,
+            scopes,
+            passport_id,
+        } => issue_device_tokens(&state, &tenant_id, &scopes, passport_id.as_deref()).await,
     }
 }
 
 /// Mint an access token + create a revocable refresh credential for an approved
-/// grant. T.1: `tenant_id`/`scopes` are the approver's, passed in here.
-async fn issue_device_tokens(state: &AppState, tenant_id: &str, scopes: &[String]) -> Response {
+/// grant. T.1: `tenant_id`/`scopes`/`passport_id` are all the approver's, passed
+/// in here — never anything the polling client sent.
+async fn issue_device_tokens(
+    state: &AppState,
+    tenant_id: &str,
+    scopes: &[String],
+    passport_id: Option<&str>,
+) -> Response {
     let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
     let cred_id = uuid::Uuid::new_v4().simple().to_string();
     let sub = format!("device:{cred_id}");
     let claims = ScopedClaims {
         sub: &sub,
-        passport_id: None,
+        passport_id,
         scopes: &scope_refs,
         tenant_id,
         ttl_secs: ISSUED_TOKEN_TTL_SECS,
@@ -645,6 +736,7 @@ async fn issue_device_tokens(state: &AppState, tenant_id: &str, scopes: &[String
         scopes: scopes.to_vec(),
         secret_hash: blake3::hash(secret.as_bytes()),
         revoked: false,
+        passport_id: passport_id.map(str::to_string),
     };
     // Persist BEFORE publishing the credential to the caller. Issuing first and
     // persisting after would hand out a token that silently stops working at the
@@ -671,6 +763,7 @@ async fn issue_device_tokens(state: &AppState, tenant_id: &str, scopes: &[String
             "scopes": scopes,
             "tenant_id": tenant_id,
             "rail": "device",
+            "passport_id": passport_id,
         })),
     )
         .into_response()
@@ -702,7 +795,9 @@ pub(super) async fn post_device_refresh(State(_state): State<AppState>, Json(req
             return problem_response(StatusCode::INTERNAL_SERVER_ERROR, "device registry unavailable");
         };
         match reg.refresh.get(cred_id) {
-            Some(cred) if !cred.revoked && cred.secret_matches(secret) => (cred.tenant_id.clone(), cred.scopes.clone()),
+            Some(cred) if !cred.revoked && cred.secret_matches(secret) => {
+                (cred.tenant_id.clone(), cred.scopes.clone(), cred.passport_id.clone())
+            }
             Some(cred) if cred.revoked => {
                 return oauth_error(
                     StatusCode::UNAUTHORIZED,
@@ -713,12 +808,14 @@ pub(super) async fn post_device_refresh(State(_state): State<AppState>, Json(req
             _ => return oauth_error(StatusCode::UNAUTHORIZED, "invalid_grant", "unknown refresh credential"),
         }
     };
-    let (tenant_id, scopes) = principal;
+    // The binding rides the credential, not the request: a refresh must neither
+    // gain a passport the pairing never had, nor silently lose one it did.
+    let (tenant_id, scopes, passport_id) = principal;
     let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
     let sub = format!("device:{cred_id}");
     let claims = ScopedClaims {
         sub: &sub,
-        passport_id: None,
+        passport_id: passport_id.as_deref(),
         scopes: &scope_refs,
         tenant_id: &tenant_id,
         ttl_secs: ISSUED_TOKEN_TTL_SECS,
@@ -733,6 +830,7 @@ pub(super) async fn post_device_refresh(State(_state): State<AppState>, Json(req
                 "scopes": scopes,
                 "tenant_id": tenant_id,
                 "rail": "device",
+                "passport_id": passport_id,
             })),
         )
             .into_response(),
@@ -833,17 +931,42 @@ mod tests {
     }
 
     #[test]
+    fn poll_carries_the_bound_passport_through_to_issuance() {
+        // The seam #705 is about: an approval that bound a passport must still
+        // be carrying it at the moment the token is minted.
+        let now = 1_000_000;
+        let mut g = pending_grant(now);
+        g.state = GrantState::Approved {
+            tenant_id: "acme".to_string(),
+            scopes: vec!["facts:write".to_string()],
+            passport_id: Some("p_alice".to_string()),
+        };
+        match decide_poll(&mut g, now) {
+            PollDecision::Issue { passport_id, .. } => {
+                assert_eq!(passport_id.as_deref(), Some("p_alice"));
+            }
+            other => panic!("expected Issue, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn poll_approved_issues_once_then_expired() {
         let now = 1_000_000;
         let mut g = pending_grant(now);
         g.state = GrantState::Approved {
             tenant_id: "acme".to_string(),
             scopes: vec!["query:read".to_string()],
+            passport_id: None,
         };
         match decide_poll(&mut g, now) {
-            PollDecision::Issue { tenant_id, scopes } => {
+            PollDecision::Issue {
+                tenant_id,
+                scopes,
+                passport_id,
+            } => {
                 assert_eq!(tenant_id, "acme");
                 assert_eq!(scopes, vec!["query:read"]);
+                assert!(passport_id.is_none(), "an unbound approval must issue unbound");
             }
             other => panic!("expected Issue, got {other:?}"),
         }
@@ -881,6 +1004,7 @@ mod tests {
 
     fn cred_for(secret: &str, revoked: bool) -> RefreshCred {
         RefreshCred {
+            passport_id: None,
             tenant_id: "acme".to_string(),
             scopes: vec!["query:read".to_string()],
             secret_hash: blake3::hash(secret.as_bytes()),
@@ -1001,6 +1125,7 @@ mod tests {
         // Truncated/garbage hex must drop the record, never decode to a hash
         // that some secret could accidentally match.
         let bad = PersistedCred {
+            passport_id: None,
             cred_id: "cred-1".to_string(),
             tenant_id: "acme".to_string(),
             scopes: vec![],

@@ -11,6 +11,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The login rails can now name the human, so a paired device can resolve a
+  work gate.** `resolve_gate_http` requires a canonical `passport_id` claim, but
+  every issuance rail minted `passport_id: None` — so no credential obtained
+  through `crux login` could satisfy the Art.14 human-approval boundary, and the
+  console's Approve button was visible but inert. The rails shipped 2026-06-16;
+  the canonical-passport requirement arrived six weeks later, and the two were
+  never joined.
+
+  - **Identity rail** — `CORECRUXD_TS_IDENTITY_ALLOWLIST` entries take an
+    optional `#<passport>` suffix (`alice@example.com=acme:facts:write#p_alice`).
+    `#` rather than a third colon-delimited field because scopes already contain
+    colons. The passport is operator-controlled authority, exactly like the
+    tenant and scopes; it is never taken from the request.
+  - **Device grant** — `POST /v1/auth/device/approve` accepts `bind_passport`,
+    binding **the approving admin's own** verified passport to the issued token
+    and carrying it across refresh. Deliberately a flag, not a passport string:
+    letting an approver name an arbitrary passport would be
+    impersonation-by-admin and would hollow out non-self-review. `/activate`
+    exposes it with that warning in the label.
+
+  An entry or approval without a passport still issues an unbound token, and an
+  unbound token still cannot resolve a gate — asserted in both directions, so
+  binding on the rails cannot become a way for an unbound token to slip through.
+  Both surfaces now report `passport_id` and a plain-language `gate_resolution`
+  line, so an operator learns the token cannot approve at issuance rather than
+  at the click.
+
+- **The identity rail works behind any authenticating proxy, not just
+  Tailscale.** It was already proxy-agnostic apart from one hardcoded header
+  name. `CORECRUXD_IDENTITY_HEADER` now names the header, defaulting to the
+  `tailscale serve` preset so existing deployments are byte-identical; presets
+  for oauth2-proxy, Cloudflare Access, Authelia and Authentik are documented.
+  Every trust check is unchanged — loopback-or-listed-CIDR, fail-closed on
+  absent peer info. **The proxy must strip-then-set the header:** a trusted CIDR
+  proves the proxy sent the request, not that it authored the header. Where that
+  cannot be guaranteed, use the device grant. (#705)
+
 ### Fixed
 
 - **A local-only daemon's Gates page was still empty for any tenant but

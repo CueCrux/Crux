@@ -366,6 +366,12 @@ pub fn routes(enabled: bool) -> Router {
 }
 
 /// `/activate` — operator approval page for the device-authorization grant.
+/// The "bind my passport" box binds the APPROVER'S OWN canonical passport to the
+/// issued token (issue #705), which is what lets the paired device satisfy an
+/// Art.14 gate decision. It is deliberately not a free-text passport field: an
+/// approver naming someone else's passport would be impersonation-by-admin and
+/// would hollow out non-self-review.
+///
 /// The form POSTs to `/v1/auth/device/approve` on the same origin; that endpoint
 /// is gated to an authenticated console admin (`admin:write`) and the
 /// approver-chosen tenant + scopes are what get minted (threat ref T.1).
@@ -473,6 +479,12 @@ const ACTIVATE_HTML: &str = r#"<!doctype html>
         </div>
       </div>
       <div class="field">
+        <label class="lbl">Approvals (Art.14)</label>
+        <div class="scopes">
+          <label><input type="checkbox" id="bind_passport" /><span><code>bind my passport</code><span class="desc"> &mdash; let this device resolve work gates <b>as you</b>. Only tick this for a machine you control: it acts with your approver identity, and every approval it makes is attributed to you.</span></span></label>
+        </div>
+      </div>
+      <div class="field">
         <label class="lbl">Scopes</label>
         <div id="scopes" class="scopes">
           <label><input type="checkbox" value="query:read" /><span><code>query:read</code><span class="desc"> — run retrieval / text-search queries</span></span></label>
@@ -534,7 +546,7 @@ async function decide(deny) {
   try {
     var resp = await fetch('/v1/auth/device/approve', {
       method: 'POST', headers: { 'content-type': 'application/json' }, credentials: 'same-origin',
-      body: JSON.stringify({ user_code: el('user_code').value.trim(), tenant_id: tenant, scopes: scopes, deny: deny }),
+      body: JSON.stringify({ user_code: el('user_code').value.trim(), tenant_id: tenant, scopes: scopes, deny: deny, bind_passport: !!el('bind_passport').checked }),
     });
     var text = await resp.text();
     if (resp.redirected || text.trim().charAt(0) === '<') { showSignin(); return; }
