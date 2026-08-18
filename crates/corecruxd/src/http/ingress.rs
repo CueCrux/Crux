@@ -361,6 +361,19 @@ fn has_forwarded_headers(headers: &HeaderMap) -> bool {
     headers.contains_key(FORWARDED_HEADER) || headers.contains_key(X_FORWARDED_FOR_HEADER)
 }
 
+/// Whether this request arrived on a **direct** loopback socket carrying no
+/// forwarding assertion.
+///
+/// Deliberately narrower than forwarded-IP trust: a reverse proxy on the same
+/// host makes every remote client's peer address loopback, so peer-is-loopback
+/// alone would hand a remote caller local authority. Requiring the absence of
+/// `Forwarded` / `X-Forwarded-For` closes that, since any proxy worth trusting
+/// sets one. Callers pair this with `AppState::http_bind_loopback` so the
+/// daemon's own listener must also be loopback-only.
+pub(crate) fn is_direct_loopback_request(headers: &HeaderMap, peer_ip: Option<IpAddr>) -> bool {
+    !has_forwarded_headers(headers) && peer_ip.map(normalize_ip).is_some_and(|ip| ip.is_loopback())
+}
+
 fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
     headers
         .get(FORWARDED_HEADER)
