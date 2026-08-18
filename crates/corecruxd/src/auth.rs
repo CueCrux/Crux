@@ -1250,6 +1250,54 @@ impl HttpScopeContext {
         }
         Ok(resolve_write_tenant_on(&self.tenants, selector)?.unwrap_or_else(|| "default".to_string()))
     }
+
+    /// Tenants a read-only oversight *listing* may span.
+    ///
+    /// [`Self::resolve_authorized_tenant`] must collapse to exactly one tenant
+    /// because a write has to stamp one. A queue read has no such obligation,
+    /// and collapsing silently is what produced the false-empty Gates page
+    /// (issue #703): a wildcard token with no selector resolved to `default`,
+    /// so pending gates held in any other tenant simply never appeared while
+    /// the page rendered its "queue is clear" state.
+    ///
+    /// `Ok(None)` = every tenant (wildcard/admin authority). `Ok(Some(list))` =
+    /// exactly those tenants. An explicit `requested` tenant still goes through
+    /// the single-tenant resolver, so every existing denial (selector mismatch,
+    /// missing tenant claim, tenant not owned by the token) is unchanged.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn resolve_authorized_tenant_scope(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<Option<Vec<String>>, ProblemResponse> {
+        let requested = requested.map(str::trim).filter(|value| !value.is_empty());
+        let header = self
+            .write_tenant_selector
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if requested.is_some() || header.is_some() {
+            return Ok(Some(vec![self.resolve_authorized_tenant(requested)?]));
+        }
+        if matches!(self.tenants, TenantAllow::Missing) && self.auth_enforced {
+            return Err(ProblemResponse(
+                ProblemDetails::forbidden("token is missing a tenant claim").with_extensions(serde_json::json!({
+                    "code": "TENANT_CLAIM_MISSING",
+                })),
+            ));
+        }
+        Ok(match &self.tenants {
+            // Wildcard authority spans every tenant — but only when it was
+            // actually proven. Auth-off and DevScopes also present as `Any`,
+            // and there the wildcard is a local-development convenience, not a
+            // verified principal: those callers keep the narrow `default` view
+            // so an unauthenticated reader still cannot ENUMERATE the tenants
+            // holding queued mutations (it must name one, as it does today).
+            TenantAllow::Any if !self.local_unverified_identity => None,
+            TenantAllow::Any => Some(vec!["default".to_string()]),
+            TenantAllow::Only(set) => Some(set.iter().cloned().collect()),
+            TenantAllow::Missing => Some(vec!["default".to_string()]),
+        })
+    }
 }
 
 pub fn http_passport_id(headers: &HeaderMap) -> Option<String> {
@@ -4096,6 +4144,89 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
             TenantAllow::Only(set) => assert!(set.contains("t-scalar")),
             other => panic!("expected Only, got {other:?}"),
         }
+    }
+
+    // ── resolve_authorized_tenant_scope (issue #703) ──────────────────────
+    // A read-only oversight queue answers for every tenant the credential is
+    // authorized for. Collapsing a wildcard token to `default` is what rendered
+    // the console Gates page empty while pending gates sat in another tenant.
+
+    #[test]
+    fn authorized_tenant_scope_spans_every_tenant_for_a_verified_wildcard_token() {
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "sub": "u1", "tenant_id": "*" })),
+            TEST_HS256_SECRET,
+        );
+        let context = passport_bound_context(&auth, &bearer(&token)).expect("context");
+        // The single-tenant resolver still collapses to `default` — that is the
+        // write contract, and the bug was reading through it.
+        assert_eq!(context.resolve_authorized_tenant(None).unwrap(), "default");
+        assert_eq!(context.resolve_authorized_tenant_scope(None).unwrap(), None);
+        // Naming a tenant still narrows to exactly that tenant.
+        assert_eq!(
+            context.resolve_authorized_tenant_scope(Some("work")).unwrap(),
+            Some(vec!["work".to_string()])
+        );
+    }
+
+    #[test]
+    fn authorized_tenant_scope_lists_every_tenant_a_multi_tenant_token_owns() {
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "sub": "u1", "tenants": ["work", "default"] })),
+            TEST_HS256_SECRET,
+        );
+        let context = passport_bound_context(&auth, &bearer(&token)).expect("context");
+        // The write resolver refuses to guess which of the two to stamp...
+        assert!(context.resolve_authorized_tenant(None).is_err());
+        // ...but a queue read can honestly answer for both.
+        let mut scope = context.resolve_authorized_tenant_scope(None).unwrap().unwrap();
+        scope.sort();
+        assert_eq!(scope, vec!["default".to_string(), "work".to_string()]);
+        // An unowned tenant is still refused, with the same code as the write path.
+        let denied = context.resolve_authorized_tenant_scope(Some("other")).unwrap_err();
+        assert_eq!(problem_code(&denied), "TENANT_FORBIDDEN");
+    }
+
+    #[test]
+    fn authorized_tenant_scope_confines_a_single_tenant_token_to_its_own_tenant() {
+        let auth = hs256_authz();
+        let token = sign_hs256(
+            &valid_claims(serde_json::json!({ "sub": "u1", "tenant_id": "work" })),
+            TEST_HS256_SECRET,
+        );
+        let context = passport_bound_context(&auth, &bearer(&token)).expect("context");
+        assert_eq!(
+            context.resolve_authorized_tenant_scope(None).unwrap(),
+            Some(vec!["work".to_string()])
+        );
+    }
+
+    #[test]
+    fn authorized_tenant_scope_refuses_a_token_with_no_tenant_claim() {
+        let auth = hs256_authz();
+        let token = sign_hs256(&valid_claims(serde_json::json!({ "sub": "u1" })), TEST_HS256_SECRET);
+        let context = passport_bound_context(&auth, &bearer(&token)).expect("context");
+        let denied = context.resolve_authorized_tenant_scope(None).unwrap_err();
+        assert_eq!(problem_code(&denied), "TENANT_CLAIM_MISSING");
+    }
+
+    #[test]
+    fn authorized_tenant_scope_keeps_auth_off_confined_to_default() {
+        // Auth-off presents as a wildcard, but nothing was proven. Widening here
+        // would let an unauthenticated local reader ENUMERATE the tenants holding
+        // queued mutations — it must still have to name one.
+        let auth = Authz::from_env(AuthMode::Off).expect("auth off");
+        let context = passport_bound_context(&auth, &HeaderMap::new()).expect("context");
+        assert_eq!(
+            context.resolve_authorized_tenant_scope(None).unwrap(),
+            Some(vec!["default".to_string()])
+        );
+        assert_eq!(
+            context.resolve_authorized_tenant_scope(Some("tenant-a")).unwrap(),
+            Some(vec!["tenant-a".to_string()])
+        );
     }
 
     #[test]

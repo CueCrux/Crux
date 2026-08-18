@@ -4341,6 +4341,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The console Gates page rendered "queue is clear" while approvals were
+  waiting in another tenant.** `GET /v1/work/gate/pending` resolved the caller
+  to exactly one tenant via `resolve_authorized_tenant`, which collapses a
+  wildcard/admin credential to `default`. Pending gates held in any other
+  tenant — the reported case had two under `work` — were filtered out, and
+  `/console#/trust/cx-gates`, which asked with no tenant context at all,
+  showed the rich empty state. That hides the passport-attributed Art.14
+  human-oversight path exactly when it is owed.
+
+  The read now answers for **every tenant the credential is authorized for**
+  and declares that scope on the wire as `tenant_scope` (`["*"]` = all).
+  A verified wildcard token spans every tenant; a multi-tenant token lists the
+  tenants it owns (where the single-tenant write resolver refuses to guess); a
+  single-tenant token is unchanged; a token with no tenant claim is still
+  refused. Auth-off/DevScopes stay confined to `default` — those wildcards are
+  a local-development convenience, not a proven principal, so an
+  unauthenticated reader still has to name a tenant rather than enumerate the
+  queue. Naming `?tenant_id=` keeps the previous, narrower behaviour and every
+  existing denial.
+
+  The Gates page carries the scope verbatim, offers an authorized-tenant
+  selector, names each row's tenant, refuses to reuse the "queue is clear"
+  state when the view is narrowed, and renders a failed or unauthorized read as
+  an explicit failure instead of an empty queue. The same fix reaches the
+  Overwatch "needs you" lane and "Withhold all", which read the same endpoint.
+  Approve/reject are untouched: still operator-gated, canonical-passport bound,
+  and still mint a CROWN `ad_ga_*` receipt. (#703)
+
 ## [0.5.59] - 2026-08-08
 
 ### Fixed

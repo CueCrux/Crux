@@ -463,6 +463,18 @@ fn projects_work_and_coordination_tools_flow() {
         .read_json()
         .unwrap();
     assert_eq!(pending["count"], 1);
+    // The answer declares the tenants it covers (issue #703). A caller — the
+    // console included — cannot otherwise tell "nothing pending anywhere" from
+    // "nothing pending in the one tenant I happened to resolve to".
+    assert_eq!(pending["tenant_scope"], json!(["tenant-a"]));
+
+    // The unscoped read stays confined to `default` under auth-off: nothing was
+    // proven here, so an unauthenticated reader must still NAME a tenant rather
+    // than enumerate the queue. (A verified wildcard token does span every
+    // tenant — see auth::tests::authorized_tenant_scope_*.)
+    let unscoped: serde_json::Value = d.get("/v1/work/gate/pending").unwrap().into_body().read_json().unwrap();
+    assert_eq!(unscoped["count"], 0);
+    assert_eq!(unscoped["tenant_scope"], json!(["default"]));
 
     let approved: serde_json::Value = d
         .post_json(

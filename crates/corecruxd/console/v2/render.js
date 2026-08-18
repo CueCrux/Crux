@@ -13500,11 +13500,41 @@
       if (m < 1) { return 'just now'; } if (m < 60) { return m + 'm ago'; }
       var h = Math.floor(m / 60); if (h < 24) { return h + 'h ago'; } return Math.floor(h / 24) + 'd ago';
     }
-    var state = { pending: [], work: [], loading: false, token: 0 };
+    // `tenant` is the operator's narrowing selection ('' = every tenant the
+    // credential is authorized for). `scope` is what the daemon ANSWERED for,
+    // rendered verbatim — a page that cannot say which tenants it asked about
+    // cannot honestly claim the queue is clear (issue #703).
+    var state = { pending: [], work: [], loading: false, token: 0, tenant: '', scope: null, seenTenants: [] };
     var head = el('p', { 'class': 'facts-count' });
     var banner = el('div', { 'class': 'facts-banner' }); banner.style.display = 'none';
+    var tenantPick = el('select', { 'class': 'facts-input', 'data-gates-tenant': 'true', 'aria-label': 'Tenant' });
+    var toolbar = el('div', { 'class': 'facts-toolbar' }, [el('label', { 'class': 'facts-field' }, [el('span', { text: 'tenant' }), tenantPick])]);
     var listWrap = el('div', { 'class': 'facts-groups' });
-    host.appendChild(el('div', { 'class': 'facts-browser' }, [head, banner, listWrap]));
+    host.appendChild(el('div', { 'class': 'facts-browser' }, [head, toolbar, banner, listWrap]));
+    tenantPick.addEventListener('change', function () { state.tenant = tenantPick.value || ''; load(); });
+
+    function gateTenant(p) { return (p && p.tenant_id) || 'default'; }
+    // Option list: every tenant we have seen hold a pending gate, plus the
+    // bounded scope the daemon reported, plus the current selection so a
+    // narrowed view never drops its own option.
+    function paintTenantPick() {
+      var opts = state.seenTenants.slice();
+      var scope = state.scope || [];
+      if (scope.length && scope[0] !== '*') { scope.forEach(function (t) { if (opts.indexOf(t) < 0) { opts.push(t); } }); }
+      if (state.tenant && opts.indexOf(state.tenant) < 0) { opts.push(state.tenant); }
+      opts.sort();
+      tenantPick.textContent = '';
+      tenantPick.appendChild(el('option', { value: '', text: 'All authorized tenants' }));
+      opts.forEach(function (t) { tenantPick.appendChild(el('option', { value: t, text: t })); });
+      tenantPick.value = state.tenant;
+    }
+
+    function scopeLabel() {
+      if (state.tenant) { return 'tenant ' + state.tenant; }
+      var scope = state.scope || [];
+      if (!scope.length) { return 'tenant scope unknown'; }
+      return scope[0] === '*' ? 'all authorized tenants' : 'tenants ' + scope.join(', ');
+    }
 
     function workLink(id) {
       return el('a', { 'class': 'btn-quiet cx-graphlink', href: '#/canvas/graph?focus=work:' + id, title: 'open ' + id + ' in the relation graph' }, ['View work item']);
@@ -13513,6 +13543,7 @@
       var rows = m6Kv([
         ['action id', p.action_id], ['work id', p.work_id],
         ['requested', (p.requested_action || 'update_state') + (p.target_state ? ' → ' + p.target_state : '')],
+        ['tenant', gateTenant(p)],
         ['by passport', p.requested_by_passport], ['status', p.status || 'pending'], ['requested', ageOf(p.requested_at_unix_ms)]
       ]);
       var links = el('div', { 'class': 'sess-rmeta' }, [workLink(p.work_id)]);
@@ -13549,7 +13580,7 @@
     function richEmpty() {
       var wrap = el('div', {});
       wrap.appendChild(el('div', { 'class': 'facts-banner ok-empty' }, [
-        el('div', { 'class': 'm6-help-h', text: 'No gates pending — the queue is clear.' }),
+        el('div', { 'class': 'm6-help-h', text: 'No gates pending across ' + scopeLabel() + ' — the queue is clear.' }),
         el('p', { 'class': 'ctl-desc', text: 'This is the canonical Art.14 approval queue. A gate is a PendingGateAction: it is created when an agent requests a work-item state transition that the work-gate policy holds for a human go/no-go (e.g. a destructive or high-risk update_state). It waits here with status “pending” until an operator approves or rejects — that decision mints a CROWN approval receipt (ad_ga_*), visible on the Receipts page.' })
       ]));
       wrap.appendChild(m6Label('how a gate is created'));
@@ -13582,26 +13613,52 @@
       }
       return wrap;
     }
+    // A tenant-narrowed view is NOT evidence the queue is clear — only that this
+    // tenant is. Say so instead of borrowing the rich "all clear" state.
+    function narrowedEmpty() {
+      return el('div', { 'class': 'facts-banner' }, [
+        el('div', { 'class': 'm6-help-h', text: 'No gates pending in tenant ' + state.tenant + '.' }),
+        el('p', { 'class': 'ctl-desc', text: 'This view is narrowed to one tenant. Other tenants this credential is authorized for may still hold pending approvals — switch the tenant selector to “All authorized tenants” to see the whole queue.' })
+      ]);
+    }
     function paint() {
       listWrap.textContent = '';
       var pend = (state.pending || []).filter(function (p) { return (p.status || 'pending') === 'pending'; });
       head.textContent = '';
       head.appendChild(el('b', { text: String(pend.length) }));
-      head.appendChild(doc().createTextNode(' pending · /v1/work/gate/pending'));
+      head.appendChild(doc().createTextNode(' pending · ' + scopeLabel() + ' · /v1/work/gate/pending'));
       if (pend.length) { pend.forEach(function (p) { listWrap.appendChild(pendingRow(p)); }); }
+      else if (state.tenant) { listWrap.appendChild(narrowedEmpty()); }
       else { listWrap.appendChild(richEmpty()); }
     }
     function load() {
       if (state.loading) { return; } state.loading = true; state.token++;
       var myToken = state.token;
-      Promise.all([fetchJSON('/v1/work/gate/pending'), fetchJSON('/v1/work?source=all')]).then(function (rr) {
+      var tq = state.tenant ? '&tenant_id=' + encodeURIComponent(state.tenant) : '';
+      Promise.all([
+        fetchJSON('/v1/work/gate/pending' + (state.tenant ? '?tenant_id=' + encodeURIComponent(state.tenant) : '')),
+        fetchJSON('/v1/work?source=all' + tq)
+      ]).then(function (rr) {
         if (myToken !== state.token) { return; }
         state.loading = false;
         var g = rr[0], w = rr[1];
-        if (!g.ok || !g.data) { banner.style.display = ''; banner.className = 'facts-banner err'; banner.textContent = 'Gates unavailable — ' + (g.status === 0 ? 'daemon unreachable' : 'HTTP ' + g.status) + '.'; listWrap.textContent = ''; return; }
+        if (!g.ok || !g.data) {
+          // Fail honestly: an unauthorized or absent tenant context is a refusal
+          // to answer, never an empty queue.
+          var why = g.status === 0 ? 'daemon unreachable' : 'HTTP ' + g.status;
+          var detail = (g.data && (g.data.detail || g.data.title)) || '';
+          banner.style.display = ''; banner.className = 'facts-banner err';
+          banner.textContent = 'Gates unavailable for ' + scopeLabel() + ' — ' + why + (detail ? ' · ' + detail : '') + '. The queue is NOT known to be clear.';
+          state.pending = []; state.scope = null;
+          listWrap.textContent = ''; head.textContent = ''; paintTenantPick();
+          return;
+        }
         banner.style.display = 'none';
         state.pending = g.data.pending || [];
+        state.scope = Array.isArray(g.data.tenant_scope) ? g.data.tenant_scope : null;
+        state.pending.forEach(function (p) { var t = gateTenant(p); if (state.seenTenants.indexOf(t) < 0) { state.seenTenants.push(t); } });
         state.work = (w.ok && w.data) ? (w.data.work || w.data.items || w.data.work_items || []) : [];
+        paintTenantPick();
         paint();
       });
     }
