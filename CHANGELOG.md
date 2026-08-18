@@ -11,6 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **A device-grant approver could grant scopes it did not itself hold.**
+  `POST /v1/auth/device/approve` required `admin:write` and then issued whatever
+  scopes the request named. The module contract already promised the issued
+  scopes were "a concrete subset of the authenticated approver's verified
+  grants", but nothing enforced it — and scope matching is exact, with no
+  hierarchy, so `admin:write` does **not** imply `facts:write`. An approver
+  holding only `admin:write` could therefore mint a device credential carrying
+  authority it never had.
+
+  The passport binding added in this release widened the impact: such a
+  credential also carries a canonical passport, so it could resolve work gates —
+  the Art.14 human-approval boundary itself. Approve now refuses any scope the
+  approver does not hold, naming the offending scopes. Found by the adversarial
+  pass; see `docs/design/gate-oversight-adversarial-2026-08-18.md`, which also
+  records four accepted risks that are **not** refused. (#705)
+
 ### Added
 
 - **The daemon now declares whether a human can resolve a work gate on it, and

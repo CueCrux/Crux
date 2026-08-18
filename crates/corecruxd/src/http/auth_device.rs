@@ -611,6 +611,33 @@ pub(super) async fn post_device_approve(
     if !req.deny && scopes.is_empty() {
         return problem_response(StatusCode::BAD_REQUEST, "at least one scope is required to approve");
     }
+    // ATTENUATION (issue #705 M5). The module contract above promises the issued
+    // scopes are "a concrete subset of the authenticated approver's verified
+    // grants" — but nothing enforced it, and `missing_scopes` is exact-match, so
+    // `admin:write` does not imply `facts:write`. An approver holding only
+    // `admin:write` could therefore grant a device `facts:write`, i.e. mint
+    // authority they do not themselves hold. M1 widened the blast radius:
+    // such a grant can now also carry a passport and resolve work gates.
+    if !req.deny {
+        let context = match crate::auth::passport_bound_context(&state.auth, &headers) {
+            Ok(context) => context,
+            Err(problem) => return problem.into_response(),
+        };
+        let unauthorized: Vec<&str> = scopes
+            .iter()
+            .filter(|scope| !context.has_scope(scope))
+            .map(String::as_str)
+            .collect();
+        if !unauthorized.is_empty() {
+            return problem_response(
+                StatusCode::FORBIDDEN,
+                format!(
+                    "cannot grant scopes the approver does not hold: {}",
+                    unauthorized.join(", ")
+                ),
+            );
+        }
+    }
 
     let now = now_secs();
     let Ok(mut reg) = REGISTRY.lock() else {
