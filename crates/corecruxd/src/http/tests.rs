@@ -8007,7 +8007,11 @@ async fn version_runtime_capability_descriptor_full_profile() {
     let Some(capability_values) = capabilities.as_object() else {
         panic!("runtime_capabilities.capabilities must be a JSON object");
     };
-    assert_eq!(capability_values.len(), 9);
+    // Bumped with `work_gate_resolution` (issue #705 M4). This count is a real
+    // contract: the console renders one status row per declared capability, so a
+    // capability added without updating the presentation list would go
+    // unreported — which the console smoke asserts from the other side.
+    assert_eq!(capability_values.len(), 10);
     for capability in capability_values.values() {
         assert!(capability["availability"].is_string());
         assert!(capability["reason_code"].is_string());

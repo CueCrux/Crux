@@ -184,6 +184,16 @@ pub fn mint_scoped_jwt_inner(
 /// the secret is unset or malformed — issuance requires the daemon to be running
 /// in a JWT mode so the minted token verifies. Not cached: each issued token is a
 /// distinct subject/tenant and is minted per request.
+/// Whether this process can mint at all — i.e. a usable HS256 secret is present.
+/// Both issuance rails 503 without it, so a caller declaring what a deployment
+/// can do needs to know before it promises anything.
+pub fn jwt_secret_configured() -> bool {
+    std::env::var(JWT_SECRET_ENV)
+        .ok()
+        .and_then(|raw| parse_jwt_secret(&raw))
+        .is_some()
+}
+
 pub fn mint_scoped_jwt_from_env(claims: &ScopedClaims) -> Option<String> {
     let secret_raw = std::env::var(JWT_SECRET_ENV).ok()?;
     let secret = parse_jwt_secret(&secret_raw)?;

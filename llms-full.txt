@@ -4363,6 +4363,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The daemon now declares whether a human can resolve a work gate on it, and
+  by which evidence rung.** `work_gate_resolution` joins the runtime-capability
+  descriptor on `/v1/version`, selected by a ladder over what the deployment is
+  actually configured for — proxy-asserted identity header, device-grant
+  vouching, or an unverified local daemon — strongest configured rung first.
+
+  **A configured rung that cannot issue blocks rather than downgrading.** An
+  identity rail with no passport-bound allowlist entry does not quietly fall
+  through to the device grant: it reports `degraded` and names the fix. Without
+  that rule a misconfiguration silently converts strong oversight into weak
+  oversight while the receipt looks identical.
+
+  The Gates page derives its Approve/Reject affordance from this declaration
+  instead of hardcoding a flow, renders the daemon's `reason` verbatim when
+  resolution is unavailable, and fails closed when the descriptor is absent — so
+  a control that renders as actionable where the daemon would refuse is now
+  structurally impossible rather than merely absent today. The console acquires
+  no bearer token to do it: the client's standing invariant (same-origin
+  credentials only) is preserved. (#705)
+
+
 - **The login rails can now name the human, so a paired device can resolve a
   work gate.** `resolve_gate_http` requires a canonical `passport_id` claim, but
   every issuance rail minted `passport_id: None` — so no credential obtained

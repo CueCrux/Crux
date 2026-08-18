@@ -528,8 +528,26 @@ fn runtime_capability_descriptor(
             graph_expand_configured: is_query_feature_enabled("CORECRUXD_QUERY_GRAPH_EXPAND"),
             console_link_graph_configured: super::console::corecrux_graph_base_url_configured(),
             companion_provenance,
+            gate_resolution: gate_resolution_inputs(state),
         },
     )
+}
+
+/// Read the live facts the gate-resolution ladder selects over (issue #705).
+///
+/// Every value is daemon configuration, not request state, so the declaration on
+/// `/v1/version` describes what THIS deployment can do rather than what one
+/// caller happens to be able to do.
+fn gate_resolution_inputs(state: &AppState) -> crate::product::GateResolutionInputs {
+    let allowlist =
+        super::auth_rails::parse_ts_allowlist(&std::env::var("CORECRUXD_TS_IDENTITY_ALLOWLIST").unwrap_or_default());
+    crate::product::GateResolutionInputs {
+        auth_off: state.auth.mode() == crate::auth::AuthMode::Off,
+        identity_rail_enabled: super::auth_rails::env_flag_enabled("CORECRUXD_TS_IDENTITY_ENABLED"),
+        identity_rail_has_passport: allowlist.values().any(|p| p.passport_id.is_some()),
+        device_grant_enabled: super::auth_rails::env_flag_enabled("CORECRUXD_DEVICE_GRANT_ENABLED"),
+        can_mint: crux_mcp::tools::loopback_auth::jwt_secret_configured(),
+    }
 }
 
 #[utoipa::path(

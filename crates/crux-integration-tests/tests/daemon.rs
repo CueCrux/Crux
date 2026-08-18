@@ -521,6 +521,22 @@ fn projects_work_and_coordination_tools_flow() {
         "naming the tenant must still work from behind a proxy"
     );
 
+    // The anti-lying gate (issue #705 M4): the capability the console reads must
+    // agree with what a REAL resolve attempt does on this deployment. Declaring
+    // `available` where the daemon would refuse rebuilds the inert Approve
+    // button with more confidence than before, so the declaration is checked
+    // immediately before the approval that proves it.
+    let version: serde_json::Value = d.get("/v1/version").unwrap().into_body().read_json().unwrap();
+    let declared = &version["product"]["runtime_capabilities"]["capabilities"]["work_gate_resolution"];
+    assert_eq!(
+        declared["availability"], "available",
+        "an auth-off daemon resolves gates through the asserted-approver branch and must say so"
+    );
+    assert_eq!(
+        declared["detail"]["rung"], "local_unverified",
+        "the declaration must name the rung it selected"
+    );
+
     let approved: serde_json::Value = d
         .post_json(
             &format!("/v1/work/gate/{action_id}/approve"),
