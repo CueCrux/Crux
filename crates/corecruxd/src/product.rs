@@ -327,6 +327,13 @@ pub struct RuntimeCapabilities {
     /// segment is unattested or refused — and when the check itself is off,
     /// because "we turned the alarm off" has to be visible.
     pub companion_provenance: RuntimeCapability,
+    /// Whether a human can resolve a gated work transition on THIS deployment,
+    /// and by which evidence rung. Every oversight surface derives its Approve
+    /// affordance from this rather than hardcoding a flow — a control that
+    /// renders as actionable when the daemon would refuse is the defect this
+    /// capability exists to make impossible (issue #705). `detail.rung` names
+    /// the selected rung; `reason` names the remedy when there is none.
+    pub work_gate_resolution: RuntimeCapability,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -358,6 +365,149 @@ pub struct RuntimeCapabilityInputs {
     pub console_link_graph_configured: bool,
     /// Live companion-provenance tallies, read from the retrieval index.
     pub companion_provenance: CompanionProvenanceRuntime,
+    /// Which evidence rungs this daemon can actually offer for a human gate
+    /// decision. See [`GateResolutionInputs`].
+    pub gate_resolution: GateResolutionInputs,
+}
+
+/// Runtime facts the gate-resolution ladder selects over. Deliberately plain
+/// booleans read at `/v1/version` time so the ladder itself is pure and can be
+/// exhaustively tested against the posture matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GateResolutionInputs {
+    /// `CORECRUXD_AUTH_MODE=off` — a local, unverified deployment. Gate
+    /// resolution works here through the asserted-approver branch, recorded as
+    /// `operator:unverified:<passport>`.
+    pub auth_off: bool,
+    /// `CORECRUXD_TS_IDENTITY_ENABLED`.
+    pub identity_rail_enabled: bool,
+    /// At least one allowlist entry carries a `#<passport>` binding. Without
+    /// one the rail issues unbound tokens, which cannot resolve a gate.
+    pub identity_rail_has_passport: bool,
+    /// `CORECRUXD_DEVICE_GRANT_ENABLED`.
+    pub device_grant_enabled: bool,
+    /// The daemon can mint (a JWT-mode HS256 secret is present). Both issuance
+    /// rails 503 without it.
+    pub can_mint: bool,
+}
+
+/// The evidence rung a deployment resolves gates by, strongest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateResolutionRung {
+    /// A proxy-asserted verified identity, mapped to a passport by allowlist.
+    IdentityHeader,
+    /// An already-trusted admin vouched for this device and bound their passport.
+    DeviceGrant,
+    /// The human at the machine on an unverified local daemon.
+    LocalUnverified,
+}
+
+impl GateResolutionRung {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IdentityHeader => "identity_header",
+            Self::DeviceGrant => "device_grant",
+            Self::LocalUnverified => "local_unverified",
+        }
+    }
+}
+
+/// Outcome of the ladder: the rung selected, or why none is available.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateResolutionSelection {
+    Selected(GateResolutionRung),
+    /// A rung is configured but cannot issue. We deliberately do NOT fall
+    /// through to a weaker rung: a misconfiguration must surface, not quietly
+    /// downgrade the strength of human oversight while the receipt still looks
+    /// identical.
+    Blocked {
+        rung: GateResolutionRung,
+        reason_code: &'static str,
+        reason: &'static str,
+    },
+    None {
+        reason_code: &'static str,
+        reason: &'static str,
+    },
+}
+
+/// Select the strongest rung this deployment is *configured* for.
+///
+/// The no-silent-downgrade rule is the load-bearing half: a configured rung that
+/// cannot issue returns `Blocked`, never a weaker `Selected`.
+pub fn select_gate_resolution(inputs: GateResolutionInputs) -> GateResolutionSelection {
+    if inputs.identity_rail_enabled {
+        if !inputs.can_mint {
+            return GateResolutionSelection::Blocked {
+                rung: GateResolutionRung::IdentityHeader,
+                reason_code: "gate_rail_cannot_mint",
+                reason: "The identity rail is enabled but the daemon cannot mint tokens; set CORECRUXD_JWT_HS256_SECRET and run in jwt_hs256 mode.",
+            };
+        }
+        if !inputs.identity_rail_has_passport {
+            return GateResolutionSelection::Blocked {
+                rung: GateResolutionRung::IdentityHeader,
+                reason_code: "gate_rail_no_passport_mapping",
+                reason: "The identity rail is enabled but no allowlist entry binds a passport; append `#<passport>` to the entry for each human who may approve.",
+            };
+        }
+        return GateResolutionSelection::Selected(GateResolutionRung::IdentityHeader);
+    }
+    if inputs.device_grant_enabled {
+        if !inputs.can_mint {
+            return GateResolutionSelection::Blocked {
+                rung: GateResolutionRung::DeviceGrant,
+                reason_code: "gate_rail_cannot_mint",
+                reason: "The device grant is enabled but the daemon cannot mint tokens; set CORECRUXD_JWT_HS256_SECRET and run in jwt_hs256 mode.",
+            };
+        }
+        return GateResolutionSelection::Selected(GateResolutionRung::DeviceGrant);
+    }
+    if inputs.auth_off {
+        return GateResolutionSelection::Selected(GateResolutionRung::LocalUnverified);
+    }
+    GateResolutionSelection::None {
+        reason_code: "gate_no_identity_rung",
+        reason: "No rung can name a human on this daemon: enable the device grant (CORECRUXD_DEVICE_GRANT_ENABLED) or the identity rail (CORECRUXD_TS_IDENTITY_ENABLED) with a passport-bound allowlist.",
+    }
+}
+
+/// Build the declared capability from the ladder's verdict.
+fn work_gate_resolution_capability(inputs: GateResolutionInputs) -> RuntimeCapability {
+    let selection = select_gate_resolution(inputs);
+    let any_rail_configured = inputs.identity_rail_enabled || inputs.device_grant_enabled || inputs.auth_off;
+    let stages = RuntimeCapabilityStages {
+        compiled: true,
+        configured: any_rail_configured,
+        initialized: inputs.auth_off || inputs.can_mint,
+        entitled: true,
+        degraded: matches!(selection, GateResolutionSelection::Blocked { .. }),
+    };
+    let mut capability = match selection {
+        GateResolutionSelection::Selected(rung) => {
+            let mut c = RuntimeCapability::available(stages);
+            c.detail = Some(serde_json::json!({ "rung": rung.as_str() }));
+            c
+        }
+        GateResolutionSelection::Blocked {
+            rung,
+            reason_code,
+            reason,
+        } => {
+            let mut c = RuntimeCapability::degraded(reason_code, reason, stages);
+            // Name the rung that is stuck. Falling through to a weaker one would
+            // have hidden exactly this.
+            c.detail = Some(serde_json::json!({ "blocked_rung": rung.as_str() }));
+            c
+        }
+        GateResolutionSelection::None { reason_code, reason } => {
+            RuntimeCapability::unavailable(reason_code, reason, stages)
+        }
+    };
+    if capability.detail.is_none() {
+        capability.detail = Some(serde_json::json!({}));
+    }
+    capability
 }
 
 /// Snapshot of companion provenance across the loaded corpus.
@@ -643,6 +793,7 @@ impl RuntimeCapabilityDescriptor {
                 graph_expand,
                 console_link_graph,
                 companion_provenance: companion_provenance_capability(inputs.companion_provenance),
+                work_gate_resolution: work_gate_resolution_capability(inputs.gate_resolution),
             },
         }
     }
@@ -1273,6 +1424,161 @@ fn contains_claim(claims: &[&str], value: &str) -> bool {
 }
 
 #[cfg(test)]
+mod gate_resolution_ladder_tests {
+    use super::*;
+
+    fn inputs() -> GateResolutionInputs {
+        GateResolutionInputs::default()
+    }
+
+    // ── the posture matrix ────────────────────────────────────────────────
+
+    #[test]
+    fn local_only_resolves_by_the_unverified_rung() {
+        let got = select_gate_resolution(GateResolutionInputs {
+            auth_off: true,
+            ..inputs()
+        });
+        assert_eq!(
+            got,
+            GateResolutionSelection::Selected(GateResolutionRung::LocalUnverified)
+        );
+    }
+
+    #[test]
+    fn device_grant_is_selected_when_it_can_mint() {
+        let got = select_gate_resolution(GateResolutionInputs {
+            device_grant_enabled: true,
+            can_mint: true,
+            ..inputs()
+        });
+        assert_eq!(got, GateResolutionSelection::Selected(GateResolutionRung::DeviceGrant));
+    }
+
+    #[test]
+    fn identity_header_outranks_the_device_grant() {
+        // Strongest CONFIGURED rung wins: a proxy-asserted per-human identity is
+        // stronger evidence than an admin vouching for a device.
+        let got = select_gate_resolution(GateResolutionInputs {
+            identity_rail_enabled: true,
+            identity_rail_has_passport: true,
+            device_grant_enabled: true,
+            can_mint: true,
+            ..inputs()
+        });
+        assert_eq!(
+            got,
+            GateResolutionSelection::Selected(GateResolutionRung::IdentityHeader)
+        );
+    }
+
+    #[test]
+    fn nothing_configured_is_honestly_unavailable() {
+        match select_gate_resolution(inputs()) {
+            GateResolutionSelection::None { reason_code, reason } => {
+                assert_eq!(reason_code, "gate_no_identity_rung");
+                // The reason must name the remedy, not just the problem.
+                assert!(reason.contains("CORECRUXD_DEVICE_GRANT_ENABLED"));
+                assert!(reason.contains("CORECRUXD_TS_IDENTITY_ENABLED"));
+            }
+            other => panic!("expected None, got {other:?}"),
+        }
+    }
+
+    // ── no silent downgrade — the load-bearing half ───────────────────────
+
+    #[test]
+    fn an_identity_rail_without_a_passport_mapping_blocks_rather_than_downgrading() {
+        // The device grant is ALSO configured and could issue. Falling through
+        // to it would quietly weaken oversight while the receipt looked
+        // identical, and would hide the misconfiguration the operator needs to
+        // see. Block instead.
+        let got = select_gate_resolution(GateResolutionInputs {
+            identity_rail_enabled: true,
+            identity_rail_has_passport: false,
+            device_grant_enabled: true,
+            can_mint: true,
+            ..inputs()
+        });
+        match got {
+            GateResolutionSelection::Blocked {
+                rung,
+                reason_code,
+                reason,
+            } => {
+                assert_eq!(rung, GateResolutionRung::IdentityHeader);
+                assert_eq!(reason_code, "gate_rail_no_passport_mapping");
+                assert!(reason.contains("#<passport>"), "the reason must name the fix");
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_rail_that_cannot_mint_blocks_rather_than_downgrading_to_auth_off() {
+        let got = select_gate_resolution(GateResolutionInputs {
+            device_grant_enabled: true,
+            can_mint: false,
+            auth_off: true,
+            ..inputs()
+        });
+        match got {
+            GateResolutionSelection::Blocked { rung, reason_code, .. } => {
+                assert_eq!(rung, GateResolutionRung::DeviceGrant);
+                assert_eq!(reason_code, "gate_rail_cannot_mint");
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    // ── the declaration must not lie ──────────────────────────────────────
+
+    #[test]
+    fn the_declared_capability_agrees_with_the_ladder_for_every_posture() {
+        // Exhaustive over the 5 boolean inputs: whatever the ladder decides,
+        // the capability the console reads says the same thing. A capability
+        // that declares `available` where a real attempt would refuse rebuilds
+        // the inert button with more confidence than before — so this is
+        // asserted in both directions rather than spot-checked.
+        for bits in 0u8..32 {
+            let i = GateResolutionInputs {
+                auth_off: bits & 1 != 0,
+                identity_rail_enabled: bits & 2 != 0,
+                identity_rail_has_passport: bits & 4 != 0,
+                device_grant_enabled: bits & 8 != 0,
+                can_mint: bits & 16 != 0,
+            };
+            let selection = select_gate_resolution(i);
+            let capability = work_gate_resolution_capability(i);
+            match selection {
+                GateResolutionSelection::Selected(rung) => {
+                    assert_eq!(capability.availability, "available", "inputs {i:?}");
+                    assert_eq!(
+                        capability.detail.as_ref().and_then(|d| d["rung"].as_str()),
+                        Some(rung.as_str()),
+                        "the declaration must name the rung it selected, inputs {i:?}"
+                    );
+                }
+                GateResolutionSelection::Blocked { rung, .. } => {
+                    assert_eq!(capability.availability, "degraded", "inputs {i:?}");
+                    assert!(capability.degraded, "inputs {i:?}");
+                    assert_eq!(
+                        capability.detail.as_ref().and_then(|d| d["blocked_rung"].as_str()),
+                        Some(rung.as_str()),
+                        "a blocked declaration must name the stuck rung, inputs {i:?}"
+                    );
+                }
+                GateResolutionSelection::None { .. } => {
+                    assert_eq!(capability.availability, "unavailable", "inputs {i:?}");
+                }
+            }
+            // Whatever the verdict, the contract the console validates holds.
+            assert!(!capability.reason_code.is_empty() || capability.availability == "available");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1387,6 +1693,7 @@ mod tests {
             &configured,
             &sync,
             RuntimeCapabilityInputs {
+                gate_resolution: GateResolutionInputs::default(),
                 http_dataplane_enabled: true,
                 local_embedder_configured: true,
                 local_embedder_initialized: true,
@@ -1414,6 +1721,7 @@ mod tests {
             &configured,
             &sync,
             RuntimeCapabilityInputs {
+                gate_resolution: GateResolutionInputs::default(),
                 http_dataplane_enabled: true,
                 local_embedder_configured: true,
                 local_embedder_initialized: true,
@@ -1438,6 +1746,7 @@ mod tests {
             &configured,
             &sync,
             RuntimeCapabilityInputs {
+                gate_resolution: GateResolutionInputs::default(),
                 http_dataplane_enabled: true,
                 local_embedder_configured: false,
                 local_embedder_initialized: false,
@@ -1466,6 +1775,7 @@ mod tests {
             &[],
             &sync,
             RuntimeCapabilityInputs {
+                gate_resolution: GateResolutionInputs::default(),
                 http_dataplane_enabled: true,
                 local_embedder_configured: false,
                 local_embedder_initialized: false,
@@ -1492,6 +1802,7 @@ mod tests {
             &[],
             &sync,
             RuntimeCapabilityInputs {
+                gate_resolution: GateResolutionInputs::default(),
                 http_dataplane_enabled: true,
                 local_embedder_configured: false,
                 local_embedder_initialized: false,

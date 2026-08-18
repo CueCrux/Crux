@@ -6164,6 +6164,81 @@ function extractThemeVars(theme) {
   }));
 })();
 
+// =========================================================================
+//  Check — (issue #705 M3/M4) the Gates page derives its Approve affordance
+//  from the daemon's `work_gate_resolution` capability, and renders the
+//  daemon's own reason verbatim when it is not available. A control that
+//  renders as actionable where the daemon would refuse is the "visible but
+//  inert" defect this whole line of work exists to remove, so it is asserted
+//  as a property of the routed page, not of a helper.
+// =========================================================================
+(function checkGateCapabilityGating() {
+  const gateSrc = funcBody(renderSrc, 'renderGatesBoard') || '';
+  check(/work_gate_resolution/.test(gateSrc),
+    '[gate-cap] the board must read the work_gate_resolution capability');
+  check(!/\bfetch\s*\(/.test(gateSrc),
+    '[gate-cap] the board must issue no raw fetch — and must NOT acquire a bearer token (api.js: the browser never holds one)');
+
+  const dom = newMockDom();
+  const priorChecks = asyncChecks.slice();
+  const settle = function () { return new Promise(function (r) { setTimeout(r, 0); }); };
+  const GATES = [{ action_id: 'ga_1', work_id: 'w-1', requested_by_passport: 'p_agent', tenant_id: 'default', requested_action: 'update_state', target_state: 'complete', status: 'pending', requested_at_unix_ms: 1 }];
+
+  function api() {
+    return { get: function (base) {
+      if (base === '/v1/work/gate/pending') {
+        return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({ count: 1, pending: GATES, tenant_scope: ['*'] }); } });
+      }
+      return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({ work: [] }); } });
+    } };
+  }
+  function descriptor(capability) {
+    return { schema_version: 1, capabilities: { work_gate_resolution: capability } };
+  }
+  const AVAILABLE = { availability: 'available', reason_code: 'ok', reason: 'ok', compiled: true, configured: true, initialized: true, entitled: true, degraded: false };
+  const BLOCKED = { availability: 'degraded', reason_code: 'gate_rail_no_passport_mapping', reason: 'The identity rail is enabled but no allowlist entry binds a passport; append `#<passport>` to the entry for each human who may approve.', compiled: true, configured: true, initialized: true, entitled: true, degraded: true };
+  const NONE = { availability: 'unavailable', reason_code: 'gate_no_identity_rung', reason: 'No rung can name a human on this daemon: enable the device grant (CORECRUXD_DEVICE_GRANT_ENABLED) or the identity rail (CORECRUXD_TS_IDENTITY_ENABLED) with a passport-bound allowlist.', compiled: true, configured: false, initialized: false, entitled: true, degraded: false };
+
+  function render1(capability) {
+    const savedDoc = global.document, savedWin = global.window;
+    global.document = dom.doc;
+    global.window = { CruxApi: api(), CruxPages: pages, CRUX_POSTURE: 'operator', CRUX_RUNTIME_CAPABILITIES: capability === null ? null : descriptor(capability) };
+    const host = dom.mkNode('div');
+    render.renderPage({ id: 'cx-gates', title: 'Gates' }, host);
+    return settle().then(settle).then(function () {
+      const text = host.textContent;
+      const banners = dom.collect(host, [host]).filter(function (n) { return n.getAttribute && n.getAttribute('data-gate-capability'); });
+      global.document = savedDoc; global.window = savedWin;
+      return { text: text, banners: banners };
+    });
+  }
+
+  asyncChecks.push(Promise.all(priorChecks).then(function () {
+    return render1(AVAILABLE).then(function (r) {
+      check(r.banners.length === 0, '[gate-cap] an available capability must NOT show a refusal banner');
+      check(/ga_1/.test(r.text), '[gate-cap] the pending gate still renders when approval is available');
+      return render1(BLOCKED);
+    }).then(function (r) {
+      check(r.banners.length === 1 && r.banners[0].getAttribute('data-gate-capability') === 'gate_rail_no_passport_mapping',
+        '[gate-cap] a degraded capability must refuse with the daemon reason code');
+      check(/#<passport>/.test(r.text),
+        '[gate-cap] the daemon reason must be rendered VERBATIM — it names the remedy');
+      return render1(NONE);
+    }).then(function (r) {
+      check(r.banners.length === 1 && r.banners[0].getAttribute('data-gate-capability') === 'gate_no_identity_rung',
+        '[gate-cap] an unavailable capability must refuse with its reason code');
+      check(/CORECRUXD_DEVICE_GRANT_ENABLED/.test(r.text),
+        '[gate-cap] the refusal must name the flag that would fix it');
+      return render1(null);
+    }).then(function (r) {
+      // Fails closed: no descriptor at all is NOT permission to offer approval.
+      check(r.banners.length === 1,
+        '[gate-cap] an absent capability descriptor must fail closed, not render an actionable control');
+      notes.push('gate capability gating (issue #705 M3/M4): cx-gates derives its Approve affordance from the daemon-declared work_gate_resolution capability, renders the daemon reason verbatim on degraded/unavailable, fails closed when the descriptor is absent, and acquires no bearer token (the console client’s standing invariant).');
+    });
+  }));
+})();
+
 // ---- Report (awaits async renderer-driven checks) -----------------------
 Promise.all(asyncChecks).then(function () { return passportMintInteraction(); }).then(function () {
   console.log('unified-shell-console v2 — M14 + desktop mission control M2 smoke');

@@ -34,7 +34,8 @@
     Object.freeze(['projection_queries', 'Projection queries']),
     Object.freeze(['graph_expand', 'Graph expansion']),
     Object.freeze(['console_link_graph', 'Link graph (CoreCrux proxy)']),
-    Object.freeze(['companion_provenance', 'Companion provenance'])
+    Object.freeze(['companion_provenance', 'Companion provenance']),
+    Object.freeze(['work_gate_resolution', 'Work-gate resolution'])
   ]);
 
   // ---- Environment shims (only used when rendering in a browser) ---------
@@ -13548,7 +13549,19 @@
       ]);
       var links = el('div', { 'class': 'sess-rmeta' }, [workLink(p.work_id)]);
       var actions = el('div', { 'class': 'gate-actions' });
-      if (isOperator()) {
+      // The Approve/Reject affordance derives from the DAEMON'S declaration of
+      // whether this deployment can resolve a gate at all (issue #705 M4), not
+      // from a flow hardcoded here. A control that renders as actionable where
+      // the daemon would refuse is exactly the "visible but inert" defect.
+      var gateCap = runtimeCapabilityState('work_gate_resolution', runtimeCapabilityDescriptor());
+      if (isOperator() && gateCap.availability !== 'available') {
+        // Render the daemon's own reason verbatim — it names the remedy, and the
+        // console must never paraphrase a refusal into something vaguer.
+        actions.appendChild(el('div', { 'class': 'facts-banner err', 'data-gate-capability': gateCap.reasonCode || 'unavailable' }, [
+          el('div', { 'class': 'm6-help-h', text: 'Approval unavailable on this daemon' }),
+          el('p', { 'class': 'ctl-desc', text: gateCap.reason || 'This daemon did not declare work-gate resolution.' })
+        ]));
+      } else if (isOperator()) {
         var msg = el('span', { 'class': 'ctl-desc' });
         var approve = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Approve']);
         var reject = el('button', { 'class': 'btn-quiet danger', type: 'button' }, ['Reject']);
