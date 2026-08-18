@@ -468,13 +468,58 @@ fn projects_work_and_coordination_tools_flow() {
     // "nothing pending in the one tenant I happened to resolve to".
     assert_eq!(pending["tenant_scope"], json!(["tenant-a"]));
 
-    // The unscoped read stays confined to `default` under auth-off: nothing was
-    // proven here, so an unauthenticated reader must still NAME a tenant rather
-    // than enumerate the queue. (A verified wildcard token does span every
-    // tenant — see auth::tests::authorized_tenant_scope_*.)
+    // Reachability, not auth mode, decides whether an unverified caller may
+    // enumerate tenants (issue #706). This harness is a DIRECT loopback client
+    // of a loopback-bound daemon — the "human at the machine" — so the unscoped
+    // read spans every tenant and finds the `tenant-a` gate without naming it.
+    // Assert on THIS gate rather than a total: other pending gates exist by now,
+    // and pinning their count would make the test about the fixture instead of
+    // about the tenant scope.
+    let contains_action = |body: &serde_json::Value| -> bool {
+        body["pending"]
+            .as_array()
+            .expect("pending array")
+            .iter()
+            .any(|gate| gate["action_id"] == action_id)
+    };
     let unscoped: serde_json::Value = d.get("/v1/work/gate/pending").unwrap().into_body().read_json().unwrap();
-    assert_eq!(unscoped["count"], 0);
-    assert_eq!(unscoped["tenant_scope"], json!(["default"]));
+    assert_eq!(unscoped["tenant_scope"], json!(["*"]));
+    assert!(
+        contains_action(&unscoped),
+        "a direct loopback caller must see the tenant-a gate without naming the tenant"
+    );
+
+    // The same request carrying a forwarding assertion is treated as proxied,
+    // and the narrowing holds: a remote reader behind a proxy must still NAME a
+    // tenant rather than enumerate the queue. This is the audit property, and it
+    // is the half that must not regress.
+    let proxied: serde_json::Value = d
+        .get_with_header("/v1/work/gate/pending", "x-forwarded-for", "203.0.113.7")
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(proxied["tenant_scope"], json!(["default"]));
+    assert!(
+        !contains_action(&proxied),
+        "a proxied caller must not enumerate a non-default tenant's gate"
+    );
+    // ...and naming the tenant still works from behind the proxy.
+    let proxied_named: serde_json::Value = d
+        .get_with_header(
+            "/v1/work/gate/pending?tenant_id=tenant-a",
+            "x-forwarded-for",
+            "203.0.113.7",
+        )
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(proxied_named["tenant_scope"], json!(["tenant-a"]));
+    assert!(
+        contains_action(&proxied_named),
+        "naming the tenant must still work from behind a proxy"
+    );
 
     let approved: serde_json::Value = d
         .post_json(

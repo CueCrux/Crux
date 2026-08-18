@@ -4343,6 +4343,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A local-only daemon's Gates page was still empty for any tenant but
+  `default`.** The previous entry widened the pending-gate read for *verified*
+  credentials and deliberately kept auth-off confined to `default`, preserving
+  the audit property that an unauthenticated reader must name a tenant rather
+  than enumerate the queue. That keyed the decision on **auth mode**, when the
+  property it actually protects is **reachability** — so the one posture with
+  no online auth by design, a loopback daemon with a single operator at the
+  keyboard, was left with exactly the symptom the original report described:
+  an empty queue, and (because the console builds its tenant picker from this
+  same response) no tenant to switch to.
+
+  The unverified case now widens to every tenant only when the daemon's own
+  listener is loopback-only **and** the request arrived on a direct loopback
+  socket carrying no `Forwarded` / `X-Forwarded-For` assertion. Both halves are
+  required: a reverse proxy on the same host makes every remote client's peer
+  address loopback, so peer-is-loopback alone would hand a remote caller local
+  authority. Anything reachable — proxied, or a non-loopback listener — keeps
+  the narrow `default` view, and naming a tenant works exactly as before.
+  `direct_local` only ever widens the unverified case: it cannot grant a tenant
+  a verified token lacks, and it cannot rescue a missing tenant claim. (#706)
+
 - **The console Gates page rendered "queue is clear" while approvals were
   waiting in another tenant.** `GET /v1/work/gate/pending` resolved the caller
   to exactly one tenant via `resolve_authorized_tenant`, which collapses a

@@ -1265,9 +1265,15 @@ impl HttpScopeContext {
     /// the single-tenant resolver, so every existing denial (selector mismatch,
     /// missing tenant claim, tenant not owned by the token) is unchanged.
     #[allow(clippy::result_large_err)]
+    ///
+    /// `direct_local` says the caller reached a loopback-only listener on a
+    /// direct socket with no forwarding assertion — i.e. the human at the
+    /// machine. It only ever *widens* the unverified case; it can neither grant
+    /// a tenant a verified token lacks nor rescue a missing tenant claim.
     pub(crate) fn resolve_authorized_tenant_scope(
         &self,
         requested: Option<&str>,
+        direct_local: bool,
     ) -> Result<Option<Vec<String>>, ProblemResponse> {
         let requested = requested.map(str::trim).filter(|value| !value.is_empty());
         let header = self
@@ -1286,13 +1292,24 @@ impl HttpScopeContext {
             ));
         }
         Ok(match &self.tenants {
-            // Wildcard authority spans every tenant — but only when it was
-            // actually proven. Auth-off and DevScopes also present as `Any`,
-            // and there the wildcard is a local-development convenience, not a
-            // verified principal: those callers keep the narrow `default` view
-            // so an unauthenticated reader still cannot ENUMERATE the tenants
-            // holding queued mutations (it must name one, as it does today).
+            // Wildcard authority spans every tenant when it was actually proven.
             TenantAllow::Any if !self.local_unverified_identity => None,
+            // Auth-off and DevScopes also present as `Any`, but there the
+            // wildcard is a local-development convenience, not a verified
+            // principal. Two sub-cases, and the distinction is REACHABILITY,
+            // not auth mode:
+            //
+            // · Direct loopback on a loopback-only listener — the human at the
+            //   machine, who already has unrestricted access to every tenant on
+            //   this daemon by any other route. Narrowing buys nothing and
+            //   costs the whole surface: a local-only operator whose gate sits
+            //   in a non-`default` tenant sees an empty queue and, because the
+            //   console's tenant picker is built from this very response, no
+            //   tenant to switch to (issue #706).
+            // · Anything reachable — keep the narrow `default` view, so an
+            //   unauthenticated remote reader still cannot ENUMERATE the tenants
+            //   holding queued mutations; it must name one, as it does today.
+            TenantAllow::Any if direct_local => None,
             TenantAllow::Any => Some(vec!["default".to_string()]),
             TenantAllow::Only(set) => Some(set.iter().cloned().collect()),
             TenantAllow::Missing => Some(vec!["default".to_string()]),
@@ -4162,10 +4179,17 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         // The single-tenant resolver still collapses to `default` — that is the
         // write contract, and the bug was reading through it.
         assert_eq!(context.resolve_authorized_tenant(None).unwrap(), "default");
-        assert_eq!(context.resolve_authorized_tenant_scope(None).unwrap(), None);
+        assert_eq!(context.resolve_authorized_tenant_scope(None, false).unwrap(), None);
         // Naming a tenant still narrows to exactly that tenant.
         assert_eq!(
-            context.resolve_authorized_tenant_scope(Some("work")).unwrap(),
+            context.resolve_authorized_tenant_scope(Some("work"), false).unwrap(),
+            Some(vec!["work".to_string()])
+        );
+        // `direct_local` is about the UNVERIFIED case only: it must not alter a
+        // verified credential's answer in either direction.
+        assert_eq!(context.resolve_authorized_tenant_scope(None, true).unwrap(), None);
+        assert_eq!(
+            context.resolve_authorized_tenant_scope(Some("work"), true).unwrap(),
             Some(vec!["work".to_string()])
         );
     }
@@ -4181,12 +4205,19 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         // The write resolver refuses to guess which of the two to stamp...
         assert!(context.resolve_authorized_tenant(None).is_err());
         // ...but a queue read can honestly answer for both.
-        let mut scope = context.resolve_authorized_tenant_scope(None).unwrap().unwrap();
+        let mut scope = context.resolve_authorized_tenant_scope(None, false).unwrap().unwrap();
         scope.sort();
         assert_eq!(scope, vec!["default".to_string(), "work".to_string()]);
         // An unowned tenant is still refused, with the same code as the write path.
-        let denied = context.resolve_authorized_tenant_scope(Some("other")).unwrap_err();
+        let denied = context
+            .resolve_authorized_tenant_scope(Some("other"), false)
+            .unwrap_err();
         assert_eq!(problem_code(&denied), "TENANT_FORBIDDEN");
+        // A loopback socket cannot grant a tenant the token does not own.
+        let still_denied = context
+            .resolve_authorized_tenant_scope(Some("other"), true)
+            .unwrap_err();
+        assert_eq!(problem_code(&still_denied), "TENANT_FORBIDDEN");
     }
 
     #[test]
@@ -4198,7 +4229,11 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         );
         let context = passport_bound_context(&auth, &bearer(&token)).expect("context");
         assert_eq!(
-            context.resolve_authorized_tenant_scope(None).unwrap(),
+            context.resolve_authorized_tenant_scope(None, false).unwrap(),
+            Some(vec!["work".to_string()])
+        );
+        assert_eq!(
+            context.resolve_authorized_tenant_scope(None, true).unwrap(),
             Some(vec!["work".to_string()])
         );
     }
@@ -4208,23 +4243,36 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         let auth = hs256_authz();
         let token = sign_hs256(&valid_claims(serde_json::json!({ "sub": "u1" })), TEST_HS256_SECRET);
         let context = passport_bound_context(&auth, &bearer(&token)).expect("context");
-        let denied = context.resolve_authorized_tenant_scope(None).unwrap_err();
+        let denied = context.resolve_authorized_tenant_scope(None, false).unwrap_err();
         assert_eq!(problem_code(&denied), "TENANT_CLAIM_MISSING");
+        // A missing tenant claim is not rescued by reaching the loopback listener.
+        let still_denied = context.resolve_authorized_tenant_scope(None, true).unwrap_err();
+        assert_eq!(problem_code(&still_denied), "TENANT_CLAIM_MISSING");
     }
 
     #[test]
-    fn authorized_tenant_scope_keeps_auth_off_confined_to_default() {
-        // Auth-off presents as a wildcard, but nothing was proven. Widening here
-        // would let an unauthenticated local reader ENUMERATE the tenants holding
-        // queued mutations — it must still have to name one.
+    fn authorized_tenant_scope_auth_off_widens_only_on_a_direct_loopback_socket() {
+        // Auth-off presents as a wildcard, but nothing was proven. Whether it may
+        // enumerate tenants turns on REACHABILITY, not auth mode.
         let auth = Authz::from_env(AuthMode::Off).expect("auth off");
         let context = passport_bound_context(&auth, &HeaderMap::new()).expect("context");
+        // Reachable (proxied, or a non-loopback listener): still confined.
         assert_eq!(
-            context.resolve_authorized_tenant_scope(None).unwrap(),
+            context.resolve_authorized_tenant_scope(None, false).unwrap(),
             Some(vec!["default".to_string()])
         );
         assert_eq!(
-            context.resolve_authorized_tenant_scope(Some("tenant-a")).unwrap(),
+            context
+                .resolve_authorized_tenant_scope(Some("tenant-a"), false)
+                .unwrap(),
+            Some(vec!["tenant-a".to_string()])
+        );
+        // Direct loopback on a loopback-only listener: the human at the machine,
+        // who can already reach every tenant here by naming it. Narrowing costs
+        // the whole Gates surface and buys nothing (issue #706).
+        assert_eq!(context.resolve_authorized_tenant_scope(None, true).unwrap(), None);
+        assert_eq!(
+            context.resolve_authorized_tenant_scope(Some("tenant-a"), true).unwrap(),
             Some(vec!["tenant-a".to_string()])
         );
     }

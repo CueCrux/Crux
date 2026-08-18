@@ -16,6 +16,13 @@ use super::receipts::*;
 use super::routing::*;
 use super::*;
 
+/// Peer address for handler-level tests that take `ConnectInfo`. Loopback with
+/// no forwarding header — the "human at the machine" case. Pair with a state
+/// whose `http_bind_loopback` is set to exercise the local-only branch.
+fn loopback_peer() -> axum::extract::ConnectInfo<std::net::SocketAddr> {
+    axum::extract::ConnectInfo("127.0.0.1:54321".parse::<std::net::SocketAddr>().expect("peer addr"))
+}
+
 use crate::auth::AuthMode;
 use crate::shard_map::LoadedShardMap;
 use crate::test_support::EnvVarGuard;
@@ -14591,6 +14598,7 @@ async fn work_jwt_actor_and_tenant_isolation_matrix() {
             by_passport: None,
             tenant_id: None,
         }),
+        loopback_peer(),
         read_a(),
     )
     .await
@@ -16364,6 +16372,7 @@ async fn work_patch_with_gated_passport_returns_202_queued() {
             by_passport: None,
             tenant_id: None,
         }),
+        loopback_peer(),
         dev_scope_headers("admin:read"),
     )
     .await

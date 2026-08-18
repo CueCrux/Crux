@@ -552,6 +552,22 @@ impl TestDaemon {
         Self::agent().get(&format!("{}{path}", self.base_url)).call()
     }
 
+    /// GET with one extra request header. Used to exercise the daemon's
+    /// reachability-sensitive branches: a forwarding header makes an otherwise
+    /// direct loopback request look proxied, which is the only way to reach the
+    /// "reachable" side of those checks from a loopback test harness.
+    pub fn get_with_header(
+        &self,
+        path: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        Self::agent()
+            .get(&format!("{}{path}", self.base_url))
+            .header(name, value)
+            .call()
+    }
+
     pub fn post_json(
         &self,
         path: &str,

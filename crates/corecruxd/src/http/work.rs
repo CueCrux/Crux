@@ -888,16 +888,23 @@ pub(super) async fn get_transitions(
 pub(super) async fn get_pending_gates(
     State(state): State<AppState>,
     Query(q): Query<GateListQuery>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let context = match work_scope_context(&state, &headers, "admin:read") {
         Ok(context) => context,
         Err(response) => return response,
     };
+    // A local-only daemon has no remote reader to protect from, so the
+    // unverified narrowing below is keyed on REACHABILITY, not auth mode
+    // (issue #706). Both halves are required: the listener must be
+    // loopback-only, and this request must not have come through a proxy.
+    let direct_local =
+        state.http_bind_loopback && super::ingress::is_direct_loopback_request(&headers, Some(peer.ip()));
     // An oversight queue answers for every tenant the credential is authorized
     // for unless the caller narrows it. Collapsing to one tenant here is what
     // hid pending gates held outside `default` (issue #703).
-    let scope = match context.resolve_authorized_tenant_scope(q.tenant_id.as_deref()) {
+    let scope = match context.resolve_authorized_tenant_scope(q.tenant_id.as_deref(), direct_local) {
         Ok(scope) => scope,
         Err(problem) => return problem.into_response(),
     };
