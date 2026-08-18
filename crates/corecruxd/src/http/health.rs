@@ -547,6 +547,7 @@ fn gate_resolution_inputs(state: &AppState) -> crate::product::GateResolutionInp
         identity_rail_has_passport: allowlist.values().any(|p| p.passport_id.is_some()),
         device_grant_enabled: super::auth_rails::env_flag_enabled("CORECRUXD_DEVICE_GRANT_ENABLED"),
         can_mint: crux_mcp::tools::loopback_auth::jwt_secret_configured(),
+        required_approvers: super::work::required_gate_approvers(),
     }
 }
 

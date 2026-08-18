@@ -15612,7 +15612,10 @@ async fn work_gate_rejects_registered_agent_token_as_human_decision() -> Result<
 }
 
 #[tokio::test]
+#[serial_test::serial] // reads CORECRUXD_WORK_GATE_APPROVERS; must not race the policy test
+
 async fn work_gate_auth_off_succeeds_with_operator_unverified_attribution() -> Result<(), Box<dyn std::error::Error>> {
+    std::env::remove_var(super::work::WORK_GATE_APPROVERS_ENV);
     for approve in [true, false] {
         let (state, work_id, action_id) = gate_test_state(AuthMode::Off, Some("tenant-a")).await?;
 
@@ -16092,6 +16095,8 @@ async fn work_gate_replay_conflicts_without_duplicate_facts_or_receipts() -> Res
 }
 
 #[tokio::test]
+#[serial_test::serial] // reads CORECRUXD_WORK_GATE_APPROVERS; must not race the policy test
+
 async fn work_gate_receipt_is_reused_after_fact_journal_failure() -> Result<(), Box<dyn std::error::Error>> {
     for approve in [true, false] {
         let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
@@ -16185,7 +16190,10 @@ async fn work_gate_concurrent_resolution_has_one_winner() -> Result<(), Box<dyn 
 }
 
 #[tokio::test]
+#[serial_test::serial] // reads CORECRUXD_WORK_GATE_APPROVERS; must not race the policy test
+
 async fn work_gate_requester_cannot_self_approve_or_self_reject() -> Result<(), Box<dyn std::error::Error>> {
+    std::env::remove_var(super::work::WORK_GATE_APPROVERS_ENV);
     for approve in [true, false] {
         let (state, _work_id, action_id) = gate_test_state(AuthMode::DevScopes, Some("tenant-a")).await?;
         let response = gate_test_resolve(
@@ -16445,7 +16453,10 @@ async fn work_patch_with_gated_passport_returns_202_queued() {
 }
 
 #[tokio::test]
+#[serial_test::serial] // reads CORECRUXD_WORK_GATE_APPROVERS; must not race the policy test
+
 async fn work_comments_get_item_and_gate_resolution_paths() {
+    std::env::remove_var(super::work::WORK_GATE_APPROVERS_ENV);
     let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
     bind_test_state_to_root_passport_key(&mut state);
     let work_id = {
@@ -16591,6 +16602,159 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
     .await
     .into_response();
     assert_eq!(json_body(approved).await["state"], "complete");
+}
+
+/// Seed a project, flip `personal-default`'s work gate on, and create one work
+/// item. Returns its id. Shared by the gate tests so the fixture is described
+/// once.
+async fn seed_gated_work_item(state: &AppState, passport: &str) -> String {
+    let mut store = state.fact_store.write().await;
+    crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    crate::projects::seed_default_if_missing(&mut store, 1).expect("project seed");
+    crate::passports::update_passport(
+        &mut store,
+        passport,
+        crate::passports::UpdatePassportInput {
+            category: None,
+            agent_work_gate: Some(true),
+            is_default_for_category: None,
+            sponsor_id: None,
+            reputation_tier: None,
+            receipt_count: None,
+            name: None,
+            owner: None,
+            position: None,
+            company: None,
+            notes: None,
+        },
+    )
+    .expect("flip gate");
+    crate::work::create_work(
+        &mut store,
+        crate::work::CreateWorkInput {
+            project_id: "default".to_string(),
+            title: "x".to_string(),
+            body: None,
+            state: None,
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            created_by_passport: passport.to_string(),
+        },
+        1_000,
+    )
+    .expect("create")
+    .id
+}
+
+/// The approver-count policy, end to end through the real handler.
+///
+/// A hard ban on self-resolution does not create four-eyes on a one-person
+/// deployment — it creates a second passport minted solely to approve one's own
+/// work, which passes the check while recording `distinct_passports` for what is
+/// really one human. So the count is configurable, and either way the receipt
+/// records what actually happened.
+#[tokio::test]
+#[serial_test::serial]
+async fn work_gate_approver_policy_permits_single_party_only_when_configured() {
+    // `work-default` throughout: it is the seeded passport that actually gets a
+    // signing key on disk. `personal-default` is pre-seeded into the store by
+    // the fixture, so `seed_defaults_if_missing` skips it and never writes one —
+    // and minting the approval receipt needs the approver's key.
+    const P: &str = "work-default";
+    async fn queue_a_gate(state: &AppState) -> String {
+        let work_id = seed_gated_work_item(state, P).await;
+        let queued = super::work::patch_work(
+            State(state.clone()),
+            Path(work_id),
+            dev_scope_passport_headers("facts:write", P),
+            Json(super::work::UpdateWorkBody {
+                title: None,
+                body: None,
+                state: Some("complete".to_string()),
+                assignee_passport: None,
+                tenant_id: None,
+                linked_pr: None,
+                linked_issue: None,
+                blocker_reason: None,
+                blocker_kind: None,
+                by_passport: Some(P.to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        json_body(queued).await["queued"]["action_id"]
+            .as_str()
+            .expect("queued action_id")
+            .to_string()
+    }
+
+    // Default (2): the requesting passport cannot resolve its own gate.
+    std::env::remove_var(super::work::WORK_GATE_APPROVERS_ENV);
+    // Distinct seeds, and both states kept alive: two states built from the same
+    // seed share a fixture directory, and dropping the first deletes it out from
+    // under the second (which surfaces as "passport key load failed").
+    let mut strict_state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    // Materialises the daemon passport key the approval receipt is signed with;
+    // without it minting fails with "passport key load failed".
+    bind_test_state_to_root_passport_key(&mut strict_state);
+    let action = queue_a_gate(&strict_state).await;
+    let refused = super::work::post_gate_approve(
+        State(strict_state.clone()),
+        Path(action),
+        dev_scope_passport_headers("facts:write", P),
+        Json(super::work::GateResolutionBody {
+            approver_passport: Some(P.to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        refused.status(),
+        StatusCode::FORBIDDEN,
+        "self-resolution must be refused under the default two-passport policy"
+    );
+
+    // Configured to 1: the same call succeeds, because on this deployment there
+    // is only one human and pretending otherwise is what produces workarounds.
+    std::env::set_var(super::work::WORK_GATE_APPROVERS_ENV, "1");
+    let mut state = test_app_state_with_auth(17, AuthMode::DevScopes);
+    bind_test_state_to_root_passport_key(&mut state);
+    let action = queue_a_gate(&state).await;
+    let allowed = super::work::post_gate_approve(
+        State(state.clone()),
+        Path(action),
+        dev_scope_passport_headers("facts:write", P),
+        Json(super::work::GateResolutionBody {
+            approver_passport: Some(P.to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        allowed.status(),
+        StatusCode::OK,
+        "single-party approval must be permitted at 1"
+    );
+    let body = json_body(allowed).await;
+    assert_eq!(body["state"], "complete");
+
+    // ...and it is recorded AS single-party. This is the half that makes the
+    // setting safe to offer: the receipt never implies a separation of duties
+    // that did not happen.
+    let receipt_path =
+        super::observations::observation_file_path(&state.data_dir, super::work::WORK_GATE_RECEIPT_SESSION);
+    let journal = std::fs::read_to_string(&receipt_path).expect("receipt journal");
+    assert!(
+        journal.contains("approvers=1:parties=1:sep=none:self_approved"),
+        "the signed action_summary must record single-party approval; journal was: {journal}"
+    );
+    assert!(
+        !journal.contains("four_eyes"),
+        "the receipt must never claim a separation of duties the daemon cannot establish"
+    );
+    std::env::remove_var(super::work::WORK_GATE_APPROVERS_ENV);
 }
 
 #[tokio::test]
