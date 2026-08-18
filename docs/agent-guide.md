@@ -187,9 +187,29 @@ in.
 Daemon-side rails 2 and 3 are opt-in and default off (see `config.example.env`:
 `CORECRUXD_TS_IDENTITY_ENABLED`, `CORECRUXD_DEVICE_GRANT_ENABLED`). Issuance mints
 HS256 JWTs, so the daemon must run in `jwt_hs256` mode. The issued `tenant_id`
-and scopes are always set by the approving identity (tailnet allowlist or device
+and scopes are always set by the approving identity (allowlist or device
 approver), never by the requesting client — this is what keeps cross-tenant
 issuance closed (threat ref T.1).
+
+Rail 2 works with **any** proxy that authenticates humans, not just Tailscale.
+`CORECRUXD_IDENTITY_HEADER` names the header your proxy sets; it defaults to the
+`tailscale serve` preset, so an existing deployment is unaffected.
+
+| proxy | `CORECRUXD_IDENTITY_HEADER` |
+|---|---|
+| `tailscale serve` (default) | `tailscale-user-login` |
+| oauth2-proxy | `x-forwarded-email` (or `x-auth-request-email`) |
+| Cloudflare Access | `cf-access-authenticated-user-email` |
+| Authelia | `remote-email` |
+| Authentik | `x-authentik-email` |
+
+> **The proxy must strip-then-set that header on every forwarded request.** A
+> trusted CIDR proves the proxy *sent* the request, not that it *authored* the
+> header — a proxy that forwards a client-supplied value hands any client a free
+> identity. `tailscale serve` and Cloudflare Access overwrite by construction;
+> oauth2-proxy and Authelia depend on how you configure them. If you cannot
+> guarantee it, use the device-authorization grant (rail 3) instead, which
+> derives identity from an approver rather than a header.
 
 ## IX / Infra: machines, hooks, config & session sync
 
