@@ -971,6 +971,32 @@ mod tests {
         assert_eq!(parsed.signature_alg, "es256");
         assert_eq!(parsed.signature, signed.signature);
         assert!(parsed.x5chain_pem.is_some());
+
+        // Independent algorithm check: the legacy implementation signed a
+        // BLAKE3 prehash while advertising ES256. Prove new Vault envelopes
+        // verify under SHA-256 and specifically fail under the old digest.
+        use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
+        use sha2::{Digest as _, Sha256};
+        let chain = split_pem_certs(parsed.x5chain_pem.as_ref().unwrap());
+        let leaf_der = pem_to_der(&chain[0]).unwrap();
+        let leaf = Certificate::from_der(&leaf_der).unwrap();
+        let spki = leaf
+            .tbs_certificate()
+            .subject_public_key_info()
+            .subject_public_key
+            .as_bytes()
+            .unwrap();
+        let verifying_key = p256::ecdsa::VerifyingKey::from_sec1_bytes(spki).unwrap();
+        let signature = p256::ecdsa::Signature::from_der(&parsed.signature).unwrap();
+        let sha256 = Sha256::digest(&parsed.canonical_body_bytes);
+        assert!(verifying_key.verify_prehash(&sha256, &signature).is_ok());
+        let legacy_blake3 = blake3::hash(&parsed.canonical_body_bytes);
+        assert!(
+            verifying_key
+                .verify_prehash(legacy_blake3.as_bytes(), &signature)
+                .is_err(),
+            "Vault C2PA signatures must not use the legacy BLAKE3 prehash"
+        );
     }
 
     #[test]

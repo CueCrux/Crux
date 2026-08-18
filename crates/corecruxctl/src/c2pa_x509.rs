@@ -401,39 +401,19 @@ fn verify_x509_envelope(
             } else {
                 let anchor_der = pem_cert_to_der(&anchor_pems[0])?;
                 let anchor_sha = sha256_fingerprint_colon(&anchor_der);
-                // Walk: each cert's issuer must equal the next cert's
-                // subject, ending at the anchor's subject. We're not
-                // cryptographically verifying intermediate signatures
-                // here — see notes — but we do check the chain
-                // links and reject mismatched names.
-                let mut valid = true;
-                let mut prev_issuer: Option<String> = Some(leaf.tbs_certificate().issuer().to_string());
-                for der in &chain_der[1..] {
-                    let cert = Certificate::from_der(der)?;
-                    let subj = cert.tbs_certificate().subject().to_string();
-                    if prev_issuer.as_deref() != Some(subj.as_str()) {
-                        valid = false;
-                        notes.push(format!(
-                            "chain break: expected subject {:?}, got {:?}",
-                            prev_issuer, subj
-                        ));
-                        break;
-                    }
-                    prev_issuer = Some(cert.tbs_certificate().issuer().to_string());
-                }
-                // Last-link check: prev_issuer must equal anchor subject.
-                let anchor_cert = Certificate::from_der(&anchor_der)?;
-                let anchor_subj = anchor_cert.tbs_certificate().subject().to_string();
-                if valid && prev_issuer.as_deref() != Some(anchor_subj.as_str()) {
-                    valid = false;
-                    notes.push(format!(
-                        "anchor subject {:?} does not match expected issuer {:?}",
-                        anchor_subj, prev_issuer
-                    ));
+                let validation = validate_cuecrux_c2pa_chain(&chain_der, &anchor_der);
+                let valid = validation.is_ok();
+                match validation {
+                    Ok(()) => notes.push(
+                        "certificate signatures, current validity, exact anchor, BasicConstraints, \
+                         key usages, C2PA leaf EKU, path length, and critical extensions validated"
+                            .to_string(),
+                    ),
+                    Err(error) => notes.push(format!("certificate chain validation failed: {error}")),
                 }
                 notes.push(
-                    "chain walk validates subject/issuer linkage to the anchor; intermediate signature \
-                     verification is delegated to platform CA libraries"
+                    "revocation and public C2PA trust-list membership are not evaluated by this \
+                     private-anchor verifier"
                         .to_string(),
                 );
                 (Some(valid), Some(anchor_sha))
@@ -459,6 +439,18 @@ fn verify_x509_envelope(
         checks_skipped,
         notes,
     })
+}
+
+/// Thin adapter over the shared CueCrux C2PA chain validator
+/// ([`corecrux_receipts::validate_c2pa_chain_to_anchor_v1`], the M9j
+/// semantics), evaluated at the current system time. A pre-epoch or
+/// otherwise unrepresentable clock fails closed as a validation error.
+fn validate_cuecrux_c2pa_chain(chain_der: &[Vec<u8>], anchor_der: &[u8]) -> Result<(), String> {
+    let now_unix_seconds = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch".to_string())?
+        .as_secs();
+    corecrux_receipts::validate_c2pa_chain_to_anchor_v1(chain_der, anchor_der, now_unix_seconds)
 }
 
 fn canonical_hash_matches(parsed: &C2paSignedManifestV1) -> bool {
@@ -575,7 +567,7 @@ mod tests {
     use super::*;
     use corecrux_receipts::vault_pki_x509_signer::{Config, VaultPkiX509Signer, VaultSignResponse};
     use corecrux_receipts::{build_c2pa_manifest_v1, sign_c2pa_manifest_via_signer, C2paManifestInputV1};
-    use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
@@ -592,6 +584,7 @@ mod tests {
                 .distinguished_name
                 .push(rcgen::DnType::CommonName, "CueCrux C2PA Root TEST");
             params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
             let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
             let cert = params.self_signed(&kp).unwrap();
             let root_pem = cert.pem();
@@ -599,7 +592,12 @@ mod tests {
             Self { root_issuer, root_pem }
         }
         fn sign_csr(&self, csr_pem: &str) -> String {
-            let csr_params = rcgen::CertificateSigningRequestParams::from_pem(csr_pem).unwrap();
+            let mut csr_params = rcgen::CertificateSigningRequestParams::from_pem(csr_pem).unwrap();
+            // Model the Vault role's strict C2PA leaf profile. The CSR carries
+            // the key, while Vault supplies these response-certificate fields.
+            csr_params.params.is_ca = IsCa::ExplicitNoCa;
+            csr_params.params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+            csr_params.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::EmailProtection];
             csr_params.signed_by(&self.root_issuer).unwrap().pem()
         }
     }
@@ -703,7 +701,12 @@ mod tests {
         assert!(report.canonical_hash_match);
         assert!(report.signature_valid, "X.509 signature must verify");
         assert_eq!(report.content_hash_match, Some(true));
-        assert_eq!(report.chain_valid, Some(true), "chain walk to anchor must pass");
+        assert_eq!(
+            report.chain_valid,
+            Some(true),
+            "chain walk to anchor must pass: {:?}",
+            report.notes
+        );
         assert!(report.ok);
     }
 
@@ -737,6 +740,49 @@ mod tests {
         assert!(report.signature_valid, "manifest signature stays valid");
         assert_eq!(report.content_hash_match, Some(false));
         assert!(!report.ok);
+    }
+
+    #[test]
+    fn c2pa_verify_rejects_same_subject_decoy_anchor_with_the_wrong_key() {
+        let tmp = TempDir::new().unwrap();
+        let signer = make_signer(&tmp, TestPki::new());
+        signer.regenerate_leaf().unwrap();
+        let manifest = build_c2pa_manifest_v1(&C2paManifestInputV1 {
+            content_bytes: b"decoy-anchor",
+            content_type: None,
+            crown_receipt_id: "r_decoy",
+            signer_passport: "p",
+            claim_generator: "g",
+            manifest_id: "urn:decoy",
+            when: "2026-07-21T00:00:00Z",
+            model: None,
+        });
+        let signed = sign_c2pa_manifest_via_signer(manifest, &signer, "2026-07-21T00:00:00Z").unwrap();
+        let manifest_file = tmp.path().join("decoy-env.jumbf");
+        std::fs::write(&manifest_file, signed.to_jumbf_base64()).unwrap();
+
+        // Same DN as the genuine test root, but a different key. The old
+        // name-only walk accepted this anchor as trusted.
+        let decoy = TestPki::new();
+        std::fs::write(tmp.path().join("decoy-root.pem"), decoy.root_pem).unwrap();
+        let report = c2pa_verify(&X509VerifyOptions {
+            manifest_path: manifest_file,
+            content: None,
+            root_anchor_path: Some(tmp.path().join("decoy-root.pem")),
+        })
+        .unwrap();
+
+        assert!(report.signature_valid, "the envelope remains self-consistent");
+        assert_eq!(report.chain_valid, Some(false));
+        assert!(!report.ok, "a same-name wrong-key anchor must not grant trust");
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("signature verification failed")),
+            "unexpected validation failure: {:?}",
+            report.notes
+        );
     }
 
     #[test]

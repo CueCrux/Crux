@@ -1179,6 +1179,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // `__reverify_receipts__::*` facts past retain, via the journaled
     // delete path. See `crate::ephemeral_gc`.
     ephemeral_gc::spawn_ephemeral_gc(config.ephemeral_gc_enabled, state.clone(), shutdown_tx.subscribe());
+    // Inactive-tenant verification-record retention. This is independently
+    // default OFF and additionally requires a valid explicit retention-days
+    // policy. It never runs on the immediate boot tick.
+    let _provenance_retention_scheduler = crate::http::spawn_provenance_retention_scheduler(
+        config.provenance_retention_scheduler_enabled,
+        config.provenance_retention_scheduler_interval_secs,
+        config.provenance_retention_scheduler_max_tenants,
+        state.clone(),
+        shutdown_tx.subscribe(),
+    );
     // ExecPlan projection root, git-backed. A boot refresh runs first so the
     // board is current before the first request rather than up to one interval
     // stale; the periodic task then keeps it so. Both are no-ops unless

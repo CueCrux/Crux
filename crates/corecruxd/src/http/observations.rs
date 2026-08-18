@@ -779,10 +779,10 @@ pub(crate) fn receipt_mint_failures() -> u64 {
 ///
 /// On any failure (encode / missing passport key / append) it increments the
 /// audit-debt counter and logs at ERROR, then returns `None`. `None` means
-/// "receipt PENDING", never a silent OK — the caller MUST surface it. We do
-/// not fail the caller: the mutation (e.g. a GDPR erasure) has already been
-/// applied and must not be rolled back or blocked for the sake of the audit
-/// record — but the debt is made loud.
+/// "receipt PENDING", never a silent OK — the caller MUST preserve its
+/// documented ordering contract. Most existing callers mint after an
+/// irreversible mutation; pre-delete lifecycle callers may instead treat
+/// `None` as a failed intent and refuse to start the mutation.
 ///
 /// The caller owns the redaction invariant: `payload` is a typed struct
 /// carrying counts + bounded reason-code + opaque ids ONLY, never erased
@@ -815,11 +815,75 @@ pub(crate) fn mint_governance_receipt<P: Serialize>(
             tracing::error!(
                 session,
                 reason = %detail,
-                "AUDIT DEBT: governance receipt mint failed; mutation already applied, receipt pending"
+                "AUDIT DEBT: governance receipt mint failed; caller must preserve its mutation-order contract"
             );
             None
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ControlledGovernanceReceiptMint {
+    Recorded(String),
+    Pending,
+    Interrupted,
+}
+
+/// Mint a durable governance receipt while allowing a caller to abandon lock
+/// acquisition before any bytes are appended. Once this function acquires the
+/// chain lock it completes append + fsync atomically; interruption after an
+/// append could otherwise strand a receipt whose durability is ambiguous.
+pub(crate) fn mint_governance_receipt_controlled<P: Serialize>(
+    state: &AppState,
+    session: &str,
+    actor: &str,
+    kind: &str,
+    payload: &P,
+    mut keep_waiting: impl FnMut() -> bool,
+) -> ControlledGovernanceReceiptMint {
+    let payload = match serde_json::to_value(payload) {
+        Ok(value) => value,
+        Err(error) => {
+            RECEIPT_MINT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(session, %error, "AUDIT DEBT: governance receipt payload encode failed; receipt pending");
+            return ControlledGovernanceReceiptMint::Pending;
+        }
+    };
+    let body = PostObservationBody {
+        kind: kind.to_string(),
+        provider: "corecruxd".to_string(),
+        client_ts: None,
+        payload,
+    };
+    let _guard = loop {
+        if !keep_waiting() {
+            return ControlledGovernanceReceiptMint::Interrupted;
+        }
+        match OBSERVATION_APPEND_LOCK.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                RECEIPT_MINT_FAILURES.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(session, "AUDIT DEBT: observation append lock poisoned; receipt pending");
+                return ControlledGovernanceReceiptMint::Pending;
+            }
+        }
+    };
+    let appended = match append_one_unlocked(state, session, actor, body, None) {
+        Ok(appended) => appended,
+        Err((_, detail)) => {
+            RECEIPT_MINT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(session, reason = %detail, "AUDIT DEBT: governance receipt mint failed; mutation must not begin");
+            return ControlledGovernanceReceiptMint::Pending;
+        }
+    };
+    let file_path = observation_file_path(&state.data_dir, session);
+    if let Err(error) = sync_observation(&file_path) {
+        RECEIPT_MINT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(session, %error, "AUDIT DEBT: governance receipt sync failed; mutation must not begin");
+        return ControlledGovernanceReceiptMint::Pending;
+    }
+    ControlledGovernanceReceiptMint::Recorded(appended.0.observation_id)
 }
 
 /// Append a signed observation and fsync its file and directory entries before
@@ -3592,6 +3656,31 @@ mod tests {
                 chained_len: 3,
             }
         );
+    }
+
+    #[test]
+    fn controlled_governance_mint_can_interrupt_before_append_lock_acquisition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crux_session::LocalPassportKey::from_path(&tmp.path().join("passport.key")).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+        let _guard = OBSERVATION_APPEND_LOCK.lock().unwrap();
+        let attempts = std::cell::Cell::new(0usize);
+
+        let result = mint_governance_receipt_controlled(
+            &state,
+            "__governance__::retention",
+            "scheduler",
+            "retention.provenance_records",
+            &serde_json::json!({"status": "planned"}),
+            || {
+                let attempt = attempts.get();
+                attempts.set(attempt.saturating_add(1));
+                attempt == 0
+            },
+        );
+
+        assert_eq!(result, ControlledGovernanceReceiptMint::Interrupted);
+        assert!(!observation_file_path(tmp.path(), "__governance__::retention").exists());
     }
 
     /// Build a minimal `AppState` whose only useful fields for `append_one`

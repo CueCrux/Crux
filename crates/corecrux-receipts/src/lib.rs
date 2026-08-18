@@ -17,6 +17,7 @@ mod audit_bundle_v1;
 mod audit_gap_v1;
 mod audit_signing_key;
 mod body_v1;
+mod c2pa_chain_trust_v1;
 mod c2pa_manifest_v1;
 mod candidate_digest_v1;
 mod chain_reanchor_v1;
@@ -66,12 +67,13 @@ pub use audit_signing_key::{
     AUDIT_EXPORT_SIGNING_KEY_ID_ENV,
 };
 pub use body_v1::{extract_body_index_v1, extract_linked_receipts_v1, ReceiptBodyIndexV1};
+pub use c2pa_chain_trust_v1::validate_c2pa_chain_to_anchor_v1;
 pub use c2pa_manifest_v1::{
-    assert_crown_receipt_id_v1, build_c2pa_manifest_v1, canonical_body_bytes_v1, ed25519_signer, parse_jumbf_base64,
-    sign_c2pa_manifest_v1, sign_c2pa_manifest_via_signer, verify_c2pa_manifest_v1,
-    verify_c2pa_signed_manifest_es256_v1, ByokP256Signer, C2paActionV1, C2paManifestError, C2paManifestInputV1,
-    C2paManifestV1, C2paSignedManifestV1, C2paSigner, C2paVerificationReportV1, SignedManifestParts,
-    C2PA_ACTION_CREATED, C2PA_MANIFEST_SCHEMA_V1, C2PA_SPEC_VERSION, CUECRUX_CROWN_RECEIPT_LABEL,
+    assert_crown_receipt_id_v1, build_c2pa_manifest_v1, c2pa_x5chain_der_v1, canonical_body_bytes_v1, ed25519_signer,
+    inspect_c2pa_leaf_certificate_v1, parse_jumbf_base64, sign_c2pa_manifest_v1, sign_c2pa_manifest_via_signer,
+    verify_c2pa_manifest_v1, verify_c2pa_signed_manifest_es256_v1, ByokP256Signer, C2paActionV1, C2paLeafCertificateV1,
+    C2paManifestError, C2paManifestInputV1, C2paManifestV1, C2paSignedManifestV1, C2paSigner, C2paVerificationReportV1,
+    SignedManifestParts, C2PA_ACTION_CREATED, C2PA_MANIFEST_SCHEMA_V1, C2PA_SPEC_VERSION, CUECRUX_CROWN_RECEIPT_LABEL,
     DIGITAL_SOURCE_TYPE_AI, SOFTWARE_AGENT_DEFAULT,
 };
 pub use chain_reanchor_v1::{

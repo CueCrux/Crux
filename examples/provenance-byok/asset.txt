@@ -1,0 +1,4 @@
+CueCrux BYOK provenance quickstart fixture.
+
+This public, non-sensitive text file is the asset bound into the sample
+provenance envelope. Change one byte after signing to see verification fail.

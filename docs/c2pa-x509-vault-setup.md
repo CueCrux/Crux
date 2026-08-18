@@ -133,6 +133,22 @@ Whatever channel: **the fingerprint must be displayed alongside the PEM**.
 Verifiers MUST refuse to trust a PEM whose fingerprint doesn't match the
 published value.
 
+`corecruxctl c2pa-verify` reports overall `ok=true` for an X.509 envelope
+only when the envelope signature/content checks pass and the presented chain
+cryptographically reaches the exact operator-selected anchor. The offline
+private-anchor validator checks current certificate validity, signatures,
+BasicConstraints, key usages, the CueCrux C2PA leaf EKU, path length, and
+unsupported critical extensions. A missing anchor is untrusted, not a soft
+success. Revocation and membership in a public C2PA trust list remain separate
+checks and are reported as such.
+
+Vault-backed manifests now use genuine ES256: ECDSA P-256 over SHA-256 of
+the canonical body. Earlier development builds mislabeled a BLAKE3-prehashed
+signature as `es256`; strict verification intentionally rejects those
+non-standard envelopes. Do not relabel or silently grandfather them as ES256.
+Before enabling the still-default-off X.509 signer, inventory any retained
+development artifacts and classify them explicitly as legacy/non-standard.
+
 ---
 
 ## 4. Rotation playbook

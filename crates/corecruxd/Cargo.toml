@@ -43,12 +43,14 @@ fs2 = { workspace = true }
 hex = { workspace = true }
 http-body-util = { workspace = true }
 jsonwebtoken = { workspace = true, default-features = false, features = ["use_pem", "aws_lc_rs"] }
+libc = "0.2"
 prometheus = { workspace = true, default-features = false }
 chacha20poly1305 = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
 roxmltree = { workspace = true }
+rustix = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -73,7 +75,7 @@ opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"], optional = true
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"], optional = true }
 uuid = { workspace = true, features = ["v4"] }
 url = { workspace = true }
-zeroize = "1.8"
+zeroize = { version = "1.8", features = ["serde"] }
 zstd = { workspace = true }
 zip = { workspace = true }
 

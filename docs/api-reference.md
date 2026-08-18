@@ -152,6 +152,37 @@ calls also reserve and spend 3 comped-wallet credits. The pinned
 `credits_spent`, and `wallet_balance`. Failed/degraded compute releases the
 reservation and emits no spend stamp.
 
+### BYOK Provenance (default off)
+
+| Method | Path | Description | Auth Scope |
+|--------|------|-------------|------------|
+| POST | `/v1/provenance/sign` | Sign an asset with a request-scoped caller P-256 key and leaf-first certificate chain | `provenance:write` or `admin:write` |
+| POST | `/v1/provenance/verify` | Verify envelope integrity and optional asset binding without retaining a record | `provenance:write` or `admin:write` |
+| POST | `/v1/provenance/verify-record` | Verify and retain a passport-signed record; supports `Idempotency-Key` | `provenance:write` or `admin:write` |
+
+Set `CORECRUXD_FEATURE_PROVENANCE_API=1` to mount the routes. They require an
+explicit authorized tenant and a safe transport posture; see the
+[BYOK provenance quickstart](provenance-byok-quickstart.md). Exact leaf pins
+can establish a narrow operator-selected identity policy, but the beta does
+not perform CA-chain/root validation. Metering remains a no-op until the
+fractional-credit contract is ratified and implemented.
+
+`CORECRUXD_PROVENANCE_RETENTION_DAYS=1..3650` enables activity-driven
+retained-record expiry; unset means no automatic deletion. Sweeps preserve
+active tenant-wide or `provenance::verification_record::`-scoped legal holds
+and mint count-only governance receipts. A non-empty sweep reports its receipt
+status/id and deletion count in `X-Cuecrux-Retention-*` response headers. See
+the quickstart for the exact lifecycle and fail-closed behavior.
+
+All three routes share a tenant-scoped 120-request/minute budget keyed by the
+verified stable JWT `sub` or `passport_id`, so token rotation and switching
+operations do not create fresh allowance. A rejection is `429` with
+`Retry-After: 60`. This sits behind the daemon-wide effective-client-IP token
+bucket, body limits, and concurrency/load-shed layer. The principal table is
+process-local: a multi-replica hosted deployment must additionally enforce a
+shared limit at its edge or gateway. Configure `CORECRUXD_TRUSTED_PROXY_CIDRS`
+before relying on forwarded client addresses; loopback is exempt by default.
+
 ### Replay Exports
 
 | Method | Path | Description | Auth Scope |
