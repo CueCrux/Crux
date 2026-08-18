@@ -46,9 +46,13 @@ use super::{problem_response, AppState, HeaderMap, IntoResponse, Json, Response,
 
 /// Opt-in flag for the Tailscale identity rail. Default off.
 const TS_ENABLED_ENV: &str = "CORECRUXD_TS_IDENTITY_ENABLED";
-/// Operator allowlist mapping tailnet logins → principal (tenant + scopes).
-/// Format: comma-separated `login=tenant:scopeA|scopeB`, e.g.
-/// `alice@example.com=acme:facts:write|query:read,bot@ex.com=acme:query:read`.
+/// Operator allowlist mapping verified logins → principal (tenant + scopes, and
+/// optionally the canonical passport the issued token acts as).
+/// Format: comma-separated `login=tenant:scopeA|scopeB[#passport]`, e.g.
+/// `alice@example.com=acme:facts:write|query:read#p_alice,bot@ex.com=acme:query:read`.
+/// The `#passport` suffix is what lets a token from this rail satisfy an Art.14
+/// human-approval boundary; without it the token is issued unbound and cannot
+/// resolve a work gate (see `resolve_gate_http`).
 const TS_ALLOWLIST_ENV: &str = "CORECRUXD_TS_IDENTITY_ALLOWLIST";
 /// Extra trusted-proxy CIDRs from which identity headers are honoured. Loopback
 /// is always trusted; this adds the tailnet-proxy peer when it is not loopback.
@@ -81,6 +85,11 @@ pub(super) struct TsPrincipal {
     pub tenant_id: String,
     /// Scopes the issued token carries.
     pub scopes: Vec<String>,
+    /// Canonical passport the issued token acts as, when the operator mapped
+    /// one. `None` ⇒ the token is issued unbound and cannot satisfy a gate
+    /// decision — deliberately, since inventing a passport here would be an
+    /// assertion, which is exactly what the boundary refuses.
+    pub passport_id: Option<String>,
 }
 
 /// Read a boolean opt-in env flag (`1`/`true`/`yes`, case-insensitive).
@@ -106,6 +115,18 @@ pub(super) fn parse_ts_allowlist(raw: &str) -> BTreeMap<String, TsPrincipal> {
         if login.is_empty() {
             continue;
         }
+        // `#passport` is split off FIRST: scopes themselves contain `:`
+        // (`facts:write`), so a colon-delimited third field would be ambiguous.
+        let (spec, passport_id) = match spec.split_once('#') {
+            Some((rest, passport)) => {
+                let passport = passport.trim();
+                if passport.is_empty() {
+                    continue;
+                }
+                (rest, Some(passport.to_string()))
+            }
+            None => (spec, None),
+        };
         let Some((tenant, scopes_raw)) = spec.split_once(':') else {
             continue;
         };
@@ -126,6 +147,7 @@ pub(super) fn parse_ts_allowlist(raw: &str) -> BTreeMap<String, TsPrincipal> {
             TsPrincipal {
                 tenant_id: tenant,
                 scopes,
+                passport_id,
             },
         );
     }
@@ -240,6 +262,7 @@ pub(super) async fn get_whoami(
             "allowlisted": allowlisted,
             "rail": rail_label(),
             "identity_header": identity_header_name(),
+            "passport_id": login.as_ref().and_then(|l| allowlist.get(l)).and_then(|p| p.passport_id.clone()),
         })),
     )
         .into_response()
@@ -282,9 +305,13 @@ pub(super) async fn post_tailscale_token(
     // from the client.
     let scope_refs: Vec<&str> = principal.scopes.iter().map(String::as_str).collect();
     let sub = format!("ts:{login}");
+    // The passport is authority from the operator-controlled allowlist, never
+    // anything the client sent — the same rule the tenant and scopes follow
+    // (T.1). Absent ⇒ issued unbound, and the token simply cannot resolve a
+    // gate; we do not synthesise one from `login`.
     let claims = ScopedClaims {
         sub: &sub,
-        passport_id: None,
+        passport_id: principal.passport_id.as_deref(),
         scopes: &scope_refs,
         tenant_id: &principal.tenant_id,
         ttl_secs: ISSUED_TOKEN_TTL_SECS,
@@ -301,6 +328,14 @@ pub(super) async fn post_tailscale_token(
                 "sub": sub,
                 "rail": rail_label(),
                 "identity_header": header_name,
+                "passport_id": principal.passport_id,
+                // Say plainly what an unbound token cannot do, rather than
+                // letting the operator discover it at the approval click.
+                "gate_resolution": if principal.passport_id.is_some() {
+                    "available — this token carries a canonical passport"
+                } else {
+                    "unavailable — no passport mapped for this identity; add `#<passport>` to its CORECRUXD_TS_IDENTITY_ALLOWLIST entry"
+                },
             })),
         )
             .into_response(),
@@ -363,6 +398,46 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(DEFAULT_IDENTITY_HEADER, "   ".parse().unwrap());
         assert!(extract_identity_login(&h).is_none());
+    }
+
+    // ── M1: the allowlist may bind a canonical passport ───────────────────
+
+    #[test]
+    fn allowlist_binds_a_passport_when_the_entry_names_one() {
+        let m = parse_ts_allowlist("alice@example.com=acme:facts:write|query:read#p_alice");
+        let p = m.get("alice@example.com").expect("alice");
+        assert_eq!(p.tenant_id, "acme");
+        assert_eq!(p.scopes, vec!["facts:write", "query:read"]);
+        assert_eq!(p.passport_id.as_deref(), Some("p_alice"));
+    }
+
+    #[test]
+    fn allowlist_entries_without_a_passport_stay_valid_and_unbound() {
+        // Backward compatibility: every entry written before this existed keeps
+        // working, and is issued unbound rather than silently given an identity.
+        let m = parse_ts_allowlist("bot@ex.com=acme:query:read");
+        let p = m.get("bot@ex.com").expect("bot");
+        assert_eq!(p.tenant_id, "acme");
+        assert!(p.passport_id.is_none());
+    }
+
+    #[test]
+    fn allowlist_passport_split_survives_scopes_that_contain_colons() {
+        // The reason `#` and not `:` — `facts:write` already contains a colon,
+        // so a third colon-delimited field could not be parsed unambiguously.
+        let m = parse_ts_allowlist("a@b.c=t1:facts:write|admin:read#p_x");
+        let p = m.get("a@b.c").expect("entry");
+        assert_eq!(p.tenant_id, "t1");
+        assert_eq!(p.scopes, vec!["facts:write", "admin:read"]);
+        assert_eq!(p.passport_id.as_deref(), Some("p_x"));
+    }
+
+    #[test]
+    fn allowlist_rejects_an_entry_whose_passport_is_blank() {
+        // A trailing `#` reads as intent to bind. Issuing it unbound would be a
+        // silent downgrade of exactly the thing the operator was configuring.
+        assert!(parse_ts_allowlist("a@b.c=t1:query:read#").is_empty());
+        assert!(parse_ts_allowlist("a@b.c=t1:query:read#   ").is_empty());
     }
 
     // ── M1b: the rail is proxy-agnostic ───────────────────────────────────
