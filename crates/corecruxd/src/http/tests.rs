@@ -17052,6 +17052,237 @@ async fn repo_add_local_path_async_failure_keeps_registered_repo() {
     assert!(persisted.last_scan_id.is_none());
 }
 
+async fn post_repo_rescan_resp(
+    state: AppState,
+    tenant_id: &str,
+    repo_id: &str,
+    scope: &str,
+) -> axum::response::Response {
+    super::repos::post_repo_rescan(
+        State(state),
+        Path(repo_id.to_string()),
+        dev_scope_headers(scope),
+        Query(super::repos::RepoTenantQuery {
+            tenant_id: tenant_id.to_string(),
+        }),
+    )
+    .await
+    .into_response()
+}
+
+async fn repo_codemap_summary(state: AppState, tenant_id: &str, repo_id: &str) -> serde_json::Value {
+    let resp = super::repos::get_repo_codemap(
+        State(state),
+        Path(repo_id.to_string()),
+        dev_scope_headers("admin:read"),
+        Query(super::repos::CodemapQuery {
+            tenant_id: tenant_id.to_string(),
+            format: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    json_body(resp).await
+}
+
+async fn register_inline_repo(
+    state: AppState,
+    repo_id: &str,
+    root_path: Option<String>,
+    clone_url: Option<String>,
+) -> axum::response::Response {
+    super::repos::post_repo(
+        State(state),
+        dev_scope_headers("admin:write"),
+        Json(super::repos::CreateRepoBody {
+            repo_id: Some(repo_id.to_string()),
+            tenant_id: "tenant-a".to_string(),
+            root_path,
+            clone_url,
+            languages: vec!["rust".to_string()],
+            scan_mode: None,
+        }),
+    )
+    .await
+    .into_response()
+}
+
+/// Atomic-replacement contract of `POST /v1/repos/{repo_id}/scan`: while the
+/// rescan is queued and running, readers keep getting the old complete map
+/// (same `scan_id`, same `last_scan_id`); after the job succeeds, they get the
+/// new complete map. A second rescan while one is in flight is refused with
+/// the in-flight job's id rather than racing the commit.
+#[tokio::test]
+#[serial_test::serial]
+async fn repo_rescan_success_replaces_map_atomically() {
+    let mut hook = super::repos::RepoScanTestHook::default();
+    hook.delay_ms_by_repo.insert("rescan-me".to_string(), 1_500);
+    let _guard = super::repos::RepoScanTestHookGuard::install(hook);
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let repo = tiny_rust_workspace();
+
+    let created = register_inline_repo(
+        state.clone(),
+        "rescan-me",
+        Some(repo.path().to_string_lossy().to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let first_scan_id = json_body(created).await["repo"]["last_scan_id"]
+        .as_str()
+        .expect("initial scan id")
+        .to_string();
+    let before = repo_codemap_summary(state.clone(), "tenant-a", "rescan-me").await;
+    assert_eq!(before["scan_id"], first_scan_id.as_str());
+    let before_symbols = before["stats"]["symbol_count"].as_u64().expect("symbol count");
+    assert!(before_symbols >= 1, "fixture scan must index symbols");
+
+    // The repo changed on disk; the persisted map is now stale.
+    std::fs::write(
+        repo.path().join("mini").join("src").join("lib.rs"),
+        "pub struct Used;\npub fn call() -> Used { Used }\npub fn added_by_rescan() {}\n",
+    )
+    .expect("grow fixture");
+
+    let accepted = post_repo_rescan_resp(state.clone(), "tenant-a", "rescan-me", "admin:write").await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let accepted_body = json_body(accepted).await;
+    let job_id = accepted_body["job_id"].as_str().expect("job id").to_string();
+    assert_eq!(accepted_body["repo"]["scan_status"], "pending");
+    // Queueing a rescan does not drop the current map.
+    assert_eq!(accepted_body["repo"]["last_scan_id"], first_scan_id.as_str());
+
+    let _ = wait_for_repo_scan_job(state.clone(), "tenant-a", &job_id, "running").await;
+    // Mid-rescan (the test hook holds the job in `running`), the old complete
+    // map is still what readers see.
+    let during = repo_codemap_summary(state.clone(), "tenant-a", "rescan-me").await;
+    assert_eq!(during["scan_id"], first_scan_id.as_str());
+
+    // One in-flight scan per repo: a concurrent rescan is refused, naming the
+    // in-flight job.
+    let dup = post_repo_rescan_resp(state.clone(), "tenant-a", "rescan-me", "admin:write").await;
+    assert_eq!(dup.status(), StatusCode::CONFLICT);
+    let dup_body = json_body(dup).await;
+    assert!(dup_body["detail"].as_str().unwrap_or_default().contains(&job_id));
+
+    let _ = wait_for_repo_scan_job(state.clone(), "tenant-a", &job_id, "succeeded").await;
+    let after = repo_codemap_summary(state.clone(), "tenant-a", "rescan-me").await;
+    let new_scan_id = after["scan_id"].as_str().expect("new scan id");
+    assert_ne!(new_scan_id, first_scan_id);
+    assert_eq!(
+        after["stats"]["symbol_count"].as_u64().expect("new symbol count"),
+        before_symbols + 1
+    );
+
+    let store = state.fact_store.read().await;
+    let persisted = crate::repo_registry::get_repo(&store, "tenant-a", "rescan-me").expect("repo persisted");
+    assert_eq!(persisted.scan_status.as_deref(), Some("done"));
+    assert!(persisted.scan_error.is_none());
+    assert_eq!(persisted.last_scan_id.as_deref(), Some(new_scan_id));
+}
+
+/// Failure-preservation contract of `POST /v1/repos/{repo_id}/scan`: a failed
+/// rescan records the failure on the registration and leaves the previously
+/// persisted map fully intact and serving — the property the legacy
+/// delete-and-re-register loop could not provide.
+#[tokio::test]
+#[serial_test::serial]
+async fn repo_rescan_failure_preserves_persisted_map() {
+    let mut hook = super::repos::RepoScanTestHook::default();
+    hook.errors_by_repo
+        .insert("rescan-fail".to_string(), "forced rescan failure for test".to_string());
+    let _guard = super::repos::RepoScanTestHookGuard::install(hook);
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let repo = tiny_rust_workspace();
+
+    let created = register_inline_repo(
+        state.clone(),
+        "rescan-fail",
+        Some(repo.path().to_string_lossy().to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let first_scan_id = json_body(created).await["repo"]["last_scan_id"]
+        .as_str()
+        .expect("initial scan id")
+        .to_string();
+    let before = repo_codemap_summary(state.clone(), "tenant-a", "rescan-fail").await;
+    let before_symbols = before["stats"]["symbol_count"].as_u64().expect("symbol count");
+    assert!(before_symbols >= 1, "fixture scan must index symbols");
+
+    let accepted = post_repo_rescan_resp(state.clone(), "tenant-a", "rescan-fail", "admin:write").await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let job_id = json_body(accepted).await["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+
+    let job = wait_for_repo_scan_job(state.clone(), "tenant-a", &job_id, "failed").await;
+    assert_eq!(job["error"], "forced rescan failure for test");
+
+    // The registration reports the failure…
+    {
+        let store = state.fact_store.read().await;
+        let persisted = crate::repo_registry::get_repo(&store, "tenant-a", "rescan-fail").expect("repo persisted");
+        assert_eq!(persisted.scan_status.as_deref(), Some("failed"));
+        assert_eq!(persisted.scan_error.as_deref(), Some("forced rescan failure for test"));
+        // …but the pointer to the persisted map is untouched.
+        assert_eq!(persisted.last_scan_id.as_deref(), Some(first_scan_id.as_str()));
+    }
+
+    // …and the old map is still served, byte-for-byte the same scan.
+    let after = repo_codemap_summary(state.clone(), "tenant-a", "rescan-fail").await;
+    assert_eq!(after["scan_id"], first_scan_id.as_str());
+    assert_eq!(
+        after["stats"]["symbol_count"].as_u64().expect("symbol count"),
+        before_symbols
+    );
+}
+
+/// Guard rails on `POST /v1/repos/{repo_id}/scan`: unknown repos 404,
+/// clone_url-only registrations 409, a registered root_path that vanished from
+/// disk 409 (map preserved), and a read-scoped caller is refused.
+#[tokio::test]
+async fn repo_rescan_guards_unknown_clone_url_missing_root_and_scope() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let missing = post_repo_rescan_resp(state.clone(), "tenant-a", "never-registered", "admin:write").await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let clone_only = register_inline_repo(
+        state.clone(),
+        "clone-only",
+        None,
+        Some("https://example.com/repo.git".to_string()),
+    )
+    .await;
+    assert_eq!(clone_only.status(), StatusCode::OK);
+    let refused = post_repo_rescan_resp(state.clone(), "tenant-a", "clone-only", "admin:write").await;
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+
+    let vanishing = tiny_rust_repo();
+    let created = register_inline_repo(
+        state.clone(),
+        "root-vanishes",
+        Some(vanishing.path().to_string_lossy().to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    drop(vanishing); // TempDir cleanup deletes the tree out from under the registration.
+    let gone = post_repo_rescan_resp(state.clone(), "tenant-a", "root-vanishes", "admin:write").await;
+    assert_eq!(gone.status(), StatusCode::CONFLICT);
+    // The refusal is non-destructive: registration and persisted map survive.
+    let survived = repo_codemap_summary(state.clone(), "tenant-a", "root-vanishes").await;
+    assert!(survived["scan_id"].as_str().is_some());
+
+    let read_only = post_repo_rescan_resp(state, "tenant-a", "root-vanishes", "admin:read").await;
+    assert_eq!(read_only.status(), StatusCode::FORBIDDEN);
+}
+
 #[tokio::test]
 async fn repo_add_local_path_async_backpressure_rejects_when_queue_full() {
     let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
