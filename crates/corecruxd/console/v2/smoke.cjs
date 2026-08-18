@@ -6063,6 +6063,107 @@ function extractThemeVars(theme) {
   }));
 })();
 
+// =========================================================================
+//  Check — (issue #703) cx-gates carries tenant context. A pending gate held in
+//  a NON-DEFAULT tenant must appear on the routed page, the page must say which
+//  tenants it answered for, a narrowed view must not borrow the rich "queue is
+//  clear" state, and an unauthorized/failed read must fail honestly rather than
+//  render as an empty queue. Driven through renderPage('cx-gates') — the routed
+//  path a browser takes — against a stubbed client.
+// =========================================================================
+(function checkGatesTenantContext() {
+  const gateSrc = funcBody(renderSrc, 'renderGatesBoard') || '';
+  check(/tenant_scope/.test(gateSrc), '[gates-tenant] the board must read tenant_scope from the daemon response');
+  check(/approveGate|rejectGate/.test(gateSrc), '[gates-tenant] approve/reject must still route through approveGate/rejectGate (operatorGatedCall)');
+
+  const dom = newMockDom();
+  const priorChecks = asyncChecks.slice();
+  const settle = function () { return new Promise(function (r) { setTimeout(r, 0); }); };
+
+  // One stubbed daemon: pending gates live in tenant `work`, none in `default`.
+  const GATES = [
+    { action_id: 'ga_1', work_id: 'w-1', requested_by_passport: 'p_agent', tenant_id: 'work', requested_action: 'update_state', target_state: 'complete', status: 'pending', requested_at_unix_ms: 1 },
+    { action_id: 'ga_2', work_id: 'w-2', requested_by_passport: 'p_agent', tenant_id: 'work', requested_action: 'update_state', target_state: 'archived', status: 'pending', requested_at_unix_ms: 2 }
+  ];
+  const seen = [];
+  let gateStatus = 200;
+  function stubApi() {
+    return { get: function (base, query) {
+      const q = query || {};
+      if (base === '/v1/work/gate/pending') {
+        seen.push(q.tenant_id || null);
+        if (gateStatus !== 200) {
+          return Promise.resolve({ ok: false, status: gateStatus, json: function () { return Promise.resolve({ detail: 'token is missing a tenant claim' }); } });
+        }
+        const tenant = q.tenant_id || null;
+        const rows = tenant ? GATES.filter(function (g) { return g.tenant_id === tenant; }) : GATES.slice();
+        const scope = tenant ? [tenant] : ['*'];
+        return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({ count: rows.length, pending: rows, tenant_scope: scope }); } });
+      }
+      return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({ work: [] }); } });
+    } };
+  }
+
+  asyncChecks.push(Promise.all(priorChecks).then(function () {
+    const savedDoc = global.document, savedWin = global.window;
+    global.document = dom.doc;
+    global.window = { CruxApi: stubApi(), CruxPages: pages, CRUX_POSTURE: 'operator', CRUX_MODE: 'professional' };
+    const host = dom.mkNode('div');
+    render.renderPage({ id: 'cx-gates', title: 'Gates' }, host);
+    // Globals are restored in the tail, not a `finally` — the chain below is
+    // async, so a `finally` here would unhook the mock DOM mid-flight.
+    const restore = function () { global.document = savedDoc; global.window = savedWin; };
+    return settle().then(settle).then(function () {
+      {
+        // (1) The default read asks for NO tenant — the daemon answers for every
+        //     authorized tenant — so a non-default gate is visible.
+        check(seen.length >= 1 && seen[0] === null, '[gates-tenant] the first read must not pin a tenant (got ' + JSON.stringify(seen[0]) + ')');
+        let text = host.textContent;
+        check(/ga_1/.test(text) && /ga_2/.test(text), '[gates-tenant] pending gates held in a non-default tenant must render');
+        check(!/queue is clear/.test(text), '[gates-tenant] the rich "queue is clear" state must NOT show while gates are pending elsewhere');
+        check(/all authorized tenants/.test(text), '[gates-tenant] the count line must name the tenant scope the daemon answered for');
+        check(/\bwork\b/.test(text), '[gates-tenant] each row must name the tenant its gate belongs to');
+
+        // (2) The operator can narrow to one authorized tenant, and the rows
+        //     match GET /v1/work/gate/pending?tenant_id=<selected>.
+        const picks = dom.collect(host, [host]).filter(function (n) { return n.getAttribute && n.getAttribute('data-gates-tenant'); });
+        check(picks.length === 1, '[gates-tenant] the page must expose exactly one tenant selector');
+        const pick = picks[0];
+        const opts = dom.collect(pick).map(function (n) { return n.getAttribute('value'); });
+        check(opts.indexOf('work') >= 0, '[gates-tenant] the selector must offer every tenant seen holding a pending gate');
+        pick.value = 'work';
+        (pick._handlers.change || []).forEach(function (fn) { fn(); });
+        return settle().then(settle).then(function () {
+          check(seen[seen.length - 1] === 'work', '[gates-tenant] selecting a tenant must re-read with ?tenant_id=<selected>');
+          text = host.textContent;
+          check(/ga_1/.test(text) && /tenant work/.test(text), '[gates-tenant] the narrowed view must show that tenant\'s rows and name the narrowing');
+
+          // (3) A tenant with no gates is honestly narrow-empty, never "clear".
+          pick.value = 'default';
+          (pick._handlers.change || []).forEach(function (fn) { fn(); });
+          return settle().then(settle);
+        }).then(function () {
+          text = host.textContent;
+          check(!/queue is clear/.test(text), '[gates-tenant] a tenant-narrowed empty result must NOT claim the whole queue is clear');
+          check(/narrowed to one tenant/.test(text), '[gates-tenant] a narrowed empty result must say it is narrowed and point back to all tenants');
+
+          // (4) A refused read fails honestly — no empty queue, no "clear".
+          gateStatus = 403;
+          pick.value = '';
+          (pick._handlers.change || []).forEach(function (fn) { fn(); });
+          return settle().then(settle);
+        }).then(function () {
+          text = host.textContent;
+          check(/Gates unavailable/.test(text) && /HTTP 403/.test(text), '[gates-tenant] an unauthorized read must render an explicit failure, not an empty queue');
+          check(/NOT known to be clear/.test(text), '[gates-tenant] the failure must say the queue is not known to be clear');
+          check(!/queue is clear/.test(text), '[gates-tenant] a failed read must never render the all-clear state');
+          notes.push('gates tenant context (issue #703): GET /v1/work/gate/pending answers for every tenant the credential is authorized for (tenant_scope in the response; ["*"] = all), cx-gates renders the scope verbatim, offers an authorized-tenant selector, and refuses to show the rich "queue is clear" state when the view is narrowed or the read failed.');
+        });
+      }
+    }).then(function () { restore(); }, function (e) { restore(); check(false, '[gates-tenant] routed gates render threw: ' + (e && e.stack || e)); });
+  }));
+})();
+
 // ---- Report (awaits async renderer-driven checks) -----------------------
 Promise.all(asyncChecks).then(function () { return passportMintInteraction(); }).then(function () {
   console.log('unified-shell-console v2 — M14 + desktop mission control M2 smoke');

@@ -894,18 +894,33 @@ pub(super) async fn get_pending_gates(
         Ok(context) => context,
         Err(response) => return response,
     };
-    let tenant_id = match context.resolve_authorized_tenant(q.tenant_id.as_deref()) {
-        Ok(tenant_id) => tenant_id,
+    // An oversight queue answers for every tenant the credential is authorized
+    // for unless the caller narrows it. Collapsing to one tenant here is what
+    // hid pending gates held outside `default` (issue #703).
+    let scope = match context.resolve_authorized_tenant_scope(q.tenant_id.as_deref()) {
+        Ok(scope) => scope,
         Err(problem) => return problem.into_response(),
     };
     let store = state.fact_store.read().await;
-    let pending = crate::work::list_pending_gates(&store, Some(&tenant_id), q.by_passport.as_deref());
+    let mut pending = crate::work::list_pending_gates(&store, None, q.by_passport.as_deref());
     drop(store);
+    if let Some(allowed) = scope.as_ref() {
+        pending.retain(|gate| allowed.iter().any(|tenant| tenant == gate_tenant(gate)));
+    }
+    // `["*"]` = answered across every tenant. Callers render this verbatim, so
+    // an empty queue can never be confused with a queue narrowed to one tenant.
+    let tenant_scope = scope.unwrap_or_else(|| vec!["*".to_string()]);
     (
         StatusCode::OK,
-        Json(serde_json::json!({"count": pending.len(), "pending": pending})),
+        Json(serde_json::json!({"count": pending.len(), "pending": pending, "tenant_scope": tenant_scope})),
     )
         .into_response()
+}
+
+/// Gates written before the tenant field existed authorize against `default`,
+/// matching [`crate::work::list_pending_gates`].
+fn gate_tenant(gate: &crate::work::PendingGateAction) -> &str {
+    gate.tenant_id.as_deref().unwrap_or("default")
 }
 
 #[tracing::instrument(level = "info", skip_all)]
