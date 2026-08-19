@@ -64,7 +64,7 @@ const TOP_N: usize = 20;
 /// pairwise, so cost grows with the square of this number.
 /// ponytail: O(n²) over open plans — fine at board scale (~200 open, ~40k
 /// cheap string comparisons). If the board ever outgrows this, index paths
-/// into a map<path, Vec<slug>> and group by bucket instead of comparing pairs.
+/// into a `map<path, Vec<slug>>` and group by bucket instead of comparing pairs.
 const MAX_PLANS_FOR_CLUSTERING: usize = 400;
 
 /// Upper bound on declared paths read per plan, so one pathological plan
