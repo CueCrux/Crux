@@ -36,9 +36,9 @@ mod console_index;
 mod consolidation_scheduler;
 mod control;
 mod coord;
-mod crucible;
 mod cost;
 mod cost_attribution;
+mod crucible;
 // Default-off, append-only comped-wallet meter shared by the explicit spend
 // rail and metered capability paths.
 #[allow(dead_code)]

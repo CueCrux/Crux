@@ -281,7 +281,10 @@ pub fn build_wire_request(
 }
 
 /// Parse a provider response body into the normalized shape.
-pub fn parse_wire_response(mode: ProviderMode, body: &serde_json::Value) -> Result<CompletionResponse, CompletionError> {
+pub fn parse_wire_response(
+    mode: ProviderMode,
+    body: &serde_json::Value,
+) -> Result<CompletionResponse, CompletionError> {
     match mode {
         ProviderMode::None => Err(CompletionError::Disabled),
         ProviderMode::Anthropic => {
@@ -320,7 +323,9 @@ pub fn parse_wire_response(mode: ProviderMode, body: &serde_json::Value) -> Resu
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string),
                 input_tokens: body.pointer("/usage/prompt_tokens").and_then(serde_json::Value::as_u64),
-                output_tokens: body.pointer("/usage/completion_tokens").and_then(serde_json::Value::as_u64),
+                output_tokens: body
+                    .pointer("/usage/completion_tokens")
+                    .and_then(serde_json::Value::as_u64),
             })
         }
     }
@@ -438,7 +443,10 @@ mod tests {
         assert_eq!(wire.body["max_tokens"], json!(1024));
         // system is a TOP-LEVEL field, not a message role.
         assert_eq!(wire.body["system"], json!("be terse"));
-        assert_eq!(wire.body["messages"], json!([{"role": "user", "content": "summarize the board"}]));
+        assert_eq!(
+            wire.body["messages"],
+            json!([{"role": "user", "content": "summarize the board"}])
+        );
     }
 
     #[test]
@@ -482,7 +490,9 @@ mod tests {
             base_url: Some("http://127.0.0.1:8000/v1/".to_string()),
             model: None,
         };
-        let wire = build_wire_request(&config, &req(), None).expect("builds").expect("some");
+        let wire = build_wire_request(&config, &req(), None)
+            .expect("builds")
+            .expect("some");
         assert_eq!(wire.url, "http://127.0.0.1:8000/v1/chat/completions");
     }
 

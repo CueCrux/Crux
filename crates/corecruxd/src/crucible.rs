@@ -370,7 +370,10 @@ mod tests {
         ]);
         assert_eq!(clusters.len(), 1, "identical declared path must cluster");
         assert_eq!(clusters[0].slugs, vec!["alpha".to_string(), "beta".to_string()]);
-        assert_eq!(clusters[0].shared_paths, vec!["crates/corecruxd/src/coord.rs".to_string()]);
+        assert_eq!(
+            clusters[0].shared_paths,
+            vec!["crates/corecruxd/src/coord.rs".to_string()]
+        );
     }
 
     /// Directory containment counts as overlap, and the reported path is the
@@ -382,7 +385,10 @@ mod tests {
             plan("beta", &["crates/corecruxd/src/coord.rs"]),
         ]);
         assert_eq!(clusters.len(), 1);
-        assert_eq!(clusters[0].shared_paths, vec!["crates/corecruxd/src/coord.rs".to_string()]);
+        assert_eq!(
+            clusters[0].shared_paths,
+            vec!["crates/corecruxd/src/coord.rs".to_string()]
+        );
     }
 
     #[test]
@@ -415,7 +421,9 @@ mod tests {
         assert_eq!(clusters.len(), 2, "expected exactly a-b and b-c, got {pairs:?}");
         assert!(pairs.iter().all(|p| p.len() == 2));
         assert!(
-            !clusters.iter().any(|c| c.slugs == vec!["a".to_string(), "c".to_string()]),
+            !clusters
+                .iter()
+                .any(|c| c.slugs == vec!["a".to_string(), "c".to_string()]),
             "a and c share no path and must not be clustered"
         );
     }
@@ -468,7 +476,11 @@ mod tests {
 
     #[test]
     fn digest_round_trips_through_json() {
-        let d = build_digest(&[item("solo", "planned", &[])], &[plan("x", &["a.rs"]), plan("y", &["a.rs"])], 7_000);
+        let d = build_digest(
+            &[item("solo", "planned", &[])],
+            &[plan("x", &["a.rs"]), plan("y", &["a.rs"])],
+            7_000,
+        );
         let encoded = serde_json::to_string(&d).expect("digest serializes");
         let decoded: BoardDigest = serde_json::from_str(&encoded).expect("digest round-trips");
         assert_eq!(decoded, d);
