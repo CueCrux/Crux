@@ -438,13 +438,13 @@ This is the body.
     /// `docs/execplan-drift-guard.md`. The body keeps only what an agent needs
     /// mid-session; operator setup is read on demand. Guard both halves.
     #[test]
-    fn execplan_discipline_v6_pins_the_workspace_green_gate_and_still_defers_setup_detail() {
+    fn execplan_discipline_v7_pins_a_runnable_workspace_green_gate_and_still_defers_setup_detail() {
         let bundled = load_bundled_profiles().unwrap();
         let p = bundled
             .iter()
             .find(|f| f.frontmatter.name == "execplan-discipline")
             .expect("execplan-discipline fragment must be bundled");
-        assert_eq!(p.frontmatter.version, 6);
+        assert_eq!(p.frontmatter.version, 7);
 
         let body = p.body.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
 
@@ -503,9 +503,18 @@ This is the body.
             body.contains("workspace-green"),
             "the milestone gate must define done as workspace-green"
         );
+        // v7: the command has to be one an agent can actually run. v6 named
+        // `clippy --all-targets`, which on a crate that denies unwrap/expect in
+        // production while its tests use them reports thousands of pre-existing
+        // errors — an unrunnable gate is worse than none, because the first
+        // agent to try it learns to ignore the rule.
         assert!(
-            body.contains("--all-targets"),
-            "the gate must name the all-targets sweep, not a per-package check"
+            body.contains("cargo check --workspace --all-targets`)"),
+            "the gate must name the compile-all-targets sweep it can actually run"
+        );
+        assert!(
+            body.contains("deliberate posture and not a finding"),
+            "the clippy --all-targets false-positive must be called out by name"
         );
     }
 
