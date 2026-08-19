@@ -34,9 +34,11 @@
 //!   Getting this wrong is silent — git clones happily into the wrong place and
 //!   the board simply stays empty — so a mismatch is validated and reported.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -117,6 +119,23 @@ impl SyncOutcome {
 
 fn run_git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
     run_git_deadline(dir, args, Duration::from_secs(GIT_TIMEOUT_SECS))
+}
+
+/// `run_git` with extra environment. Only the date-backdating test needs this,
+/// but it lives beside `run_git` so both share one spawn path.
+#[cfg(test)]
+fn run_git_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir).args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
 }
 
 /// Run `git` under a **wall-clock deadline**, killing it if it outlives one.
@@ -382,6 +401,7 @@ pub fn spawn_refresh_task() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::UNIX_EPOCH;
 
     fn tmp(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("crux-execplan-git-{name}-{}", std::process::id()));
@@ -463,6 +483,92 @@ mod tests {
         .expect("write plan");
         run_git(Some(dir), &["add", "-A"]).expect("add");
         run_git(Some(dir), &["commit", "-m", "seed"]).expect("commit");
+    }
+
+    /// A git checkout stamps every file it writes with the *checkout* time, so
+    /// filesystem mtime says "seconds old" about a plan committed months ago.
+    /// Downstream that is not cosmetic: `ARCHIVE_AGE_MS` (90d) and
+    /// `STALE_AGE_MS` (14d) both read this number, so a replica younger than
+    /// either threshold makes every fact-less plan permanently fresh.
+    ///
+    /// Asserts the property — age comes from the commit, not the file — rather
+    /// than an exact timestamp, and the fixture makes the two provably
+    /// different: the file is rewritten (fresh mtime) *after* being committed
+    /// with a backdated committer date.
+    #[test]
+    fn plan_age_comes_from_the_commit_not_the_checkout_mtime() {
+        let repo = tmp("age-src");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        run_git(Some(&repo), &["init", "--initial-branch=main"]).expect("init");
+        run_git(Some(&repo), &["config", "user.email", "t@example.com"]).expect("email");
+        run_git(Some(&repo), &["config", "user.name", "t"]).expect("name");
+        let plans = repo.join(".agent/execplans");
+        std::fs::create_dir_all(&plans).expect("mkdir plans");
+        std::fs::write(plans.join("old-plan-2026-01-02.md"), "# Old\n").expect("write");
+        run_git(Some(&repo), &["add", "-A"]).expect("add");
+        // 2026-01-02T03:04:05Z — comfortably past both age thresholds.
+        const COMMITTED_AT_SECS: u64 = 1_767_323_045;
+        run_git_env(
+            &repo,
+            &["commit", "-m", "old"],
+            &[
+                ("GIT_AUTHOR_DATE", "1767323045 +0000"),
+                ("GIT_COMMITTER_DATE", "1767323045 +0000"),
+            ],
+        )
+        .expect("commit");
+
+        // Rewrite the file so its mtime is *now*: this is what a clone or pull
+        // does to every file it touches.
+        std::fs::write(plans.join("old-plan-2026-01-02.md"), "# Old\n").expect("rewrite");
+        let fs_mtime_ms = std::fs::metadata(plans.join("old-plan-2026-01-02.md"))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_millis() as u64);
+
+        let files = crate::work_execplans::walk_execplans_root(&plans).expect("walk");
+        let f = files
+            .iter()
+            .find(|f| f.slug == "old-plan-2026-01-02")
+            .expect("plan must be walked");
+
+        assert_eq!(
+            f.mtime_unix_ms,
+            COMMITTED_AT_SECS * 1000,
+            "age must be the commit time, not the checkout mtime"
+        );
+        // Positive control on the fixture itself: if these were equal the
+        // assertion above would pass for the wrong reason.
+        assert!(
+            fs_mtime_ms > f.mtime_unix_ms,
+            "fixture is broken — mtime ({fs_mtime_ms}) must be newer than the \
+             backdated commit ({}) for this test to discriminate",
+            f.mtime_unix_ms
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The fallback half. A plan written but not yet committed has no commit
+    /// time; mtime is then the truthful answer and must be used rather than
+    /// treating the missing entry as age zero.
+    #[test]
+    fn uncommitted_plan_falls_back_to_filesystem_mtime() {
+        let repo = tmp("age-fallback");
+        seed_origin(&repo);
+        let plans = repo.join(".agent/execplans");
+        std::fs::write(plans.join("fresh-plan-2026-08-19.md"), "# Fresh\n").expect("write");
+
+        let files = crate::work_execplans::walk_execplans_root(&plans).expect("walk");
+        let f = files
+            .iter()
+            .find(|f| f.slug == "fresh-plan-2026-08-19")
+            .expect("uncommitted plan must still be walked");
+        assert!(
+            f.mtime_unix_ms > 0,
+            "an uncommitted plan must fall back to mtime, not to zero"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     fn cfg_for(remote: &Path) -> GitConfig {
@@ -1064,4 +1170,86 @@ pub fn write_plan(
         content_hash: content_hash(content.as_bytes()),
         pushed,
     })
+}
+
+// ── Plan age from git, not from the filesystem ─────────────────────────────
+
+/// How long a directory's commit-time map is reused before git is asked again.
+/// The consumers compare against 14- and 90-day thresholds, so a map that is up
+/// to a minute stale cannot change an answer; this exists purely to keep the
+/// `git log` off every HTTP request.
+const COMMIT_TIME_TTL: Duration = Duration::from_secs(60);
+
+/// `git log` over a full plan directory is bounded separately from network
+/// operations — it is local and should never take the 120s transport deadline.
+const COMMIT_TIME_TIMEOUT: Duration = Duration::from_secs(10);
+
+type CommitTimes = Arc<HashMap<String, u64>>;
+static COMMIT_TIME_CACHE: OnceLock<Mutex<HashMap<PathBuf, (Instant, CommitTimes)>>> = OnceLock::new();
+
+/// Last-commit time (unix ms) for every `*.md` in `dir`, keyed by file stem.
+///
+/// The plan walker reads filesystem mtime, which on a git-backed replica is the
+/// time the **checkout** wrote the file, not the time the plan was last worked
+/// on. A clone or a pull stamps every file it touches with the same instant, so
+/// plan age collapses to "when did the daemon last sync" — and the two age rules
+/// downstream stop working: nothing reaches `ARCHIVE_AGE_MS` (90d) however old
+/// it really is, and nothing ever crosses `STALE_AGE_MS` (14d), because the
+/// replica is younger than both. Git holds the real answer.
+///
+/// One `git log` for the whole directory, not one per file: `--name-only` with a
+/// bare `%ct` header walks history newest-first, so the first time a path
+/// appears is its last-change time. Over a thousand-plan directory that is one
+/// process instead of a thousand.
+///
+/// Returns `None` when `dir` is not in a git checkout, when `git` is absent, or
+/// when the command fails or times out — every caller must fall back to mtime
+/// rather than treat a missing map as "age zero".
+pub fn last_commit_times(dir: &Path) -> Option<HashMap<String, u64>> {
+    let out = run_git_deadline(
+        Some(dir),
+        &["log", "--pretty=format:%ct", "--name-only", "--", "."],
+        COMMIT_TIME_TIMEOUT,
+    )
+    .ok()?;
+
+    let mut times: HashMap<String, u64> = HashMap::new();
+    let mut current: Option<u64> = None;
+    for line in out.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        // A bare epoch-seconds line is a commit header; anything else is a path
+        // belonging to the commit above it.
+        if let Ok(secs) = line.parse::<u64>() {
+            current = Some(secs.saturating_mul(1000));
+            continue;
+        }
+        let Some(ts) = current else { continue };
+        let Some(stem) = Path::new(line).file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
+            continue;
+        };
+        // Newest-first: the first sighting wins, later (older) ones are ignored.
+        times.entry(stem).or_insert(ts);
+    }
+    Some(times)
+}
+
+/// [`last_commit_times`] behind a short TTL, because the plan list is rebuilt on
+/// several read paths per request and the underlying checkout only moves when
+/// the refresh task pulls.
+pub fn cached_last_commit_times(dir: &Path) -> Option<CommitTimes> {
+    let cache = COMMIT_TIME_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // A poisoned lock is recoverable here: the map is a pure cache, so take the
+    // inner value rather than propagating a panic into every board read.
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, times)) = guard.get(dir) {
+        if at.elapsed() < COMMIT_TIME_TTL {
+            return Some(Arc::clone(times));
+        }
+    }
+    let fresh: CommitTimes = Arc::new(last_commit_times(dir)?);
+    guard.insert(dir.to_path_buf(), (Instant::now(), Arc::clone(&fresh)));
+    Some(fresh)
 }

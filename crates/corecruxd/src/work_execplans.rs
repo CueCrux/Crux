@@ -164,6 +164,15 @@ fn numeric_milestone_id(id: &str) -> Option<u32> {
 pub struct ExecplanFile {
     pub slug: String,
     pub path: PathBuf,
+    /// Last-change time, used downstream as the plan's age
+    /// (`STALE_AGE_MS`, `ARCHIVE_AGE_MS`).
+    ///
+    /// This is the file's **git last-commit time** when the directory is a git
+    /// checkout, and its filesystem mtime only as a fallback. On a git-backed
+    /// replica the mtime alone is the time the clone or pull wrote the file, so
+    /// every plan shares one timestamp and age collapses to "when did we last
+    /// sync" — see [`crate::execplan_git::last_commit_times`]. The field keeps
+    /// its historical name because it is still the mtime off a plain directory.
     pub mtime_unix_ms: u64,
     pub content: String,
 }
@@ -1194,6 +1203,9 @@ pub fn walk_execplans_root(root: &Path) -> std::io::Result<Vec<ExecplanFile>> {
     if !root.exists() {
         return Ok(out);
     }
+    // Ask git once for the whole directory; `None` when this is not a checkout,
+    // in which case mtime is the honest answer anyway.
+    let commit_times = crate::execplan_git::cached_last_commit_times(root);
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
@@ -1208,12 +1220,19 @@ pub fn walk_execplans_root(root: &Path) -> std::io::Result<Vec<ExecplanFile>> {
             continue;
         }
         let content = std::fs::read_to_string(&path)?;
-        let mtime_unix_ms = entry
+        let fs_mtime_unix_ms = entry
             .metadata()
             .ok()
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_millis() as u64);
+        // Git wins where it has an answer. A file that is present but not yet
+        // committed has no commit time, and mtime is then correct: it was
+        // genuinely just written.
+        let mtime_unix_ms = commit_times
+            .as_ref()
+            .and_then(|m| m.get(&stem).copied())
+            .unwrap_or(fs_mtime_unix_ms);
         out.push(ExecplanFile {
             slug: stem,
             path,
