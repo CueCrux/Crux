@@ -38,6 +38,7 @@ mod control;
 mod coord;
 mod cost;
 mod cost_attribution;
+mod crucible;
 // Default-off, append-only comped-wallet meter shared by the explicit spend
 // rail and metered capability paths.
 #[allow(dead_code)]
@@ -1213,6 +1214,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     consolidation_scheduler::spawn_consolidation_scheduler(
         config.consolidation_scheduler_enabled,
         config.consolidation_scheduler_interval_secs,
+        state.fact_store.clone(),
+        shutdown_tx.subscribe(),
+    );
+
+    // Board crucible. Gated at spawn by CORECRUXD_CRUCIBLE (default OFF);
+    // interval config-driven. Surface only: each tick runs the deterministic
+    // ExecPlan-board pass and appends ONE `__board_digest__::*` fact — it never
+    // edits a plan or a work state. Deterministic and offline: no model call,
+    // no egress. See `crate::crucible`.
+    crucible::spawn_board_crucible(
+        config.crucible_enabled,
+        config.crucible_interval_secs,
         state.fact_store.clone(),
         shutdown_tx.subscribe(),
     );

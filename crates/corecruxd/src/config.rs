@@ -534,6 +534,13 @@ pub struct Config {
     pub consolidation_scheduler_enabled: bool,
     pub consolidation_scheduler_interval_secs: u64,
 
+    // Board crucible (`crate::crucible`): periodic deterministic digest of the
+    // ExecPlan board, appended as a `__board_digest__::*` fact. Surface only —
+    // never edits a plan or a work state; no model call and no network egress,
+    // so the default path stays offline. Default OFF; interval config-driven.
+    pub crucible_enabled: bool,
+    pub crucible_interval_secs: u64,
+
     // Multi-agent coordination plane (`/v1/coord/*`, `crate::coord`):
     // presence-joined session board + advisory claims. Default OFF.
     pub coord_enabled: bool,
@@ -1392,6 +1399,12 @@ pub fn load_config() -> Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(3600)
+            .clamp(60, 86_400),
+        crucible_enabled: env_bool("CORECRUXD_CRUCIBLE").unwrap_or(false),
+        crucible_interval_secs: std::env::var("CORECRUXD_CRUCIBLE_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(86_400)
             .clamp(60, 86_400),
         // Launch default: coordination plane ON (proven live on host crux).
         // Explicit `CORECRUXD_COORD=0` still disables it.
