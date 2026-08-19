@@ -548,6 +548,24 @@ fn projects_work_and_coordination_tools_flow() {
         .unwrap();
     assert_eq!(approved["state"], "complete");
 
+    // M5 gate (issue #705): one real gate resolved end to end, and its receipt
+    // verified against THE DAEMON'S OWN verdict — not a claim computed here.
+    // A resolution that mints an unverifiable receipt is an audit trail that
+    // only looks like one, which is the failure mode this whole line of work is
+    // about.
+    let receipt_id = approved["receipt_id"].as_str().expect("approval receipt_id");
+    let verification: serde_json::Value = d
+        .get(&format!("/v1/receipts/{receipt_id}/verification?tenant_id=tenant-a"))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(
+        verification["signature_valid"], true,
+        "the daemon must verify the approval receipt it just minted: {verification}"
+    );
+    assert_eq!(verification["error_code"], "OK", "verification verdict: {verification}");
+
     let transitions: serde_json::Value = d
         .get(&format!("/v1/work/{work_id}/transitions"))
         .unwrap()
