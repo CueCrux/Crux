@@ -1982,6 +1982,7 @@ struct RetentionSweepContext<'a> {
     controls: &'a RetentionSweepControls,
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(unreachable_code, unused_variables, unused_mut))]
 fn sweep_expired_verification_records_with_controls(
     data_dir: &Path,
     request: RetentionSweepRequest<'_>,
@@ -2801,6 +2802,7 @@ pub(crate) fn spawn_provenance_retention_scheduler(
     )
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(unreachable_code, unused_mut))]
 fn spawn_provenance_retention_scheduler_with_interval(
     enabled: bool,
     interval: Duration,
