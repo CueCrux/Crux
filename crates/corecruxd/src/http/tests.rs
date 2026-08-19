@@ -1231,6 +1231,79 @@ async fn attack_device_approve_cannot_grant_scopes_the_approver_lacks() {
     std::env::remove_var("CORECRUXD_DEVICE_GRANT_ENABLED");
 }
 
+/// R3 (issue #705): lending an approver identity is a FALLBACK, not a feature.
+///
+/// Where a stronger rung can name the device's own human, `bind_passport` is
+/// refused — the device user should arrive as themselves. An approver cannot
+/// distinguish "my second laptop" from "a colleague's", so the rule removes the
+/// need to lend rather than policing the intent.
+#[tokio::test]
+#[serial_test::serial]
+async fn attack_bind_passport_is_refused_when_a_stronger_rung_can_name_the_human() {
+    const RAIL: &str = "CORECRUXD_TS_IDENTITY_ENABLED";
+    const ALLOW: &str = "CORECRUXD_TS_IDENTITY_ALLOWLIST";
+    const SECRET: &str = "CORECRUXD_JWT_HS256_SECRET";
+    std::env::set_var("CORECRUXD_DEVICE_GRANT_ENABLED", "1");
+    let state = test_app_state_with_auth(4, AuthMode::DevScopes);
+
+    let approve = |state: AppState| async move {
+        super::auth_device::post_device_approve(
+            State(state),
+            dev_scope_headers("admin:write facts:write"),
+            Json(super::auth_device::DeviceApproveReq {
+                user_code: "AAAA-BBBB".to_string(),
+                tenant_id: "acme".to_string(),
+                scopes: vec!["facts:write".to_string()],
+                deny: false,
+                bind_passport: true,
+            }),
+        )
+        .await
+        .into_response()
+    };
+
+    // Every case here refuses with 403 — under DevScopes there is no canonical
+    // passport, so M1's guard would fire anyway. What matters is WHICH guard
+    // refused, so assert on the detail rather than the status.
+    async fn detail(resp: Response) -> String {
+        json_body(resp).await["detail"].as_str().unwrap_or_default().to_string()
+    }
+
+    // Identity rail live and able to name humans ⇒ lending refused by the R3 rule.
+    std::env::set_var(SECRET, "0123456789abcdef0123456789abcdef");
+    std::env::set_var(RAIL, "1");
+    std::env::set_var(ALLOW, "alice@example.com=acme:facts:write#p_alice");
+    let d = detail(approve(state.clone()).await).await;
+    assert!(
+        d.contains("can name the device's own human"),
+        "the rail can name them, so lending must be refused for THAT reason; got: {d}"
+    );
+
+    // Rail configured but NOT usable (no passport mapping) ⇒ still refused, and
+    // for the no-silent-downgrade reason: a misconfigured stronger rung must
+    // surface rather than become a licence to lend.
+    std::env::set_var(ALLOW, "alice@example.com=acme:facts:write");
+    let d = detail(approve(state.clone()).await).await;
+    assert!(
+        d.contains("configured but not usable"),
+        "a broken stronger rung must refuse for its own reason; got: {d}"
+    );
+
+    // No stronger rung ⇒ lending is the only way to name anyone, so the R3 rule
+    // stands aside and the ordinary canonical-passport guard is what answers.
+    std::env::remove_var(RAIL);
+    std::env::remove_var(ALLOW);
+    let d = detail(approve(state).await).await;
+    assert!(
+        d.contains("canonical passport_id claim"),
+        "with no stronger rung the R3 rule must stand aside; got: {d}"
+    );
+
+    for k in [RAIL, ALLOW, SECRET, "CORECRUXD_DEVICE_GRANT_ENABLED"] {
+        std::env::remove_var(k);
+    }
+}
+
 pub(super) fn dev_scope_headers(scopes: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
