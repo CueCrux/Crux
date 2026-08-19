@@ -108,7 +108,7 @@ To understand what makes this tamper-evident, read these symbols in order:
 
 ## Build / test
 
-- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.59
+- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.61
   (`[workspace.package]` in `Cargo.toml` is authoritative, and
   `scripts/check-agent-docs.sh` fails the build when this line disagrees with it).
 - `cargo build --workspace --locked`
@@ -528,7 +528,7 @@ schema: crux-agent-manifest/v1
 summary: Local-first, tamper-evident retrieval + memory engine with signed, replayable receipts.
 msrv: "1.88.0"
 edition: "2021"
-workspace_version: "0.5.59"
+workspace_version: "0.5.61"
 
 verify_commands:
   - cargo test --workspace
@@ -4361,6 +4361,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.61] - 2026-08-19
+
 ### Security
 
 - **Lending an approver identity is now refused wherever the device's own human
@@ -4396,6 +4398,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `admin:write`-gated server-side. (#705)
 
 ### Added
+
+- **The board can now digest itself.** The daemon already derived the expensive
+  parts of ExecPlan-board analysis — dependency depth, cycles, and the
+  orchestrator edges that point the wrong way — but nothing ever read them on a
+  cadence, so with 200+ open plans the analysis only existed when a human
+  thought to ask.
+
+  A new background pass (`CORECRUXD_CRUCIBLE=1`, default off, daily) runs that
+  analysis and appends one `__board_digest__::<run_id>` fact. It surfaces only:
+  it never edits a plan, changes a work state, or resolves a finding. It is
+  also fully deterministic and offline — no model call, no egress, no
+  credentials — so the same binary runs the same pass on a laptop and on a
+  server.
+
+  When `CRUX_EXECPLANS_ROOT` is unset it declines to write rather than report
+  an empty board, because a digest asserting nothing is open is
+  indistinguishable from a digest of a board the daemon cannot see. (#715)
+
+- **Daemon-side enrichment can now use Claude, OpenAI, or a local model.**
+  A completion provider with four modes (`none`, `anthropic`, `openai`,
+  `local`). `none` is the default and builds no request at all, so the
+  local-first path never depends on a model being configured, reachable, or
+  paid for; `local` targets an OpenAI-compatible server on the machine and
+  needs no credential.
+
+  Anthropic and OpenAI get separate adapters rather than one shim, because they
+  are separate protocols — different path, different auth header, a mandatory
+  `max_tokens`, a top-level system field, and reply text in a content array
+  rather than a choices array. Routing one through the other silently returns
+  empty text instead of failing. `local` reuses the OpenAI adapter because
+  Ollama, llama.cpp and vLLM all serve that shape natively. (#715)
 
 - **The number of distinct passports a work gate requires is now the operator's
   to set.** `CORECRUXD_WORK_GATE_APPROVERS` takes `1` or `2`, default `2` — the
@@ -5422,6 +5455,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-audit` CVE scanning in CI
 
 [unreleased]: https://github.com/CueCrux/Crux/compare/v0.5.59...HEAD
+[0.5.61]: https://github.com/CueCrux/Crux/compare/v0.5.59...v0.5.61
 [0.5.59]: https://github.com/CueCrux/Crux/compare/v0.5.58...v0.5.59
 [0.5.58]: https://github.com/CueCrux/Crux/compare/v0.5.57...v0.5.58
 [0.5.57]: https://github.com/CueCrux/Crux/compare/v0.5.56...v0.5.57
