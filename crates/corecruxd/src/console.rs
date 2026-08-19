@@ -375,8 +375,32 @@ pub fn routes(enabled: bool) -> Router {
 /// The form POSTs to `/v1/auth/device/approve` on the same origin; that endpoint
 /// is gated to an authenticated console admin (`admin:write`) and the
 /// approver-chosen tenant + scopes are what get minted (threat ref T.1).
+/// Served only when the device grant is actually enabled.
+///
+/// The page was previously unconditional, so a daemon with
+/// `CORECRUXD_DEVICE_GRANT_ENABLED` off still served a fully-branded
+/// "Approve device login" form that could never approve anything — pure
+/// phishing surface with zero function. Phishing is the FIRST threat this
+/// rail's own module docs name, and its stated mitigation ("the page shows the
+/// requesting client name") is weakest exactly when the page is genuine,
+/// because it is. Matching the rest of the rail's disabled-⇒-404 idiom removes
+/// the surface wherever the feature is off.
+///
+/// Note this does not make the page non-public where the grant IS enabled;
+/// that is a front-proxy allowlist decision, since approval itself is already
+/// `admin:write`-gated server-side.
 async fn serve_activate() -> impl IntoResponse {
-    Html(ACTIVATE_HTML)
+    let enabled = std::env::var("CORECRUXD_DEVICE_GRANT_ENABLED")
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"));
+    if !enabled {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Html("<!doctype html><meta charset=\"utf-8\"><title>Not found</title><p>Device authorization grant disabled (set CORECRUXD_DEVICE_GRANT_ENABLED=1).".to_string()),
+        )
+            .into_response();
+    }
+    Html(ACTIVATE_HTML.to_string()).into_response()
 }
 
 const ACTIVATE_HTML: &str = r#"<!doctype html>
@@ -667,7 +691,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial] // sets CORECRUXD_DEVICE_GRANT_ENABLED for the /activate row
+
     async fn browser_security_headers_cover_all_console_responses() {
+        // `/activate` only exists when the device grant is enabled, and the
+        // interesting row here is the real page rather than its 404 (headers on
+        // a 404 are already covered by /console-3d/missing.js below).
+        std::env::set_var("CORECRUXD_DEVICE_GRANT_ENABLED", "1");
         use tower::ServiceExt;
 
         let _guard = env_lock();
@@ -724,6 +754,7 @@ mod tests {
             assert_eq!(response.status(), expected_status, "unexpected status for {uri}");
             assert_browser_security_headers(response.headers());
         }
+        std::env::remove_var("CORECRUXD_DEVICE_GRANT_ENABLED");
 
         let preflight = super::routes(true)
             .oneshot(
@@ -1468,5 +1499,47 @@ mod tests {
             allow_headers.contains("authorization"),
             "preflight must name `authorization` explicitly (got {allow_headers:?})"
         );
+    }
+}
+
+#[cfg(test)]
+mod activate_surface_tests {
+    use super::*;
+
+    const FLAG: &str = "CORECRUXD_DEVICE_GRANT_ENABLED";
+
+    /// The page must not exist where the feature does not.
+    ///
+    /// Serving a fully-branded "Approve device login" form on a daemon that
+    /// cannot approve anything is pure phishing surface: an attacker who
+    /// obtains a `user_code` gets a genuine, TLS-served page on the real
+    /// domain to send an admin to. Phishing is the first threat this rail's own
+    /// module docs name.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn activate_is_absent_when_the_device_grant_is_disabled() {
+        std::env::remove_var(FLAG);
+        let resp = serve_activate().await.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+
+        for off in ["0", "false", "no", "off", ""] {
+            std::env::set_var(FLAG, off);
+            let resp = serve_activate().await.into_response();
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "flag value {off:?} must not expose the page"
+            );
+        }
+        std::env::remove_var(FLAG);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn activate_serves_the_approval_page_when_enabled() {
+        std::env::set_var(FLAG, "1");
+        let resp = serve_activate().await.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        std::env::remove_var(FLAG);
     }
 }

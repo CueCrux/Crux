@@ -4361,6 +4361,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`/activate` no longer exists on daemons that cannot use it.** The
+  device-approval page was served unconditionally, so a daemon with
+  `CORECRUXD_DEVICE_GRANT_ENABLED` off still returned a fully-branded
+  "Approve device login" form that could never approve anything.
+
+  That is pure phishing surface with zero function: an attacker who obtains a
+  `user_code` gets a genuine, correctly-branded, TLS-served page on the real
+  domain to send a console admin to. Phishing is the first threat this rail's
+  own module docs name, and their stated mitigation — the page shows the
+  requesting client name — is weakest precisely when the page is legitimate,
+  because it is. It now 404s with the flag named, matching the rest of the
+  rail's disabled-⇒-404 idiom.
+
+  This does not make the page non-public where the grant *is* enabled; that is
+  a front-proxy allowlist decision, since approval itself is already
+  `admin:write`-gated server-side. (#705)
+
 ### Added
 
 - **The number of distinct passports a work gate requires is now the operator's
