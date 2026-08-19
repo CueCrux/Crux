@@ -438,13 +438,13 @@ This is the body.
     /// `docs/execplan-drift-guard.md`. The body keeps only what an agent needs
     /// mid-session; operator setup is read on demand. Guard both halves.
     #[test]
-    fn execplan_discipline_v5_pins_the_refresh_step_and_still_defers_setup_detail() {
+    fn execplan_discipline_v6_pins_the_workspace_green_gate_and_still_defers_setup_detail() {
         let bundled = load_bundled_profiles().unwrap();
         let p = bundled
             .iter()
             .find(|f| f.frontmatter.name == "execplan-discipline")
             .expect("execplan-discipline fragment must be bundled");
-        assert_eq!(p.frontmatter.version, 5);
+        assert_eq!(p.frontmatter.version, 6);
 
         let body = p.body.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
 
@@ -494,6 +494,18 @@ This is the body.
         assert!(
             body.contains("get_gaps` is **not** this"),
             "the get_gaps/capability-registry distinction must be explicit"
+        );
+
+        // v6: a per-package check passes while a downstream *test* target is
+        // broken. Without the workspace-green half, "I ran the steps" reads as a
+        // gate result — which is how a one-field struct change reached CI unseen.
+        assert!(
+            body.contains("workspace-green"),
+            "the milestone gate must define done as workspace-green"
+        );
+        assert!(
+            body.contains("--all-targets"),
+            "the gate must name the all-targets sweep, not a per-package check"
         );
     }
 
