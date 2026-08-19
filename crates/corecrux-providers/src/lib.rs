@@ -20,6 +20,7 @@
 //! derives from the daemon-root passport; this crate takes that key as a parameter and
 //! never sources or persists it itself.
 
+pub mod completion;
 pub mod github;
 pub mod github_sync;
 pub mod openai;
