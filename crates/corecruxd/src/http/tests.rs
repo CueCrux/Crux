@@ -10502,6 +10502,144 @@ async fn console_tenant_category_patch_requires_admin_write_scope() {
 // console-bridge envelope; passport.category must match entity effective
 // category.
 
+/// Durable authorship on the HTTP write plane: `actor` comes from the verified
+/// passport, not the request body. Before this, every `/v1/facts` and
+/// `/v1/facts/bulk` write stored `actor = null` — the gap that failed `gate:M4`
+/// of `crux-code-minimalism-profile-and-engram-2026-07-16`, where
+/// `corecruxctl code-health harvest --push` produced unattributable findings.
+#[tokio::test]
+async fn put_fact_stamps_actor_from_passport() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let body = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
+        entity: "codehealth:corecruxd".to_string(),
+        key: "debt:src/app.rs:2".to_string(),
+        value: "{}".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+        horizon_class: None,
+        actor: None,
+    };
+    let resp = facts::put_fact(
+        State(state),
+        dev_scope_passport_headers("facts:write", "work-default"),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let stored = json_body(resp).await;
+    assert_eq!(
+        stored["actor"], "work-default",
+        "a passport-bearing HTTP write must record its author"
+    );
+}
+
+/// A caller must not be able to self-attribute: a body-supplied `actor` is
+/// overwritten by the verified passport, exactly as `tenant_hash` is.
+#[tokio::test]
+async fn put_fact_ignores_client_supplied_actor() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let body = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
+        entity: "codehealth:corecruxd".to_string(),
+        key: "debt:src/app.rs:3".to_string(),
+        value: "{}".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+        horizon_class: None,
+        actor: Some("someone-else".to_string()),
+    };
+    let resp = facts::put_fact(
+        State(state),
+        dev_scope_passport_headers("facts:write", "work-default"),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let stored = json_body(resp).await;
+    assert_eq!(
+        stored["actor"], "work-default",
+        "a client-supplied actor must never win over the verified passport"
+    );
+}
+
+/// No passport on the token ⇒ `actor` stays null, byte-identical to the
+/// pre-change behaviour. This is why the stamp needs no feature flag.
+#[tokio::test]
+async fn put_fact_without_passport_leaves_actor_null() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let body = corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
+        entity: "codehealth:corecruxd".to_string(),
+        key: "debt:src/app.rs:4".to_string(),
+        value: "{}".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+        horizon_class: None,
+        actor: None,
+    };
+    let resp = facts::put_fact(State(state), dev_scope_headers("facts:write"), Json(body))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let stored = json_body(resp).await;
+    assert!(
+        stored["actor"].is_null(),
+        "a passport-less write must stay unattributed: {stored}"
+    );
+}
+
+/// The bulk door shares `prepare_fact_write_checked`, so it inherits the stamp.
+#[tokio::test]
+async fn put_facts_bulk_stamps_actor_from_passport() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let mk = |key: &str| corecrux_memory::fact_store::StoreFact {
+        tenant_hash: "default".to_string(),
+        entity: "codehealth:corecruxd".to_string(),
+        key: key.to_string(),
+        value: "{}".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+        horizon_class: None,
+        actor: None,
+    };
+    let resp = facts::put_facts_bulk(
+        State(state),
+        dev_scope_passport_headers("facts:write", "work-default"),
+        Json(vec![mk("debt:src/a.rs:1"), mk("debt:src/b.rs:1")]),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let stored = json_body(resp).await;
+    let facts = stored["facts"].as_array().expect("facts array");
+    assert_eq!(facts.len(), 2);
+    for fact in facts {
+        assert_eq!(
+            fact["actor"], "work-default",
+            "every bulk-written fact must carry the author"
+        );
+    }
+}
+
 #[tokio::test]
 async fn put_fact_personal_passport_blocked_on_work_entity() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
