@@ -1,7 +1,7 @@
 +++
 name = "execplan-discipline"
-version = 5
-description = "Multi-milestone work goes through an ExecPlan first. Codifies the Insights-report `ExecPlan Workflow` snippet (M1..Mn pattern in 15+ sessions), plus the board-drift guard that keeps plan `Status:` lines aligned with derived state. v5 closes the propagation gap the gate routine never named: the board is a read-time projection over the daemon's replica, so a locally-committed plan is invisible until it is pushed and refreshed — and an *untracked* plan can be silently destroyed by a sibling session's checkout, which is how one closed plan was lost on 2026-07-31. Adds the push + `POST /v1/execplans/refresh` step and a commit-on-create rule. v4 corrects the Pre-flight step: it pointed at `get_gaps(query=...)`, which reads retrieval-coverage facts rather than the capability registry, and at a Feature Registry endpoint that moved into the Crux daemon when the PlanCrux API was retired 2026-07-24."
+version = 6
+description = "v6 defines the milestone gate: done means committed (or explicitly marked in-progress) AND workspace-green — a per-package check passes while a downstream test target is broken, which is how a one-field struct change reached CI unseen on 2026-06-15. Multi-milestone work goes through an ExecPlan first. Codifies the Insights-report `ExecPlan Workflow` snippet (M1..Mn pattern in 15+ sessions), plus the board-drift guard that keeps plan `Status:` lines aligned with derived state. v5 closes the propagation gap the gate routine never named: the board is a read-time projection over the daemon's replica, so a locally-committed plan is invisible until it is pushed and refreshed — and an *untracked* plan can be silently destroyed by a sibling session's checkout, which is how one closed plan was lost on 2026-07-31. Adds the push + `POST /v1/execplans/refresh` step and a commit-on-create rule. v4 corrects the Pre-flight step: it pointed at `get_gaps(query=...)`, which reads retrieval-coverage facts rather than the capability registry, and at a Feature Registry endpoint that moved into the Crux daemon when the PlanCrux API was retired 2026-07-24."
 targets = ["claude_md", "agents_md"]
 order = 30
 risk_class = "low"
@@ -34,6 +34,12 @@ Required sections in each plan: Purpose, Non-goals, Context, Constraints, Propos
     for the periodic pull; `409` means git backing is not configured, which is a different problem
     from a failed pull. Agents with no checkout author via `POST /v1/execplans` instead.
 - Test + commit per milestone. Don't batch milestones into one commit.
+- A milestone is **not done** until it is (a) committed, or explicitly marked
+  `uncommitted-in-progress` in `Progress`, **and** (b) **workspace-green** — the
+  repo-wide gate over every target, not just the crate or package you touched
+  (Rust: `cargo clippy --workspace --all-targets -- -D warnings`). A per-package
+  check passes while a downstream *test* target is broken. The `gate:M<n>`
+  fact's `tests_passing` field records the **workspace** result.
 - **Never leave a plan file untracked.** An untracked plan lives only in one working tree: a sibling
   session's `git checkout` takes it away, and the loss is silent because the board projects over the
   daemon's replica, not yours. Commit the file the moment you create it, not when the plan closes.
