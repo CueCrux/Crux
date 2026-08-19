@@ -4363,6 +4363,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Lending an approver identity is now refused wherever the device's own human
+  can be named.** `bind_passport` on a device grant binds the approving admin's
+  passport — which is correct for your own second machine, and impersonation if
+  an admin ticks it while approving a colleague's. No mechanism can tell those
+  apart, so rather than policing the intent the need is removed: where the
+  identity rail can name the device's human, lending is refused and that human
+  must arrive as themselves.
+
+  A stronger rung that is configured but *unusable* refuses too, matching the
+  ladder's no-silent-downgrade rule — a misconfigured identity rail must
+  surface, not become a licence to lend. Where no stronger rung exists, lending
+  remains the only way to name anyone and stays available. (#705, accepted risk
+  R3)
+
+
 - **`/activate` no longer exists on daemons that cannot use it.** The
   device-approval page was served unconditionally, so a daemon with
   `CORECRUXD_DEVICE_GRANT_ENABLED` off still returned a fully-branded

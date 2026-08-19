@@ -538,7 +538,7 @@ fn runtime_capability_descriptor(
 /// Every value is daemon configuration, not request state, so the declaration on
 /// `/v1/version` describes what THIS deployment can do rather than what one
 /// caller happens to be able to do.
-fn gate_resolution_inputs(state: &AppState) -> crate::product::GateResolutionInputs {
+pub(super) fn gate_resolution_inputs(state: &AppState) -> crate::product::GateResolutionInputs {
     let allowlist =
         super::auth_rails::parse_ts_allowlist(&std::env::var("CORECRUXD_TS_IDENTITY_ALLOWLIST").unwrap_or_default());
     crate::product::GateResolutionInputs {

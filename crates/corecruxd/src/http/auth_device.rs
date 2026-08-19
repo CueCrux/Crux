@@ -560,6 +560,37 @@ pub(super) async fn post_device_approve(
     // never a value the request names. Refuse loudly rather than issuing an
     // unbound token the operator believes is bound.
     let approver_passport = if req.bind_passport && !req.deny {
+        // R3 (issue #705). Lending your approver identity to a device is only
+        // ever a FALLBACK for when nothing on this deployment can name the
+        // device's human. Where a stronger rung can name them, they must come
+        // in as themselves and lending is refused outright — an approver cannot
+        // tell "my second laptop" from "a colleague's", so the safe rule is to
+        // remove the need rather than police the intent.
+        //
+        // A stronger rung that is CONFIGURED BUT BROKEN also refuses, matching
+        // the ladder's no-silent-downgrade rule: a misconfigured identity rail
+        // must surface, not quietly become a licence to lend.
+        match crate::product::select_gate_resolution(super::health::gate_resolution_inputs(&state)) {
+            crate::product::GateResolutionSelection::Selected(crate::product::GateResolutionRung::IdentityHeader) => {
+                return problem_response(
+                    StatusCode::FORBIDDEN,
+                    "this daemon can name the device's own human through the identity rail; \
+                     bind that identity to a passport in CORECRUXD_TS_IDENTITY_ALLOWLIST instead of \
+                     lending yours",
+                );
+            }
+            crate::product::GateResolutionSelection::Blocked {
+                rung: crate::product::GateResolutionRung::IdentityHeader,
+                reason,
+                ..
+            } => {
+                return problem_response(
+                    StatusCode::FORBIDDEN,
+                    format!("the identity rail is configured but not usable, so lending your passport would silently weaken oversight: {reason}"),
+                );
+            }
+            _ => {}
+        }
         let context = match crate::auth::passport_bound_context(&state.auth, &headers) {
             Ok(context) => context,
             Err(problem) => return problem.into_response(),

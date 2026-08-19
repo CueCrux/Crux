@@ -77,7 +77,33 @@ candidate-links surface (`/v1/identity/candidates`) proposes such links but
 deliberately never resolves them without operator confirmation. **This is an
 operator-signed accepted risk, not a defect to fix in this plan.**
 
-### R3 — `bind_passport` on someone else's device grants them your identity
+### R3 — `bind_passport` on someone else's device grants them your identity — **DECIDED 2026-08-19, conditional**
+
+**Resolution, in three parts:**
+
+1. **Shipped now.** Lending is a *fallback*, never a feature. Where a stronger
+   rung can name the device's own human, `bind_passport` is **refused** — the
+   device user must arrive as themselves. A stronger rung that is configured but
+   *unusable* also refuses, matching the ladder's no-silent-downgrade rule: a
+   misconfigured identity rail must surface, not become a licence to lend.
+2. **On SSO landing** (`cross-site-auth-sso-cuecrux-2026-07-13`, currently M0
+   done / M1–M5 not started, `app.cuecrux.com` dark): the hosted posture stops
+   using `bind_passport` at all, because the issuer can name each human.
+3. **Residual, accepted and named:** self-hosted **and** multi-human **and** no
+   proxy **and** no SSO. That quadrant keeps the original exposure. On a *solo*
+   deployment lending to your own second machine is correct behaviour — see the
+   approver-count policy — so the risk is one specific configuration, not a
+   general hole.
+
+> **The subscription tier gates SSO, not this.** An entitlement check controls
+> feature *availability*, not a security property; a free self-hosted deployment
+> would keep the full exposure. Self-hosters with no proxy and no VPN are exactly
+> the audience OD-57 optimised for when Tailscale-only was rejected, so part 1
+> deliberately requires no tier, no SSO and no infrastructure.
+
+Original statement of the risk follows.
+
+#### As originally found
 
 The device grant binds *the approving admin's own* passport, which is what makes
 it safe against impersonation-by-admin. But an admin who ticks it while
