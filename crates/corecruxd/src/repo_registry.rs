@@ -109,19 +109,17 @@ pub fn validate_repo_id(id: &str) -> Result<(), RepoRegistryError> {
     }
 }
 
-pub fn list_repos(store: &FactStore, tenant_id: &str) -> Vec<RepoRegistration> {
-    let prefix = format!("{REPO_REGISTRY_PREFIX}::{tenant_id}::");
-    let result = store.query(&FactQuery {
-        min_effective_confidence: None,
-        tenant_hash: None,
-        query: None,
-        entity: None,
-        entity_prefix: Some(prefix),
-        top_k: 2_000,
-        token_budget: None,
-    });
+/// List every registration under `prefix`, latest version per repo.
+///
+/// Uses [`FactStore::latest_by_entity_prefix`] — NOT `query { top_k }` +
+/// `dedup_latest`. The query path truncates to `top_k` before dedup collapses
+/// versions, and every in-place rescan appends registration versions
+/// (pending/running/done — see `http/repos.rs`), so a fixed page silently
+/// dropped repos once `repos × versions` crossed it: 954 registered repos
+/// listed as 666 after one full rescan (issue #720).
+fn list_registrations(store: &FactStore, prefix: &str) -> Vec<RepoRegistration> {
     let mut repos = Vec::new();
-    for fact in crate::fact_helpers::dedup_latest(result.facts) {
+    for fact in store.latest_by_entity_prefix(prefix) {
         if fact.key != REPO_FACT_KEY {
             continue;
         }
@@ -129,29 +127,18 @@ pub fn list_repos(store: &FactStore, tenant_id: &str) -> Vec<RepoRegistration> {
             repos.push(registration);
         }
     }
+    repos
+}
+
+pub fn list_repos(store: &FactStore, tenant_id: &str) -> Vec<RepoRegistration> {
+    let prefix = format!("{REPO_REGISTRY_PREFIX}::{tenant_id}::");
+    let mut repos = list_registrations(store, &prefix);
     repos.sort_by(|a, b| a.repo_id.cmp(&b.repo_id));
     repos
 }
 
 pub fn list_all_repos(store: &FactStore) -> Vec<RepoRegistration> {
-    let result = store.query(&FactQuery {
-        min_effective_confidence: None,
-        tenant_hash: None,
-        query: None,
-        entity: None,
-        entity_prefix: Some(format!("{REPO_REGISTRY_PREFIX}::")),
-        top_k: 10_000,
-        token_budget: None,
-    });
-    let mut repos = Vec::new();
-    for fact in crate::fact_helpers::dedup_latest(result.facts) {
-        if fact.key != REPO_FACT_KEY {
-            continue;
-        }
-        if let Ok(registration) = serde_json::from_str::<RepoRegistration>(&fact.value) {
-            repos.push(registration);
-        }
-    }
+    let mut repos = list_registrations(store, &format!("{REPO_REGISTRY_PREFIX}::"));
     repos.sort_by(|a, b| a.tenant_id.cmp(&b.tenant_id).then_with(|| a.repo_id.cmp(&b.repo_id)));
     repos
 }
@@ -360,5 +347,71 @@ mod tests {
 
         let legacy = get_repo(&store, "tenant-a", "legacy").expect("legacy repo");
         assert!(legacy.scan_status.is_none());
+    }
+
+    /// Regression for issue #720: every in-place rescan (`POST .../rescan`)
+    /// appends registration versions (pending → running → done, see
+    /// `http/repos.rs`), and the old list path fetched at most `top_k = 2_000`
+    /// fact versions BEFORE `dedup_latest` collapsed them — so after one full
+    /// rescan of 954 repos (× 4 versions = 3_816 rows) `GET /v1/repos` listed
+    /// only 666 repos. The listing must return every repo exactly once, at its
+    /// latest version, however many versions accumulate.
+    #[test]
+    fn list_repos_lists_every_repo_once_when_versions_exceed_any_page() {
+        let mut store = FactStore::new();
+        let repo_count = 954usize;
+        for i in 0..repo_count {
+            let mut reg = registration(&format!("repo-{i:04}"), None);
+            store_repo(&mut store, &reg).expect("register repo");
+            // One full in-place rescan cycle: three more registration versions.
+            for status in ["pending", "running", "done"] {
+                reg.scan_status = Some(status.to_string());
+                store_repo(&mut store, &reg).expect("rescan status write");
+            }
+        }
+
+        let listed = list_repos(&store, "tenant-a");
+        assert_eq!(
+            listed.len(),
+            repo_count,
+            "all repos listed exactly once (954 -> 666 was the bug)"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for reg in &listed {
+            assert!(
+                seen.insert(reg.repo_id.clone()),
+                "duplicate listing for {}",
+                reg.repo_id
+            );
+            assert_eq!(
+                reg.scan_status.as_deref(),
+                Some("done"),
+                "{}: latest registration version wins",
+                reg.repo_id
+            );
+        }
+    }
+
+    /// Cross-tenant sibling of the #720 regression: `list_all_repos` (used by
+    /// scan recovery and admin surfaces) must also count repos, not versions,
+    /// and keep each latest registration per tenant.
+    #[test]
+    fn list_all_repos_lists_every_tenant_repo_once_despite_versions() {
+        let mut store = FactStore::new();
+        for tenant in ["tenant-a", "tenant-b"] {
+            for i in 0..3 {
+                let mut reg = registration(&format!("repo-{i}"), Some("pending"));
+                reg.tenant_id = tenant.to_string();
+                store_repo(&mut store, &reg).expect("register repo");
+                reg.scan_status = Some("done".to_string());
+                store_repo(&mut store, &reg).expect("update repo");
+            }
+        }
+
+        let listed = list_all_repos(&store);
+        assert_eq!(listed.len(), 6, "one row per (tenant, repo)");
+        assert!(listed.iter().all(|r| r.scan_status.as_deref() == Some("done")));
+        assert_eq!(listed.iter().filter(|r| r.tenant_id == "tenant-a").count(), 3);
+        assert_eq!(listed.iter().filter(|r| r.tenant_id == "tenant-b").count(), 3);
     }
 }

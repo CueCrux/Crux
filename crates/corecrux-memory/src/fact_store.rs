@@ -1656,6 +1656,36 @@ impl FactStore {
             .collect()
     }
 
+    /// Latest-version-wins listing for an entity prefix: exactly one row per
+    /// `(tenant, entity, key)` chain — the highest-version non-deleted fact —
+    /// with NO result cap, so the result size counts entities, never fact
+    /// versions. Result order is unspecified; callers re-sort.
+    ///
+    /// Registry-style surfaces previously ran `query { entity_prefix, top_k }`
+    /// and then [`dedup_latest`], but [`Self::query`] truncates to `top_k`
+    /// BEFORE dedup collapses versions: once total live versions under the
+    /// prefix exceed `top_k`, whole entities silently vanish from the listing
+    /// (issue #720 — repeated in-place rescans accumulated registration
+    /// versions until `/v1/repos` dropped repos). Deduping at the index layer
+    /// makes version accumulation unable to evict entities.
+    ///
+    /// Unfiltered — internal / admin only; does NOT apply the tenant filter
+    /// (same contract as [`Self::get_by_entity`], audit H2). Callers that need
+    /// tenant scoping must encode it in the entity prefix or filter the result.
+    pub fn latest_by_entity_prefix(&self, prefix: &str) -> Vec<Fact> {
+        self.key_index
+            .iter()
+            .filter(|((_tenant, entity, _key), _ids)| entity.starts_with(prefix))
+            .filter_map(|(_chain_key, ids)| {
+                ids.iter()
+                    .filter_map(|id| self.facts.get(id))
+                    .filter(|f| !f.deleted)
+                    .max_by_key(|f| f.version)
+                    .cloned()
+            })
+            .collect()
+    }
+
     /// Query facts by keyword match (simple substring search).
     /// Returns facts sorted by relevance, limited by top_k or token_budget.
     pub fn query(&self, q: &FactQuery) -> FactQueryResult {
@@ -3049,6 +3079,66 @@ mod tests {
             "e1: highest version wins even when v2 arrives after v3"
         );
         assert_eq!(out[1].value, "v5");
+    }
+
+    // ── latest_by_entity_prefix (issue #720) ─────────────────────────────
+
+    /// The listing must count entities, not fact versions: many versions per
+    /// chain never evict other entities (the `query { top_k }` + dedup path
+    /// regression behind issue #720), the highest version wins per chain, and
+    /// non-matching prefixes stay out.
+    #[test]
+    fn latest_by_entity_prefix_lists_every_chain_once_at_latest_version() {
+        let mut store = FactStore::new();
+        for i in 0..40 {
+            let entity = format!("reg::t::{i:02}");
+            for version in 1..=3 {
+                store.store(tenant_fact(
+                    "default",
+                    &entity,
+                    "content",
+                    &format!("{entity}-v{version}"),
+                ));
+            }
+        }
+        store.store(tenant_fact("default", "reg::t::00", "sidecar", "sidecar-v1"));
+        store.store(tenant_fact("default", "other::t::00", "content", "unrelated"));
+
+        let rows = store.latest_by_entity_prefix("reg::t::");
+        // 40 entities × key "content" + one extra key on entity 00. 120 content
+        // versions collapse to 40 rows — a top_k-style page of, say, 100 facts
+        // would have dropped entities here.
+        assert_eq!(rows.len(), 41, "one row per (entity, key) chain");
+        assert!(rows.iter().all(|f| f.entity.starts_with("reg::t::")));
+        for row in rows.iter().filter(|f| f.key == "content") {
+            assert_eq!(row.version, 3, "{}: highest version wins", row.entity);
+            assert_eq!(row.value, format!("{}-v3", row.entity));
+        }
+    }
+
+    /// Soft-deleted versions are invisible: a deleted latest falls back to the
+    /// prior live version, a fully-deleted chain disappears, and same-named
+    /// chains in different tenants stay separate rows (dedup_latest parity).
+    #[test]
+    fn latest_by_entity_prefix_skips_deleted_and_separates_tenants() {
+        let mut store = FactStore::new();
+        let v1 = store.store(tenant_fact("default", "reg::a", "content", "a-v1"));
+        let v2 = store.store(tenant_fact("default", "reg::a", "content", "a-v2"));
+        let gone = store.store(tenant_fact("default", "reg::b", "content", "b-v1"));
+        store.store(tenant_fact("tenant-2", "reg::a", "content", "a-t2"));
+        assert!(store.delete("default", &v2.fact_id), "delete latest of reg::a");
+        assert!(store.delete("default", &gone.fact_id), "delete whole reg::b chain");
+
+        let mut rows = store.latest_by_entity_prefix("reg::");
+        rows.sort_by(|x, y| x.tenant_hash.cmp(&y.tenant_hash));
+        assert_eq!(rows.len(), 2, "reg::b fully deleted must vanish");
+        assert_eq!(
+            rows[0].fact_id, v1.fact_id,
+            "deleted latest falls back to prior live version"
+        );
+        assert_eq!(rows[0].value, "a-v1");
+        assert_eq!(rows[1].tenant_hash, "tenant-2");
+        assert_eq!(rows[1].value, "a-t2");
     }
 
     /// Backward-compat (agent-passport M1): a JSON fact written before the
