@@ -108,7 +108,7 @@ To understand what makes this tamper-evident, read these symbols in order:
 
 ## Build / test
 
-- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.61
+- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.62
   (`[workspace.package]` in `Cargo.toml` is authoritative, and
   `scripts/check-agent-docs.sh` fails the build when this line disagrees with it).
 - `cargo build --workspace --locked`
@@ -528,7 +528,7 @@ schema: crux-agent-manifest/v1
 summary: Local-first, tamper-evident retrieval + memory engine with signed, replayable receipts.
 msrv: "1.88.0"
 edition: "2021"
-workspace_version: "0.5.61"
+workspace_version: "0.5.62"
 
 verify_commands:
   - cargo test --workspace
@@ -4361,6 +4361,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.62] - 2026-08-19
+
+### Fixed
+
+- **The macOS release build compiles again.** Provenance retention is
+  deliberately disabled off Linux — it needs descriptor-anchored filesystem
+  operations — and the two `cfg(not(target_os = "linux"))` stubs return early
+  to do that. The early return left the rest of each function unreachable,
+  which `-D unreachable-code` rejected, so the aarch64-apple-darwin job failed
+  and v0.5.61 shipped without macOS binaries or provenance attestation.
+
+  Nothing functional changed on any platform; the lint allowances are scoped to
+  non-Linux, so the shipping Linux build keeps full strictness. macOS is only
+  compiled on `v*` tags, which is why this reached a release before anyone saw
+  it. (#722)
+
 ## [0.5.61] - 2026-08-19
 
 ### Security
@@ -5455,6 +5471,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-audit` CVE scanning in CI
 
 [unreleased]: https://github.com/CueCrux/Crux/compare/v0.5.59...HEAD
+[0.5.62]: https://github.com/CueCrux/Crux/compare/v0.5.61...v0.5.62
 [0.5.61]: https://github.com/CueCrux/Crux/compare/v0.5.59...v0.5.61
 [0.5.59]: https://github.com/CueCrux/Crux/compare/v0.5.58...v0.5.59
 [0.5.58]: https://github.com/CueCrux/Crux/compare/v0.5.57...v0.5.58
