@@ -25,7 +25,7 @@ mod console;
 mod consolidation_receipt;
 mod context_budget;
 mod context_surface;
-mod coord;
+pub(crate) mod coord;
 mod cost;
 mod credit_meter;
 mod dataplane;

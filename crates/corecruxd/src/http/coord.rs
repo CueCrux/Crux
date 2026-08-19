@@ -715,7 +715,7 @@ async fn open_plan_path_claims(state: &AppState) -> Vec<crate::coord::PlanPathCl
 ///
 /// Vendored and generated trees carry no authorship signal — two plans
 /// "sharing" a `node_modules` file tells you nothing — so they are dropped.
-fn extract_declared_paths(md: &str) -> Vec<String> {
+pub(crate) fn extract_declared_paths(md: &str) -> Vec<String> {
     const NOISE: &[&str] = &["node_modules/", "target/", "dist/", "build/", ".git/", "vendor/"];
     let mut out: Vec<String> = Vec::new();
     for token in md.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '`' | '"' | ',' | ';')) {
