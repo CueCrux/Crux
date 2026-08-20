@@ -405,10 +405,25 @@ pub struct CoordActiveView {
 /// Pure assembly of the active view — testable without HTTP or stores.
 ///
 /// `presence_by_passport` maps passport_id → last_seen_at_unix_ms.
-/// Sessions are included when their passport was seen within
-/// `presence_ttl_secs` AND (when `project_id` is given) their binding either
-/// matches the project or carries no project at all — a session that never
-/// declared a project is still a potential writer on the tree.
+/// Sessions are included when their binding's tenant is `tenant_id`, their
+/// passport was seen within `presence_ttl_secs`, AND (when `project_id` is
+/// given) their binding either matches the project or carries no project at
+/// all — a session that never declared a project is still a potential writer
+/// on the tree.
+///
+/// `tenant_id` is the caller's already-resolved authorization tenant, not a
+/// preference: it is a required `&str` rather than an `Option` so no caller can
+/// re-open the leak by forgetting to pass one. Intents and leases are joined
+/// off the surviving bindings (by `session_id_hex` and `passport_id`), so
+/// filtering bindings is what keeps another tenant's declared focus and held
+/// punchcards off this caller's board.
+///
+/// The filter is strict equality and therefore fails **closed**: a binding
+/// stamped with a tenant the caller cannot name is invisible to it, including
+/// when the caller is its own owner reading under a different label (session
+/// bindings default to the `personal` placeholder — `session_bindings::resolve`
+/// — while a token with no tenant claim resolves to `default`). An empty board
+/// is a visible, config-fixable symptom; a cross-tenant read is a silent one.
 #[allow(clippy::too_many_arguments)] // assembly point for five independent surfaces; a builder would obscure the join
 pub fn assemble_active(
     bindings: &[crate::session_bindings::SessionBinding],
@@ -416,6 +431,7 @@ pub fn assemble_active(
     intents: &[CoordIntent],
     leases: &[LeaseSummary],
     work_in_flight: Vec<crate::work::WorkItem>,
+    tenant_id: &str,
     project_id: Option<&str>,
     presence_ttl_secs: u64,
     now_unix_ms: u64,
@@ -423,6 +439,12 @@ pub fn assemble_active(
     let ttl_ms = presence_ttl_secs.saturating_mul(1000);
     let mut active_sessions = Vec::new();
     for b in bindings {
+        // Tenant authority first: everything below (presence, intent, leases)
+        // is a liveness question, and a session that belongs to another tenant
+        // must not be answered at all.
+        if b.tenant_id != tenant_id {
+            continue;
+        }
         let Some(&last_seen) = presence_by_passport.get(&b.passport_id) else {
             continue;
         };
@@ -490,10 +512,20 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn binding(session: &str, passport: &str, project: Option<&str>, bound_at: u64) -> SessionBinding {
+        binding_in_tenant(session, passport, project, bound_at, "personal")
+    }
+
+    fn binding_in_tenant(
+        session: &str,
+        passport: &str,
+        project: Option<&str>,
+        bound_at: u64,
+        tenant: &str,
+    ) -> SessionBinding {
         SessionBinding {
             session_id_hex: session.to_string(),
             project_id: project.map(str::to_string),
-            tenant_id: "personal".to_string(),
+            tenant_id: tenant.to_string(),
             passport_id: passport.to_string(),
             passport_category: "personal".to_string(),
             agent_work_gate: false,
@@ -558,6 +590,86 @@ mod tests {
     }
 
     #[test]
+    fn assemble_active_scopes_sessions_to_the_callers_tenant() {
+        // D4 residual: `assemble_active` used to ignore the caller's tenant
+        // entirely, so a tenant-A reader with admin:read received every
+        // tenant's live sessions — plus the intents and leases joined off
+        // them. Both sessions below share one passport on purpose: the filter
+        // must key on the binding's tenant, not on passport identity, or a
+        // passport bound in two tenants leaks straight back.
+        let now: u64 = 1_000_000;
+        let bindings = vec![
+            binding_in_tenant("aaaa", "shared-passport", None, now - 1_000, "tenant-a"),
+            binding_in_tenant("bbbb", "shared-passport", None, now - 1_000, "tenant-b"),
+        ];
+        let mut presence = BTreeMap::new();
+        presence.insert("shared-passport".to_string(), now - 1_000);
+        let intents = vec![
+            intent("aaaa", "plan-a", now + 100_000),
+            intent("bbbb", "plan-b-secret", now + 100_000),
+        ];
+        let leases = vec![lease("shared-passport", "tree://crates/corecruxd")];
+
+        let view = assemble_active(
+            &bindings,
+            &presence,
+            &intents,
+            &leases,
+            vec![],
+            "tenant-a",
+            None,
+            900,
+            now,
+        );
+        let ids: Vec<&str> = view.active_sessions.iter().map(|s| s.session_id_hex.as_str()).collect();
+        assert_eq!(ids, vec!["aaaa"], "tenant-b session must not surface: {ids:?}");
+        assert!(
+            view.active_sessions.iter().all(|s| s.tenant_id == "tenant-a"),
+            "every returned row must carry the caller's tenant"
+        );
+        let slugs: Vec<&str> = view
+            .active_sessions
+            .iter()
+            .filter_map(|s| s.intent.as_ref().and_then(|i| i.execplan_slug.as_deref()))
+            .collect();
+        assert_eq!(slugs, vec!["plan-a"], "tenant-b intent leaked: {slugs:?}");
+
+        // Symmetric: the tenant-b reader sees only its own row.
+        let view = assemble_active(
+            &bindings,
+            &presence,
+            &intents,
+            &leases,
+            vec![],
+            "tenant-b",
+            None,
+            900,
+            now,
+        );
+        let ids: Vec<&str> = view.active_sessions.iter().map(|s| s.session_id_hex.as_str()).collect();
+        assert_eq!(ids, vec!["bbbb"], "tenant-a session must not surface: {ids:?}");
+
+        // Fails closed: a tenant nobody is bound to gets an empty board, not
+        // everybody's board.
+        let view = assemble_active(
+            &bindings,
+            &presence,
+            &intents,
+            &leases,
+            vec![],
+            "tenant-c",
+            None,
+            900,
+            now,
+        );
+        assert!(
+            view.active_sessions.is_empty(),
+            "unknown tenant must see nothing, got {:?}",
+            view.active_sessions
+        );
+    }
+
+    #[test]
     fn assemble_filters_by_presence_ttl() {
         let now: u64 = 10_000_000;
         let bindings = vec![
@@ -567,7 +679,7 @@ mod tests {
         let mut presence = BTreeMap::new();
         presence.insert("p1".to_string(), now - 10_000); // 10s ago — live
         presence.insert("p2".to_string(), now - 2_000_000); // long gone (>15 min)
-        let view = assemble_active(&bindings, &presence, &[], &[], vec![], None, 900, now);
+        let view = assemble_active(&bindings, &presence, &[], &[], vec![], "personal", None, 900, now);
         assert_eq!(view.active_sessions.len(), 1);
         assert_eq!(view.active_sessions[0].session_id_hex, "aaaa");
         assert_eq!(view.active_sessions[0].active_until_unix_ms, now - 10_000 + 900_000);
@@ -577,7 +689,7 @@ mod tests {
     fn assemble_drops_sessions_with_no_presence_row() {
         let bindings = vec![binding("aaaa", "p1", None, 100)];
         let presence = BTreeMap::new();
-        let view = assemble_active(&bindings, &presence, &[], &[], vec![], None, 900, 1_000);
+        let view = assemble_active(&bindings, &presence, &[], &[], vec![], "personal", None, 900, 1_000);
         assert!(view.active_sessions.is_empty());
     }
 
@@ -593,7 +705,17 @@ mod tests {
         for p in ["p1", "p2", "p3"] {
             presence.insert(p.to_string(), now - 1_000);
         }
-        let view = assemble_active(&bindings, &presence, &[], &[], vec![], Some("proj"), 900, now);
+        let view = assemble_active(
+            &bindings,
+            &presence,
+            &[],
+            &[],
+            vec![],
+            "personal",
+            Some("proj"),
+            900,
+            now,
+        );
         let ids: Vec<&str> = view.active_sessions.iter().map(|s| s.session_id_hex.as_str()).collect();
         assert!(ids.contains(&"aaaa"), "project match kept");
         assert!(ids.contains(&"cccc"), "unscoped session kept");
@@ -615,7 +737,17 @@ mod tests {
             intent("bbbb", "expired-plan", now - 1), // expired — must not surface
         ];
         let leases = vec![lease("p1", "file://src/a.rs"), lease("p2", "tree://src/b")];
-        let view = assemble_active(&bindings, &presence, &intents, &leases, vec![], None, 900, now);
+        let view = assemble_active(
+            &bindings,
+            &presence,
+            &intents,
+            &leases,
+            vec![],
+            "personal",
+            None,
+            900,
+            now,
+        );
         let a = view
             .active_sessions
             .iter()
@@ -652,13 +784,13 @@ mod tests {
         let mut presence = BTreeMap::new();
         presence.insert("p1".to_string(), now - 1_000); // passport is live
                                                         // No intents: only the fresh boot shows.
-        let view = assemble_active(&bindings, &presence, &[], &[], vec![], None, 900, now);
+        let view = assemble_active(&bindings, &presence, &[], &[], vec![], "personal", None, 900, now);
         let ids: Vec<&str> = view.active_sessions.iter().map(|s| s.session_id_hex.as_str()).collect();
         assert_eq!(ids, vec!["fresh"], "stale bindings dropped: {ids:?}");
 
         // A live intent revives exactly that old session.
         let intents = vec![intent("old1", "still-working", now + 100_000)];
-        let view = assemble_active(&bindings, &presence, &intents, &[], vec![], None, 900, now);
+        let view = assemble_active(&bindings, &presence, &intents, &[], vec![], "personal", None, 900, now);
         let ids: Vec<&str> = view.active_sessions.iter().map(|s| s.session_id_hex.as_str()).collect();
         assert!(ids.contains(&"old1"), "live intent keeps old session: {ids:?}");
         assert!(!ids.contains(&"old2"), "intent-less old session still dropped");
@@ -772,7 +904,7 @@ mod tests {
         let mut presence = BTreeMap::new();
         presence.insert("p1".to_string(), now - 50_000);
         presence.insert("p2".to_string(), now - 1_000);
-        let view = assemble_active(&bindings, &presence, &[], &[], vec![], None, 900, now);
+        let view = assemble_active(&bindings, &presence, &[], &[], vec![], "personal", None, 900, now);
         assert_eq!(view.active_sessions[0].session_id_hex, "bbbb");
     }
 }
