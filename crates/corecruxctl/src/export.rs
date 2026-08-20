@@ -43,6 +43,7 @@
 use std::path::{Path, PathBuf};
 
 use corecrux_memory::cruxpack::PrivateSummary;
+use corecrux_receipts::{evaluate_signer_pin_v1, ExpectedSignerV1, SignerPinOutcomeV1};
 use crux_session::passport::LocalPassportKey;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde_json::Value;
@@ -108,6 +109,13 @@ pub struct ContextVerifyReport {
     pub audit_bundle_hash_match: bool,
     pub cruxpack_verify_ok: bool,
     pub audit_verify_ok: bool,
+    /// Whether the manifest's and the cruxpack's signer were checked against a
+    /// caller-supplied expected key, and what that check said (play03 D2).
+    pub signer_pin: SignerPinOutcomeV1,
+    /// What a reader is entitled to conclude. `UNPINNED — trust unproven` when
+    /// no expected key was supplied: every check below is self-referential,
+    /// verified against the key the bundle itself carries.
+    pub trust_label: String,
     pub failures: Vec<String>,
 }
 
@@ -175,7 +183,7 @@ pub fn run_context_export(
     //    pins what the audit half verified to right now).
     let cruxpack_blake3 = blake3_file(&cruxpack_path)?;
     let audit_bundle_blake3 = blake3_file(&audit_bundle_path)?;
-    let audit_verify = audit_export::run_audit_verify(&audit_bundle_path, None)?;
+    let audit_verify = audit_export::run_audit_verify(&audit_bundle_path, None, None)?;
     let audit_verify_ok = audit_verify.ok;
 
     // 4) passport-sign the deterministic binding → the custody proof.
@@ -291,7 +299,25 @@ fn component_blake3<'a>(manifest: &'a Value, name: &str) -> Result<&'a str, BoxE
 /// passport signature, the per-component blake3 hashes (so a swapped file is
 /// caught even though the signature commits to the recorded hash), the cruxpack
 /// self-verification, and re-runs audit-verify.
-pub fn run_context_verify(bundle_dir: &Path) -> Result<ContextVerifyReport, BoxErr> {
+///
+/// Every one of those checks is self-referential: they verify the bundle
+/// against the key the bundle carries. Someone who edits the bundle and
+/// re-signs it with their own passport passes all of them. `expected` is the
+/// answer to that (play03 D2): supply the passport public key the bundle should
+/// have come from and a bundle signed by anyone else is refused, on both the
+/// custody manifest *and* the cruxpack, which carry independent signatures and
+/// must agree. Supply nothing and the verdict is unchanged but relabelled
+/// `UNPINNED — trust unproven`, because it is a consistency result, not a
+/// custody result.
+///
+/// The nested audit bundle is *not* pinned to `expected`: it is signed by the
+/// audit-export key, a different identity from the passport
+/// (`CRUX_EXPORT_VERIFY_PUBLIC_KEY_HEX` pins that one, on the audit-verify
+/// surfaces).
+pub fn run_context_verify(
+    bundle_dir: &Path,
+    expected: Option<&ExpectedSignerV1>,
+) -> Result<ContextVerifyReport, BoxErr> {
     let manifest_raw = std::fs::read(bundle_dir.join(MANIFEST_FILE))?;
     let manifest: Value = serde_json::from_slice(&manifest_raw)?;
     let mut failures: Vec<String> = Vec::new();
@@ -350,13 +376,14 @@ pub fn run_context_verify(bundle_dir: &Path) -> Result<ContextVerifyReport, BoxE
     }
 
     // 3) cruxpack self-verifies (its own content hash + signature).
-    let cruxpack_verify_ok = memory_pack::read_and_verify_pack(&bundle_dir.join(MEMORY_PACK_FILE)).is_ok();
+    let verified_pack = memory_pack::read_and_verify_pack(&bundle_dir.join(MEMORY_PACK_FILE)).ok();
+    let cruxpack_verify_ok = verified_pack.is_some();
     if !cruxpack_verify_ok {
         failures.push("memory.cruxpack failed its own verification".to_string());
     }
 
     // 4) independently re-run audit-verify (don't trust the embedded result).
-    let audit_verify_ok = match audit_export::run_audit_verify(&bundle_dir.join(AUDIT_BUNDLE_FILE), None) {
+    let audit_verify_ok = match audit_export::run_audit_verify(&bundle_dir.join(AUDIT_BUNDLE_FILE), None, None) {
         Ok(report) => report.ok,
         Err(_) => false,
     };
@@ -364,7 +391,49 @@ pub fn run_context_verify(bundle_dir: &Path) -> Result<ContextVerifyReport, BoxE
         failures.push("audit-bundle.tar.zst failed offline audit-verify".to_string());
     }
 
-    let ok = cruxpack_hash_match && audit_bundle_hash_match && signature_valid && cruxpack_verify_ok && audit_verify_ok;
+    // 5) identity: is the signer the one the caller expected? Both signatures
+    //    in the bundle are checked, because a bundle whose manifest and pack
+    //    disagree on issuer is not one custody story.
+    let manifest_pin = evaluate_signer_pin_v1(expected, &hex::decode(pub_hex).unwrap_or_default());
+    if manifest_pin.is_mismatch() {
+        failures.push(format!(
+            "{MANIFEST_FILE} was signed by {pub_hex}, not the expected signer {}",
+            expected.map(ExpectedSignerV1::to_hex).unwrap_or_default()
+        ));
+    }
+    let pack_pin = match &verified_pack {
+        Some(pack) => {
+            let outcome = evaluate_signer_pin_v1(
+                expected,
+                &hex::decode(&pack.manifest.public_key_hex).unwrap_or_default(),
+            );
+            if outcome.is_mismatch() {
+                failures.push(format!(
+                    "{MEMORY_PACK_FILE} was signed by {}, not the expected signer {}",
+                    pack.manifest.public_key_hex,
+                    expected.map(ExpectedSignerV1::to_hex).unwrap_or_default()
+                ));
+            }
+            outcome
+        }
+        // The pack could not be verified at all, so its issuer is unknown; the
+        // manifest verdict is the only identity statement available.
+        None => manifest_pin,
+    };
+    let signer_pin = if manifest_pin.is_mismatch() || pack_pin.is_mismatch() {
+        SignerPinOutcomeV1::Mismatch
+    } else if manifest_pin.is_pinned() && pack_pin.is_pinned() {
+        SignerPinOutcomeV1::Pinned
+    } else {
+        SignerPinOutcomeV1::Unpinned
+    };
+
+    let ok = cruxpack_hash_match
+        && audit_bundle_hash_match
+        && signature_valid
+        && cruxpack_verify_ok
+        && audit_verify_ok
+        && !signer_pin.is_mismatch();
 
     Ok(ContextVerifyReport {
         ok,
@@ -374,6 +443,8 @@ pub fn run_context_verify(bundle_dir: &Path) -> Result<ContextVerifyReport, BoxE
         audit_bundle_hash_match,
         cruxpack_verify_ok,
         audit_verify_ok,
+        signer_pin,
+        trust_label: signer_pin.label().to_string(),
         failures,
     })
 }
@@ -445,12 +516,66 @@ mod tests {
         assert!(!pack_raw.contains("private-value-stays-home"), "private value leaked");
 
         // The custody proof verifies offline, on every axis.
-        let v = run_context_verify(&bundle).expect("verify");
+        let v = run_context_verify(&bundle, None).expect("verify");
         assert!(v.ok, "freshly exported bundle must verify: {v:?}");
         assert!(v.signature_valid);
         assert!(v.cruxpack_hash_match && v.audit_bundle_hash_match);
         assert!(v.cruxpack_verify_ok && v.audit_verify_ok);
         assert!(!v.passport_fpr.is_empty());
+        // ...but unpinned, so the verdict is labelled as unproven trust.
+        assert_eq!(v.signer_pin, SignerPinOutcomeV1::Unpinned);
+        assert_eq!(v.trust_label, corecrux_receipts::EXPORT_TRUST_UNPINNED_LABEL);
+    }
+
+    /// play03 D2 — the whole point of the pin. Nothing about the bundle is
+    /// tampered; it is simply not from the issuer the caller expected, and
+    /// every self-referential check still passes. Unpinned it reads green.
+    #[test]
+    fn a_bundle_from_an_unexpected_signer_is_refused_when_pinned() {
+        let data = tempfile::tempdir().expect("data");
+        seed(data.path());
+        let out = tempfile::tempdir().expect("out");
+        let bundle = out.path().join("bundle");
+        export_to(&bundle, data.path());
+
+        assert!(
+            run_context_verify(&bundle, None).expect("verify").ok,
+            "unpinned verification cannot tell issuers apart"
+        );
+
+        let other = ExpectedSignerV1::from_hex(&"cd".repeat(32)).expect("pin");
+        let v = run_context_verify(&bundle, Some(&other)).expect("verify runs");
+        assert!(!v.ok, "a bundle from an unexpected issuer must not verify green");
+        assert_eq!(v.signer_pin, SignerPinOutcomeV1::Mismatch);
+        assert_eq!(v.trust_label, corecrux_receipts::EXPORT_TRUST_MISMATCH_LABEL);
+        assert!(
+            v.failures.iter().any(|f| f.contains("expected signer")),
+            "failures must name the identity mismatch: {:?}",
+            v.failures
+        );
+        // The self-referential checks are untouched — only identity failed.
+        assert!(v.signature_valid && v.cruxpack_hash_match && v.audit_bundle_hash_match);
+    }
+
+    /// Pinning the passport that actually signed the bundle verifies green and
+    /// says the identity was checked.
+    #[test]
+    fn pinning_the_exporting_passport_verifies_and_reports_pinned() {
+        let data = tempfile::tempdir().expect("data");
+        seed(data.path());
+        let out = tempfile::tempdir().expect("out");
+        let bundle = out.path().join("bundle");
+        export_to(&bundle, data.path());
+
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(bundle.join(MANIFEST_FILE)).expect("read")).expect("parse");
+        let pub_hex = manifest["signature"]["public_key_hex"].as_str().expect("pubkey");
+        let pin = ExpectedSignerV1::from_hex(pub_hex).expect("pin");
+
+        let v = run_context_verify(&bundle, Some(&pin)).expect("verify");
+        assert!(v.ok, "the real issuer must verify: {v:?}");
+        assert_eq!(v.signer_pin, SignerPinOutcomeV1::Pinned);
+        assert_eq!(v.trust_label, corecrux_receipts::EXPORT_TRUST_PINNED_LABEL);
     }
 
     #[test]
@@ -468,7 +593,7 @@ mod tests {
         raw[mid] = raw[mid].wrapping_add(1);
         std::fs::write(&p, raw).expect("write");
 
-        let v = run_context_verify(&bundle).expect("verify runs");
+        let v = run_context_verify(&bundle, None).expect("verify runs");
         assert!(!v.ok, "tampered bundle must not verify");
         assert!(!v.audit_bundle_hash_match, "hash mismatch must be detected");
         assert!(!v.failures.is_empty());
@@ -489,7 +614,7 @@ mod tests {
         manifest["signature"]["passport_fpr"] = Value::String("forged-fpr".into());
         std::fs::write(&mp, serde_json::to_vec_pretty(&manifest).expect("ser")).expect("write");
 
-        let v = run_context_verify(&bundle).expect("verify runs");
+        let v = run_context_verify(&bundle, None).expect("verify runs");
         assert!(!v.signature_valid, "altered signed field must break the signature");
         assert!(!v.ok);
     }

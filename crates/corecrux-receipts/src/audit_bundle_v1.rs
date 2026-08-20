@@ -36,6 +36,8 @@ use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::audit_signing_key::{AUDIT_EXPORT_SIGNING_KEY_ENV, AUDIT_EXPORT_SIGNING_KEY_FILENAME};
+use crate::export_identity_v1::{evaluate_signer_pin_v1, ExpectedSignerError, ExpectedSignerV1, SignerPinOutcomeV1};
 use crate::witness_v1::{
     verify_rekor_checkpoint, verify_witness_binding_v1, verify_witness_proof_v1, WitnessLogPublicKeyV1, WitnessProofV1,
 };
@@ -118,6 +120,14 @@ pub enum AuditBundleError {
     InvalidPubKeyLen(usize),
     #[error("invalid signature length: expected 64 bytes, got {0}")]
     InvalidSigLen(usize),
+    #[error(
+        "refusing to build an audit bundle signed with an ephemeral key: a throwaway signer proves nothing to a \
+         verifier. Set {AUDIT_EXPORT_SIGNING_KEY_ENV}, or give the exporter a data directory so a stable \
+         `{AUDIT_EXPORT_SIGNING_KEY_FILENAME}` identity is generated once and reused"
+    )]
+    EphemeralSigningKeyRefused,
+    #[error("expected signer pin is unusable: {0}")]
+    ExpectedSigner(#[from] ExpectedSignerError),
 }
 
 /// A single fact-event in the exported bundle. Mirrors the shape returned
@@ -348,7 +358,18 @@ fn write_tar_entry<W: Write>(builder: &mut tar::Builder<W>, path: &str, bytes: &
 
 /// Build (frame + sign) a bundle. Does NOT write to disk — the caller
 /// chooses how to persist (file, in-memory buffer for HTTP streaming, etc).
+///
+/// Refuses [`AuditBundleKeyClassV1::Ephemeral`] (play03 D2). The resolver in
+/// `audit_signing_key` already refuses to *mint* a throwaway key, and this is
+/// the second half of the same guarantee: no caller can hand-assemble an
+/// ephemeral-class bundle by supplying its own one-shot key. The variant stays
+/// in the enum because bundles exported before this refusal must still parse
+/// and verify.
 pub fn build_bundle_v1(input: BuildBundleInputV1<'_>) -> Result<BuiltBundleV1, AuditBundleError> {
+    if input.key_class == AuditBundleKeyClassV1::Ephemeral {
+        return Err(AuditBundleError::EphemeralSigningKeyRefused);
+    }
+
     let mut events_jsonl: Vec<u8> = Vec::new();
     for ev in &input.events {
         serde_json::to_writer(&mut events_jsonl, ev)?;
@@ -436,6 +457,18 @@ pub struct VerifyReportV1 {
     /// that mode inclusion is checked but root endorsement is not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub witness_root_endorsed: Option<bool>,
+    /// Base64 (standard, padded) Ed25519 public key embedded in the manifest:
+    /// the issuer identity this report was computed against, and the value a
+    /// caller pins on the next verify.
+    pub signer_public_key_b64: String,
+    /// Result of checking the embedded signer against a caller-supplied
+    /// expected key (play03 D2). `unpinned` means no pin was available, so
+    /// nothing about the artifact's *origin* was proven.
+    pub signer_pin: SignerPinOutcomeV1,
+    /// What a reader is entitled to conclude from this report. Carries the
+    /// `UNPINNED — trust unproven` relabel when `signer_pin` is `unpinned`, so
+    /// a self-attesting pass is never read as proof of custody.
+    pub trust_label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
 }
@@ -471,6 +504,15 @@ fn decode_all_bounded(compressed: &[u8], max_bytes: u64) -> Result<Vec<u8>, Audi
 ///
 /// Any failure short-circuits with `ok=false` and a populated
 /// `failure_reason`.
+///
+/// Step 4 proves the manifest is *internally consistent*, not who produced it:
+/// the key it verifies against travels inside the artifact. The expected-signer
+/// pin ([`verify_bundle_pinned_v1`]) is what turns that into a statement about
+/// origin. This entry point takes the pin from
+/// [`EXPORT_VERIFY_PUBLIC_KEY_ENV`](crate::EXPORT_VERIFY_PUBLIC_KEY_ENV) so
+/// existing callers gain pinning from operator configuration alone; with the
+/// variable unset the report is unchanged except for the
+/// `UNPINNED — trust unproven` relabel.
 pub fn verify_bundle_v1(tar_zst_bytes: &[u8]) -> Result<VerifyReportV1, AuditBundleError> {
     verify_bundle_with_trust_roots_v1(tar_zst_bytes, None)
 }
@@ -480,9 +522,33 @@ pub fn verify_bundle_v1(tar_zst_bytes: &[u8]) -> Result<VerifyReportV1, AuditBun
 /// (Ed25519 for self-hosted logs, ECDSA P-256 for public-good Rekor) — proving
 /// the tree root is the one the log operator signed (the trust root), not merely
 /// internally consistent. Without a key, root endorsement is `None` (not checked).
+///
+/// Takes the expected-signer pin from the environment, like
+/// [`verify_bundle_v1`].
 pub fn verify_bundle_with_trust_roots_v1(
     tar_zst_bytes: &[u8],
     log_key: Option<&WitnessLogPublicKeyV1>,
+) -> Result<VerifyReportV1, AuditBundleError> {
+    let expected = ExpectedSignerV1::from_env()?;
+    verify_bundle_pinned_v1(tar_zst_bytes, log_key, expected.as_ref())
+}
+
+/// Like [`verify_bundle_with_trust_roots_v1`], but with the expected signer
+/// supplied explicitly instead of read from the environment.
+///
+/// `expected = Some(key)` refuses `ok = true` for any bundle whose embedded
+/// `signer_public_key_b64` is a different key, which is what defeats the
+/// edit-then-re-sign attack that a self-attesting verifier waves through.
+/// `expected = None` keeps today's verdict and labels it
+/// [`EXPORT_TRUST_UNPINNED_LABEL`](crate::EXPORT_TRUST_UNPINNED_LABEL).
+///
+/// The pin is evaluated before the content-hash checks: an artifact from an
+/// unexpected issuer is rejected on identity, not on whatever else happens to
+/// be wrong with it.
+pub fn verify_bundle_pinned_v1(
+    tar_zst_bytes: &[u8],
+    log_key: Option<&WitnessLogPublicKeyV1>,
+    expected: Option<&ExpectedSignerV1>,
 ) -> Result<VerifyReportV1, AuditBundleError> {
     let decoded = decode_all_bounded(tar_zst_bytes, MAX_DECOMPRESSED_BUNDLE_BYTES)?;
     let mut archive = tar::Archive::new(decoded.as_slice());
@@ -522,6 +588,42 @@ pub fn verify_bundle_with_trust_roots_v1(
         return Err(AuditBundleError::MissingField("key_class"));
     }
 
+    // Identity first (play03 D2): decode the embedded issuer key and settle the
+    // expected-signer pin before spending any work on the artifact's contents.
+    // A bundle from an unexpected issuer is rejected for being the wrong
+    // issuer, not for whatever else may also be wrong with it.
+    let pubkey_bytes = base64::engine::general_purpose::STANDARD.decode(&manifest.signer_public_key_b64)?;
+    if pubkey_bytes.len() != 32 {
+        return Err(AuditBundleError::InvalidPubKeyLen(pubkey_bytes.len()));
+    }
+    let mut pubkey_arr = [0u8; 32];
+    pubkey_arr.copy_from_slice(&pubkey_bytes);
+    let signer_pin = evaluate_signer_pin_v1(expected, &pubkey_bytes);
+    if signer_pin.is_mismatch() {
+        return Ok(VerifyReportV1 {
+            ok: false,
+            bundle_format_version: manifest.bundle_format_version,
+            bundle_id: manifest.bundle_id,
+            fact_count: manifest.fact_count,
+            receipt_count: manifest.receipt_count,
+            events_jsonl_sha256_match: false,
+            receipts_cbor_sha256_match: false,
+            signature_valid: false,
+            witness_proof_count: manifest.witness_proof_count,
+            witness_proofs_sha256_match: false,
+            witness_proofs_valid: false,
+            witness_root_endorsed: None,
+            signer_public_key_b64: manifest.signer_public_key_b64,
+            signer_pin,
+            trust_label: signer_pin.label().to_string(),
+            failure_reason: Some(format!(
+                "bundle was signed by {} but the expected signer is {}",
+                hex::encode(pubkey_arr),
+                expected.map(ExpectedSignerV1::to_hex).unwrap_or_default()
+            )),
+        });
+    }
+
     let events_hash = hex_sha256(&events);
     let receipts_hash = hex_sha256(&receipts);
     let events_match = events_hash == manifest.events_jsonl_sha256;
@@ -541,6 +643,9 @@ pub fn verify_bundle_with_trust_roots_v1(
             witness_proofs_sha256_match: false,
             witness_proofs_valid: false,
             witness_root_endorsed: None,
+            signer_public_key_b64: manifest.signer_public_key_b64,
+            signer_pin,
+            trust_label: signer_pin.label().to_string(),
             failure_reason: Some(format!(
                 "{EVENTS_FILENAME} sha256 mismatch: expected {}, got {}",
                 manifest.events_jsonl_sha256, events_hash
@@ -561,6 +666,9 @@ pub fn verify_bundle_with_trust_roots_v1(
             witness_proofs_sha256_match: false,
             witness_proofs_valid: false,
             witness_root_endorsed: None,
+            signer_public_key_b64: manifest.signer_public_key_b64,
+            signer_pin,
+            trust_label: signer_pin.label().to_string(),
             failure_reason: Some(format!(
                 "{RECEIPTS_FILENAME} sha256 mismatch: expected {}, got {}",
                 manifest.receipts_cbor_sha256, receipts_hash
@@ -568,12 +676,6 @@ pub fn verify_bundle_with_trust_roots_v1(
         });
     }
 
-    let pubkey_bytes = base64::engine::general_purpose::STANDARD.decode(&manifest.signer_public_key_b64)?;
-    if pubkey_bytes.len() != 32 {
-        return Err(AuditBundleError::InvalidPubKeyLen(pubkey_bytes.len()));
-    }
-    let mut pubkey_arr = [0u8; 32];
-    pubkey_arr.copy_from_slice(&pubkey_bytes);
     let verifying = VerifyingKey::from_bytes(&pubkey_arr)?;
 
     let sig_bytes = base64::engine::general_purpose::STANDARD.decode(&manifest.signature_b64)?;
@@ -600,6 +702,9 @@ pub fn verify_bundle_with_trust_roots_v1(
             witness_proofs_sha256_match: false,
             witness_proofs_valid: false,
             witness_root_endorsed: None,
+            signer_public_key_b64: manifest.signer_public_key_b64,
+            signer_pin,
+            trust_label: signer_pin.label().to_string(),
             failure_reason: Some("manifest signature failed Ed25519 verification".to_string()),
         });
     }
@@ -622,6 +727,9 @@ pub fn verify_bundle_with_trust_roots_v1(
         witness_proofs_sha256_match: witness_sha_match,
         witness_proofs_valid: witness_valid,
         witness_root_endorsed: witness_endorsed,
+        signer_public_key_b64: manifest.signer_public_key_b64,
+        signer_pin,
+        trust_label: signer_pin.label().to_string(),
         failure_reason: witness_failure,
     })
 }
@@ -930,6 +1038,96 @@ mod tests {
         let report = verify_bundle_v1(&tar_bytes).expect("verify");
         assert!(!report.ok, "key provenance is signed and must not be mutable");
         assert!(!report.signature_valid);
+    }
+
+    /// play03 D2, red-before-green: on unpatched code `build_bundle_v1` signs
+    /// happily with a throwaway key and the result verifies `ok = true`. An
+    /// export nobody can pin is not evidence, so the builder refuses it.
+    #[test]
+    fn ephemeral_key_class_export_is_refused() {
+        let mut input = sample_input();
+        input.key_class = AuditBundleKeyClassV1::Ephemeral;
+        let Err(err) = build_bundle_v1(input) else {
+            panic!("ephemeral-signed export must be refused");
+        };
+        assert!(matches!(err, AuditBundleError::EphemeralSigningKeyRefused));
+        assert!(err.to_string().contains(AUDIT_EXPORT_SIGNING_KEY_ENV));
+    }
+
+    /// The attack the pin exists for: edit the archive, re-sign the manifest
+    /// with a key you made a moment ago, and every self-attesting check passes.
+    /// Unpinned it still reports `ok = true` (relabelled); pinned it is refused.
+    #[test]
+    fn attacker_resigned_export_passes_unpinned_but_is_refused_when_pinned() {
+        let honest_key = sample_signing_key();
+        let attacker_key = SigningKey::from_bytes(&[0x99; 32]);
+
+        let mut input = sample_input();
+        input.events[0].value = "attacker-rewrote-this".to_string();
+        input.signing_key = Box::leak(Box::new(attacker_key.clone()));
+        let forged = build_bundle_v1(input).expect("build");
+        let mut tar_bytes = Vec::new();
+        forged.write_tar_zst(&mut tar_bytes).expect("frame");
+
+        // Unpinned: internally consistent, so it still passes — but the label
+        // says the trust question was never asked.
+        let unpinned = verify_bundle_pinned_v1(&tar_bytes, None, None).expect("verify");
+        assert!(unpinned.ok, "self-consistency check should still pass");
+        assert_eq!(unpinned.signer_pin, SignerPinOutcomeV1::Unpinned);
+        assert_eq!(unpinned.trust_label, crate::EXPORT_TRUST_UNPINNED_LABEL);
+
+        // Pinned to the honest issuer: refused.
+        let pin = ExpectedSignerV1::from_hex(&hex::encode(honest_key.verifying_key().to_bytes())).expect("pin");
+        let pinned = verify_bundle_pinned_v1(&tar_bytes, None, Some(&pin)).expect("verify");
+        assert!(!pinned.ok, "a bundle from an unexpected issuer must not verify green");
+        assert_eq!(pinned.signer_pin, SignerPinOutcomeV1::Mismatch);
+        assert_eq!(pinned.trust_label, crate::EXPORT_TRUST_MISMATCH_LABEL);
+        assert!(pinned.failure_reason.expect("reason").contains("expected signer"));
+    }
+
+    #[test]
+    fn pinning_the_real_issuer_verifies_and_says_so() {
+        let built = build_bundle_v1(sample_input()).expect("build");
+        let mut tar_bytes = Vec::new();
+        built.write_tar_zst(&mut tar_bytes).expect("frame");
+
+        let pin =
+            ExpectedSignerV1::from_hex(&hex::encode(sample_signing_key().verifying_key().to_bytes())).expect("pin");
+        let report = verify_bundle_pinned_v1(&tar_bytes, None, Some(&pin)).expect("verify");
+        assert!(report.ok);
+        assert_eq!(report.signer_pin, SignerPinOutcomeV1::Pinned);
+        assert_eq!(report.trust_label, crate::EXPORT_TRUST_PINNED_LABEL);
+        // The report hands back the issuer key so an operator can pin it.
+        assert_eq!(
+            report.signer_public_key_b64,
+            base64::engine::general_purpose::STANDARD.encode(sample_signing_key().verifying_key().to_bytes())
+        );
+    }
+
+    #[test]
+    fn a_pin_mismatch_is_reported_before_content_tampering() {
+        // Identity is settled first: a bundle from the wrong issuer fails on
+        // the pin even when its own content hashes are broken too.
+        let built = build_bundle_v1(sample_input()).expect("build");
+        let mut tampered_events = built.events_jsonl.clone();
+        tampered_events[0] = tampered_events[0].wrapping_add(1);
+
+        let mut tar_bytes: Vec<u8> = Vec::new();
+        {
+            let zstd_enc = zstd::stream::write::Encoder::new(&mut tar_bytes, 3)
+                .expect("zstd")
+                .auto_finish();
+            let mut builder = tar::Builder::new(zstd_enc);
+            write_tar_entry(&mut builder, MANIFEST_FILENAME, &built.manifest_json).expect("manifest");
+            write_tar_entry(&mut builder, EVENTS_FILENAME, &tampered_events).expect("events");
+            write_tar_entry(&mut builder, RECEIPTS_FILENAME, &built.receipts_cbor).expect("receipts");
+            builder.finish().expect("finish");
+        }
+
+        let other = ExpectedSignerV1::from_hex(&"ab".repeat(32)).expect("pin");
+        let report = verify_bundle_pinned_v1(&tar_bytes, None, Some(&other)).expect("verify");
+        assert!(!report.ok);
+        assert_eq!(report.signer_pin, SignerPinOutcomeV1::Mismatch);
     }
 
     #[test]

@@ -45,11 +45,17 @@ The signed manifest fields are:
 `bundle_format_version` is `3` for new bundles. `key_class` is one of
 `persistent`, `env`, or `ephemeral`: `persistent` means the issuer key was
 generated once and stored owner-only in the daemon data directory; `env` means
-the operator supplied `CORECRUXD_AUDIT_EXPORT_SIGNING_KEY_B64`; and `ephemeral`
-is the fallback only when no data directory is available. The embedded
+the operator supplied `CORECRUXD_AUDIT_EXPORT_SIGNING_KEY_B64`. The embedded
 `signer_public_key_b64` remains the key used for offline cryptographic
 verification; `key_class` records signed provenance rather than replacing that
 check.
+
+`ephemeral` is **read-only**: writers refuse to produce it (play03 D2). A key
+minted for the length of one export cannot be pinned by any verifier and cannot
+tie two exports to one issuer, so an ephemeral-signed bundle is a signature
+without an identity. `resolve_audit_export_signing_key` and `build_bundle_v1`
+both reject it; the variant remains in the schema so bundles written before that
+refusal still parse and verify.
 
 Compatibility is fail-closed and version-specific: v1 uses declaration-order
 compact JSON without a domain tag; v2 uses recursively key-sorted compact JSON
@@ -104,6 +110,30 @@ A conforming verifier must:
 7. Verify the signature over the canonical manifest signing bytes.
 
 `ok=true` only when all checks pass.
+
+### Signer identity (pinning)
+
+Steps 5-7 verify the bundle against the key the bundle itself carries. That
+proves internal consistency, not origin: an edited bundle re-signed with a
+newly generated key passes all of them. Identity is therefore a separate,
+caller-supplied check rather than a format rule, and the verifiers in this
+workspace report it as `signer_pin` — the result of comparing
+`signer_public_key_b64` against an expected signer the caller supplies out of
+band:
+
+| `signer_pin` | Meaning | Effect on `ok` |
+|---|---|---|
+| `pinned` | The embedded signer is the expected key. | unchanged |
+| `unpinned` | No expected key was supplied. | unchanged |
+| `mismatch` | The embedded signer is a different key. | forced to `false` |
+
+The pin comes from `--expect-pubkey-hex` / `?expect_pubkey_hex=` where the
+surface offers one, otherwise from `CRUX_EXPORT_VERIFY_PUBLIC_KEY_HEX` — the
+audit-export signer. (`corecruxctl context verify` pins the daemon *passport*
+instead, from `CRUX_CONTEXT_VERIFY_PASSPORT_HEX`; the two identities are
+different keys.) An `unpinned` report carries `trust_label` = `internally
+consistent, UNPINNED — trust unproven`, so a green verdict is not read as proof
+of custody.
 
 ## Conformance Vectors
 

@@ -23,6 +23,7 @@ mod candidate_digest_v1;
 mod chain_reanchor_v1;
 mod cose_sign1_v1;
 mod crypto_shred_v1;
+mod export_identity_v1;
 mod export_v1;
 mod forget_v1;
 mod identity_v1;
@@ -43,10 +44,10 @@ pub use approval_decision_v1::{
     APPROVAL_DECISION_KIND_V1,
 };
 pub use audit_bundle_v1::{
-    build_bundle_v1, decode_receipts_cbor, verify_bundle_v1, verify_bundle_with_trust_roots_v1, AuditBundleError,
-    AuditBundleKeyClassV1, AuditBundleManifestV1, AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1,
-    BuildBundleInputV1, BuiltBundleV1, VerifyReportV1, BUNDLE_FORMAT_VERSION, EVENTS_FILENAME, MANIFEST_FILENAME,
-    RECEIPTS_FILENAME,
+    build_bundle_v1, decode_receipts_cbor, verify_bundle_pinned_v1, verify_bundle_v1,
+    verify_bundle_with_trust_roots_v1, AuditBundleError, AuditBundleKeyClassV1, AuditBundleManifestV1,
+    AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1, BuildBundleInputV1, BuiltBundleV1, VerifyReportV1,
+    BUNDLE_FORMAT_VERSION, EVENTS_FILENAME, MANIFEST_FILENAME, RECEIPTS_FILENAME,
 };
 pub use audit_gap_v1::{
     assert_chain_reanchor_kind_v1, assert_consolidation_kind_v1, assert_coverage_attestation_kind_v1,
@@ -95,6 +96,11 @@ pub use crypto_shred_v1::{
     CryptoShredError, CryptoShredSealInputV1, CRYPTO_SHRED_DESTROY_ATTESTED_STATE_V1,
     CRYPTO_SHRED_DESTROY_MARKER_SCHEMA_V1, CRYPTO_SHRED_DESTROY_REQUESTED_STATE_V1, CRYPTO_SHRED_ENVELOPE_SCHEMA_V1,
     CRYPTO_SHRED_METHOD_V1,
+};
+pub use export_identity_v1::{
+    evaluate_signer_pin_v1, export_identity_posture_v1, ExpectedSignerError, ExpectedSignerV1, ExportIdentityPostureV1,
+    SignerPinOutcomeV1, CONTEXT_VERIFY_PASSPORT_KEY_ENV, EXPORT_TRUST_MISMATCH_LABEL, EXPORT_TRUST_PINNED_LABEL,
+    EXPORT_TRUST_UNPINNED_LABEL, EXPORT_VERIFY_PUBLIC_KEY_ENV,
 };
 pub use export_v1::{
     build_receipt_export_v1, BuildReceiptExportInput, ExportError, ExportFileV1, ExportFormatV1, ExportRedactionV1,

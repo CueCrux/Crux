@@ -334,6 +334,16 @@ mod tests {
         crate::test_env_lock()
     }
 
+    /// Deterministic 32-byte export signer for tests that actually build a
+    /// bundle. Required since play03 D2: an `McpContext` with no `data_dir`
+    /// used to fall back to a throwaway key, and now refuses.
+    const TEST_SIGNER_SECRET: [u8; 32] = [0x5a; 32];
+
+    fn test_signer_b64() -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(TEST_SIGNER_SECRET)
+    }
+
     struct FeatureFlagGuard {
         _lock: tokio::sync::MutexGuard<'static, ()>,
     }
@@ -344,6 +354,14 @@ mod tests {
             env::remove_var(SIGNING_KEY_ID_ENV);
             env::set_var(FEATURE_FLAG_ENV, "1");
             Self { _lock: lock }
+        }
+
+        /// `enabled()` plus a configured export signer — the shape any caller
+        /// that means to produce a verifiable bundle must now be in.
+        async fn enabled_with_signer() -> Self {
+            let guard = Self::enabled().await;
+            env::set_var(SIGNING_KEY_ENV, test_signer_b64());
+            guard
         }
         async fn disabled() -> Self {
             let lock = flag_lock().lock().await;
@@ -410,7 +428,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_export_builds_self_verifying_bundle() {
-        let _g = FeatureFlagGuard::enabled().await;
+        let _g = FeatureFlagGuard::enabled_with_signer().await;
         let td = tempfile::tempdir().unwrap();
         redirect_export_dir(&td);
 
@@ -435,7 +453,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_export_strips_reserved_prefixes_for_non_operator() {
-        let _g = FeatureFlagGuard::enabled().await;
+        let _g = FeatureFlagGuard::enabled_with_signer().await;
         let td = tempfile::tempdir().unwrap();
         redirect_export_dir(&td);
 
@@ -483,7 +501,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_export_operator_sees_reserved_when_requested() {
-        let _g = FeatureFlagGuard::enabled().await;
+        let _g = FeatureFlagGuard::enabled_with_signer().await;
         let td = tempfile::tempdir().unwrap();
         redirect_export_dir(&td);
 
@@ -505,7 +523,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_export_respects_since_until_window() {
-        let _g = FeatureFlagGuard::enabled().await;
+        let _g = FeatureFlagGuard::enabled_with_signer().await;
         let td = tempfile::tempdir().unwrap();
         redirect_export_dir(&td);
 
@@ -523,7 +541,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_export_manifest_round_trips() {
-        let _g = FeatureFlagGuard::enabled().await;
+        let _g = FeatureFlagGuard::enabled_with_signer().await;
         let td = tempfile::tempdir().unwrap();
         redirect_export_dir(&td);
 
@@ -563,7 +581,7 @@ mod tests {
                 assert_eq!(m.bundle_format_version, corecrux_receipts::BUNDLE_FORMAT_VERSION);
                 assert_eq!(m.fact_count, 1);
                 assert_eq!(m.receipt_count, 1);
-                assert_eq!(m.key_class, Some(corecrux_receipts::AuditBundleKeyClassV1::Ephemeral));
+                assert_eq!(m.key_class, Some(corecrux_receipts::AuditBundleKeyClassV1::Env));
                 assert!(!m.signature_b64.is_empty());
             }
         }
@@ -619,5 +637,56 @@ mod tests {
             .unwrap(),
             persistent.signing_key.to_bytes()
         );
+    }
+
+    /// play03 D2, red-before-green: this context has no `data_dir` and no
+    /// configured signer, which is exactly the shape that used to mint a
+    /// one-shot key and hand back a bundle that verifies green. The export is
+    /// now refused, and the error names the two ways to configure a real
+    /// issuer.
+    #[tokio::test]
+    async fn audit_export_refuses_an_ephemeral_signing_key() {
+        let _g = FeatureFlagGuard::enabled().await;
+        let td = tempfile::tempdir().unwrap();
+        redirect_export_dir(&td);
+
+        let ctx = agent_ctx("alice");
+        handle_store_fact(&json!({"entity": "p", "key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap();
+
+        let err = handle_audit_export_bundle(&json!({"token_budget": 1000}), &ctx)
+            .await
+            .expect_err("an export with no durable signer identity must be refused");
+        assert_eq!(err.code, INTERNAL_ERROR);
+        assert!(
+            err.message.contains(SIGNING_KEY_ENV),
+            "refusal must name the remedy, got: {}",
+            err.message
+        );
+        assert!(err.message.contains("data directory"), "got: {}", err.message);
+    }
+
+    /// The refusal is not "no key at all" — a configured signer still exports.
+    #[tokio::test]
+    async fn audit_export_succeeds_once_a_signer_is_configured() {
+        let _g = FeatureFlagGuard::enabled_with_signer().await;
+        let td = tempfile::tempdir().unwrap();
+        redirect_export_dir(&td);
+
+        let ctx = agent_ctx("alice");
+        handle_store_fact(&json!({"entity": "p", "key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap();
+
+        let resp = handle_audit_export_bundle(&json!({"token_budget": 1000}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(resp["key_class"], "env");
+        let raw = std::fs::read(resp["bytes_path"].as_str().unwrap()).unwrap();
+        let report = verify_bundle_v1(&raw).unwrap();
+        assert!(report.ok);
+        // Unpinned by default: the pass is a consistency result, not a custody one.
+        assert_eq!(report.trust_label, corecrux_receipts::EXPORT_TRUST_UNPINNED_LABEL);
     }
 }

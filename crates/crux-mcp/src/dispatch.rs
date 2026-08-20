@@ -1102,6 +1102,12 @@ mod tests {
         let _guard = envelope_env_lock().lock().await;
         std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
         std::env::set_var(crate::tools::audit_export::FEATURE_FLAG_ENV, "1");
+        // An export needs a durable signer identity since play03 D2; this
+        // context has no data_dir, so configure the env signer.
+        std::env::set_var(
+            crate::tools::audit_export::SIGNING_KEY_ENV,
+            base64::engine::general_purpose::STANDARD.encode([0x5a_u8; 32]),
+        );
         let td = tempfile::tempdir().unwrap();
         std::env::set_var(crate::tools::audit_export::EXPORT_DIR_ENV, td.path());
 
@@ -1151,6 +1157,7 @@ mod tests {
 
         std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
         std::env::remove_var(crate::tools::audit_export::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::tools::audit_export::SIGNING_KEY_ENV);
         std::env::remove_var(crate::tools::audit_export::EXPORT_DIR_ENV);
     }
 
