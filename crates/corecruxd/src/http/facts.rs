@@ -218,6 +218,23 @@ fn prepare_fact_write_checked(
 ) -> Result<corecrux_memory::fact_store::StoreFact, Response> {
     // Never trust a client-supplied tenant stamp; derive it from auth context.
     fact.tenant_hash = tenant_hash_for_write_context(ctx)?;
+    // Durable authorship (agent-passport M1) for the HTTP write plane. The MCP
+    // `store_fact` path stamps `actor` from a resolved passport; HTTP never did,
+    // so every `/v1/facts` and `/v1/facts/bulk` write landed with `actor = null`
+    // — including `corecruxctl code-health harvest --push`, which is what failed
+    // `gate:M4` of ExecPlan `crux-code-minimalism-profile-and-engram-2026-07-16`.
+    //
+    // Derived from the verified bearer token, never from the request body, for
+    // the same reason `tenant_hash` is above: a caller must not be able to
+    // self-attribute a fact to another principal.
+    //
+    // No feature flag. `HttpScopeContext::passport_id` is `Some` only when the
+    // verified JWT carried a canonical non-empty `passport_id` claim, so a
+    // deployment that issues no passports still writes `actor = None` — the
+    // pre-change behaviour, byte for byte. The MCP path needs its
+    // `CORECRUXD_AGENT_PASSPORTS` gate because it *resolves* an agent token-name
+    // to a passport through a map; HTTP has no such inference to gate.
+    fact.actor.clone_from(&ctx.passport_id);
     if let Some(prefix) = crate::fact_privacy::generic_create_reserved_entity_prefix(&fact.entity) {
         return Err(ProblemResponse(
             ProblemDetails::forbidden(format!("entity uses create-reserved prefix `{prefix}`")).with_extensions(
