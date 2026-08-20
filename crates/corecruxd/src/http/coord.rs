@@ -178,6 +178,7 @@ pub(super) async fn get_coord_active(
         &intents,
         &leases,
         work_in_flight,
+        &tenant_id,
         q.project_id.as_deref(),
         state.coord_presence_ttl_secs,
         now,
@@ -320,7 +321,21 @@ mod tests {
 
     /// Bind a session + touch presence so the active view has a live row.
     async fn seed_live_session(state: &AppState, session: &str, project: &str) {
-        {
+        seed_live_session_in_tenant(state, session, project, None).await;
+    }
+
+    /// As [`seed_live_session`], but stamps an explicit tenant on the binding
+    /// and heartbeats whichever passport that tenant's category resolves to
+    /// (`None` keeps the `personal` placeholder that `session_bindings::resolve`
+    /// defaults to). Returns the bound passport so callers can assert on the
+    /// passport-level joins.
+    async fn seed_live_session_in_tenant(
+        state: &AppState,
+        session: &str,
+        project: &str,
+        tenant: Option<&str>,
+    ) -> String {
+        let passport_id = {
             let mut store = state.fact_store.write().await;
             crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed passports");
             let binding = crate::session_bindings::resolve(
@@ -328,18 +343,17 @@ mod tests {
                 crate::session_bindings::ResolveInput {
                     session_id_hex: session,
                     project_id: Some(project.to_string()),
-                    tenant_id: None,
+                    tenant_id: tenant.map(str::to_string),
                     passport_id: None,
                     now_unix_ms: now_unix_ms(),
                 },
             )
             .expect("resolve binding");
             crate::session_bindings::write_binding(&mut store, &binding).expect("write binding");
-        }
-        state
-            .presence
-            .touch("personal-default", "POST", "/v1/coord/announce")
-            .await;
+            binding.passport_id
+        };
+        state.presence.touch(&passport_id, "POST", "/v1/coord/announce").await;
+        passport_id
     }
 
     #[tokio::test]
@@ -391,7 +405,7 @@ mod tests {
             StateExtract(state.clone()),
             Query(ActiveQuery {
                 project_id: Some("proj".to_string()),
-                tenant_id: None,
+                tenant_id: Some("personal".to_string()),
             }),
             HeaderMap::new(),
         )
@@ -492,7 +506,7 @@ mod tests {
             StateExtract(state.clone()),
             QueryExtract(ActiveQuery {
                 project_id: Some("proj".to_string()),
-                tenant_id: None,
+                tenant_id: Some("personal".to_string()),
             }),
             HeaderMap::new(),
         )
@@ -514,7 +528,7 @@ mod tests {
             StateExtract(state),
             QueryExtract(ActiveQuery {
                 project_id: Some("other".to_string()),
-                tenant_id: None,
+                tenant_id: Some("personal".to_string()),
             }),
             HeaderMap::new(),
         )
@@ -522,6 +536,74 @@ mod tests {
         .into_response();
         let view = body_json(resp).await;
         assert_eq!(view["active_sessions"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[tokio::test]
+    async fn coord_active_never_returns_another_tenants_sessions() {
+        // D4 (play03 M4) end-to-end: before the `assemble_active` tenant
+        // filter, a tenant-A caller holding admin:read got every tenant's live
+        // sessions and their declared focus. Both sessions here deliberately
+        // resolve to the SAME passport (both tenants classify as `work`), so a
+        // passport-level filter would still leak — only the binding's tenant
+        // separates them.
+        let state = test_app_state(1);
+        let pa = seed_live_session_in_tenant(&state, "aaaa", "proj", Some("tenant-a")).await;
+        let pb = seed_live_session_in_tenant(&state, "bbbb", "proj", Some("tenant-b")).await;
+        assert_eq!(pa, pb, "test only bites if both tenants share one passport");
+
+        for (session, slug) in [("aaaa", "plan-a"), ("bbbb", "plan-b-secret")] {
+            let mut body = announce_body(session, "proj");
+            body.by_passport = None;
+            body.execplan_slug = Some(slug.to_string());
+            let resp = post_coord_announce(StateExtract(state.clone()), HeaderMap::new(), JsonExtract(body))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::OK, "announce {session}");
+        }
+
+        let view_for = |tenant: &str| {
+            let state = state.clone();
+            let tenant = tenant.to_string();
+            async move {
+                let resp = get_coord_active(
+                    StateExtract(state),
+                    QueryExtract(ActiveQuery {
+                        project_id: Some("proj".to_string()),
+                        tenant_id: Some(tenant),
+                    }),
+                    HeaderMap::new(),
+                )
+                .await
+                .into_response();
+                assert_eq!(resp.status(), StatusCode::OK);
+                body_json(resp).await
+            }
+        };
+
+        let a = view_for("tenant-a").await;
+        let sessions = a["active_sessions"].as_array().expect("sessions array");
+        assert_eq!(sessions.len(), 1, "tenant-a must see exactly its own session: {a}");
+        assert_eq!(sessions[0]["session_id_hex"], "aaaa");
+        assert_eq!(sessions[0]["tenant_id"], "tenant-a");
+        assert_eq!(sessions[0]["intent"]["execplan_slug"], "plan-a");
+        assert!(
+            !serde_json::to_string(&a).expect("serialize").contains("plan-b-secret"),
+            "tenant-b intent leaked into the tenant-a board: {a}"
+        );
+
+        let b = view_for("tenant-b").await;
+        let sessions = b["active_sessions"].as_array().expect("sessions array");
+        assert_eq!(sessions.len(), 1, "tenant-b must see exactly its own session: {b}");
+        assert_eq!(sessions[0]["session_id_hex"], "bbbb");
+        assert_eq!(sessions[0]["tenant_id"], "tenant-b");
+
+        // A third tenant is shown nothing rather than everything.
+        let c = view_for("tenant-c").await;
+        assert_eq!(
+            c["active_sessions"].as_array().map(Vec::len),
+            Some(0),
+            "unknown tenant must fail closed: {c}"
+        );
     }
 
     #[tokio::test]
@@ -541,7 +623,7 @@ mod tests {
             StateExtract(state),
             QueryExtract(ActiveQuery {
                 project_id: Some("proj".to_string()),
-                tenant_id: None,
+                tenant_id: Some("personal".to_string()),
             }),
             HeaderMap::new(),
         )
@@ -589,7 +671,7 @@ mod tests {
             StateExtract(state),
             QueryExtract(ActiveQuery {
                 project_id: Some("proj".to_string()),
-                tenant_id: None,
+                tenant_id: Some("personal".to_string()),
             }),
             HeaderMap::new(),
         )
