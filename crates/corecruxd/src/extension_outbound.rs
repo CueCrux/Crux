@@ -26,6 +26,11 @@
 //! 9. Validates the response shape and any `fact_writes[]` against the
 //!    grant's `allowed_prefixes_write`. Out-of-scope writes are dropped
 //!    + warning-logged; the caller still gets the `result` payload.
+//! 10. Stamps the call's [`PackAttribution`] — extension id + version +
+//!     install-time `manifest_hash` — onto the returned [`DispatchOutcome`]
+//!     and onto the audit event, so the receipt names the exact pack build
+//!     and the HTTP layer can reuse it as the `Fact.actor` of every write
+//!     this call persists.
 //!
 //! ## Why a transport trait
 //!
@@ -34,6 +39,7 @@
 //! Production binds to [`UreqTransport`], matching the in-tree
 //! `cuecrux_session` pattern that already uses ureq via spawn_blocking.
 
+use crate::extension_registry::PackAttribution;
 use crux_integrations::{
     append_audit_event, ExternalToolDefinition, IntegrationAuditEvent, IntegrationManifest, AUDIT_EXTENSION_INVOKE_OK,
     AUDIT_EXTENSION_INVOKE_REJECTED, AUDIT_SUPPRESSED,
@@ -286,6 +292,10 @@ fn default_confidence() -> f32 {
 #[derive(Debug, Clone, Serialize)]
 pub struct DispatchOutcome {
     pub result: serde_json::Value,
+    /// Which pack build produced this outcome. The receipt half of the M5
+    /// attribution seam; its [`PackAttribution::actor`] is what the caller
+    /// stamps on the facts it persists from `fact_writes[]`.
+    pub attribution: PackAttribution,
     pub accepted_fact_writes: usize,
     pub dropped_fact_writes: usize,
     /// Drop reasons by index in the original `fact_writes[]` array.
@@ -379,6 +389,10 @@ pub fn dispatch_external_tool(
     config: &OutboundConfig,
     data_dir: &Path,
     manifest: &IntegrationManifest,
+    // Built by the caller from the registry record ([`PackAttribution::from_installed`]),
+    // never recomputed from `manifest`: attribution has to name the bytes the
+    // operator installed, not whatever a manifest presented later claims.
+    attribution: &PackAttribution,
     grant: &crate::extension_grants::ExtensionGrant,
     tool_name: &str,
     args: &serde_json::Value,
@@ -391,6 +405,7 @@ pub fn dispatch_external_tool(
         rate_table,
         config,
         manifest,
+        attribution,
         grant,
         tool_name,
         args,
@@ -398,7 +413,15 @@ pub fn dispatch_external_tool(
         request_id,
         auth_secret_resolved,
     );
-    audit_dispatch_result(data_dir, rate_table, manifest, tool_name, calling_passport_fpr, &result);
+    audit_dispatch_result(
+        data_dir,
+        rate_table,
+        manifest,
+        attribution,
+        tool_name,
+        calling_passport_fpr,
+        &result,
+    );
     result
 }
 
@@ -408,6 +431,7 @@ fn dispatch_external_tool_inner(
     rate_table: &RateTable,
     config: &OutboundConfig,
     manifest: &IntegrationManifest,
+    attribution: &PackAttribution,
     grant: &crate::extension_grants::ExtensionGrant,
     tool_name: &str,
     args: &serde_json::Value,
@@ -530,6 +554,7 @@ fn dispatch_external_tool_inner(
     }
     let outcome = DispatchOutcome {
         result: parsed.result.clone(),
+        attribution: attribution.clone(),
         accepted_fact_writes: accepted,
         dropped_fact_writes: parsed.fact_writes.len() - accepted,
         drop_reasons,
@@ -540,10 +565,48 @@ fn dispatch_external_tool_inner(
     Ok((outcome, parsed))
 }
 
+/// Stage the in-scope `fact_writes[]` of a completed dispatch as
+/// [`StoreFact`](corecrux_memory::fact_store::StoreFact)s, each stamped with the calling pack's
+/// [`PackAttribution::actor`].
+///
+/// The HTTP layer used to re-implement the grant/privacy filter inline
+/// while persisting, which meant the "is this write in scope" rule lived in
+/// two places and the attribution would have had to be derived a second
+/// time. Deriving it once — here, from the outcome the dispatcher already
+/// stamped — is what keeps a stored fact's `actor` and the receipt's
+/// `attribution` provably the same value.
+///
+/// Callers still run the fact-privacy gate over each result before storing;
+/// this function only decides scope and authorship.
+pub fn attributed_fact_writes(
+    parsed: &ExternalToolResponse,
+    grant: &crate::extension_grants::ExtensionGrant,
+    attribution: &PackAttribution,
+) -> Vec<corecrux_memory::fact_store::StoreFact> {
+    let actor = attribution.actor();
+    parsed
+        .fact_writes
+        .iter()
+        .filter(|w| write_allowed_by_grant(&grant.allowed_prefixes_write, &w.entity))
+        .map(|w| corecrux_memory::fact_store::StoreFact {
+            tenant_hash: corecrux_memory::fact_store::default_tenant_hash(),
+            entity: w.entity.clone(),
+            key: w.key.clone(),
+            value: w.value.clone(),
+            source_receipt: None,
+            confidence: w.confidence,
+            private: false,
+            horizon_class: None,
+            actor: Some(actor.clone()),
+        })
+        .collect()
+}
+
 fn audit_dispatch_result(
     data_dir: &Path,
     rate_table: &RateTable,
     manifest: &IntegrationManifest,
+    attribution: &PackAttribution,
     tool_name: &str,
     calling_passport_fpr: &str,
     result: &Result<(DispatchOutcome, ExternalToolResponse), OutboundError>,
@@ -560,7 +623,7 @@ fn audit_dispatch_result(
                 &manifest.id,
                 Some(&manifest.version),
                 "ok",
-                serde_json::json!({ "tool_name": tool_name }),
+                serde_json::json!({ "tool_name": tool_name, "manifest_hash": attribution.manifest_hash }),
             ),
             Err(error) => IntegrationAuditEvent::extension(
                 now_unix_ms,
@@ -571,6 +634,7 @@ fn audit_dispatch_result(
                 "rejected",
                 serde_json::json!({
                     "tool_name": tool_name,
+                    "manifest_hash": attribution.manifest_hash,
                     "reason": error.audit_reason(),
                 }),
             ),
@@ -660,6 +724,18 @@ mod tests {
     };
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+
+    /// Stand-in for the install-time `manifest_hash` the registry record
+    /// carries; the dispatcher treats it as opaque, so the tests only need a
+    /// value with the real `blake3:` shape.
+    const TEST_MANIFEST_HASH: &str = "blake3:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+
+    /// The attribution the HTTP layer builds from the install record. Tests
+    /// mint it from the fixture manifest so the id/version halves stay in
+    /// step with whatever manifest the case dispatches.
+    fn attribution_for(manifest: &IntegrationManifest) -> PackAttribution {
+        PackAttribution::new(&manifest.id, &manifest.version, TEST_MANIFEST_HASH)
+    }
 
     fn audit_dir() -> &'static Path {
         static AUDIT_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
@@ -775,6 +851,7 @@ mod tests {
             &cfg,
             audit_dir(),
             &m,
+            &attribution_for(&m),
             &g,
             "quote.daily",
             &serde_json::json!({}),
@@ -802,6 +879,7 @@ mod tests {
             &OutboundConfig::default(),
             audit_dir(),
             &m,
+            &attribution_for(&m),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
             &serde_json::json!({}),
@@ -827,6 +905,7 @@ mod tests {
             &OutboundConfig::default(),
             audit_dir(),
             &m,
+            &attribution_for(&m),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
             &serde_json::json!({}),
@@ -851,6 +930,7 @@ mod tests {
             &OutboundConfig::default(),
             audit_dir(),
             &m,
+            &attribution_for(&m),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
             &serde_json::json!({}),
@@ -896,6 +976,7 @@ mod tests {
             &cfg,
             audit_dir(),
             &manifest("ext.example.quote"),
+            &attribution_for(&manifest("ext.example.quote")),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
             &serde_json::json!({}),
@@ -929,6 +1010,7 @@ mod tests {
             &OutboundConfig::default(),
             audit_dir(),
             &manifest("ext.example.quote"),
+            &attribution_for(&manifest("ext.example.quote")),
             &grant("ext.example.quote", "p_alice"),
             "quote.unknown",
             &serde_json::json!({}),
@@ -949,10 +1031,12 @@ mod tests {
             &OutboundConfig::default(),
             audit_dir(),
             &manifest("ext.example.quote"),
+            &attribution_for(&manifest("ext.example.quote")),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
             &serde_json::json!({}),
-            "p_bob", // <-- mismatch
+            "p_bob",
+            // <-- mismatch
             "req-004",
             None,
         )
@@ -971,6 +1055,7 @@ mod tests {
             &OutboundConfig::default(),
             audit_dir(),
             &manifest("ext.example.quote"),
+            &attribution_for(&manifest("ext.example.quote")),
             &g,
             "quote.daily",
             &serde_json::json!({}),
@@ -1000,6 +1085,7 @@ mod tests {
                 &cfg,
                 audit_dir(),
                 &m,
+                &attribution_for(&m),
                 &g,
                 "quote.daily",
                 &serde_json::json!({}),
@@ -1015,6 +1101,7 @@ mod tests {
             &cfg,
             audit_dir(),
             &m,
+            &attribution_for(&m),
             &g,
             "quote.daily",
             &serde_json::json!({}),
@@ -1037,6 +1124,7 @@ mod tests {
             &OutboundConfig::default(),
             audit_dir(),
             &m,
+            &attribution_for(&m),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
             &serde_json::json!({}),
@@ -1059,6 +1147,7 @@ mod tests {
             &cfg,
             audit_dir(),
             &m,
+            &attribution_for(&m),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
             &serde_json::json!({}),
@@ -1081,6 +1170,7 @@ mod tests {
             &OutboundConfig::default(),
             audit_dir(),
             &manifest("ext.example.quote"),
+            &attribution_for(&manifest("ext.example.quote")),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
             &serde_json::json!({}),
@@ -1104,6 +1194,7 @@ mod tests {
             &OutboundConfig::default(),
             audit_dir(),
             &manifest("ext.example.quote"),
+            &attribution_for(&manifest("ext.example.quote")),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
             &serde_json::json!({}),
@@ -1129,6 +1220,7 @@ mod tests {
             &cfg,
             audit_dir(),
             &manifest("ext.example.quote"),
+            &attribution_for(&manifest("ext.example.quote")),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
             &serde_json::json!({}),
@@ -1157,6 +1249,7 @@ mod tests {
             &cfg,
             audit_dir(),
             &m,
+            &attribution_for(&m),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
             &serde_json::json!({}),
@@ -1188,6 +1281,7 @@ mod tests {
             &cfg,
             audit_dir(),
             &m,
+            &attribution_for(&m),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
             &serde_json::json!({}),
@@ -1222,6 +1316,7 @@ mod tests {
             &cfg,
             audit_dir(),
             &m,
+            &attribution_for(&m),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
             &serde_json::json!({}),
@@ -1254,6 +1349,7 @@ mod tests {
             &cfg,
             audit_dir(),
             &m,
+            &attribution_for(&m),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
             &serde_json::json!({}),
@@ -1277,6 +1373,7 @@ mod tests {
             &OutboundConfig::default(),
             audit_dir(),
             &manifest("ext.example.quote"),
+            &attribution_for(&manifest("ext.example.quote")),
             &grant("ext.example.quote", "p_alice"),
             "quote.daily",
             &serde_json::json!({}),
@@ -1304,6 +1401,7 @@ mod tests {
             &OutboundConfig::default(),
             dir.path(),
             &manifest,
+            &attribution_for(&manifest),
             &grant,
             "quote.daily",
             &serde_json::json!({"secret": "must-not-be-audited"}),
@@ -1318,6 +1416,7 @@ mod tests {
             &OutboundConfig::default(),
             dir.path(),
             &manifest,
+            &attribution_for(&manifest),
             &grant,
             "quote.undeclared",
             &serde_json::json!({"secret": "also-not-audited"}),
@@ -1357,6 +1456,7 @@ mod tests {
                 &OutboundConfig::default(),
                 dir.path(),
                 &manifest,
+                &attribution_for(&manifest),
                 &grant,
                 "quote.daily",
                 &serde_json::json!({}),
@@ -1384,5 +1484,131 @@ mod tests {
             markers[0].detail.as_ref().and_then(|detail| detail.get("count")),
             Some(&serde_json::json!(1))
         );
+    }
+
+    /// M5 attribution seam, receipt half: the outcome the operator (and the
+    /// storage path) reads names the exact pack build that produced it.
+    #[test]
+    fn dispatch_outcome_carries_pack_attribution() {
+        let transport = MockTransport::new(vec![happy_response()]);
+        let m = manifest("ext.example.quote");
+        let g = grant("ext.example.quote", "p_alice");
+        let (outcome, _) = dispatch_external_tool(
+            &transport,
+            &RateTable::new(),
+            &OutboundConfig::default(),
+            audit_dir(),
+            &m,
+            &attribution_for(&m),
+            &g,
+            "quote.daily",
+            &serde_json::json!({}),
+            "p_alice",
+            "req-attribution",
+            None,
+        )
+        .expect("dispatch");
+
+        assert_eq!(outcome.attribution.extension_id, "ext.example.quote");
+        assert_eq!(outcome.attribution.extension_version, "0.1.0");
+        assert_eq!(outcome.attribution.manifest_hash, TEST_MANIFEST_HASH);
+        assert_eq!(
+            outcome.attribution.actor(),
+            format!("pack:ext.example.quote@0.1.0#{TEST_MANIFEST_HASH}")
+        );
+    }
+
+    /// Tool-call half: the audit tail records the manifest hash, so a call
+    /// can be tied to a pack build even when it produced no fact at all —
+    /// including on the rejected path, which never yields an outcome.
+    #[test]
+    fn invoke_audit_events_carry_the_manifest_hash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rates = RateTable::new();
+        let transport = MockTransport::new(vec![happy_response()]);
+        let m = manifest("ext.example.attributed");
+        let g = grant("ext.example.attributed", "p_alice");
+
+        dispatch_external_tool(
+            &transport,
+            &rates,
+            &OutboundConfig::default(),
+            dir.path(),
+            &m,
+            &attribution_for(&m),
+            &g,
+            "quote.daily",
+            &serde_json::json!({}),
+            "p_alice",
+            "req-attrib-ok",
+            None,
+        )
+        .expect("ok");
+        dispatch_external_tool(
+            &transport,
+            &rates,
+            &OutboundConfig::default(),
+            dir.path(),
+            &m,
+            &attribution_for(&m),
+            &g,
+            "quote.undeclared",
+            &serde_json::json!({}),
+            "p_alice",
+            "req-attrib-rejected",
+            None,
+        )
+        .expect_err("rejected");
+
+        let audit = crux_integrations::read_audit_tail(dir.path(), 50).expect("audit");
+        assert_eq!(audit.len(), 2);
+        for event in &audit {
+            assert_eq!(event.pack_id, "ext.example.attributed");
+            assert_eq!(event.version, "0.1.0");
+            assert_eq!(
+                event.detail.as_ref().and_then(|detail| detail.get("manifest_hash")),
+                Some(&serde_json::json!(TEST_MANIFEST_HASH)),
+                "action {} must name the pack build",
+                event.action
+            );
+        }
+    }
+
+    /// Storage half: every write this call persists is stamped, and the
+    /// stamp is the same one the receipt reports. Out-of-scope writes stay
+    /// dropped — attribution does not widen the grant.
+    #[test]
+    fn attributed_fact_writes_stamp_actor_and_keep_dropping_out_of_scope() {
+        let g = grant("ext.example.quote", "p_alice");
+        let attribution = PackAttribution::new("ext.example.quote", "0.1.0", TEST_MANIFEST_HASH);
+        let parsed = ExternalToolResponse {
+            result: serde_json::json!({}),
+            fact_writes: vec![
+                ProposedFactWrite {
+                    entity: "personal::quotes::today".into(),
+                    key: "content".into(),
+                    value: "Roses are red".into(),
+                    confidence: 0.9,
+                },
+                ProposedFactWrite {
+                    entity: "somewhere::else".into(),
+                    key: "content".into(),
+                    value: "out of scope".into(),
+                    confidence: 1.0,
+                },
+                ProposedFactWrite {
+                    entity: "__extension__::sneaky".into(),
+                    key: "record".into(),
+                    value: "privacy-gated namespace".into(),
+                    confidence: 1.0,
+                },
+            ],
+        };
+
+        let staged = attributed_fact_writes(&parsed, &g, &attribution);
+        assert_eq!(staged.len(), 1, "only the in-scope write survives");
+        assert_eq!(staged[0].entity, "personal::quotes::today");
+        assert!((staged[0].confidence - 0.9).abs() < f32::EPSILON);
+        assert_eq!(staged[0].actor.as_deref(), Some(attribution.actor().as_str()));
     }
 }

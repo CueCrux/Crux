@@ -64,6 +64,7 @@ use wasmtime::{
 };
 
 use super::extension_grants::ExtensionGrant;
+use super::extension_registry::PackAttribution;
 
 /// Per-call resource limits. Defaults are safe for trivial tools; a
 /// future "Pro" extension type may want to widen them, but defaulting
@@ -350,6 +351,11 @@ impl Drop for WasmEngine {
 #[derive(Debug, Clone, Serialize)]
 pub struct WasmDispatchOutcome {
     pub result: serde_json::Value,
+    /// Which pack build produced this outcome — `None` only on the
+    /// foundation entry point [`dispatch_wasm_tool`], which runs raw module
+    /// bytes with no installed record behind them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<PackAttribution>,
     pub elapsed_ms: u64,
     pub fuel_consumed: u64,
     pub log: Vec<HostLogEntry>,
@@ -384,6 +390,9 @@ pub struct WasmCallContext<'a> {
     pub calling_passport_id: &'a str,
     pub request_id: &'a str,
     pub extension_id: &'a str,
+    /// Pack build behind this call. Owned rather than borrowed because it
+    /// ends up on the outcome, which outlives the borrowed context.
+    pub attribution: Option<PackAttribution>,
     pub grant: Option<Arc<ExtensionGrant>>,
     pub fact_store: Option<Arc<dyn HostFactStore>>,
 }
@@ -415,6 +424,7 @@ pub fn dispatch_wasm_tool(
             calling_passport_id,
             request_id,
             extension_id: "",
+            attribution: None,
             grant: None,
             fact_store: None,
         },
@@ -528,6 +538,7 @@ pub fn dispatch_wasm_tool_with_context(
     Ok((
         WasmDispatchOutcome {
             result: response.result.clone(),
+            attribution: ctx.attribution,
             elapsed_ms: elapsed.as_millis() as u64,
             fuel_consumed,
             log,
@@ -1311,6 +1322,7 @@ mod tests {
                 calling_passport_id: "p_test",
                 request_id: "req-1",
                 extension_id: "ext.test",
+                attribution: None,
                 grant,
                 fact_store: store,
             },

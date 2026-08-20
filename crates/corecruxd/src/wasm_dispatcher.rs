@@ -30,6 +30,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 use crate::extension_grants::ExtensionGrant;
+use crate::extension_registry::PackAttribution;
 use crate::wasm_host::{
     dispatch_wasm_tool_with_context, HostFact, HostFactQuery, HostFactStore, HostStoreFact, WasmCallContext,
     WasmConfig, WasmDispatchOutcome, WasmEngine, WasmError,
@@ -88,6 +89,9 @@ pub async fn dispatch_wasm_via_http(
     fact_store: Arc<RwLock<FactStore>>,
     extension_id: String,
     manifest: IntegrationManifest,
+    // Built by the caller from the registry record — see
+    // [`PackAttribution::from_installed`] for why it is not recomputed here.
+    attribution: PackAttribution,
     grant: ExtensionGrant,
     tool_name: String,
     args: serde_json::Value,
@@ -128,8 +132,13 @@ pub async fn dispatch_wasm_via_http(
         });
     }
 
+    // A wasm pack never returns `fact_writes[]` for the caller to persist —
+    // it writes through the host ABI mid-call — so the attribution has to be
+    // baked into the adapter the module writes through, not applied
+    // afterwards the way the external-tool path does it.
     let adapter: Arc<dyn HostFactStore> = Arc::new(WasmFactStoreAdapter {
         store: Arc::clone(&fact_store),
+        pack_actor: attribution.actor(),
     });
     let grant_arc = Arc::new(grant);
 
@@ -146,6 +155,7 @@ pub async fn dispatch_wasm_via_http(
                 calling_passport_id: &calling_passport_id,
                 request_id: &request_id,
                 extension_id: &extension_id,
+                attribution: Some(attribution),
                 grant: Some(grant_arc),
                 fact_store: Some(adapter),
             },
@@ -163,6 +173,9 @@ pub async fn dispatch_wasm_via_http(
 /// the `tokio::sync::RwLock::blocking_{read,write}` calls are valid.
 pub struct WasmFactStoreAdapter {
     pub store: Arc<RwLock<FactStore>>,
+    /// [`PackAttribution::actor`] of the pack build this call is running,
+    /// stamped on every fact the module stores through the host ABI.
+    pub pack_actor: String,
 }
 
 impl HostFactStore for WasmFactStoreAdapter {
@@ -195,7 +208,7 @@ impl HostFactStore for WasmFactStoreAdapter {
             confidence: req.confidence,
             private: false,
             horizon_class: None,
-            actor: None,
+            actor: Some(self.pack_actor.clone()),
         };
         // Final belt-and-braces: even if the grant allowed the prefix,
         // privacy gate has the last word over private prefixes.
