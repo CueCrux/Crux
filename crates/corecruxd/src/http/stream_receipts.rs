@@ -1178,6 +1178,162 @@ mod tests {
         assert!(missing.is_none());
     }
 
+    /// D3 (play03-custody-coord-remediation-2026-07 M1): the receipt this
+    /// daemon minted for the `local` tenant must not verify when someone
+    /// asks for it as another tenant's.
+    ///
+    /// This is the shape the dataplane branch of
+    /// `get_receipt_verification_v1` takes: the tenant comes off the query
+    /// string, not the receipt. Before the binding it was echoed straight
+    /// into the report and the verdict was a clean `OK`, so a genuine
+    /// keyring-signed receipt could be presented under any tenant label.
+    /// The material here is the daemon's own, read back off disk.
+    #[test]
+    fn minted_stream_receipt_does_not_verify_under_a_foreign_tenant() {
+        use base64::Engine as _;
+        use corecrux_receipts::{
+            verify_receipt_v1, Ed25519KeyEntryV1, Ed25519KeyRingV1, ReceiptSigV1, VerifyReceiptInput,
+        };
+
+        let state = signing_state();
+        let minted = mint_stream_receipt(&state, "operator", &injected_draft()).expect("mint");
+        let record = read_mediation_records(&state, "s-1")
+            .into_iter()
+            .find(|r| r.payload["receipt_id"] == minted.receipt_id)
+            .expect("minted record on disk");
+
+        let body_bytes = hex::decode(record.payload["body_cbor_hex"].as_str().expect("hex")).expect("decode body");
+        let body_hash = corecrux_frame::compute_payload_hash(&body_bytes);
+        let sig = &record.payload["sig"];
+        let sig_envelope = ReceiptSigV1 {
+            schema: sig["schema"].as_str().expect("schema").to_string(),
+            receipt_id: minted.receipt_id.clone(),
+            alg: sig["alg"].as_str().expect("alg").to_string(),
+            key_id: sig["key_id"].as_str().expect("key_id").to_string(),
+            signed_at: sig["signed_at"].as_str().expect("signed_at").to_string(),
+            signature: hex::decode(sig["signature_hex"].as_str().expect("sig hex")).expect("decode sig"),
+            signed_payload_hash: body_hash.to_vec(),
+        };
+        let mut sig_bytes = Vec::new();
+        ciborium::ser::into_writer(&sig_envelope, &mut sig_bytes).expect("encode envelope");
+        let public_key: [u8; 32] = hex::decode(&state.passport_public_key_hex)
+            .expect("hex")
+            .try_into()
+            .expect("32 bytes");
+        let keyring = Ed25519KeyRingV1 {
+            v: 1,
+            keys: vec![Ed25519KeyEntryV1 {
+                key_id: sig_envelope.key_id.clone(),
+                pub_key_base64: base64::engine::general_purpose::STANDARD.encode(public_key),
+            }],
+        };
+        let verify_as = |tenant: &str| {
+            verify_receipt_v1(VerifyReceiptInput {
+                tenant_id: tenant,
+                receipt_id: &minted.receipt_id,
+                body_bytes: &body_bytes,
+                stored_body_payload_hash: body_hash,
+                sig_bytes: Some(&sig_bytes),
+                keyring: Some(&keyring),
+                verified_at: "2026-07-04T00:00:01Z",
+                verifier_build: &state.build,
+                recompute_candidate_digest: false,
+            })
+            .expect("verify")
+        };
+
+        // Control: its own tenant still verifies, and the report says the
+        // tenant was actually bound rather than merely echoed.
+        let own = verify_as("local");
+        assert_eq!(own.error_code, "OK");
+        assert!(own.signature_valid);
+        assert!(own.binding.tenant_bound);
+
+        let foreign = verify_as("tenant-b");
+        assert_eq!(
+            foreign.error_code, "SIG_TENANT_MISMATCH",
+            "a receipt minted under `local` must not verify as tenant-b's"
+        );
+        assert!(!foreign.signature_valid);
+        assert!(!foreign.binding.tenant_bound);
+    }
+
+    /// D3: a receipt record the observation hash chain does not cover must
+    /// not resolve, even though its own envelope signature is genuine.
+    ///
+    /// `validate_chain` answers about the *file*, and it tolerates a legacy
+    /// (`seq: None`) prefix. A record in that prefix links to nothing in
+    /// either direction, so it can be dropped or reordered without breaking
+    /// the chain the report is claiming as its tamper-evidence. Every
+    /// receipt this daemon mints is appended with a `seq`, so refusing an
+    /// unchained one costs no legitimate receipt.
+    #[test]
+    fn local_stream_receipt_verification_rejects_an_unchained_record() {
+        let state = signing_state();
+        let minted = mint_stream_receipt(&state, "operator", &injected_draft()).expect("mint");
+
+        // Control: as minted, it resolves and reports the position check.
+        let found = crate::http::receipts::local_stream_receipt_verification(&state, &minted.receipt_id)
+            .expect("resolve")
+            .expect("receipt found");
+        assert_eq!(found.verification.error_code, "OK");
+        assert!(
+            found.verification.binding.chain_position_checked,
+            "the resolver checked the chain, so the report must say so"
+        );
+
+        // Rebuild the log as a legacy prefix in front of an intact chain —
+        // the one file shape `validate_chain` accepts while leaving a record
+        // linked to nothing. The receipt under test keeps a genuine,
+        // daemon-signed envelope; the only thing wrong with it is its
+        // position, which is precisely what D3 says nothing checks.
+        let mut second = injected_draft();
+        second.session_id = Some("s-2".to_string());
+        mint_stream_receipt(&state, "operator", &second).expect("mint second");
+        let chained = read_mediation_records(&state, "s-2")
+            .into_iter()
+            .next()
+            .expect("second record");
+        assert_eq!(chained.seq, Some(0), "a fresh log starts its chain at seq 0");
+
+        let path = crate::http::observations::observation_file_path(&state.data_dir, "mediation::s-1");
+        let text = std::fs::read_to_string(&path).expect("read log");
+        let mut legacy: ObservationRecordV1 =
+            serde_json::from_str(text.lines().next().expect("one line")).expect("parse record");
+        legacy.seq = None;
+        legacy.prev_hash = None;
+        let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).expect("load key");
+        let body_bytes = corecrux_receipts::canonical_body_bytes(&legacy).expect("canonicalise");
+        let hash = blake3::hash(&body_bytes);
+        legacy.receipt.body_hash = format!("blake3:{}", hex::encode(hash.as_bytes()));
+        legacy.receipt.signature = hex::encode(key.sign_hash(hash.as_bytes()));
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&legacy).expect("serialise legacy"),
+                serde_json::to_string(&chained).expect("serialise chained"),
+            ),
+        )
+        .expect("rewrite log");
+
+        // The file-level check is satisfied — that is the whole point.
+        assert!(
+            matches!(
+                crate::http::observations::validate_chain(&read_mediation_records(&state, "s-1")),
+                crate::http::observations::ChainStatus::Ok { .. }
+            ),
+            "the file's chain must still validate, or this proves nothing"
+        );
+
+        let err = crate::http::receipts::local_stream_receipt_verification(&state, &minted.receipt_id)
+            .expect_err("an unchained record must not resolve");
+        assert!(
+            err.contains("hash chain"),
+            "the error names the missing chain coverage: {err}"
+        );
+    }
+
     #[test]
     fn local_stream_receipt_verification_rejects_tampered_log() {
         let state = signing_state();

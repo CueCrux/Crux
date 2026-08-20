@@ -723,6 +723,7 @@ fn observation_verification_report(
             payload_hash_matches,
             canonical_bytes_parse_ok: !body_bytes.is_empty(),
         },
+        binding: Default::default(),
         trace_checks: VerificationTraceChecksV1::default(),
         trace_summary: None,
         signature_valid,

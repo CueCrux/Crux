@@ -715,6 +715,7 @@ fn store_and_load_verification_report_roundtrip() {
             payload_hash_matches: true,
             canonical_bytes_parse_ok: true,
         },
+        binding: Default::default(),
         trace_checks: VerificationTraceChecksV1::default(),
         trace_summary: None,
         signature_valid: true,
@@ -770,6 +771,7 @@ fn load_report_with_mismatched_tenant_returns_error() {
             payload_hash_matches: true,
             canonical_bytes_parse_ok: true,
         },
+        binding: Default::default(),
         trace_checks: VerificationTraceChecksV1::default(),
         trace_summary: None,
         signature_valid: false,
@@ -2091,4 +2093,175 @@ mod proptests {
             });
         }
     }
+}
+
+// ── D3: tenant + receipt-id binding (play03-custody-coord-remediation-2026-07 M1) ──
+
+/// Build a body that names its own tenant, the way every shipping
+/// `build_*_body_v1` in this crate does (`stream_v1.rs:159`,
+/// `memory_use_v1.rs:188`, `usage_receipt_v1.rs:159`, …).
+fn encode_body_cbor_for(receipt_id: &str, tenant_id: &str) -> Vec<u8> {
+    let v = ciborium::value::Value::Map(vec![
+        (
+            ciborium::value::Value::Text("schema".to_string()),
+            ciborium::value::Value::Text("cuecrux.receipt.body.v1".to_string()),
+        ),
+        (
+            ciborium::value::Value::Text("receipt_id".to_string()),
+            ciborium::value::Value::Text(receipt_id.to_string()),
+        ),
+        (
+            ciborium::value::Value::Text("tenant_id".to_string()),
+            ciborium::value::Value::Text(tenant_id.to_string()),
+        ),
+    ]);
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&v, &mut out).expect("encode body");
+    out
+}
+
+/// A genuine, keyring-signed receipt plus the sig envelope for it.
+fn signed_receipt_fixture(receipt_id: &str, tenant_id: &str) -> (Vec<u8>, [u8; 32], Vec<u8>, Ed25519KeyRingV1) {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0xD3);
+    let mut sk_bytes = [0u8; 32];
+    rng.fill_bytes(&mut sk_bytes);
+    let sk = SigningKey::from_bytes(&sk_bytes);
+    let keyring = Ed25519KeyRingV1 {
+        v: 1,
+        keys: vec![Ed25519KeyEntryV1 {
+            key_id: "k1".to_string(),
+            pub_key_base64: base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().as_bytes()),
+        }],
+    };
+    let body = encode_body_cbor_for(receipt_id, tenant_id);
+    let stored_hash = *blake3::hash(&body).as_bytes();
+    let sig = ReceiptSigV1 {
+        schema: "cuecrux.receipt.sig.v1".to_string(),
+        receipt_id: receipt_id.to_string(),
+        alg: "ed25519".to_string(),
+        key_id: "k1".to_string(),
+        signed_at: "2026-07-04T00:00:00Z".to_string(),
+        signature: sk.sign(&body).to_bytes().to_vec(),
+        signed_payload_hash: stored_hash.to_vec(),
+    };
+    (body, stored_hash, encode_sig_cbor(&sig), keyring)
+}
+
+fn d3_build() -> corecrux_types::BuildInfo {
+    corecrux_types::BuildInfo {
+        version: "0.0.1".to_string(),
+        commit: "deadbeef".to_string(),
+    }
+}
+
+/// D3: a genuine receipt minted for tenant-a must not verify when it is
+/// presented as tenant-b's.
+///
+/// The keyring is flat and has no per-tenant scoping, so the same key signs
+/// every tenant's receipts — before this check, relabelling a receipt was a
+/// matter of asking for it under a different `tenant_id`, and the verifier
+/// returned a clean `OK` because it only ever echoed the queried tenant back
+/// into the report. The tenant lives inside the *signed body*, so the
+/// relabel cannot survive the check without re-signing.
+#[test]
+fn verify_rejects_a_receipt_presented_under_another_tenant() {
+    let receipt_id = "00000000-0000-0000-0000-0000000000d3";
+    let (body, stored_hash, sig_bytes, keyring) = signed_receipt_fixture(receipt_id, "tenant-a");
+    let build = d3_build();
+
+    // Control: the receipt's own tenant verifies, and says so.
+    let own = verify_receipt_v1(VerifyReceiptInput {
+        tenant_id: "tenant-a",
+        receipt_id,
+        body_bytes: &body,
+        stored_body_payload_hash: stored_hash,
+        sig_bytes: Some(&sig_bytes),
+        keyring: Some(&keyring),
+        verified_at: "2026-07-04T00:00:01Z",
+        verifier_build: &build,
+        recompute_candidate_digest: false,
+    })
+    .expect("verify");
+    assert_eq!(own.error_code, "OK");
+    assert!(own.signature_valid);
+    assert!(own.binding.tenant_bound, "the body named tenant-a and we asked for it");
+    assert!(own.binding.receipt_id_bound);
+    assert!(
+        !own.binding.chain_position_checked,
+        "the verifier sees one receipt; it cannot check position"
+    );
+
+    // The attack: identical bytes, identical signature, different label.
+    let relabelled = verify_receipt_v1(VerifyReceiptInput {
+        tenant_id: "tenant-b",
+        receipt_id,
+        body_bytes: &body,
+        stored_body_payload_hash: stored_hash,
+        sig_bytes: Some(&sig_bytes),
+        keyring: Some(&keyring),
+        verified_at: "2026-07-04T00:00:01Z",
+        verifier_build: &build,
+        recompute_candidate_digest: false,
+    })
+    .expect("verify");
+    assert_eq!(
+        relabelled.error_code, "SIG_TENANT_MISMATCH",
+        "a tenant-a receipt must not verify as tenant-b's"
+    );
+    assert!(!relabelled.signature_valid);
+    assert!(!relabelled.binding.tenant_bound);
+}
+
+/// D3 backward-compat (Decision log D-1): a body that predates the binding
+/// carries no `tenant_id`, so there is nothing to bind to. It must keep
+/// verifying — receipts in the wild cannot be made to fail retroactively —
+/// but the report must say the binding is absent rather than emit the same
+/// bare `OK` as a bound receipt.
+#[test]
+fn verify_accepts_an_unbound_legacy_body_but_marks_it_unbound() {
+    let receipt_id = "00000000-0000-0000-0000-000000000001";
+    let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+    let mut sk_bytes = [0u8; 32];
+    rng.fill_bytes(&mut sk_bytes);
+    let sk = SigningKey::from_bytes(&sk_bytes);
+    let keyring = Ed25519KeyRingV1 {
+        v: 1,
+        keys: vec![Ed25519KeyEntryV1 {
+            key_id: "k1".to_string(),
+            pub_key_base64: base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().as_bytes()),
+        }],
+    };
+    // `encode_body_cbor` is the pre-D3 shape: schema + receipt_id, no tenant.
+    let body = encode_body_cbor();
+    let stored_hash = *blake3::hash(&body).as_bytes();
+    let sig = ReceiptSigV1 {
+        schema: "cuecrux.receipt.sig.v1".to_string(),
+        receipt_id: receipt_id.to_string(),
+        alg: "ed25519".to_string(),
+        key_id: "k1".to_string(),
+        signed_at: "2026-02-09T00:00:00Z".to_string(),
+        signature: sk.sign(&body).to_bytes().to_vec(),
+        signed_payload_hash: stored_hash.to_vec(),
+    };
+    let sig_bytes = encode_sig_cbor(&sig);
+
+    let report = verify_receipt_v1(VerifyReceiptInput {
+        tenant_id: "any-tenant-at-all",
+        receipt_id,
+        body_bytes: &body,
+        stored_body_payload_hash: stored_hash,
+        sig_bytes: Some(&sig_bytes),
+        keyring: Some(&keyring),
+        verified_at: "2026-02-09T00:00:01Z",
+        verifier_build: &d3_build(),
+        recompute_candidate_digest: false,
+    })
+    .expect("verify");
+    assert_eq!(report.error_code, "OK", "a legacy receipt must not break");
+    assert!(report.signature_valid);
+    assert!(
+        !report.binding.tenant_bound,
+        "nothing in the signed body ties this receipt to a tenant"
+    );
+    assert!(report.binding.receipt_id_bound, "this body did name its receipt_id");
 }

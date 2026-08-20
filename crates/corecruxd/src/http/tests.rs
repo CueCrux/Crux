@@ -20085,6 +20085,52 @@ async fn get_gpus_501_is_platform_upgrade_aware() {
 
 // ── OpenAPI contract: /v1/openapi.json (integration-surface plan M0) ─────
 
+/// D3 (play03-custody-coord-remediation-2026-07 M1): the published contract
+/// must not promise a check the verifier does not run.
+///
+/// The 200 description read "signature + hash-chain checks" while
+/// `verify_receipt_v1` performed no chain-position check of any kind — an
+/// auditor reading the spec would conclude a spliced or replayed receipt
+/// could not pass. The description now names what is actually checked and
+/// points at `binding.chain_position_checked` for the part that is the
+/// resolving store's job, not the verifier's.
+#[tokio::test]
+async fn openapi_receipt_verification_does_not_promise_a_hash_chain_check() {
+    use tower::ServiceExt;
+
+    let state = test_app_state(16);
+    let app = router(state, test_case_store());
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/v1/openapi.json")
+                .body(axum::body::Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let doc = json_body(resp).await;
+
+    let description = doc["paths"]["/v1/receipts/{receiptId}/verification"]["get"]["responses"]["200"]["description"]
+        .as_str()
+        .expect("200 description for the verification route")
+        .to_string();
+    assert!(
+        !description.contains("hash-chain"),
+        "the endpoint runs no chain check; the contract must not claim one: {description}"
+    );
+    assert!(
+        description.contains("chain_position_checked"),
+        "the contract must point at the field that reports chain position: {description}"
+    );
+    assert!(
+        description.contains("binding"),
+        "the contract must name the tenant/receipt binding it now enforces: {description}"
+    );
+}
+
 #[tokio::test]
 async fn openapi_json_route_serves_valid_openapi_3_document() {
     use tower::ServiceExt;

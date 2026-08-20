@@ -79,6 +79,7 @@ pub(super) fn local_approval_receipt(
         {
             continue;
         }
+        require_chain_covered(&record, "local approval receipt")?;
         let Some(body_hex) = record.payload.get("body_cbor_hex").and_then(serde_json::Value::as_str) else {
             continue;
         };
@@ -149,7 +150,10 @@ pub(super) fn local_approval_receipt(
             verifier_build: &state.build,
             recompute_candidate_digest: false,
         }) {
-            Ok(report) if report.signature_valid && report.error_code == "OK" => report,
+            Ok(mut report) if report.signature_valid && report.error_code == "OK" => {
+                report.binding.chain_position_checked = true;
+                report
+            }
             Ok(_) | Err(_) => return Err("local approval receipt signature verification failed".to_string()),
         };
         let request_id = fields
@@ -420,10 +424,16 @@ pub(super) fn local_governance_receipt_verification(
             continue;
         };
 
+        // Scoped to the record, not just the file. `validate_chain` reports
+        // `Ok` for a file whose legacy (`seq: None`) prefix is followed by a
+        // valid chain, but a record sitting in that prefix links to nothing:
+        // deleting or reordering it leaves the file's chain intact. Reporting
+        // the file's verdict as this receipt's tamper-evidence was the D3
+        // over-claim in its mildest form.
         let chain_valid = matches!(
             super::observations::validate_chain(&records),
             super::observations::ChainStatus::Ok { .. }
-        );
+        ) && record.seq.is_some();
         let failure_reason = verify_observation_envelope(state, record).err();
         let tenant_id = record
             .payload
@@ -451,6 +461,27 @@ pub(super) fn local_governance_receipt_verification(
         }));
     }
     Ok(None)
+}
+
+/// Refuse a receipt record that the observation hash chain does not cover.
+///
+/// [`super::observations::validate_chain`] answers a question about the
+/// *file*: it tolerates a legacy (`seq: None`) prefix from before the chain
+/// existed and only links the chained suffix. A record in that prefix has no
+/// `prev_hash` pointing at it and none pointing out of it, so it can be
+/// deleted, duplicated, or reordered without breaking anything the chain
+/// check would notice — verifying it and returning `OK` claims a
+/// tamper-evidence that is not there (defect D3).
+///
+/// Every receipt this daemon mints is appended through
+/// `append_one_unlocked`, which always assigns a `seq`. An unchained receipt
+/// record is therefore not one we wrote, and refusing it costs no legitimate
+/// receipt.
+fn require_chain_covered(record: &super::observations::ObservationRecordV1, what: &str) -> Result<(), String> {
+    if record.seq.is_none() {
+        return Err(format!("{what} record is not covered by the observation hash chain"));
+    }
+    Ok(())
 }
 
 /// Best-effort top-level `tenant_id` text field from a CBOR receipt body.
@@ -524,6 +555,7 @@ pub(super) fn local_stream_receipt_verification(
             return Err("local stream receipt observation chain is invalid".to_string());
         }
         verify_observation_envelope(state, record)?;
+        require_chain_covered(record, "local stream receipt")?;
 
         let Some(body_hex) = record.payload.get("body_cbor_hex").and_then(serde_json::Value::as_str) else {
             return Err("local stream receipt body is missing".to_string());
@@ -587,7 +619,7 @@ pub(super) fn local_stream_receipt_verification(
 
         let tenant_id = cbor_top_level_tenant(&body_bytes).unwrap_or_else(|| "local".to_string());
         let verified_at = record.ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let verification = verify_receipt_v1(VerifyReceiptInput {
+        let mut verification = verify_receipt_v1(VerifyReceiptInput {
             tenant_id: &tenant_id,
             receipt_id,
             body_bytes: &body_bytes,
@@ -599,6 +631,9 @@ pub(super) fn local_stream_receipt_verification(
             recompute_candidate_digest: false,
         })
         .map_err(|err| format!("verify local stream receipt: {err}"))?;
+        // The verifier sees one receipt and cannot check position; this
+        // resolver just did, above, for the whole file and for this record.
+        verification.binding.chain_position_checked = true;
         return Ok(Some(LocalStreamReceipt {
             tenant_id,
             verification,
@@ -842,7 +877,7 @@ pub(super) async fn get_receipt_signature_v1(
         ("tenant_id" = String, Query, description = "Tenant the receipt belongs to"),
     ),
     responses(
-        (status = 200, description = "Receipt verification report (signature + hash-chain checks)"),
+        (status = 200, description = "Receipt verification report: body hash, Ed25519 signature over the body bytes, keyring membership, and the signed body's tenant/receipt binding. Chain position is reported in binding.chain_position_checked, not assumed."),
         (status = 404, description = "Receipt body not found"),
         (status = 401, description = "Unauthorized"),
         (status = 501, description = "Dataplane disabled"),
