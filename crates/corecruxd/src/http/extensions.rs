@@ -714,7 +714,7 @@ pub(super) async fn invoke_extension_tool(
     // Snapshot installed extension + grant out of the store before the
     // outbound call so we can drop the read lock during the (potentially
     // slow) network round-trip / wasm execution.
-    let (manifest, grant) = {
+    let (manifest, attribution, grant) = {
         let store = state.fact_store.read().await;
         let installed = match crate::extension_registry::get_extension(&store, &extension_id) {
             Some(r) => r,
@@ -734,7 +734,11 @@ pub(super) async fn invoke_extension_tool(
                 );
             }
         };
-        (installed.manifest, grant)
+        // Built once, from the install record — the only place that knows the
+        // hash of the bytes the operator actually installed. Both dispatch
+        // branches and every fact they write carry this same value.
+        let attribution = crate::extension_registry::PackAttribution::from_installed(&installed);
+        (installed.manifest, attribution, grant)
     };
 
     // Tool name must be in the grant's allow-list (or the allow-list
@@ -752,6 +756,7 @@ pub(super) async fn invoke_extension_tool(
             state,
             extension_id,
             manifest,
+            attribution,
             grant,
             tool_name,
             body.args,
@@ -787,6 +792,7 @@ pub(super) async fn invoke_extension_tool(
             &cfg,
             &data_dir,
             &manifest_clone,
+            &attribution,
             &grant_clone,
             &tool_name,
             &args,
@@ -819,24 +825,12 @@ pub(super) async fn invoke_extension_tool(
     // belt-and-braces check; identical-shape entries that snuck through
     // would still be marked private at storage time.
     if outcome.accepted_fact_writes > 0 {
+        // Scope filtering + the `actor` stamp both come from the dispatcher's
+        // own outcome, so a stored fact's authorship is the same value the
+        // receipt reports rather than a second derivation that can drift.
+        let staged = crate::extension_outbound::attributed_fact_writes(&parsed, &grant, &outcome.attribution);
         let mut store = state.fact_store.write().await;
-        for w in &parsed.fact_writes {
-            if crate::fact_privacy::generic_create_reserved_entity_prefix(&w.entity).is_some()
-                || !grant.allowed_prefixes_write.iter().any(|p| w.entity.starts_with(p))
-            {
-                continue; // already counted as dropped
-            }
-            let mut sf = corecrux_memory::fact_store::StoreFact {
-                tenant_hash: "default".to_string(),
-                entity: w.entity.clone(),
-                key: w.key.clone(),
-                value: w.value.clone(),
-                source_receipt: None,
-                confidence: w.confidence,
-                private: false,
-                horizon_class: None,
-                actor: None,
-            };
+        for mut sf in staged {
             crate::fact_privacy::enforce_global(&mut sf);
             store.store(sf);
         }
@@ -928,10 +922,12 @@ pub(super) async fn delete_trusted_key(
 /// `--features wasm-extensions` the daemon returns 501; with the
 /// feature, calls into [`crate::wasm_dispatcher`].
 #[cfg(feature = "wasm-extensions")]
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_wasm_kind_or_unsupported(
     state: AppState,
     extension_id: String,
     manifest: IntegrationManifest,
+    attribution: crate::extension_registry::PackAttribution,
     grant: crate::extension_grants::ExtensionGrant,
     tool_name: String,
     args: serde_json::Value,
@@ -952,6 +948,7 @@ async fn dispatch_wasm_kind_or_unsupported(
         state.fact_store.clone(),
         extension_id,
         manifest,
+        attribution,
         grant,
         tool_name,
         args,
@@ -988,11 +985,12 @@ async fn dispatch_wasm_kind_or_unsupported(
 /// variant (which IS async); suppress the unused_async lint here since
 /// the body is a synchronous early-return.
 #[cfg(not(feature = "wasm-extensions"))]
-#[allow(clippy::unused_async)]
+#[allow(clippy::unused_async, clippy::too_many_arguments)]
 async fn dispatch_wasm_kind_or_unsupported(
     _state: AppState,
     _extension_id: String,
     _manifest: IntegrationManifest,
+    _attribution: crate::extension_registry::PackAttribution,
     _grant: crate::extension_grants::ExtensionGrant,
     _tool_name: String,
     _args: serde_json::Value,

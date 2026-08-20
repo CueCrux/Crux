@@ -72,6 +72,77 @@ pub struct InstalledExtension {
     pub installed_by_passport: Option<String>,
 }
 
+/// Prefix of every [`PackAttribution::actor`] stamp. Namespaces pack
+/// authorship against the other `Fact.actor` producers (passport ids and
+/// raw agent names), so "which of these facts did a pack write" is a
+/// prefix test rather than a join.
+pub const PACK_ACTOR_PREFIX: &str = "pack:";
+
+/// Per-mutation provenance for anything a pack originates — the M5
+/// frontier seam of `crux-daemon-buyer-fit-buildout-2026-07-13`.
+///
+/// The dispatcher already recorded *which passport called a pack tool*.
+/// What nothing recorded was *which pack build produced the resulting
+/// mutation*, and `extension_id` alone cannot answer that: the same id is
+/// reinstalled at new versions, and a single version can be re-cut with
+/// different bytes. The triple (id, version, install-time `manifest_hash`)
+/// is therefore what travels with every pack-originated write.
+///
+/// Two carriers, deliberately different shapes:
+/// - [`PackAttribution::actor`] flattens the triple into one string,
+///   because `Fact.actor` is a single `Option<String>` and a pack-written
+///   fact has to stay self-describing with no registry lookup.
+/// - The struct itself rides verbatim on dispatch outcomes and the audit
+///   tail, where structured fields are cheaper to filter on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PackAttribution {
+    pub extension_id: String,
+    pub extension_version: String,
+    /// Install-time BLAKE3 over the canonical signing payload, carrying the
+    /// `blake3:` prefix exactly as [`InstalledExtension::manifest_hash`]
+    /// stores it. Kept whole rather than truncated: a shortened digest would
+    /// force every downstream verifier to agree on a truncation length that
+    /// is not part of any wire contract.
+    pub manifest_hash: String,
+}
+
+impl PackAttribution {
+    pub fn new(
+        extension_id: impl Into<String>,
+        extension_version: impl Into<String>,
+        manifest_hash: impl Into<String>,
+    ) -> Self {
+        Self {
+            extension_id: extension_id.into(),
+            extension_version: extension_version.into(),
+            manifest_hash: manifest_hash.into(),
+        }
+    }
+
+    /// Build from the persisted install record — the only source that has
+    /// the hash of the bytes actually installed, as opposed to whatever a
+    /// manifest presented later claims.
+    pub fn from_installed(installed: &InstalledExtension) -> Self {
+        Self::new(
+            installed.manifest.id.clone(),
+            installed.manifest.version.clone(),
+            installed.manifest_hash.clone(),
+        )
+    }
+
+    /// Flat stamp written to `Fact.actor`:
+    /// `pack:<extension_id>@<version>#<manifest_hash>`. The separators are
+    /// chosen so the id (lowercase alphanumerics + `.`/`-`/`_`, enforced by
+    /// `validate_id`) can never contain them, keeping the stamp unambiguously
+    /// splittable by a reader that has only the fact.
+    pub fn actor(&self) -> String {
+        format!(
+            "{PACK_ACTOR_PREFIX}{}@{}#{}",
+            self.extension_id, self.extension_version, self.manifest_hash
+        )
+    }
+}
+
 /// Path to the operator keyring under the daemon's data directory.
 pub fn trusted_keys_path(data_dir: impl AsRef<Path>) -> PathBuf {
     data_dir.as_ref().join("extensions").join(TRUSTED_KEYS_FILENAME)
@@ -440,5 +511,59 @@ mod tests {
 
     fn store_temp() -> FactStore {
         FactStore::new()
+    }
+
+    /// M5 attribution seam: the stamp a pack-originated mutation carries is
+    /// built from the *install record*, so it names the bytes the operator
+    /// actually installed rather than whatever a later manifest claims.
+    #[test]
+    fn pack_attribution_uses_the_install_record_hash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = fixture_manifest("ext.example.quote", "p_alice");
+        let mut store = FactStore::new();
+        let installed =
+            install_extension(&mut store, dir.path(), manifest, None, 17_700_000_000_000, true).expect("install");
+
+        let attribution = PackAttribution::from_installed(&installed);
+        assert_eq!(attribution.extension_id, "ext.example.quote");
+        assert_eq!(attribution.extension_version, "0.1.0");
+        assert_eq!(attribution.manifest_hash, installed.manifest_hash);
+        assert!(
+            installed.manifest_hash.starts_with("blake3:"),
+            "install hash keeps its algorithm prefix: {}",
+            installed.manifest_hash
+        );
+
+        let actor = attribution.actor();
+        assert!(actor.starts_with(PACK_ACTOR_PREFIX));
+        assert_eq!(
+            actor,
+            format!("pack:ext.example.quote@0.1.0#{}", installed.manifest_hash),
+            "the `Fact.actor` stamp is a wire contract; changing its shape breaks every reader"
+        );
+    }
+
+    /// Why the hash is in the stamp at all: one id at one version can be
+    /// re-cut with different bytes, so id+version alone cannot tell two pack
+    /// builds apart when attributing a mutation after the fact.
+    #[test]
+    fn pack_attribution_separates_two_builds_of_the_same_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut first = fixture_manifest("ext.example.quote", "p_alice");
+        first.summary = "Returns a quote.".to_string();
+        let mut second = fixture_manifest("ext.example.quote", "p_alice");
+        second.summary = "Returns a different quote.".to_string();
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.version, second.version);
+
+        let mut store_a = FactStore::new();
+        let a = install_extension(&mut store_a, dir.path(), first, None, 1, true).expect("install a");
+        let mut store_b = FactStore::new();
+        let b = install_extension(&mut store_b, dir.path(), second, None, 2, true).expect("install b");
+
+        assert_ne!(
+            PackAttribution::from_installed(&a).actor(),
+            PackAttribution::from_installed(&b).actor()
+        );
     }
 }
