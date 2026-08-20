@@ -126,7 +126,9 @@ committing.
 **Ask first:** changing any default port (HTTP `14800`, gRPC `4007`, MCP `14801`); changing
 receipt formats, seal material, or anything under `crates/corecrux-receipts/`,
 `-segment/`, `-storage/` that an invariant (I1–I6) names; adding a new on-disk artifact type
-(update all three wiring points: storage allowlist, projection registry, load-at-startup).
+(update all three wiring points: storage allowlist, projection registry, load-at-startup);
+instrumenting a new `crux.outcome` site — the set is curated, and the admission bar plus the
+two ways to get it silently wrong are in `docs/agent/outcome-instrumentation.md`.
 
 **Never:** GPU/CUDA code, `--features cuda`, or GPU readiness checks (this repo is CPU-only —
 ADR 003); references to proprietary crates (`corecrux-analytics`, `corecrux-decision`,
@@ -711,6 +713,31 @@ ci_assertions:
     - handle_declare_constraint
     - write_ccxe
     - BootstrapSeeder
+    # outcome dimension (docs/agent/outcome-instrumentation.md)
+    - SpanOutcome
+    - OUTCOME_FIELD
+    - record_outcome
+    - record_outcome_through
+    - OutcomeExt
+    - TRACE_CAPTURE_ENV
+    - CruxSpanLayer
+    - capture_spans
+    - capture_spans_async
+    - outcomes_of
+    - load_latest_workspace_blocking
+    - list_dossier_ids_internal
+    - list_storybook_versions_internal
+    - list_extensions
+    - list_grants_for_extension
+    - list_grants_for_passport
+    - list_links
+    - get_plane_layers
+    - get_project_layers
+    - read_project_layers
+    - read_plane_layers
+    - latest_storybook_ts
+    - query_prefix
+    - count_facts_with_prefix
   tests:
     - tampering_with_signature_breaks_signature_check
     - wrong_verifying_key_fails
@@ -746,6 +773,12 @@ ci_assertions:
     - declare_constraint_basic
     - declare_constraint_invalid_type
     - declare_constraint_invalid_severity
+    # outcome dimension (docs/agent/outcome-instrumentation.md)
+    - record_outcome_is_inert_when_the_span_never_declared_the_field
+    - the_workspace_scan_loader_records_whether_it_found_anything
+    - a_corrupt_scan_fact_records_empty_not_found
+    - the_dossier_lister_records_whether_it_returned_anything
+    - the_storybook_version_lister_records_whether_it_returned_anything
   fuzz_targets:
     - segment_decode
     - storage_scan_frames
