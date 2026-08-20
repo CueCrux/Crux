@@ -71,7 +71,9 @@ committing.
 **Ask first:** changing any default port (HTTP `14800`, gRPC `4007`, MCP `14801`); changing
 receipt formats, seal material, or anything under `crates/corecrux-receipts/`,
 `-segment/`, `-storage/` that an invariant (I1–I6) names; adding a new on-disk artifact type
-(update all three wiring points: storage allowlist, projection registry, load-at-startup).
+(update all three wiring points: storage allowlist, projection registry, load-at-startup);
+instrumenting a new `crux.outcome` site — the set is curated, and the admission bar plus the
+two ways to get it silently wrong are in `docs/agent/outcome-instrumentation.md`.
 
 **Never:** GPU/CUDA code, `--features cuda`, or GPU readiness checks (this repo is CPU-only —
 ADR 003); references to proprietary crates (`corecrux-analytics`, `corecrux-decision`,
