@@ -20,6 +20,7 @@ pub enum VerifyErrorCodeV1 {
     SigParseError,
     SigAlgUnsupported,
     SigReceiptIdMismatch,
+    SigTenantMismatch,
     SigPayloadHashMismatch,
     KeyRingMissing,
     KeyNotFound,
@@ -37,6 +38,7 @@ impl VerifyErrorCodeV1 {
             Self::SigParseError => "SIG_PARSE_ERROR",
             Self::SigAlgUnsupported => "SIG_ALG_UNSUPPORTED",
             Self::SigReceiptIdMismatch => "SIG_RECEIPT_ID_MISMATCH",
+            Self::SigTenantMismatch => "SIG_TENANT_MISMATCH",
             Self::SigPayloadHashMismatch => "SIG_PAYLOAD_HASH_MISMATCH",
             Self::KeyRingMissing => "KEYRING_MISSING",
             Self::KeyNotFound => "KEY_NOT_FOUND",
@@ -85,6 +87,13 @@ pub struct VerificationReportV1 {
 
     pub signature: VerificationSigInfoV1,
     pub integrity: VerificationIntegrityV1,
+    /// What this receipt could be bound to beyond its own bytes.
+    ///
+    /// Defaulted on deserialize so reports written before the binding
+    /// existed still load; they read as "nothing bound", which is the truth
+    /// about them.
+    #[serde(default)]
+    pub binding: VerificationBindingV1,
     #[serde(rename = "trace_checks", default)]
     pub trace_checks: VerificationTraceChecksV1,
     /// Best-effort extracted trace values from the receipt body (for drift tools).
@@ -122,6 +131,52 @@ pub struct VerificationIntegrityV1 {
     pub payload_hash_matches: bool,
     #[serde(rename = "canonical_bytes_parse_ok")]
     pub canonical_bytes_parse_ok: bool,
+}
+
+/// Which of a receipt's *contextual* claims the verifier could actually check.
+///
+/// A valid Ed25519 signature proves the body bytes are authentic. It does not
+/// prove the body belongs to the tenant you asked about, at the chain position
+/// you asked about — and until this struct existed the report said `OK` either
+/// way, which is what made a genuine receipt replayable under another tenant
+/// label (defect D3).
+///
+/// The signature covers `body_bytes` alone; the `ReceiptSigV1` envelope is not
+/// signed. So the only trustworthy source for these claims is the body itself,
+/// and that is where [`verify_receipt_v1`] reads them from.
+///
+/// `false` is not automatically a failure: a body that carries no `tenant_id`
+/// predates the binding and still verifies, but it reports `tenant_bound:
+/// false` so an auditor can tell an unbound receipt from a bound one instead
+/// of reading the same bare `OK` for both.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, Default, PartialEq, Eq)]
+pub struct VerificationBindingV1 {
+    /// The signed body declared a top-level `tenant_id` and it equals the
+    /// tenant the caller asked about. A *mismatch* is a hard failure
+    /// (`SIG_TENANT_MISMATCH`), so `false` here means "the body declared no
+    /// tenant", never "the tenant was wrong".
+    #[serde(rename = "tenant_bound")]
+    pub tenant_bound: bool,
+    /// The signed body declared a top-level `receipt_id` and it equals the
+    /// receipt the caller asked about.
+    ///
+    /// Reported, not enforced. The `sig.receipt_id` envelope check below
+    /// already rejects the careless case, and hard-failing on the body field
+    /// would change the verdict for receipts whose producers never treated it
+    /// as a contract. A `false` here on a receipt whose body *does* carry a
+    /// `receipt_id` means the envelope agreed with the query and the signed
+    /// body did not — worth an operator's attention.
+    #[serde(rename = "receipt_id_bound")]
+    pub receipt_id_bound: bool,
+    /// The caller resolved this receipt's position in a tamper-evident chain
+    /// before asking for verification.
+    ///
+    /// [`verify_receipt_v1`] never sets this: it is handed one receipt and
+    /// cannot see its neighbours, so only the store that resolved it can
+    /// assert the position. It stays `false` unless that store sets it, which
+    /// is the honest answer for every caller that does no chain resolution.
+    #[serde(rename = "chain_position_checked")]
+    pub chain_position_checked: bool,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, Default)]
@@ -184,6 +239,16 @@ pub struct VerifyReceiptInput<'a> {
     pub recompute_candidate_digest: bool,
 }
 
+/// Verify one receipt in isolation: body hash, Ed25519 signature over the body
+/// bytes, keyring membership of the signing key, and — since D3 — that the
+/// signed body's own `tenant_id` is the tenant the caller asked about.
+///
+/// What it deliberately does **not** check: chain position. This function is
+/// handed a single receipt and never its neighbours, so it cannot tell a chain
+/// head from a spliced-in replay. Callers that resolve receipts out of a
+/// hash-chained store must run that check themselves and record it in
+/// [`VerificationBindingV1::chain_position_checked`]; callers that cannot must
+/// leave it `false` rather than let the report imply a check nobody ran.
 pub fn verify_receipt_v1(input: VerifyReceiptInput<'_>) -> Result<VerificationReportV1, VerifyError> {
     let computed = blake3::hash(input.body_bytes);
     let payload_hash_matches = computed.as_bytes() == &input.stored_body_payload_hash;
@@ -206,6 +271,19 @@ pub fn verify_receipt_v1(input: VerifyReceiptInput<'_>) -> Result<VerificationRe
     let payload_hash_hex = hex32(&input.stored_body_payload_hash);
     let verifier_build = format!("{}@{}", input.verifier_build.version, input.verifier_build.commit);
 
+    // Contextual binding (D3). Read from the BODY, never the sig envelope: the
+    // ed25519 signature covers `body_bytes` only, so a field in the envelope
+    // can be rewritten without invalidating it. That makes the pre-existing
+    // `sig.receipt_id` check below a consistency check rather than a binding
+    // — the body is the only source that costs a re-signing to change.
+    let body_tenant_id = body_top_level_text(parsed_body.as_ref(), "tenant_id");
+    let body_receipt_id = body_top_level_text(parsed_body.as_ref(), "receipt_id");
+    let binding = VerificationBindingV1 {
+        tenant_bound: body_tenant_id.as_deref() == Some(input.tenant_id),
+        receipt_id_bound: body_receipt_id.as_deref() == Some(input.receipt_id),
+        chain_position_checked: false,
+    };
+
     // If body hash doesn't match, we still attempt to verify the signature over the stored bytes
     // so operators can distinguish "corrupt storage" from "bad signature".
 
@@ -217,6 +295,55 @@ pub fn verify_receipt_v1(input: VerifyReceiptInput<'_>) -> Result<VerificationRe
         alg: "ed25519".to_string(),
         key_id: None,
     };
+
+    // Fail closed on a tenant mismatch BEFORE anything else about the
+    // signature is considered. A receipt whose signed body names another
+    // tenant is not this tenant's receipt, whether or not it also happens to
+    // carry a valid signature — that is exactly the replay D3 describes, and
+    // deciding it here means no later branch can return `OK` for it.
+    let binding_failure = body_tenant_id
+        .as_deref()
+        .filter(|t| *t != input.tenant_id)
+        .map(|found| {
+            (
+                VerifyErrorCodeV1::SigTenantMismatch,
+                format!(
+                    "signed body tenant_id mismatch: expected {} got {found}",
+                    input.tenant_id
+                ),
+            )
+        });
+    if let Some((binding_err, binding_msg)) = binding_failure {
+        // Storage corruption still outranks it, same as every other check
+        // here: an operator must be able to tell a mangled body from a
+        // deliberately relabelled one.
+        err = if payload_hash_matches {
+            binding_err
+        } else {
+            VerifyErrorCodeV1::BodyHashMismatch
+        };
+        err_msg = Some(binding_msg);
+        return Ok(VerificationReportV1 {
+            schema: "cuecrux.receipt.verify.v1".to_string(),
+            receipt_id: input.receipt_id.to_string(),
+            tenant_id: input.tenant_id.to_string(),
+            payload_hash_hex,
+            signature: sig_info,
+            integrity: VerificationIntegrityV1 {
+                payload_hash_matches,
+                canonical_bytes_parse_ok,
+            },
+            binding,
+            trace_checks,
+            trace_summary,
+            signature_valid,
+            pubkey_fingerprint,
+            error_code: err.as_str().to_string(),
+            error_message: err_msg,
+            verified_at: input.verified_at.to_string(),
+            verifier_build,
+        });
+    }
 
     let Some(sig_bytes) = input.sig_bytes else {
         err = if !payload_hash_matches {
@@ -242,6 +369,7 @@ pub fn verify_receipt_v1(input: VerifyReceiptInput<'_>) -> Result<VerificationRe
                 payload_hash_matches,
                 canonical_bytes_parse_ok,
             },
+            binding,
             trace_checks,
             trace_summary,
             signature_valid,
@@ -272,6 +400,7 @@ pub fn verify_receipt_v1(input: VerifyReceiptInput<'_>) -> Result<VerificationRe
                     payload_hash_matches,
                     canonical_bytes_parse_ok,
                 },
+                binding,
                 trace_checks,
                 trace_summary,
                 signature_valid,
@@ -304,6 +433,7 @@ pub fn verify_receipt_v1(input: VerifyReceiptInput<'_>) -> Result<VerificationRe
                 payload_hash_matches,
                 canonical_bytes_parse_ok,
             },
+            binding,
             trace_checks,
             trace_summary,
             signature_valid,
@@ -335,6 +465,7 @@ pub fn verify_receipt_v1(input: VerifyReceiptInput<'_>) -> Result<VerificationRe
                 payload_hash_matches,
                 canonical_bytes_parse_ok,
             },
+            binding,
             trace_checks,
             trace_summary,
             signature_valid,
@@ -370,6 +501,7 @@ pub fn verify_receipt_v1(input: VerifyReceiptInput<'_>) -> Result<VerificationRe
                 payload_hash_matches,
                 canonical_bytes_parse_ok,
             },
+            binding,
             trace_checks,
             trace_summary,
             signature_valid,
@@ -398,6 +530,7 @@ pub fn verify_receipt_v1(input: VerifyReceiptInput<'_>) -> Result<VerificationRe
                 payload_hash_matches,
                 canonical_bytes_parse_ok,
             },
+            binding,
             trace_checks,
             trace_summary,
             signature_valid,
@@ -428,6 +561,7 @@ pub fn verify_receipt_v1(input: VerifyReceiptInput<'_>) -> Result<VerificationRe
                     payload_hash_matches,
                     canonical_bytes_parse_ok,
                 },
+                binding,
                 trace_checks,
                 trace_summary,
                 signature_valid,
@@ -457,6 +591,7 @@ pub fn verify_receipt_v1(input: VerifyReceiptInput<'_>) -> Result<VerificationRe
                 payload_hash_matches,
                 canonical_bytes_parse_ok,
             },
+            binding,
             trace_checks,
             trace_summary,
             signature_valid,
@@ -487,6 +622,7 @@ pub fn verify_receipt_v1(input: VerifyReceiptInput<'_>) -> Result<VerificationRe
                     payload_hash_matches,
                     canonical_bytes_parse_ok,
                 },
+                binding,
                 trace_checks,
                 trace_summary,
                 signature_valid,
@@ -518,6 +654,7 @@ pub fn verify_receipt_v1(input: VerifyReceiptInput<'_>) -> Result<VerificationRe
                 payload_hash_matches,
                 canonical_bytes_parse_ok,
             },
+            binding,
             trace_checks,
             trace_summary,
             signature_valid,
@@ -577,6 +714,7 @@ pub fn verify_receipt_v1(input: VerifyReceiptInput<'_>) -> Result<VerificationRe
             payload_hash_matches,
             canonical_bytes_parse_ok,
         },
+        binding,
         trace_checks,
         trace_summary,
         signature_valid,
@@ -586,6 +724,25 @@ pub fn verify_receipt_v1(input: VerifyReceiptInput<'_>) -> Result<VerificationRe
         verified_at: input.verified_at.to_string(),
         verifier_build,
     })
+}
+
+/// Read a top-level text field out of an already-parsed receipt body.
+///
+/// Deliberately top-level and text-only: a nested or non-text `tenant_id` is
+/// treated as absent rather than coerced, so a producer cannot smuggle a
+/// binding claim past the check by changing its shape.
+fn body_top_level_text(parsed_body: Option<&ciborium::value::Value>, field: &str) -> Option<String> {
+    let ciborium::value::Value::Map(map) = parsed_body? else {
+        return None;
+    };
+    for (k, v) in map {
+        if let (ciborium::value::Value::Text(k), ciborium::value::Value::Text(v)) = (k, v) {
+            if k == field {
+                return Some(v.clone());
+            }
+        }
+    }
+    None
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {
@@ -1153,6 +1310,7 @@ mod tests {
                 payload_hash_matches: true,
                 canonical_bytes_parse_ok: true,
             },
+            binding: Default::default(),
             trace_checks: VerificationTraceChecksV1::default(),
             trace_summary: None,
             signature_valid: true,

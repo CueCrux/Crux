@@ -145,8 +145,9 @@ pub use usage_receipt_v1::{
     USAGE_EVENT_CLASSES_V1, USAGE_PING_ALLOWED_KEYS_V1, USAGE_PING_BODY_SCHEMA_V1, USAGE_PING_KIND_V1,
 };
 pub use verify_v1::{
-    verify_receipt_v1, ReceiptSigV1, VerificationIntegrityV1, VerificationReportV1, VerificationSigInfoV1,
-    VerificationTraceChecksV1, VerificationTraceSummaryV1, VerifyErrorCodeV1, VerifyReceiptInput,
+    verify_receipt_v1, ReceiptSigV1, VerificationBindingV1, VerificationIntegrityV1, VerificationReportV1,
+    VerificationSigInfoV1, VerificationTraceChecksV1, VerificationTraceSummaryV1, VerifyErrorCodeV1,
+    VerifyReceiptInput,
 };
 pub use witness_v1::{
     assert_external_anchor_kind_v1, assert_rfc3161_timestamp_kind_v1, build_external_anchor_body_v1,
