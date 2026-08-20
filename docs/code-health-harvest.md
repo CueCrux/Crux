@@ -52,6 +52,34 @@ Findings live under `entity="codehealth:<repo>"` (the repo's leaf dir name):
   `{commit_sha, counts, resolved, total, tools_ran, tools_missing}`;
   `horizon_class="medium"`.
 
+### Debt ledger — `debt:<repo>/<area>`
+
+`debt` is the one class that records a *deliberate* shortcut rather than a
+defect: a `crux-min:` marker naming a ceiling and the trigger that should lift
+it. Buried among four defect classes it is not separately queryable, so `--push`
+also projects debt findings into per-area ledger entities:
+
+- **Entity** — `debt:<repo>/<area>`. `<area>` is the crate for `crates/<name>/…`
+  paths, otherwise the first path segment, and `root` for a repo-root file.
+- **Key** — the same `debt:<file>:<line>` finding key.
+- **Value** — `{ceiling, upgrade_trigger, file_line, commit_sha}`. The ceiling is
+  the marker text up to the first `;`, the trigger is the remainder (`null` when
+  the marker has no `;`; a wrapped marker is truncated at its first line).
+
+This is a **projection, not a migration**: debt findings still go to
+`codehealth:<repo>` exactly as before, so existing `codehealth:*` debt facts stay
+valid. Each push reconciles the union of the areas that have debt now and the
+areas already holding debt facts (discovered with
+`GET /v1/facts/list?entity_prefix=debt:<repo>/`), so an area whose last marker
+was deleted has its facts retired rather than left claiming a shortcut that no
+longer exists. No `run:<date>` summary is written per area — the
+`codehealth:<repo>` run summary already counts the class.
+
+```text
+query_facts(entity_prefix="debt:", token_budget=500)      # the whole debt ledger
+query_facts(entity="debt:Crux/crux-mcp", token_budget=500) # one area's shortcuts
+```
+
 ### Reconciliation (desired-state)
 
 `--push` reconciles the store to exactly the current finding set:

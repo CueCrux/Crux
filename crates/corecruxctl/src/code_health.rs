@@ -9,7 +9,8 @@
 //! (`cargo-check`, `machete`, `grep`, `ts-prune`/`knip`) and the `commit_sha`
 //! it was measured at. We build no static analyzer of our own; we normalize
 //! what compilers/linters/grep already know into a stable JSON shape that M2
-//! pushes into the fact store under `entity="codehealth:<repo>"`.
+//! pushes into the fact store under `entity="codehealth:<repo>"`, plus the
+//! `debt`-class projection into `entity="debt:<repo>/<area>"` (M4).
 //!
 //! M1 scope: the tool battery + normalized JSON to stdout + fixture-driven
 //! unit tests on the pure parsers. No daemon writes (that is `--push`, M2).
@@ -554,6 +555,82 @@ pub fn run_summary_fact(entity: &str, h: &Harvest, date: &str, resolved: usize) 
     })
 }
 
+// ───────────────── debt ledger (M4: `debt:<repo>/<area>`) ─────────────────
+//
+// `debt` is one of five finding classes, and the only one that records a
+// *deliberate* shortcut rather than a defect: a `crux-min:` marker naming a
+// ceiling and the trigger that should lift it. Buried among four defect classes
+// under `codehealth:<repo>` it is not separately queryable, so the harvester
+// also projects debt findings into per-area `debt:<repo>/<area>` entities —
+// `query_facts(entity_prefix="debt:")` then reads the ledger and nothing else.
+//
+// This is a projection, not a migration: debt findings keep going to
+// `codehealth:<repo>` exactly as before, so every existing `codehealth:*` debt
+// fact stays valid and no consumer of that entity breaks.
+
+/// Ledger area for a debt finding — the sub-tree that owns the shortcut.
+///
+/// `crates/<name>/…` → `<name>` (a cargo workspace's ownership unit is the
+/// crate); any other nested path → its first segment; a repo-root file →
+/// `root`. Deliberately coarse: the area exists to split a repo's ledger by
+/// owner, not to encode the path — the full path is in the value's `file_line`.
+// crux-min: positional area rule; upgrade trigger = a repo whose ledger lands
+// almost entirely in one area (a `src/`-rooted TS repo), which wants a
+// per-repo area map instead.
+fn debt_area(file: &str) -> String {
+    let mut segs = file.split('/').filter(|s| !s.is_empty());
+    let (Some(first), Some(second)) = (segs.next(), segs.next()) else {
+        return "root".to_string(); // repo-root file: no owning sub-tree
+    };
+    if first == "crates" {
+        second.to_string()
+    } else {
+        first.to_string()
+    }
+}
+
+/// Split a `crux-min:` marker into `(ceiling, upgrade_trigger)`.
+///
+/// The documented shape is `crux-min: <ceiling>; <upgrade trigger>`
+/// (`crates/crux-config-wizard/profiles/code-minimalism.md`). Everything after
+/// the marker up to the first `;` is the ceiling, the remainder is the trigger.
+/// A marker with no `;` yields no trigger rather than a guess. The last
+/// occurrence of the needle wins because [`scan_markers`] prefixes the matched
+/// needle onto the raw source line, so the marker text appears twice.
+// crux-min: single-line markers only; upgrade trigger = `scan_markers` joining
+// continuation lines, after which a wrapped trigger stops being truncated.
+fn split_debt_marker(message: &str) -> (String, Option<String>) {
+    let body = match message.rsplit_once("crux-min:") {
+        Some((_, rest)) => rest.trim(),
+        None => message.trim(),
+    };
+    match body.split_once(';') {
+        Some((ceiling, trigger)) => {
+            let trigger = trigger.trim();
+            (
+                ceiling.trim().to_string(),
+                (!trigger.is_empty()).then(|| trigger.to_string()),
+            )
+        }
+        None => (body.to_string(), None),
+    }
+}
+
+/// Ledger value for a debt finding — the ExecPlan's shape
+/// `{ceiling, upgrade_trigger, file_line, commit_sha}`. Distinct from
+/// [`finding_value`]: a reader of the debt ledger wants the ceiling and its
+/// trigger, not the class/tool of a defect scan.
+fn debt_value(f: &Finding) -> String {
+    let (ceiling, upgrade_trigger) = split_debt_marker(&f.message);
+    serde_json::json!({
+        "ceiling": ceiling,
+        "upgrade_trigger": upgrade_trigger,
+        "file_line": format!("{}:{}", f.file, f.line),
+        "commit_sha": f.commit_sha,
+    })
+    .to_string()
+}
+
 /// True for finding-class keys (`dead:`, `unused-dep:`, `stub:`, `todo:`,
 /// `dark:`). Excludes `run:<date>` summaries and any unrelated key, which the
 /// reconciler must never touch.
@@ -590,15 +667,36 @@ pub struct ReconcilePlan {
 /// for today is dropped so `push` can rewrite one fresh.
 pub fn reconcile_plan(entity: &str, h: &Harvest, date: &str, existing: &[(String, String, String)]) -> ReconcilePlan {
     let run_key = format!("run:{date}");
-    let desired: std::collections::BTreeMap<String, String> =
-        h.findings.iter().map(|f| (fact_key(f), finding_value(f))).collect();
+    let desired = h.findings.iter().map(|f| (fact_key(f), finding_value(f))).collect();
+    reconcile_desired(entity, desired, Some(run_key.as_str()), existing)
+}
 
+/// Reconcile one `debt:<repo>/<area>` ledger entity against the debt findings
+/// that belong to it. Same desired-state semantics as [`reconcile_plan`] over a
+/// different value projection ([`debt_value`]), and **no** `run_key`: the debt
+/// pass writes no run summary (the `codehealth:` one already counts the class),
+/// so a `run:` key under a debt entity is left alone rather than deleted and
+/// never rewritten.
+fn debt_reconcile_plan(entity: &str, findings: &[&Finding], existing: &[(String, String, String)]) -> ReconcilePlan {
+    let desired = findings.iter().map(|f| (fact_key(f), debt_value(f))).collect();
+    reconcile_desired(entity, desired, None, existing)
+}
+
+/// The reconcile core, over an already-built `key -> value` desired set.
+/// `run_key`, when given, is the one non-finding key that is deleted so the
+/// caller can rewrite it fresh.
+fn reconcile_desired(
+    entity: &str,
+    desired: std::collections::BTreeMap<String, String>,
+    run_key: Option<&str>,
+    existing: &[(String, String, String)],
+) -> ReconcilePlan {
     let mut delete = Vec::new();
     let mut kept: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut retired_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     for (key, id, value) in existing {
-        if key == &run_key {
+        if run_key == Some(key.as_str()) {
             delete.push(id.clone()); // drop stale same-day run copies; rewrite fresh
             continue;
         }
@@ -647,6 +745,18 @@ pub struct PushReport {
     pub unchanged: usize,
     pub retired: usize,
     pub run_key: String,
+    /// One row per `debt:<repo>/<area>` ledger entity reconciled (empty when
+    /// the repo has no `crux-min:` markers and none are on record).
+    pub debt: Vec<DebtLedgerReport>,
+}
+
+/// Outcome for one `debt:<repo>/<area>` ledger entity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DebtLedgerReport {
+    pub entity: String,
+    pub written: usize,
+    pub unchanged: usize,
+    pub retired: usize,
 }
 
 fn http_agent() -> ureq::Agent {
@@ -714,6 +824,57 @@ fn fetch_entity_facts(
     Ok(out)
 }
 
+/// Cap on discovery pages — 64 x 500 rows. A bound, not a limit we expect to
+/// reach: it exists so a daemon that echoed a non-advancing cursor could not
+/// spin this loop forever.
+const DEBT_DISCOVERY_MAX_PAGES: usize = 64;
+
+/// Every entity under `prefix` that currently holds facts, via cursor-paged
+/// `GET /v1/facts/list?entity_prefix=…`.
+///
+/// Discovery only. The authoritative rows still come from
+/// [`fetch_entity_facts`], because the list endpoint truncates long values —
+/// and a truncated value never compares equal to the desired one, which would
+/// turn every push into a full rewrite of that entity.
+fn fetch_entities_with_prefix(
+    agent: &ureq::Agent,
+    base: &str,
+    token: Option<&str>,
+    prefix: &str,
+) -> Result<std::collections::BTreeSet<String>, DynErr> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..DEBT_DISCOVERY_MAX_PAGES {
+        let mut url = format!(
+            "{}/v1/facts/list?limit=500&entity_prefix={}",
+            base.trim_end_matches('/'),
+            urlencoding::encode(prefix)
+        );
+        if let Some(c) = &cursor {
+            use std::fmt::Write as _;
+            let _ = write!(url, "&cursor={}", urlencoding::encode(c));
+        }
+        let resp = with_bearer(agent.get(&url), token).call()?;
+        let body = resp.into_body().read_to_string()?;
+        let parsed: serde_json::Value = serde_json::from_str(&body)?;
+        if let Some(arr) = parsed.get("facts").and_then(|f| f.as_array()) {
+            for f in arr {
+                if let Some(entity) = f.get("entity").and_then(|e| e.as_str()) {
+                    if entity.starts_with(prefix) {
+                        out.insert(entity.to_string());
+                    }
+                }
+            }
+        }
+        let has_more = parsed.get("has_more").and_then(|h| h.as_bool()) == Some(true);
+        match parsed.get("next_cursor").and_then(|c| c.as_str()) {
+            Some(c) if has_more => cursor = Some(c.to_string()),
+            _ => break,
+        }
+    }
+    Ok(out)
+}
+
 fn delete_fact(agent: &ureq::Agent, base: &str, token: Option<&str>, id: &str) -> Result<(), DynErr> {
     let url = format!("{}/v1/facts/{}", base.trim_end_matches('/'), urlencoding::encode(id));
     with_bearer(agent.delete(&url), token).call()?;
@@ -734,6 +895,55 @@ fn put_json(
         return Err(format!("{what} failed ({status}): {err_body}").into());
     }
     Ok(())
+}
+
+/// Reconcile the harvest's `debt`-class findings into per-area
+/// `debt:<repo>/<area>` entities (M4), additively — the `codehealth:<repo>`
+/// pass has already written the same findings and is untouched.
+///
+/// The reconciled set is the **union** of the areas that have debt now and the
+/// areas that hold debt facts already: without the second half, an area whose
+/// last `crux-min:` marker was deleted would never be fetched again and its
+/// facts would sit there claiming a shortcut that no longer exists — the exact
+/// rot the ledger exists to prevent.
+fn push_debt_ledger(
+    agent: &ureq::Agent,
+    base: &str,
+    token: Option<&str>,
+    h: &Harvest,
+) -> Result<Vec<DebtLedgerReport>, DynErr> {
+    let prefix = format!("debt:{}/", h.repo);
+    let mut by_entity: std::collections::BTreeMap<String, Vec<&Finding>> = std::collections::BTreeMap::new();
+    for f in h.findings.iter().filter(|f| f.class == class::DEBT) {
+        by_entity
+            .entry(format!("{prefix}{}", debt_area(&f.file)))
+            .or_default()
+            .push(f);
+    }
+
+    let mut entities: std::collections::BTreeSet<String> = by_entity.keys().cloned().collect();
+    entities.extend(fetch_entities_with_prefix(agent, base, token, &prefix)?);
+
+    let mut out = Vec::new();
+    for entity in entities {
+        let existing = fetch_entity_facts(agent, base, token, &entity)?;
+        let findings = by_entity.get(&entity).map_or(&[][..], Vec::as_slice);
+        let plan = debt_reconcile_plan(&entity, findings, &existing);
+        for id in &plan.delete {
+            delete_fact(agent, base, token, id)?;
+        }
+        if !plan.write.is_empty() {
+            let url = format!("{}/v1/facts/bulk", base.trim_end_matches('/'));
+            put_json(agent, &url, token, serde_json::json!(plan.write), "debt fact write")?;
+        }
+        out.push(DebtLedgerReport {
+            entity,
+            written: plan.write.len(),
+            unchanged: plan.unchanged,
+            retired: plan.retired,
+        });
+    }
+    Ok(out)
 }
 
 /// Harvest `repo` and reconcile the result into the daemon at `base`: delete
@@ -761,12 +971,15 @@ pub fn push(repo: &Path, base: &str, token: Option<&str>, date: &str) -> Result<
     let url = format!("{}/v1/facts", base.trim_end_matches('/'));
     put_json(&agent, &url, token, summary, "run-summary write")?;
 
+    let debt = push_debt_ledger(&agent, base, token, &h)?;
+
     Ok(PushReport {
         entity,
         written: plan.write.len(),
         unchanged: plan.unchanged,
         retired: plan.retired,
         run_key,
+        debt,
     })
 }
 
@@ -807,6 +1020,12 @@ pub fn run_push(repo: &Path, base: &str, token_file: Option<&Path>) -> Result<()
         "{}: {} written, {} unchanged, {} retired; summary {}",
         report.entity, report.written, report.unchanged, report.retired, report.run_key
     );
+    for d in &report.debt {
+        println!(
+            "  {}: {} written, {} unchanged, {} retired",
+            d.entity, d.written, d.unchanged, d.retired
+        );
+    }
     Ok(())
 }
 
@@ -1148,8 +1367,9 @@ mod tests {
     fn push_empty_repo_writes_only_run_summary() {
         let repo = tmp(); // no source files, no Cargo.toml → empty harvest
         let (port, h) = crate::test_support::serve_responses(vec![
-            (200, r#"{"facts":[]}"#.to_string()), // fetch_entity_facts
-            (200, "{}".to_string()),              // run-summary PUT
+            (200, r#"{"facts":[]}"#.to_string()),                  // fetch_entity_facts
+            (200, "{}".to_string()),                               // run-summary PUT
+            (200, r#"{"facts":[],"has_more":false}"#.to_string()), // debt-ledger discovery
         ]);
         let report = push(&repo, &format!("http://127.0.0.1:{port}"), Some("tok"), "2026-06-17").expect("push ok");
         let reqs = h.join().unwrap();
@@ -1174,9 +1394,10 @@ mod tests {
         })
         .to_string();
         let (port, h) = crate::test_support::serve_responses(vec![
-            (200, existing),         // fetch
-            (200, "{}".to_string()), // DELETE f_stale
-            (200, "{}".to_string()), // run summary PUT
+            (200, existing),                                       // fetch
+            (200, "{}".to_string()),                               // DELETE f_stale
+            (200, "{}".to_string()),                               // run summary PUT
+            (200, r#"{"facts":[],"has_more":false}"#.to_string()), // debt-ledger discovery
         ]);
         let report = push(&repo, &format!("http://127.0.0.1:{port}"), None, "2026-06-17").expect("push ok");
         let reqs = h.join().unwrap();
@@ -1190,14 +1411,187 @@ mod tests {
         std::fs::create_dir_all(repo.join("src")).unwrap();
         std::fs::write(repo.join("src/a.rs"), "// TODO: do it\n").unwrap();
         let (port, h) = crate::test_support::serve_responses(vec![
-            (200, r#"{"facts":[]}"#.to_string()), // fetch (nothing yet)
-            (200, "{}".to_string()),              // bulk write PUT
-            (200, "{}".to_string()),              // run summary PUT
+            (200, r#"{"facts":[]}"#.to_string()),                  // fetch (nothing yet)
+            (200, "{}".to_string()),                               // bulk write PUT
+            (200, "{}".to_string()),                               // run summary PUT
+            (200, r#"{"facts":[],"has_more":false}"#.to_string()), // debt-ledger discovery
         ]);
         let report = push(&repo, &format!("http://127.0.0.1:{port}"), None, "2026-06-17").expect("push ok");
         let reqs = h.join().unwrap();
         assert_eq!(report.written, 1);
         assert!(reqs[1].starts_with("PUT /v1/facts/bulk"));
         assert!(reqs[1].contains("todo:src/a.rs:1"));
+        assert!(report.debt.is_empty(), "a todo is not debt: {:?}", report.debt);
+    }
+
+    // ── debt ledger (M4) ─────────────────────────────────────────────────
+
+    #[test]
+    fn debt_area_is_the_crate_then_the_first_segment_then_root() {
+        assert_eq!(debt_area("crates/crux-mcp/src/tools/reuse.rs"), "crux-mcp");
+        assert_eq!(debt_area("integrations/adapters/langchain.py"), "integrations");
+        assert_eq!(debt_area("main.rs"), "root");
+        assert_eq!(debt_area(""), "root");
+        // `crates/` with nothing under the crate dir has no crate to name.
+        assert_eq!(debt_area("crates"), "root");
+    }
+
+    #[test]
+    fn split_debt_marker_takes_ceiling_before_the_semicolon() {
+        // The shape `scan_markers` actually produces: needle + raw source line,
+        // so `crux-min:` appears twice and the last occurrence must win.
+        let (ceiling, trigger) =
+            split_debt_marker("crux-min:: // crux-min: global lock; per-account locks if throughput matters");
+        assert_eq!(ceiling, "global lock");
+        assert_eq!(trigger.as_deref(), Some("per-account locks if throughput matters"));
+
+        // No `;` ⇒ the whole body is the ceiling and the trigger is absent,
+        // never guessed.
+        let (ceiling, trigger) = split_debt_marker("crux-min:: // crux-min: naive term-overlap scoring");
+        assert_eq!(ceiling, "naive term-overlap scoring");
+        assert_eq!(trigger, None);
+
+        // Trailing `;` with nothing after it is also "no trigger".
+        let (_, trigger) = split_debt_marker("crux-min: something;   ");
+        assert_eq!(trigger, None);
+    }
+
+    #[test]
+    fn debt_value_carries_the_ledger_shape_not_the_finding_shape() {
+        let f = Finding {
+            class: class::DEBT.into(),
+            file: "crates/x/src/a.rs".into(),
+            line: 4,
+            message: "crux-min:: // crux-min: O(n^2) scan; swap in an index past 10k rows".into(),
+            tool: "grep".into(),
+            commit_sha: "abc1234".into(),
+        };
+        let v: serde_json::Value = serde_json::from_str(&debt_value(&f)).expect("value is json");
+        assert_eq!(v["ceiling"], "O(n^2) scan");
+        assert_eq!(v["upgrade_trigger"], "swap in an index past 10k rows");
+        assert_eq!(v["file_line"], "crates/x/src/a.rs:4");
+        assert_eq!(v["commit_sha"], "abc1234");
+    }
+
+    #[test]
+    fn debt_reconcile_skips_unchanged_and_leaves_run_keys_alone() {
+        let f = Finding {
+            class: class::DEBT.into(),
+            file: "crates/x/src/a.rs".into(),
+            line: 4,
+            message: "crux-min:: // crux-min: global lock; per-account locks".into(),
+            tool: "grep".into(),
+            commit_sha: "s".into(),
+        };
+        let existing = vec![
+            (
+                "debt:crates/x/src/a.rs:4".to_string(),
+                "f_keep".to_string(),
+                debt_value(&f),
+            ),
+            ("run:2026-08-20".to_string(), "f_run".to_string(), "{}".to_string()),
+        ];
+        let plan = debt_reconcile_plan("debt:Crux/x", &[&f], &existing);
+        assert!(plan.write.is_empty(), "unchanged debt must not be rewritten");
+        assert_eq!(plan.unchanged, 1);
+        assert!(
+            plan.delete.is_empty(),
+            "the debt pass writes no run summary, so it must not delete one: {:?}",
+            plan.delete
+        );
+    }
+
+    #[test]
+    fn push_projects_debt_findings_into_per_area_entities() {
+        let repo = tmp();
+        std::fs::create_dir_all(repo.join("crates/alpha/src")).unwrap();
+        std::fs::create_dir_all(repo.join("beta")).unwrap();
+        std::fs::write(
+            repo.join("crates/alpha/src/a.rs"),
+            "// crux-min: global lock; per-account locks if throughput matters
+",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("beta/b.ts"),
+            "// crux-min: naive scan
+",
+        )
+        .unwrap();
+        let slug = repo_slug(&repo);
+
+        let (port, h) = crate::test_support::serve_responses(vec![
+            (200, r#"{"facts":[]}"#.to_string()),                  // codehealth fetch
+            (200, "{}".to_string()),                               // codehealth bulk write
+            (200, "{}".to_string()),                               // run summary
+            (200, r#"{"facts":[],"has_more":false}"#.to_string()), // debt discovery: nothing on record
+            (200, r#"{"facts":[]}"#.to_string()),                  // debt:<slug>/alpha fetch
+            (200, "{}".to_string()),                               // debt:<slug>/alpha write
+            (200, r#"{"facts":[]}"#.to_string()),                  // debt:<slug>/beta fetch
+            (200, "{}".to_string()),                               // debt:<slug>/beta write
+        ]);
+        let report = push(&repo, &format!("http://127.0.0.1:{port}"), None, "2026-08-20").expect("push ok");
+        let reqs = h.join().unwrap();
+
+        // Additive: the shared codehealth entity still carries both findings.
+        assert!(reqs[1].starts_with("PUT /v1/facts/bulk"), "{}", reqs[1]);
+        assert!(
+            reqs[1].contains("codehealth%3A") || reqs[1].contains("codehealth:"),
+            "{}",
+            reqs[1]
+        );
+        assert!(reqs[1].contains("debt:crates/alpha/src/a.rs:1"), "{}", reqs[1]);
+        assert!(reqs[1].contains("debt:beta/b.ts:1"), "{}", reqs[1]);
+
+        // Discovery is prefix-scoped to this repo's ledger.
+        assert!(reqs[3].starts_with("GET /v1/facts/list?"), "{}", reqs[3]);
+        assert!(reqs[3].contains("entity_prefix=debt%3A"), "{}", reqs[3]);
+
+        assert_eq!(report.debt.len(), 2, "{:?}", report.debt);
+        assert_eq!(report.debt[0].entity, format!("debt:{slug}/alpha"));
+        assert_eq!(report.debt[0].written, 1);
+        assert_eq!(report.debt[1].entity, format!("debt:{slug}/beta"));
+        assert_eq!(report.debt[1].written, 1);
+        assert!(reqs[4].contains("alpha"), "{}", reqs[4]);
+        assert!(reqs[5].contains("ceiling"), "{}", reqs[5]);
+        assert!(reqs[5].contains("global lock"), "{}", reqs[5]);
+        assert!(reqs[5].contains("crates/alpha/src/a.rs:1"), "{}", reqs[5]);
+    }
+
+    #[test]
+    fn push_retires_debt_facts_for_an_area_whose_marker_is_gone() {
+        let repo = tmp(); // empty harvest: no `crux-min:` marker anywhere
+        let slug = repo_slug(&repo);
+        let orphaned = format!("debt:{slug}/alpha");
+        let listed = serde_json::json!({
+            "facts": [{
+                "entity": orphaned,
+                "key": "debt:crates/alpha/src/a.rs:1",
+                "fact_id": "f_debt",
+                "value": "{}"
+            }],
+            "has_more": false
+        })
+        .to_string();
+        let entity_rows = serde_json::json!({
+            "facts": [{ "key": "debt:crates/alpha/src/a.rs:1", "fact_id": "f_debt", "value": "{}" }]
+        })
+        .to_string();
+
+        let (port, h) = crate::test_support::serve_responses(vec![
+            (200, r#"{"facts":[]}"#.to_string()), // codehealth fetch
+            (200, "{}".to_string()),              // run summary
+            (200, listed),                        // discovery surfaces the orphaned area
+            (200, entity_rows),                   // its authoritative rows
+            (200, "{}".to_string()),              // DELETE f_debt
+        ]);
+        let report = push(&repo, &format!("http://127.0.0.1:{port}"), None, "2026-08-20").expect("push ok");
+        let reqs = h.join().unwrap();
+
+        assert_eq!(report.debt.len(), 1, "{:?}", report.debt);
+        assert_eq!(report.debt[0].entity, orphaned);
+        assert_eq!(report.debt[0].retired, 1);
+        assert_eq!(report.debt[0].written, 0);
+        assert!(reqs[4].starts_with("DELETE /v1/facts/f_debt"), "{}", reqs[4]);
     }
 }
