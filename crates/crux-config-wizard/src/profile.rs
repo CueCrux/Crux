@@ -434,6 +434,58 @@ This is the body.
         );
     }
 
+    /// v2 lifted the deploy checklist into the bundled `pre-deploy-gate` skill.
+    /// What stays inline is only what a deploy-triggered skill cannot deliver in
+    /// time: the process-detachment triad (any long-running job, not just a
+    /// deploy) and the three-place wiring rule (a coding-time gotcha that has
+    /// nothing to do with deploying). Guard both directions — the moved
+    /// checklist must not creep back, and those two must not drift out.
+    #[test]
+    fn pre_deploy_gate_v2_defers_the_checklist_to_the_skill() {
+        let bundled = load_bundled_profiles().unwrap();
+        let p = bundled
+            .iter()
+            .find(|f| f.frontmatter.name == "pre-deploy-gate")
+            .expect("pre-deploy-gate fragment must be bundled");
+        assert_eq!(p.frontmatter.version, 2);
+
+        let body = p.body.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+        for moved in [
+            "ls db/migrations/",
+            "database_url",
+            "df -h",
+            "corecruxd-deploy-audit",
+            "journalctl -u corecruxd",
+            "store_fact(entity=\"incident:",
+        ] {
+            assert!(
+                !body.contains(moved),
+                "checklist item crept back into the always-loaded profile: {moved}"
+            );
+        }
+
+        assert!(
+            body.contains("`pre-deploy-gate` skill's checklist"),
+            "the profile must name the skill, or the checklist becomes unreachable"
+        );
+        assert!(
+            body.contains("setsid + nohup + < /dev/null + disown"),
+            "the process-detachment triad fires outside a deploy and must stay inline"
+        );
+        assert!(
+            body.contains("storage allowlist, projection registry, and load-at-startup"),
+            "three-place wiring is a coding-time gotcha and must stay inline"
+        );
+
+        // The point of the move is the always-loaded cost. v1 was 34 non-blank
+        // lines; a pointer that grows back past ~a dozen has undone the win.
+        let body_lines = p.body.lines().filter(|l| !l.trim().is_empty()).count();
+        assert!(
+            body_lines <= 13,
+            "pre-deploy-gate body is {body_lines} non-blank lines; detail belongs in the skill"
+        );
+    }
+
     /// v3 moved the drift guard's install/wiring detail into
     /// `docs/execplan-drift-guard.md`. The body keeps only what an agent needs
     /// mid-session; operator setup is read on demand. Guard both halves.

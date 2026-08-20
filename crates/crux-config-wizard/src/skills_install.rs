@@ -15,6 +15,12 @@
 //! (`execplan-run` encodes the ExecPlan execution + closeout loop) is the same
 //! class of artefact as a profile fragment — versioned, regenerable, and
 //! useless if it only exists on one machine.
+//!
+//! The second class is progressive disclosure: a profile block that is
+//! task-scoped rather than session-scoped costs every session its tokens but
+//! is read by almost none of them. `pre-deploy-gate` is that case — the
+//! checklist lives here and loads on a deploy trigger, while the profile keeps
+//! only what has to be in context before the trigger fires.
 
 use std::path::{Path, PathBuf};
 
@@ -57,6 +63,11 @@ const BUNDLED: &[SkillFile] = &[
         rel: "execplan-run/scripts/ep",
         body: include_str!("../assets/skills/execplan-run/scripts/ep"),
         exec: true,
+    },
+    SkillFile {
+        rel: "pre-deploy-gate/SKILL.md",
+        body: include_str!("../assets/skills/pre-deploy-gate/SKILL.md"),
+        exec: false,
     },
 ];
 
@@ -232,6 +243,52 @@ mod tests {
                 f.rel.contains("/scripts/"),
                 "{} exec bit disagrees with its path",
                 f.rel
+            );
+        }
+    }
+
+    /// M4 of ExecPlan `opus-5-agent-config-rightsizing-2026-07-27` is a *move*,
+    /// not a deletion: every rule that left `profiles/pre-deploy-gate.md` v1 has
+    /// to be reachable from exactly one of the two surfaces. Coverage and
+    /// non-duplication are asserted together on purpose — a dropped item loses a
+    /// gotcha (plan risk R2), and a re-inlined one puts the same rule in both the
+    /// always-loaded file and the skill, which is the duplication this generation
+    /// of models pays tokens to reconcile.
+    #[test]
+    fn pre_deploy_gate_rules_survive_the_move_without_duplicating() {
+        let skill = BUNDLED
+            .iter()
+            .find(|f| f.rel == "pre-deploy-gate/SKILL.md")
+            .expect("pre-deploy-gate skill must be bundled")
+            .body;
+        let profile = crate::load_bundled_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.frontmatter.name == "pre-deploy-gate")
+            .expect("pre-deploy-gate profile must be bundled")
+            .body;
+
+        for rule in [
+            "ls db/migrations/",
+            "idempotent on re-run",
+            "CORECRUXD_AUTH_MODE",
+            "never `cat`'d into a file you write",
+            "df -h",
+            "kill -9",
+            "--backup-binary",
+            "corecruxd-deploy-audit",
+            "curl /readyz",
+            "journalctl -u corecruxd",
+            "incident:<YYYY-MM-DD>",
+            "setsid + nohup + < /dev/null + disown",
+            "storage allowlist, projection registry, and load-at-startup",
+        ] {
+            let in_skill = skill.contains(rule);
+            let in_profile = profile.contains(rule);
+            assert!(in_skill || in_profile, "rule lost in the profile→skill move: {rule}");
+            assert!(
+                !(in_skill && in_profile),
+                "rule is on both surfaces, so every deploy session reads it twice: {rule}"
             );
         }
     }
