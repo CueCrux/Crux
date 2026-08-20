@@ -566,7 +566,7 @@ fn dispatch_external_tool_inner(
 }
 
 /// Stage the in-scope `fact_writes[]` of a completed dispatch as
-/// [`StoreFact`]s, each stamped with the calling pack's
+/// [`StoreFact`](corecrux_memory::fact_store::StoreFact)s, each stamped with the calling pack's
 /// [`PackAttribution::actor`].
 ///
 /// The HTTP layer used to re-implement the grant/privacy filter inline
