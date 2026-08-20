@@ -215,6 +215,18 @@ pub(super) async fn post_publish(
         .into_response()
 }
 
+/// Records `crux.outcome` (ExecPlan `crux-code-intel-silent-empty-outcomes`, M2).
+///
+/// This function *is* the second motivating bug. With `query:` in place of
+/// `entity_prefix`, unrelated facts that merely mentioned the prefix took every
+/// one of the 500 slots and this returned **zero of eight** dossiers — as a
+/// `200 OK` with an empty array, no error anywhere (Crux#558). The prefix scan
+/// is fixed; the outcome dimension is what makes a recurrence visible instead
+/// of silent.
+///
+/// Admission bar: if this returned empty on every call, that would be a bug —
+/// the caller is listing a project that has dossiers.
+#[tracing::instrument(level = "info", skip_all, fields(crux.outcome = tracing::field::Empty))]
 async fn list_dossier_ids_internal(
     fact_store: &std::sync::Arc<tokio::sync::RwLock<corecrux_memory::FactStore>>,
     scope: &crate::auth::TenantScope,
@@ -250,7 +262,7 @@ async fn list_dossier_ids_internal(
         })
         .collect();
     out.sort_by(|a, b| b.1.cmp(&a.1));
-    out
+    crux_observe::span_layer::OutcomeExt::record_outcome_through(out)
 }
 
 async fn load_dossier(
@@ -676,6 +688,55 @@ mod tests {
         assert_eq!(extract_passport_id(&headers), "anonymous");
         headers.insert("x-corecrux-passport-id", "p_abc".parse().unwrap());
         assert_eq!(extract_passport_id(&headers), "p_abc");
+    }
+
+    // ── outcome dimension (ExecPlan crux-code-intel-silent-empty-outcomes, M2) ──
+
+    /// Drives the real handler, not the internal directly, so tenant scope is
+    /// resolved exactly as it is in production — this lister's emptiness is a
+    /// function of what the caller is allowed to see, and a test that bypassed
+    /// that would prove less than it appears to.
+    ///
+    /// Also the guard for the sharp edge: lose
+    /// `fields(crux.outcome = tracing::field::Empty)` on the lister and both
+    /// observations read `Unrecorded`, failing here rather than going quiet in
+    /// production.
+    #[test]
+    fn the_dossier_lister_records_whether_it_returned_anything() {
+        use crux_observe::span_layer::SpanOutcome;
+
+        let ((), spans) = crate::span_capture_test_support::capture_spans_async(64, || async {
+            let st = state();
+            let list = |project: &str| {
+                list_dossiers(
+                    State(st.clone()),
+                    Path(project.to_string()),
+                    Query(BudgetQuery::default()),
+                    HeaderMap::new(),
+                    Query(super::super::traces::OptionalTenantQuery::default()),
+                )
+            };
+
+            // Empty path: a project with nothing published under it.
+            let (status, body) = parts(list("nothing-here").await.into_response()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["count"], 0, "precondition: the empty case is empty");
+
+            // Non-empty path.
+            assert_eq!(
+                publish(&st, dossier("d1", "proj", "agent-1", 1000, vec![claim("c1")])).await,
+                StatusCode::CREATED
+            );
+            let (status, body) = parts(list("proj").await.into_response()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["count"], 1, "precondition: the non-empty case is non-empty");
+        });
+
+        assert_eq!(
+            crate::span_capture_test_support::outcomes_of(&spans, "list_dossier_ids_internal"),
+            vec![SpanOutcome::Empty, SpanOutcome::NonEmpty],
+            "the lister that returned 0 of 8 in Crux#558 must now say which it was"
+        );
     }
 
     #[tokio::test]

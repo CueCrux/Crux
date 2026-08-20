@@ -121,6 +121,8 @@ mod repo_watch;
 mod self_update;
 mod session_bindings;
 mod shard_map;
+#[cfg(test)]
+mod span_capture_test_support;
 mod status_feed;
 mod storybook;
 mod structured_log;
