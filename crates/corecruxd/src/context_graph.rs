@@ -22,6 +22,7 @@
 #![allow(dead_code)] // graph-fold helpers staged for the AX Graph panel — kept for symmetry with sibling renderers
 
 use corecrux_memory::fact_store::{FactQuery, FactStore};
+use crux_observe::span_layer::OutcomeExt;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -465,6 +466,18 @@ pub fn load_latest_workspace_blocking_pub(store: &FactStore) -> Option<crate::wo
     load_latest_workspace_blocking(store)
 }
 
+/// Records `crux.outcome` (ExecPlan `crux-code-intel-silent-empty-outcomes`, M2).
+///
+/// This function *is* the first motivating bug. It ran on every storybook
+/// generation and returned `None`, so the storybook reported 0 LOC, 0 stubs and
+/// 0 dead code — a result indistinguishable from "no scan has ever been run".
+/// `liveness` said `executed: true`, which was correct and useless. The lookup
+/// is fixed (`20ba145`), but the *class* is only observable if the site says
+/// whether its work came back empty.
+///
+/// Admission bar: if this returned `None` on every call, that would be a bug —
+/// a daemon with a workspace scan on disk must be able to read it back.
+#[tracing::instrument(level = "info", skip_all, fields(crux.outcome = tracing::field::Empty))]
 fn load_latest_workspace_blocking(store: &FactStore) -> Option<crate::workspace_scan::WorkspaceScan> {
     // Exact-entity lookup, NOT a `query:` text search.
     //
@@ -491,10 +504,13 @@ fn load_latest_workspace_blocking(store: &FactStore) -> Option<crate::workspace_
         token_budget: None,
     });
     let latest = crate::fact_helpers::dedup_latest(result.facts);
-    let fact = latest
+    // `and_then` rather than `?`: the outcome must be recorded on the
+    // not-found path too, which is the whole point of the dimension.
+    latest
         .into_iter()
-        .find(|f| f.entity == crate::workspace_scan::LATEST_SCAN_ENTITY && f.key == crate::workspace_scan::SCAN_KEY)?;
-    serde_json::from_str::<crate::workspace_scan::WorkspaceScan>(&fact.value).ok()
+        .find(|f| f.entity == crate::workspace_scan::LATEST_SCAN_ENTITY && f.key == crate::workspace_scan::SCAN_KEY)
+        .and_then(|fact| serde_json::from_str::<crate::workspace_scan::WorkspaceScan>(&fact.value).ok())
+        .record_outcome_through()
 }
 
 /// Fold a workspace scan into the project graph. Adds module / file (and
@@ -1002,6 +1018,66 @@ mod tests {
             ]
         );
         assert!(query_prefix(&store, "__nothing__::", 100).is_empty());
+    }
+
+    // ── outcome dimension (ExecPlan crux-code-intel-silent-empty-outcomes, M2) ──
+
+    /// The loader must say *which* case it was: found, or came back empty.
+    /// Before the dimension existed, an always-`None` lookup was
+    /// indistinguishable from a workspace nobody had ever scanned — the exact
+    /// confusion that let the `20ba145` bug run on every storybook generation
+    /// while `liveness` reported `executed: true`.
+    ///
+    /// This is also the guard for the design's one sharp edge: a site that
+    /// loses its `fields(crux.outcome = tracing::field::Empty)` declaration
+    /// records **nothing**, silently. Drop that clause from the loader and both
+    /// observations below read `Unrecorded`, and this fails.
+    #[test]
+    fn the_workspace_scan_loader_records_whether_it_found_anything() {
+        use crux_observe::span_layer::SpanOutcome;
+
+        let ((), spans) = crate::span_capture_test_support::capture_spans(16, || {
+            // Empty path: nothing stored at all.
+            assert!(load_latest_workspace_blocking(&FactStore::new()).is_none());
+            // Non-empty path: a scan is present and parses.
+            let mut store = FactStore::new();
+            let mut scan = crate::workspace_scan::WorkspaceScan::default();
+            scan.scan_id = "ws_outcome".into();
+            put_scan(&mut store, &scan);
+            assert!(load_latest_workspace_blocking(&store).is_some());
+        });
+
+        assert_eq!(
+            crate::span_capture_test_support::outcomes_of(&spans, "load_latest_workspace_blocking"),
+            vec![SpanOutcome::Empty, SpanOutcome::NonEmpty],
+            "the loader must declare an outcome on both paths, in order"
+        );
+    }
+
+    /// A stored-but-unparseable scan is still an empty *result*: the caller gets
+    /// `None` and renders a zero-LOC workspace either way. Recording it as
+    /// non-empty because a fact happened to exist would put the dimension's
+    /// blind spot exactly where the bug was.
+    #[test]
+    fn a_corrupt_scan_fact_records_empty_not_found() {
+        use crux_observe::span_layer::SpanOutcome;
+
+        let ((), spans) = crate::span_capture_test_support::capture_spans(8, || {
+            let mut store = FactStore::new();
+            put_fact(
+                &mut store,
+                crate::workspace_scan::LATEST_SCAN_ENTITY,
+                crate::workspace_scan::SCAN_KEY,
+                "{ not json",
+            );
+            assert!(load_latest_workspace_blocking(&store).is_none());
+        });
+
+        assert_eq!(
+            crate::span_capture_test_support::outcomes_of(&spans, "load_latest_workspace_blocking"),
+            vec![SpanOutcome::Empty],
+            "a fact that will not parse is an empty result, not a found one"
+        );
     }
 
     #[test]

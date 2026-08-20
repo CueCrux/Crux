@@ -151,6 +151,18 @@ pub(super) async fn post_generate(
         .into_response()
 }
 
+/// Records `crux.outcome` (ExecPlan `crux-code-intel-silent-empty-outcomes`, M2).
+///
+/// Third site in the curated set, and the same defect class as the dossier
+/// lister above it: one of the fourteen listers that passed its entity prefix
+/// as `query:` and could therefore be crowded out of its own `top_k`
+/// (Crux#558). Not a bug that was observed here, but the same code shape over
+/// the same store, and the storybook is exactly where an empty list reads as
+/// "nothing has been generated" rather than "the read failed".
+///
+/// Admission bar: if this returned empty on every call, that would be a bug —
+/// every project that has ever generated a storybook has at least one version.
+#[tracing::instrument(level = "info", skip_all, fields(crux.outcome = tracing::field::Empty))]
 async fn list_storybook_versions_internal(
     fact_store: &std::sync::Arc<tokio::sync::RwLock<corecrux_memory::FactStore>>,
     scope: &crate::auth::TenantScope,
@@ -175,7 +187,7 @@ async fn list_storybook_versions_internal(
         .filter_map(|f| f.entity[prefix.len()..].parse::<u64>().ok())
         .collect();
     tss.sort_by(|a, b| b.cmp(a));
-    tss
+    crux_observe::span_layer::OutcomeExt::record_outcome_through(tss)
 }
 
 async fn load_storybook(
@@ -517,6 +529,50 @@ mod tests {
         assert_eq!(extract_passport_id(&headers), "anonymous");
         headers.insert("x-corecrux-passport-id", "p_abc".parse().unwrap());
         assert_eq!(extract_passport_id(&headers), "p_abc");
+    }
+
+    // ── outcome dimension (ExecPlan crux-code-intel-silent-empty-outcomes, M2) ──
+
+    /// Third curated site. Driven through `list_versions` so tenant scope is
+    /// resolved the production way, and asserted on the count first so a green
+    /// outcome assertion cannot be reading a case that was empty for some other
+    /// reason.
+    ///
+    /// Guards the sharp edge too: without
+    /// `fields(crux.outcome = tracing::field::Empty)` on the lister, both
+    /// observations read `Unrecorded` and this fails.
+    #[test]
+    fn the_storybook_version_lister_records_whether_it_returned_anything() {
+        use crux_observe::span_layer::SpanOutcome;
+
+        let ((), spans) = crate::span_capture_test_support::capture_spans_async(64, || async {
+            let st = state();
+            let list = |project: &str| {
+                list_versions(
+                    State(st.clone()),
+                    Path(project.to_string()),
+                    HeaderMap::new(),
+                    Query(super::super::traces::OptionalTenantQuery::default()),
+                )
+            };
+
+            // Empty path: no storybook has ever been generated here.
+            let (status, body) = parts(list("nothing-here").await.into_response()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["count"], 0, "precondition: the empty case is empty");
+
+            // Non-empty path.
+            persist(&st, &doc("proj", 1000)).await;
+            let (status, body) = parts(list("proj").await.into_response()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["count"], 1, "precondition: the non-empty case is non-empty");
+        });
+
+        assert_eq!(
+            crate::span_capture_test_support::outcomes_of(&spans, "list_storybook_versions_internal"),
+            vec![SpanOutcome::Empty, SpanOutcome::NonEmpty],
+            "a version lister that goes permanently quiet must be visible as such"
+        );
     }
 
     #[test]
