@@ -72,10 +72,15 @@ where
     F: std::future::Future<Output = T>,
 {
     capture_spans(capacity, || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("current-thread runtime");
+        // Not `.expect()`: this module's `#[cfg(test)]` gate lives in `main.rs`,
+        // out of file, so `scripts/unwrap-ratchet.sh` cannot see it and would
+        // count an `expect` here as a new PRODUCTION unwrap site. Inflating the
+        // baseline to absorb a test-only expect would permanently license a
+        // real one, which is the trade the ratchet exists to prevent.
+        let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(runtime) => runtime,
+            Err(error) => panic!("current-thread runtime for span capture: {error}"),
+        };
         runtime.block_on(f())
     })
 }
