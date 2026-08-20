@@ -822,13 +822,112 @@ fn response_with_rcx_mode(mut response: Response, decision: Option<&crux_router:
 
 // ── Progressive retrieval: expand ──────────────────────────────────────
 
+/// Hydration tiers, spelled the way `crux-mcp`'s CRC-v1 envelope spells them
+/// ([`crux_mcp::crc_v1`]) rather than inventing a second vocabulary for the same
+/// idea. `mixed` is an outcome, never a request: it is what a `full` request
+/// degrades to when part of the set is withheld.
+const HYDRATE_POINTER: &str = "pointer";
+const HYDRATE_FULL: &str = "full";
+const HYDRATE_MIXED: &str = "mixed";
+
+/// Per-chunk hydration outcomes, reported on the chunk in `full` mode only.
+/// `demoted` is over budget and re-askable; `unavailable` is a segment that
+/// could not be read and is not. Collapsing them into one word would hide which
+/// of "ask again with a bigger budget" and "escalate" the caller needs.
+const HYDRATE_DEMOTED: &str = "demoted";
+const HYDRATE_UNAVAILABLE: &str = "unavailable";
+
 #[derive(serde::Deserialize, utoipa::ToSchema)]
 pub(super) struct TextSearchExpandBody {
     /// Tenant ID for the expand request (must match original scan).
-    #[allow(dead_code)] // Deserialized from request; tenant validation planned for multi-tenant expand.
     pub(super) tenant_id: String,
     /// Result IDs to expand (segment_index:doc_id pairs).
     pub(super) result_ids: Vec<ExpandResultId>,
+    /// Hydration tier. `"pointer"` — the default, and what an absent field
+    /// means — returns exactly the fields this route has always returned.
+    /// `"full"` additionally carries each chunk's `stream_id` (the `doc_id`
+    /// string supplied at ingest) and `content`.
+    #[serde(default)]
+    pub(super) hydrate: Option<String>,
+    /// Token budget for the hydrated tier, priced in the same `token_count`
+    /// each pointer already advertises, so a caller can budget from the
+    /// pointer response without guessing. Chunks hydrate in the order
+    /// `result_ids` lists them until it is spent; the rest stay pointers and
+    /// are counted in `meta.demoted`. Ignored in `"pointer"` mode.
+    #[serde(default)]
+    pub(super) token_budget: Option<usize>,
+}
+
+/// A chunk that has already passed the tenant check and may therefore be
+/// hydrated: where its bytes live, and what hydrating it would cost.
+struct HydrationCandidate {
+    /// Position in the emitted `chunks` array.
+    chunk_index: usize,
+    segment_index: usize,
+    frame_offset: u32,
+    token_cost: usize,
+}
+
+/// Every frame of the segment behind `segment_index`, or `None` if it cannot be
+/// read.
+///
+/// Reading is deliberately whole-segment: `frame_offset` in a `.ccxi` doc table
+/// is an offset into the *logical* record stream, and a sealed segment's record
+/// area is neither that stream nor addressable by it — blocks are padded to
+/// 4 KiB and may be compressed. `decode_segment_frames_v1` reassembles the
+/// stream first, which is the only thing that makes the offset mean what the
+/// companion says it means. The cost is why hydration is opt-in and budgeted,
+/// and why the decode is cached per segment for the life of one request.
+fn segment_frames_for_reader(
+    index: &corecrux_retrieval::IndexManager,
+    segment_index: usize,
+) -> Option<Vec<corecrux_segment::SegmentFrameV1>> {
+    let path = index.reader_segment_path(segment_index)?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "expand-hydrate-segment-unreadable");
+            return None;
+        }
+    };
+    match corecrux_segment::decode_segment_frames_v1(&bytes) {
+        Ok(frames) => Some(frames),
+        Err(error) => {
+            tracing::warn!(path = %path.display(), error = %format!("{error:?}"), "expand-hydrate-segment-undecodable");
+            None
+        }
+    }
+}
+
+/// The `(stream_id, content)` behind one indexed document.
+///
+/// `tenant_hash` is re-checked here against the frame's own canonical header —
+/// the same field, from the authoritative source, that the `.ccxi` doc table
+/// only caches a hash of. The caller has already refused every doc whose cached
+/// tenant differs; this asks the segment the same question, so a companion that
+/// disagrees with the segment beside it cannot turn into a cross-tenant read.
+fn hydrate_frame(
+    frames: &[corecrux_segment::SegmentFrameV1],
+    frame_offset: u32,
+    tenant_hash: u64,
+) -> Option<(String, String)> {
+    // Frames come back sorted on `record_off`, which is the value a `.ccxi`
+    // doc entry stores as `frame_offset` — so this is a join on the key, not a
+    // positional guess at `doc_id` (the companion skips non-indexable frames).
+    let position = frames
+        .binary_search_by_key(&frame_offset, |frame| frame.record_off)
+        .ok()?;
+    let frame = frames.get(position)?;
+    let header = corecrux_frame::decode_canonical_header_bytes_v1(&frame.header_bytes).ok()?;
+    if xxhash_rust::xxh64::xxh64(header.tenant_id.as_bytes(), 0) != tenant_hash {
+        tracing::warn!(
+            frame_offset,
+            "expand-hydrate-tenant-mismatch: .ccxi doc table disagrees with its segment"
+        );
+        return None;
+    }
+    let content = std::str::from_utf8(&frame.payload_bytes).ok()?;
+    Some((header.stream_id, content.to_string()))
 }
 
 #[derive(serde::Deserialize, utoipa::ToSchema)]
@@ -868,6 +967,15 @@ pub(super) async fn post_query_text_search_expand(
         return problem_response(StatusCode::NOT_FOUND, "text-search query not enabled");
     }
 
+    // An unrecognised tier is refused rather than silently served as pointers:
+    // a caller who typed `"Full"` would otherwise read a pointer response and
+    // conclude hydration is broken.
+    let hydrate_full = match body.hydrate.as_deref().map(str::trim) {
+        None | Some("") | Some(HYDRATE_POINTER) => false,
+        Some(HYDRATE_FULL) => true,
+        Some(_) => return problem_response(StatusCode::BAD_REQUEST, "hydrate must be \"pointer\" or \"full\""),
+    };
+
     let semantic_profile = state.fact_store.read().await.semantic_profile();
     let local_semantic_profile_id = semantic_profile.as_ref().map(|profile| profile.profile_id.clone());
     let embedding_fingerprint = semantic_profile
@@ -877,7 +985,8 @@ pub(super) async fn post_query_text_search_expand(
     let readers = index.readers();
 
     let mut tokens_loaded: usize = 0;
-    let mut chunks = Vec::new();
+    let mut chunks: Vec<serde_json::Value> = Vec::new();
+    let mut candidates: Vec<HydrationCandidate> = Vec::new();
 
     for rid in &body.result_ids {
         if rid.segment_index >= readers.len() {
@@ -892,7 +1001,17 @@ pub(super) async fn post_query_text_search_expand(
         if doc.tenant_hash_full != tenant_hash {
             continue;
         }
+        // Past this line the document belongs to the caller's tenant. Hydration
+        // reads content, so it is only *recorded* here and performed after the
+        // loop — a read placed above this check would be a cross-tenant leak.
         tokens_loaded += doc.doc_length_tokens as usize;
+
+        candidates.push(HydrationCandidate {
+            chunk_index: chunks.len(),
+            segment_index: rid.segment_index,
+            frame_offset: doc.frame_offset,
+            token_cost: doc.doc_length_tokens as usize,
+        });
 
         chunks.push(serde_json::json!({
             "segment_index": rid.segment_index,
@@ -909,19 +1028,89 @@ pub(super) async fn post_query_text_search_expand(
         }));
     }
 
+    let mut hydrated = 0usize;
+    let mut demoted = 0usize;
+    let mut unavailable = 0usize;
+    let mut tokens_hydrated = 0usize;
+
+    if hydrate_full {
+        // Greedy prefix over the caller's own `result_ids` order — the same
+        // boundary `crux_mcp::budget` applies to the fact path, reused rather
+        // than re-derived. At least one chunk always hydrates, and everything
+        // past the budget is demoted to the pointer it already is rather than
+        // dropped, so nothing is lost by asking for more than fits.
+        let costs: Vec<usize> = candidates.iter().map(|candidate| candidate.token_cost).collect();
+        let full_count = match body.token_budget {
+            Some(budget) => crux_mcp::budget::fact_full_within_budget(&costs, budget),
+            None => costs.len(),
+        };
+
+        // One decode per segment per request, not per chunk: expanding ten hits
+        // out of one segment must not read that segment ten times.
+        let mut frames_by_segment: std::collections::BTreeMap<usize, Option<Vec<corecrux_segment::SegmentFrameV1>>> =
+            std::collections::BTreeMap::new();
+
+        for (rank, candidate) in candidates.iter().enumerate() {
+            let chunk = &mut chunks[candidate.chunk_index];
+            if rank >= full_count {
+                demoted += 1;
+                chunk["hydrate"] = serde_json::json!(HYDRATE_DEMOTED);
+                continue;
+            }
+            let frames = frames_by_segment
+                .entry(candidate.segment_index)
+                .or_insert_with(|| segment_frames_for_reader(&index, candidate.segment_index));
+            match frames
+                .as_deref()
+                .and_then(|frames| hydrate_frame(frames, candidate.frame_offset, tenant_hash))
+            {
+                Some((stream_id, content)) => {
+                    hydrated += 1;
+                    tokens_hydrated += candidate.token_cost;
+                    chunk["hydrate"] = serde_json::json!(HYDRATE_FULL);
+                    chunk["stream_id"] = serde_json::json!(stream_id);
+                    chunk["content"] = serde_json::json!(content);
+                }
+                None => {
+                    unavailable += 1;
+                    chunk["hydrate"] = serde_json::json!(HYDRATE_UNAVAILABLE);
+                }
+            }
+        }
+    }
+
+    let mut meta = serde_json::json!({
+        "source_label": "local_tenant_index",
+        "score_space": SCORE_SPACE_BM25_LEXICAL,
+        "semantic_profile_id": null,
+        "local_semantic_profile_id": local_semantic_profile_id,
+        "local_semantic_profile": semantic_profile,
+        "embedding_fingerprint": embedding_fingerprint,
+    });
+    if hydrate_full {
+        // Only the hydrated path adds keys. Pointer mode — the default, and
+        // what every existing caller sends — is byte-for-byte what it was.
+        let tier = if demoted == 0 && unavailable == 0 {
+            HYDRATE_FULL
+        } else if hydrated == 0 {
+            HYDRATE_POINTER
+        } else {
+            HYDRATE_MIXED
+        };
+        meta["hydrate_tier"] = serde_json::json!(tier);
+        meta["hydrated"] = serde_json::json!(hydrated);
+        meta["demoted"] = serde_json::json!(demoted);
+        meta["unavailable"] = serde_json::json!(unavailable);
+        meta["tokens_hydrated"] = serde_json::json!(tokens_hydrated);
+        meta["token_budget"] = serde_json::json!(body.token_budget);
+    }
+
     (
         StatusCode::OK,
         axum::Json(serde_json::json!({
             "chunks": chunks,
             "tokens_loaded": tokens_loaded,
-            "meta": {
-                "source_label": "local_tenant_index",
-                "score_space": SCORE_SPACE_BM25_LEXICAL,
-                "semantic_profile_id": null,
-                "local_semantic_profile_id": local_semantic_profile_id,
-                "local_semantic_profile": semantic_profile,
-                "embedding_fingerprint": embedding_fingerprint,
-            }
+            "meta": meta,
         })),
     )
         .into_response()
@@ -1157,6 +1346,311 @@ mod query_tests {
             // went. The join key is the contract; the offset is not.
             assert!(hit["segment_index"].is_u64(), "segment_index still reported");
         }
+    }
+
+    // ── M8: search-hit hydration (`hydrate: "full"`) ──────────────────
+    //
+    // ExecPlan `unified-skills-registry-rcx-trust-2026-08-08`. M6 proved a
+    // search hit could not be resolved back to the document it came from:
+    // `doc_id` is a daemon-assigned integer and expand echoed pointers only.
+
+    /// The captured pre-M8 response shape of this route. It is a fixture, not a
+    /// description: the default path must keep returning exactly these keys, so
+    /// a caller that sends no `hydrate` field pays nothing for the new tier.
+    const POINTER_CHUNK_KEYS: [&str; 9] = [
+        "doc_id",
+        "frame_offset",
+        "local_semantic_profile_id",
+        "score_space",
+        "segment_index",
+        "segment_seq",
+        "semantic_profile_id",
+        "source_label",
+        "token_count",
+    ];
+    const POINTER_META_KEYS: [&str; 6] = [
+        "embedding_fingerprint",
+        "local_semantic_profile",
+        "local_semantic_profile_id",
+        "score_space",
+        "semantic_profile_id",
+        "source_label",
+    ];
+
+    fn segments_dir(state: &AppState) -> std::path::PathBuf {
+        state.data_dir.join("shards").join("shard-0000").join("segments")
+    }
+
+    /// Seal one prose document per entry into its own segment, then load the
+    /// shard directory into the retrieval index. Each `seal_prose_documents`
+    /// call force-seals its head, so entry `n` is segment `n`.
+    async fn seal_and_load(state: &AppState, docs: &[(&str, &str, &str)]) {
+        for (tenant, doc_id, text) in docs {
+            let documents = vec![crate::local_ingest::ProseDocument {
+                doc_id: (*doc_id).to_string(),
+                chunks: vec![crate::local_ingest::ProseChunk {
+                    chunk_id: format!("{doc_id}::0"),
+                    text: (*text).to_string(),
+                    dense_vector: None,
+                }],
+            }];
+            crate::local_ingest::seal_prose_documents(
+                &state.data_dir,
+                0,
+                1,
+                tenant,
+                "corpus",
+                "2026-08-20T00:00:00Z",
+                &documents,
+                None,
+            )
+            .unwrap();
+        }
+        state
+            .retrieval_index
+            .write()
+            .await
+            .scan_and_load(&segments_dir(state))
+            .unwrap();
+    }
+
+    fn expand_body(
+        tenant: &str,
+        ids: &[(usize, u32)],
+        hydrate: Option<&str>,
+        token_budget: Option<usize>,
+    ) -> TextSearchExpandBody {
+        TextSearchExpandBody {
+            tenant_id: tenant.to_string(),
+            result_ids: ids
+                .iter()
+                .map(|(segment_index, doc_id)| ExpandResultId {
+                    segment_index: *segment_index,
+                    doc_id: *doc_id,
+                })
+                .collect(),
+            hydrate: hydrate.map(str::to_string),
+            token_budget,
+        }
+    }
+
+    async fn expand_bytes(state: AppState, body: TextSearchExpandBody) -> (StatusCode, Vec<u8>) {
+        let response = post_query_text_search_expand(State(state), HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, bytes.to_vec())
+    }
+
+    async fn expand_json(state: AppState, body: TextSearchExpandBody) -> (StatusCode, serde_json::Value) {
+        let (status, bytes) = expand_bytes(state, body).await;
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// The `(segment_index, doc_id)` pointers a scan hands a caller — the only
+    /// handles expand accepts, and the reason hydration exists at all.
+    async fn search_ids(state: AppState, tenant: &str, query: &str) -> Vec<(usize, u32)> {
+        let response = post_query_text_search(
+            State(state),
+            HeaderMap::new(),
+            Json(TextSearchBody {
+                tenant_id: tenant.to_string(),
+                query: query.to_string(),
+                limit: 10,
+                token_budget: None,
+                min_score: None,
+                mode: None,
+                include_receipt: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|hit| {
+                (
+                    hit["segment_index"].as_u64().expect("segment_index") as usize,
+                    hit["doc_id"].as_u64().expect("doc_id") as u32,
+                )
+            })
+            .collect()
+    }
+
+    fn sorted_keys(value: &serde_json::Value) -> Vec<String> {
+        let mut keys: Vec<String> = value
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Gate 1: an absent `hydrate` field costs an existing caller nothing —
+    /// not a key, not a byte. Asserted against the captured key fixture and by
+    /// comparing the serialised bodies, not by eye.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn text_search_expand_pointer_mode_is_byte_identical_to_the_pre_hydration_shape() {
+        std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
+        let state = enabled();
+        seal_and_load(&state, &[("t1", "doc-a", "peregrine falcon dives")]).await;
+        let ids = search_ids(state.clone(), "t1", "peregrine falcon").await;
+        assert_eq!(ids.len(), 1);
+
+        let (status, absent) = expand_bytes(state.clone(), expand_body("t1", &ids, None, None)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, explicit) = expand_bytes(state, expand_body("t1", &ids, Some("pointer"), None)).await;
+        assert_eq!(
+            absent, explicit,
+            "an absent hydrate field and an explicit \"pointer\" must serialise identically"
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&absent).unwrap();
+        assert_eq!(sorted_keys(&json["chunks"][0]), POINTER_CHUNK_KEYS);
+        assert_eq!(sorted_keys(&json["meta"]), POINTER_META_KEYS);
+    }
+
+    /// Gate 2: `hydrate: "full"` resolves a pointer to the `doc_id` string the
+    /// caller supplied at ingest and to the chunk's own text. This is the hop
+    /// M6 found missing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn text_search_expand_hydrate_full_returns_the_ingest_doc_id_and_chunk_text() {
+        std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
+        let state = enabled();
+        seal_and_load(&state, &[("t1", "skill://parse-yaml", "peregrine falcon dives")]).await;
+        let ids = search_ids(state.clone(), "t1", "peregrine falcon").await;
+
+        let (status, json) = expand_json(state, expand_body("t1", &ids, Some("full"), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        let chunk = &json["chunks"][0];
+        assert_eq!(chunk["hydrate"], "full");
+        assert_eq!(
+            chunk["stream_id"], "skill://parse-yaml",
+            "stream_id is the doc_id string supplied at ingest, not the daemon's integer"
+        );
+        assert_eq!(chunk["content"], "peregrine falcon dives");
+        // The pointer fields are additive-safe: still there, still the same.
+        assert_eq!(chunk["doc_id"], ids[0].1);
+        assert_eq!(json["meta"]["hydrate_tier"], "full");
+        assert_eq!(json["meta"]["hydrated"], 1);
+        assert_eq!(json["meta"]["demoted"], 0);
+    }
+
+    /// Gate 3, and the single most dangerous way to get M8 wrong: the frame
+    /// read must sit strictly after the `tenant_hash_full` check. Here t2 asks
+    /// to hydrate a pointer that addresses t1's document — a valid
+    /// `(segment_index, doc_id)` that simply is not theirs.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn text_search_expand_hydrate_never_reads_another_tenants_content() {
+        std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
+        let state = enabled();
+        seal_and_load(
+            &state,
+            &[
+                ("t1", "t1-secret-doc", "peregrine falcon dives"),
+                ("t2", "t2-own-doc", "kestrel hovers"),
+            ],
+        )
+        .await;
+        let t1_ids = search_ids(state.clone(), "t1", "peregrine falcon").await;
+        assert_eq!(t1_ids.len(), 1, "t1 owns exactly one matching chunk");
+
+        let (status, json) = expand_json(state, expand_body("t2", &t1_ids, Some("full"), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            json["chunks"].as_array().expect("chunks").is_empty(),
+            "another tenant's result_id resolves to nothing"
+        );
+        let rendered = serde_json::to_string(&json).unwrap();
+        assert!(
+            !rendered.contains("peregrine") && !rendered.contains("t1-secret-doc"),
+            "no trace of t1's content or stream_id may appear in t2's response: {rendered}"
+        );
+        assert_eq!(json["meta"]["hydrated"], 0);
+    }
+
+    /// Gate 4: `token_budget` governs the hydrated tier. Over-budget chunks are
+    /// demoted to the pointer they already are and counted, never dropped —
+    /// the `wrap_facts_tiered` demotion contract, applied to chunks.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn text_search_expand_hydration_honours_token_budget_and_discloses_demotion() {
+        std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
+        let state = enabled();
+        seal_and_load(
+            &state,
+            &[
+                ("t1", "doc-a", "peregrine falcon dives"),
+                ("t1", "doc-b", "peregrine falcon nests"),
+            ],
+        )
+        .await;
+        let ids = search_ids(state.clone(), "t1", "peregrine falcon").await;
+        assert_eq!(ids.len(), 2);
+
+        let (status, json) = expand_json(state, expand_body("t1", &ids, Some("full"), Some(1))).await;
+        assert_eq!(status, StatusCode::OK);
+        let chunks = json["chunks"].as_array().expect("chunks");
+        assert_eq!(chunks.len(), 2, "demotion withholds content, never the pointer");
+        assert_eq!(chunks[0]["hydrate"], "full");
+        assert!(chunks[0]["content"].is_string());
+        assert_eq!(chunks[1]["hydrate"], "demoted");
+        assert!(chunks[1].get("content").is_none(), "a demoted chunk carries no content");
+        assert_eq!(json["meta"]["hydrate_tier"], "mixed");
+        assert_eq!(json["meta"]["hydrated"], 1);
+        assert_eq!(json["meta"]["demoted"], 1);
+        assert_eq!(json["meta"]["token_budget"], 1);
+    }
+
+    /// A segment whose file has gone is reported as `unavailable`, distinct
+    /// from a budget demotion: one is re-askable with a bigger budget, the
+    /// other is an operational fault. The pointer survives either way.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn text_search_expand_reports_an_unreadable_segment_rather_than_failing() {
+        std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
+        let state = enabled();
+        seal_and_load(&state, &[("t1", "doc-a", "peregrine falcon dives")]).await;
+        let ids = search_ids(state.clone(), "t1", "peregrine falcon").await;
+        for entry in std::fs::read_dir(segments_dir(&state)).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) == Some("ccxseg") {
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+
+        let (status, json) = expand_json(state, expand_body("t1", &ids, Some("full"), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["chunks"][0]["hydrate"], "unavailable");
+        assert!(json["chunks"][0].get("content").is_none());
+        assert_eq!(json["meta"]["unavailable"], 1);
+        assert_eq!(json["meta"]["hydrate_tier"], "pointer");
+    }
+
+    /// A misspelt tier is refused. Serving pointers for `"Full"` would look
+    /// exactly like hydration being broken, which is a worse failure than a 400.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn text_search_expand_rejects_an_unknown_hydrate_tier() {
+        std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
+        let state = enabled();
+        seal_and_load(&state, &[("t1", "doc-a", "peregrine falcon dives")]).await;
+
+        let (status, _) = expand_json(state, expand_body("t1", &[(0, 0)], Some("Full"), None)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

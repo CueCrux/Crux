@@ -4676,6 +4676,8 @@ async fn text_search_expand_returns_chunks() {
                 doc_id: 1,
             },
         ],
+        hydrate: None,
+        token_budget: None,
     };
 
     let resp = query::post_query_text_search_expand(State(state), HeaderMap::new(), Json(body))
@@ -4719,6 +4721,8 @@ async fn text_search_expand_skips_invalid_ids() {
                 doc_id: 999,
             },
         ],
+        hydrate: None,
+        token_budget: None,
     };
 
     let resp = query::post_query_text_search_expand(State(state), HeaderMap::new(), Json(body))
@@ -4743,6 +4747,8 @@ async fn text_search_expand_empty_index() {
             segment_index: 0,
             doc_id: 0,
         }],
+        hydrate: None,
+        token_budget: None,
     };
 
     let resp = query::post_query_text_search_expand(State(state), HeaderMap::new(), Json(body))

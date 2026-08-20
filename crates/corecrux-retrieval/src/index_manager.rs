@@ -283,6 +283,31 @@ impl IndexManager {
         self.segments.values().filter_map(|s| s.reader.as_ref()).collect()
     }
 
+    /// The `.ccxseg` behind the reader at `reader_index` in
+    /// [`IndexManager::readers`].
+    ///
+    /// Same filter and same iteration order as `readers()`, so the positional
+    /// `segment_index` a caller got back from a BM25 hit addresses the same
+    /// segment here — that alignment is the whole contract, and
+    /// `reader_segment_path_aligns_with_readers` holds it.
+    ///
+    /// The stored path is whichever member of the segment's file group was
+    /// discovered (`.ccxi` when a companion was loaded, `.ccxseg` when it was
+    /// not), so only the stem is load-bearing; the extension is normalised
+    /// here. `None` for an out-of-range index or a segment loaded from bytes,
+    /// which has no file at all.
+    pub fn reader_segment_path(&self, reader_index: usize) -> Option<PathBuf> {
+        let segment = self
+            .segments
+            .values()
+            .filter(|s| s.reader.is_some())
+            .nth(reader_index)?;
+        if segment.path.as_os_str().is_empty() {
+            return None;
+        }
+        Some(segment.path.with_extension("ccxseg"))
+    }
+
     /// Get readers filtered by tier.
     pub fn readers_by_tier(&self, tier: IndexTier) -> Vec<&CcxiReader> {
         self.segments
@@ -1032,6 +1057,48 @@ mod tests {
 
         let readers = mgr.readers();
         assert_eq!(readers.len(), 2);
+    }
+
+    /// The positional `segment_index` a BM25 hit carries is an index into
+    /// `readers()`; hydrating that hit needs the file behind it. The two views
+    /// must therefore stay index-aligned, which is what this pins.
+    #[test]
+    fn reader_segment_path_aligns_with_readers() {
+        let tmp = TempDir::new().unwrap();
+        for seq in [7u64, 3u64] {
+            let path = tmp.path().join(format!("seg-{seq:020}-0a0b.ccxi"));
+            std::fs::write(&path, build_test_ccxi(0, seq)).unwrap();
+        }
+
+        let mut mgr = IndexManager::new();
+        mgr.scan_and_load(tmp.path()).unwrap();
+
+        let readers = mgr.readers();
+        assert_eq!(readers.len(), 2);
+        for (index, reader) in readers.iter().enumerate() {
+            let path = mgr.reader_segment_path(index).expect("a scanned segment has a file");
+            assert_eq!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("ccxseg"),
+                "the .ccxi stem is normalised to the segment it companions"
+            );
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap().to_string();
+            assert!(
+                stem.contains(&format!("{:020}", reader.header.segment_seq)),
+                "reader_segment_path({index}) = {stem} must name the same segment as readers()[{index}]"
+            );
+        }
+        assert!(mgr.reader_segment_path(2).is_none(), "out of range yields no path");
+    }
+
+    #[test]
+    fn reader_segment_path_is_none_for_a_bytes_loaded_segment() {
+        let mut mgr = IndexManager::new();
+        mgr.load_ccxi_bytes(&build_test_ccxi(0, 1)).unwrap();
+        assert!(
+            mgr.reader_segment_path(0).is_none(),
+            "a segment loaded from bytes has no file to read back"
+        );
     }
 
     #[test]
