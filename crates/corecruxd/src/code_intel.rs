@@ -17,7 +17,9 @@
 //! * [`blast_radius`] — who depends on a symbol, separating static references
 //!   from *observed* runtime callers, and labelling which evidence supports each.
 //! * [`liveness`] — did this run, in a stated window? Dead-code with evidence
-//!   rather than inference.
+//!   rather than inference. It also answers the mirror-image question: did it
+//!   run and come back *empty* every time — a failure that raises no error and
+//!   writes no log line (ExecPlan `crux-code-intel-silent-empty-outcomes`).
 //! * [`trace_diff`] — where two traces diverge, for regression localisation.
 //!
 //! # Token budget is mandatory, not decorative
@@ -292,6 +294,27 @@ pub struct Liveness {
     pub executed: bool,
     pub executions: usize,
     pub total_ns: u64,
+    /// Executions whose site declared an outcome and reported it **empty** —
+    /// `None`, an empty collection, a zero count.
+    ///
+    /// Only sites that opted in via [`crux_observe::span_layer::record_outcome`]
+    /// ever contribute here, so a zero is not a claim that the work came back
+    /// full. Read it next to `executions_outcome_unrecorded`.
+    pub executions_empty: usize,
+    /// Executions whose site never declared an outcome at all.
+    ///
+    /// Exposed rather than folded in with the non-empty ones so a reader can see
+    /// the gap. Every span captured before the outcome dimension existed, and
+    /// every uninstrumented site, lands here — which is honest, not a defect.
+    pub executions_outcome_unrecorded: usize,
+    /// The symbol declared an outcome on **every** observed execution and every
+    /// one of them was empty. A function that always returns nothing is either
+    /// dead or broken, and neither shows up in `executed` or `had_error`.
+    ///
+    /// Deliberately conservative: never true on zero executions, and never true
+    /// when any execution is unrecorded. A flag that fires on partial data is
+    /// noise, and a noisy signal is one readers learn to ignore.
+    pub always_empty: bool,
     /// Present in the static graph at all.
     pub exists_statically: bool,
     /// Flagged dead by the AST reachability tier.
@@ -310,13 +333,25 @@ pub struct Liveness {
     pub window: Window,
 }
 
-/// Did this symbol run? The dead-code answer with runtime evidence.
+/// Did this symbol run — and did it produce anything? The dead-code answer with
+/// runtime evidence, plus the outcome dimension for the silent-empty case.
 pub fn liveness(scan: &WorkspaceScan, spans: &[StoredSpan], symbol: &str) -> Liveness {
     let executions: Vec<&StoredSpan> = spans.iter().filter(|s| s.span.name == symbol).collect();
     let exists = scan.symbols.iter().any(|s| s.name == symbol);
     let flagged_dead = scan.dead_code.iter().any(|d| d.name == symbol);
     let test_only = scan.test_only_symbols.iter().any(|n| n == symbol);
     let executed = !executions.is_empty();
+
+    // The outcome dimension. `Unrecorded` is counted apart from `NonEmpty`
+    // rather than lumped in with it: an absent signal reading as a healthy one
+    // is the exact defect this dimension exists to catch.
+    let executions_empty = executions.iter().filter(|s| s.span.outcome.is_empty_result()).count();
+    let executions_outcome_unrecorded = executions.iter().filter(|s| !s.span.outcome.is_recorded()).count();
+    // At least one execution, none of them silent, and every one of them empty.
+    // The unrecorded clause is implied by the count equality today (`Unrecorded`
+    // is not `Empty`), and is written out because it is the property the field
+    // promises rather than an incidental consequence of one enum's shape.
+    let always_empty = executed && executions_outcome_unrecorded == 0 && executions_empty == executions.len();
 
     // Did the runtime tier get a chance to speak about this symbol at all?
     //
@@ -355,6 +390,9 @@ pub fn liveness(scan: &WorkspaceScan, spans: &[StoredSpan], symbol: &str) -> Liv
         executed,
         executions: executions.len(),
         total_ns: executions.iter().map(|s| s.span.duration_ns).sum(),
+        executions_empty,
+        executions_outcome_unrecorded,
+        always_empty,
         exists_statically: exists,
         flagged_dead_static: flagged_dead,
         referenced_only_by_tests: test_only,
@@ -433,7 +471,7 @@ pub fn trace_diff(spans: &[StoredSpan], a: u64, b: u64, token_budget: usize) -> 
 mod tests {
     use super::*;
     use crate::workspace_scan::{DeadSymbol, SymbolInfo};
-    use crux_observe::span_layer::SpanRecord;
+    use crux_observe::span_layer::{SpanOutcome, SpanRecord};
 
     fn stored(trace: u64, id: u64, parent: Option<u64>, depth: u32, name: &str, ns: u64) -> StoredSpan {
         StoredSpan {
@@ -727,6 +765,114 @@ mod tests {
     fn liveness_flags_unknown_symbols_rather_than_calling_them_dead() {
         let scan = scan_with(vec!["a"], vec![]);
         assert_eq!(liveness(&scan, &[], "nope").verdict, "unknown_symbol");
+    }
+
+    // ── The outcome dimension (ExecPlan crux-code-intel-silent-empty-outcomes,
+    //    M3) ────────────────────────────────────────────────────────────────
+    //
+    // These pin the conservative half of `always_empty`. The flag exists to
+    // catch "ran, and silently returned nothing"; a flag that also fires on
+    // thin or undeclared data would be noise, and noise is what gets ignored.
+
+    /// A span for `name` carrying an explicit outcome, so a test can express
+    /// "this execution declared itself empty" rather than inferring it.
+    fn stored_with_outcome(id: u64, name: &str, outcome: SpanOutcome) -> StoredSpan {
+        let mut s = stored(7, id, None, 0, name, 10);
+        s.span.outcome = outcome;
+        s
+    }
+
+    /// Bug 1 verbatim: `load_latest_workspace_blocking` ran on every storybook
+    /// generation and returned `None` every time. `executed` was true and
+    /// `had_error` false, so nothing in the old shape could say so.
+    #[test]
+    fn always_empty_fires_when_every_declared_execution_came_back_empty() {
+        let scan = scan_with(vec!["load_latest_workspace_blocking"], vec![]);
+        let spans: Vec<StoredSpan> = (0..3)
+            .map(|i| stored_with_outcome(i, "load_latest_workspace_blocking", SpanOutcome::Empty))
+            .collect();
+        let l = liveness(&scan, &spans, "load_latest_workspace_blocking");
+        assert!(l.executed, "the bug's whole shape is that it did run");
+        assert_eq!(l.verdict, "live", "the verdict contract is unchanged by this dimension");
+        assert_eq!(l.executions, 3);
+        assert_eq!(l.executions_empty, 3);
+        assert_eq!(l.executions_outcome_unrecorded, 0);
+        assert!(l.always_empty);
+    }
+
+    /// Zero executions is not "always empty" — it is "never seen", which
+    /// `executed` and `window` already say. Asserting it separately because the
+    /// vacuous-truth reading of "every execution was empty" is exactly the kind
+    /// of default-open hole this plan exists to avoid.
+    #[test]
+    fn always_empty_is_false_when_the_symbol_never_executed() {
+        let scan = scan_with(vec!["rare"], vec![]);
+        let l = liveness(&scan, &[], "rare");
+        assert_eq!(l.executions, 0);
+        assert_eq!(l.executions_empty, 0);
+        assert_eq!(l.executions_outcome_unrecorded, 0);
+        assert!(!l.always_empty, "zero executions must never read as always-empty");
+    }
+
+    /// Partial data. One execution declared itself empty, one never declared
+    /// anything — which may or may not have been empty. Firing here would be a
+    /// claim the evidence does not support.
+    #[test]
+    fn always_empty_is_false_when_any_execution_is_unrecorded() {
+        let scan = scan_with(vec!["lister"], vec![]);
+        let spans = vec![
+            stored_with_outcome(1, "lister", SpanOutcome::Empty),
+            stored_with_outcome(2, "lister", SpanOutcome::Unrecorded),
+        ];
+        let l = liveness(&scan, &spans, "lister");
+        assert_eq!(l.executions, 2);
+        assert_eq!(l.executions_empty, 1);
+        assert_eq!(l.executions_outcome_unrecorded, 1);
+        assert!(!l.always_empty, "one silent execution is not evidence of emptiness");
+    }
+
+    /// A site that sometimes returns something is doing its job. The signal is
+    /// the rate, and this plan's flag deliberately only speaks at rate 1.0.
+    #[test]
+    fn always_empty_is_false_on_a_mixed_run() {
+        let scan = scan_with(vec!["lister"], vec![]);
+        let spans = vec![
+            stored_with_outcome(1, "lister", SpanOutcome::Empty),
+            stored_with_outcome(2, "lister", SpanOutcome::NonEmpty),
+        ];
+        let l = liveness(&scan, &spans, "lister");
+        assert_eq!(l.executions_empty, 1);
+        assert_eq!(l.executions_outcome_unrecorded, 0);
+        assert!(!l.always_empty);
+    }
+
+    /// Today's `spans.jsonl` and every uninstrumented site: all `Unrecorded`.
+    /// The counts must show the gap rather than letting an absent signal be
+    /// read as a healthy one — the `chain_valid.unwrap_or(true)` failure shape.
+    #[test]
+    fn undeclared_executions_are_counted_apart_from_non_empty_ones() {
+        let scan = scan_with(vec!["untouched"], vec![]);
+        let spans = vec![
+            stored_with_outcome(1, "untouched", SpanOutcome::Unrecorded),
+            stored_with_outcome(2, "untouched", SpanOutcome::Unrecorded),
+        ];
+        let l = liveness(&scan, &spans, "untouched");
+        assert_eq!(l.executions, 2);
+        assert_eq!(l.executions_empty, 0, "unrecorded is not empty");
+        assert_eq!(l.executions_outcome_unrecorded, 2, "and it is not non-empty either");
+        assert!(!l.always_empty);
+    }
+
+    /// The counts are only useful if a caller can see them, and every consumer
+    /// of `/v1/code-intel/liveness` reads JSON, not the struct.
+    #[test]
+    fn the_outcome_counts_are_serialised_onto_the_liveness_response() {
+        let scan = scan_with(vec!["lister"], vec![]);
+        let spans = vec![stored_with_outcome(1, "lister", SpanOutcome::Empty)];
+        let v = serde_json::to_value(liveness(&scan, &spans, "lister")).unwrap();
+        assert_eq!(v["executions_empty"], 1);
+        assert_eq!(v["executions_outcome_unrecorded"], 0);
+        assert_eq!(v["always_empty"], true);
     }
 
     #[test]
