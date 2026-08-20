@@ -142,13 +142,25 @@ fn now_unix_ms() -> u64 {
         .map_or(0, |duration| duration.as_millis() as u64)
 }
 
+/// The human resolving a passport-mint request: the asserted passport, the
+/// durable actor string, and — when the trusted-proxy identity rail named
+/// them rather than their bearer's claims — the rail label, recorded on the
+/// receipt envelope as `approver_source`.
+struct MintRequestApprover {
+    asserted: String,
+    actor: String,
+    source: Option<&'static str>,
+}
+
 #[allow(clippy::result_large_err)] // Axum responses preserve the exact HTTP denial at this boundary.
 fn mint_request_approver(
     state: &AppState,
     headers: &HeaderMap,
+    peer: Option<std::net::IpAddr>,
     claimed_approver: Option<&str>,
-) -> Result<(String, String), axum::response::Response> {
-    let context = crate::auth::passport_bound_context(&state.auth, headers).map_err(IntoResponse::into_response)?;
+) -> Result<MintRequestApprover, axum::response::Response> {
+    let context = super::auth_rails::passport_bound_context_for_human_decision(&state.auth, headers, peer)
+        .map_err(IntoResponse::into_response)?;
     if let Err(problem) = crate::auth::require_http_scopes_for_tenant(&state.auth, headers, &["admin:write"], "default")
     {
         return Err(problem.into_response());
@@ -191,7 +203,20 @@ fn mint_request_approver(
             "approver_passport does not match the authenticated passport",
         ));
     }
-    Ok((asserted.to_string(), asserted.to_string()))
+    if context.passport_from_identity_rail() {
+        // Mint requests live in `default`; the allowlist tenant must authorize
+        // it just as the bearer's tenant claim had to above.
+        context
+            .resolve_authorized_tenant(Some("default"))
+            .map_err(IntoResponse::into_response)?;
+    }
+    Ok(MintRequestApprover {
+        asserted: asserted.to_string(),
+        actor: asserted.to_string(),
+        source: context
+            .passport_from_identity_rail()
+            .then(super::auth_rails::rail_label),
+    })
 }
 
 #[allow(clippy::result_large_err)] // Axum responses preserve the exact HTTP denial at this boundary.
@@ -274,6 +299,7 @@ pub(super) async fn get_pending_mint_requests(
 pub(super) async fn post_mint_request_approve(
     State(state): State<AppState>,
     Path(request_id): Path<String>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<ResolveMintRequestBody>,
 ) -> impl IntoResponse {
@@ -282,11 +308,14 @@ pub(super) async fn post_mint_request_approve(
     if !state.passport_mint_requests_enabled {
         return mint_requests_disabled_response();
     }
-    let (asserted_approver, approver_actor) =
-        match mint_request_approver(&state, &headers, body.approver_passport.as_deref()) {
-            Ok(approver) => approver,
-            Err(response) => return response,
-        };
+    let MintRequestApprover {
+        asserted: asserted_approver,
+        actor: approver_actor,
+        source: approver_source,
+    } = match mint_request_approver(&state, &headers, Some(peer.ip()), body.approver_passport.as_deref()) {
+        Ok(approver) => approver,
+        Err(response) => return response,
+    };
 
     // One exclusive guard spans pending preflight, receipt persistence,
     // passport mint/update, and terminal transition. Approve and reject cannot
@@ -358,6 +387,12 @@ pub(super) async fn post_mint_request_approve(
         "passport_issued_at_unix_ms".to_string(),
         serde_json::Value::Number(passport_issued_at_unix_ms.into()),
     );
+    if let Some(source) = approver_source {
+        envelope_fields.insert(
+            "approver_source".to_string(),
+            serde_json::Value::String(source.to_string()),
+        );
+    }
     let receipt = match super::approval_receipts::mint_or_load_approval_receipt(
         &state,
         &super::approval_receipts::ApprovalReceiptSpec {
@@ -412,6 +447,7 @@ pub(super) async fn post_mint_request_approve(
 pub(super) async fn post_mint_request_reject(
     State(state): State<AppState>,
     Path(request_id): Path<String>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<ResolveMintRequestBody>,
 ) -> impl IntoResponse {
@@ -420,11 +456,14 @@ pub(super) async fn post_mint_request_reject(
     if !state.passport_mint_requests_enabled {
         return mint_requests_disabled_response();
     }
-    let (asserted_approver, approver_actor) =
-        match mint_request_approver(&state, &headers, body.approver_passport.as_deref()) {
-            Ok(approver) => approver,
-            Err(response) => return response,
-        };
+    let MintRequestApprover {
+        asserted: asserted_approver,
+        actor: approver_actor,
+        source: approver_source,
+    } = match mint_request_approver(&state, &headers, Some(peer.ip()), body.approver_passport.as_deref()) {
+        Ok(approver) => approver,
+        Err(response) => return response,
+    };
 
     let mut store = state.fact_store.write().await;
     let pending = match crate::mint_requests::pending_request(&store, &request_id) {
@@ -441,6 +480,12 @@ pub(super) async fn post_mint_request_reject(
         "requester_id".to_string(),
         serde_json::Value::String(pending.requester_id.clone()),
     );
+    if let Some(source) = approver_source {
+        envelope_fields.insert(
+            "approver_source".to_string(),
+            serde_json::Value::String(source.to_string()),
+        );
+    }
     let receipt = match super::approval_receipts::mint_or_load_approval_receipt(
         &state,
         &super::approval_receipts::ApprovalReceiptSpec {
