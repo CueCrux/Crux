@@ -28,6 +28,10 @@ mod activity;
 mod agentgraph_kinds;
 mod attention;
 mod auth;
+// Per-subject CEK key store for at-rest crypto-shred erasure (Track E/G3).
+// Constructed only under CORECRUXD_FACT_ENCRYPTION; inert until the fact
+// cipher wiring lands, so the module carries its own dead_code allow.
+mod cek_registry;
 mod code_intel;
 mod codegraph_fusion;
 mod companion_attestation;
