@@ -112,6 +112,7 @@ Domain lens for the PlanCrux Feature Registry on top of the substrate. Capabilit
 Code health findings + context chains, ingested by `corecruxctl code-health` (ingest-not-analyze) — never re-read the codebase to re-derive these.
 - **Findings** live as facts under `entity="codehealth:<repo>"` (keys `dead:`/`unused-dep:`/`stub:`/`todo:`/`dark:<…>`, value `{class,file,line,message,tool,commit_sha}`; one `run:<date>` summary). Query current findings (resolved ones are retired, never returned):
   - `query_facts(entity="codehealth:Crux", token_budget=500)` — all current findings + latest run summary for a repo.
+  - `query_facts(entity_prefix="debt:", token_budget=500)` — the **debt ledger**: `crux-min:` shortcuts projected into `entity="debt:<repo>/<area>"`, value `{ceiling, upgrade_trigger, file_line, commit_sha}`. Same findings as the `debt:` keys under `codehealth:<repo>`, queryable on their own.
   - `query_facts(query="codehealth stub", token_budget=500)` — stub/`todo!()` findings across repos.
 - **Chains** live as `codechain` entities (id = slugified route/fn; payload `{root, steps:[{name,qualified,file,line,depth,kind}], terminations}`). Answer "what does this route touch?" without re-reading code:
   - `entity_list(kind="codechain", limit=50)` — all extracted chains.

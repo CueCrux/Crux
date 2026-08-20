@@ -1182,8 +1182,9 @@ enum CodeHealthCommand {
         /// Output format: `json` (default) or `text`. Ignored with `--push`.
         #[arg(long, default_value = "json")]
         format: String,
-        /// Push findings to the daemon fact store (`codehealth:<repo>`),
-        /// retiring resolved findings and writing a `run:<date>` summary.
+        /// Push findings to the daemon fact store (`codehealth:<repo>`, plus
+        /// the `debt`-class projection into `debt:<repo>/<area>`), retiring
+        /// resolved findings and writing a `run:<date>` summary.
         #[arg(long, default_value_t = false)]
         push: bool,
         /// Daemon HTTP base URL for `--push`.
