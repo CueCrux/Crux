@@ -60,13 +60,16 @@ pub fn blast_radius_description() -> &'static str {
 }
 
 pub fn liveness_description() -> &'static str {
-    "Did this symbol actually run, and how often, in a stated observation window. \
-     Returns execution counts plus the window the answer is true for. Use this to \
-     tell 'never called' apart from 'never called *while we were looking*' — the \
-     window is part of the answer, so a negative is only ever as strong as the \
-     traffic behind it. If you are asking because a dossier claimed the symbol \
-     was dead, `get_project_dossiers` already carries the tier evidence and the \
-     window that claim was graded over."
+    "Did this symbol actually run, how often, and did it come back empty, in a \
+     stated observation window. Returns execution counts plus the window the \
+     answer is true for. Use this to tell 'never called' apart from 'never \
+     called *while we were looking*' — the window is part of the answer, so a \
+     negative is only ever as strong as the traffic behind it. Also use it for \
+     the opposite question: `always_empty` reports a symbol that ran every time \
+     and returned nothing every time, which raises no error and no log line. If \
+     you are asking because a dossier claimed the symbol was dead, \
+     `get_project_dossiers` already carries the tier evidence and the window \
+     that claim was graded over."
 }
 
 pub fn trace_diff_description() -> &'static str {

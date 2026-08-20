@@ -197,7 +197,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/console/corecrux/lane-weights", methods: &["GET", "PUT", "DELETE"], tag: "Console", auth: "admin", summary: "Console corecrux lane weights" },
     RouteEntry { path: "/v1/code-intel/blast-radius", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Static + observed dependents of a symbol" },
     RouteEntry { path: "/v1/code-intel/dead-code", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Dead-code evidence ladder across tiers" },
-    RouteEntry { path: "/v1/code-intel/liveness", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Did this symbol execute, in a stated window" },
+    RouteEntry { path: "/v1/code-intel/liveness", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Did this symbol execute — and come back empty — in a stated window" },
     RouteEntry { path: "/v1/code-intel/path", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "What actually executes for an entry point" },
     RouteEntry { path: "/v1/code-intel/trace-diff", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Where two traces diverge" },
     RouteEntry { path: "/v1/code-intel/releases", methods: &["GET"], tag: "CodeIntel", auth: "admin-read", summary: "Releases held for a tenant, with retention window" },
