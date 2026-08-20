@@ -166,7 +166,18 @@ pub const DAEMON_IMPLEMENTED_PRO_CLAIMS: &[&str] = &[
 /// `daemon_implemented_pro_claims_have_a_gate_site` fails the build if the two
 /// lists drift apart in either direction.
 ///
-/// `None` means **sold, declared daemon-implemented, and enforced nowhere**.
+/// `None` means **this claim string gates nothing** — no handler consults it,
+/// so enabling or withholding the claim changes no daemon behaviour. It does
+/// *not* mean the capability is absent, and reading it that way is how the M4
+/// vow audit came within one ruling of withdrawing three working products from
+/// sale. Three of the four `None` rows below are routed, handled and backed;
+/// they are authorized by `require_sync_read` / `require_sync_write`
+/// (`http/sync.rs:409` / `:426`), which check scopes and peer identity and have
+/// never looked at a claim string. Each row names its `route -> handler ->
+/// backing logic` so the next reader does not have to re-derive that. The
+/// defect they record is **registration, not absence**: the remedy is to wire
+/// the name to the route it already has, never to withdraw the capability.
+///
 /// Do not add a `None` row to make a new claim compile. The four below are
 /// recorded findings awaiting the M5 human gate, not a pattern to follow —
 /// and note the `ledger:history` trap above: dropping one from
@@ -174,42 +185,82 @@ pub const DAEMON_IMPLEMENTED_PRO_CLAIMS: &[&str] = &[
 /// asserting an outside implementer that does not exist. They leave both lists
 /// together or not at all.
 ///
-/// The classification behind the four, for the record: of the twenty claims
-/// declared daemon-implemented, five egress (the GPU-1 bridge, the only Pro
-/// handler that reaches the network), eleven are local compute that answers on
-/// a network-severed daemon, and these four have no gate and no handler at all.
+/// The classification behind the twenty claims declared daemon-implemented,
+/// for the record: five egress (the GPU-1 bridge, the only Pro handler that
+/// reaches the network), eleven are local compute that answers on a
+/// network-severed daemon, three (`sync:mirror`, `sync:promote`,
+/// `tenant:business_offboarding`) have a complete route and handler but no
+/// claim-string gate, and one (`console:workbench`) has neither — outside this
+/// file the string occurs nowhere in the repository at all, and inside it only
+/// in the two arrays, this table and the assertion below.
 #[cfg(test)]
 const DAEMON_CLAIM_GATE_SITES: &[(&str, Option<&str>)] = &[
-    ("gpu1:answer", Some("http/gpu1.rs:801 service_enabled")),
-    ("gpu1:rerank", Some("http/gpu1.rs:801 service_enabled")),
-    ("gpu1:enrich", Some("http/gpu1.rs:801 service_enabled")),
-    ("gpu1:coverage", Some("http/gpu1.rs:801 service_enabled")),
-    ("gpu1:developer", Some("http/gpu1.rs:801 service_enabled")),
+    ("gpu1:answer", Some("http/gpu1.rs:800 service_enabled")),
+    ("gpu1:rerank", Some("http/gpu1.rs:800 service_enabled")),
+    ("gpu1:enrich", Some("http/gpu1.rs:800 service_enabled")),
+    ("gpu1:coverage", Some("http/gpu1.rs:800 service_enabled")),
+    ("gpu1:developer", Some("http/gpu1.rs:800 service_enabled")),
     ("replay:answer", Some("http/replay.rs:214")),
-    ("agent_brief:pro", Some("http/workbench.rs:875 require_surface_enabled")),
+    ("agent_brief:pro", Some("http/workbench.rs:877 require_surface_enabled")),
     (
         "context_pack:budgeted",
-        Some("http/workbench.rs:875 require_surface_enabled"),
+        Some("http/workbench.rs:877 require_surface_enabled"),
     ),
     (
         "impact:preflight",
-        Some("http/workbench.rs:875 require_surface_enabled"),
+        Some("http/workbench.rs:877 require_surface_enabled"),
     ),
-    ("audit:triage", Some("http/workbench.rs:875 require_surface_enabled")),
+    ("audit:triage", Some("http/workbench.rs:877 require_surface_enabled")),
     (
         "reasoning:timeline",
-        Some("http/workbench.rs:875 require_surface_enabled"),
+        Some("http/workbench.rs:877 require_surface_enabled"),
     ),
-    ("handoff:v2", Some("http/workbench.rs:875 require_surface_enabled")),
-    ("route_probe:lab", Some("http/workbench.rs:875 require_surface_enabled")),
-    ("api_drift:check", Some("http/workbench.rs:875 require_surface_enabled")),
-    ("policy:simulate", Some("http/workbench.rs:875 require_surface_enabled")),
+    ("handoff:v2", Some("http/workbench.rs:877 require_surface_enabled")),
+    ("route_probe:lab", Some("http/workbench.rs:877 require_surface_enabled")),
+    ("api_drift:check", Some("http/workbench.rs:877 require_surface_enabled")),
+    ("policy:simulate", Some("http/workbench.rs:877 require_surface_enabled")),
     ("enrichers:first_party", Some("http/actions.rs:59")),
-    // M4 findings — no gate, no handler, claim string occurs only in the
-    // PRO_CAPABILITY_CLAIMS / DAEMON_IMPLEMENTED_PRO_CLAIMS arrays.
+    // M4 findings. `None` here records a missing claim-string gate, not a
+    // missing implementation — see the doc comment above before acting on one.
+    //
+    // sync:mirror — routed, handled, backed. Read side only; the write side is
+    // the peer's, not ours.
+    //   GET  /v1/sync/tenants/{tenantId}/manifest                  http/mod.rs:825
+    //     -> http/sync.rs:442 get_tenant_manifest
+    //     -> corecrux-memory/src/sync.rs:257 build_tenant_manifest
+    //   GET  /v1/sync/tenants/{tenantId}/collections/{collection}   http/mod.rs:829
+    //     -> http/sync.rs:469 get_tenant_collection
+    //     -> corecrux-memory/src/sync.rs:295 tenant_collection_page
     ("sync:mirror", None),
+    // sync:promote — routed, handled, backed. Two-phase: preview is a read,
+    // confirm is a write, and confirm re-derives the preview to check
+    // `confirm_hash` before it stores anything.
+    //   POST /v1/sync/tenants/{tenantId}/promotions/preview         http/mod.rs:833
+    //     -> http/sync.rs:496 post_promotion_preview
+    //   POST /v1/sync/tenants/{tenantId}/promotions/confirm         http/mod.rs:837
+    //     -> http/sync.rs:514 post_promotion_confirm
+    //     -> corecrux-memory/src/sync.rs:341 promotion_preview
     ("sync:promote", None),
+    // console:workbench — the only genuine phantom of the four: no route, no
+    // handler, no backing logic. It reads as an umbrella over the workbench
+    // surfaces, which are individually gated at
+    // http/workbench.rs:877 require_surface_enabled, one claim per
+    // `WorkbenchSurface` variant (http/workbench.rs:32). Nine of those ten
+    // claims are already rows in this table; the tenth, `ledger:history`, is
+    // deliberately unsold — see the PRO_CAPABILITY_CLAIMS doc comment above.
+    // So the umbrella gates nothing that its members do not already gate.
+    // Bind it to the nine or retire it (both arrays together, per the
+    // `ledger:history` trap) — ExecPlan
+    // `crux-claim-wiring-and-hosted-tier-closure-2026-08-07` M2.
     ("console:workbench", None),
+    // tenant:business_offboarding — routed, handled, backed, and it is the one
+    // of the four that destroys data, so a withdrawal ruling here is the
+    // expensive mistake. The handler wipes the tenant mirror, signs a wipe
+    // receipt and stores it under `__sync_wipe_receipt__::{tenantId}`.
+    //   POST /v1/sync/tenants/{tenantId}/offboard                   http/mod.rs:841
+    //     -> http/sync.rs:561 post_tenant_offboard
+    //     -> corecrux-memory/src/sync.rs:414 offboard_tenant_mirror
+    //     -> http/sync.rs:604 sign_wipe_receipt
     ("tenant:business_offboarding", None),
 ];
 
