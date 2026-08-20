@@ -4312,6 +4312,129 @@ async fn http_session_state_with_passport_uses_mcp_session_scope() {
     assert_eq!(alice_body["state"]["step"], 1);
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn observation_readback_is_scoped_to_authenticated_jwt_subject() {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+    const TEST_HS256_SECRET: &str = "0123456789abcdef0123456789abcdef";
+    const SESSION_ID: &str = "minimalism-filemod-incident";
+
+    let _secret = EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
+    let _issuer = EnvVarGuard::set("CORECRUXD_JWT_ISS", "corecrux-test");
+    let _audience = EnvVarGuard::set("CORECRUXD_JWT_AUD", "corecrux");
+
+    let mut state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    bind_test_state_to_root_passport_key(&mut state);
+
+    #[derive(serde::Serialize)]
+    struct Claims<'a> {
+        exp: usize,
+        iss: &'a str,
+        aud: &'a str,
+        scope: &'a str,
+        sub: &'a str,
+    }
+
+    let bearer = |subject: &str| {
+        let claims = Claims {
+            exp: (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_secs()
+                + 3600) as usize,
+            iss: "corecrux-test",
+            aud: "corecrux",
+            scope: "sessions:write query:read",
+            sub: subject,
+        };
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(TEST_HS256_SECRET.as_bytes()),
+        )
+        .expect("jwt");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer header"),
+        );
+        headers
+    };
+
+    let hook_headers = bearer("hook-client");
+    let other_headers = bearer("tailnet-shared");
+
+    let write = observations::post_observation(
+        State(state.clone()),
+        hook_headers.clone(),
+        Path(SESSION_ID.to_string()),
+        Json(observations::PostObservationBody {
+            kind: "filemod".to_string(),
+            provider: "claude-code".to_string(),
+            client_ts: None,
+            payload: serde_json::json!({
+                "path": "crates/corecruxd/src/http/tests.rs",
+                "hash_algo": "blake3",
+                "content_hash_before": "before",
+                "content_hash_after": "after",
+                "lines_added": 3,
+                "lines_removed": 1,
+                "tool": "Edit",
+                "execplan_slug": "crux-code-minimalism-profile-and-engram-2026-07-16",
+                "milestone": "M5a",
+            }),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(write.status(), StatusCode::CREATED);
+
+    let same_subject = observations::get_observations(
+        State(state.clone()),
+        hook_headers,
+        Path(SESSION_ID.to_string()),
+        Query(observations::ListObservationsQuery {
+            since: None,
+            limit: None,
+            provider: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(same_subject.status(), StatusCode::OK);
+    let same_body = json_body(same_subject).await;
+    let observations = same_body["observations"].as_array().expect("observations array");
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0]["principal"], "hook-client");
+    assert_eq!(observations[0]["payload"]["lines_added"], 3);
+    assert_eq!(
+        observations[0]["session_id"],
+        crux_mcp::scope::scoped_session_id(Some("hook-client"), SESSION_ID)
+    );
+    assert_eq!(same_body["chain"]["status"], "ok");
+
+    let other_subject = observations::get_observations(
+        State(state),
+        other_headers,
+        Path(SESSION_ID.to_string()),
+        Query(observations::ListObservationsQuery {
+            since: None,
+            limit: None,
+            provider: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(other_subject.status(), StatusCode::OK);
+    let other_body = json_body(other_subject).await;
+    assert_eq!(
+        other_body["observations"].as_array().expect("observations array").len(),
+        0
+    );
+    assert_eq!(other_body["chain"]["status"], "no_chain");
+}
+
 // ── Text Search (POST /v1/query/text-search) ────────────────────
 //
 // Text search is available by default. These serialized tests clear the
