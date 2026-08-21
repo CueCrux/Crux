@@ -653,11 +653,37 @@ pub(super) fn execplan_items_for_query(
     // don't filter against explicitly. Skip `project_id` here so the common
     // SPA pattern `?source=all&project_id=default` still surfaces them; the
     // user disambiguates kanban vs execplans via the `source` chip.
+    //
+    // The same argument decides `tenant_id`, and getting it wrong took the
+    // board out entirely: the projection walks plan *files* under one root and
+    // stamps every item `tenant_id: None` (`work_execplans.rs`), so a flat
+    // `work_tenant_id(w) == tenant_id` compares "default" against the caller's
+    // tenant and drops all of them — as `200 {"count":0}`, indistinguishable
+    // from an empty backlog or an unconfigured root. Any token whose tenant
+    // claim is not `default` saw an empty board, on `/v1/work` and on
+    // `/v1/attention/summary` alike.
+    //
+    // Tenant binding on the kanban path is deliberate and stays (it is what
+    // stops one tenant's rows being counted into another's roll-up); it was
+    // never load-bearing here, because these items carry no tenant to bind.
+    // So filter only the items that actually declare one — that keeps the
+    // narrowing for any future tenant-stamped plan while letting the
+    // workspace-scoped ones through.
+    filter_execplan_items(items, q, tenant_id)
+}
+
+/// The post-walk narrowing for projected ExecPlan items, split out so the
+/// tenant rule can be asserted without a plan root on disk or process env.
+pub(super) fn filter_execplan_items(
+    items: Vec<crate::work::WorkItem>,
+    q: &ListWorkQuery,
+    tenant_id: &str,
+) -> Vec<crate::work::WorkItem> {
     items
         .into_iter()
         .filter(|w| {
             q.state.as_deref().is_none_or(|s| w.state == s)
-                && crate::work::work_tenant_id(w) == tenant_id
+                && w.tenant_id.as_deref().is_none_or(|t| t == tenant_id)
                 && q.assignee_passport
                     .as_deref()
                     .is_none_or(|a| w.assignee_passport.as_deref() == Some(a))
@@ -1539,5 +1565,81 @@ mod gate_approver_policy_tests {
         };
         assert_eq!(sep.parties(), 2);
         assert_eq!(sep.evidence(), "distinct_passports");
+    }
+}
+
+#[cfg(test)]
+mod execplan_tenant_scope_tests {
+    use super::{filter_execplan_items, ListWorkQuery, WorkSource};
+    use crate::work::WorkItem;
+
+    fn plan(id: &str, tenant_id: Option<&str>) -> WorkItem {
+        WorkItem {
+            id: id.into(),
+            project_id: crate::work_execplans::VIRTUAL_PROJECT_ID.into(),
+            state: "in_progress".into(),
+            title: id.into(),
+            body: String::new(),
+            assignee_passport: None,
+            tenant_id: tenant_id.map(str::to_string),
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: None,
+            blocker_kind: None,
+            created_by_passport: "test".into(),
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+            plan_path: None,
+            plan_content_hash: None,
+            current_milestone: None,
+            next_ready_milestone: None,
+            superseded_by: None,
+            depends_on: Vec::new(),
+            extended_by: Vec::new(),
+            blocked_by: Vec::new(),
+            open_decisions: Vec::new(),
+            orchestrator_id: None,
+            milestones_done: None,
+            milestones_total: None,
+            notes_count: None,
+            provenance: None,
+            stale: None,
+            token_burn: None,
+        }
+    }
+
+    fn query() -> ListWorkQuery {
+        ListWorkQuery {
+            source: WorkSource::Execplans,
+            ..Default::default()
+        }
+    }
+
+    /// The regression: the projection stamps `tenant_id: None` on every plan,
+    /// so binding it to the caller's tenant hid the entire board from any
+    /// token whose claim was not `default` — silently, as an empty 200.
+    #[test]
+    fn workspace_scoped_plans_are_visible_to_a_non_default_tenant() {
+        let items = vec![plan("execplan:alpha", None), plan("execplan:beta", None)];
+        let kept = filter_execplan_items(items, &query(), "work");
+        assert_eq!(
+            kept.len(),
+            2,
+            "plans carrying no tenant are workspace-scoped and must survive a non-default caller tenant"
+        );
+    }
+
+    /// Positive control for the narrowing half: a plan that *does* declare a
+    /// tenant is still scoped, so the predicate is not vacuously true.
+    #[test]
+    fn tenant_stamped_plans_are_still_narrowed_to_the_caller() {
+        let items = vec![
+            plan("execplan:workspace", None),
+            plan("execplan:mine", Some("work")),
+            plan("execplan:theirs", Some("other")),
+        ];
+        let kept = filter_execplan_items(items, &query(), "work");
+        let ids: Vec<&str> = kept.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, vec!["execplan:workspace", "execplan:mine"]);
     }
 }
