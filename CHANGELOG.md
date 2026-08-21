@@ -11,6 +11,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.63] - 2026-08-21
+
+### Fixed
+
+- **The ephemeral-fact GC no longer clones the whole fact store every hour.**
+  `run_sweep_once` copied every fact into a `Vec<Fact>` once an hour to pick
+  sweep candidates; on a daemon whose fact journal had grown to 2.4 GB that was
+  a ~1.5 GB allocation burst on top of a ~2.7 GB baseline, which tripped a
+  4 GiB container limit and OOM-killed the production daemon every ~60 minutes
+  for more than twelve hours (restart policy hid it). The candidate scan now
+  streams `all_facts()` under the read guard and keeps only candidate ids;
+  selection semantics are unchanged. (#739)
+- **Receipt verification is bound to its tenant and chain position** (D3) so a
+  receipt cannot verify under another tenant's chain. (#736)
+- **`/v1/coord/active` is scoped to the caller's tenant** (D4 residual). (#731)
+- **HTTP fact writes are attributed to the verified passport** rather than the
+  asserted one. (#719)
+- Span capture no longer races the interest cache (#733); ExecPlan age is taken
+  from git commit time, not checkout mtime (#717); the execplan-discipline gate
+  names a runnable command (#718).
+
+### Added
+
+- `text-search` expand hits hydrate to `stream_id` + content (#732).
+- Code-intel liveness carries an outcome dimension (#730); code-health projects
+  debt findings into `debt:<repo>/<area>` entities (#729); every pack mutation
+  is attributed to the pack build behind it (#728).
+- The per-subject CEK registry lands on main (erasure, Audit II Tier 2 M5)
+  (#725); the pre-deploy checklist moves behind a config-wizard skill (#727);
+  observation instrumentation at the three sites where "empty" is a bug (#724),
+  with curated `crux.outcome` guidance (#734).
+- Test: observation subject isolation is pinned (#737).
+
+### Changed
+
+- Dependency refresh: tree-sitter 0.26.12, rcgen 0.14.9, thiserror 2.0.20,
+  http-body-util 0.1.5, wat 1.256.0, plus GitHub Actions bumps.
+
 ## [0.5.62] - 2026-08-19
 
 ### Fixed
@@ -1120,7 +1158,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-deny` supply chain and licence audit in CI
 - `cargo-audit` CVE scanning in CI
 
-[unreleased]: https://github.com/CueCrux/Crux/compare/v0.5.59...HEAD
+[unreleased]: https://github.com/CueCrux/Crux/compare/v0.5.63...HEAD
+[0.5.63]: https://github.com/CueCrux/Crux/compare/v0.5.62...v0.5.63
 [0.5.62]: https://github.com/CueCrux/Crux/compare/v0.5.61...v0.5.62
 [0.5.61]: https://github.com/CueCrux/Crux/compare/v0.5.59...v0.5.61
 [0.5.59]: https://github.com/CueCrux/Crux/compare/v0.5.58...v0.5.59
