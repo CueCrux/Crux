@@ -308,6 +308,49 @@ mod tests {
         assert!(SignerPinOutcomeV1::Pinned.is_pinned());
     }
 
+    /// `from_env` is a one-line delegation, and that made it invisible to the
+    /// suite: every other test exercised `from_env_var` with a custom variable
+    /// name, so a mutant replacing `from_env`'s body with `Ok(None)` survived
+    /// (`cargo-mutants --in-diff`, PR #736 lineage).
+    ///
+    /// What survived is not cosmetic. `Ok(None)` is the *unpinned* answer, so a
+    /// `from_env` that quietly stopped reading its variable would disable
+    /// export-signer pinning entirely while every existing test stayed green —
+    /// the precise silent downgrade this module exists to refuse. This pins the
+    /// wiring: `from_env` must read `EXPORT_VERIFY_PUBLIC_KEY_ENV` specifically.
+    ///
+    /// Sole test in this crate touching that variable, and it restores the
+    /// previous value, so it cannot race a sibling.
+    #[test]
+    fn from_env_reads_the_documented_variable() {
+        let previous = std::env::var(EXPORT_VERIFY_PUBLIC_KEY_ENV).ok();
+
+        std::env::set_var(EXPORT_VERIFY_PUBLIC_KEY_ENV, KEY_A);
+        let pinned = ExpectedSignerV1::from_env().expect("a well-formed pin parses");
+        assert_eq!(
+            pinned.map(|p| p.to_hex()),
+            Some(KEY_A.to_string()),
+            "from_env must read EXPORT_VERIFY_PUBLIC_KEY_ENV, not silently return None"
+        );
+
+        // Unset is genuinely unpinned — the honest answer, and the one the
+        // surviving mutant impersonated.
+        std::env::remove_var(EXPORT_VERIFY_PUBLIC_KEY_ENV);
+        assert_eq!(ExpectedSignerV1::from_env(), Ok(None));
+
+        // A set-but-malformed value is an error, never a silent downgrade.
+        std::env::set_var(EXPORT_VERIFY_PUBLIC_KEY_ENV, "not-a-key");
+        assert!(
+            ExpectedSignerV1::from_env().is_err(),
+            "a typo'd pin must fail loudly rather than report unpinned"
+        );
+
+        match previous {
+            Some(v) => std::env::set_var(EXPORT_VERIFY_PUBLIC_KEY_ENV, v),
+            None => std::env::remove_var(EXPORT_VERIFY_PUBLIC_KEY_ENV),
+        }
+    }
+
     #[test]
     fn posture_tokens_are_stable() {
         assert_eq!(ExportIdentityPostureV1::Pinned.as_str(), "pinned");
