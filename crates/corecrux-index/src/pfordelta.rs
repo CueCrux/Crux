@@ -52,14 +52,35 @@ pub fn pfordelta_decode(data: &[u8]) -> Vec<u32> {
 
     // SAFETY: data[0..4] is a 4-byte slice — try_into to [u8; 4] is infallible.
     #[allow(clippy::unwrap_used)]
-    let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let declared = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+
+    // `declared` is the first four bytes of whatever we were handed, so a
+    // corrupt or hostile `.ccxi` can ask for `u32::MAX` values — about 17 GB —
+    // straight into `Vec::with_capacity`. Clamp it to what the remaining bytes
+    // could conceivably encode: a value occupies at least one bit, so
+    // `8 * remaining` is a hard upper bound and a well-formed stream is always
+    // far under it.
+    let max_encodable = data.len().saturating_sub(4).saturating_mul(8);
+    let count = declared.min(max_encodable);
+
     let mut deltas = Vec::with_capacity(count);
     let mut cursor = 4usize;
 
     while deltas.len() < count {
-        let remaining = count - deltas.len();
+        let before = deltas.len();
+        let remaining = count - before;
         let block_len = remaining.min(BLOCK_SIZE);
         cursor = decode_block(data, cursor, block_len, &mut deltas);
+
+        // `decode_block` reports truncation by returning `data.len()` without
+        // pushing anything, and a zero `block_len` byte likewise decodes no
+        // values. Either way the loop condition cannot change, so without this
+        // check a single truncated posting list spins forever and takes every
+        // query on the index down with it. Stop on no progress and return what
+        // decoded cleanly.
+        if deltas.len() == before {
+            break;
+        }
     }
 
     // Un-delta: prefix sum
@@ -261,5 +282,57 @@ mod tests {
             encoded.len(),
             raw_size as f64 / encoded.len() as f64
         );
+    }
+
+    /// A truncated posting list used to hang the whole index: `decode_block`
+    /// signals truncation by returning `data.len()` and pushing nothing, so
+    /// `deltas.len() < count` stayed true forever. Any query touching the
+    /// segment wedged its thread.
+    #[test]
+    fn truncated_stream_terminates_instead_of_spinning() {
+        // Header claims 500 values; the body carries one 3-byte block header
+        // and then stops.
+        let mut data = 500u32.to_le_bytes().to_vec();
+        data.extend_from_slice(&[8, 0, 100]);
+        let decoded = pfordelta_decode(&data);
+        assert!(decoded.len() < 500, "a truncated stream must not report a full decode");
+    }
+
+    /// A block-length byte of zero decodes no values while still advancing the
+    /// cursor — the other route to a loop that cannot make progress.
+    #[test]
+    fn zero_block_len_terminates() {
+        let mut data = 64u32.to_le_bytes().to_vec();
+        data.extend_from_slice(&[8, 0, 0, 0, 0, 0, 0]);
+        let _ = pfordelta_decode(&data);
+    }
+
+    /// The header is attacker-controlled and used to reach `with_capacity`
+    /// unclamped, so eleven bytes of input could reserve ~17 GB.
+    ///
+    /// This asserts the *capacity*, not the length or a crash. Linux overcommit
+    /// happily hands back a 17 GB reservation without touching a page, so an
+    /// unclamped decode returns a perfectly ordinary-looking empty Vec and any
+    /// test phrased as "it didn't abort" passes with the bug still in place.
+    /// The reservation itself is the observable.
+    #[test]
+    fn absurd_declared_count_does_not_reserve_wildly() {
+        let mut data = u32::MAX.to_le_bytes().to_vec();
+        data.extend_from_slice(&[8, 0, 4, 1, 1, 1, 1]);
+        let decoded = pfordelta_decode(&data);
+        assert!(
+            decoded.capacity() <= data.len() * 8,
+            "capacity {} must stay bounded by what {} bytes can encode",
+            decoded.capacity(),
+            data.len()
+        );
+    }
+
+    /// Positive control: the guards must not change well-formed decoding.
+    #[test]
+    fn round_trip_survives_the_truncation_guards() {
+        let ids: Vec<u32> = (0..300).map(|i| i * 7 + 1).collect();
+        let encoded = pfordelta_encode(&ids);
+        assert_eq!(pfordelta_decode(&encoded), ids);
     }
 }
