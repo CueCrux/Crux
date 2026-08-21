@@ -75,9 +75,15 @@ pub const SESSION_BINDING_MIN_AGE_HOURS: i64 = 1;
 /// Default GC tick interval: hourly.
 const GC_INTERVAL_SECS: u64 = 3600;
 
-/// Pure selection over a fact slice. Returns the `fact_id`s that the GC
-/// would soft-delete, applying the conservative, reversible rule
+/// Pure selection over a stream of borrowed facts. Returns the `fact_id`s
+/// that the GC would soft-delete, applying the conservative, reversible rule
 /// documented at the module level.
+///
+/// Takes an iterator of `&Fact` (e.g. `FactStore::all_facts()` under a read
+/// guard) and makes a SINGLE pass, retaining only candidate ids — never the
+/// facts. Cloning the whole store into a `Vec<Fact>` once an hour was a
+/// +1.5 GiB burst on a 2.4 GB journal and got the daemon memcg-killed every
+/// tick (`incident:2026-08-20`).
 ///
 /// Safety invariants (all enforced here, independent of caller):
 /// - Only `__session_binding__::*` and `__reverify_receipts__::*` entities
@@ -87,29 +93,30 @@ const GC_INTERVAL_SECS: u64 = 3600;
 /// - The newest [`SESSION_BINDING_KEEP_N`] bindings per passport, and any
 ///   binding younger than the [`SESSION_BINDING_MIN_AGE_HOURS`] floor, are
 ///   always kept.
-pub fn select_ephemeral_candidates(facts: &[Fact], now: DateTime<Utc>, retain: Duration) -> Vec<String> {
+pub fn select_ephemeral_candidates<'a>(
+    facts: impl IntoIterator<Item = &'a Fact>,
+    now: DateTime<Utc>,
+    retain: Duration,
+) -> Vec<String> {
     let mut out = Vec::new();
+    let min_age = Duration::hours(SESSION_BINDING_MIN_AGE_HOURS);
+    let mut by_passport: HashMap<String, Vec<(DateTime<Utc>, String)>> = HashMap::new();
 
-    // `__reverify_receipts__::*` — age-based: any fact past `retain`.
     for f in facts {
         if f.deleted {
             continue;
         }
-        if f.entity.starts_with("__reverify_receipts__::") && (now - f.stored_at) > retain {
-            out.push(f.fact_id.clone());
-        }
-    }
-
-    // `__session_binding__::*` — per-passport population cap. Each MCP session
-    // mints a unique-id binding, so keep the newest KEEP_N per passport and
-    // collect the rest once they age past the safety floor.
-    let min_age = Duration::hours(SESSION_BINDING_MIN_AGE_HOURS);
-    let mut by_passport: HashMap<String, Vec<(DateTime<Utc>, String)>> = HashMap::new();
-    for f in facts {
-        if f.deleted || !f.entity.starts_with("__session_binding__::") {
+        // `__reverify_receipts__::*` — age-based: any fact past `retain`.
+        if f.entity.starts_with("__reverify_receipts__::") {
+            if (now - f.stored_at) > retain {
+                out.push(f.fact_id.clone());
+            }
             continue;
         }
-        if f.key != SESSION_BINDING_RECORD_KEY {
+        // `__session_binding__::*` — per-passport population cap. Each MCP
+        // session mints a unique-id binding, so keep the newest KEEP_N per
+        // passport and collect the rest once they age past the safety floor.
+        if !f.entity.starts_with("__session_binding__::") || f.key != SESSION_BINDING_RECORD_KEY {
             continue;
         }
         // Attribute each binding to its passport; unparseable records are kept
@@ -134,15 +141,18 @@ pub fn select_ephemeral_candidates(facts: &[Fact], now: DateTime<Utc>, retain: D
     out
 }
 
-/// Run one GC sweep against the store. Collects candidates under a read
-/// lock, then soft-deletes each via the journaled
-/// [`FactStore::try_delete`] under a write lock. Returns the number of
-/// facts soft-deleted. Pure no-op when no candidates qualify.
+/// Run one GC sweep against the store. Streams candidates off the live
+/// store under a read lock (ids only — no clone of the facts), then
+/// soft-deletes each via the journaled [`FactStore::try_delete`] under a
+/// write lock. Returns the number of facts soft-deleted. Pure no-op when no
+/// candidates qualify.
 pub async fn run_sweep_once(store: &Arc<RwLock<FactStore>>, now: DateTime<Utc>, retain: Duration) -> usize {
     let candidates = {
         let guard = store.read().await;
-        let facts: Vec<Fact> = guard.all_facts().cloned().collect();
-        select_ephemeral_candidates(&facts, now, retain)
+        let mut scanned = 0usize;
+        let candidates = select_ephemeral_candidates(guard.all_facts().inspect(|_| scanned += 1), now, retain);
+        tracing::debug!(scanned, candidates = candidates.len(), "ephemeral-gc-scan");
+        candidates
     };
     if candidates.is_empty() {
         return 0;
@@ -347,7 +357,7 @@ mod tests {
                 ts,
             ));
         }
-        let selected = select_ephemeral_candidates(&facts, now, Duration::days(DEFAULT_RETAIN_DAYS));
+        let selected = select_ephemeral_candidates(facts.iter(), now, Duration::days(DEFAULT_RETAIN_DAYS));
         assert!(
             selected.contains(&"r1".to_string()),
             "private receipt past retain collected"
@@ -382,7 +392,7 @@ mod tests {
                 ts,
             ));
         }
-        let selected = select_ephemeral_candidates(&facts, now, Duration::days(DEFAULT_RETAIN_DAYS));
+        let selected = select_ephemeral_candidates(facts.iter(), now, Duration::days(DEFAULT_RETAIN_DAYS));
         assert!(selected.is_empty(), "no candidates expected, got {selected:?}");
     }
 
@@ -404,7 +414,7 @@ mod tests {
                 ));
             }
         }
-        let selected = select_ephemeral_candidates(&facts, now, Duration::days(DEFAULT_RETAIN_DAYS));
+        let selected = select_ephemeral_candidates(facts.iter(), now, Duration::days(DEFAULT_RETAIN_DAYS));
         assert_eq!(selected.len(), 16, "8 per passport × 2 passports");
     }
 
@@ -428,7 +438,7 @@ mod tests {
             fact("__reverify_receipts__::f1", &receipt_id, now - Duration::days(45), true),
             fact("user::notes", &user_id, now - Duration::days(45), false),
         ];
-        let selected = select_ephemeral_candidates(&backdated, now, retain);
+        let selected = select_ephemeral_candidates(backdated.iter(), now, retain);
         assert_eq!(selected, vec![receipt_id.clone()], "only the aged ephemeral receipt");
 
         // Drive the real journaled delete path.
@@ -531,5 +541,40 @@ mod tests {
             });
         }
         assert_eq!(run_sweep_once(&store, now, retain).await, 0);
+    }
+
+    /// Regression for `incident:2026-08-20` (hourly memcg kill): the sweep
+    /// must stream `all_facts()` straight off the live store — ids only, no
+    /// `Vec<Fact>` clone. Exercised against a store large enough that a clone
+    /// would be the dominant allocation; asserts the selector consumes the
+    /// borrowed iterator directly and still finds exactly the aged receipts.
+    #[tokio::test]
+    async fn sweep_streams_live_store_without_cloning_facts() {
+        let now = Utc::now();
+        let retain = Duration::days(DEFAULT_RETAIN_DAYS);
+        let mut s = FactStore::new();
+        // Aged receipts first (store_synced is O(n) per insert; keep n small).
+        for i in 0..3 {
+            s.store_synced(fact(
+                &format!("__reverify_receipts__::aged{i}"),
+                &format!("aged{i}"),
+                now - Duration::days(45),
+                true,
+            ));
+        }
+        // Bulk non-reserved filler: never eligible, only scanned.
+        for i in 0..5_000 {
+            store_fact(&mut s, &format!("user::bulk{i}"), "k", i % 2 == 0);
+        }
+        let store = Arc::new(RwLock::new(s));
+
+        // The selector takes the store's borrowed iterator as-is — nothing to clone.
+        {
+            let g = store.read().await;
+            let selected = select_ephemeral_candidates(g.all_facts(), now, retain);
+            assert_eq!(selected.len(), 3, "only the 3 aged receipts: {selected:?}");
+        }
+        assert_eq!(run_sweep_once(&store, now, retain).await, 3);
+        assert_eq!(run_sweep_once(&store, now, retain).await, 0, "idempotent");
     }
 }
