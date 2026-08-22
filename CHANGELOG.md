@@ -15,6 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **One truncated posting list could hang every query touching a segment.**
+  `decode_block` signals truncation by returning `data.len()` and pushing no
+  values; `pfordelta_decode` looped `while deltas.len() < count` without
+  checking the call had made progress, so once the data ran out the loop could
+  not terminate — wedging the decoding thread and, with it, every query over
+  that segment. A `block_len` byte of zero reached the same state by another
+  route.
+
+  The declared count had the same origin problem: the first four bytes of
+  whatever was handed in went straight into `Vec::with_capacity`, so an
+  eleven-byte input claiming `u32::MAX` reserved about 17 GB. It is now clamped
+  to what the remaining bytes could possibly encode, and the loop breaks when a
+  block decodes nothing, returning what decoded cleanly. (#744)
+
 - **The console could not resolve a work gate even where the daemon declared it
   available.** Behind Caddy + oauth2-proxy the client `Authorization` is
   stripped, the proxy's verified identity headers are forwarded, and one shared
