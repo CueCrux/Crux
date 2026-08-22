@@ -25,6 +25,8 @@
 //! - Identity headers are trusted **only** when the request peer is loopback or
 //!   an operator-listed trusted proxy CIDR — never from a direct non-loopback
 //!   client (which could spoof the header). WireGuard is the proof.
+//!   enforced-by: non_loopback_peer_untrusted_without_cidr
+//!   enforced-by: missing_peer_fails_closed
 //! - **The proxy MUST strip-then-set the identity header.** A trusted CIDR
 //!   proves the proxy *sent* the request, not that it *authored* the header: a
 //!   proxy that forwards a client-supplied value hands any client a free
