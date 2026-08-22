@@ -415,7 +415,19 @@ fn query_visible_http_facts_as_of_inner(
         .all_facts_for_tenant(tenant_hash)
         .filter(|fact| !fact.deleted)
         .filter(|fact| as_of.is_none_or(|instant| fact.valid_at(instant)))
-        .filter(|fact| crux_mcp::scope::fact_visible_to_agent(fact, agent_name))
+        .filter(|fact| {
+            crux_mcp::scope::fact_visible_to_agent(fact, agent_name)
+                // Addressed-only exemption for seeded documentation. Reserved
+                // namespaces are born private, so an unauthenticated caller —
+                // which on an auth-off daemon is the operator, `passport_id`
+                // being `None` — otherwise cannot read the daemon's own manual
+                // through `/v1/context` even by naming it. Scoped to
+                // `__bootstrap__::` and to requests that name an entity;
+                // undirected recall still excludes every internal namespace,
+                // and `__agent::` / `__ops::` stay hidden.
+                || (q.entity.is_some()
+                    && corecrux_memory::fact_privacy::is_addressable_without_agent_identity(&fact.entity))
+        })
         .filter(|fact| q.tenant_hash.as_ref().is_none_or(|tenant| fact.tenant_hash == *tenant))
         .filter(|fact| {
             q.entity_prefix

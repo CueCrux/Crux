@@ -752,6 +752,40 @@ mod tests {
         assert_eq!(entities, vec!["__bootstrap__::doc:api-append".to_string()]);
     }
 
+    /// The boundary of the exemption that keeps the test above passing.
+    /// Seeded documentation is addressable without an agent identity; private
+    /// daemon state is not. Without this, "reserved namespaces are readable
+    /// when named" could widen to `__agent::` / `__ops::` and nothing would
+    /// fail — the disclosure would be strictly worse than the problem the
+    /// exemption solves.
+    #[tokio::test]
+    async fn addressing_private_daemon_state_without_an_agent_returns_nothing() {
+        let state = enabled_state();
+        for entity in ["__agent::alice::secret", "__ops::internal-state"] {
+            store_fact(&state, entity, "content", "private daemon state").await;
+
+            let bundle = get_bundle(&state, req(Some(entity), None, Some(4000))).await;
+            let entities: Vec<String> = bundle["sections"]
+                .as_array()
+                .expect("sections")
+                .iter()
+                .find(|s| s["kind"] == "facts")
+                .map(|s| {
+                    s["facts"]
+                        .as_array()
+                        .expect("facts items")
+                        .iter()
+                        .map(|f| f["entity"].as_str().unwrap_or_default().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert!(
+                entities.is_empty(),
+                "{entity} must stay hidden from a caller with no agent identity, got {entities:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn stable_region_is_byte_stable_across_calls() {
         let state = enabled_state();
