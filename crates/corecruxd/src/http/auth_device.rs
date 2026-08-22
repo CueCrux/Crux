@@ -24,8 +24,18 @@
 //! - **Phishing:** short `user_code` TTL; `/activate` shows the requesting client
 //!   name; approval is bound to an authenticated console admin (`admin:write`).
 //! - **Tenant leakage (T.1):** the issued `tenant_id` + scopes come from the
-//!   *approver*, never from the polling client.
+//!   *approver*, never from the polling client — and never exceed what that
+//!   approver itself holds. Scope matching is exact, so `admin:write` does not
+//!   imply `facts:write`.
+//!   enforced-by: attack_device_approve_cannot_grant_scopes_the_approver_lacks
+//! - **Identity lending is a fallback, not a feature.** `bind_passport` binds
+//!   the approver's own passport; where a stronger rung can name the device's
+//!   human, it is refused so they arrive as themselves.
+//!   enforced-by: attack_bind_passport_is_refused_when_a_stronger_rung_can_name_the_human
 //! - Gated behind `CORECRUXD_DEVICE_GRANT_ENABLED` (default off) ⇒ 404 disabled.
+//!   `/activate` is gated on the same flag: a branded approval form on a daemon
+//!   that cannot approve is phishing surface with no function.
+//!   enforced-by: activate_is_absent_when_the_device_grant_is_disabled
 //!
 //! Durability (ExecPlan `crux-hosted-relay-gateway-2026-07-30`, M1): refresh
 //! credentials — and their revocations — persist across restarts as private

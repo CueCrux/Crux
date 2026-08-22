@@ -930,6 +930,8 @@ pub(super) async fn get_pending_gates(
     // An oversight queue answers for every tenant the credential is authorized
     // for unless the caller narrows it. Collapsing to one tenant here is what
     // hid pending gates held outside `default` (issue #703).
+    // enforced-by: authorized_tenant_scope_spans_every_tenant_for_a_verified_wildcard_token
+    // enforced-by: authorized_tenant_scope_auth_off_widens_only_on_a_direct_loopback_socket
     let scope = match context.resolve_authorized_tenant_scope(q.tenant_id.as_deref(), direct_local) {
         Ok(scope) => scope,
         Err(problem) => return problem.into_response(),
@@ -1194,6 +1196,8 @@ impl GateSeparation {
     /// verifies that two passports differ, and cannot establish that they belong
     /// to two people. Claiming separation of duties it never proved is the
     /// failure this wording exists to prevent.
+    /// enforced-by: a_two_party_decision_records_distinct_passports_and_never_claims_four_eyes
+    /// enforced-by: a_single_party_decision_is_recorded_as_self_approved_not_hidden
     fn evidence(self) -> &'static str {
         if self.self_resolution {
             "none:self_approved"

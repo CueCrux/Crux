@@ -372,13 +372,13 @@ This is the body.
     /// sections were re-verification instructions; re-adding them would reintroduce the
     /// over-verification this generation is prone to.
     #[test]
-    fn code_grounding_v2_drops_the_reverification_sections() {
+    fn code_grounding_v3_keeps_citation_rules_and_drops_reverification() {
         let bundled = load_bundled_profiles().unwrap();
         let p = bundled
             .iter()
             .find(|f| f.frontmatter.name == "code-grounding")
             .expect("code-grounding fragment must be bundled");
-        assert_eq!(p.frontmatter.version, 2);
+        assert_eq!(p.frontmatter.version, 3);
 
         let body = p.body.to_lowercase();
         for dropped in [
@@ -393,6 +393,11 @@ This is the body.
         }
         assert!(body.contains("file:line"), "citation rule survives");
         assert!(body.contains("corpus"), "corpus-identity rule survives");
+        // v3 additions. Both are citation rules rather than re-verification
+        // rituals: one says WHICH tree to cite, the other says a load-bearing
+        // claim cites the test that keeps it.
+        assert!(body.contains("origin/main"), "v3 origin/main existence rule");
+        assert!(body.contains("enforced-by:"), "v3 enforced-by rule");
     }
 
     /// v2 collapsed four competing boot rituals into one, and handed the retrieval-budget
