@@ -2484,6 +2484,18 @@ Rail 2 works with **any** proxy that authenticates humans, not just Tailscale.
 > guarantee it, use the device-authorization grant (rail 3) instead, which
 > derives identity from an approver rather than a header.
 
+Rail 2 also answers the **proxied console**. When the console sits behind an
+authenticating proxy that injects one shared admin JWT (no `passport_id`) and
+forwards each operator's verified login in the identity header, the
+human-decision routes — work-gate approve/reject and passport-mint
+approve/reject — consult the rail directly: a trusted proxy peer (loopback or
+`CORECRUXD_TS_TRUSTED_PROXY_CIDRS`) plus an allowlisted login whose entry
+carries `#<passport_id>` resolves the decision *as that passport*, and the
+receipt envelope records `approver_source` so the provenance is auditable.
+Without the `#<passport_id>` suffix the login is known but unbound and the
+decision is refused exactly as before; agent tokens, passport-header overrides
+and untrusted peers are refused unchanged.
+
 ## IX / Infra: machines, hooks, config & session sync
 
 Onboarding is login-driven and observable. `corecruxctl login` does three things:

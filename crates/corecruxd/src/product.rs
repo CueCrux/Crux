@@ -450,6 +450,10 @@ pub struct GateResolutionInputs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateResolutionRung {
     /// A proxy-asserted verified identity, mapped to a passport by allowlist.
+    /// Honoured both by the rail's token mint and directly on the
+    /// human-decision routes, so a proxied console operator whose bearer is a
+    /// shared bridge JWT still resolves as their own allowlisted passport
+    /// (`http::auth_rails::passport_bound_context_for_human_decision`).
     IdentityHeader,
     /// An already-trusted admin vouched for this device and bound their passport.
     DeviceGrant,

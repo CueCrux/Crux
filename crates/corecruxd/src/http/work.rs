@@ -934,33 +934,38 @@ fn gate_tenant(gate: &crate::work::PendingGateAction) -> &str {
 pub(super) async fn post_gate_approve(
     State(state): State<AppState>,
     Path(action_id): Path<String>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<GateResolutionBody>,
 ) -> impl IntoResponse {
-    resolve_gate_http(&state, &action_id, &headers, &body, true).await
+    resolve_gate_http(&state, &action_id, &headers, Some(peer.ip()), &body, true).await
 }
 
 #[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_gate_reject(
     State(state): State<AppState>,
     Path(action_id): Path<String>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<GateResolutionBody>,
 ) -> impl IntoResponse {
-    resolve_gate_http(&state, &action_id, &headers, &body, false).await
+    resolve_gate_http(&state, &action_id, &headers, Some(peer.ip()), &body, false).await
 }
 
 async fn resolve_gate_http(
     state: &AppState,
     action_id: &str,
     headers: &HeaderMap,
+    peer: Option<std::net::IpAddr>,
     body: &GateResolutionBody,
     approve: bool,
 ) -> axum::response::Response {
     // This is intentionally independent of route_auth: its default posture is
     // shadow. Enforcing modes retain the hard boundary; auth-off uses an
-    // explicitly unverified operator attribution instead.
-    let context = match crate::auth::passport_bound_context(&state.auth, headers) {
+    // explicitly unverified operator attribution instead. A bearer without a
+    // canonical passport claim may still be named by the trusted-proxy
+    // identity rail (the proxied-console posture) — see `auth_rails`.
+    let context = match super::auth_rails::passport_bound_context_for_human_decision(&state.auth, headers, peer) {
         Ok(context) => context,
         Err(problem) => return problem.into_response(),
     };
@@ -1070,7 +1075,10 @@ async fn resolve_gate_http(
         required_approvers,
         self_resolution,
     };
-    let receipt = match mint_gate_receipt(state, &target, &approver_actor, approve, separation) {
+    let approver_source = context
+        .passport_from_identity_rail()
+        .then(super::auth_rails::rail_label);
+    let receipt = match mint_gate_receipt(state, &target, &approver_actor, approver_source, approve, separation) {
         Ok(receipt) => receipt,
         Err((status, detail)) => return problem_response(status, detail),
     };
@@ -1173,6 +1181,10 @@ fn mint_gate_receipt(
     state: &AppState,
     target: &crate::work::GateResolutionTarget,
     approver_passport: &str,
+    // `Some(rail)` when the approver was named by the trusted-proxy identity
+    // rail rather than the bearer's own claims; recorded on the envelope so the
+    // provenance of a proxied-console decision is visible to an auditor.
+    approver_source: Option<&str>,
     approve: bool,
     separation: GateSeparation,
 ) -> Result<super::approval_receipts::MintedApprovalReceipt, (StatusCode, String)> {
@@ -1216,6 +1228,12 @@ fn mint_gate_receipt(
         "self_approved".to_string(),
         serde_json::Value::Bool(separation.self_resolution),
     );
+    if let Some(source) = approver_source {
+        envelope_fields.insert(
+            "approver_source".to_string(),
+            serde_json::Value::String(source.to_string()),
+        );
+    }
     super::approval_receipts::mint_or_load_approval_receipt(
         state,
         &super::approval_receipts::ApprovalReceiptSpec {

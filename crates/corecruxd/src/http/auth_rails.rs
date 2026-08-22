@@ -235,6 +235,53 @@ pub(super) fn peer_identity_trusted(peer: Option<IpAddr>, trusted: &[(IpAddr, u8
     trusted.iter().any(|cidr| ip_in_cidr(peer, *cidr))
 }
 
+/// The passport the identity rail establishes for this request, if any: rail
+/// enabled, peer trusted, identity header naming an allowlisted login, and that
+/// entry carrying a `#passport`. Every other case is `None` — fail closed, so a
+/// caller behaves exactly as it did before the rail existed.
+pub(super) fn trusted_identity_passport(peer: Option<IpAddr>, headers: &HeaderMap) -> Option<TsPrincipal> {
+    if !env_flag_enabled(TS_ENABLED_ENV) || !peer_identity_trusted(peer, &trusted_cidrs()) {
+        return None;
+    }
+    let login = extract_identity_login(headers)?;
+    parse_ts_allowlist(&std::env::var(TS_ALLOWLIST_ENV).unwrap_or_default())
+        .remove(&login)
+        .filter(|principal| principal.passport_id.is_some())
+}
+
+/// `passport_bound_context` for the human-decision routes (work-gate and
+/// passport-mint approve/reject).
+///
+/// In the proxied-console posture an authenticating proxy injects one shared
+/// admin JWT and the operator's verified identity rides the identity header, so
+/// the bearer carries no canonical passport claim and the decision routes
+/// refused with 403 while `/v1/version` declared the `identity_header` rung
+/// available. Here the rail supplies the passport instead — under exactly the
+/// trust rules its own mint endpoint applies. Agent tokens, passport-header
+/// overrides and local-unverified modes are left untouched, so every existing
+/// refusal on those routes still fires; scopes stay the bearer's.
+#[allow(clippy::result_large_err)]
+pub(super) fn passport_bound_context_for_human_decision(
+    auth: &crate::auth::Authz,
+    headers: &HeaderMap,
+    peer: Option<IpAddr>,
+) -> Result<crate::auth::HttpScopeContext, crate::problem::ProblemResponse> {
+    let mut context = crate::auth::passport_bound_context(auth, headers)?;
+    if context.canonical_passport_claim_verified()
+        || context.credential_is_agent_token()
+        || context.passport_override_used()
+        || context.local_unverified_identity()
+    {
+        return Ok(context);
+    }
+    if let Some(principal) = trusted_identity_passport(peer, headers) {
+        if let Some(passport_id) = principal.passport_id.as_deref() {
+            context.bind_trusted_identity_passport(passport_id, &principal.tenant_id)?;
+        }
+    }
+    Ok(context)
+}
+
 /// `GET /v1/auth/whoami` — echo the identity the daemon trusts for this caller.
 #[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn get_whoami(
@@ -542,6 +589,57 @@ mod tests {
         assert!(parse_cidr("10.0.0.0/33").is_none());
         assert!(parse_cidr("notanip/8").is_none());
         assert!(parse_cidr("10.0.0.0").is_none());
+    }
+
+    // ── Human-decision routes consult the rail ────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn trusted_identity_passport_binds_only_on_the_full_trust_chain() {
+        std::env::remove_var(IDENTITY_HEADER_ENV);
+        std::env::remove_var(TS_TRUSTED_CIDRS_ENV);
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let remote: IpAddr = "100.89.67.6".parse().unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(DEFAULT_IDENTITY_HEADER, "Alice@Example.com".parse().unwrap());
+
+        // Rail disabled ⇒ None regardless of everything else.
+        std::env::remove_var(TS_ENABLED_ENV);
+        std::env::set_var(TS_ALLOWLIST_ENV, "alice@example.com=acme:facts:write#p_alice");
+        assert!(trusted_identity_passport(Some(loopback), &h).is_none());
+
+        // Full chain ⇒ the allowlisted principal, passport included.
+        std::env::set_var(TS_ENABLED_ENV, "1");
+        assert_eq!(
+            trusted_identity_passport(Some(loopback), &h),
+            Some(TsPrincipal {
+                tenant_id: "acme".to_string(),
+                scopes: vec!["facts:write".to_string()],
+                passport_id: Some("p_alice".to_string()),
+            })
+        );
+
+        // Untrusted or missing peer ⇒ None (fail closed)...
+        assert!(trusted_identity_passport(Some(remote), &h).is_none());
+        assert!(trusted_identity_passport(None, &h).is_none());
+        // ...unless the peer is an operator-listed proxy CIDR.
+        std::env::set_var(TS_TRUSTED_CIDRS_ENV, "100.64.0.0/10");
+        assert!(trusted_identity_passport(Some(remote), &h).is_some());
+        std::env::remove_var(TS_TRUSTED_CIDRS_ENV);
+
+        // Login not allowlisted, or no header at all ⇒ None.
+        let mut other = HeaderMap::new();
+        other.insert(DEFAULT_IDENTITY_HEADER, "mallory@example.com".parse().unwrap());
+        assert!(trusted_identity_passport(Some(loopback), &other).is_none());
+        assert!(trusted_identity_passport(Some(loopback), &HeaderMap::new()).is_none());
+
+        // Allowlisted but unbound (no `#passport`) ⇒ None: the rail must not
+        // invent a passport here any more than its mint endpoint does.
+        std::env::set_var(TS_ALLOWLIST_ENV, "alice@example.com=acme:facts:write");
+        assert!(trusted_identity_passport(Some(loopback), &h).is_none());
+
+        std::env::remove_var(TS_ENABLED_ENV);
+        std::env::remove_var(TS_ALLOWLIST_ENV);
     }
 
     #[test]

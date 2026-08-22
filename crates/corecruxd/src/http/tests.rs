@@ -12437,6 +12437,7 @@ async fn mint_test_resolve(
         super::passports::post_mint_request_approve(
             State(state.clone()),
             Path(request_id.to_string()),
+            loopback_peer(),
             headers,
             Json(body),
         )
@@ -12446,6 +12447,7 @@ async fn mint_test_resolve(
         super::passports::post_mint_request_reject(
             State(state.clone()),
             Path(request_id.to_string()),
+            loopback_peer(),
             headers,
             Json(body),
         )
@@ -12512,6 +12514,7 @@ async fn passport_mint_request_approve_http_mints_and_attributes_operator() -> R
     let resp = super::passports::post_mint_request_approve(
         State(state.clone()),
         Path(request_id.clone()),
+        loopback_peer(),
         mint_test_verified_headers("admin:write", "operator-work"),
         Json(super::passports::ResolveMintRequestBody {
             approver_passport: Some("operator-work".to_string()),
@@ -12670,6 +12673,7 @@ async fn passport_mint_request_resolution_requires_admin_write_without_mutation(
     let resp = super::passports::post_mint_request_approve(
         State(state.clone()),
         Path(request_id.clone()),
+        loopback_peer(),
         dev_scope_headers("admin:read"),
         Json(super::passports::ResolveMintRequestBody {
             approver_passport: Some("operator-work".to_string()),
@@ -12684,6 +12688,7 @@ async fn passport_mint_request_resolution_requires_admin_write_without_mutation(
     let reject = super::passports::post_mint_request_reject(
         State(state.clone()),
         Path(request_id.clone()),
+        loopback_peer(),
         dev_scope_headers("admin:read"),
         Json(super::passports::ResolveMintRequestBody {
             approver_passport: Some("operator-work".to_string()),
@@ -12727,6 +12732,7 @@ async fn passport_mint_request_flag_off_approve_and_reject_are_noops() -> Result
     let approve = super::passports::post_mint_request_approve(
         State(state.clone()),
         Path(request_id.clone()),
+        loopback_peer(),
         dev_scope_passport_headers("admin:write", "rejecting-operator"),
         Json(body()),
     )
@@ -12737,6 +12743,7 @@ async fn passport_mint_request_flag_off_approve_and_reject_are_noops() -> Result
     let reject = super::passports::post_mint_request_reject(
         State(state.clone()),
         Path(request_id.clone()),
+        loopback_peer(),
         dev_scope_headers("admin:write"),
         Json(body()),
     )
@@ -12776,6 +12783,7 @@ async fn passport_mint_request_reject_http_mints_nothing_and_attributes_operator
     let resp = super::passports::post_mint_request_reject(
         State(state.clone()),
         Path(request_id.clone()),
+        loopback_peer(),
         mint_test_verified_headers("admin:write", "rejecting-operator"),
         Json(super::passports::ResolveMintRequestBody {
             approver_passport: Some("rejecting-operator".to_string()),
@@ -12889,6 +12897,7 @@ async fn passport_mint_request_approve_http_maps_category_and_terminal_errors_wi
         super::passports::post_mint_request_approve(
             State(state.clone()),
             Path(request_id),
+            loopback_peer(),
             mint_test_verified_headers("admin:write", "operator-work"),
             Json(super::passports::ResolveMintRequestBody {
                 approver_passport: Some("operator-work".to_string()),
@@ -13120,6 +13129,92 @@ async fn passport_mint_request_jwt_reviewer_binding_denies_body_and_header_imper
     let resolved = crate::mint_requests::get_mint_request(&store, &request_id)
         .ok_or_else(|| std::io::Error::other("JWT resolved mint request missing"))?;
     assert_eq!(resolved.resolved_by_passport.as_deref(), Some("approver-a"));
+    Ok(())
+}
+
+/// The passport-mint decision routes share the gate routes' human-decision
+/// contract, so the proxied-console posture (shared bridge JWT, identity in a
+/// header) resolves them the same way — see
+/// `work_gate_proxied_console_resolves_as_the_allowlisted_identity_passport`.
+#[tokio::test]
+#[serial_test::serial]
+async fn passport_mint_request_proxied_console_resolves_as_the_allowlisted_identity_passport(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    let _secret = EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", SECRET);
+    let _issuer = EnvVarGuard::set("CORECRUXD_JWT_ISS", "corecrux-test");
+    let _audience = EnvVarGuard::set("CORECRUXD_JWT_AUD", "corecrux");
+    let _header = EnvVarGuard::unset("CORECRUXD_IDENTITY_HEADER");
+    let _cidrs = EnvVarGuard::unset("CORECRUXD_TS_TRUSTED_PROXY_CIDRS");
+    let _rail = EnvVarGuard::set("CORECRUXD_TS_IDENTITY_ENABLED", "1");
+    let _allow = EnvVarGuard::set(
+        "CORECRUXD_TS_IDENTITY_ALLOWLIST",
+        "myles=default:admin:write#p_myles,bob=tenant-b:admin:write#p_bob",
+    );
+
+    #[derive(serde::Serialize)]
+    struct BridgeClaims<'a> {
+        exp: usize,
+        iss: &'a str,
+        aud: &'a str,
+        sub: &'a str,
+        scope: &'a str,
+        tenant_id: &'a str,
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let token = encode(
+        &Header::new(Algorithm::HS256),
+        &BridgeClaims {
+            exp: now.as_secs().saturating_add(3_600) as usize,
+            iss: "corecrux-test",
+            aud: "corecrux",
+            sub: "console-bridge",
+            scope: "admin:write admin:read",
+            tenant_id: "*",
+        },
+        &EncodingKey::from_secret(SECRET.as_bytes()),
+    )?;
+    let bridge = |login: Option<&str>| -> Result<HeaderMap, axum::http::header::InvalidHeaderValue> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}"))?,
+        );
+        if let Some(login) = login {
+            headers.insert("tailscale-user-login", HeaderValue::from_str(login)?);
+        }
+        Ok(headers)
+    };
+
+    for approve in [true, false] {
+        let (state, request_id) =
+            mint_test_state(AuthMode::JwtHs256, "requester-a", "requester-a", Some("work")).await?;
+        // Bridge alone, and an identity whose allowlist tenant cannot act in
+        // `default` (where mint requests live), are both refused.
+        let bare = mint_test_resolve(&state, &request_id, bridge(None)?, None, Some("work"), approve).await;
+        assert_eq!(bare.status(), StatusCode::FORBIDDEN);
+        let wrong_tenant =
+            mint_test_resolve(&state, &request_id, bridge(Some("bob"))?, None, Some("work"), approve).await;
+        assert_eq!(wrong_tenant.status(), StatusCode::FORBIDDEN);
+        assert_eq!(mint_test_observation_count(&state)?, 0);
+
+        let accepted =
+            mint_test_resolve(&state, &request_id, bridge(Some("myles"))?, None, Some("work"), approve).await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let body = json_body(accepted).await;
+        let receipt_id = body["receipt_id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("proxied-console mint receipt id missing"))?;
+        let receipt = super::receipts::local_approval_receipt(&state, "default", receipt_id)?
+            .ok_or_else(|| std::io::Error::other("proxied-console mint receipt missing"))?;
+        assert_eq!(receipt.reviewer_passport, "p_myles");
+        let store = state.fact_store.read().await;
+        let resolved = crate::mint_requests::get_mint_request(&store, &request_id)
+            .ok_or_else(|| std::io::Error::other("proxied-console resolved mint request missing"))?;
+        assert_eq!(resolved.resolved_by_passport.as_deref(), Some("p_myles"));
+    }
     Ok(())
 }
 
@@ -15741,13 +15836,25 @@ async fn gate_test_resolve(
         approver_passport: approver_hint.map(str::to_string),
     };
     if approve {
-        super::work::post_gate_approve(State(state.clone()), Path(action_id.to_string()), headers, Json(body))
-            .await
-            .into_response()
+        super::work::post_gate_approve(
+            State(state.clone()),
+            Path(action_id.to_string()),
+            loopback_peer(),
+            headers,
+            Json(body),
+        )
+        .await
+        .into_response()
     } else {
-        super::work::post_gate_reject(State(state.clone()), Path(action_id.to_string()), headers, Json(body))
-            .await
-            .into_response()
+        super::work::post_gate_reject(
+            State(state.clone()),
+            Path(action_id.to_string()),
+            loopback_peer(),
+            headers,
+            Json(body),
+        )
+        .await
+        .into_response()
     }
 }
 
@@ -15840,6 +15947,9 @@ async fn work_gate_read_only_token_is_denied_in_route_auth_shadow() -> Result<()
         request
             .headers_mut()
             .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        // The decision routes read the peer (trusted-proxy identity rail);
+        // `into_make_service_with_connect_info` injects it in `main.rs`.
+        request.extensions_mut().insert(loopback_peer());
         let response = app.oneshot(request).await?;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
@@ -15927,6 +16037,14 @@ async fn work_gate_rejects_registered_agent_token_as_human_decision() -> Result<
     let _tenant = EnvVarGuard::set("CORECRUXD_AGENT_TOKEN_HTTP_TENANT", "tenant-a");
     let _passport_flag = EnvVarGuard::unset("CORECRUXD_AGENT_PASSPORTS");
     let _passport_map = EnvVarGuard::unset("CRUX_AGENT_PASSPORTS");
+    // The identity rail is live and could name a human — an agent token must
+    // STILL not become one by riding alongside an identity header.
+    let _header = EnvVarGuard::unset("CORECRUXD_IDENTITY_HEADER");
+    let _rail = EnvVarGuard::set("CORECRUXD_TS_IDENTITY_ENABLED", "1");
+    let _allow = EnvVarGuard::set(
+        "CORECRUXD_TS_IDENTITY_ALLOWLIST",
+        "alice@example.com=tenant-a:facts:write#p_alice",
+    );
 
     for approve in [true, false] {
         let (state, _work_id, action_id) = gate_test_state(AuthMode::JwtHs256, Some("tenant-a")).await?;
@@ -15935,6 +16053,7 @@ async fn work_gate_rejects_registered_agent_token_as_human_decision() -> Result<
             header::AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {AGENT_TOKEN}"))?,
         );
+        headers.insert("tailscale-user-login", HeaderValue::from_static("alice@example.com"));
         let response = gate_test_resolve(&state, &action_id, headers, None, approve).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(gate_test_observation_count(&state)?, 0);
@@ -15947,6 +16066,167 @@ async fn work_gate_rejects_registered_agent_token_as_human_decision() -> Result<
         assert_eq!(gate.status, "pending");
         assert_eq!(gate.resolved_by_passport, None);
         assert_eq!(gate.receipt_id, None);
+    }
+    Ok(())
+}
+
+/// Proxied-console posture (gate-oversight ExecPlan M4; verified live
+/// 2026-08-20 on v0.5.62): an authenticating proxy injects ONE shared admin JWT
+/// (`sub: console-bridge`, `tenant_id: *`, no `passport_id`) and forwards the
+/// operator's verified login in the identity header. The rail mapped that login
+/// to a passport and `/v1/version` declared the `identity_header` rung
+/// available — yet the decision routes refused with 403, so the declaration
+/// lied. The routes now consult the rail under its own trust rules: trusted
+/// peer + allowlisted login carrying `#passport` ⇒ the decision is attributed
+/// to that passport; every weaker chain ⇒ the original 403, nothing mutated.
+#[tokio::test]
+#[serial_test::serial]
+async fn work_gate_proxied_console_resolves_as_the_allowlisted_identity_passport(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    let _secret = EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", SECRET);
+    let _issuer = EnvVarGuard::set("CORECRUXD_JWT_ISS", "corecrux-test");
+    let _audience = EnvVarGuard::set("CORECRUXD_JWT_AUD", "corecrux");
+    let _approvers = EnvVarGuard::unset(super::work::WORK_GATE_APPROVERS_ENV);
+    let _header = EnvVarGuard::set("CORECRUXD_IDENTITY_HEADER", "x-auth-request-user");
+    let _cidrs = EnvVarGuard::unset("CORECRUXD_TS_TRUSTED_PROXY_CIDRS");
+    let _rail = EnvVarGuard::set("CORECRUXD_TS_IDENTITY_ENABLED", "1");
+    let _allow = EnvVarGuard::set(
+        "CORECRUXD_TS_IDENTITY_ALLOWLIST",
+        "myles=tenant-a:facts:write#p_myles,bob=tenant-b:facts:write#p_bob,carol=tenant-a:facts:write",
+    );
+
+    #[derive(serde::Serialize)]
+    struct BridgeClaims<'a> {
+        exp: usize,
+        iss: &'a str,
+        aud: &'a str,
+        sub: &'a str,
+        scope: &'a str,
+        tenant_id: &'a str,
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let token = encode(
+        &Header::new(Algorithm::HS256),
+        &BridgeClaims {
+            exp: now.as_secs().saturating_add(3_600) as usize,
+            iss: "corecrux-test",
+            aud: "corecrux",
+            sub: "console-bridge",
+            scope: "facts:write admin:write admin:read",
+            tenant_id: "*",
+        },
+        &EncodingKey::from_secret(SECRET.as_bytes()),
+    )?;
+    let bridge = |login: Option<&str>| -> Result<HeaderMap, axum::http::header::InvalidHeaderValue> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}"))?,
+        );
+        if let Some(login) = login {
+            headers.insert("x-auth-request-user", HeaderValue::from_str(login)?);
+        }
+        Ok(headers)
+    };
+
+    for approve in [true, false] {
+        let (state, _work_id, action_id) = gate_test_state(AuthMode::JwtHs256, Some("tenant-a")).await?;
+        let pending_untouched = |store: &corecrux_memory::FactStore| -> Result<(), Box<dyn std::error::Error>> {
+            let entity = format!("{}::{action_id}", crate::work::WORK_GATE_ENTITY_PREFIX);
+            let fact = gate_test_latest_fact(store, &entity)
+                .ok_or_else(|| std::io::Error::other("pending gate missing after a refused attempt"))?;
+            let gate: crate::work::PendingGateAction = serde_json::from_str(&fact.value)?;
+            assert_eq!(gate.status, "pending");
+            assert_eq!(gate.resolved_by_passport, None);
+            Ok(())
+        };
+
+        // The bridge JWT alone — today's failure — is still refused.
+        let bare = gate_test_resolve(&state, &action_id, bridge(None)?, None, approve).await;
+        assert_eq!(bare.status(), StatusCode::FORBIDDEN);
+        // Rail switched off ⇒ the header is ignored entirely (unchanged 403).
+        {
+            let _off = EnvVarGuard::set("CORECRUXD_TS_IDENTITY_ENABLED", "0");
+            let off = gate_test_resolve(&state, &action_id, bridge(Some("myles"))?, None, approve).await;
+            assert_eq!(off.status(), StatusCode::FORBIDDEN);
+        }
+        // Allowlisted but without a `#passport` ⇒ refused; the rail never
+        // invents one.
+        let unbound = gate_test_resolve(&state, &action_id, bridge(Some("carol"))?, None, approve).await;
+        assert_eq!(unbound.status(), StatusCode::FORBIDDEN);
+        // Allowlisted for another tenant ⇒ the gate's tenant is not authorized.
+        let wrong_tenant = gate_test_resolve(&state, &action_id, bridge(Some("bob"))?, None, approve).await;
+        assert_eq!(wrong_tenant.status(), StatusCode::FORBIDDEN);
+        // A body hint naming someone else cannot ride on the header identity.
+        let spoofed = gate_test_resolve(&state, &action_id, bridge(Some("myles"))?, Some("p_other"), approve).await;
+        assert_eq!(spoofed.status(), StatusCode::FORBIDDEN);
+        // A non-loopback, non-listed peer could have spoofed the header ⇒ 403.
+        let remote = axum::extract::ConnectInfo("100.89.67.6:40000".parse::<std::net::SocketAddr>()?);
+        let body = super::work::GateResolutionBody {
+            approver_passport: None,
+        };
+        let from_remote = if approve {
+            super::work::post_gate_approve(
+                State(state.clone()),
+                Path(action_id.clone()),
+                remote,
+                bridge(Some("myles"))?,
+                Json(body),
+            )
+            .await
+            .into_response()
+        } else {
+            super::work::post_gate_reject(
+                State(state.clone()),
+                Path(action_id.clone()),
+                remote,
+                bridge(Some("myles"))?,
+                Json(body),
+            )
+            .await
+            .into_response()
+        };
+        assert_eq!(from_remote.status(), StatusCode::FORBIDDEN);
+        assert_eq!(gate_test_observation_count(&state)?, 0);
+        pending_untouched(&*state.fact_store.read().await)?;
+
+        // The full chain: loopback peer, rail on, allowlisted login bound to a
+        // passport whose tenant holds the gate ⇒ resolved AS that passport.
+        let accepted = gate_test_resolve(&state, &action_id, bridge(Some("myles"))?, None, approve).await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let body = json_body(accepted).await;
+        let receipt_id = body["receipt_id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("proxied-console gate receipt_id missing"))?
+            .to_string();
+        assert_eq!(gate_test_observation_count(&state)?, 1);
+        let receipt = super::receipts::local_approval_receipt(&state, "tenant-a", &receipt_id)?
+            .ok_or_else(|| std::io::Error::other("proxied-console gate receipt missing"))?;
+        assert_eq!(receipt.reviewer_passport, "p_myles");
+        assert_eq!(receipt.decision, if approve { "approve" } else { "reject" });
+        // Provenance: the envelope says the rail named the approver.
+        let observations = super::observations::read_observations_strict(&super::observations::observation_file_path(
+            &state.data_dir,
+            super::work::WORK_GATE_RECEIPT_SESSION,
+        ))?;
+        assert_eq!(
+            observations[0].payload["approver_source"].as_str(),
+            Some("identity-header"),
+            "the receipt envelope must record that the identity rail named the approver"
+        );
+
+        let store = state.fact_store.read().await;
+        let entity = format!("{}::{action_id}", crate::work::WORK_GATE_ENTITY_PREFIX);
+        let fact = gate_test_latest_fact(&store, &entity)
+            .ok_or_else(|| std::io::Error::other("resolved proxied-console gate fact missing"))?;
+        assert_eq!(fact.actor.as_deref(), Some("p_myles"));
+        assert_eq!(fact.source_receipt.as_deref(), Some(receipt_id.as_str()));
+        let gate: crate::work::PendingGateAction = serde_json::from_str(&fact.value)?;
+        assert_eq!(gate.status, if approve { "approved" } else { "rejected" });
+        assert_eq!(gate.resolved_by_passport.as_deref(), Some("p_myles"));
     }
     Ok(())
 }
@@ -16900,6 +17180,7 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
     let rejected = super::work::post_gate_reject(
         State(state.clone()),
         Path(reject_action),
+        loopback_peer(),
         dev_scope_passport_headers("facts:write", "work-default"),
         Json(super::work::GateResolutionBody {
             approver_passport: Some("work-default".to_string()),
@@ -16934,6 +17215,7 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
     let approved = super::work::post_gate_approve(
         State(state),
         Path(approve_action),
+        loopback_peer(),
         dev_scope_passport_headers("facts:write", "work-default"),
         Json(super::work::GateResolutionBody {
             approver_passport: Some("work-default".to_string()),
@@ -17043,6 +17325,7 @@ async fn work_gate_approver_policy_permits_single_party_only_when_configured() {
     let refused = super::work::post_gate_approve(
         State(strict_state.clone()),
         Path(action),
+        loopback_peer(),
         dev_scope_passport_headers("facts:write", P),
         Json(super::work::GateResolutionBody {
             approver_passport: Some(P.to_string()),
@@ -17065,6 +17348,7 @@ async fn work_gate_approver_policy_permits_single_party_only_when_configured() {
     let allowed = super::work::post_gate_approve(
         State(state.clone()),
         Path(action),
+        loopback_peer(),
         dev_scope_passport_headers("facts:write", P),
         Json(super::work::GateResolutionBody {
             approver_passport: Some(P.to_string()),

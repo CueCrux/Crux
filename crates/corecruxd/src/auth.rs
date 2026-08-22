@@ -995,6 +995,10 @@ pub struct HttpScopeContext {
     local_unverified_identity: bool,
     passport_override_used: bool,
     canonical_passport_claim_verified: bool,
+    /// The passport was established by the trusted-proxy identity rail
+    /// (`http::auth_rails`) rather than carried in the bearer's own claims.
+    /// Set only through [`Self::bind_trusted_identity_passport`].
+    passport_from_identity_rail: bool,
     credential_is_agent_token: bool,
     scope_bypass: bool,
     /// Tenant authority derived from the bearer token's `tenant_id`/`tenants`
@@ -1185,6 +1189,49 @@ impl HttpScopeContext {
         self.credential_is_agent_token
     }
 
+    /// Whether the passport on this context came from the trusted-proxy
+    /// identity rail rather than the bearer's claims — recorded on receipts so
+    /// an auditor can tell a proxied-console decision from a passport JWT.
+    pub(crate) fn passport_from_identity_rail(&self) -> bool {
+        self.passport_from_identity_rail
+    }
+
+    /// Bind the passport the trusted-proxy identity rail established for this
+    /// caller (`http::auth_rails::trusted_identity_passport`): the bearer had
+    /// no canonical passport claim, but an authenticating proxy the daemon
+    /// trusts asserted a login the operator's allowlist maps to `passport_id`.
+    ///
+    /// Tenant authority is the intersection of the bearer's and the
+    /// allowlist's: `*` keeps the bearer's, a concrete tenant narrows to it,
+    /// and a tenant the bearer cannot act in refuses. Binding never widens.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn bind_trusted_identity_passport(
+        &mut self,
+        passport_id: &str,
+        tenant_id: &str,
+    ) -> Result<(), ProblemResponse> {
+        self.tenants = match (&self.tenants, tenant_id) {
+            (_, "*") => self.tenants.clone(),
+            (TenantAllow::Any, tenant) => TenantAllow::Only(BTreeSet::from([tenant.to_string()])),
+            (TenantAllow::Only(set), tenant) if set.contains(tenant) => {
+                TenantAllow::Only(BTreeSet::from([tenant.to_string()]))
+            }
+            _ => return Err(ProblemResponse(
+                ProblemDetails::forbidden(
+                    "the identity allowlist maps this login to a tenant the bearer credential is not authorized for",
+                )
+                .with_extensions(serde_json::json!({
+                    "code": "TENANT_FORBIDDEN",
+                    "tenantId": tenant_id,
+                })),
+            )),
+        };
+        self.passport_id = Some(passport_id.to_string());
+        self.canonical_passport_claim_verified = true;
+        self.passport_from_identity_rail = true;
+        Ok(())
+    }
+
     /// Tenant to stamp on an HTTP write (OD-37). `Ok(None)` → default tenant.
     #[allow(clippy::result_large_err)]
     pub(crate) fn resolve_write_tenant(&self) -> Result<Option<String>, ProblemResponse> {
@@ -1350,6 +1397,7 @@ pub fn passport_bound_context(auth: &Authz, headers: &HeaderMap) -> Result<HttpS
         local_unverified_identity: matches!(auth.mode, AuthMode::Off | AuthMode::DevScopes),
         passport_override_used,
         canonical_passport_claim_verified: ctx.canonical_passport_claim_verified,
+        passport_from_identity_rail: false,
         credential_is_agent_token: ctx.credential_is_agent_token,
         scope_bypass: auth.mode == AuthMode::Off,
         tenants,
