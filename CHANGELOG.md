@@ -11,6 +11,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.64] - 2026-08-23
+
+### Fixed
+
+- **The console could not resolve a work gate even where the daemon declared it
+  available.** Behind Caddy + oauth2-proxy the client `Authorization` is
+  stripped, the proxy's verified identity headers are forwarded, and one shared
+  bridge JWT is injected — `sub: console-bridge`, admin scopes, `tenant_id: *`,
+  **no `passport_id`**. The identity rail was enabled and mapped the operator's
+  login to a canonical passport, and `/v1/version` declared the
+  `work_gate_resolution` rung `identity_header` available — yet every console
+  Approve/Reject failed with *"a canonical passport_id claim is required for
+  gate resolution"*, because the rail was consulted only by its own mint
+  endpoints and never on the decision routes.
+
+  That is precisely the anti-lying property the gate-oversight work asserts: the
+  declaration said "available" while the real attempt failed.
+
+  On the human-decision routes — `POST /v1/work/gate/{id}/approve|reject` and
+  `POST /v1/passport/mint-requests/{id}/approve|reject` — a bearer carrying no
+  canonical passport claim now consults the identity rail under **exactly** the
+  trust rules its mint endpoint applies: rail enabled, peer trusted (loopback or
+  a listed CIDR), identity header naming an allowlisted login, and that entry
+  carrying `#passport_id`. The passport is then bound to the context and the
+  rail recorded on the receipt envelope as `approver_source`. (#738)
+
+- **Signed exports could be re-signed by anyone.** Every verifier checked the
+  artifact against the public key the artifact itself carried — a
+  self-attestation, not a custody proof: edit an export, re-sign it with a key
+  generated a second ago, and both `verify_bundle_v1` and `run_context_verify`
+  returned a green `ok`. The write side had the mirror hole:
+  `resolve_audit_export_signing_key` minted a throwaway Ed25519 key whenever it
+  had neither a configured signing key nor a data dir, so the daemon could hand
+  out an artifact no verifier could ever pin.
+
+  The write side now **refuses**: a one-shot signer cannot be pinned and cannot
+  tie two exports to one issuer, so it is a configuration error rather than a
+  degraded mode. `build_bundle_v1` independently rejects `key_class = ephemeral`
+  so a caller cannot hand-assemble one either. The enum variant survives, so
+  bundles already in the wild still parse and verify. (#735)
+
 ## [0.5.63] - 2026-08-21
 
 ### Fixed
@@ -1159,6 +1200,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-audit` CVE scanning in CI
 
 [unreleased]: https://github.com/CueCrux/Crux/compare/v0.5.63...HEAD
+[0.5.64]: https://github.com/CueCrux/Crux/compare/v0.5.63...v0.5.64
 [0.5.63]: https://github.com/CueCrux/Crux/compare/v0.5.62...v0.5.63
 [0.5.62]: https://github.com/CueCrux/Crux/compare/v0.5.61...v0.5.62
 [0.5.61]: https://github.com/CueCrux/Crux/compare/v0.5.59...v0.5.61
