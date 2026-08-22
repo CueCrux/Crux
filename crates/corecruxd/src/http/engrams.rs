@@ -17,9 +17,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use corecrux_memory::engrams::{
-    build_engram_manifest, compute_engram_set_hash, current_session_procedure, hash_json, local_catalog_with_overlays,
-    model_id_to_capability_class, prompt_hash, resolve_from_catalog, validate_local_engram, LocalEngram,
-    ENGRAM_ENTITY_PREFIX, SESSION_PROCEDURE_SCHEMA,
+    build_engram_manifest, compute_engram_set_hash, current_session_procedure, hash_json,
+    local_catalog_with_overlays_for_tenant, model_id_to_capability_class, prompt_hash, resolve_from_catalog,
+    validate_local_engram, LocalEngram, ENGRAM_ENTITY_PREFIX, SESSION_PROCEDURE_SCHEMA,
 };
 
 use super::{
@@ -110,8 +110,16 @@ pub(super) async fn list_engrams(
     if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["query:read", "admin:read"]) {
         return problem.into_response();
     }
+    let ctx = match http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(problem) => return problem.into_response(),
+    };
+    let tenant_hash = match super::facts::tenant_hash_for_read_context(&ctx) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let store = state.fact_store.read().await;
-    let mut engrams = local_catalog_with_overlays(&store);
+    let mut engrams = local_catalog_with_overlays_for_tenant(&store, &tenant_hash);
     drop(store);
     if let Some(bucket) = query.intent_bucket.as_deref().filter(|s| !s.trim().is_empty()) {
         engrams.retain(|e| e.intent_bucket == bucket);
@@ -267,10 +275,28 @@ pub(super) async fn memory_session_init(
     {
         return problem.into_response();
     }
-    let tenant_id = body
-        .tenant_id
-        .or(body.tenant_id_camel)
-        .unwrap_or_else(|| "local".to_string());
+    let requested_tenant = body.tenant_id.as_deref().or(body.tenant_id_camel.as_deref());
+    let ctx = match http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(problem) => return problem.into_response(),
+    };
+    let tenant_hash = match requested_tenant {
+        Some(tenant) => match super::facts::tenant_hash_for_requested_context(&ctx, tenant) {
+            Ok(tenant) => tenant,
+            Err(response) => return response,
+        },
+        None => match super::facts::tenant_hash_for_read_context(&ctx) {
+            Ok(tenant) => tenant,
+            Err(response) => return response,
+        },
+    };
+    let tenant_id = body.tenant_id.or(body.tenant_id_camel).unwrap_or_else(|| {
+        if tenant_hash == "default" {
+            "local".to_string()
+        } else {
+            tenant_hash.clone()
+        }
+    });
     let agent_id = body
         .agent_id
         .or(body.agent_id_camel)
@@ -278,7 +304,7 @@ pub(super) async fn memory_session_init(
     let model_id = body.model_id.or(body.model_id_camel);
     let capability_class = model_id_to_capability_class(model_id.as_deref());
     let store = state.fact_store.read().await;
-    let engrams = local_catalog_with_overlays(&store);
+    let engrams = local_catalog_with_overlays_for_tenant(&store, &tenant_hash);
     drop(store);
     let session_procedure = current_session_procedure();
     let manifest = build_engram_manifest(&engrams, &tenant_id, &capability_class);
@@ -317,10 +343,28 @@ pub(super) async fn resolve_engrams(
             "names must contain 1..=20 name@version entries",
         );
     }
-    let tenant_id = body
-        .tenant_id
-        .or(body.tenant_id_camel)
-        .unwrap_or_else(|| "local".to_string());
+    let requested_tenant = body.tenant_id.as_deref().or(body.tenant_id_camel.as_deref());
+    let ctx = match http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(problem) => return problem.into_response(),
+    };
+    let tenant_hash = match requested_tenant {
+        Some(tenant) => match super::facts::tenant_hash_for_requested_context(&ctx, tenant) {
+            Ok(tenant) => tenant,
+            Err(response) => return response,
+        },
+        None => match super::facts::tenant_hash_for_read_context(&ctx) {
+            Ok(tenant) => tenant,
+            Err(response) => return response,
+        },
+    };
+    let tenant_id = body.tenant_id.or(body.tenant_id_camel).unwrap_or_else(|| {
+        if tenant_hash == "default" {
+            "local".to_string()
+        } else {
+            tenant_hash.clone()
+        }
+    });
     let agent_id = body
         .agent_id
         .or(body.agent_id_camel)
@@ -328,7 +372,7 @@ pub(super) async fn resolve_engrams(
     let model_id = body.model_id.or(body.model_id_camel);
     let capability_class = model_id_to_capability_class(model_id.as_deref());
     let store = state.fact_store.read().await;
-    let engrams = local_catalog_with_overlays(&store);
+    let engrams = local_catalog_with_overlays_for_tenant(&store, &tenant_hash);
     drop(store);
     let manifest = build_engram_manifest(&engrams, &tenant_id, &capability_class);
     let manifest_status = match body.manifest_hash.as_deref() {

@@ -183,6 +183,32 @@ pub fn is_internal_namespace(entity: &str) -> bool {
     entity.starts_with(INTERNAL_NAMESPACE_MARKER)
 }
 
+/// The one internal namespace that is *seeded documentation* rather than
+/// somebody's private state: the first-run docs the daemon ships about itself.
+pub const SEEDED_DOCUMENTATION_PREFIX: &str = "__bootstrap__::";
+
+/// Whether an entity may be returned to a caller that named it explicitly but
+/// carries no authenticated agent identity.
+///
+/// This exists because two correct rules met and disagreed. Reserved
+/// namespaces are born private, so `fact_visible_to_agent` hides them from a
+/// caller with no passport. Separately, daemon-internal namespaces are kept out
+/// of *undirected* recall but deliberately stay reachable when addressed, so
+/// that nothing becomes unreachable. On an auth-off local daemon `passport_id`
+/// is `None` and the operator is nonetheless the owner, so applying the first
+/// rule everywhere made the daemon's own manual unreadable through
+/// `/v1/context` — the exact outcome the second rule was written to prevent.
+///
+/// The distinction that resolves it is content, not prefix shape:
+/// `__bootstrap__::` is documentation the daemon seeded about itself and is
+/// safe to hand to anyone who can already reach the port, whereas `__agent::`
+/// and `__ops::` are private state whose disclosure would be a real leak. So
+/// the exemption is deliberately one namespace wide, and addressed-only —
+/// undirected recall still excludes every internal namespace.
+pub fn is_addressable_without_agent_identity(entity: &str) -> bool {
+    entity.starts_with(SEEDED_DOCUMENTATION_PREFIX)
+}
+
 /// Reserved entity namespaces owned exclusively by daemon governance flows.
 ///
 /// Client-facing fact-create and target-mutation handlers must reject these

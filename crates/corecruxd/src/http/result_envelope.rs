@@ -120,6 +120,10 @@ pub(super) async fn post_result_envelope_import(
             return err.into_response();
         }
     }
+    let tenant_hash = match super::facts::tenant_hash_for_requested_context(&ctx, &tenant_id) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
 
     // ---- Passport binding (§2.1 passport_fpr): mismatch → reject ------------
     if let Some(envelope_fpr) = envelope.passport_fpr.as_deref() {
@@ -153,7 +157,7 @@ pub(super) async fn post_result_envelope_import(
             ) {
                 let mut store = state.fact_store.write().await;
                 store.store(StoreFact {
-                    tenant_hash: "default".to_string(),
+                    tenant_hash: tenant_hash.clone(),
                     entity: format!("__result_envelope_incident__::{tenant_id}"),
                     key: envelope.job_id.clone(),
                     value: json!({
@@ -177,7 +181,6 @@ pub(super) async fn post_result_envelope_import(
 
     // ---- Idempotency: prior receipt for this job_id with matching hash ------
     let receipt_entity = import_receipt_entity(&tenant_id);
-    let tenant_hash = super::facts::tenant_hash_for_read_context(&ctx);
     {
         let store = state.fact_store.read().await;
         for fact in store.get_by_entity_for_tenant(&receipt_entity, &tenant_hash) {
@@ -264,7 +267,7 @@ pub(super) async fn post_result_envelope_import(
         let reqs: Vec<StoreFact> = facts_in
             .iter()
             .map(|f| StoreFact {
-                tenant_hash: "default".to_string(),
+                tenant_hash: tenant_hash.clone(),
                 entity: f.entity.clone(),
                 key: f.key.clone(),
                 value: f.value.clone(),
@@ -374,7 +377,7 @@ pub(super) async fn post_result_envelope_import(
     {
         let mut store = state.fact_store.write().await;
         store.store(StoreFact {
-            tenant_hash: "default".to_string(),
+            tenant_hash,
             entity: receipt_entity,
             key: envelope.job_id.clone(),
             value: receipt_value.to_string(),
@@ -408,7 +411,8 @@ pub(super) async fn post_result_envelope_import(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::tests::test_app_state;
+    use crate::http::tests::{test_app_state, test_app_state_with_auth};
+    use crate::test_support::EnvVarGuard;
     use axum::body::to_bytes;
     use corecrux_memory::result_envelope::{
         result_envelope_content_hash, CompanionArtifact, EnvelopeEdge, EnvelopeEntity, EnvelopeFact, EnvelopePayload,
@@ -658,6 +662,75 @@ mod tests {
         let store = state.fact_store.read().await;
         assert_eq!(store.get_by_entity("business::acme::person::ada").len(), 1);
         assert_eq!(store.get_by_entity("__result_envelope__::business::acme").len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn jwt_import_stamps_payload_incident_and_receipt_to_authorized_tenant() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        const SECRET: &str = "0123456789abcdef0123456789abcdef";
+        let (signing, _guard) = pin_platform_key();
+        let _secret = EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", SECRET);
+        let _issuer = EnvVarGuard::set("CORECRUXD_JWT_ISS", "corecrux-test");
+        let _audience = EnvVarGuard::set("CORECRUXD_JWT_AUD", "corecrux");
+        let _tenant_mode = EnvVarGuard::unset("CORECRUXD_TENANT_WRITE_STAMP");
+        let state = test_app_state_with_auth(8, crate::auth::AuthMode::JwtHs256);
+
+        let headers_for = |tenant: &str| {
+            let claims = json!({
+                "exp": chrono::Utc::now().timestamp() + 3600,
+                "iss": "corecrux-test",
+                "aud": "corecrux",
+                "scope": "facts:write",
+                "tenant_id": tenant,
+            });
+            let token = encode(
+                &Header::new(Algorithm::HS256),
+                &claims,
+                &EncodingKey::from_secret(SECRET.as_bytes()),
+            )
+            .unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {token}").parse().unwrap(),
+            );
+            headers
+        };
+
+        let denied = post_result_envelope_import(
+            State(state.clone()),
+            headers_for("business::other"),
+            Json(build_envelope(&signing, "job_wrong_tenant")),
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert_eq!(state.fact_store.read().await.count(), 0);
+
+        let accepted = post_result_envelope_import(
+            State(state.clone()),
+            headers_for("business::acme"),
+            Json(build_envelope(&signing, "job_tenant_scoped")),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::CREATED);
+        let store = state.fact_store.read().await;
+        assert_eq!(
+            store
+                .get_by_entity_for_tenant("business::acme::person::ada", "business::acme")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_by_entity_for_tenant("__result_envelope__::business::acme", "business::acme")
+                .len(),
+            1
+        );
+        assert!(store
+            .get_by_entity_for_tenant("business::acme::person::ada", "default")
+            .is_empty());
     }
 
     #[tokio::test]

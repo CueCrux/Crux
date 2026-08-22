@@ -39,7 +39,10 @@ pub(super) async fn get_answer_replay(
         Ok(ctx) => ctx,
         Err(problem) => return problem.into_response(),
     };
-    let tenant_hash = super::facts::tenant_hash_for_read_context(&ctx);
+    let tenant_hash = match super::facts::tenant_hash_for_requested_context(&ctx, &q.tenant_id) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let Some(capsule) = load_answer_capsule(&state, &q.tenant_id, &answer_id, &tenant_hash).await else {
         return problem_response(StatusCode::NOT_FOUND, "answer replay capsule not found");
     };
@@ -74,7 +77,10 @@ pub(super) async fn get_answer_replay_validity(
         Ok(ctx) => ctx,
         Err(problem) => return problem.into_response(),
     };
-    let tenant_hash = super::facts::tenant_hash_for_read_context(&ctx);
+    let tenant_hash = match super::facts::tenant_hash_for_requested_context(&ctx, &q.tenant_id) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let Some(capsule) = load_answer_capsule(&state, &q.tenant_id, &answer_id, &tenant_hash).await else {
         return problem_response(StatusCode::NOT_FOUND, "answer replay capsule not found");
     };
@@ -146,9 +152,13 @@ pub(super) async fn get_answer_replay_validity(
 // remain mounted. Test builds still exercise this writer directly.
 #[cfg_attr(not(feature = "hosted-surfaces"), allow(dead_code))]
 #[tracing::instrument(level = "info", skip_all)]
-pub(super) async fn store_answer_capsule(state: &AppState, capsule: &AnswerReplayCapsule) -> std::io::Result<()> {
+pub(super) async fn store_answer_capsule(
+    state: &AppState,
+    capsule: &AnswerReplayCapsule,
+    tenant_hash: &str,
+) -> std::io::Result<()> {
     let mut fact = StoreFact {
-        tenant_hash: "default".to_string(),
+        tenant_hash: tenant_hash.to_string(),
         entity: answer_capsule_entity(&capsule.tenant_id, &capsule.answer_id),
         key: "capsule".to_string(),
         value: serde_json::to_string(capsule).map_err(std::io::Error::other)?,
@@ -1197,7 +1207,9 @@ mod tests {
         let mut evidence = evidence_ref(&fact.fact_id);
         evidence.text_hash = Some(hash_text(&fact.value));
         let capsule = capsule_with(tenant_id, answer_id, vec![evidence], Vec::new());
-        store_answer_capsule(&state, &capsule).await.expect("store capsule");
+        store_answer_capsule(&state, &capsule, "default")
+            .await
+            .expect("store capsule");
         (state, capsule)
     }
 
@@ -1646,7 +1658,9 @@ mod tests {
         let mut evidence = evidence_ref(&fact.fact_id);
         evidence.text_hash = Some(hash_text("something else entirely"));
         let capsule = capsule_with("tenant-a", "ans_1", vec![evidence], Vec::new());
-        store_answer_capsule(&state, &capsule).await.expect("store capsule");
+        store_answer_capsule(&state, &capsule, "default")
+            .await
+            .expect("store capsule");
 
         let resp = get_answer_replay_validity(
             State(state),
@@ -1678,7 +1692,9 @@ mod tests {
         evidence.text_hash = Some(hash_text(&fact.value));
         evidence.artifact_id = Some(77);
         let capsule = capsule_with("tenant-a", "ans_1", vec![evidence], Vec::new());
-        store_answer_capsule(&state, &capsule).await.expect("store capsule");
+        store_answer_capsule(&state, &capsule, "default")
+            .await
+            .expect("store capsule");
 
         let resp = get_answer_replay_validity(
             State(state),
@@ -1704,7 +1720,9 @@ mod tests {
     async fn store_then_load_answer_capsule_round_trips() {
         let state = pro_replay_state();
         let capsule = capsule_with("tenant-a", "ans_1", vec![evidence_ref("f_1")], Vec::new());
-        store_answer_capsule(&state, &capsule).await.expect("store capsule");
+        store_answer_capsule(&state, &capsule, "default")
+            .await
+            .expect("store capsule");
         let loaded = load_answer_capsule(&state, "tenant-a", "ans_1", "default")
             .await
             .expect("capsule present");
@@ -2845,7 +2863,9 @@ mod tests {
         .is_none());
 
         let capsule = capsule_with("tenant-a", "ans_1", vec![evidence_ref("f_1")], Vec::new());
-        store_answer_capsule(&state, &capsule).await.expect("store capsule");
+        store_answer_capsule(&state, &capsule, "default")
+            .await
+            .expect("store capsule");
         let resp = export_answer_capsule_if_present(
             &state,
             "tenant-a",

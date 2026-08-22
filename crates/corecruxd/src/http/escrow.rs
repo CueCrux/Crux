@@ -217,7 +217,10 @@ pub(super) async fn get_wrapped_dek(
     if !valid_vault_id(&vault_id) {
         return problem_response(StatusCode::BAD_REQUEST, "vault_id must be [A-Za-z0-9_-]{1,128}");
     }
-    let tenant = tenant_hash_for_read_context(&ctx);
+    let tenant = match tenant_hash_for_read_context(&ctx) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let facts = {
         let store = state.fact_store.read().await;
         store

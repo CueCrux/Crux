@@ -895,7 +895,10 @@ pub(super) async fn post_incident(
         Ok(ctx) => ctx,
         Err(problem) => return problem.into_response(),
     };
-    let tenant_hash = super::facts::tenant_hash_for_read_context(&ctx);
+    let tenant_hash = match super::facts::tenant_hash_for_requested_context(&ctx, &body.tenant_id) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let created_by = ctx.passport_id.unwrap_or_else(|| state.passport_fpr.clone());
     let case = match assemble_case(&state, body, created_by.clone(), &tenant_hash).await {
         Ok(case) => case,

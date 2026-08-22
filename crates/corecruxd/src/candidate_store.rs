@@ -29,7 +29,8 @@
 //! defence in depth, not the primary guarantee.
 //!
 //! This module owns the whole candidate domain: the schema, the born-private
-//! write, the read-back, and the review lifecycle ([`promote`]/[`reject`]) with
+//! write, the read-back, and the review lifecycle
+//! ([`promote_for_tenant`] / [`reject_for_tenant`]) with
 //! the fail-closed gate ([`PromotionMode`]).
 
 use corecrux_memory::fact_store::StoreFact;
@@ -154,15 +155,25 @@ pub fn candidate_entity(candidate_id: &str) -> String {
 /// was written under. The caller supplies `candidate_id` (content-addressed or
 /// uuid) and the already-built body; the receipt should already be embedded in
 /// `body.receipt` and `receipt_body_hash` linked as `source_receipt`.
+#[cfg(test)]
 pub fn write_candidate(
     store: &mut FactStore,
+    body: &MemoryCandidateV1,
+    receipt_body_hash: Option<String>,
+) -> Result<String, String> {
+    write_candidate_for_tenant(store, "default", body, receipt_body_hash)
+}
+
+pub fn write_candidate_for_tenant(
+    store: &mut FactStore,
+    tenant_hash: &str,
     body: &MemoryCandidateV1,
     receipt_body_hash: Option<String>,
 ) -> Result<String, String> {
     let entity = candidate_entity(&body.candidate_id);
     let value = serde_json::to_string(body).map_err(|e| format!("serialize candidate: {e}"))?;
     let req = StoreFact {
-        tenant_hash: "default".to_string(),
+        tenant_hash: tenant_hash.to_string(),
         entity: entity.clone(),
         key: CANDIDATE_KEY.to_string(),
         value,
@@ -181,9 +192,18 @@ pub fn write_candidate(
 /// Read back the latest version of every candidate, optionally filtered by
 /// status. Only non-deleted, non-superseded (`superseded_by == None`) records
 /// under [`CANDIDATE_PREFIX`] are considered (latest-wins).
+#[cfg(test)]
 pub fn list_candidates(store: &FactStore, status: Option<CandidateStatus>) -> Vec<MemoryCandidateV1> {
+    list_candidates_for_tenant(store, "default", status)
+}
+
+pub fn list_candidates_for_tenant(
+    store: &FactStore,
+    tenant_hash: &str,
+    status: Option<CandidateStatus>,
+) -> Vec<MemoryCandidateV1> {
     store
-        .all_facts()
+        .all_facts_for_tenant(tenant_hash)
         .filter(|f: &&Fact| {
             f.entity.starts_with(CANDIDATE_PREFIX) && f.key == CANDIDATE_KEY && !f.deleted && f.superseded_by.is_none()
         })
@@ -193,10 +213,15 @@ pub fn list_candidates(store: &FactStore, status: Option<CandidateStatus>) -> Ve
 }
 
 /// Latest version of a single candidate by id (None if absent/superseded away).
+#[cfg(test)]
 pub fn get_candidate(store: &FactStore, candidate_id: &str) -> Option<MemoryCandidateV1> {
+    get_candidate_for_tenant(store, "default", candidate_id)
+}
+
+pub fn get_candidate_for_tenant(store: &FactStore, tenant_hash: &str, candidate_id: &str) -> Option<MemoryCandidateV1> {
     let entity = candidate_entity(candidate_id);
     store
-        .all_facts()
+        .all_facts_for_tenant(tenant_hash)
         .find(|f| f.entity == entity && f.key == CANDIDATE_KEY && !f.deleted && f.superseded_by.is_none())
         .and_then(|f| serde_json::from_str::<MemoryCandidateV1>(&f.value).ok())
 }
@@ -251,13 +276,24 @@ impl std::error::Error for ReviewError {}
 /// below-threshold) candidate is refused — it stays a review-only candidate.
 /// An `Explicit` promotion is always honoured (a human/agent decided). Callable
 /// from `candidate` or (re-promote) `rejected` state, but not `promoted`.
+#[cfg(test)]
 pub fn promote(
     store: &mut FactStore,
     candidate_id: &str,
     mode: PromotionMode,
     reviewed_at: &str,
 ) -> Result<String, ReviewError> {
-    let cand = get_candidate(store, candidate_id).ok_or(ReviewError::NotFound)?;
+    promote_for_tenant(store, "default", candidate_id, mode, reviewed_at)
+}
+
+pub fn promote_for_tenant(
+    store: &mut FactStore,
+    tenant_hash: &str,
+    candidate_id: &str,
+    mode: PromotionMode,
+    reviewed_at: &str,
+) -> Result<String, ReviewError> {
+    let cand = get_candidate_for_tenant(store, tenant_hash, candidate_id).ok_or(ReviewError::NotFound)?;
     if cand.status == CandidateStatus::Promoted {
         return Err(ReviewError::AlreadyPromoted);
     }
@@ -291,7 +327,7 @@ pub fn promote(
         PromotionMode::Auto { .. } => "auto-capture:auto-promoted".to_string(),
     };
     let real = StoreFact {
-        tenant_hash: "default".to_string(),
+        tenant_hash: tenant_hash.to_string(),
         entity: cand.proposed_entity.clone(),
         key: cand.proposed_key.clone(),
         value: cand.proposed_value.clone(),
@@ -311,15 +347,26 @@ pub fn promote(
     updated.promoted_fact_id = Some(promoted.fact_id.clone());
     updated.reject_reason = None;
     updated.created_at = reviewed_at.to_string();
-    write_candidate(store, &updated, None).map_err(ReviewError::Store)?;
+    write_candidate_for_tenant(store, tenant_hash, &updated, None).map_err(ReviewError::Store)?;
     Ok(promoted.fact_id)
 }
 
 /// Reject a candidate: record it as `rejected` with a reason. Reversible — a
 /// rejected candidate can later be re-promoted. Refuses a `promoted` candidate
 /// (retract the promoted fact directly via supersession instead).
+#[cfg(test)]
 pub fn reject(store: &mut FactStore, candidate_id: &str, reason: &str, reviewed_at: &str) -> Result<(), ReviewError> {
-    let cand = get_candidate(store, candidate_id).ok_or(ReviewError::NotFound)?;
+    reject_for_tenant(store, "default", candidate_id, reason, reviewed_at)
+}
+
+pub fn reject_for_tenant(
+    store: &mut FactStore,
+    tenant_hash: &str,
+    candidate_id: &str,
+    reason: &str,
+    reviewed_at: &str,
+) -> Result<(), ReviewError> {
+    let cand = get_candidate_for_tenant(store, tenant_hash, candidate_id).ok_or(ReviewError::NotFound)?;
     if cand.status == CandidateStatus::Promoted {
         return Err(ReviewError::AlreadyPromoted);
     }
@@ -328,7 +375,7 @@ pub fn reject(store: &mut FactStore, candidate_id: &str, reason: &str, reviewed_
     updated.reject_reason = Some(reason.to_string());
     updated.promoted_fact_id = None;
     updated.created_at = reviewed_at.to_string();
-    write_candidate(store, &updated, None).map_err(ReviewError::Store)?;
+    write_candidate_for_tenant(store, tenant_hash, &updated, None).map_err(ReviewError::Store)?;
     Ok(())
 }
 
@@ -350,9 +397,14 @@ pub fn route_near_duplicates(store: &mut FactStore, now_rfc3339: &str) -> usize 
             let Some(fact) = store.get(&d.fact_id) else {
                 continue;
             };
-            (fact.entity.clone(), fact.key.clone(), fact.value.clone())
+            (
+                fact.tenant_hash.clone(),
+                fact.entity.clone(),
+                fact.key.clone(),
+                fact.value.clone(),
+            )
         };
-        let (entity, key, value) = proposal;
+        let (tenant_hash, entity, key, value) = proposal;
         let body = MemoryCandidateV1::new_candidate(
             format!("neardup-{}-{}", d.fact_id, d.similar_to),
             entity,
@@ -372,7 +424,7 @@ pub fn route_near_duplicates(store: &mut FactStore, now_rfc3339: &str) -> usize 
             None, // receipt minted by the review route layer, not here
             now_rfc3339.to_string(),
         );
-        match write_candidate(store, &body, None) {
+        match write_candidate_for_tenant(store, &tenant_hash, &body, None) {
             Ok(_) => written += 1,
             Err(err) => tracing::warn!(err, fact_id = %d.fact_id, "near-duplicate candidate write failed"),
         }
@@ -448,6 +500,47 @@ mod tests {
         // No promoted candidates yet.
         assert!(list_candidates(&store, Some(CandidateStatus::Promoted)).is_empty());
         assert_eq!(list_candidates(&store, Some(CandidateStatus::Candidate)).len(), 1);
+    }
+
+    #[test]
+    fn candidates_and_promotions_are_isolated_by_tenant() {
+        let mut store = FactStore::new();
+        write_candidate_for_tenant(&mut store, "tenant-a", &sample_body("same-id"), None).unwrap();
+        write_candidate_for_tenant(&mut store, "tenant-b", &sample_body("same-id"), None).unwrap();
+
+        let promoted = promote_for_tenant(
+            &mut store,
+            "tenant-a",
+            "same-id",
+            PromotionMode::Explicit {
+                reviewer: "reviewer-a".to_string(),
+            },
+            "2026-07-30T00:00:00Z",
+        )
+        .unwrap();
+        assert!(!promoted.is_empty());
+        assert_eq!(
+            get_candidate_for_tenant(&store, "tenant-a", "same-id").unwrap().status,
+            CandidateStatus::Promoted
+        );
+        assert_eq!(
+            get_candidate_for_tenant(&store, "tenant-b", "same-id").unwrap().status,
+            CandidateStatus::Candidate
+        );
+        assert_eq!(
+            store
+                .all_facts_for_tenant("tenant-a")
+                .filter(|fact| fact.entity == "person:user" && fact.key == "owns_cat_count")
+                .count(),
+            1
+        );
+        assert_eq!(
+            store
+                .all_facts_for_tenant("tenant-b")
+                .filter(|fact| fact.entity == "person:user" && fact.key == "owns_cat_count")
+                .count(),
+            0
+        );
     }
 
     fn scored_body(id: &str, score: f32) -> MemoryCandidateV1 {
@@ -609,7 +702,7 @@ mod tests {
         store.set_semantic_dedup(0.8);
 
         let mk = |entity: &str, key: &str, value: &str| StoreFact {
-            tenant_hash: "default".to_string(),
+            tenant_hash: "tenant-a".to_string(),
             entity: entity.to_string(),
             key: key.to_string(),
             value: value.to_string(),
@@ -629,8 +722,12 @@ mod tests {
         assert_eq!(written, 1, "one review candidate written");
         assert!(store.near_duplicates().is_empty(), "flags drained after routing");
 
-        let candidates = list_candidates(&store, Some(CandidateStatus::Candidate));
+        let candidates = list_candidates_for_tenant(&store, "tenant-a", Some(CandidateStatus::Candidate));
         assert_eq!(candidates.len(), 1, "candidate visible in the review queue");
+        assert!(
+            list_candidates(&store, Some(CandidateStatus::Candidate)).is_empty(),
+            "near-duplicate routing must not fall back to the shared default tenant"
+        );
         let c = &candidates[0];
         assert_eq!(c.rule, "semantic_dedup");
         assert!(c.verifier_score.is_none(), "unscored ⇒ review-only (fail-closed)");

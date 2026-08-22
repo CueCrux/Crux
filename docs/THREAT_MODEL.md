@@ -66,6 +66,14 @@ for the Crux Daemon.
   `__engram__::`; authenticated `PUT /v1/engrams/{name}` with `admin:write`
   validates the typed object and stamps daemon-owned actor, time, tenant,
   privacy, and provenance fields.
+- JWT modes default wired HTTP fact-backed surfaces to real tenant
+  stamping/filtering. Multi-tenant and wildcard tokens on tenant-implicit
+  routes require an authorized `X-Corecrux-Tenant-Id`; an explicit route/body
+  tenant also selects the tenant and must agree with the header. Missing,
+  ambiguous, or mismatched claims fail closed. Operators may explicitly set
+  `CORECRUXD_TENANT_WRITE_STAMP=off` or `shadow` only while migrating
+  historical shared-`default` rows. This flag does not cover MCP or stores with
+  independent entity/session/projection tenant models.
 - Decision-tool rows deliberately remain compatibility annotations. Their
   BLAKE3 value is a content identifier, not a signature or append-only proof;
   consumers must require the `integrity: "untrusted_annotation"` contract and

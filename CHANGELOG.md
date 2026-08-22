@@ -801,6 +801,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **JWT HTTP fact storage is tenant-isolated by default.** The daemon freezes
+  `CORECRUXD_TENANT_WRITE_STAMP` at startup, defaults it to `on` for JWT auth,
+  rejects invalid configuration and ambiguous/missing tenant authority, and
+  keeps `off`/`shadow` only as explicit shared-`default` migration modes.
+  Generic and console facts, context recall, engram overlays, memory
+  candidates, result envelopes, replay, and paired audit reads now preserve
+  one authorized tenant end to end. MCP and stores with
+  independent tenant contracts are explicitly outside this flag.
+
 - **`.mcp.json` is gitignored.** MCP clients write the daemon's agent bearer
   token into that file at the repository root, where it was previously
   committable.
