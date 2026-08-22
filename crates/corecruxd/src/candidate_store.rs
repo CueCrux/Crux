@@ -29,7 +29,8 @@
 //! defence in depth, not the primary guarantee.
 //!
 //! This module owns the whole candidate domain: the schema, the born-private
-//! write, the read-back, and the review lifecycle ([`promote`]/[`reject`]) with
+//! write, the read-back, and the review lifecycle
+//! ([`promote_for_tenant`] / [`reject_for_tenant`]) with
 //! the fail-closed gate ([`PromotionMode`]).
 
 use corecrux_memory::fact_store::StoreFact;
