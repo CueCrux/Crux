@@ -4202,6 +4202,10 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         for mode in [AuthMode::JwtHs256, AuthMode::JwtJwks] {
             let auth = Authz {
                 mode,
+                // Irrelevant to this test — it asserts that a JWT mode with no
+                // loaded config is refused, which happens before any tenant
+                // resolution. `Off` is the neutral choice.
+                tenant_stamp_mode: TenantStampMode::Off,
                 jwt_hs256: None,
                 jwt_jwks: None,
                 agent_http: None,
@@ -5370,14 +5374,39 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         assert_eq!(TenantStampMode::On.as_str(), "on");
     }
 
+    /// Migrated from `tenant_stamp_mode_from_env_reads_the_real_env`, which
+    /// pinned the posture this commit deliberately replaces. Two things changed
+    /// and both are the point of the change, so they are asserted rather than
+    /// dropped:
+    ///
+    /// - under JWT auth an unset variable now resolves to `On`, not `Off`;
+    /// - an unrecognised value is now an error, where it used to fall silently
+    ///   to `Off`. A typo in the deployment used to disable tenant isolation
+    ///   and say nothing.
     #[test]
     #[serial_test::serial]
-    fn tenant_stamp_mode_from_env_reads_the_real_env() {
+    fn tenant_stamp_mode_from_env_for_auth_defaults_on_for_jwt_and_rejects_junk() {
         let lock = env_lock();
         let _g = lock.lock().unwrap();
 
+        // Non-JWT deployments are out of scope for the flag entirely.
         std::env::remove_var("CORECRUXD_TENANT_WRITE_STAMP");
-        assert_eq!(TenantStampMode::from_env(), TenantStampMode::Off);
+        for mode in [AuthMode::Off, AuthMode::DevScopes] {
+            assert_eq!(
+                TenantStampMode::from_env_for_auth(mode),
+                Ok(TenantStampMode::Off),
+                "{mode:?} must not be swept into tenant stamping"
+            );
+        }
+
+        // The default flip: JWT with nothing configured isolates.
+        for mode in [AuthMode::JwtHs256, AuthMode::JwtJwks] {
+            assert_eq!(
+                TenantStampMode::from_env_for_auth(mode),
+                Ok(TenantStampMode::On),
+                "{mode:?} must default to on when the variable is unset"
+            );
+        }
 
         for (raw, want) in [
             ("1", TenantStampMode::On),
@@ -5388,11 +5417,23 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
             ("audit", TenantStampMode::Shadow),
             ("0", TenantStampMode::Off),
             ("off", TenantStampMode::Off),
-            ("banana", TenantStampMode::Off),
-            ("", TenantStampMode::Off),
+            ("legacy", TenantStampMode::Off),
         ] {
             std::env::set_var("CORECRUXD_TENANT_WRITE_STAMP", raw);
-            assert_eq!(TenantStampMode::from_env(), want, "raw {raw:?}");
+            assert_eq!(
+                TenantStampMode::from_env_for_auth(AuthMode::JwtHs256),
+                Ok(want),
+                "raw {raw:?}"
+            );
+        }
+
+        // Junk fails closed and loudly instead of quietly disabling isolation.
+        for raw in ["banana", "", "  ", "no"] {
+            std::env::set_var("CORECRUXD_TENANT_WRITE_STAMP", raw);
+            assert!(
+                TenantStampMode::from_env_for_auth(AuthMode::JwtHs256).is_err(),
+                "raw {raw:?} must be rejected, not silently treated as off"
+            );
         }
 
         std::env::remove_var("CORECRUXD_TENANT_WRITE_STAMP");
@@ -5400,26 +5441,43 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
 
     #[test]
     #[serial_test::serial]
-    fn scope_context_write_and_read_tenant_follow_the_env_posture() {
+    /// Migrated from `scope_context_write_and_read_tenant_follow_the_env_posture`.
+    /// The posture is now frozen into `Authz` at startup, so a context does not
+    /// follow the environment any more — the old name described exactly the
+    /// behaviour this commit removes. Reading the posture per request is what
+    /// let a late `set_var` (a test, a supervisor, a shell hook) move an already
+    /// authenticated caller between tenants mid-process.
+    ///
+    /// The assertions that still carry weight are kept: `On` resolves the
+    /// token's own tenant, an unowned selector is refused, and `Shadow` neither
+    /// stamps nor rejects.
+    fn scope_context_tenant_resolution_uses_the_frozen_posture_not_the_env() {
         let lock = env_lock();
         let _g = lock.lock().unwrap();
 
-        let auth = hs256_authz();
+        let auth = hs256_authz(); // test_hs256 freezes `On`
         let token = sign_hs256(
             &valid_claims(serde_json::json!({ "scope": "facts:write", "tenant_id": "t1" })),
             TEST_HS256_SECRET,
         );
 
-        std::env::remove_var("CORECRUXD_TENANT_WRITE_STAMP");
         let ctx = passport_bound_context(&auth, &bearer(&token)).expect("context");
-        assert_eq!(ctx.resolve_write_tenant().unwrap(), None, "default posture is off");
-        assert_eq!(ctx.resolve_read_tenant(), None);
-
-        std::env::set_var("CORECRUXD_TENANT_WRITE_STAMP", "1");
         assert_eq!(ctx.resolve_write_tenant().unwrap(), Some("t1".to_string()));
-        assert_eq!(ctx.resolve_read_tenant(), Some("t1".to_string()));
+        assert_eq!(ctx.resolve_read_tenant().unwrap(), Some("t1".to_string()));
 
-        // A selector the token does not own is refused even under `On`.
+        // The freeze: mutating the variable after the fact must not move an
+        // authenticated caller off its tenant.
+        for raw in ["0", "off", "shadow"] {
+            std::env::set_var("CORECRUXD_TENANT_WRITE_STAMP", raw);
+            assert_eq!(
+                ctx.resolve_write_tenant().unwrap(),
+                Some("t1".to_string()),
+                "posture is frozen at startup; a late {raw:?} must not take effect"
+            );
+        }
+        std::env::remove_var("CORECRUXD_TENANT_WRITE_STAMP");
+
+        // A selector the token does not own is refused under `On`.
         let mut headers = bearer(&token);
         headers.insert("x-corecrux-tenant-id", "t2".parse().unwrap());
         let ctx = passport_bound_context(&auth, &headers).expect("context");
@@ -5427,14 +5485,18 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         assert_eq!(err.0.status, 403);
         assert_eq!(problem_code(&err), "TENANT_FORBIDDEN");
 
-        std::env::set_var("CORECRUXD_TENANT_WRITE_STAMP", "shadow");
+        // Shadow is observation only — it neither stamps nor rejects. Built
+        // directly, because the posture no longer comes from the environment.
+        let shadow_auth = Authz {
+            tenant_stamp_mode: TenantStampMode::Shadow,
+            ..hs256_authz()
+        };
+        let ctx = passport_bound_context(&shadow_auth, &headers).expect("context");
         assert_eq!(
             ctx.resolve_write_tenant().unwrap(),
             None,
             "shadow must never reject or stamp"
         );
-
-        std::env::remove_var("CORECRUXD_TENANT_WRITE_STAMP");
     }
 
     #[test]
@@ -5453,8 +5515,13 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         let ctx = passport_bound_context(&auth, &bearer(&token)).expect("context");
         let err = ctx.resolve_write_tenant().unwrap_err();
         assert_eq!(problem_code(&err), "TENANT_SELECTOR_REQUIRED");
-        // Multi-tenant tokens read `default`, in lockstep with the write side.
-        assert_eq!(ctx.resolve_read_tenant(), None);
+        // Still in lockstep with the write side, but the lockstep moved: a
+        // multi-tenant token with no selector used to fall back to reading
+        // `default`, which is the ambiguity this commit closes — the caller
+        // has not said which tenant it means, so the read is refused rather
+        // than silently answered from the shared tenant.
+        let read_err = ctx.resolve_read_tenant().unwrap_err();
+        assert_eq!(problem_code(&read_err), "TENANT_SELECTOR_REQUIRED");
 
         let mut headers = bearer(&token);
         headers.insert("x-corecrux-tenant-id", "  t2  ".parse().unwrap());

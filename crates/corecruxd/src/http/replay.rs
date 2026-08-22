@@ -1207,7 +1207,9 @@ mod tests {
         let mut evidence = evidence_ref(&fact.fact_id);
         evidence.text_hash = Some(hash_text(&fact.value));
         let capsule = capsule_with(tenant_id, answer_id, vec![evidence], Vec::new());
-        store_answer_capsule(&state, &capsule).await.expect("store capsule");
+        store_answer_capsule(&state, &capsule, "default")
+            .await
+            .expect("store capsule");
         (state, capsule)
     }
 
@@ -1656,7 +1658,9 @@ mod tests {
         let mut evidence = evidence_ref(&fact.fact_id);
         evidence.text_hash = Some(hash_text("something else entirely"));
         let capsule = capsule_with("tenant-a", "ans_1", vec![evidence], Vec::new());
-        store_answer_capsule(&state, &capsule).await.expect("store capsule");
+        store_answer_capsule(&state, &capsule, "default")
+            .await
+            .expect("store capsule");
 
         let resp = get_answer_replay_validity(
             State(state),
@@ -1688,7 +1692,9 @@ mod tests {
         evidence.text_hash = Some(hash_text(&fact.value));
         evidence.artifact_id = Some(77);
         let capsule = capsule_with("tenant-a", "ans_1", vec![evidence], Vec::new());
-        store_answer_capsule(&state, &capsule).await.expect("store capsule");
+        store_answer_capsule(&state, &capsule, "default")
+            .await
+            .expect("store capsule");
 
         let resp = get_answer_replay_validity(
             State(state),
@@ -1714,7 +1720,9 @@ mod tests {
     async fn store_then_load_answer_capsule_round_trips() {
         let state = pro_replay_state();
         let capsule = capsule_with("tenant-a", "ans_1", vec![evidence_ref("f_1")], Vec::new());
-        store_answer_capsule(&state, &capsule).await.expect("store capsule");
+        store_answer_capsule(&state, &capsule, "default")
+            .await
+            .expect("store capsule");
         let loaded = load_answer_capsule(&state, "tenant-a", "ans_1", "default")
             .await
             .expect("capsule present");
@@ -2855,7 +2863,9 @@ mod tests {
         .is_none());
 
         let capsule = capsule_with("tenant-a", "ans_1", vec![evidence_ref("f_1")], Vec::new());
-        store_answer_capsule(&state, &capsule).await.expect("store capsule");
+        store_answer_capsule(&state, &capsule, "default")
+            .await
+            .expect("store capsule");
         let resp = export_answer_capsule_if_present(
             &state,
             "tenant-a",
