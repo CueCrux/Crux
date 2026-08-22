@@ -7,8 +7,16 @@
 //!
 //! Environment configuration takes precedence. Without an environment key, a
 //! caller with a data directory gets a stable key generated once and stored as
-//! an owner-only file. Callers without a data directory retain the historical
-//! ephemeral fallback so library-only and in-memory use remains possible.
+//! an owner-only file.
+//!
+//! A caller with *neither* is refused (play03 defect **D2**). The historical
+//! behaviour was to mint a throwaway key and sign with it, which produced an
+//! export that passes offline verification and proves nothing: the key exists
+//! only for the length of one call, so no verifier can ever pin it and no
+//! second export can be tied to the first. Failing loudly at resolution turns a
+//! silent downgrade of the custody guarantee into a configuration error the
+//! operator can fix, either by setting the environment key or by giving the
+//! exporter a data directory.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -51,6 +59,12 @@ pub enum AuditSigningKeyError {
     },
     #[error("audit-export signing-key resolver lock was poisoned")]
     ResolverLockPoisoned,
+    #[error(
+        "refusing to sign an audit export with an ephemeral key: a throwaway signer proves nothing to a verifier. \
+         Set {AUDIT_EXPORT_SIGNING_KEY_ENV}, or give the exporter a data directory so a stable \
+         `{AUDIT_EXPORT_SIGNING_KEY_FILENAME}` identity is generated once and reused"
+    )]
+    EphemeralSigningKeyRefused,
 }
 
 /// Return the stable key-file path used beneath a daemon data directory.
@@ -61,8 +75,13 @@ pub fn persistent_audit_export_signing_key_path(data_dir: &Path) -> PathBuf {
 /// Resolve an audit-export signer with strict precedence:
 ///
 /// 1. `CORECRUXD_AUDIT_EXPORT_SIGNING_KEY_B64` (`key_class = env`);
-/// 2. a generated-once 0600 key under `data_dir` (`persistent`);
-/// 3. a one-shot key only when `data_dir` is unavailable (`ephemeral`).
+/// 2. a generated-once 0600 key under `data_dir` (`persistent`).
+///
+/// With neither configured there is no durable issuer identity to sign as, and
+/// this returns [`AuditSigningKeyError::EphemeralSigningKeyRefused`] rather than
+/// minting a one-shot key (play03 D2). [`AuditBundleKeyClassV1::Ephemeral`]
+/// survives only so bundles exported before this refusal still parse and
+/// verify.
 ///
 /// A configured but malformed environment value is an error; it never causes
 /// a silent fallback to a different issuer identity.
@@ -87,11 +106,7 @@ pub fn resolve_audit_export_signing_key(
         });
     }
 
-    Ok(ResolvedAuditSigningKey {
-        signing_key: generate_signing_key(),
-        signer_key_id,
-        key_class: AuditBundleKeyClassV1::Ephemeral,
-    })
+    Err(AuditSigningKeyError::EphemeralSigningKeyRefused)
 }
 
 fn signing_key_from_environment() -> Result<Option<SigningKey>, AuditSigningKeyError> {

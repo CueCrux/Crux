@@ -1204,6 +1204,12 @@ async fn t1_memory_edit_and_pin_owner_can_other_cannot() {
 async fn t1_audit_export_owner_can_other_cannot() {
     let _g = t1_env_lock().lock().await;
     std::env::set_var("CORECRUXD_FEATURE_AUDIT_EXPORT", "1");
+    // An export needs a durable signer identity since play03 D2; this fixture
+    // has no data_dir, so configure the env signer.
+    std::env::set_var(crate::tools::audit_export::SIGNING_KEY_ENV, {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode([0x5a_u8; 32])
+    });
     let td = tempfile::tempdir().unwrap();
     std::env::set_var("CORECRUXD_AUDIT_EXPORT_DIR", td.path());
     let (_base, claude, codex) = owner_other_fixture().await;
@@ -1266,6 +1272,7 @@ async fn t1_audit_export_owner_can_other_cannot() {
         "T.1: a different passport's non-operator export must not include the owner's private fact"
     );
     std::env::remove_var("CORECRUXD_FEATURE_AUDIT_EXPORT");
+    std::env::remove_var(crate::tools::audit_export::SIGNING_KEY_ENV);
     std::env::remove_var("CORECRUXD_AUDIT_EXPORT_DIR");
 }
 

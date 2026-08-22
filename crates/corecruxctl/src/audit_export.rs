@@ -20,8 +20,8 @@ use chrono::{DateTime, Utc};
 
 use corecrux_memory::FactStore;
 use corecrux_receipts::{
-    build_bundle_v1, resolve_audit_export_signing_key, verify_bundle_with_trust_roots_v1, AuditBundleScopeV1,
-    AuditEventV1, AuditReceiptRefV1, BuildBundleInputV1, VerifyReportV1, WitnessLogPublicKeyV1,
+    build_bundle_v1, resolve_audit_export_signing_key, verify_bundle_pinned_v1, AuditBundleScopeV1, AuditEventV1,
+    AuditReceiptRefV1, BuildBundleInputV1, ExpectedSignerV1, VerifyReportV1, WitnessLogPublicKeyV1,
 };
 
 const RESERVED_PREFIXES: &[&str] = &["__agent::", "__ops::", "__bootstrap__::", "__agent_session::"];
@@ -132,16 +132,22 @@ pub fn run_audit_export(args: AuditExportArgs) -> Result<(u64, u64, String), Box
 }
 
 /// Verify a bundle on disk and return a structured report. Fully OFFLINE.
+///
+/// `expected` pins the issuer (play03 D2): the signature check alone only says
+/// the bundle is consistent with the key it carries, so a bundle re-signed by
+/// someone else passes it. With a pin, a different issuer forces `ok = false`;
+/// without one the report is labelled `UNPINNED — trust unproven`.
 pub fn run_audit_verify(
     path: &Path,
     rekor_pubkey_path: Option<&Path>,
+    expected: Option<&ExpectedSignerV1>,
 ) -> Result<VerifyReportV1, Box<dyn std::error::Error + Send + Sync>> {
     let raw = std::fs::read(path)?;
     let log_key = match rekor_pubkey_path {
         Some(p) => Some(load_log_public_key(p)?),
         None => None,
     };
-    let report = verify_bundle_with_trust_roots_v1(&raw, log_key.as_ref())?;
+    let report = verify_bundle_pinned_v1(&raw, log_key.as_ref(), expected)?;
     Ok(report)
 }
 
@@ -230,7 +236,7 @@ mod tests {
         assert_eq!(receipts, 1);
         assert!(!bundle_id.is_empty());
 
-        let report = run_audit_verify(&out, None).unwrap();
+        let report = run_audit_verify(&out, None, None).unwrap();
         assert!(
             report.ok,
             "offline verifier should accept freshly built bundle: {report:?}"
@@ -269,7 +275,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(facts, 1);
-        let report = run_audit_verify(&out, None).unwrap();
+        let report = run_audit_verify(&out, None, None).unwrap();
         assert!(report.ok);
     }
 
@@ -313,7 +319,7 @@ mod tests {
         // Either zstd will reject the corruption (Err) or the verifier
         // will catch the content-hash mismatch (Ok with !ok). Both are
         // acceptable failure modes.
-        match run_audit_verify(&out, None) {
+        match run_audit_verify(&out, None, None) {
             Ok(report) => {
                 assert!(!report.ok, "tampered bundle should not pass verification: {report:?}");
             }

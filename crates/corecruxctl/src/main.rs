@@ -789,6 +789,12 @@ enum Command {
         /// that proves the tree head is the log operator's, not fabricated.
         #[arg(long)]
         rekor_pubkey: Option<PathBuf>,
+        /// Expected bundle signer public key, 64 hex chars. Refuses a bundle
+        /// signed by a different issuer. Defaults to
+        /// CRUX_EXPORT_VERIFY_PUBLIC_KEY_HEX; without either, the report is
+        /// labelled "UNPINNED — trust unproven".
+        #[arg(long)]
+        expect_pubkey_hex: Option<String>,
     },
 
     /// One-time secret sweep over ops-namespace facts (`__ops__::*`,
@@ -944,12 +950,23 @@ enum ContextCommand {
     /// Checks the passport signature on the custody-proof manifest, the
     /// per-component blake3 hashes, the cruxpack self-verification, and
     /// re-runs audit-verify. Exits non-zero on any failure.
+    ///
+    /// Those checks verify the bundle against the key the bundle carries, so
+    /// they prove consistency, not origin. Pass `--expect-pubkey-hex` (or set
+    /// CRUX_CONTEXT_VERIFY_PASSPORT_HEX) to also require that the signer is
+    /// the passport you expected; without it the report is labelled
+    /// "UNPINNED — trust unproven".
     Verify {
         /// Path to the bundle DIRECTORY produced by `context export`.
         bundle: PathBuf,
         /// Emit the verification report as JSON.
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Expected passport public key, 64 hex chars. Refuses the bundle when
+        /// its manifest or cruxpack was signed by a different key. Defaults to
+        /// CRUX_CONTEXT_VERIFY_PASSPORT_HEX.
+        #[arg(long)]
+        expect_pubkey_hex: Option<String>,
     },
 }
 
@@ -4817,8 +4834,21 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 );
                 Ok(())
             }
-            ContextCommand::Verify { bundle, json } => {
-                let report = export::run_context_verify(&bundle)?;
+            ContextCommand::Verify {
+                bundle,
+                json,
+                expect_pubkey_hex,
+            } => {
+                // An explicitly-passed pin wins; otherwise fall back to the
+                // operator's environment. A malformed pin is an error, never a
+                // quiet downgrade to an unpinned pass.
+                let expected = match expect_pubkey_hex.as_deref() {
+                    Some(raw) => Some(corecrux_receipts::ExpectedSignerV1::from_hex(raw)?),
+                    None => corecrux_receipts::ExpectedSignerV1::from_env_var(
+                        corecrux_receipts::CONTEXT_VERIFY_PASSPORT_KEY_ENV,
+                    )?,
+                };
+                let report = export::run_context_verify(&bundle, expected.as_ref())?;
                 if json {
                     println!(
                         "{}",
@@ -4830,12 +4860,14 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             "audit_bundle_hash_match": report.audit_bundle_hash_match,
                             "cruxpack_verify_ok": report.cruxpack_verify_ok,
                             "audit_verify_ok": report.audit_verify_ok,
+                            "signer_pin": report.signer_pin,
+                            "trust_label": report.trust_label,
                             "failures": report.failures,
                         })
                     );
                 } else {
                     println!(
-                        "context verify {}: passport_fpr={} signature_valid={} cruxpack_hash={} audit_hash={} cruxpack_verify={} audit_verify={}",
+                        "context verify {}: passport_fpr={} signature_valid={} cruxpack_hash={} audit_hash={} cruxpack_verify={} audit_verify={} signer_pin={}",
                         if report.ok { "OK" } else { "FAIL" },
                         report.passport_fpr,
                         report.signature_valid,
@@ -4843,7 +4875,9 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         report.audit_bundle_hash_match,
                         report.cruxpack_verify_ok,
                         report.audit_verify_ok,
+                        serde_json::to_string(&report.signer_pin).unwrap_or_default(),
                     );
+                    println!("  trust: {}", report.trust_label);
                     for f in &report.failures {
                         println!("  - {f}");
                     }
@@ -4955,8 +4989,13 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             bundle,
             json,
             rekor_pubkey,
+            expect_pubkey_hex,
         } => {
-            let report = audit_export::run_audit_verify(&bundle, rekor_pubkey.as_deref())?;
+            let expected = match expect_pubkey_hex.as_deref() {
+                Some(raw) => Some(corecrux_receipts::ExpectedSignerV1::from_hex(raw)?),
+                None => corecrux_receipts::ExpectedSignerV1::from_env()?,
+            };
+            let report = audit_export::run_audit_verify(&bundle, rekor_pubkey.as_deref(), expected.as_ref())?;
             if json {
                 let s = serde_json::to_string_pretty(&report)?;
                 println!("{s}");
@@ -4971,6 +5010,9 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     report.events_jsonl_sha256_match,
                     report.receipts_cbor_sha256_match,
                 );
+                // Say plainly whether the issuer was actually checked, so an
+                // OK line is not read as proof of who produced the bundle.
+                println!("  trust: {}", report.trust_label);
                 if let Some(reason) = &report.failure_reason {
                     eprintln!("failure: {reason}");
                 }

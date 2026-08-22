@@ -188,6 +188,12 @@ corecruxctl context export --data-dir <dir> --out ./bundle   # signed=true
 corecruxctl context verify ./bundle --json                   # ok=true, offline, no network
 ```
 
+Those checks verify the bundle against the key the bundle carries, which proves it is internally
+consistent, not who produced it — an unpinned pass is reported as
+`UNPINNED — trust unproven`. Add `--expect-pubkey-hex <64 hex>` (or set
+`CRUX_CONTEXT_VERIFY_PASSPORT_HEX`) to also require the signer to be the passport you expected;
+a bundle re-signed by anyone else then fails.
+
 There is no lock-in: the answer to *"can you export it?"* and *"can you prove what it saw and
 did?"* is a command, not a support ticket. This export → offline-verify → tamper-rejection cycle
 is a release-blocking CI gate, so every published build has passed its own exit test. Release
