@@ -26,7 +26,6 @@ const MAX_TARGETS: usize = 24;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AffectedPath {
     path: PathBuf,
-    must_exist: bool,
 }
 
 impl AffectedPath {
@@ -71,7 +70,6 @@ enum SectionKind {
 
 #[derive(Debug)]
 struct RawSection {
-    kind: SectionKind,
     source: String,
     destination: Option<String>,
 }
@@ -128,14 +126,15 @@ pub(crate) fn parse(command: &str, cwd: &str) -> Result<Vec<AffectedPath>, Targe
             let line = lines[index];
             reject_ambiguous_control(line, kind)?;
 
-            if !line.trim().is_empty() {
-                match kind {
-                    SectionKind::Add => has_add_line |= line.starts_with('+'),
-                    SectionKind::Update => {
-                        has_update_content |= line.starts_with(['+', '-', ' ']);
-                    }
-                    SectionKind::Delete => delete_has_body = true,
+            match kind {
+                SectionKind::Add => has_add_line |= line.starts_with('+'),
+                // Codex represents context for an empty line as either a raw
+                // empty line or a line beginning with one space. Both are
+                // real update content even though `trim()` makes them empty.
+                SectionKind::Update => {
+                    has_update_content |= line.is_empty() || line.starts_with(['+', '-', ' ']);
                 }
+                SectionKind::Delete => delete_has_body |= !line.trim().is_empty(),
             }
             index += 1;
         }
@@ -153,11 +152,7 @@ pub(crate) fn parse(command: &str, cwd: &str) -> Result<Vec<AffectedPath>, Targe
             _ => {}
         }
 
-        sections.push(RawSection {
-            kind,
-            source,
-            destination,
-        });
+        sections.push(RawSection { source, destination });
     }
 
     if sections.is_empty() {
@@ -241,18 +236,17 @@ fn normalize_sections(sections: &[RawSection], cwd: &str) -> Result<Vec<Affected
     let mut targets = Vec::new();
 
     for section in sections {
-        let source_must_exist = section.kind != SectionKind::Add;
-        let source = normalize_target(&section.source, &cwd, source_must_exist)?;
+        let source = normalize_target(&section.source, &cwd)?;
 
         if let Some(destination) = &section.destination {
-            let destination = normalize_target(destination, &cwd, false)?;
+            let destination = normalize_target(destination, &cwd)?;
             if destination == source {
                 return Err(TargetError::InvalidPath("Move to destination equals its source"));
             }
-            push_deduplicated(&mut targets, source, source_must_exist)?;
-            push_deduplicated(&mut targets, destination, false)?;
+            push_deduplicated(&mut targets, source)?;
+            push_deduplicated(&mut targets, destination)?;
         } else {
-            push_deduplicated(&mut targets, source, source_must_exist)?;
+            push_deduplicated(&mut targets, source)?;
         }
     }
 
@@ -271,7 +265,7 @@ fn normalize_cwd(cwd: &str) -> Result<PathBuf, TargetError> {
     if normalized.as_os_str().is_empty() {
         return Err(TargetError::InvalidCwd);
     }
-    inspect_existing_components(&normalized, true).map_err(|_| TargetError::InvalidCwd)?;
+    inspect_existing_components(&normalized).map_err(|_| TargetError::InvalidCwd)?;
     let metadata = std::fs::symlink_metadata(&normalized).map_err(|_| TargetError::InvalidCwd)?;
     if !metadata.is_dir() {
         return Err(TargetError::InvalidCwd);
@@ -279,7 +273,7 @@ fn normalize_cwd(cwd: &str) -> Result<PathBuf, TargetError> {
     Ok(normalized)
 }
 
-fn normalize_target(path: &str, cwd: &Path, must_exist: bool) -> Result<PathBuf, TargetError> {
+fn normalize_target(path: &str, cwd: &Path) -> Result<PathBuf, TargetError> {
     if path.contains('\0') {
         return Err(TargetError::InvalidPath("NUL bytes are not permitted"));
     }
@@ -291,7 +285,7 @@ fn normalize_target(path: &str, cwd: &Path, must_exist: bool) -> Result<PathBuf,
     if normalized == cwd || !normalized.starts_with(cwd) {
         return Err(TargetError::InvalidPath("target must remain below cwd"));
     }
-    inspect_existing_components(&normalized, must_exist)?;
+    inspect_existing_components(&normalized)?;
     Ok(normalized)
 }
 
@@ -322,7 +316,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     normalized
 }
 
-fn inspect_existing_components(path: &Path, must_exist: bool) -> Result<(), TargetError> {
+fn inspect_existing_components(path: &Path) -> Result<(), TargetError> {
     let mut prefixes = path.ancestors().collect::<Vec<_>>();
     prefixes.reverse();
 
@@ -337,10 +331,10 @@ fn inspect_existing_components(path: &Path, must_exist: bool) -> Result<(), Targ
                     return Err(TargetError::InvalidPath("intermediate component is not a directory"));
                 }
             }
-            Err(error) if error.kind() == ErrorKind::NotFound && !must_exist => break,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Err(TargetError::InvalidPath("Update/Delete source does not exist"));
-            }
+            // A later section may update a path created earlier in this same
+            // patch. Target extraction therefore permits a missing leaf and
+            // leaves operation sequencing/existence validation to Codex.
+            Err(error) if error.kind() == ErrorKind::NotFound => break,
             Err(_) => {
                 return Err(TargetError::InvalidPath("path metadata could not be inspected"));
             }
@@ -349,15 +343,14 @@ fn inspect_existing_components(path: &Path, must_exist: bool) -> Result<(), Targ
     Ok(())
 }
 
-fn push_deduplicated(targets: &mut Vec<AffectedPath>, path: PathBuf, must_exist: bool) -> Result<(), TargetError> {
-    if let Some(existing) = targets.iter_mut().find(|target| target.path == path) {
-        existing.must_exist |= must_exist;
+fn push_deduplicated(targets: &mut Vec<AffectedPath>, path: PathBuf) -> Result<(), TargetError> {
+    if targets.iter().any(|target| target.path == path) {
         return Ok(());
     }
     if targets.len() == MAX_TARGETS {
         return Err(TargetError::TooManyTargets);
     }
-    targets.push(AffectedPath { path, must_exist });
+    targets.push(AffectedPath { path });
     Ok(())
 }
 
@@ -463,6 +456,17 @@ mod tests {
     }
 
     #[test]
+    fn empty_and_space_context_lines_are_valid_update_content() {
+        let root = root();
+        fs::write(root.path().join("empty"), "\n").unwrap();
+        fs::write(root.path().join("space"), " \n").unwrap();
+        let empty = "*** Begin Patch\n*** Update File: empty\n*** Move to: empty-moved\n@@\n\n*** End Patch";
+        let space = "*** Begin Patch\n*** Update File: space\n*** Move to: space-moved\n@@\n \n*** End Patch";
+        assert_eq!(parse(empty, root.path().to_str().unwrap()).unwrap().len(), 2);
+        assert_eq!(parse(space, root.path().to_str().unwrap()).unwrap().len(), 2);
+    }
+
+    #[test]
     fn malformed_envelopes_and_controls_are_rejected() {
         let root = root();
         let cwd = root.path().to_str().unwrap();
@@ -494,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_traversal_absolute_escape_and_missing_source_are_rejected() {
+    fn parent_traversal_and_absolute_escape_are_rejected_but_missing_targets_are_probed() {
         let root = root();
         let cwd = root.path().to_str().unwrap();
         let parent = "*** Begin Patch\n*** Add File: link/../victim\n+x\n*** End Patch";
@@ -502,7 +506,15 @@ mod tests {
         let missing = "*** Begin Patch\n*** Update File: missing\n@@\n-old\n+new\n*** End Patch";
         assert!(parse(parent, cwd).is_err());
         assert!(parse(outside, cwd).is_err());
-        assert!(parse(missing, cwd).is_err());
+        assert_eq!(parse(missing, cwd).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn add_followed_by_update_of_the_new_path_is_valid_and_deduplicated() {
+        let root = root();
+        let patch = "*** Begin Patch\n*** Add File: new.txt\n+first\n*** Update File: new.txt\n@@\n-first\n+second\n*** End Patch";
+        let targets = parse(patch, root.path().to_str().unwrap()).unwrap();
+        assert_eq!(names(&targets), ["new.txt"]);
     }
 
     #[test]

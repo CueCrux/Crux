@@ -44,16 +44,17 @@ hooks in `~/.codex/config.toml`:
 hooks = true
 ```
 
-The snippet sets `CRUX_CODEX_AGENT_NAME=openai` so the hook reads the named
-token from `~/.config/cuecrux/crux-tokens/MCP_AGENT_TOKENS_CSV` at runtime.
-No token is stored in `hooks.json`. Override with:
+The snippet preserves a process-level `CRUX_CODEX_AGENT_NAME` and defaults to
+`openai` only when it is unset, so the hook reads the selected named token at
+runtime. No token is stored in `hooks.json`. Override with:
 
 | Env var | Default | Purpose |
 | --- | --- | --- |
 | `CRUX_MCP_URL` | `~/.config/cuecrux/env` or `http://127.0.0.1:14801/mcp` | MCP endpoint. |
-| `CRUX_CODEX_AGENT_NAME` | unset | Named agent token to read from `CRUX_AGENT_TOKENS` or the token CSV. |
-| `CRUX_AGENT_TOKEN` | unset | Direct bearer token fallback. |
+| `CRUX_CODEX_AGENT_NAME` | unset | Agent label/token selector; valid values are 1-64 ASCII letters, digits, `.`, `_`, or `-`. |
+| `CRUX_AGENT_TOKEN` | unset | Per-process bearer token; highest precedence in every Codex adapter. |
 | `CRUX_AGENT_TOKENS_FILE` | `~/.config/cuecrux/crux-tokens/MCP_AGENT_TOKENS_CSV` | Named token CSV path. |
+| `CRUX_AGENT_TOKEN_DIR` | `~/.config/cuecrux/crux-tokens` | Named `*.mcp-token` directory used by the enforcement wrapper. |
 | `CRUX_CODEX_HOOK_TIMEOUT` | `2.0` | Per-MCP-call timeout, clamped to 0.2-10s. |
 | `CRUX_CONSOLE_BASE` | unset or `~/.config/cuecrux/env` | Optional console link base passed to the shared banner. |
 
@@ -84,20 +85,62 @@ before they run automatically.
 release's stable wrapper:
 
 ```text
-$HOME/.local/share/crux/hooks/crux-enforce.sh openai
+$HOME/.local/share/crux/hooks/crux-enforce.sh
 ```
 
-Install the wrapper as mode `0700` during the verified release rollout. It
-must source the existing mode-`0600` CueCrux environment, resolve only the
-named `openai.mcp-token` at runtime, and `exec`
-`$HOME/.local/bin/crux-hook observe-pre`. Do not copy a bearer token into the
-wrapper or `hooks.json`, and do not point the wrapper at a mutable checkout.
-Merge the snippet only after that path resolves to the accepted release
-binary, then review/trust the command in Codex's Hooks settings.
+Install the tracked wrapper as mode `0700` during the verified release rollout:
+
+```bash
+install -d -m 0700 "$HOME/.local/share/crux/hooks"
+install -m 0700 hooks/crux-enforce.sh \
+  "$HOME/.local/share/crux/hooks/crux-enforce.sh"
+```
+
+It sources the existing mode-`0600` CueCrux environment and then `exec`s
+`$HOME/.local/bin/crux-hook observe-pre`. A process-level `CRUX_AGENT_TOKEN`
+takes precedence; otherwise it reads only
+`$CRUX_AGENT_TOKEN_DIR/${CRUX_CODEX_AGENT_NAME:-openai}.mcp-token`. Do not copy
+a bearer token into the wrapper or `hooks.json`, and do not point the wrapper
+at a mutable checkout. Merge the snippet only after that path resolves to the
+accepted release binary, then review/trust the command in Codex's Hooks
+settings.
+
+### Concurrent-writer identity
+
+Punchcards distinguish holders by the passport authenticated by the hook's
+bearer token, not by Codex's `session_id`. Every concurrent Codex writer must
+therefore run with a distinct process-injected token/passport and a distinct
+`CRUX_CODEX_AGENT_NAME`. Fleet mode additionally requires
+`CORECRUXD_AGENT_PASSPORTS=1` and one explicit, distinct
+`CRUX_AGENT_PASSPORTS=<agent>:<passport>:<tenant>` entry per worker, for
+example `worker-a:codex-worker-a:work,worker-b:codex-worker-b:work`. An
+unmapped token authenticates punchcard checks as `agent:<name>`, while its raw
+`get_passport` key may be only `<name>`; those identities are not equivalent.
+
+Before acquiring a lease, require `auth_posture_audit` to report agent
+passports enabled and require `get_passport` to name the worker's explicitly
+mapped passport. Use that configured passport as the exact punchcard holder.
+The fleet launcher must reject a disabled mapping flag, an unmapped worker, or
+a missing, duplicate, or mismatched identity before creating a worktree or
+acquiring a lease. Sessions sharing the fallback `openai` token see each
+other's cards as self-held and are not isolated; auth-off or shared-anonymous
+mode cannot provide fleet isolation.
+
+The enforcement gate uses two Codex processes with distinct synthetic-safe
+credentials: worker A holds an absolute file lease, A's hook reports no peer
+conflict, and worker B's hook denies the same patch without mutating the file.
+Releasing A's lease then permits B. Never print either credential while
+running this gate. Until the mapping checks and live two-worker gate pass, this
+source integration is cross-passport enforcement infrastructure, not Program
+3/4 fleet-M2 closure.
 
 For each canonical patch, the hook parses every Add, Update, Delete, and Move
-source/destination, normalizes those paths below the hook `cwd`, and checks
-every `file://` punchcard resource. A malformed or escaping patch is denied.
+source/destination, normalizes those paths below the hook `cwd` to one absolute
+lexical spelling, and checks every `file://<absolute-path>` punchcard resource.
+A malformed or escaping patch is denied. Manual and fleet leases intended to
+cover these edits must use the same absolute namespace (`file:///absolute/path`
+or an enclosing `tree:///absolute/directory`); repo-relative resources are not
+aliases and can be ambiguous across worktrees.
 Any enforced conflict denies the whole patch and names all conflicts. A valid
 conflict-free patch emits zero stdout bytes, which is Codex's supported
 no-decision path; daemon transport failures retain the existing fail-open
@@ -114,11 +157,12 @@ printf '%s' "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"smoke\",\"tran
 ```
 
 The second command exits zero with no stdout when the daemon is unavailable.
-The release gate additionally requires a two-passport test: hold a punchcard
-on a harmless temporary file, verify the other passport's patch is denied and
-the file hash is unchanged, release the lease, then verify the same patch
-proceeds. Ensure the effective Codex configuration contains exactly one
-`observe-pre` enforcement command.
+The release gate additionally requires the two-Codex, distinct-passport test
+above: the holder's own probe is conflict-free, the other passport's patch is
+denied and the file hash is unchanged, and the same patch proceeds only after
+release. Ensure the effective Codex configuration contains exactly one
+`observe-pre` enforcement command and no two active workers resolve to the
+same passport.
 
 ## In-session MCP tools
 

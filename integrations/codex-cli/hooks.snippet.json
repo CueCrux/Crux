@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.local/share/crux/hooks/crux-enforce.sh openai",
+            "command": "$HOME/.local/share/crux/hooks/crux-enforce.sh",
             "async": false,
             "timeout": 15
           }
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "CRUX_CODEX_AGENT_NAME=openai python3 /usr/local/share/crux/integrations/codex-cli/hooks/crux-session-start.py",
+            "command": "CRUX_CODEX_AGENT_NAME=${CRUX_CODEX_AGENT_NAME:-openai} python3 /usr/local/share/crux/integrations/codex-cli/hooks/crux-session-start.py",
             "async": false,
             "timeout": 8
           }
@@ -31,7 +31,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "CRUX_CODEX_AGENT_NAME=openai python3 /usr/local/share/crux/integrations/codex-cli/hooks/crux-session-start.py",
+            "command": "CRUX_CODEX_AGENT_NAME=${CRUX_CODEX_AGENT_NAME:-openai} python3 /usr/local/share/crux/integrations/codex-cli/hooks/crux-session-start.py",
             "async": false,
             "timeout": 8
           }
