@@ -190,11 +190,14 @@ fn parse_section_header(line: &str) -> Result<(SectionKind, String), TargetError
 }
 
 fn require_path(path: &str) -> Result<String, TargetError> {
-    // Codex removes horizontal tabs throughout a path and trims trailing
-    // Unicode whitespace from every path-bearing operation marker. It keeps
-    // leading spaces after the marker. Normalize identically so the punchcard
-    // resource names the file Codex will actually mutate.
-    let path = path.replace('\t', "");
+    // Codex removes horizontal tabs and carriage returns throughout a path,
+    // then trims trailing Unicode whitespace from every path-bearing operation
+    // marker. It keeps leading spaces after the marker. Normalize identically
+    // so the punchcard resource names the file Codex will actually mutate.
+    let path = path
+        .chars()
+        .filter(|character| !matches!(character, '\t' | '\r'))
+        .collect::<String>();
     let path = path.trim_end();
     if path.is_empty() {
         Err(TargetError::Malformed("file path is empty"))
@@ -399,7 +402,7 @@ mod tests {
         let root = root();
         fs::write(root.path().join("move.rs"), "old").unwrap();
         fs::write(root.path().join("delete.rs"), "old").unwrap();
-        let patch = "*** Begin Patch\n*** Add File: a\tdd.rs \t\u{00a0}\n+x\n*** Add File: \t leading.rs  \n+y\n*** Update File: mo\tve.rs \t\n*** Move to:  mo\tved.rs \t\u{00a0}\n*** Delete File: de\tlete.rs \t\n*** End Patch";
+        let patch = "*** Begin Patch\n*** Add File: a\td\rd.rs \t\u{00a0}\n+x\n*** Add File: \t\r leading.rs  \n+y\n*** Update File: mo\tv\re.rs \t\n*** Move to:  mo\tv\red.rs \t\u{00a0}\n*** Delete File: de\tle\rte.rs \t\n*** End Patch";
         let targets = parse(patch, root.path().to_str().unwrap()).unwrap();
         assert_eq!(
             names(&targets),

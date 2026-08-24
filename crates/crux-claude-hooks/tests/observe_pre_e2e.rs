@@ -224,7 +224,7 @@ fn codex_whitespace_normalization_uses_the_same_add_and_move_resources() {
     let destination = resource(&root.path().join("moved.rs"));
     let expected = [add.clone(), source.clone(), destination.clone()];
     let mock = spawn_mock(expected.len(), &[add.clone(), destination.clone()], &[]);
-    let patch = "*** Begin Patch\n*** Add File: a\tdd.rs \t\u{00a0}\n+new\n*** Update File: mo\tve.rs \t\n*** Move to: mo\tved.rs \t\u{00a0}\n*** End Patch";
+    let patch = "*** Begin Patch\n*** Add File: a\td\rd.rs \t\u{00a0}\n+new\n*** Update File: mo\tv\re.rs \t\n*** Move to: mo\tv\red.rs \t\u{00a0}\n*** End Patch";
     let output = run_hook(&codex_input(root.path(), patch.to_string()), &mock.url);
     let captured = mock.join.join().unwrap().into_iter().collect::<HashSet<_>>();
     let value = decision(&output);
