@@ -216,7 +216,7 @@ fn add_update_delete_and_both_move_endpoints_are_probed_and_denied() {
 }
 
 #[test]
-fn trailing_whitespace_uses_the_same_add_and_move_resources_as_codex() {
+fn codex_whitespace_normalization_uses_the_same_add_and_move_resources() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("move.rs"), "old").unwrap();
     let add = resource(&root.path().join("add.rs"));
@@ -224,7 +224,7 @@ fn trailing_whitespace_uses_the_same_add_and_move_resources_as_codex() {
     let destination = resource(&root.path().join("moved.rs"));
     let expected = [add.clone(), source.clone(), destination.clone()];
     let mock = spawn_mock(expected.len(), &[add.clone(), destination.clone()], &[]);
-    let patch = "*** Begin Patch\n*** Add File: add.rs \t\u{00a0}\n+new\n*** Update File: move.rs \t\n*** Move to: moved.rs \t\u{00a0}\n*** End Patch";
+    let patch = "*** Begin Patch\n*** Add File: a\tdd.rs \t\u{00a0}\n+new\n*** Update File: mo\tve.rs \t\n*** Move to: mo\tved.rs \t\u{00a0}\n*** End Patch";
     let output = run_hook(&codex_input(root.path(), patch.to_string()), &mock.url);
     let captured = mock.join.join().unwrap().into_iter().collect::<HashSet<_>>();
     let value = decision(&output);

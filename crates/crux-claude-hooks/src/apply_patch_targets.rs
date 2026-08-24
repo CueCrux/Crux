@@ -70,10 +70,10 @@ enum SectionKind {
 }
 
 #[derive(Debug)]
-struct RawSection<'a> {
+struct RawSection {
     kind: SectionKind,
-    source: &'a str,
-    destination: Option<&'a str>,
+    source: String,
+    destination: Option<String>,
 }
 
 /// Parse and normalize every affected path in `command` against `cwd`.
@@ -167,7 +167,7 @@ pub(crate) fn parse(command: &str, cwd: &str) -> Result<Vec<AffectedPath>, Targe
     normalize_sections(&sections, cwd)
 }
 
-fn parse_section_header(line: &str) -> Result<(SectionKind, &str), TargetError> {
+fn parse_section_header(line: &str) -> Result<(SectionKind, String), TargetError> {
     if let Some(path) = line.strip_prefix(ADD_FILE) {
         return Ok((SectionKind::Add, require_path(path)?));
     }
@@ -189,16 +189,17 @@ fn parse_section_header(line: &str) -> Result<(SectionKind, &str), TargetError> 
     Err(TargetError::Malformed("expected a file section header"))
 }
 
-fn require_path(path: &str) -> Result<&str, TargetError> {
-    // Codex trims trailing Unicode whitespace from every path-bearing
-    // operation marker while preserving leading whitespace after the marker.
-    // Normalize identically so the punchcard resource names the file Codex
-    // will actually mutate.
+fn require_path(path: &str) -> Result<String, TargetError> {
+    // Codex removes horizontal tabs throughout a path and trims trailing
+    // Unicode whitespace from every path-bearing operation marker. It keeps
+    // leading spaces after the marker. Normalize identically so the punchcard
+    // resource names the file Codex will actually mutate.
+    let path = path.replace('\t', "");
     let path = path.trim_end();
     if path.is_empty() {
         Err(TargetError::Malformed("file path is empty"))
     } else {
-        Ok(path)
+        Ok(path.to_owned())
     }
 }
 
@@ -232,15 +233,15 @@ fn reject_ambiguous_control(line: &str, kind: SectionKind) -> Result<(), TargetE
     Ok(())
 }
 
-fn normalize_sections(sections: &[RawSection<'_>], cwd: &str) -> Result<Vec<AffectedPath>, TargetError> {
+fn normalize_sections(sections: &[RawSection], cwd: &str) -> Result<Vec<AffectedPath>, TargetError> {
     let cwd = normalize_cwd(cwd)?;
     let mut targets = Vec::new();
 
     for section in sections {
         let source_must_exist = section.kind != SectionKind::Add;
-        let source = normalize_target(section.source, &cwd, source_must_exist)?;
+        let source = normalize_target(&section.source, &cwd, source_must_exist)?;
 
-        if let Some(destination) = section.destination {
+        if let Some(destination) = &section.destination {
             let destination = normalize_target(destination, &cwd, false)?;
             if destination == source {
                 return Err(TargetError::InvalidPath("Move to destination equals its source"));
@@ -394,11 +395,11 @@ mod tests {
     }
 
     #[test]
-    fn path_markers_match_codex_trailing_whitespace_normalization() {
+    fn path_markers_match_codex_whitespace_normalization() {
         let root = root();
         fs::write(root.path().join("move.rs"), "old").unwrap();
         fs::write(root.path().join("delete.rs"), "old").unwrap();
-        let patch = "*** Begin Patch\n*** Add File: add.rs \t\u{00a0}\n+x\n*** Add File:  leading.rs  \n+y\n*** Update File: move.rs \t\n*** Move to:  moved.rs \t\u{00a0}\n*** Delete File: delete.rs \t\n*** End Patch";
+        let patch = "*** Begin Patch\n*** Add File: a\tdd.rs \t\u{00a0}\n+x\n*** Add File: \t leading.rs  \n+y\n*** Update File: mo\tve.rs \t\n*** Move to:  mo\tved.rs \t\u{00a0}\n*** Delete File: de\tlete.rs \t\n*** End Patch";
         let targets = parse(patch, root.path().to_str().unwrap()).unwrap();
         assert_eq!(
             names(&targets),
