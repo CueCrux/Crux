@@ -216,6 +216,29 @@ fn add_update_delete_and_both_move_endpoints_are_probed_and_denied() {
 }
 
 #[test]
+fn trailing_whitespace_uses_the_same_add_and_move_resources_as_codex() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("move.rs"), "old").unwrap();
+    let add = resource(&root.path().join("add.rs"));
+    let source = resource(&root.path().join("move.rs"));
+    let destination = resource(&root.path().join("moved.rs"));
+    let expected = [add.clone(), source.clone(), destination.clone()];
+    let mock = spawn_mock(expected.len(), &[add.clone(), destination.clone()], &[]);
+    let patch = "*** Begin Patch\n*** Add File: add.rs \t\u{00a0}\n+new\n*** Update File: move.rs \t\n*** Move to: moved.rs \t\u{00a0}\n*** End Patch";
+    let output = run_hook(&codex_input(root.path(), patch.to_string()), &mock.url);
+    let captured = mock.join.join().unwrap().into_iter().collect::<HashSet<_>>();
+    let value = decision(&output);
+    let reason = value["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+
+    assert_eq!(captured, expected.into_iter().collect());
+    assert_eq!(value["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert!(reason.contains(&add));
+    assert!(reason.contains(&destination));
+}
+
+#[test]
 fn all_three_waves_run_after_error_and_conflicts_stay_in_patch_order() {
     let root = tempfile::tempdir().unwrap();
     let mut sections = String::new();

@@ -190,7 +190,12 @@ fn parse_section_header(line: &str) -> Result<(SectionKind, &str), TargetError> 
 }
 
 fn require_path(path: &str) -> Result<&str, TargetError> {
-    if path.trim().is_empty() {
+    // Codex trims trailing Unicode whitespace from every path-bearing
+    // operation marker while preserving leading whitespace after the marker.
+    // Normalize identically so the punchcard resource names the file Codex
+    // will actually mutate.
+    let path = path.trim_end();
+    if path.is_empty() {
         Err(TargetError::Malformed("file path is empty"))
     } else {
         Ok(path)
@@ -386,6 +391,19 @@ mod tests {
         let patch = "*** Begin Patch\n*** Update File: old name.rs\n*** Move to: new 名.rs\n*** End Patch";
         let targets = parse(patch, root.path().to_str().unwrap()).unwrap();
         assert_eq!(names(&targets), ["old name.rs", "new 名.rs"]);
+    }
+
+    #[test]
+    fn path_markers_match_codex_trailing_whitespace_normalization() {
+        let root = root();
+        fs::write(root.path().join("move.rs"), "old").unwrap();
+        fs::write(root.path().join("delete.rs"), "old").unwrap();
+        let patch = "*** Begin Patch\n*** Add File: add.rs \t\u{00a0}\n+x\n*** Add File:  leading.rs  \n+y\n*** Update File: move.rs \t\n*** Move to:  moved.rs \t\u{00a0}\n*** Delete File: delete.rs \t\n*** End Patch";
+        let targets = parse(patch, root.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            names(&targets),
+            ["add.rs", " leading.rs", "move.rs", " moved.rs", "delete.rs"]
+        );
     }
 
     #[test]
