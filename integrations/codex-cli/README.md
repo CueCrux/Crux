@@ -4,6 +4,8 @@ First-party Codex CLI adapters for Crux Daemon:
 
 - `hooks/crux-session-start.py` injects a Crux boot banner when a Codex
   session starts.
+- `crux-hook observe-pre`, reached through the release enforcement wrapper,
+  denies native `apply_patch` calls that overlap an enforced punchcard.
 - `crux-mcp-stdio.py` exposes Crux MCP tools to the Codex model through
   Codex's stdio MCP server config.
 - `codex-tailer.py` watches Codex session JSONL files and stores observations
@@ -74,6 +76,49 @@ The hook is fail-open. If the daemon or token is unavailable it logs to
 
 Codex may require you to trust newly installed hooks in its Hooks settings UI
 before they run automatically.
+
+## Native `apply_patch` enforcement
+
+`hooks.snippet.json` contains one synchronous `PreToolUse` entry with matcher
+`^apply_patch$` and a 15-second outer timeout. It invokes the accepted
+release's stable wrapper:
+
+```text
+$HOME/.local/share/crux/hooks/crux-enforce.sh openai
+```
+
+Install the wrapper as mode `0700` during the verified release rollout. It
+must source the existing mode-`0600` CueCrux environment, resolve only the
+named `openai.mcp-token` at runtime, and `exec`
+`$HOME/.local/bin/crux-hook observe-pre`. Do not copy a bearer token into the
+wrapper or `hooks.json`, and do not point the wrapper at a mutable checkout.
+Merge the snippet only after that path resolves to the accepted release
+binary, then review/trust the command in Codex's Hooks settings.
+
+For each canonical patch, the hook parses every Add, Update, Delete, and Move
+source/destination, normalizes those paths below the hook `cwd`, and checks
+every `file://` punchcard resource. A malformed or escaping patch is denied.
+Any enforced conflict denies the whole patch and names all conflicts. A valid
+conflict-free patch emits zero stdout bytes, which is Codex's supported
+no-decision path; daemon transport failures retain the existing fail-open
+policy.
+
+Check the source integration before installing it:
+
+```bash
+jq empty hooks.snippet.json
+
+tmp_dir="$(mktemp -d)"
+printf '%s' "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"smoke\",\"transcript_path\":null,\"cwd\":\"$tmp_dir\",\"tool_name\":\"apply_patch\",\"tool_input\":{\"command\":\"*** Begin Patch\\n*** Add File: smoke.txt\\n+ok\\n*** End Patch\"}}" \
+  | CRUX_MCP_URL=http://127.0.0.1:1/mcp crux-hook observe-pre
+```
+
+The second command exits zero with no stdout when the daemon is unavailable.
+The release gate additionally requires a two-passport test: hold a punchcard
+on a harmless temporary file, verify the other passport's patch is denied and
+the file hash is unchanged, release the lease, then verify the same patch
+proceeds. Ensure the effective Codex configuration contains exactly one
+`observe-pre` enforcement command.
 
 ## In-session MCP tools
 

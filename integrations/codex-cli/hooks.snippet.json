@@ -1,6 +1,19 @@
 {
-  "_comment": "Crux Daemon startup banner for OpenAI Codex CLI. Merge the hooks block into ~/.codex/hooks.json. The command reads CRUX_CODEX_AGENT_NAME/openai from the local token CSV at runtime; no token is stored here.",
+  "_comment": "Crux Daemon startup and native apply_patch enforcement for OpenAI Codex CLI. Merge the hooks block into ~/.codex/hooks.json. Tokens are resolved at runtime; no bearer material is stored here.",
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^apply_patch$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/share/crux/hooks/crux-enforce.sh openai",
+            "async": false,
+            "timeout": 15
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "hooks": [
