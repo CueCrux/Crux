@@ -122,7 +122,7 @@ pub(crate) fn parse(command: &str, cwd: &str) -> Result<Vec<AffectedPath>, Targe
         }
 
         let mut has_add_line = false;
-        let mut has_update_hunk = false;
+        let mut has_update_content = false;
         let mut delete_has_body = false;
         while index < last && !is_section_header(lines[index]) {
             let line = lines[index];
@@ -132,7 +132,7 @@ pub(crate) fn parse(command: &str, cwd: &str) -> Result<Vec<AffectedPath>, Targe
                 match kind {
                     SectionKind::Add => has_add_line |= line.starts_with('+'),
                     SectionKind::Update => {
-                        has_update_hunk |= line == "@@" || line.starts_with("@@ ");
+                        has_update_content |= line.starts_with(['+', '-', ' ']);
                     }
                     SectionKind::Delete => delete_has_body = true,
                 }
@@ -144,8 +144,8 @@ pub(crate) fn parse(command: &str, cwd: &str) -> Result<Vec<AffectedPath>, Targe
             SectionKind::Add if !has_add_line => {
                 return Err(TargetError::Malformed("Add File requires a + body line"));
             }
-            SectionKind::Update if !has_update_hunk && destination.is_none() => {
-                return Err(TargetError::Malformed("Update File requires a hunk or Move to"));
+            SectionKind::Update if !has_update_content => {
+                return Err(TargetError::Malformed("Update File requires a change line"));
             }
             SectionKind::Delete if delete_has_body => {
                 return Err(TargetError::Malformed("Delete File must be header-only"));
@@ -392,7 +392,7 @@ mod tests {
     fn update_move_includes_both_endpoints() {
         let root = root();
         fs::write(root.path().join("old name.rs"), "old").unwrap();
-        let patch = "*** Begin Patch\n*** Update File: old name.rs\n*** Move to: new 名.rs\n*** End Patch";
+        let patch = "*** Begin Patch\n*** Update File: old name.rs\n*** Move to: new 名.rs\n-old\n+new\n*** End Patch";
         let targets = parse(patch, root.path().to_str().unwrap()).unwrap();
         assert_eq!(names(&targets), ["old name.rs", "new 名.rs"]);
     }
@@ -402,7 +402,7 @@ mod tests {
         let root = root();
         fs::write(root.path().join("move.rs"), "old").unwrap();
         fs::write(root.path().join("delete.rs"), "old").unwrap();
-        let patch = "*** Begin Patch\n*** Add File: a\td\rd.rs \t\u{00a0}\n+x\n*** Add File: \t\r leading.rs  \n+y\n*** Update File: mo\tv\re.rs \t\n*** Move to:  mo\tv\red.rs \t\u{00a0}\n*** Delete File: de\tle\rte.rs \t\n*** End Patch";
+        let patch = "*** Begin Patch\n*** Add File: a\td\rd.rs \t\u{00a0}\n+x\n*** Add File: \t\r leading.rs  \n+y\n*** Update File: mo\tv\re.rs \t\n*** Move to:  mo\tv\red.rs \t\u{00a0}\n-old\n+new\n*** Delete File: de\tle\rte.rs \t\n*** End Patch";
         let targets = parse(patch, root.path().to_str().unwrap()).unwrap();
         assert_eq!(
             names(&targets),
@@ -411,22 +411,29 @@ mod tests {
     }
 
     #[test]
-    fn header_only_delete_and_move_only_update_are_valid() {
+    fn header_only_delete_is_valid_and_move_only_update_is_rejected() {
         let root = root();
         fs::write(root.path().join("delete.rs"), "old").unwrap();
         fs::write(root.path().join("move.rs"), "old").unwrap();
-        let patch = "*** Begin Patch\n*** Delete File: delete.rs\n*** Update File: move.rs\n*** Move to: moved.rs\n*** End Patch";
-        assert_eq!(parse(patch, root.path().to_str().unwrap()).unwrap().len(), 3);
+        let delete = "*** Begin Patch\n*** Delete File: delete.rs\n*** End Patch";
+        let move_only = "*** Begin Patch\n*** Update File: move.rs\n*** Move to: moved.rs\n*** End Patch";
+        assert_eq!(parse(delete, root.path().to_str().unwrap()).unwrap().len(), 1);
+        assert!(parse(move_only, root.path().to_str().unwrap()).is_err());
     }
 
     #[test]
-    fn add_needs_plus_and_update_needs_hunk_or_move() {
+    fn add_needs_plus_and_update_needs_change_content_not_a_hunk_marker() {
         let root = root();
         fs::write(root.path().join("x"), "old").unwrap();
         let add = "*** Begin Patch\n*** Add File: a\nplain\n*** End Patch";
-        let update = "*** Begin Patch\n*** Update File: x\n-old\n+new\n*** End Patch";
+        let update_without_hunk = "*** Begin Patch\n*** Update File: x\n-old\n+new\n*** End Patch";
+        let empty_hunk = "*** Begin Patch\n*** Update File: x\n@@\n*** End Patch";
         assert!(parse(add, root.path().to_str().unwrap()).is_err());
-        assert!(parse(update, root.path().to_str().unwrap()).is_err());
+        assert_eq!(
+            parse(update_without_hunk, root.path().to_str().unwrap()).unwrap().len(),
+            1
+        );
+        assert!(parse(empty_hunk, root.path().to_str().unwrap()).is_err());
     }
 
     #[test]

@@ -197,7 +197,7 @@ fn add_update_delete_and_both_move_endpoints_are_probed_and_denied() {
     let paths =
         ["add.rs", "update.rs", "delete.rs", "move.rs", "moved.rs"].map(|name| resource(&root.path().join(name)));
     let mock = spawn_mock(paths.len(), &paths, &[]);
-    let patch = "*** Begin Patch\n*** Add File: add.rs\n+new\n*** Update File: update.rs\n@@\n-old\n+new\n*** Delete File: delete.rs\n*** Update File: move.rs\n*** Move to: moved.rs\n*** End Patch";
+    let patch = "*** Begin Patch\n*** Add File: add.rs\n+new\n*** Update File: update.rs\n@@\n-old\n+new\n*** Delete File: delete.rs\n*** Update File: move.rs\n*** Move to: moved.rs\n-old\n+new\n*** End Patch";
     let output = run_hook(&codex_input(root.path(), patch.to_string()), &mock.url);
     let captured = mock.join.join().unwrap().into_iter().collect::<HashSet<_>>();
     let value = decision(&output);
@@ -224,7 +224,7 @@ fn codex_whitespace_normalization_uses_the_same_add_and_move_resources() {
     let destination = resource(&root.path().join("moved.rs"));
     let expected = [add.clone(), source.clone(), destination.clone()];
     let mock = spawn_mock(expected.len(), &[add.clone(), destination.clone()], &[]);
-    let patch = "*** Begin Patch\n*** Add File: a\td\rd.rs \t\u{00a0}\n+new\n*** Update File: mo\tv\re.rs \t\n*** Move to: mo\tv\red.rs \t\u{00a0}\n*** End Patch";
+    let patch = "*** Begin Patch\n*** Add File: a\td\rd.rs \t\u{00a0}\n+new\n*** Update File: mo\tv\re.rs \t\n*** Move to: mo\tv\red.rs \t\u{00a0}\n-old\n+new\n*** End Patch";
     let output = run_hook(&codex_input(root.path(), patch.to_string()), &mock.url);
     let captured = mock.join.join().unwrap().into_iter().collect::<HashSet<_>>();
     let value = decision(&output);
