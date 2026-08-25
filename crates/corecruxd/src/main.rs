@@ -1037,12 +1037,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )
             .into());
         };
-        let delegate_config = corecrux_memory::embeddings::DelegatingEmbeddingConfig::new(
+        let mut delegate_config = corecrux_memory::embeddings::DelegatingEmbeddingConfig::new(
             delegate_url.clone(),
             delegate_token.expose().to_string(),
             config.embedding_model.clone(),
             expected_dimensions,
         );
+        // One payer per daemon: the wallet named here funds every embedding
+        // this daemon delegates, whoever the end-user request belonged to.
+        // Unset means no quote on the wire, which only an unmetered provider
+        // accepts — the pre-metering behaviour, preserved deliberately.
+        if let Some(tenant) = config.embed_delegate_tenant.as_ref() {
+            let mut payer = corecrux_memory::embeddings::DelegatedEmbedPayer::new(tenant.clone());
+            if let Some(price_list_hash) = config.embed_delegate_price_list_hash.as_ref() {
+                payer = payer.with_price_list_hash(price_list_hash.clone());
+            }
+            delegate_config = delegate_config.with_payer(payer);
+        }
+        let delegate_payer_tenant = config.embed_delegate_tenant.clone();
         let delegate = corecrux_memory::embeddings::DelegatingEmbedder::new(delegate_config).map_err(|err| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1052,6 +1064,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!(
             model = %config.embedding_model,
             dimensions = expected_dimensions,
+            payer_tenant = delegate_payer_tenant.as_deref().unwrap_or("<unmetered>"),
             "embedding-delegation-configured"
         );
         state.fact_store.write().await.set_embedder(Box::new(delegate));
