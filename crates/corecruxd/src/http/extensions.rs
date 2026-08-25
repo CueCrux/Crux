@@ -195,6 +195,7 @@ pub(super) async fn register_extension(
         &state.data_dir,
         manifest,
         installed_by,
+        crate::pack_lifecycle::default_install_state(),
         now_unix_ms(),
         bypass,
     );
@@ -342,6 +343,7 @@ pub(super) async fn install_from_registry(
         &state.data_dir,
         manifest,
         installed_by,
+        crate::pack_lifecycle::default_install_state(),
         now_unix_ms(),
         bypass,
     );
@@ -714,7 +716,7 @@ pub(super) async fn invoke_extension_tool(
     // Snapshot installed extension + grant out of the store before the
     // outbound call so we can drop the read lock during the (potentially
     // slow) network round-trip / wasm execution.
-    let (manifest, attribution, grant) = {
+    let (manifest, attribution, lifecycle, grant) = {
         let store = state.fact_store.read().await;
         let installed = match crate::extension_registry::get_extension(&store, &extension_id) {
             Some(r) => r,
@@ -738,8 +740,22 @@ pub(super) async fn invoke_extension_tool(
         // hash of the bytes the operator actually installed. Both dispatch
         // branches and every fact they write carry this same value.
         let attribution = crate::extension_registry::PackAttribution::from_installed(&installed);
-        (installed.manifest, attribution, grant)
+        (installed.manifest, attribution, installed.lifecycle, grant)
     };
+
+    // Staged-activation seam: a quarantined pack is refused here, before
+    // any transport is opened or any module is loaded — the point of
+    // quarantine is that the code does not run, not that its writes are
+    // discarded afterwards.
+    if !lifecycle.is_dispatchable() {
+        return problem_response(
+            StatusCode::CONFLICT,
+            format!(
+                "extension '{extension_id}' is {}; POST /v1/extensions/{extension_id}/lifecycle with a reason to re-instate it",
+                lifecycle.as_str()
+            ),
+        );
+    }
 
     // Tool name must be in the grant's allow-list (or the allow-list
     // must be empty, meaning "all tools the manifest declares").
@@ -757,6 +773,7 @@ pub(super) async fn invoke_extension_tool(
             extension_id,
             manifest,
             attribution,
+            lifecycle,
             grant,
             tool_name,
             body.args,
@@ -820,24 +837,111 @@ pub(super) async fn invoke_extension_tool(
         }
     };
 
-    // Persist the accepted fact_writes (the dispatcher already filtered
-    // out-of-scope ones). Each write hits the privacy gate as a final
-    // belt-and-braces check; identical-shape entries that snuck through
-    // would still be marked private at storage time.
-    if outcome.accepted_fact_writes > 0 {
-        // Scope filtering + the `actor` stamp both come from the dispatcher's
-        // own outcome, so a stored fact's authorship is the same value the
-        // receipt reports rather than a second derivation that can drift.
-        let staged = crate::extension_outbound::attributed_fact_writes(&parsed, &grant, &outcome.attribution);
-        let mut store = state.fact_store.write().await;
-        for mut sf in staged {
-            crate::fact_privacy::enforce_global(&mut sf);
-            store.store(sf);
+    // Scope filtering + the `actor` stamp both come from the dispatcher's
+    // own outcome, so a stored fact's authorship is the same value the
+    // receipt reports rather than a second derivation that can drift.
+    // Whether those writes then land is the lifecycle's call, not this
+    // handler's — see `classify_dispatch_writes`.
+    let writes = crate::extension_outbound::attributed_fact_writes(&parsed, &grant, &outcome.attribution);
+    match crate::pack_lifecycle::classify_dispatch_writes(lifecycle, writes) {
+        crate::pack_lifecycle::DispatchWrites::Commit(writes) => {
+            if !writes.is_empty() {
+                let mut store = state.fact_store.write().await;
+                for sf in writes {
+                    store.store(sf);
+                }
+                drop(store);
+            }
+            (StatusCode::OK, Json(outcome)).into_response()
         }
-        drop(store);
+        // Staged: the pack ran and we know precisely what it would have
+        // changed — and the store was never opened for writing.
+        crate::pack_lifecycle::DispatchWrites::Observe(observed) => {
+            append_audit_event(
+                &state.data_dir,
+                &IntegrationAuditEvent::extension(
+                    now_unix_ms(),
+                    crux_integrations::AUDIT_EXTENSION_INVOKE_STAGED,
+                    Some(&calling_passport),
+                    &outcome.attribution.extension_id,
+                    Some(&outcome.attribution.extension_version),
+                    lifecycle.as_str(),
+                    serde_json::json!({
+                        "manifest_hash": outcome.attribution.manifest_hash,
+                        "observed_fact_writes": observed.len(),
+                    }),
+                ),
+            );
+            (
+                StatusCode::OK,
+                Json(crate::pack_lifecycle::StagedDispatchEnvelope::new(
+                    lifecycle, observed, outcome,
+                )),
+            )
+                .into_response()
+        }
     }
+}
 
-    (StatusCode::OK, Json(outcome)).into_response()
+// ── Staged activation (buyer-fit M5 frontier seam) ───────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct SetLifecycleBody {
+    pub state: crate::pack_lifecycle::PackLifecycleState,
+    /// Mandatory only when leaving quarantine — see
+    /// [`crate::pack_lifecycle::LifecycleError::ReasonRequired`].
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// `POST /v1/extensions/{id}/lifecycle` — move a pack between staged,
+/// active and quarantined.
+///
+/// This is the operator-facing half of the staged-activation seam: the
+/// pre-enable replay that `proof-carrying-adaptive-packs` M1 performs runs
+/// against a `staged` pack and then calls this route to take it live, and
+/// its M4 auto-quarantine calls it the other way with the regression as the
+/// `reason`.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn set_extension_lifecycle(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<SetLifecycleBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
+        return problem.into_response();
+    }
+    let actor = extract_passport_id(&headers);
+    let mut store = state.fact_store.write().await;
+    let result = crate::pack_lifecycle::set_lifecycle(
+        &mut store,
+        &state.data_dir,
+        &id,
+        body.state,
+        body.reason.as_deref(),
+        actor.as_deref(),
+        now_unix_ms(),
+    );
+    drop(store);
+    match result {
+        Ok((record, transition)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "schema": "crux.extensions.lifecycle.v1",
+                "transition": transition,
+                "extension": record,
+            })),
+        )
+            .into_response(),
+        Err(crate::pack_lifecycle::LifecycleError::NotFound(_)) => {
+            problem_response(StatusCode::NOT_FOUND, format!("extension '{id}' not installed"))
+        }
+        Err(err @ crate::pack_lifecycle::LifecycleError::ReasonRequired) => {
+            problem_response(StatusCode::UNPROCESSABLE_ENTITY, err.to_string())
+        }
+        Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
+    }
 }
 
 /// `DELETE /v1/extensions/{id}/grants/{passport_fpr}` — revoke a grant.
@@ -928,6 +1032,7 @@ async fn dispatch_wasm_kind_or_unsupported(
     extension_id: String,
     manifest: IntegrationManifest,
     attribution: crate::extension_registry::PackAttribution,
+    lifecycle: crate::pack_lifecycle::PackLifecycleState,
     grant: crate::extension_grants::ExtensionGrant,
     tool_name: String,
     args: serde_json::Value,
@@ -941,6 +1046,11 @@ async fn dispatch_wasm_kind_or_unsupported(
     };
     let cfg = crate::wasm_host::WasmConfig::from_env();
     let request_id = make_request_id();
+    // A wasm pack writes through the host ABI mid-call, so staging cannot
+    // be applied after the fact the way the external-tool path does it —
+    // the adapter itself has to be the one that observes instead of
+    // committing. `commits_writes()` is the same predicate both paths use.
+    let commit = lifecycle.commits_writes();
     let result = crate::wasm_dispatcher::dispatch_wasm_via_http(
         engine,
         cfg,
@@ -949,6 +1059,7 @@ async fn dispatch_wasm_kind_or_unsupported(
         extension_id,
         manifest,
         attribution,
+        commit,
         grant,
         tool_name,
         args,
@@ -957,7 +1068,14 @@ async fn dispatch_wasm_kind_or_unsupported(
     )
     .await;
     match result {
-        Ok(outcome) => (StatusCode::OK, Json(outcome)).into_response(),
+        Ok((outcome, observed)) if !commit => (
+            StatusCode::OK,
+            Json(crate::pack_lifecycle::StagedDispatchEnvelope::new(
+                lifecycle, observed, outcome,
+            )),
+        )
+            .into_response(),
+        Ok((outcome, _)) => (StatusCode::OK, Json(outcome)).into_response(),
         Err(crate::wasm_dispatcher::WasmDispatchError::ModuleFileMissing(p)) => problem_response(
             StatusCode::NOT_FOUND,
             format!("wasm module file missing at '{}'", p.display()),
@@ -991,6 +1109,7 @@ async fn dispatch_wasm_kind_or_unsupported(
     _extension_id: String,
     _manifest: IntegrationManifest,
     _attribution: crate::extension_registry::PackAttribution,
+    _lifecycle: crate::pack_lifecycle::PackLifecycleState,
     _grant: crate::extension_grants::ExtensionGrant,
     _tool_name: String,
     _args: serde_json::Value,

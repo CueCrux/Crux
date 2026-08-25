@@ -406,6 +406,16 @@ pub const AUDIT_TRUSTED_KEY_ADDED: &str = "trusted_key_added";
 pub const AUDIT_TRUSTED_KEY_REMOVED: &str = "trusted_key_removed";
 pub const AUDIT_EXTENSION_INVOKE_OK: &str = "extension_invoke_ok";
 pub const AUDIT_EXTENSION_INVOKE_REJECTED: &str = "extension_invoke_rejected";
+/// A pack moved between lifecycle states (staged / active / quarantined).
+/// The `detail` carries `from`, `to`, and the operator's `reason`, so the
+/// audit tail alone answers "who took this pack live, and why was it put
+/// back" without replaying the install-record fact chain.
+pub const AUDIT_EXTENSION_LIFECYCLE: &str = "extension_lifecycle";
+/// A staged pack was dispatched: it ran, and its writes were observed
+/// rather than committed. Distinct from `extension_invoke_ok` precisely so
+/// "this call changed memory" and "this call only proved what it would
+/// change" are never conflated in the tail.
+pub const AUDIT_EXTENSION_INVOKE_STAGED: &str = "extension_invoke_staged";
 pub const AUDIT_SUPPRESSED: &str = "audit_suppressed";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

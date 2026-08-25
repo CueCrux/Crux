@@ -22,7 +22,7 @@
 //!    HTTP response is uniform across both kinds.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use corecrux_memory::fact_store::{FactQuery, FactStore, StoreFact};
 use crux_integrations::{EntryKind, IntegrationManifest};
@@ -31,6 +31,7 @@ use tokio::sync::RwLock;
 
 use crate::extension_grants::ExtensionGrant;
 use crate::extension_registry::PackAttribution;
+use crate::pack_lifecycle::ObservedFactWrite;
 use crate::wasm_host::{
     dispatch_wasm_tool_with_context, HostFact, HostFactQuery, HostFactStore, HostStoreFact, WasmCallContext,
     WasmConfig, WasmDispatchOutcome, WasmEngine, WasmError,
@@ -92,12 +93,16 @@ pub async fn dispatch_wasm_via_http(
     // Built by the caller from the registry record — see
     // [`PackAttribution::from_installed`] for why it is not recomputed here.
     attribution: PackAttribution,
+    // Staged-activation seam: `false` means the pack is not live, so its
+    // writes are observed and returned instead of committed. Decided by
+    // `PackLifecycleState::commits_writes` at the HTTP boundary.
+    commit: bool,
     grant: ExtensionGrant,
     tool_name: String,
     args: serde_json::Value,
     calling_passport_id: String,
     request_id: String,
-) -> Result<WasmDispatchOutcome, WasmDispatchError> {
+) -> Result<(WasmDispatchOutcome, Vec<ObservedFactWrite>), WasmDispatchError> {
     if manifest.entry.kind != EntryKind::Wasm {
         return Err(WasmDispatchError::NotWasmKind(extension_id));
     }
@@ -136,9 +141,12 @@ pub async fn dispatch_wasm_via_http(
     // it writes through the host ABI mid-call — so the attribution has to be
     // baked into the adapter the module writes through, not applied
     // afterwards the way the external-tool path does it.
+    let observed: Arc<Mutex<Vec<ObservedFactWrite>>> = Arc::new(Mutex::new(Vec::new()));
     let adapter: Arc<dyn HostFactStore> = Arc::new(WasmFactStoreAdapter {
         store: Arc::clone(&fact_store),
         pack_actor: attribution.actor(),
+        commit,
+        observed: Arc::clone(&observed),
     });
     let grant_arc = Arc::new(grant);
 
@@ -165,7 +173,10 @@ pub async fn dispatch_wasm_via_http(
     .map_err(|e| WasmDispatchError::Dispatch(WasmError::Trap(format!("join error: {e}"))))?
     .map(|(outcome, _)| outcome)?;
 
-    Ok(outcome)
+    // The adapter is the only other holder and the blocking task has
+    // joined, so nothing can still be appending here.
+    let observed = observed.lock().map(|guard| guard.clone()).unwrap_or_default();
+    Ok((outcome, observed))
 }
 
 /// Adapter from the daemon's real `FactStore` to the wasm host's
@@ -176,6 +187,13 @@ pub struct WasmFactStoreAdapter {
     /// [`PackAttribution::actor`] of the pack build this call is running,
     /// stamped on every fact the module stores through the host ABI.
     pub pack_actor: String,
+    /// Whether writes reach the store. `false` for a staged pack — the
+    /// module still gets a well-formed fact back, so its own control flow
+    /// is unchanged and the replay observes the behaviour it would really
+    /// have, but canonical memory is untouched.
+    pub commit: bool,
+    /// Writes captured in dispatch order while `commit` is false.
+    pub observed: Arc<Mutex<Vec<ObservedFactWrite>>>,
 }
 
 impl HostFactStore for WasmFactStoreAdapter {
@@ -198,7 +216,6 @@ impl HostFactStore for WasmFactStoreAdapter {
         if let Some(prefix) = crate::fact_privacy::generic_create_reserved_entity_prefix(&req.entity) {
             return Err(format!("create-reserved fact namespace `{prefix}`"));
         }
-        let mut store = self.store.blocking_write();
         let mut sf = StoreFact {
             tenant_hash: "default".to_string(),
             entity: req.entity,
@@ -211,8 +228,32 @@ impl HostFactStore for WasmFactStoreAdapter {
             actor: Some(self.pack_actor.clone()),
         };
         // Final belt-and-braces: even if the grant allowed the prefix,
-        // privacy gate has the last word over private prefixes.
+        // privacy gate has the last word over private prefixes. Applied
+        // before the staged branch too, so what a replay observes is what a
+        // live run would really have written.
         crate::fact_privacy::enforce_global(&mut sf);
+
+        if !self.commit {
+            let mut observed = self
+                .observed
+                .lock()
+                .map_err(|_| "staged write buffer poisoned".to_string())?;
+            observed.push(ObservedFactWrite::from_store_fact(&sf));
+            // Synthetic, deterministic identity: the module gets a fact
+            // back so its control flow is unchanged, and two replays of the
+            // same operations produce the same ids. A real `fact_id` would
+            // be a lie — nothing was stored.
+            return Ok(HostFact {
+                fact_id: format!("staged:{}", observed.len() - 1),
+                entity: sf.entity,
+                key: sf.key,
+                value: sf.value,
+                confidence: sf.confidence,
+                stored_at_unix_ms: 0,
+            });
+        }
+
+        let mut store = self.store.blocking_write();
         let fact = store.store(sf);
         Ok(to_host_fact(&fact))
     }
