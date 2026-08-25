@@ -883,6 +883,279 @@ pub(super) async fn invoke_extension_tool(
     }
 }
 
+// ── Conformance hook (buyer-fit M5 frontier seam) ────────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct ConformanceRunBody {
+    /// Name of the shadow corpus these cases came from. Required — a
+    /// behavioural result whose corpus is unnamed cannot be compared to
+    /// anything later.
+    pub corpus_id: String,
+    #[serde(default)]
+    pub passport_fpr: Option<String>,
+    /// Operations to replay. Omit to fall back to one case per tool the
+    /// manifest declares — see
+    /// [`crate::pack_conformance::cases_from_manifest`].
+    #[serde(default)]
+    pub cases: Option<Vec<crate::pack_conformance::ConformanceCase>>,
+}
+
+/// Run one declared operation against a staged pack and report what it
+/// would have done.
+///
+/// Deliberately *not* folded together with [`invoke_extension_tool`]: that
+/// handler maps each dispatch failure onto a distinct HTTP status (403 for
+/// a scope violation, 429 for a rate limit, 502 upstream), and a replay
+/// wants every failure flattened into one recorded observation instead. The
+/// part that must not diverge — whether a write lands — is shared: both go
+/// through [`crate::pack_lifecycle::classify_dispatch_writes`], so an
+/// operation observed here behaves exactly as it would through the invoke
+/// route.
+#[allow(clippy::too_many_arguments)]
+async fn run_staged_operation(
+    state: &AppState,
+    extension_id: &str,
+    manifest: &IntegrationManifest,
+    attribution: &crate::extension_registry::PackAttribution,
+    grant: &crate::extension_grants::ExtensionGrant,
+    tool_name: &str,
+    args: serde_json::Value,
+    calling_passport: &str,
+) -> Result<crate::pack_conformance::StagedOperationOutcome, String> {
+    if !grant.allowed_tool_names.is_empty() && !grant.allowed_tool_names.contains(&tool_name.to_string()) {
+        return Err(format!("tool '{tool_name}' is not in the grant's allowed_tool_names"));
+    }
+    let started = std::time::Instant::now();
+
+    if manifest.entry.kind == crux_integrations::EntryKind::Wasm {
+        return run_staged_wasm_operation(
+            state,
+            extension_id,
+            manifest,
+            attribution,
+            grant,
+            tool_name,
+            args,
+            calling_passport,
+            started,
+        )
+        .await;
+    }
+    if manifest.entry.kind != crux_integrations::EntryKind::ExternalTool {
+        return Err(format!(
+            "unsupported entry.kind {:?} for tool dispatch",
+            manifest.entry.kind
+        ));
+    }
+
+    let cfg = crate::extension_outbound::OutboundConfig::from_env();
+    let rate_table = state.extension_rate_table.clone();
+    let data_dir = state.data_dir.clone();
+    let manifest_clone = manifest.clone();
+    let attribution_clone = attribution.clone();
+    let grant_clone = grant.clone();
+    let tool = tool_name.to_string();
+    let passport = calling_passport.to_string();
+    let request_id = make_request_id();
+    let dispatched = tokio::task::spawn_blocking(move || {
+        let transport = crate::extension_outbound::UreqTransport;
+        crate::extension_outbound::dispatch_external_tool(
+            &transport,
+            &rate_table,
+            &cfg,
+            &data_dir,
+            &manifest_clone,
+            &attribution_clone,
+            &grant_clone,
+            &tool,
+            &args,
+            &passport,
+            &request_id,
+            None,
+        )
+    })
+    .await
+    .map_err(|err| format!("dispatch join error: {err}"))?
+    .map_err(|err| err.to_string())?;
+
+    let (outcome, parsed) = dispatched;
+    let writes = crate::extension_outbound::attributed_fact_writes(&parsed, grant, &outcome.attribution);
+    // Forced staged: a conformance run is only reachable on a staged pack
+    // (see `precheck`), and passing the state explicitly keeps that true
+    // even if a future caller reaches this helper another way.
+    let observed = match crate::pack_lifecycle::classify_dispatch_writes(
+        crate::pack_lifecycle::PackLifecycleState::Staged,
+        writes,
+    ) {
+        crate::pack_lifecycle::DispatchWrites::Observe(observed) => observed,
+        crate::pack_lifecycle::DispatchWrites::Commit(_) => {
+            return Err("staged classification returned a commit; refusing to proceed".to_string());
+        }
+    };
+    Ok(crate::pack_conformance::StagedOperationOutcome {
+        result: outcome.result,
+        observed_fact_writes: observed,
+        dropped_fact_writes: outcome.dropped_fact_writes,
+        duration_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+#[cfg(feature = "wasm-extensions")]
+#[allow(clippy::too_many_arguments)]
+async fn run_staged_wasm_operation(
+    state: &AppState,
+    extension_id: &str,
+    manifest: &IntegrationManifest,
+    attribution: &crate::extension_registry::PackAttribution,
+    grant: &crate::extension_grants::ExtensionGrant,
+    tool_name: &str,
+    args: serde_json::Value,
+    calling_passport: &str,
+    started: std::time::Instant,
+) -> Result<crate::pack_conformance::StagedOperationOutcome, String> {
+    let engine = state
+        .wasm_engine
+        .clone()
+        .ok_or_else(|| "wasm engine init failed at startup".to_string())?;
+    let (outcome, observed) = crate::wasm_dispatcher::dispatch_wasm_via_http(
+        engine,
+        crate::wasm_host::WasmConfig::from_env(),
+        state.data_dir.clone(),
+        state.fact_store.clone(),
+        extension_id.to_string(),
+        manifest.clone(),
+        attribution.clone(),
+        false, // staged: observe, never commit
+        grant.clone(),
+        tool_name.to_string(),
+        args,
+        calling_passport.to_string(),
+        make_request_id(),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok(crate::pack_conformance::StagedOperationOutcome {
+        result: outcome.result,
+        observed_fact_writes: observed,
+        // A wasm module writes through the host ABI, where an out-of-scope
+        // write is refused inline rather than counted at the end — so there
+        // is no drop tally to report here.
+        dropped_fact_writes: 0,
+        duration_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+#[cfg(not(feature = "wasm-extensions"))]
+#[allow(clippy::unused_async, clippy::too_many_arguments)]
+async fn run_staged_wasm_operation(
+    _state: &AppState,
+    _extension_id: &str,
+    _manifest: &IntegrationManifest,
+    _attribution: &crate::extension_registry::PackAttribution,
+    _grant: &crate::extension_grants::ExtensionGrant,
+    _tool_name: &str,
+    _args: serde_json::Value,
+    _calling_passport: &str,
+    _started: std::time::Instant,
+) -> Result<crate::pack_conformance::StagedOperationOutcome, String> {
+    Err("wasm extensions require building corecruxd with --features wasm-extensions".to_string())
+}
+
+/// `POST /v1/extensions/{id}/conformance` — replay a staged pack's declared
+/// operations and return what each one would have done.
+///
+/// The hook `proof-carrying-adaptive-packs-2026-07-13` M1 calls before
+/// enabling a pack. It reports evidence and never a verdict: comparing the
+/// observed behaviour against a declared envelope, and deciding whether the
+/// pack may go live, belong to that plan.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn run_extension_conformance(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ConformanceRunBody>,
+) -> impl IntoResponse {
+    // `facts:write` even though a staged run writes nothing: it executes the
+    // pack's code and reaches its endpoint, so it is not a read.
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
+        return problem.into_response();
+    }
+    let calling_passport = body.passport_fpr.clone().or_else(|| extract_passport_id(&headers));
+    let Some(calling_passport) = calling_passport else {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "passport_fpr required (body field or X-Corecrux-Passport-Id header)",
+        );
+    };
+
+    let (manifest, attribution, lifecycle, grant) = {
+        let store = state.fact_store.read().await;
+        let Some(installed) = crate::extension_registry::get_extension(&store, &id) else {
+            return problem_response(StatusCode::NOT_FOUND, format!("extension '{id}' not installed"));
+        };
+        let Some(grant) = crate::extension_grants::get_grant(&store, &id, &calling_passport) else {
+            return problem_response(
+                StatusCode::FORBIDDEN,
+                format!("passport '{calling_passport}' has no grant for extension '{id}'"),
+            );
+        };
+        let attribution = crate::extension_registry::PackAttribution::from_installed(&installed);
+        (installed.manifest, attribution, installed.lifecycle, grant)
+    };
+
+    let cases = body
+        .cases
+        .unwrap_or_else(|| crate::pack_conformance::cases_from_manifest(&manifest));
+    if let Err(err) = crate::pack_conformance::precheck(&id, lifecycle, &body.corpus_id, &cases) {
+        let status = match err {
+            crate::pack_conformance::ConformanceError::NotStaged(_, _) => StatusCode::CONFLICT,
+            _ => StatusCode::UNPROCESSABLE_ENTITY,
+        };
+        return problem_response(status, err.to_string());
+    }
+
+    let started_at_unix_ms = now_unix_ms();
+    let mut observations = Vec::with_capacity(cases.len());
+    for case in &cases {
+        // Sequentially, in declaration order: a pack's later operations can
+        // depend on what its earlier ones did, so a parallel run would not
+        // be the replay the corpus describes.
+        let outcome = run_staged_operation(
+            &state,
+            &id,
+            &manifest,
+            &attribution,
+            &grant,
+            &case.tool_name,
+            case.args.clone(),
+            &calling_passport,
+        )
+        .await;
+        observations.push(crate::pack_conformance::observe(case, outcome));
+    }
+
+    let run =
+        crate::pack_conformance::build_run(attribution, lifecycle, body.corpus_id, started_at_unix_ms, observations);
+    append_audit_event(
+        &state.data_dir,
+        &IntegrationAuditEvent::extension(
+            now_unix_ms(),
+            crux_integrations::AUDIT_EXTENSION_CONFORMANCE_RUN,
+            Some(&calling_passport),
+            &run.pack.extension_id,
+            Some(&run.pack.extension_version),
+            if run.totals.errors == 0 { "ok" } else { "errors" },
+            serde_json::json!({
+                "manifest_hash": run.pack.manifest_hash,
+                "corpus_id": run.corpus_id,
+                "observed_digest": run.observed_digest,
+                "totals": run.totals,
+            }),
+        ),
+    );
+    (StatusCode::OK, Json(run)).into_response()
+}
+
 // ── Staged activation (buyer-fit M5 frontier seam) ───────────────────────
 
 #[derive(Debug, serde::Deserialize)]

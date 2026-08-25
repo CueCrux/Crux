@@ -416,6 +416,11 @@ pub const AUDIT_EXTENSION_LIFECYCLE: &str = "extension_lifecycle";
 /// "this call changed memory" and "this call only proved what it would
 /// change" are never conflated in the tail.
 pub const AUDIT_EXTENSION_INVOKE_STAGED: &str = "extension_invoke_staged";
+/// A staged pack's declared operations were replayed and observed. The
+/// `detail` carries the corpus id and the run's `observed_digest`, so the
+/// audit tail alone shows that a replay happened and which behaviour it
+/// saw, even if the run body itself is never persisted.
+pub const AUDIT_EXTENSION_CONFORMANCE_RUN: &str = "extension_conformance_run";
 pub const AUDIT_SUPPRESSED: &str = "audit_suppressed";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
