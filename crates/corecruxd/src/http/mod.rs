@@ -1254,6 +1254,17 @@ pub(crate) fn router_with_route_auth(
             "/v1/extensions/{id}/conformance",
             axum::routing::post(self::extensions::run_extension_conformance),
         )
+        // Buyer-fit M5 outcome-event seam: what became of the memory a pack
+        // wrote. Mostly derived from the store + audit tail; only
+        // judgements the daemon cannot know are recorded.
+        .route(
+            "/v1/extensions/{id}/outcomes",
+            get(self::extensions::list_extension_outcomes),
+        )
+        .route(
+            "/v1/extensions/{id}/outcomes",
+            axum::routing::post(self::extensions::record_extension_outcome),
+        )
         // Storybook readout — Phase 3 of the context graph.
         .route(
             "/v1/projects/{id}/storybook",

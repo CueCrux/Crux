@@ -105,6 +105,7 @@ mod onboarding;
 mod ops_events;
 mod pack_conformance;
 mod pack_lifecycle;
+mod pack_outcomes;
 mod passports;
 mod plane_layer_sync;
 mod planes;

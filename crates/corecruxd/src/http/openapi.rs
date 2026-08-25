@@ -261,6 +261,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/extensions/{id}/grants", methods: &["GET", "POST"], tag: "Extensions", auth: "read-write", summary: "Extensions {id} grants" },
     RouteEntry { path: "/v1/extensions/{id}/grants/{passport_fpr}", methods: &["DELETE"], tag: "Extensions", auth: "write", summary: "Extensions {id} grants {passport fpr}" },
     RouteEntry { path: "/v1/extensions/{id}/lifecycle", methods: &["POST"], tag: "Extensions", auth: "write", summary: "Extensions {id} lifecycle" },
+    RouteEntry { path: "/v1/extensions/{id}/outcomes", methods: &["GET", "POST"], tag: "Extensions", auth: "read-write", summary: "Extensions {id} outcomes" },
     RouteEntry { path: "/v1/extensions/{id}/tools/{tool_name}/invoke", methods: &["POST"], tag: "Extensions", auth: "write", summary: "Extensions {id} tools {tool name} invoke" },
     RouteEntry { path: "/v1/facts", methods: &["GET", "PUT"], tag: "Facts", auth: "read-write", summary: "Facts" },
     RouteEntry { path: "/v1/memory/extract", methods: &["POST"], tag: "Memory", auth: "write", summary: "Gated auto-capture: extract review-only candidates" },
