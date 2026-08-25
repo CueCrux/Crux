@@ -214,16 +214,20 @@ def mcp_url() -> str:
 
 
 def resolve_token() -> str | None:
+    # Match the stdio bridge and enforcement wrapper: a token injected into
+    # this Codex process is authoritative for that worker. Looking up a shared
+    # named token first can make the banner report a different passport from
+    # the edit-enforcement hook.
+    token = os.environ.get("CRUX_AGENT_TOKEN", "").strip()
+    if token:
+        return token
+
     agent_name = os.environ.get("CRUX_CODEX_AGENT_NAME", "").strip()
     if agent_name:
         named = token_for_agent(agent_name)
         if named:
             return named
         log_error(f"token for CRUX_CODEX_AGENT_NAME={agent_name} not found")
-
-    token = os.environ.get("CRUX_AGENT_TOKEN", "").strip()
-    if token:
-        return token
 
     fallback_name = os.environ.get("CRUX_AGENT_TOKEN_NAME", "").strip()
     if fallback_name:
