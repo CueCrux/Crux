@@ -4476,6 +4476,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **One tenant erasure could wedge every write on the shard.** `forget-tenants`
+  with `reclaim: true` retires a segment together with the L0 directory run
+  whose `run_id` equals its `segment_seq`. That pairing is not reliable:
+  `publish_dir_run_v1` resolves a run-id collision by incrementing `run_id`, so
+  a run describing segment *N* can be published as `run_id N+1` — and a stale
+  `directory/` file is enough to trigger it (host `crux` carries 1083 dirrun
+  files against 1061 segments). The displaced run survives the reclaim still
+  naming a segment that is gone.
+
+  `rebuild_directory_from_runs` treated that extent as corruption and returned
+  `dirrun references missing segment_seq N`, which fails `ShardStorage::open` —
+  and open is on the path of every write, while reads scan `segments/` directly
+  and stay green. The result is the silent-500 signature this store has now hit
+  twice, once for 44 hours: all ingest returning 500 with `/readyz` healthy, and
+  `corecruxctl storage repair-manifest` reporting the shard *healthy* because
+  the segment is already out of the manifest and only the directory still names
+  it.
+
+  An extent naming a retired segment is now a **miss**, not an error: the
+  manifest is append-only and published runs are never rewritten, so a run
+  outliving its segment is the designed state after erasure. The extent is
+  skipped and counted, and each affected run logs `dirrun-extents-skipped`
+  once.
+
+  `corecruxctl storage repair-manifest` learned the same class, so a store
+  already wedged by an older daemon can be recovered offline: it now reports
+  `dangling_dir_runs` alongside `dangling_segments` and retires the runs whose
+  named segments are *all* gone. A run that also names live segments is
+  reported and left alone — its live extents are how those streams resolve, so
+  dropping it would trade a wedged shard for a lossy one. (#740)
+
 ## [0.5.64] - 2026-08-23
 
 ### Fixed

@@ -3,22 +3,39 @@
 // Licensed under the Apache License, Version 2.0.
 // See LICENSE in the repository root.
 
-//! Manifest repair driver — finds MANIFEST entries whose segment file is gone and tombstones them.
+//! Manifest repair driver — finds MANIFEST references that no longer resolve and tombstones them.
 //!
-//! A shard whose manifest references a deleted segment cannot be opened at all:
-//! `ShardStorage::open` does `File::open` on every referenced segment, so one
-//! dangling entry fails every write. Reads are unaffected (they scan the
-//! `segments/` dir), which is why this failure mode is silent — host `crux` ran
-//! 38 hours with all ingest returning 500 and `/readyz` green.
+//! A shard whose manifest does not resolve cannot be opened at all, and
+//! `ShardStorage::open` is on the path of every write. Reads are unaffected
+//! (they scan the `segments/` dir), which is why this failure mode is silent —
+//! host `crux` ran 38 hours with all ingest returning 500 and `/readyz` green.
+//!
+//! Two classes reach that state, and they are mirror images:
+//!
+//! 1. **A segment the manifest names is gone from disk.** `open` does
+//!    `File::open` on every referenced segment, so one dangling entry fails.
+//! 2. **A directory run names a segment the manifest has already retired.**
+//!    Erasure retires the L0 run whose `run_id` equals the segment's seq, but a
+//!    run can be published under a different id (`publish_dir_run_v1` increments
+//!    on a path collision) and higher-level runs merge extents across segments,
+//!    so a run outlives the segment it names. Comparing the manifest against
+//!    `segments/` cannot see this: the segment is already out of the manifest
+//!    and only the directory still names it, so class (1) reports **healthy**
+//!    while every write fails.
 //!
 //! Repair is an append, never a rewrite: the removals go on the end of the
-//! manifest log as `RemoveSegment` tombstones, so no existing record or checksum
-//! is touched and the worst case of a bad run is the state the shard is already
-//! in. See ExecPlan `crux-erasure-manifest-repair-2026-08-08`.
+//! manifest log as `RemoveSegment` / `RemoveDirRun` tombstones, so no existing
+//! record or checksum is touched and the worst case of a bad run is the state
+//! the shard is already in. A run that names live segments as well is reported
+//! and left alone — its live extents are how those streams resolve, so dropping
+//! it would trade a wedged shard for a lossy one. See ExecPlan
+//! `crux-erasure-manifest-repair-2026-08-08`.
 
 use std::path::{Path, PathBuf};
 
-use corecrux_storage::{load_manifest_segment_catalog, retire_segments_in_manifest};
+use corecrux_storage::{
+    find_dangling_dir_runs, load_manifest_segment_catalog, retire_dir_runs_in_manifest, retire_segments_in_manifest,
+};
 use serde::Serialize;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
@@ -41,6 +58,26 @@ pub struct DanglingSegment {
     pub relative_path: String,
 }
 
+/// A directory run naming segments the manifest no longer carries.
+///
+/// The mirror-image of [`DanglingSegment`] and invisible to the segment scan:
+/// here the *segment* is already out of the manifest and only the directory
+/// still names it, so a manifest-vs-`segments/` comparison reports the shard
+/// healthy while every write fails.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DanglingDirRun {
+    pub shard_id: u32,
+    pub level: u32,
+    pub run_id: u64,
+    pub relative_path: String,
+    pub absent_segment_seqs: Vec<u64>,
+    /// Only wholly-absent runs are retired. A run that also names live segments
+    /// carries the directory entries those streams resolve through, so dropping
+    /// it would trade a wedged shard for a lossy one — upgrade the daemon
+    /// instead (it skips the stale extent in place).
+    pub wholly_absent: bool,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ShardRepairReport {
     pub shard_id: u32,
@@ -49,9 +86,14 @@ pub struct ShardRepairReport {
     /// Of those, how many are missing from disk.
     pub dangling: usize,
     pub dangling_segments: Vec<DanglingSegment>,
+    /// Directory runs naming segments the MANIFEST has already retired.
+    pub dangling_dir_runs: Vec<DanglingDirRun>,
+    /// Of those, how many name live segments too and so were left alone.
+    pub dir_runs_retained_mixed: usize,
     pub manifest_end_before: u64,
     pub manifest_end_after: u64,
     pub retired: Vec<u64>,
+    pub retired_dir_runs: Vec<u64>,
     pub applied: bool,
 }
 
@@ -60,7 +102,9 @@ pub struct RepairManifestReport {
     pub schema: String,
     pub data_dir: String,
     pub applied: bool,
-    /// True when every scanned shard's manifest agrees with its `segments/` dir.
+    /// True when every scanned shard's manifest agrees with its `segments/` dir
+    /// **and** no directory run names a segment the manifest has retired. Both
+    /// halves wedge writes, and only the first is visible to a segment scan.
     pub healthy: bool,
     pub shards: Vec<ShardRepairReport>,
 }
@@ -91,7 +135,7 @@ pub fn repair_manifest(opts: &RepairManifestOptions) -> Result<RepairManifestRep
         schema: REPAIR_SCHEMA_V1.to_string(),
         data_dir: opts.data_dir.display().to_string(),
         applied: opts.apply,
-        healthy: shards.iter().all(|s| s.dangling == 0),
+        healthy: shards.iter().all(|s| s.dangling == 0 && s.dangling_dir_runs.is_empty()),
         shards,
     })
 }
@@ -112,6 +156,19 @@ fn repair_one_shard(shards_root: &Path, shard_id: u32, apply: bool) -> Result<Sh
         });
     }
 
+    let dir_runs: Vec<DanglingDirRun> = find_dangling_dir_runs(&shard_dir)?
+        .into_iter()
+        .map(|r| DanglingDirRun {
+            shard_id,
+            level: r.level,
+            run_id: r.run_id,
+            relative_path: r.relative_path,
+            absent_segment_seqs: r.absent_segment_seqs,
+            wholly_absent: r.wholly_absent,
+        })
+        .collect();
+    let dir_runs_retained_mixed = dir_runs.iter().filter(|r| !r.wholly_absent).count();
+
     let mut report = ShardRepairReport {
         shard_id,
         manifest_segments: catalog.segments.len(),
@@ -119,18 +176,35 @@ fn repair_one_shard(shards_root: &Path, shard_id: u32, apply: bool) -> Result<Sh
         manifest_end_before: catalog.manifest_end,
         manifest_end_after: catalog.manifest_end,
         retired: Vec::new(),
+        retired_dir_runs: Vec::new(),
         applied: false,
         dangling_segments,
+        dangling_dir_runs: dir_runs,
+        dir_runs_retained_mixed,
     };
 
-    if !apply || report.dangling == 0 {
+    let retirable: Vec<(u32, u64)> = report
+        .dangling_dir_runs
+        .iter()
+        .filter(|r| r.wholly_absent)
+        .map(|r| (r.level, r.run_id))
+        .collect();
+
+    if !apply || (report.dangling == 0 && retirable.is_empty()) {
         return Ok(report);
     }
 
-    let seqs: Vec<u64> = report.dangling_segments.iter().map(|d| d.segment_seq).collect();
-    let outcome = retire_segments_in_manifest(shards_root, shard_id, &seqs)?;
-    report.manifest_end_after = outcome.manifest_end;
-    report.retired = outcome.retired;
+    if report.dangling > 0 {
+        let seqs: Vec<u64> = report.dangling_segments.iter().map(|d| d.segment_seq).collect();
+        let outcome = retire_segments_in_manifest(shards_root, shard_id, &seqs)?;
+        report.manifest_end_after = outcome.manifest_end;
+        report.retired = outcome.retired;
+    }
+    if !retirable.is_empty() {
+        let outcome = retire_dir_runs_in_manifest(shards_root, shard_id, &retirable)?;
+        report.manifest_end_after = outcome.manifest_end;
+        report.retired_dir_runs = outcome.retired.into_iter().map(|(_, run_id)| run_id).collect();
+    }
     report.applied = true;
     Ok(report)
 }
@@ -215,6 +289,109 @@ mod tests {
             shard: Some(0),
             apply,
         }
+    }
+
+    /// Build a shard whose segment 2 run is displaced off `run_id == seq`, the
+    /// way a leftover `directory/` file does in production.
+    fn build_shard_with_displaced_dir_run(root: &Path) {
+        use corecrux_storage::{AppendEventInput, ShardStorage, ShardStorageOptions};
+        let options = ShardStorageOptions {
+            head_max_record_bytes: 0,
+            ..Default::default()
+        };
+        let mut storage = ShardStorage::open(root, 0, 1, options).unwrap();
+        let seal = |storage: &mut ShardStorage, i: u64| {
+            let stream_hash = corecrux_frame::stream_hash_xxhash64("t", "corpus", &format!("doc-{i}")).unwrap();
+            storage
+                .append_batch(
+                    stream_hash,
+                    0,
+                    "t",
+                    "corpus",
+                    &format!("doc-{i}"),
+                    "2026-01-01T00:00:00Z",
+                    &[AppendEventInput {
+                        event_id: &format!("evt-{i}"),
+                        occurred_at: "2026-01-01T00:00:00Z",
+                        event_type: "test.event",
+                        content_type: "text/plain",
+                        payload_bytes: b"hello",
+                    }],
+                )
+                .unwrap();
+            storage.force_seal_head().unwrap();
+        };
+        seal(&mut storage, 1);
+        // Planted after open, which sweeps unreferenced directory files away.
+        std::fs::write(
+            root.join("shard-0000")
+                .join("directory/dirrun-l0-r00000000000000000002.ccxdir"),
+            b"stray",
+        )
+        .unwrap();
+        seal(&mut storage, 2);
+    }
+
+    /// The class a segment scan cannot see: the segment is out of the manifest,
+    /// only the directory still names it. Before this, the report said healthy
+    /// while every write on the shard failed.
+    #[test]
+    fn a_dir_run_naming_a_retired_segment_is_reported_and_retired() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shards = tmp.path().join("shards");
+        build_shard_with_displaced_dir_run(&shards);
+        unlink_segment_group(&shards.join("shard-0000"), 2);
+        corecrux_storage::retire_segments_in_manifest(&shards, 0, &[2]).unwrap();
+
+        let report = repair_manifest(&opts(tmp.path(), false)).unwrap();
+        assert!(!report.healthy, "a run naming a retired segment is not healthy");
+        assert_eq!(report.shards[0].dangling, 0, "the segment scan alone sees nothing");
+        let runs = &report.shards[0].dangling_dir_runs;
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].absent_segment_seqs, vec![2]);
+        assert!(runs[0].wholly_absent);
+
+        let applied = repair_manifest(&opts(tmp.path(), true)).unwrap();
+        assert!(applied.shards[0].applied);
+        assert_eq!(applied.shards[0].retired_dir_runs, vec![3], "displaced onto run_id 3");
+        assert!(applied.shards[0].manifest_end_after > applied.shards[0].manifest_end_before);
+
+        let rescan = repair_manifest(&opts(tmp.path(), false)).unwrap();
+        assert!(rescan.healthy, "repair is idempotent and leaves the shard clean");
+    }
+
+    /// The shard is writable again after repair — the property the outage cost.
+    #[test]
+    fn repair_restores_writes_to_a_wedged_shard() {
+        use corecrux_storage::{AppendEventInput, ShardStorage, ShardStorageOptions};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shards = tmp.path().join("shards");
+        build_shard_with_displaced_dir_run(&shards);
+        unlink_segment_group(&shards.join("shard-0000"), 2);
+        corecrux_storage::retire_segments_in_manifest(&shards, 0, &[2]).unwrap();
+
+        repair_manifest(&opts(tmp.path(), true)).unwrap();
+
+        let mut storage = ShardStorage::open(&shards, 0, 1, ShardStorageOptions::default()).expect("open after repair");
+        let stream_hash = corecrux_frame::stream_hash_xxhash64("t", "corpus", "doc-after").unwrap();
+        storage
+            .append_batch(
+                stream_hash,
+                0,
+                "t",
+                "corpus",
+                "doc-after",
+                "2026-01-01T00:00:00Z",
+                &[AppendEventInput {
+                    event_id: "evt-after",
+                    occurred_at: "2026-01-01T00:00:00Z",
+                    event_type: "test.event",
+                    content_type: "text/plain",
+                    payload_bytes: b"hello",
+                }],
+            )
+            .expect("append after repair");
+        storage.force_seal_head().expect("seal after repair");
     }
 
     #[test]
