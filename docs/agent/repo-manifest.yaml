@@ -13,7 +13,7 @@ verify_commands:
   - cargo test --workspace
   - corecruxctl verify-store --strict   # per-segment BLAKE3 + chain walk
   - corecruxctl replay --strict         # recompute + compare
-  - cargo fuzz run segment_decode       # (nightly; one of 4 targets)
+  - cargo fuzz run segment_decode       # (nightly; one of 5 targets)
 
 docs:
   reading_order:
@@ -121,7 +121,7 @@ invariants:
     statement: exported context bundle is passport-signed; tampered component or signed field fails offline verification
     checked_by: tampered_signed_field_fails_signature
 
-fuzz_targets: [segment_decode, storage_scan_frames, receipt_verify_cbor, rcx_canonical_token]
+fuzz_targets: [segment_decode, storage_scan_frames, receipt_verify_cbor, rcx_canonical_token, escrow_recovery_code]
 
 # ---------------------------------------------------------------------------
 # CI ASSERTIONS — scripts/check-agent-docs.sh greps the tree for each of these.
@@ -261,3 +261,4 @@ ci_assertions:
     - storage_scan_frames
     - receipt_verify_cbor
     - rcx_canonical_token
+    - escrow_recovery_code

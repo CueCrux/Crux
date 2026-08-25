@@ -17,6 +17,7 @@ corecrux-receipts = { path = "../crates/corecrux-receipts" }
 corecrux-segment = { path = "../crates/corecrux-segment" }
 corecrux-storage = { path = "../crates/corecrux-storage", features = ["fuzzing"] }
 corecrux-types = { path = "../crates/corecrux-types" }
+crux-escrow = { path = "../crates/crux-escrow" }
 crux-session = { path = "../crates/crux-session" }
 rcx-capability-token = { path = "../crates/rcx-capability-token" }
 
@@ -44,6 +45,13 @@ bench = false
 [[bin]]
 name = "rcx_canonical_token"
 path = "fuzz_targets/rcx_canonical_token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "escrow_recovery_code"
+path = "fuzz_targets/escrow_recovery_code.rs"
 test = false
 doc = false
 bench = false

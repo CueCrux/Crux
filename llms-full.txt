@@ -252,7 +252,7 @@ Files are repo-relative; tests are named by their `fn`.
 | 6 | Capability tokens are verified against a trusted issuer key | `verify_token` (`verify_strict` against `trust_root_pubkey`), `validate_basic` | `crates/rcx-capability-token/src/lib.rs` | `strict_verify_rejects_tampered_token`, `strict_verify_rejects_wrong_trust_root` |
 | 7 | Memory updates are non-destructive and versioned (history retained) | `store` → `supersede_prior_version` → `mark_superseded` (predecessor marked, not deleted) | `crates/corecrux-memory/src/fact_store.rs` | `store_same_key_auto_supersedes_prior_version_in_recall`, `consolidate_facts_v1_supersedes_targets_without_deleting_history` |
 | 8 | Capability coverage is provable (no silent gaps) | `compute_coverage_report`, `compute_gaps` | `crates/crux-lens-features/src/analytics.rs` | `gaps_identifies_critical_no_tests_for_shipped`, `coverage_report_tallies_per_system` |
-| 9 | Untrusted bytes never panic the parsers | fuzz targets (libfuzzer) | `fuzz/fuzz_targets/` | `segment_decode`, `storage_scan_frames`, `receipt_verify_cbor`, `rcx_canonical_token` |
+| 9 | Untrusted bytes never panic the parsers | fuzz targets (libfuzzer) | `fuzz/fuzz_targets/` | `segment_decode`, `storage_scan_frames`, `receipt_verify_cbor`, `rcx_canonical_token`, `escrow_recovery_code` |
 | 10 | `.cruxpack` export excludes private/reserved/deleted facts by default, and a pack carrying deleted facts fails verification | `CRUXPACK_SCHEMA_V1`, `build_manifest` (cruxpack) | `crates/corecrux-memory/src/cruxpack.rs` | `export_excludes_private_and_reserved_by_default`, `verify_rejects_pack_carrying_deleted_facts`, `valid_pack_verifies` |
 | 11 | Context export is a signed custody proof — any tampered component or signed field fails offline verification | `run_context_export`, `run_context_verify` | `crates/corecruxctl/src/export.rs` | `context_export_round_trips_and_is_a_signed_custody_proof`, `tampered_component_fails_verification`, `tampered_signed_field_fails_signature` |
 | 12 | Usage receipts carry metadata only (never content) and sign/verify round-trip | `usage_receipt_v1` module | `crates/corecrux-receipts/src/usage_receipt_v1.rs` | `body_carries_only_metadata`, `build_sign_verify_round_trip`, `assert_kind_rejects_content_bearing_body` |
@@ -536,7 +536,7 @@ verify_commands:
   - cargo test --workspace
   - corecruxctl verify-store --strict   # per-segment BLAKE3 + chain walk
   - corecruxctl replay --strict         # recompute + compare
-  - cargo fuzz run segment_decode       # (nightly; one of 4 targets)
+  - cargo fuzz run segment_decode       # (nightly; one of 5 targets)
 
 docs:
   reading_order:
@@ -644,7 +644,7 @@ invariants:
     statement: exported context bundle is passport-signed; tampered component or signed field fails offline verification
     checked_by: tampered_signed_field_fails_signature
 
-fuzz_targets: [segment_decode, storage_scan_frames, receipt_verify_cbor, rcx_canonical_token]
+fuzz_targets: [segment_decode, storage_scan_frames, receipt_verify_cbor, rcx_canonical_token, escrow_recovery_code]
 
 # ---------------------------------------------------------------------------
 # CI ASSERTIONS — scripts/check-agent-docs.sh greps the tree for each of these.
@@ -784,6 +784,7 @@ ci_assertions:
     - storage_scan_frames
     - receipt_verify_cbor
     - rcx_canonical_token
+    - escrow_recovery_code
 
 # ============================================================
 # BEGIN docs/THREAT_MODEL.md
