@@ -1265,6 +1265,16 @@ pub(crate) fn router_with_route_auth(
             "/v1/extensions/{id}/outcomes",
             axum::routing::post(self::extensions::record_extension_outcome),
         )
+        // Buyer-fit M5 atomic-rollback seam: the install record's own
+        // version chain is the pin ledger; a rollback is one write.
+        .route(
+            "/v1/extensions/{id}/pins",
+            get(self::extensions::list_extension_pins),
+        )
+        .route(
+            "/v1/extensions/{id}/rollback",
+            axum::routing::post(self::extensions::rollback_extension),
+        )
         // Storybook readout — Phase 3 of the context graph.
         .route(
             "/v1/projects/{id}/storybook",

@@ -905,6 +905,112 @@ pub(super) async fn invoke_extension_tool(
     }
 }
 
+// ── Atomic rollback (buyer-fit M5 frontier seam) ─────────────────────────
+
+/// `GET /v1/extensions/{id}/pins` — every restorable point in this pack's
+/// history, oldest first.
+///
+/// The ledger is the install record's own supersession chain, so it cannot
+/// drift from what was actually installed.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn list_extension_pins(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    let store = state.fact_store.read().await;
+    let pins = crate::pack_rollback::list_pins(&store, &id);
+    drop(store);
+    if pins.is_empty() {
+        return problem_response(
+            StatusCode::NOT_FOUND,
+            format!("extension '{id}' has no install history"),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "schema": "crux.extensions.pins.v1",
+            "extension_id": id,
+            "count": pins.len(),
+            "pins": pins,
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct RollbackBody {
+    #[serde(default)]
+    pub target: crate::pack_rollback::RollbackTarget,
+    /// Required. A rollback with no reason records that a pack's bytes
+    /// changed and nothing about why.
+    pub reason: String,
+    /// State to restore into. Omit to restore the pin's own recorded state.
+    #[serde(default)]
+    pub lifecycle: Option<crate::pack_lifecycle::PackLifecycleState>,
+}
+
+/// `POST /v1/extensions/{id}/rollback` — atomically restore a pinned prior
+/// build.
+///
+/// The restore half of `proof-carrying-adaptive-packs-2026-07-13` M4:
+/// quarantine the regressing version, restore the previous pin. One write,
+/// so there is no partial pack state; idempotent, so an automatic responder
+/// that retries changes nothing the second time.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn rollback_extension(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<RollbackBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
+        return problem.into_response();
+    }
+    let actor = extract_passport_id(&headers);
+    let mut store = state.fact_store.write().await;
+    let result = crate::pack_rollback::rollback(
+        &mut store,
+        &state.data_dir,
+        &id,
+        crate::pack_rollback::RollbackInput {
+            target: body.target,
+            reason: body.reason,
+            actor,
+            lifecycle: body.lifecycle,
+            now_unix_ms: now_unix_ms(),
+        },
+    );
+    drop(store);
+    match result {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "schema": "crux.extensions.rollback.v1",
+                "rollback": outcome,
+            })),
+        )
+            .into_response(),
+        Err(crate::pack_rollback::RollbackError::NotFound(_)) => {
+            problem_response(StatusCode::NOT_FOUND, format!("extension '{id}' not installed"))
+        }
+        Err(err @ crate::pack_rollback::RollbackError::TargetNotFound(_)) => {
+            problem_response(StatusCode::NOT_FOUND, err.to_string())
+        }
+        Err(err @ crate::pack_rollback::RollbackError::ReasonRequired) => {
+            problem_response(StatusCode::UNPROCESSABLE_ENTITY, err.to_string())
+        }
+        Err(err @ crate::pack_rollback::RollbackError::NoPriorPin(_)) => {
+            problem_response(StatusCode::CONFLICT, err.to_string())
+        }
+        Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
 // ── Outcome events (buyer-fit M5 frontier seam) ──────────────────────────
 
 /// `GET /v1/extensions/{id}/outcomes` — what became of this pack's writes,
