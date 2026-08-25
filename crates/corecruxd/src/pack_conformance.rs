@@ -51,6 +51,11 @@ pub const CONFORMANCE_RUN_SCHEMA: &str = "crux.pack.conformance_run.v1";
 /// audit of declared behaviour, not a load generator: each case is a real
 /// outbound call, so an unbounded list would turn this route into an
 /// amplifier pointed at the pack's endpoint.
+///
+/// Pinned equal to `crux_integrations::conformance::MAX_DECLARED_CASES` by
+/// `declared_case_cap_matches_the_run_cap`: a corpus a manifest may declare
+/// but this hook would refuse to run is a declaration that could never be
+/// proved.
 pub const MAX_CASES_PER_RUN: usize = 64;
 
 /// One declared operation to replay.
@@ -201,15 +206,30 @@ pub fn precheck(
     Ok(())
 }
 
-/// Default corpus when the caller supplies none: one case per tool the
-/// manifest declares, called with empty args.
+/// Default corpus when the caller supplies none.
 ///
-/// This is what makes the hook usable today, before
-/// `proof-carrying-adaptive-packs` M0 adds a `pack.conformance.v1` block
-/// carrying a real corpus reference. It is a floor, not a substitute: empty
-/// args exercise a tool's existence and its write scope, not its behaviour
-/// on realistic input. The M0 manifest block plugs in exactly here.
+/// A pack that ships a `pack.conformance.v1` block (`proof-carrying-adaptive-packs`
+/// M0) has already declared, under its publisher's signature, which operations
+/// it wants replayed and with what arguments — so those are the cases, and a
+/// replay of a declaring pack is a replay of what it promised rather than of
+/// whatever the caller felt like sending.
+///
+/// Without a block, the floor: one case per declared tool, called with empty
+/// args. That is a floor and not a substitute — empty args exercise a tool's
+/// existence and its write scope, not its behaviour on realistic input.
 pub fn cases_from_manifest(manifest: &IntegrationManifest) -> Vec<ConformanceCase> {
+    if let Some(declaration) = &manifest.conformance {
+        return declaration
+            .replay_corpus
+            .cases
+            .iter()
+            .map(|case| ConformanceCase {
+                case_id: case.case_id.clone(),
+                tool_name: case.tool_name.clone(),
+                args: case.args.clone(),
+            })
+            .collect();
+    }
     manifest
         .tools
         .iter()
@@ -219,6 +239,20 @@ pub fn cases_from_manifest(manifest: &IntegrationManifest) -> Vec<ConformanceCas
             args: serde_json::json!({}),
         })
         .collect()
+}
+
+/// The corpus a pack declares, if it declares one.
+///
+/// Used to default the run's `corpus_id`. A declared corpus is signed and
+/// content-addressed, which makes it a better name for the run than one the
+/// caller typed — and it means an operator replaying a declaring pack cannot
+/// accidentally file the result under the wrong corpus, which is the one
+/// misattribution that is not recoverable after the fact.
+pub fn corpus_id_from_manifest(manifest: &IntegrationManifest) -> Option<&str> {
+    manifest
+        .conformance
+        .as_ref()
+        .map(|declaration| declaration.replay_corpus.corpus_id.as_str())
 }
 
 /// BLAKE3 over the canonical JSON of one operation's result payload.
@@ -609,6 +643,7 @@ mod tests {
             wasm_module_path: None,
             wasm_module_url: None,
             wasm_module_sha256: None,
+            conformance: None,
         };
         assert!(cases_from_manifest(&manifest).is_empty());
 
@@ -628,5 +663,96 @@ mod tests {
         let second: serde_json::Value = serde_json::from_str(r#"{"b":{"x":3,"y":2},"a":1}"#).expect("json");
         assert_eq!(result_hash(&first).0, result_hash(&second).0);
         assert_ne!(result_hash(&first).0, result_hash(&serde_json::json!({"a": 2})).0);
+    }
+
+    // ── pack.conformance.v1 (proof-carrying-adaptive-packs M0) ───────────
+
+    /// A manifest may not declare a corpus larger than one run will execute.
+    /// Two constants in two crates drift silently; this is the pin.
+    #[test]
+    fn declared_case_cap_matches_the_run_cap() {
+        assert_eq!(crux_integrations::conformance::MAX_DECLARED_CASES, MAX_CASES_PER_RUN);
+    }
+
+    fn reference_pack_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../integrations/community/ext.conformance.reference/0.2.0/manifest.json")
+    }
+
+    fn read_reference_pack() -> IntegrationManifest {
+        let path = reference_pack_path();
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        serde_json::from_str(&text).unwrap_or_else(|err| panic!("parse {}: {err}", path.display()))
+    }
+
+    /// The M0 gate, from the daemon's side: the committed reference pack
+    /// parses through the daemon's own manifest type and its signature
+    /// verifies over the bytes that include the conformance declaration.
+    #[test]
+    fn daemon_parses_and_signature_checks_the_reference_pack() {
+        let manifest = read_reference_pack();
+        let mut policy = crux_integrations::ValidationPolicy {
+            allow_unsigned_first_party: false,
+            allow_unsigned: false,
+            ..crux_integrations::ValidationPolicy::default()
+        };
+        let signature = manifest.signature.as_ref().expect("the reference pack must be signed");
+        let public_key_hex = signature
+            .public_key_hex
+            .as_ref()
+            .expect("the reference pack must carry its inline signing key");
+        policy
+            .trusted_public_keys
+            .insert(signature.passport_fpr.clone(), public_key_hex.clone());
+        manifest.validate(&policy).expect("reference pack must validate");
+
+        let declaration = manifest.conformance.as_ref().expect("declaration");
+        assert_eq!(declaration.schema, crux_integrations::PACK_CONFORMANCE_SCHEMA_V1);
+        assert_eq!(
+            corpus_id_from_manifest(&manifest),
+            Some(declaration.replay_corpus.corpus_id.as_str())
+        );
+    }
+
+    /// The hook replays what the pack declared, not one empty-args call per
+    /// tool. A declaring pack whose replay ignored its own corpus would be
+    /// proved against operations it never promised.
+    #[test]
+    fn a_declared_corpus_supplies_the_cases() {
+        let manifest = read_reference_pack();
+        let declaration = manifest.conformance.as_ref().expect("declaration");
+        let cases = cases_from_manifest(&manifest);
+
+        assert_eq!(cases.len(), declaration.replay_corpus.cases.len());
+        assert_ne!(
+            cases.len(),
+            manifest.tools.len(),
+            "the reference corpus must exercise a tool more than once, or this test cannot tell the two sources apart"
+        );
+        for (case, declared) in cases.iter().zip(&declaration.replay_corpus.cases) {
+            assert_eq!(case.case_id, declared.case_id);
+            assert_eq!(case.tool_name, declared.tool_name);
+            assert_eq!(case.args, declared.args);
+        }
+        assert!(
+            cases.iter().any(|case| case.args != serde_json::json!({})),
+            "the declared corpus must carry real arguments, which the empty-args floor never does"
+        );
+
+        // Strip the declaration and the floor comes back.
+        let mut without = manifest.clone();
+        without.conformance = None;
+        let floor = cases_from_manifest(&without);
+        assert_eq!(floor.len(), without.tools.len());
+        assert!(floor.iter().all(|case| case.args == serde_json::json!({})));
+    }
+
+    /// A declared corpus is still a corpus the hook agrees to run.
+    #[test]
+    fn the_declared_corpus_passes_precheck() {
+        let manifest = read_reference_pack();
+        let cases = cases_from_manifest(&manifest);
+        let corpus_id = corpus_id_from_manifest(&manifest).unwrap_or_default();
+        precheck(&manifest.id, PackLifecycleState::Staged, corpus_id, &cases).expect("declared corpus must precheck");
     }
 }

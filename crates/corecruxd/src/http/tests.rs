@@ -19795,6 +19795,7 @@ fn build_signed_manifest(
         wasm_module_path: None,
         wasm_module_url: None,
         wasm_module_sha256: None,
+        conformance: None,
     };
     sign_manifest(&mut manifest, signing_key, publisher_fpr).expect("sign");
     manifest
@@ -20106,6 +20107,7 @@ async fn extensions_register_unsigned_returns_400_with_dev_hint() {
         wasm_module_path: None,
         wasm_module_url: None,
         wasm_module_sha256: None,
+        conformance: None,
     };
     let resp = super::extensions::register_extension(
         State(state),
@@ -20554,6 +20556,7 @@ async fn wasm_install_then_invoke_returns_module_result() {
         wasm_module_path: Some("extension.wasm".to_string()),
         wasm_module_url: None,
         wasm_module_sha256: Some(module_sha),
+        conformance: None,
     };
     sign_manifest(&mut manifest, &signing_key, &publisher_fpr).expect("sign");
 
@@ -20666,6 +20669,7 @@ async fn wasm_invoke_with_sha_mismatch_returns_409() {
         wasm_module_path: Some("extension.wasm".to_string()),
         wasm_module_url: None,
         wasm_module_sha256: Some(bogus_sha),
+        conformance: None,
     };
     sign_manifest(&mut manifest, &signing_key, &publisher_fpr).expect("sign");
 
@@ -22904,6 +22908,7 @@ fn build_studio_pack(
         wasm_module_path: None,
         wasm_module_url: None,
         wasm_module_sha256: None,
+        conformance: None,
     };
     manifest.hashes.bundle = Some(bundle_hash.clone());
     match signing_key {

@@ -1,0 +1,402 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuecrux.com/spec/pack.conformance.v1.schema.json",
+  "title": "pack.conformance.v1",
+  "description": "Signed conformance declaration carried inside a crux.integration.v1 pack manifest: what the pack claims to do, the corpus its declared operations are replayed against, the invariants that must hold, the numeric envelope its behaviour must stay inside, and what upgrading to or rolling back from it costs.",
+  "$comment": "Copyright (c) 2026 CueCrux Ltd. SPDX-License-Identifier: MIT. This schema document is published under the MIT Licence so it can be implemented and vendored freely; the full notice is in docs/spec/pack-conformance-v1.md. The Crux daemon that enforces it remains Apache-2.0.",
+  "license": {
+    "spdx": "MIT",
+    "url": "https://opensource.org/licenses/MIT",
+    "notice": "docs/spec/pack-conformance-v1.md#licence"
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "claimed_capabilities",
+    "expected_mutations",
+    "replay_corpus",
+    "invariants",
+    "envelope",
+    "compatibility"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "pack.conformance.v1"
+    },
+    "claimed_capabilities": {
+      "type": "array",
+      "description": "Must equal the manifest's declared capability set.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "expected_mutations": {
+      "$ref": "#/$defs/expected_mutations"
+    },
+    "replay_corpus": {
+      "$ref": "#/$defs/replay_corpus"
+    },
+    "invariants": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/invariant_test"
+      }
+    },
+    "envelope": {
+      "$ref": "#/$defs/behavioural_envelope"
+    },
+    "compatibility": {
+      "$ref": "#/$defs/compatibility_assertions"
+    }
+  },
+  "$defs": {
+    "expected_mutations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "facts",
+        "receipts"
+      ],
+      "properties": {
+        "facts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/expected_fact_mutation"
+          }
+        },
+        "receipts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/expected_receipt_mutation"
+          }
+        }
+      }
+    },
+    "expected_fact_mutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entity_prefix",
+        "keys",
+        "operation",
+        "private",
+        "max_per_call"
+      ],
+      "properties": {
+        "entity_prefix": {
+          "type": "string",
+          "minLength": 1
+        },
+        "keys": {
+          "type": "array",
+          "description": "Keys written under the prefix; empty means any key.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "write",
+            "supersede"
+          ]
+        },
+        "private": {
+          "type": "boolean"
+        },
+        "max_per_call": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "expected_receipt_mutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "receipt_kind",
+        "max_per_call"
+      ],
+      "properties": {
+        "receipt_kind": {
+          "type": "string",
+          "enum": [
+            "dispatch",
+            "fact_write",
+            "supersession"
+          ]
+        },
+        "max_per_call": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "replay_corpus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "corpus_id",
+        "path",
+        "sha256",
+        "cases"
+      ],
+      "properties": {
+        "corpus_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Operator-readable corpus name. Mandatory: a behavioural number whose corpus is unnamed cannot be compared to a later one."
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Relative to the pack directory."
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "cases": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/declared_case"
+          }
+        }
+      }
+    },
+    "declared_case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "tool_name",
+        "args"
+      ],
+      "properties": {
+        "case_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tool_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "args": {
+          "description": "Arguments passed to the tool; any JSON value."
+        }
+      }
+    },
+    "invariant_test": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "description",
+        "kind",
+        "applies_to_cases"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "no_undeclared_fact_writes",
+            "no_private_fact_access",
+            "no_undeclared_capability_use",
+            "no_egress_outside_allowlist",
+            "deterministic_replay",
+            "reversible_writes",
+            "no_new_contradictions"
+          ]
+        },
+        "applies_to_cases": {
+          "type": "array",
+          "description": "Case ids this applies to; empty means every declared case.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "behavioural_envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Every bound is an integer: JSON has no canonical form for a float, and this block is signed.",
+      "required": [
+        "max_tokens_per_call",
+        "max_tokens_per_run",
+        "max_latency_ms_per_call",
+        "max_latency_ms_per_run",
+        "max_response_bytes_per_call",
+        "max_fact_writes_per_call",
+        "decay",
+        "max_contradiction_rate_ppm",
+        "undo"
+      ],
+      "properties": {
+        "max_tokens_per_call": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_tokens_per_run": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_latency_ms_per_call": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_latency_ms_per_run": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_response_bytes_per_call": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_fact_writes_per_call": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "decay": {
+          "$ref": "#/$defs/decay_envelope"
+        },
+        "max_contradiction_rate_ppm": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000,
+          "description": "Contradictions the pack may introduce, per million facts written."
+        },
+        "undo": {
+          "$ref": "#/$defs/undo_envelope"
+        }
+      }
+    },
+    "decay_envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "min_half_life_seconds",
+        "max_refreshes_per_call"
+      ],
+      "properties": {
+        "min_half_life_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Zero is only valid for a pack that writes no facts."
+        },
+        "max_refreshes_per_call": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "undo_envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_operations_per_call",
+        "max_latency_ms"
+      ],
+      "properties": {
+        "max_operations_per_call": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Non-zero exactly when the pack declares fact writes."
+        },
+        "max_latency_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "compatibility_assertions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "min_daemon_version",
+        "manifest_schema",
+        "supersedes",
+        "migrations",
+        "rollback_safe"
+      ],
+      "properties": {
+        "min_daemon_version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "manifest_schema": {
+          "type": "string",
+          "const": "crux.integration.v1"
+        },
+        "supersedes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "migrations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/migration_assertion"
+          }
+        },
+        "rollback_safe": {
+          "type": "boolean"
+        }
+      }
+    },
+    "migration_assertion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "from_version",
+        "to_version",
+        "kind",
+        "reversible",
+        "description"
+      ],
+      "properties": {
+        "from_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "to_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "none",
+            "supersede_facts",
+            "rekey_entities",
+            "reindex"
+          ]
+        },
+        "reversible": {
+          "type": "boolean"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

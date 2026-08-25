@@ -25,6 +25,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# The conformance reference pack content-addresses its replay corpus with
+# SHA-256 (the digest form `pack.conformance.v1` declares), so the regen
+# writer and the drift test both need a SHA-2 implementation.
+sha2 = { workspace = true }
 # The community_packs test regenerates + signs the example Studio pack.
 blake3 = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["std", "rand_core"] }

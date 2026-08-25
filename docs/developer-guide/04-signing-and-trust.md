@@ -30,8 +30,11 @@ Fingerprint helper: `fingerprint_from_public_key` returns
 The payload is `ManifestSigningPayload`
 ([lib.rs:466](../../crates/crux-integrations/src/lib.rs#L466)) — `schema`, `id`, `name`,
 `version`, `publisher_passport_fpr`, `summary`, `entry`, `capabilities`,
-`network`, `data_access`, `safety`. Serialised with `serde_json::to_vec`, in
-struct-declaration order.
+`network`, `data_access`, `safety`, and `conformance` when the pack ships a
+[`pack.conformance.v1`](../spec/pack-conformance-v1.md) declaration. Serialised
+with `serde_json::to_vec`, in struct-declaration order; `conformance` is last
+and omitted when absent, so manifests signed before the block existed produce
+byte-identical payloads.
 
 `external_tool_endpoint`, `tools[]`, `wasm_module_*`, `hashes` and `signature`
 itself are **outside** the signature. See §2.4 for what that means in practice
