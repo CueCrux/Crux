@@ -8445,6 +8445,12 @@ fn runtime_capability_profile_env() -> [EnvVarGuard; 6] {
 fn full_runtime_capability_state() -> AppState {
     let mut state = test_app_state(16);
     state.operating_mode = crate::product::OperatingMode::ProHybrid;
+    // `sync:mirror` is deliberately still here after the 2026-08-25 M5
+    // withdrawal. This field is the *raw configured* list, and
+    // `RuntimeCapabilityDescriptor::from_runtime` reads it raw
+    // (`product.rs` `sync_enabled`) — so the string remains the operator's
+    // switch for hosted sync even though it is no longer a sold claim. Do not
+    // "tidy" it out; that would stop exercising the switch.
     state.enabled_pro_services = vec!["gpu1:rerank".to_string(), "sync:mirror".to_string()];
     state
 }
@@ -8845,6 +8851,8 @@ async fn version_endpoint_reports_degraded_sync_when_remote_is_incomplete() {
 
     let mut state = test_app_state(16);
     state.operating_mode = crate::product::OperatingMode::ProHybrid;
+    // Raw configured list — still the hosted-sync switch after the M5
+    // withdrawal; see `full_runtime_capability_state`.
     state.enabled_pro_services = vec!["sync:mirror".to_string()];
     let resp = get_version(State(state)).await.into_response();
     assert_eq!(resp.status(), StatusCode::OK);

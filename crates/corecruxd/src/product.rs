@@ -103,8 +103,6 @@ pub const PRO_CAPABILITY_CLAIMS: &[&str] = &[
     "gpu1:enrich",
     "gpu1:coverage",
     "gpu1:developer",
-    "sync:mirror",
-    "sync:promote",
     "sync:managed_backup",
     "replay:answer",
     "agent_brief:pro",
@@ -125,10 +123,8 @@ pub const PRO_CAPABILITY_CLAIMS: &[&str] = &[
     "enrichers:first_party",
     "enrichers:custom",
     "materiality:custom",
-    "console:workbench",
     "control_plane:hosted",
     "credits:pooled",
-    "tenant:business_offboarding",
 ];
 
 pub const DAEMON_IMPLEMENTED_PRO_CLAIMS: &[&str] = &[
@@ -137,8 +133,6 @@ pub const DAEMON_IMPLEMENTED_PRO_CLAIMS: &[&str] = &[
     "gpu1:enrich",
     "gpu1:coverage",
     "gpu1:developer",
-    "sync:mirror",
-    "sync:promote",
     "replay:answer",
     "agent_brief:pro",
     "context_pack:budgeted",
@@ -150,8 +144,6 @@ pub const DAEMON_IMPLEMENTED_PRO_CLAIMS: &[&str] = &[
     "api_drift:check",
     "policy:simulate",
     "enrichers:first_party",
-    "console:workbench",
-    "tenant:business_offboarding",
 ];
 
 /// Where each [`DAEMON_IMPLEMENTED_PRO_CLAIMS`] entry is actually enforced.
@@ -166,33 +158,50 @@ pub const DAEMON_IMPLEMENTED_PRO_CLAIMS: &[&str] = &[
 /// `daemon_implemented_pro_claims_have_a_gate_site` fails the build if the two
 /// lists drift apart in either direction.
 ///
-/// `None` means **this claim string gates nothing** — no handler consults it,
-/// so enabling or withholding the claim changes no daemon behaviour. It does
-/// *not* mean the capability is absent, and reading it that way is how the M4
-/// vow audit came within one ruling of withdrawing three working products from
-/// sale. Three of the four `None` rows below are routed, handled and backed;
-/// they are authorized by `require_sync_read` / `require_sync_write`
+/// Every row is `Some`, and since the M5 ruling below that is an invariant:
+/// `every_daemon_claim_names_its_gate_site` fails the build on the first
+/// `None`. Do not add one to make a new claim compile. `None` means **this
+/// claim string gates nothing** — no handler consults it, so enabling or
+/// withholding it changes no daemon behaviour — and a capability in that state
+/// is not sold here.
+///
+/// ## The 2026-08-25 ruling
+///
+/// The M4 vow audit left four `None` rows — `sync:mirror`, `sync:promote`,
+/// `console:workbench` and `tenant:business_offboarding` — sold in
+/// `PRO_CAPABILITY_CLAIMS` and enforced nowhere. Three of them were routed,
+/// handled and backed, authorized by `require_sync_read` / `require_sync_write`
 /// (`http/sync.rs:409` / `:426`), which check scopes and peer identity and have
-/// never looked at a claim string. Each row names its `route -> handler ->
-/// backing logic` so the next reader does not have to re-derive that. The
-/// defect they record is **registration, not absence**: the remedy is to wire
-/// the name to the route it already has, never to withdraw the capability.
+/// never looked at a claim string; `console:workbench` had no route at all.
 ///
-/// Do not add a `None` row to make a new claim compile. The four below are
-/// recorded findings awaiting the M5 human gate, not a pattern to follow —
-/// and note the `ledger:history` trap above: dropping one from
+/// The M5 human gate ruled on 2026-08-25: **a capability enforced nowhere is
+/// withdrawn from sale, not wired up.** All four left `PRO_CAPABILITY_CLAIMS`
+/// and `DAEMON_IMPLEMENTED_PRO_CLAIMS` together — ExecPlan
+/// `crux-hosted-admission-boundary-2026-08-03` M5 — following the two standing
+/// precedents rather than inventing a third answer: `code_intel_multi_repo`
+/// withdrawn 2026-08-03 (WebCrux #69, Crux #622 `f299c9bd`), then
+/// `code_intel_release_diff`, `code_intel_retention_90d`/`_365d` and
+/// `code_intel_evidence_pack` on 2026-08-06 (WebCrux #71 `39e19287`). This
+/// settles the open question in ExecPlan
+/// `crux-claim-wiring-and-hosted-tier-closure-2026-08-07` M2, which proposed
+/// the other branch — binding `console:workbench` to its nine members.
+///
+/// Withdrawal changes what is **sold**, not what the daemon **does**. The sync
+/// routes still serve, and `sync_enabled` still reads the raw
+/// `configured_pro_services` list, so background sync is untouched. Only the
+/// `/v1/version` posture stops advertising four capabilities that nothing would
+/// have refused.
+///
+/// Re-selling one means landing its gate in the same change: two array entries
+/// plus a `Some` row here. Note the `ledger:history` trap above — the two
+/// arrays are edited together or not at all, because dropping a claim from
 /// `DAEMON_IMPLEMENTED_PRO_CLAIMS` alone re-labels it `contracted_external`,
-/// asserting an outside implementer that does not exist. They leave both lists
-/// together or not at all.
+/// asserting an outside implementer that does not exist.
 ///
-/// The classification behind the twenty claims declared daemon-implemented,
+/// The classification behind the sixteen claims declared daemon-implemented,
 /// for the record: five egress (the GPU-1 bridge, the only Pro handler that
-/// reaches the network), eleven are local compute that answers on a
-/// network-severed daemon, three (`sync:mirror`, `sync:promote`,
-/// `tenant:business_offboarding`) have a complete route and handler but no
-/// claim-string gate, and one (`console:workbench`) has neither — outside this
-/// file the string occurs nowhere in the repository at all, and inside it only
-/// in the two arrays, this table and the assertion below.
+/// reaches the network), and eleven local compute that answers on a
+/// network-severed daemon.
 #[cfg(test)]
 const DAEMON_CLAIM_GATE_SITES: &[(&str, Option<&str>)] = &[
     ("gpu1:answer", Some("http/gpu1.rs:800 service_enabled")),
@@ -220,48 +229,6 @@ const DAEMON_CLAIM_GATE_SITES: &[(&str, Option<&str>)] = &[
     ("api_drift:check", Some("http/workbench.rs:877 require_surface_enabled")),
     ("policy:simulate", Some("http/workbench.rs:877 require_surface_enabled")),
     ("enrichers:first_party", Some("http/actions.rs:59")),
-    // M4 findings. `None` here records a missing claim-string gate, not a
-    // missing implementation — see the doc comment above before acting on one.
-    //
-    // sync:mirror — routed, handled, backed. Read side only; the write side is
-    // the peer's, not ours.
-    //   GET  /v1/sync/tenants/{tenantId}/manifest                  http/mod.rs:825
-    //     -> http/sync.rs:442 get_tenant_manifest
-    //     -> corecrux-memory/src/sync.rs:257 build_tenant_manifest
-    //   GET  /v1/sync/tenants/{tenantId}/collections/{collection}   http/mod.rs:829
-    //     -> http/sync.rs:469 get_tenant_collection
-    //     -> corecrux-memory/src/sync.rs:295 tenant_collection_page
-    ("sync:mirror", None),
-    // sync:promote — routed, handled, backed. Two-phase: preview is a read,
-    // confirm is a write, and confirm re-derives the preview to check
-    // `confirm_hash` before it stores anything.
-    //   POST /v1/sync/tenants/{tenantId}/promotions/preview         http/mod.rs:833
-    //     -> http/sync.rs:496 post_promotion_preview
-    //   POST /v1/sync/tenants/{tenantId}/promotions/confirm         http/mod.rs:837
-    //     -> http/sync.rs:514 post_promotion_confirm
-    //     -> corecrux-memory/src/sync.rs:341 promotion_preview
-    ("sync:promote", None),
-    // console:workbench — the only genuine phantom of the four: no route, no
-    // handler, no backing logic. It reads as an umbrella over the workbench
-    // surfaces, which are individually gated at
-    // http/workbench.rs:877 require_surface_enabled, one claim per
-    // `WorkbenchSurface` variant (http/workbench.rs:32). Nine of those ten
-    // claims are already rows in this table; the tenth, `ledger:history`, is
-    // deliberately unsold — see the PRO_CAPABILITY_CLAIMS doc comment above.
-    // So the umbrella gates nothing that its members do not already gate.
-    // Bind it to the nine or retire it (both arrays together, per the
-    // `ledger:history` trap) — ExecPlan
-    // `crux-claim-wiring-and-hosted-tier-closure-2026-08-07` M2.
-    ("console:workbench", None),
-    // tenant:business_offboarding — routed, handled, backed, and it is the one
-    // of the four that destroys data, so a withdrawal ruling here is the
-    // expensive mistake. The handler wipes the tenant mirror, signs a wipe
-    // receipt and stores it under `__sync_wipe_receipt__::{tenantId}`.
-    //   POST /v1/sync/tenants/{tenantId}/offboard                   http/mod.rs:841
-    //     -> http/sync.rs:561 post_tenant_offboard
-    //     -> corecrux-memory/src/sync.rs:414 offboard_tenant_mirror
-    //     -> http/sync.rs:604 sign_wipe_receipt
-    ("tenant:business_offboarding", None),
 ];
 
 pub const HOSTED_CONTROL_PLANE_PRO_CLAIMS: &[&str] = &[
@@ -1688,14 +1655,14 @@ mod tests {
         }
     }
 
-    /// The four ungated claims are pinned by name so that fixing one is a
-    /// deliberate edit to this list rather than a silent drift, and so that a
-    /// *fifth* cannot appear unnoticed.
+    /// No sold Pro claim is enforced nowhere.
     ///
-    /// This asserts a known defect, not a desired state. It goes away at M5,
-    /// which is a human gate because it changes what is sold.
+    /// The inverse of the M4-era assertion this replaces, which pinned the four
+    /// ungated claims *as a known defect*. The M5 human gate ruled on
+    /// 2026-08-25 that a capability enforced nowhere is withdrawn from sale, so
+    /// the defect no longer has a home: every row names its gate.
     #[test]
-    fn the_only_ungated_daemon_claims_are_the_four_m4_found() {
+    fn every_daemon_claim_names_its_gate_site() {
         let ungated: Vec<&str> = DAEMON_CLAIM_GATE_SITES
             .iter()
             .filter_map(|(claim, gate)| gate.is_none().then_some(*claim))
@@ -1703,16 +1670,38 @@ mod tests {
 
         assert_eq!(
             ungated,
-            vec![
-                "sync:mirror",
-                "sync:promote",
-                "console:workbench",
-                "tenant:business_offboarding",
-            ],
-            "the set of sold-but-unenforced Pro claims changed. If you added one, don't — wire a \
-             gate. If you removed one, remove it from PRO_CAPABILITY_CLAIMS too (see the \
-             ledger:history note) and update this assertion."
+            Vec::<&str>::new(),
+            "these claims are sold as daemon-implemented but nothing refuses them. Land the gate \
+             and name its file:line, or withdraw the claim from PRO_CAPABILITY_CLAIMS and \
+             DAEMON_IMPLEMENTED_PRO_CLAIMS together (see the ledger:history note). A `None` row is \
+             not an option any more."
         );
+    }
+
+    /// The four claims the M5 gate withdrew stay withdrawn.
+    ///
+    /// Each had a place in both arrays and a gate in neither, which is exactly
+    /// the shape a well-meaning re-add takes. Landing a gate first is the only
+    /// way back in — and then this list shrinks in the same commit.
+    #[test]
+    fn the_m5_withdrawn_claims_are_not_sold() {
+        for claim in [
+            "sync:mirror",
+            "sync:promote",
+            "console:workbench",
+            "tenant:business_offboarding",
+        ] {
+            assert!(
+                !contains_claim(PRO_CAPABILITY_CLAIMS, claim),
+                "{claim} was withdrawn from sale by the 2026-08-25 M5 ruling (ExecPlan \
+                 crux-hosted-admission-boundary-2026-08-03); do not re-add it without a gate"
+            );
+            assert!(
+                !contains_claim(DAEMON_IMPLEMENTED_PRO_CLAIMS, claim),
+                "{claim} must leave both arrays together — in DAEMON_IMPLEMENTED_PRO_CLAIMS alone \
+                 it would report as contracted_external, asserting an implementer that does not exist"
+            );
+        }
     }
 
     #[test]
@@ -1739,6 +1728,9 @@ mod tests {
     fn pro_mode_enables_free_and_pro_but_not_max_claims() {
         let configured = vec![
             "gpu1:answer".to_string(),
+            "replay:answer".to_string(),
+            // withdrawn from sale at M5 — configured, but no longer sellable,
+            // so the filter must drop it like any other unknown string.
             "sync:mirror".to_string(),
             "gpu:onsite".to_string(),
             "unknown:service".to_string(),
@@ -1748,7 +1740,7 @@ mod tests {
         assert!(posture.enabled_capability_claims.contains(&"daemon:local"));
         assert!(posture.enabled_capability_claims.contains(&"gpu1:answer"));
         assert!(!posture.enabled_capability_claims.contains(&"gpu:onsite"));
-        assert_eq!(posture.enabled_pro_services, vec!["gpu1:answer", "sync:mirror"]);
+        assert_eq!(posture.enabled_pro_services, vec!["gpu1:answer", "replay:answer"]);
     }
 
     #[test]
