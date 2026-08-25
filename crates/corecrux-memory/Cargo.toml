@@ -17,6 +17,11 @@ dense-embed-model = ["dep:fastembed"]
 
 [dependencies]
 blake3 = { workspace = true }
+# The delegating embedder mints the credit quote the metered `/v1/compute/embed`
+# door requires. It reuses that door's own `PinnedCreditQuote` rather than
+# redeclaring the wire shape, so client and provider cannot drift. Adds no new
+# transitive dependency: corecrux-billing's own deps are already in this graph.
+corecrux-billing = { path = "../corecrux-billing" }
 crux-sync = { path = "../crux-sync" }
 ed25519-dalek = { workspace = true, features = ["std"] }
 hex = { workspace = true }
