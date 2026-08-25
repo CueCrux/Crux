@@ -1785,6 +1785,9 @@ impl ShardStorage {
     pub(crate) fn rebuild_directory_from_runs(&mut self) -> Result<HashSet<u64>> {
         let mut present_segments: HashSet<u64> = HashSet::new();
         let mut out: HashMap<u64, Vec<StreamSegmentRef>> = HashMap::new();
+        // Reset, not accumulate: `open` rebuilds more than once, and a running
+        // total across rebuilds would report a multiple of the real debris.
+        self.directory_extents_skipped = 0;
 
         let mut runs: Vec<DirRunMeta> = self.dir_runs.values().cloned().collect();
         runs.sort_by(|a, b| {
@@ -1836,11 +1839,16 @@ impl ShardStorage {
                     present_segments.insert(e.segment_seq);
                 }
             }
-            if retired_extents > 0 {
+            // `NonZeroUsize` rather than `> 0`: the count is also accumulated
+            // onto the shard below, so the only thing a comparison here decides
+            // is whether to log — which no test can observe, leaving a mutant
+            // with nowhere to die.
+            if let Some(count) = std::num::NonZeroUsize::new(retired_extents) {
+                self.directory_extents_skipped += count.get();
                 tracing::info!(
                     run_level = run.key.level,
                     run_id = run.key.run_id,
-                    retired_extents,
+                    retired_extents = count.get(),
                     "dirrun-extents-skipped: directory run names segments the manifest has retired"
                 );
             }

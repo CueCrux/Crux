@@ -1332,6 +1332,14 @@ pub struct ShardStorage {
     next_segment_seq: u64,
     next_head_commit_id: u64,
 
+    /// Directory extents skipped by the most recent directory rebuild because
+    /// the manifest has retired the segment they name.
+    ///
+    /// Kept rather than only logged so the skip is *observable*: it is the
+    /// difference between a shard that opened cleanly and one that opened by
+    /// stepping over post-erasure debris, and a test can assert which happened.
+    directory_extents_skipped: usize,
+
     head: Option<HeadSegment>,
 }
 
@@ -1934,6 +1942,7 @@ impl ShardStorage {
             epoch,
             paths,
             _lock_file: lock_file,
+            directory_extents_skipped: 0,
             manifest_end,
             manifest,
             segments_by_seq,

@@ -5476,6 +5476,147 @@ mod tests {
         storage.force_seal_head().expect("seal after reclaim");
     }
 
+    /// Skipping post-erasure debris is *counted*, not merely tolerated.
+    ///
+    /// A shard that opened cleanly and one that opened by stepping over a
+    /// retired segment's extents are different states, and an operator chasing
+    /// a recall gap needs to be able to tell them apart.
+    #[test]
+    fn skipped_retired_extents_are_counted_on_the_open_handle() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = seal_with_displaced_dir_run();
+        unlink_group(&dir.path().join("shard-0000"), 2);
+        retire_segments_in_manifest(dir.path(), 0, &[2]).expect("retire");
+
+        let storage = ShardStorage::open(dir.path(), 0, 1, ShardStorageOptions::default()).expect("open");
+        assert_eq!(
+            storage.directory_extents_skipped, 1,
+            "the one extent naming retired segment 2 must be counted"
+        );
+
+        // A shard with nothing retired counts nothing — otherwise the signal
+        // says "debris" on every healthy open and means nothing.
+        let clean = seal_n_segments(2);
+        let storage = ShardStorage::open(clean.path(), 0, 1, ShardStorageOptions::default()).expect("open");
+        assert_eq!(storage.directory_extents_skipped, 0);
+    }
+
+    /// Publish a directory run naming `extents`, bypassing the seal path.
+    ///
+    /// Seal-published L0 runs name only their own segment, so the mixed and
+    /// repeated-extent shapes — which compaction and run-id displacement both
+    /// produce — cannot be built through it.
+    fn publish_run(dir: &Path, run_id: u64, extents: &[(u64, u64)]) {
+        let mut storage = ShardStorage::open(dir, 0, 1, ShardStorageOptions::default()).unwrap();
+        let dir_extents: Vec<DirExtentV1> = extents
+            .iter()
+            .map(|&(stream_hash, segment_seq)| DirExtentV1 {
+                stream_hash,
+                min_seq: 0,
+                max_seq: 0,
+                segment_seq,
+            })
+            .collect();
+        storage
+            .publish_dir_run_v1(DirRunKey { level: 0, run_id }, 1, &dir_extents)
+            .unwrap()
+            .expect("a non-empty extent set publishes a run");
+    }
+
+    /// A run naming both a live and a retired segment is reported but **not**
+    /// wholly absent — retiring it would drop the live extents, which are how
+    /// their streams resolve.
+    #[test]
+    fn a_mixed_dir_run_is_reported_but_not_wholly_absent() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = seal_n_segments(2);
+        let shard_dir = dir.path().join("shard-0000");
+        let live = corecrux_frame::stream_hash_xxhash64("t", "corpus", "doc-0").unwrap();
+        let dead = corecrux_frame::stream_hash_xxhash64("t", "corpus", "doc-1").unwrap();
+        publish_run(dir.path(), 900, &[(live, 1), (dead, 2)]);
+
+        unlink_group(&shard_dir, 2);
+        retire_segments_in_manifest(dir.path(), 0, &[2]).expect("retire");
+
+        let found = find_dangling_dir_runs(&shard_dir).expect("scan");
+        let mixed: Vec<_> = found.iter().filter(|r| r.run_id == 900).collect();
+        assert_eq!(mixed.len(), 1, "{found:?}");
+        assert_eq!(mixed[0].absent_segment_seqs, vec![2]);
+        assert!(
+            !mixed[0].wholly_absent,
+            "segment 1 is still live inside this run, so it must not be retirable"
+        );
+    }
+
+    /// One absent segment named by several extents is reported once, not once
+    /// per extent — the field is the blast radius, and repeats would inflate it.
+    #[test]
+    fn a_repeated_absent_segment_is_reported_once() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = seal_n_segments(2);
+        let shard_dir = dir.path().join("shard-0000");
+        let a = corecrux_frame::stream_hash_xxhash64("t", "corpus", "doc-0").unwrap();
+        let b = corecrux_frame::stream_hash_xxhash64("t", "corpus", "doc-1").unwrap();
+        publish_run(dir.path(), 901, &[(a, 2), (b, 2)]);
+
+        unlink_group(&shard_dir, 2);
+        retire_segments_in_manifest(dir.path(), 0, &[2]).expect("retire");
+
+        let found = find_dangling_dir_runs(&shard_dir).expect("scan");
+        let run = found.iter().find(|r| r.run_id == 901).expect("the run is reported");
+        assert_eq!(run.absent_segment_seqs, vec![2], "two extents, one absent segment");
+        assert!(run.wholly_absent, "no live segment inside this run");
+    }
+
+    /// A shard with no retired segments has no dangling runs — the scan must
+    /// not report the healthy case, or the signal is worthless.
+    #[test]
+    fn a_healthy_shard_has_no_dangling_dir_runs() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = seal_n_segments(3);
+        assert!(find_dangling_dir_runs(&dir.path().join("shard-0000"))
+            .expect("scan")
+            .is_empty());
+    }
+
+    /// Retiring a run is an append that reports exactly what it did, and asking
+    /// twice is a no-op rather than a second removal.
+    #[test]
+    fn retiring_a_dir_run_appends_and_reports_what_it_did() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = seal_n_segments(2);
+        let shard_dir = dir.path().join("shard-0000");
+        let a = corecrux_frame::stream_hash_xxhash64("t", "corpus", "doc-0").unwrap();
+        publish_run(dir.path(), 902, &[(a, 2)]);
+        unlink_group(&shard_dir, 2);
+        retire_segments_in_manifest(dir.path(), 0, &[2]).expect("retire");
+
+        let manifest = shard_dir.join("MANIFEST");
+        let before = std::fs::read(&manifest).unwrap();
+
+        let outcome = retire_dir_runs_in_manifest(dir.path(), 0, &[(0, 902), (0, 4242)]).expect("retire runs");
+        assert_eq!(outcome.retired, vec![(0, 902)]);
+        assert_eq!(
+            outcome.not_present,
+            vec![(0, 4242)],
+            "an unknown run is recorded, not an error"
+        );
+
+        let after = std::fs::read(&manifest).unwrap();
+        assert_eq!(&after[..before.len()], &before[..], "append only, never a rewrite");
+        assert_eq!(
+            outcome.manifest_end,
+            after.len() as u64,
+            "the reported end is the manifest's real end"
+        );
+        assert!(outcome.manifest_end > before.len() as u64);
+
+        let again = retire_dir_runs_in_manifest(dir.path(), 0, &[(0, 902)]).expect("retire runs");
+        assert!(again.retired.is_empty(), "already retired");
+        assert_eq!(again.not_present, vec![(0, 902)]);
+        assert!(find_dangling_dir_runs(&shard_dir).expect("scan").is_empty());
+    }
+
     /// The tombstone is an append: every pre-existing byte survives, so a bad
     /// run can never be worse than the state it started from.
     #[test]
