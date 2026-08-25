@@ -35,7 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   manifest is append-only and published runs are never rewritten, so a run
   outliving its segment is the designed state after erasure. The extent is
   skipped and counted, and each affected run logs `dirrun-extents-skipped`
-  once. (#740)
+  once.
+
+  `corecruxctl storage repair-manifest` learned the same class, so a store
+  already wedged by an older daemon can be recovered offline: it now reports
+  `dangling_dir_runs` alongside `dangling_segments` and retires the runs whose
+  named segments are *all* gone. A run that also names live segments is
+  reported and left alone — its live extents are how those streams resolve, so
+  dropping it would trade a wedged shard for a lossy one. (#740)
 
 ## [0.5.64] - 2026-08-23
 

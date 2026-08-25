@@ -2090,12 +2090,20 @@ enum StorageCommand {
         #[arg(long)]
         node_id: Option<String>,
     },
-    /// Report (and optionally repair) MANIFEST entries whose segment file is gone.
+    /// Report (and optionally repair) MANIFEST entries that no longer resolve.
     ///
-    /// One dangling entry makes the shard impossible to open, which fails every
-    /// write while reads carry on — see ExecPlan
-    /// `crux-erasure-manifest-repair-2026-08-08`. Repair appends `RemoveSegment`
-    /// tombstones; it never rewrites existing manifest bytes.
+    /// Two classes, both of which make the shard impossible to open and so fail
+    /// every write while reads carry on — see ExecPlan
+    /// `crux-erasure-manifest-repair-2026-08-08`:
+    ///
+    /// 1. a MANIFEST segment whose file is gone;
+    /// 2. a `directory/` run naming a segment the MANIFEST has already retired,
+    ///    which a segment scan alone reports as healthy.
+    ///
+    /// Repair appends `RemoveSegment` / `RemoveDirRun` tombstones; it never
+    /// rewrites existing manifest bytes. A run that also names live segments is
+    /// reported and left alone — dropping it would lose the directory entries
+    /// those streams resolve through.
     #[command(name = "repair-manifest")]
     RepairManifest {
         /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
