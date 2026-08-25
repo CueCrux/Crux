@@ -1760,6 +1760,28 @@ impl ShardStorage {
         })
     }
 
+    /// Rebuild the stream directory from the manifest's directory runs.
+    ///
+    /// An extent naming a segment the manifest no longer carries is a **miss**,
+    /// not corruption. Reclaim (tenant erasure) retires a segment together with
+    /// the L0 run whose `run_id` equals its `segment_seq`, but that pair is not
+    /// the whole story: a seal publishes its run from the *live* extent set, so
+    /// a later segment's L0 run routinely carries extents for earlier segments
+    /// (and directory compaction merges extents across segments besides). Those
+    /// runs outlive the reclaimed segment by design — the manifest is
+    /// append-only and published runs are never rewritten.
+    ///
+    /// Erroring on such an extent fails `ShardStorage::open`, and open is on the
+    /// path of every write while reads scan `segments/` directly. The result is
+    /// the silent-500 signature this store has hit twice: all ingest returning
+    /// 500 with `/readyz` green, unrecoverable without an offline manifest
+    /// repair (see `corecruxctl storage repair-manifest`, which cannot see this
+    /// class at all because the segment is already out of the manifest). One
+    /// erasure with `reclaim: true` was enough to wedge host `crux` both times.
+    ///
+    /// So: skip the extent, count it, and say so once per run. The directory is
+    /// a lookup index — an entry that resolves to nothing is a miss, and the
+    /// read path already treats an absent directory entry as one.
     pub(crate) fn rebuild_directory_from_runs(&mut self) -> Result<HashSet<u64>> {
         let mut present_segments: HashSet<u64> = HashSet::new();
         let mut out: HashMap<u64, Vec<StreamSegmentRef>> = HashMap::new();
@@ -1793,12 +1815,12 @@ impl ShardStorage {
                 });
             }
 
+            let mut retired_extents = 0usize;
             for part in decoded.partitions {
                 for e in part {
                     if !self.segments_by_seq.contains_key(&e.segment_seq) {
-                        return Err(StorageError::ManifestRecordInvalid {
-                            msg: format!("dirrun references missing segment_seq {}", e.segment_seq),
-                        });
+                        retired_extents += 1;
+                        continue;
                     }
 
                     let cut = self.stream_cut_seq(e.stream_hash);
@@ -1813,6 +1835,14 @@ impl ShardStorage {
                     });
                     present_segments.insert(e.segment_seq);
                 }
+            }
+            if retired_extents > 0 {
+                tracing::info!(
+                    run_level = run.key.level,
+                    run_id = run.key.run_id,
+                    retired_extents,
+                    "dirrun-extents-skipped: directory run names segments the manifest has retired"
+                );
             }
         }
 

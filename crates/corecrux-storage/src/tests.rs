@@ -5360,6 +5360,122 @@ mod tests {
         assert!(storage.segments_by_seq.contains_key(&3));
     }
 
+    /// Seal two segments where the second one's L0 run is forced off its
+    /// `run_id == segment_seq` slot, and return the shard root.
+    ///
+    /// `publish_dir_run_v1` resolves a run-id collision by **incrementing**
+    /// `run_id` (append.rs, "Keep run-id resolution deterministic"), and a
+    /// leftover `directory/` file is enough to trigger it — host `crux` carries
+    /// 1083 dirrun files against 1061 segments. The extents inside still name
+    /// the segment they were built from, so the published run is
+    /// `run_id = seq + 1` *describing* `seq`. That silently breaks the
+    /// invariant `retire_segments_in_manifest` is built on ("L0 run ids are
+    /// segment sequences", lib.rs).
+    ///
+    /// Returns the shard root; segment 2 is the one whose run is displaced.
+    fn seal_with_displaced_dir_run() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let options = ShardStorageOptions {
+            head_max_record_bytes: 0,
+            build_ccxi: true,
+            ..Default::default()
+        };
+        let append_and_seal = |storage: &mut ShardStorage, i: u64| {
+            let stream_id = format!("doc-{i}");
+            let stream_hash = corecrux_frame::stream_hash_xxhash64("t", "corpus", &stream_id).unwrap();
+            storage
+                .append_batch(
+                    stream_hash,
+                    0,
+                    "t",
+                    "corpus",
+                    &stream_id,
+                    "2026-01-01T00:00:00Z",
+                    &[AppendEventInput {
+                        event_id: &format!("evt-{i}"),
+                        occurred_at: "2026-01-01T00:00:00Z",
+                        event_type: "evt",
+                        content_type: "text/plain",
+                        payload_bytes: b"hello",
+                    }],
+                )
+                .unwrap();
+            storage.force_seal_head().unwrap();
+        };
+
+        let mut storage = ShardStorage::open(dir.path(), 0, 1, options.clone()).unwrap();
+        append_and_seal(&mut storage, 1);
+
+        // Plant the collision *after* open: `open` sweeps unreferenced
+        // `directory/` files into quarantine, so planting it earlier would
+        // remove it before the seal that must trip over it.
+        let shard_dir = dir.path().join("shard-0000");
+        std::fs::write(shard_dir.join(dir_run_relative_path_v1(0, 2)), b"stray").unwrap();
+
+        append_and_seal(&mut storage, 2);
+        drop(storage);
+        dir
+    }
+
+    /// A displaced L0 run outlives the segment it describes, and that must be a
+    /// miss rather than a corrupt shard.
+    ///
+    /// `retire_segments_in_manifest` retires segment 2 together with
+    /// `DirRunKey { level: 0, run_id: 2 }` — but the run describing segment 2
+    /// was published as `run_id: 3`, so it survives the reclaim still naming a
+    /// segment that is gone. Before the fix that extent failed
+    /// `rebuild_directory_from_runs` with "dirrun references missing
+    /// segment_seq 2", which fails `open`, which fails every write while reads
+    /// (they scan `segments/` directly) stay green. Host `crux` hit exactly this
+    /// twice — once for 44 h — from a single `forget-tenants` with
+    /// `reclaim: true`.
+    #[test]
+    fn retiring_a_segment_whose_run_was_displaced_still_opens() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = seal_with_displaced_dir_run();
+        unlink_group(&dir.path().join("shard-0000"), 2);
+
+        let outcome = retire_segments_in_manifest(dir.path(), 0, &[2]).expect("retire");
+        assert_eq!(outcome.retired, vec![2]);
+
+        let storage = ShardStorage::open(dir.path(), 0, 1, ShardStorageOptions::default())
+            .ok()
+            .expect("a run naming a retired segment is a miss, not a corrupt shard");
+        assert!(!storage.segments_by_seq.contains_key(&2));
+        assert!(storage.segments_by_seq.contains_key(&1));
+    }
+
+    /// …and the shard is still *writable* afterwards, which is the property the
+    /// outage actually cost: `open` succeeding is only half of it.
+    #[test]
+    fn a_shard_stays_writable_after_reclaiming_a_segment_whose_run_was_displaced() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = seal_with_displaced_dir_run();
+        unlink_group(&dir.path().join("shard-0000"), 2);
+        retire_segments_in_manifest(dir.path(), 0, &[2]).expect("retire");
+
+        let mut storage = ShardStorage::open(dir.path(), 0, 1, ShardStorageOptions::default()).expect("open");
+        let stream_hash = corecrux_frame::stream_hash_xxhash64("t", "corpus", "doc-after").unwrap();
+        storage
+            .append_batch(
+                stream_hash,
+                0,
+                "t",
+                "corpus",
+                "doc-after",
+                "2026-01-01T00:00:00Z",
+                &[AppendEventInput {
+                    event_id: "evt-after",
+                    occurred_at: "2026-01-01T00:00:00Z",
+                    event_type: "evt",
+                    content_type: "text/plain",
+                    payload_bytes: b"hello",
+                }],
+            )
+            .expect("append after reclaim");
+        storage.force_seal_head().expect("seal after reclaim");
+    }
+
     /// The tombstone is an append: every pre-existing byte survives, so a bad
     /// run can never be worse than the state it started from.
     #[test]
