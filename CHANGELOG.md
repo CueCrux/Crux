@@ -44,6 +44,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported and left alone — its live extents are how those streams resolve, so
   dropping it would trade a wedged shard for a lossy one. (#740)
 
+- **One dense query could OOM the daemon on a large corpus.** The process-wide
+  cache of parsed `.ccxe` companions was bounded only by corpus size — its own
+  doc comment said "stays bounded by the corpus", which is precisely the
+  problem — and the query path then *copied* every vector out of it to build the
+  provider, so the whole corpus was resident twice for the length of every
+  query. On host `crux` (~900 dense segments) a single `/v1/query/text-search`
+  took the daemon from 2.8 GB to an OOM kill at 5.74 GB against a 5.5 GiB memcg
+  limit, with `/readyz` green until the moment it died.
+
+  The cache now carries a byte budget with LRU eviction, default 512 MiB and
+  settable with `CORECRUXD_DENSE_CACHE_BUDGET_BYTES` (`0` restores the old
+  unbounded behaviour). Candidate vectors are shared with the provider rather
+  than copied, which removes the second resident copy outright; a segment larger
+  than the whole budget is still cached rather than re-read on every access.
+
+  **This is a memory bound, not a recall cap.** An evicted companion is re-read
+  on the next query, so the candidate set, the scores and the ranking are
+  bit-identical — the CE dense lane stays uncapped and exact per ExecPlan
+  `dense-lane-and-extraction-upsell-2026-06-26`. A regression test asserts
+  exactly that: a query touching more segments than the budget can hold scores
+  identically to one with an unbounded cache. (#740)
+
 ## [0.5.64] - 2026-08-23
 
 ### Fixed

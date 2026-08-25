@@ -29,6 +29,7 @@
 //! Decision Log); re-ranking is a correct, shippable first increment.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Cosine-similarity provider for the dense retrieval lane.
 ///
@@ -49,7 +50,14 @@ pub trait DenseProvider {
 /// output is deterministic for a given input.
 pub struct CosineDenseProvider {
     query_unit: Vec<f32>,
-    vectors: HashMap<(u32, usize), Vec<f32>>,
+    /// Candidate vectors, shared rather than owned outright.
+    ///
+    /// A caller that already holds these vectors — the daemon's per-segment
+    /// `.ccxe` cache does — would otherwise have to hand over a deep copy, so
+    /// the whole corpus would be resident **twice** for the life of every
+    /// query. On a 900-segment store that is the difference between ~0.8 GB and
+    /// ~1.6 GB, which is what put a 5.5 GiB daemon over its memcg limit.
+    vectors: HashMap<(u32, usize), Arc<Vec<f32>>>,
 }
 
 impl CosineDenseProvider {
@@ -58,7 +66,23 @@ impl CosineDenseProvider {
     /// The query is unit-normalised once here; candidate norms are computed at
     /// score time, so callers need not pre-normalise. Dimension mismatches and
     /// zero-norm vectors score `None` rather than panicking.
+    ///
+    /// Takes ownership of the vectors and shares them internally; nothing is
+    /// deep-copied. A caller that already holds shareable vectors should use
+    /// [`CosineDenseProvider::from_shared`] instead.
     pub fn new(query_embedding: &[f32], vectors: HashMap<(u32, usize), Vec<f32>>) -> Self {
+        Self::from_shared(
+            query_embedding,
+            vectors.into_iter().map(|(k, v)| (k, Arc::new(v))).collect(),
+        )
+    }
+
+    /// Build a provider over vectors the caller keeps a handle on.
+    ///
+    /// Identical scoring to [`CosineDenseProvider::new`]; the difference is
+    /// purely that the candidate data is shared with the caller instead of
+    /// copied out of it.
+    pub fn from_shared(query_embedding: &[f32], vectors: HashMap<(u32, usize), Arc<Vec<f32>>>) -> Self {
         Self {
             query_unit: unit_normalize(query_embedding),
             vectors,

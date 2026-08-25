@@ -325,7 +325,11 @@ pub fn seal_prose_documents(
 // emits, including the packed TurboQuant ones.
 
 /// `(doc_id, vector)` entries read from a `.ccxe` companion.
-type DenseEntries = Vec<(u32, Vec<f32>)>;
+///
+/// Vectors are shared, not owned outright, so handing a segment's entries to a
+/// [`corecrux_retrieval::CosineDenseProvider`] costs pointer clones rather than
+/// a second copy of the corpus.
+type DenseEntries = Vec<(u32, std::sync::Arc<Vec<f32>>)>;
 
 /// Write a `.ccxe` dense companion atomically (tmp → rename).
 fn write_ccxe(
@@ -390,7 +394,15 @@ fn read_ccxe(path: &Path) -> Option<(u32, DenseEntries)> {
     if vectors.len() != reader.doc_ids.len() {
         return None;
     }
-    Some((dim, reader.doc_ids.iter().copied().zip(vectors).collect()))
+    Some((
+        dim,
+        reader
+            .doc_ids
+            .iter()
+            .copied()
+            .zip(vectors.into_iter().map(std::sync::Arc::new))
+            .collect(),
+    ))
 }
 
 /// Parsed dense data for one sealed segment (buyer-fit FU3 cache). Sealed
@@ -401,12 +413,143 @@ struct CachedDenseSegment {
     dimension: usize,
     entries: DenseEntries,
     profile: Option<corecrux_memory::embeddings::SemanticProfile>,
+    /// Approximate heap cost of this entry, charged against the cache budget.
+    bytes: usize,
 }
 
-/// Cache map: `(shards_dir, segment_seq, companion file name)` → parsed dense
-/// segment.
-type DenseSegmentCache =
-    std::collections::HashMap<(std::path::PathBuf, u64, String), std::sync::Arc<CachedDenseSegment>>;
+impl CachedDenseSegment {
+    /// Heap cost of the parsed segment: the vector payloads dominate, and the
+    /// per-vector `Arc` + tuple overhead is counted because a segment is tens of
+    /// thousands of small allocations, not one big one.
+    fn measure(entries: &DenseEntries) -> usize {
+        const PER_VECTOR_OVERHEAD: usize =
+            std::mem::size_of::<(u32, std::sync::Arc<Vec<f32>>)>() + std::mem::size_of::<Vec<f32>>() + 16; // Arc strong/weak counts
+        entries
+            .iter()
+            .map(|(_, v)| v.len() * std::mem::size_of::<f32>() + PER_VECTOR_OVERHEAD)
+            .sum()
+    }
+}
+
+/// Cache key: `(shards_dir, segment_seq, companion file name)`.
+type DenseCacheKey = (std::path::PathBuf, u64, String);
+
+/// Byte-budgeted LRU over parsed dense companions.
+///
+/// **This is a memory bound, not a recall cap.** Evicting an entry only means
+/// the next query re-reads that companion from disk; the candidate set, the
+/// scores and the ranking are identical either way. The dense lane stays
+/// uncapped and exact, per ExecPlan `dense-lane-and-extraction-upsell-2026-06-26`
+/// — a budget that dropped segments from the result set would violate it, and
+/// this one cannot, because a miss is a re-read rather than a skip.
+#[derive(Default)]
+struct DenseSegmentCache {
+    map: std::collections::HashMap<DenseCacheKey, (std::sync::Arc<CachedDenseSegment>, u64)>,
+    bytes: usize,
+    /// Monotonic tick stamped on each access; lowest tick is the LRU victim.
+    clock: u64,
+}
+
+impl DenseSegmentCache {
+    fn get(&mut self, key: &DenseCacheKey) -> Option<std::sync::Arc<CachedDenseSegment>> {
+        self.clock += 1;
+        let clock = self.clock;
+        let (segment, last_used) = self.map.get_mut(key)?;
+        *last_used = clock;
+        Some(std::sync::Arc::clone(segment))
+    }
+
+    /// Insert and evict down to `budget`.
+    ///
+    /// The entry just inserted is never the victim, so a single segment larger
+    /// than the whole budget is still served (over budget, deliberately) rather
+    /// than thrashed on every access.
+    fn insert(&mut self, key: DenseCacheKey, segment: std::sync::Arc<CachedDenseSegment>, budget: usize) {
+        self.clock += 1;
+        let clock = self.clock;
+        if let Some((old, _)) = self.map.insert(key.clone(), (segment, clock)) {
+            self.bytes = self.bytes.saturating_sub(old.bytes);
+        }
+        self.bytes = self.bytes.saturating_add(self.map[&key].0.bytes);
+        self.evict_to(budget, Some(&key));
+    }
+
+    fn evict_to(&mut self, budget: usize, keep: Option<&DenseCacheKey>) {
+        while self.bytes > budget {
+            let victim = self
+                .map
+                .iter()
+                .filter(|(k, _)| Some(*k) != keep)
+                .min_by_key(|(_, (_, last_used))| *last_used)
+                .map(|(k, _)| k.clone());
+            let Some(victim) = victim else {
+                // Only the protected entry is left; it is over budget on its own.
+                break;
+            };
+            if let Some((evicted, _)) = self.map.remove(&victim) {
+                self.bytes = self.bytes.saturating_sub(evicted.bytes);
+            }
+        }
+    }
+
+    /// Drop everything. Byte accounting is reset with the map — the two must
+    /// never be cleared separately, or the cache evicts against a phantom total.
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.map.clear();
+        self.bytes = 0;
+    }
+
+    /// Drop entries for `shards_dir` that are no longer live, leaving other data
+    /// dirs' entries alone.
+    fn retain_live(&mut self, shards_dir: &std::path::Path, live: &std::collections::HashSet<u64>) {
+        let mut freed = 0usize;
+        self.map.retain(|(sd, seq, _), (segment, _)| {
+            let keep = sd != shards_dir || live.contains(seq);
+            if !keep {
+                freed += segment.bytes;
+            }
+            keep
+        });
+        self.bytes = self.bytes.saturating_sub(freed);
+    }
+}
+
+/// Default byte budget for [`DENSE_SEGMENT_CACHE`], overridable with
+/// `CORECRUXD_DENSE_CACHE_BUDGET_BYTES` (`0` disables the bound).
+///
+/// 512 MiB. The sizing that matters is the *peak* during one query, because the
+/// provider holds every scored segment live for the length of the call: on host
+/// `crux`'s ~900 dense segments (~205 chunks x 1024 f32 each) that is ~0.8 GB of
+/// vectors, on top of a ~2.8 GB base, inside a 5.5 GiB memcg. What the budget
+/// controls is what stays resident *between* queries — with the entries shared
+/// rather than copied, 512 MiB of that peak is retained and the rest is released
+/// when the provider drops. That leaves >1.5 GiB of headroom at the corpus size
+/// which OOM-killed the daemon on 2026-08-25.
+const DENSE_CACHE_BUDGET_DEFAULT_BYTES: usize = 512 * 1024 * 1024;
+
+/// Resolved cache budget in bytes. `0` means unbounded (the pre-2026-08-25
+/// behaviour), kept as an explicit opt-out for hosts with memory to spare.
+fn dense_cache_budget_bytes() -> usize {
+    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        match std::env::var("CORECRUXD_DENSE_CACHE_BUDGET_BYTES") {
+            Ok(raw) => match raw.trim().parse::<usize>() {
+                Ok(0) => usize::MAX, // explicit opt-out
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    tracing::warn!(
+                        value = %raw,
+                        default_bytes = DENSE_CACHE_BUDGET_DEFAULT_BYTES,
+                        "CORECRUXD_DENSE_CACHE_BUDGET_BYTES is not a byte count; using the default"
+                    );
+                    DENSE_CACHE_BUDGET_DEFAULT_BYTES
+                }
+            },
+            Err(_) => DENSE_CACHE_BUDGET_DEFAULT_BYTES,
+        }
+    })
+}
 
 /// Process-wide cache of parsed `.ccxe`/`.ccxprof` companions so the prose
 /// query-dense path does not re-read (and re-`read_dir`) every companion from
@@ -429,8 +572,11 @@ type DenseSegmentCache =
 /// entry is never invalidated by one. The exception is `rebuild-companions
 /// --force`, which rewrites a key in place; run against a live daemon, that
 /// daemon keeps serving the pre-force parse until it restarts.
+/// Bounded since 2026-08-25: unbounded, one dense query over a 900-segment
+/// corpus took the daemon from 2.8 GB to an OOM kill at 5.74 GB against a
+/// 5.5 GiB memcg limit (Crux #740). See [`DENSE_CACHE_BUDGET_DEFAULT_BYTES`].
 static DENSE_SEGMENT_CACHE: std::sync::LazyLock<std::sync::Mutex<DenseSegmentCache>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(DenseSegmentCache::default()));
 
 /// Why a delegated query cannot safely score a persisted dense segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -476,6 +622,7 @@ pub fn build_dense_provider(
         expected_fingerprint,
         query_model_id,
         false,
+        dense_cache_budget_bytes(),
     )
     .ok()
     .flatten()
@@ -498,6 +645,7 @@ pub fn build_dense_provider_strict(
         Some(expected_fingerprint),
         query_model_id,
         true,
+        dense_cache_budget_bytes(),
     )
 }
 
@@ -508,6 +656,10 @@ fn build_dense_provider_inner(
     expected_fingerprint: Option<&str>,
     query_model_id: Option<&str>,
     strict_profile: bool,
+    // Cache byte budget. A parameter rather than a read of the process-wide
+    // setting so a test can drive eviction without racing every other test's
+    // environment.
+    budget: usize,
 ) -> Result<Option<corecrux_retrieval::CosineDenseProvider>, DenseProfileCompatibilityError> {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -522,9 +674,11 @@ fn build_dense_provider_inner(
     // Bound the cache to this shards dir's live segment set; leave other data
     // dirs' entries untouched.
     let live: HashSet<u64> = readers.iter().map(|r| r.header.segment_seq).collect();
-    cache.retain(|(sd, seq, _), _| sd != &shards_dir || live.contains(seq));
+    cache.retain_live(&shards_dir, &live);
 
-    let mut vectors: HashMap<(u32, usize), Vec<f32>> = HashMap::new();
+    // Shared, not copied: the provider scores against the same allocations the
+    // cache holds, so a query does not put a second copy of the corpus in RSS.
+    let mut vectors: HashMap<(u32, usize), Arc<Vec<f32>>> = HashMap::new();
     for (segment_index, reader) in readers.iter().enumerate() {
         let seq = reader.header.segment_seq;
         let path = match select_ccxe_for_seq(&shards_dir, seq, query_model_key.as_deref()) {
@@ -545,9 +699,12 @@ fn build_dense_provider_inner(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let cached = if let Some(c) = cache.get(&(shards_dir.clone(), seq, file_name.clone())) {
-            Arc::clone(c)
+        let key = (shards_dir.clone(), seq, file_name);
+        let cached = if let Some(c) = cache.get(&key) {
+            c
         } else {
+            // A miss costs a re-read, never a skipped segment: eviction bounds
+            // memory, it does not narrow the candidate set.
             let Some((dimension, entries)) = read_ccxe(&path) else {
                 if strict_profile {
                     return Err(DenseProfileCompatibilityError::InvalidVectorCompanion { segment_seq: seq });
@@ -557,10 +714,11 @@ fn build_dense_provider_inner(
             let profile = read_ccxprof(&ccxprof_path_for(&path));
             let c = Arc::new(CachedDenseSegment {
                 dimension: dimension as usize,
+                bytes: CachedDenseSegment::measure(&entries),
                 entries,
                 profile,
             });
-            cache.insert((shards_dir.clone(), seq, file_name), Arc::clone(&c));
+            cache.insert(key, Arc::clone(&c), budget);
             c
         };
         // Local/generic embedders retain the existing compatible-subset
@@ -607,14 +765,17 @@ fn build_dense_provider_inner(
             }
         }
         for (doc_id, v) in &cached.entries {
-            vectors.insert((*doc_id, segment_index), v.clone());
+            // `Arc::clone` — a refcount bump, not a vector copy. The provider and
+            // the cache score against the same allocation, and an entry evicted
+            // mid-query stays alive for the provider that still holds it.
+            vectors.insert((*doc_id, segment_index), Arc::clone(v));
         }
     }
 
     if vectors.is_empty() {
         return Ok(None);
     }
-    Ok(Some(corecrux_retrieval::CosineDenseProvider::new(
+    Ok(Some(corecrux_retrieval::CosineDenseProvider::from_shared(
         query_embedding,
         vectors,
     )))
@@ -1587,6 +1748,167 @@ mod tests {
             ),
             Err(DenseProfileCompatibilityError::DimensionMismatch { .. })
         ));
+    }
+
+    // ── Dense cache byte budget (Crux #740) ──────────────────────────────
+    //
+    // Unbounded, this cache took host `crux` from 2.8 GB to an OOM kill at
+    // 5.74 GB on one dense query over ~900 segments. The bound must hold memory
+    // down *without* narrowing what the lane scores — the CE dense lane is
+    // uncapped by contract, so an evicted segment has to come back on the next
+    // query, not disappear from it.
+
+    fn cached_segment(vector_len: usize) -> std::sync::Arc<CachedDenseSegment> {
+        let entries: DenseEntries = vec![(0u32, std::sync::Arc::new(vec![1.0f32; vector_len]))];
+        std::sync::Arc::new(CachedDenseSegment {
+            dimension: vector_len,
+            bytes: CachedDenseSegment::measure(&entries),
+            entries,
+            profile: None,
+        })
+    }
+
+    fn cache_key(seq: u64) -> DenseCacheKey {
+        (std::path::PathBuf::from("/shards"), seq, format!("seg-{seq}.ccxe"))
+    }
+
+    /// The budget is enforced, and the victim is the least *recently used* entry
+    /// rather than the oldest inserted — otherwise a hot segment is evicted out
+    /// from under the query that keeps asking for it.
+    #[test]
+    fn the_dense_cache_evicts_the_least_recently_used_entry_to_stay_in_budget() {
+        let mut cache = DenseSegmentCache::default();
+        let one = cached_segment(64).bytes;
+        let budget = one * 2;
+
+        cache.insert(cache_key(1), cached_segment(64), budget);
+        cache.insert(cache_key(2), cached_segment(64), budget);
+        assert_eq!(cache.map.len(), 2);
+        assert!(cache.bytes <= budget, "{} > {budget}", cache.bytes);
+
+        // Touch 1 so 2 becomes the least recently used, then overflow.
+        assert!(cache.get(&cache_key(1)).is_some());
+        cache.insert(cache_key(3), cached_segment(64), budget);
+
+        assert!(cache.bytes <= budget, "over budget: {} > {budget}", cache.bytes);
+        assert!(cache.map.contains_key(&cache_key(1)), "recently used entry survives");
+        assert!(cache.map.contains_key(&cache_key(3)), "the new entry survives");
+        assert!(!cache.map.contains_key(&cache_key(2)), "the LRU entry is the victim");
+    }
+
+    /// A segment bigger than the entire budget is still served. Evicting the
+    /// entry just inserted would mean re-reading it on every single access, and
+    /// a store whose segments all exceed the budget would never cache anything.
+    #[test]
+    fn a_segment_larger_than_the_budget_is_still_cached() {
+        let mut cache = DenseSegmentCache::default();
+        cache.insert(cache_key(1), cached_segment(4096), 1);
+        assert_eq!(cache.map.len(), 1);
+        assert!(cache.bytes > 1, "deliberately over budget rather than absent");
+    }
+
+    /// Byte accounting survives replacement and pruning — if it drifted upward
+    /// the cache would evict everything, and downward it would never evict.
+    #[test]
+    fn dense_cache_byte_accounting_tracks_replacement_and_pruning() {
+        let mut cache = DenseSegmentCache::default();
+        let big = cached_segment(1024).bytes;
+        cache.insert(cache_key(1), cached_segment(1024), usize::MAX);
+        assert_eq!(cache.bytes, big);
+
+        // Replacing an entry charges the new size, not the sum of both.
+        let small = cached_segment(8).bytes;
+        cache.insert(cache_key(1), cached_segment(8), usize::MAX);
+        assert_eq!(cache.map.len(), 1);
+        assert_eq!(cache.bytes, small);
+
+        // Pruning a dead segment gives its bytes back.
+        cache.insert(cache_key(2), cached_segment(1024), usize::MAX);
+        cache.retain_live(
+            std::path::Path::new("/shards"),
+            &std::collections::HashSet::from([1u64]),
+        );
+        assert_eq!(cache.map.len(), 1);
+        assert_eq!(cache.bytes, small);
+
+        // Another data dir's entries are not this shards dir's business.
+        cache.insert(
+            (std::path::PathBuf::from("/other"), 9, "seg-9.ccxe".to_string()),
+            cached_segment(8),
+            usize::MAX,
+        );
+        cache.retain_live(std::path::Path::new("/shards"), &std::collections::HashSet::new());
+        assert_eq!(cache.map.len(), 1, "only /shards entries were pruned");
+    }
+
+    /// The property the bound exists to preserve: a query touching more segments
+    /// than the cache can hold returns **exactly** what an unbounded cache
+    /// returns. Eviction costs a re-read, never a candidate.
+    #[test]
+    #[serial_test::serial]
+    fn a_query_over_more_segments_than_fit_in_the_budget_scores_identically() {
+        use corecrux_retrieval::dense::DenseProvider;
+
+        const SEGMENTS: usize = 6;
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..SEGMENTS {
+            // Distinct directions so a mixed-up segment would change a score.
+            let angle = i as f32 * 0.37;
+            let docs = vec![ProseDocument {
+                doc_id: format!("d{i}"),
+                chunks: vec![dense_chunk(
+                    &format!("d{i}::0"),
+                    &format!("chunk {i}"),
+                    vec![angle.cos(), angle.sin()],
+                )],
+            }];
+            seal_prose_documents(tmp.path(), 0, 1, "t", "corpus", "2026-08-25T00:00:00Z", &docs, None).unwrap();
+        }
+        let mut mgr = IndexManager::new();
+        mgr.scan_and_load(&tmp.path().join("shards").join("shard-0000").join("segments"))
+            .unwrap();
+        assert_eq!(mgr.readers().len(), SEGMENTS, "one segment per seal");
+
+        let query = [1.0f32, 0.0];
+        let score_all = |budget: usize| -> Vec<Option<f32>> {
+            DENSE_SEGMENT_CACHE.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            let provider = build_dense_provider_inner(&mgr, tmp.path(), &query, None, None, false, budget)
+                .expect("build")
+                .expect("some vectors");
+            assert_eq!(provider.len(), SEGMENTS, "every segment is scored");
+            (0..SEGMENTS).map(|i| provider.dense_score(0, i)).collect()
+        };
+
+        let unbounded = score_all(usize::MAX);
+
+        // A budget that cannot hold even two segments.
+        let one_segment = cached_segment(2).bytes;
+        let bounded = score_all(one_segment);
+
+        assert_eq!(bounded, unbounded, "eviction must not change a single score");
+        assert!(
+            unbounded.iter().all(Option::is_some),
+            "fixture sanity: every segment scored"
+        );
+
+        let cache = DENSE_SEGMENT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            cache.map.len() < SEGMENTS,
+            "the budget must actually have evicted: {} entries held",
+            cache.map.len()
+        );
+        assert!(cache.bytes <= one_segment, "cache left over budget: {}", cache.bytes);
+    }
+
+    /// A malformed budget is a misconfiguration to warn about, not a reason to
+    /// run unbounded — the unbounded case is what OOM-killed the daemon.
+    #[test]
+    fn the_default_dense_cache_budget_is_bounded_and_nonzero() {
+        assert!(DENSE_CACHE_BUDGET_DEFAULT_BYTES > 0);
+        assert!(
+            DENSE_CACHE_BUDGET_DEFAULT_BYTES < 2 * 1024 * 1024 * 1024,
+            "a default this large would not keep a 5.5 GiB daemon alive"
+        );
     }
 
     /// FU3: `build_dense_provider` caches parsed companions per `(shards_dir,
