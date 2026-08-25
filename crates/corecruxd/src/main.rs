@@ -103,6 +103,7 @@ mod console;
 mod metrics;
 mod onboarding;
 mod ops_events;
+mod pack_conformance;
 mod pack_lifecycle;
 mod passports;
 mod plane_layer_sync;

@@ -1247,6 +1247,13 @@ pub(crate) fn router_with_route_auth(
             "/v1/extensions/{id}/lifecycle",
             axum::routing::post(self::extensions::set_extension_lifecycle),
         )
+        // Buyer-fit M5 conformance hook: replay a staged pack's declared
+        // operations and report what each would have done. Evidence only —
+        // the pass/fail verdict belongs to proof-carrying-adaptive-packs.
+        .route(
+            "/v1/extensions/{id}/conformance",
+            axum::routing::post(self::extensions::run_extension_conformance),
+        )
         // Storybook readout — Phase 3 of the context graph.
         .route(
             "/v1/projects/{id}/storybook",
