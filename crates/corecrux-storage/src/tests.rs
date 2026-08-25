@@ -5617,6 +5617,44 @@ mod tests {
         assert!(find_dangling_dir_runs(&shard_dir).expect("scan").is_empty());
     }
 
+    /// No manifest means no run can dangle, so every requested run comes back
+    /// as `not_present` and the caller is free to proceed. Erroring here would
+    /// block repair on a shard whose runs were never registered at all — the
+    /// opposite of the failure this guards.
+    #[test]
+    fn retiring_dir_runs_without_a_manifest_reports_them_all_not_present() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("shard-0000")).unwrap();
+        let outcome =
+            retire_dir_runs_in_manifest(dir.path(), 0, &[(0, 7), (1, 8)]).expect("no manifest is not an error");
+        assert_eq!(outcome.not_present, vec![(0, 7), (1, 8)]);
+        assert!(outcome.retired.is_empty());
+    }
+
+    /// A call that retires nothing still reports where the manifest ends —
+    /// a caller chaining repairs needs the real offset, not a zero.
+    #[test]
+    fn retiring_no_dir_runs_still_reports_the_manifest_end() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = seal_n_segments(2);
+        let manifest = dir.path().join("shard-0000").join("MANIFEST");
+        let len = std::fs::metadata(&manifest).unwrap().len();
+
+        let outcome = retire_dir_runs_in_manifest(dir.path(), 0, &[(0, 4242)]).expect("retire runs");
+        assert!(outcome.retired.is_empty());
+        assert_eq!(outcome.not_present, vec![(0, 4242)]);
+        assert_eq!(
+            outcome.manifest_end, len,
+            "nothing retired, but the end is still the real end"
+        );
+        assert_eq!(
+            std::fs::metadata(&manifest).unwrap().len(),
+            len,
+            "a no-op retire writes nothing"
+        );
+    }
+
     /// The tombstone is an append: every pre-existing byte survives, so a bad
     /// run can never be worse than the state it started from.
     #[test]
