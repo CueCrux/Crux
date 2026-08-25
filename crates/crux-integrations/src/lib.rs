@@ -421,6 +421,10 @@ pub const AUDIT_EXTENSION_INVOKE_STAGED: &str = "extension_invoke_staged";
 /// audit tail alone shows that a replay happened and which behaviour it
 /// saw, even if the run body itself is never persisted.
 pub const AUDIT_EXTENSION_CONFORMANCE_RUN: &str = "extension_conformance_run";
+/// A pinned prior pack build was atomically restored. The `detail` names
+/// the build moved from and to plus the operator's `reason`, so the trail
+/// answers why a pack's bytes changed, not only that they did.
+pub const AUDIT_EXTENSION_ROLLBACK: &str = "extension_rollback";
 pub const AUDIT_SUPPRESSED: &str = "audit_suppressed";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
