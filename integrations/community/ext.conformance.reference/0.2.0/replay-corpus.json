@@ -1,0 +1,25 @@
+{
+  "corpus_id": "conformance-reference-v1",
+  "description": "Three declared operations replayed against a local shadow corpus: two reads that must be deterministic, and one write that must stay inside the declared namespace and be reversible.",
+  "cases": [
+    {
+      "case_id": "recall-default",
+      "tool_name": "ext.conformance.reference.recall",
+      "args": {}
+    },
+    {
+      "case_id": "recall-topic",
+      "tool_name": "ext.conformance.reference.recall",
+      "args": {
+        "topic": "conformance"
+      }
+    },
+    {
+      "case_id": "remember-note",
+      "tool_name": "ext.conformance.reference.remember",
+      "args": {
+        "note": "A pack proves what it does."
+      }
+    }
+  ]
+}

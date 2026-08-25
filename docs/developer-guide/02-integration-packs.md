@@ -59,6 +59,7 @@ missing `summary` fails as a JSON decode error rather than a validation error
 | `wasm_module_path` | string | `wasm` (xor URL) | Must not start `/` nor contain `..` ([lib.rs:577](../../crates/crux-integrations/src/lib.rs#L577)) |
 | `wasm_module_url` | string | `wasm` (xor path) | Must start `https://` ([lib.rs:584](../../crates/crux-integrations/src/lib.rs#L584)) |
 | `wasm_module_sha256` | string | `wasm` | Exactly 64 lowercase hex chars ([lib.rs:564](../../crates/crux-integrations/src/lib.rs#L564)) |
+| `conformance` | object | no | `pack.conformance.v1` — the signed declaration of what the pack does. Only valid for `external_tool` / `wasm`. Full rules and the MIT schema: [docs/spec/pack-conformance-v1.md](../spec/pack-conformance-v1.md) ([conformance.rs](../../crates/crux-integrations/src/conformance.rs)) |
 
 ### `tools[]` entry
 
@@ -105,7 +106,12 @@ script) is expected to act on the recipe at `entry.path`.
 `manifest_hash()` hashes `ManifestSigningPayload`
 ([lib.rs:466](../../crates/crux-integrations/src/lib.rs#L466)): `schema`, `id`, `name`,
 `version`, `publisher_passport_fpr`, `summary`, `entry`, `capabilities`,
-`network`, `data_access`, `safety`.
+`network`, `data_access`, `safety`, and — when present — `conformance`.
+
+`conformance` is inside the signature deliberately: the whole value of a
+`pack.conformance.v1` declaration is that a pack cannot widen its own envelope
+after signing. It is skipped when absent, so a manifest signed before the block
+existed hashes and verifies unchanged.
 
 Fields **outside** the signature: `external_tool_endpoint`, `tools[]`,
 `wasm_module_path`, `wasm_module_url`, `wasm_module_sha256`, `hashes`,
@@ -259,6 +265,7 @@ Accepted truthy values for all three are exactly `1`, `true`, `TRUE`, `yes`,
 - [crates/crux-integrations/src/lib.rs:30](../../crates/crux-integrations/src/lib.rs#L30) — schema constants, first-party fingerprint
 - [crates/crux-integrations/src/lib.rs:98](../../crates/crux-integrations/src/lib.rs#L98) — `IntegrationManifest`
 - [crates/crux-integrations/src/lib.rs:154](../../crates/crux-integrations/src/lib.rs#L154) — `ExternalToolDefinition`
+- [crates/crux-integrations/src/conformance.rs](../../crates/crux-integrations/src/conformance.rs) — `PackConformance` (`pack.conformance.v1`), spec at [docs/spec/pack-conformance-v1.md](../spec/pack-conformance-v1.md)
 - [crates/crux-integrations/src/lib.rs:186](../../crates/crux-integrations/src/lib.rs#L186) — `EntryKind`
 - [crates/crux-integrations/src/lib.rs:438](../../crates/crux-integrations/src/lib.rs#L438) — `ValidationPolicy`
 - [crates/crux-integrations/src/lib.rs:466](../../crates/crux-integrations/src/lib.rs#L466) — `ManifestSigningPayload`

@@ -1,0 +1,37 @@
+{
+  "schema": "crux.integration.v1",
+  "id": "ext.conformance.reference",
+  "version": "0.2.0",
+  "external_tool_endpoint": "https://reference.pack.invalid/tools",
+  "tools": [
+    {
+      "name": "ext.conformance.reference.recall",
+      "description": "Return notes the pack previously stored. Read-only.",
+      "input_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "topic": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "ext.conformance.reference.remember",
+      "description": "Store one note under the pack's declared entity namespace.",
+      "input_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "note"
+        ],
+        "properties": {
+          "note": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  ]
+}

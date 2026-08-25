@@ -1,0 +1,202 @@
+{
+  "schema": "crux.integration.v1",
+  "id": "ext.conformance.reference",
+  "name": "Conformance Reference Pack",
+  "version": "0.2.0",
+  "publisher_passport_fpr": "p_ecd0588a5ccd437d9a6a5544d858939d",
+  "summary": "Worked example of a pack.conformance.v1 declaration: claimed capabilities, expected mutations, a content-addressed replay corpus, invariants, a behavioural envelope, and migration assertions.",
+  "entry": {
+    "kind": "external_tool",
+    "path": "tools/ext.conformance.reference.json"
+  },
+  "capabilities": [
+    "facts:read",
+    "facts:write"
+  ],
+  "network": {
+    "allowed_hosts": [
+      "reference.pack.invalid"
+    ],
+    "requires_user_token": false
+  },
+  "data_access": {
+    "tenant_scopes": [
+      "selected"
+    ],
+    "content_preview": false,
+    "private_facts": false
+  },
+  "safety": {
+    "sandbox": "none",
+    "max_runtime_ms": 2000,
+    "max_output_bytes": 16384
+  },
+  "hashes": {
+    "manifest": "blake3:00e1c65eb1b2f3d52a3e650a6a32865ecf9d9782ff5b8e43145da4bd2cb80478"
+  },
+  "signature": {
+    "alg": "ed25519",
+    "passport_fpr": "p_ecd0588a5ccd437d9a6a5544d858939d",
+    "public_key_hex": "b791b18a7eeb32c7f9149f30ba7270a8f41df434e731a704cd8e1d73e76f9848",
+    "sig": "8+SsjxyK2DP7aCdc0kBzPDZANp3nH188n9NgXDJJHbeT/F2uYbWFB7+xlRkYsoGxsEHOXuIcqVkk8hemQHzzAA=="
+  },
+  "external_tool_endpoint": "https://reference.pack.invalid/tools",
+  "tools": [
+    {
+      "name": "ext.conformance.reference.recall",
+      "description": "Return notes the pack previously stored. Read-only.",
+      "input_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "topic": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "ext.conformance.reference.remember",
+      "description": "Store one note under the pack's declared entity namespace.",
+      "input_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "note"
+        ],
+        "properties": {
+          "note": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  ],
+  "conformance": {
+    "schema": "pack.conformance.v1",
+    "claimed_capabilities": [
+      "facts:read",
+      "facts:write"
+    ],
+    "expected_mutations": {
+      "facts": [
+        {
+          "entity_prefix": "ext.conformance.reference::notes::",
+          "keys": [
+            "content"
+          ],
+          "operation": "write",
+          "private": false,
+          "max_per_call": 1
+        }
+      ],
+      "receipts": [
+        {
+          "receipt_kind": "dispatch",
+          "max_per_call": 1
+        },
+        {
+          "receipt_kind": "fact_write",
+          "max_per_call": 1
+        }
+      ]
+    },
+    "replay_corpus": {
+      "corpus_id": "conformance-reference-v1",
+      "path": "replay-corpus.json",
+      "sha256": "d9e28bdc05f55eb88260cea15ee4614d0f048b6c5dd4b542559e8d69b9abc449",
+      "cases": [
+        {
+          "case_id": "recall-default",
+          "tool_name": "ext.conformance.reference.recall",
+          "args": {}
+        },
+        {
+          "case_id": "recall-topic",
+          "tool_name": "ext.conformance.reference.recall",
+          "args": {
+            "topic": "conformance"
+          }
+        },
+        {
+          "case_id": "remember-note",
+          "tool_name": "ext.conformance.reference.remember",
+          "args": {
+            "note": "A pack proves what it does."
+          }
+        }
+      ]
+    },
+    "invariants": [
+      {
+        "id": "writes-stay-in-namespace",
+        "description": "Every fact write lands under ext.conformance.reference::notes::.",
+        "kind": "no_undeclared_fact_writes",
+        "applies_to_cases": []
+      },
+      {
+        "id": "no-private-reads",
+        "description": "The pack never reads a private fact; its data_access does not grant it.",
+        "kind": "no_private_fact_access",
+        "applies_to_cases": []
+      },
+      {
+        "id": "egress-pinned",
+        "description": "The pack reaches no host outside network.allowed_hosts.",
+        "kind": "no_egress_outside_allowlist",
+        "applies_to_cases": []
+      },
+      {
+        "id": "recall-is-deterministic",
+        "description": "Replaying either read twice yields the same observed behaviour.",
+        "kind": "deterministic_replay",
+        "applies_to_cases": [
+          "recall-default",
+          "recall-topic"
+        ]
+      },
+      {
+        "id": "writes-are-reversible",
+        "description": "The stored note can be fully reversed by one supersession.",
+        "kind": "reversible_writes",
+        "applies_to_cases": [
+          "remember-note"
+        ]
+      }
+    ],
+    "envelope": {
+      "max_tokens_per_call": 512,
+      "max_tokens_per_run": 2048,
+      "max_latency_ms_per_call": 2000,
+      "max_latency_ms_per_run": 8000,
+      "max_response_bytes_per_call": 16384,
+      "max_fact_writes_per_call": 1,
+      "decay": {
+        "min_half_life_seconds": 604800,
+        "max_refreshes_per_call": 0
+      },
+      "max_contradiction_rate_ppm": 0,
+      "undo": {
+        "max_operations_per_call": 1,
+        "max_latency_ms": 500
+      }
+    },
+    "compatibility": {
+      "min_daemon_version": "0.5.0",
+      "manifest_schema": "crux.integration.v1",
+      "supersedes": [
+        "0.1.0"
+      ],
+      "migrations": [
+        {
+          "from_version": "0.1.0",
+          "to_version": "0.2.0",
+          "kind": "supersede_facts",
+          "reversible": true,
+          "description": "Notes written by 0.1.0 are superseded by re-derived ones carrying the 0.2.0 key set; the superseded versions remain readable, so a rollback loses nothing."
+        }
+      ],
+      "rollback_safe": true
+    }
+  }
+}

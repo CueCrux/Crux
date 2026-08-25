@@ -1132,7 +1132,11 @@ pub(super) async fn record_extension_outcome(
 pub(super) struct ConformanceRunBody {
     /// Name of the shadow corpus these cases came from. Required — a
     /// behavioural result whose corpus is unnamed cannot be compared to
-    /// anything later.
+    /// anything later. May be omitted only for a pack that ships a
+    /// `pack.conformance.v1` block, in which case the signed
+    /// `replay_corpus.corpus_id` names the run; the precheck still refuses an
+    /// unnamed corpus when neither source supplies one.
+    #[serde(default)]
     pub corpus_id: String,
     #[serde(default)]
     pub passport_fpr: Option<String>,
@@ -1349,7 +1353,14 @@ pub(super) async fn run_extension_conformance(
     let cases = body
         .cases
         .unwrap_or_else(|| crate::pack_conformance::cases_from_manifest(&manifest));
-    if let Err(err) = crate::pack_conformance::precheck(&id, lifecycle, &body.corpus_id, &cases) {
+    let corpus_id = if body.corpus_id.trim().is_empty() {
+        crate::pack_conformance::corpus_id_from_manifest(&manifest)
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        body.corpus_id
+    };
+    if let Err(err) = crate::pack_conformance::precheck(&id, lifecycle, &corpus_id, &cases) {
         let status = match err {
             crate::pack_conformance::ConformanceError::NotStaged(_, _) => StatusCode::CONFLICT,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
@@ -1377,8 +1388,7 @@ pub(super) async fn run_extension_conformance(
         observations.push(crate::pack_conformance::observe(case, outcome));
     }
 
-    let run =
-        crate::pack_conformance::build_run(attribution, lifecycle, body.corpus_id, started_at_unix_ms, observations);
+    let run = crate::pack_conformance::build_run(attribution, lifecycle, corpus_id, started_at_unix_ms, observations);
     append_audit_event(
         &state.data_dir,
         &IntegrationAuditEvent::extension(
