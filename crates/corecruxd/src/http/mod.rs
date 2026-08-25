@@ -1240,6 +1240,13 @@ pub(crate) fn router_with_route_auth(
             "/v1/extensions/{id}/tools/{tool_name}/invoke",
             axum::routing::post(self::extensions::invoke_extension_tool),
         )
+        // Buyer-fit M5 staged-activation seam: staged / active /
+        // quarantined. A staged pack runs and is observed but commits
+        // nothing; a quarantined one is refused at dispatch.
+        .route(
+            "/v1/extensions/{id}/lifecycle",
+            axum::routing::post(self::extensions::set_extension_lifecycle),
+        )
         // Storybook readout — Phase 3 of the context graph.
         .route(
             "/v1/projects/{id}/storybook",

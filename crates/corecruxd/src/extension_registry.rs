@@ -18,6 +18,7 @@
 //! by adding per-extension grants and a tool dispatcher; both consume the
 //! [`InstalledExtension`] records this module produces.
 
+use crate::pack_lifecycle::PackLifecycleState;
 use corecrux_memory::fact_store::{FactQuery, FactStore, StoreFact};
 use crux_integrations::{
     append_audit_event, IntegrationAuditEvent, IntegrationError, IntegrationManifest, TrustTier, TrustedKeyring,
@@ -70,6 +71,12 @@ pub struct InstalledExtension {
     /// header at the time of `POST /v1/extensions/register`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_by_passport: Option<String>,
+    /// Staged / active / quarantined — the M5 staged-activation seam.
+    /// Defaulted, so records written before the seam existed read back as
+    /// [`PackLifecycleState::Active`] and no installed pack changes
+    /// behaviour on upgrade.
+    #[serde(default)]
+    pub lifecycle: PackLifecycleState,
 }
 
 /// Prefix of every [`PackAttribution::actor`] stamp. Namespaces pack
@@ -185,8 +192,41 @@ pub fn build_policy(data_dir: impl AsRef<Path>) -> Result<ValidationPolicy, Exte
     })
 }
 
+/// Persist (or re-persist) an install record.
+///
+/// One `try_store` of the `__extension__::{id}::record` fact — which is a
+/// new *version* of the same fact, so the previous record stays in the
+/// supersession chain and every rewrite is one commit point that either
+/// happens or does not. [`crate::pack_lifecycle`] and the rollback path
+/// both go through here rather than each open-coding the write, so there is
+/// a single place where a record's shape and privacy posture are decided.
+pub fn put_record(store: &mut FactStore, record: &InstalledExtension) -> Result<(), ExtensionsError> {
+    let mut sf = StoreFact {
+        tenant_hash: "default".to_string(),
+        entity: entity_for(&record.manifest.id),
+        key: EXTENSION_RECORD_KEY.to_string(),
+        value: serde_json::to_string(record)?,
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+        horizon_class: None,
+        actor: None,
+    };
+    // Force-private via the global gate (the `__extension__::` prefix is
+    // in `fact_privacy::DEFAULT_PRIVATE_PREFIXES`).
+    crate::fact_privacy::enforce_global(&mut sf);
+    store.try_store(sf)?;
+    Ok(())
+}
+
 /// Install an extension. Validates the signed manifest against the
 /// operator keyring; persists the install record on success.
+///
+/// `initial_state` decides whether the pack is live the moment it is
+/// installed or has to be replayed and activated first — see
+/// [`crate::pack_lifecycle::default_install_state`]. It is a parameter
+/// rather than an env read so this function stays a pure function of its
+/// arguments.
 ///
 /// `allow_unsigned_dev_bypass=true` permits installing an unsigned
 /// manifest and tags the trust tier `Unknown`. Operators set this only
@@ -197,6 +237,7 @@ pub fn install_extension(
     data_dir: impl AsRef<Path>,
     manifest: IntegrationManifest,
     installed_by_passport: Option<String>,
+    initial_state: PackLifecycleState,
     now_unix_ms: u64,
     allow_unsigned_dev_bypass: bool,
 ) -> Result<InstalledExtension, ExtensionsError> {
@@ -230,23 +271,9 @@ pub fn install_extension(
         trust_tier,
         installed_at_unix_ms: now_unix_ms,
         installed_by_passport: installed_by_passport.filter(|s| !s.trim().is_empty()),
+        lifecycle: initial_state,
     };
-    let value = serde_json::to_string(&record)?;
-    let mut sf = StoreFact {
-        tenant_hash: "default".to_string(),
-        entity: entity_for(&manifest.id),
-        key: EXTENSION_RECORD_KEY.to_string(),
-        value,
-        source_receipt: None,
-        confidence: 1.0,
-        private: false,
-        horizon_class: None,
-        actor: None,
-    };
-    // Force-private via the global gate (the `__extension__::` prefix is
-    // in `fact_privacy::DEFAULT_PRIVATE_PREFIXES`).
-    crate::fact_privacy::enforce_global(&mut sf);
-    store.try_store(sf)?;
+    put_record(store, &record)?;
     append_audit_event(
         &data_dir,
         &IntegrationAuditEvent::extension(
@@ -259,6 +286,7 @@ pub fn install_extension(
             serde_json::json!({
                 "manifest_hash": record.manifest_hash,
                 "trust_tier": record.trust_tier,
+                "lifecycle": record.lifecycle,
             }),
         ),
     );
@@ -336,6 +364,11 @@ mod tests {
     };
     use ed25519_dalek::SigningKey;
 
+    /// These cases predate the staged-activation seam and are about
+    /// install/validation, not lifecycle — they install live, which is also
+    /// what the default operator posture does.
+    const ACTIVE: PackLifecycleState = PackLifecycleState::Active;
+
     fn fixture_manifest(id: &str, publisher_fpr: &str) -> IntegrationManifest {
         IntegrationManifest {
             schema: INTEGRATION_SCHEMA_V1.to_string(),
@@ -397,6 +430,7 @@ mod tests {
             dir.path(),
             manifest,
             Some("agent-claude".to_string()),
+            ACTIVE,
             17_700_000_000_000,
             false,
         )
@@ -437,8 +471,8 @@ mod tests {
         sign_manifest(&mut manifest, &key, "p_alice").expect("sign");
 
         let mut store = FactStore::new();
-        install_extension(&mut store, dir.path(), manifest.clone(), None, 1, false).expect("first install");
-        let err = install_extension(&mut store, dir.path(), manifest, None, 2, false).expect_err("dup");
+        install_extension(&mut store, dir.path(), manifest.clone(), None, ACTIVE, 1, false).expect("first install");
+        let err = install_extension(&mut store, dir.path(), manifest, None, ACTIVE, 2, false).expect_err("dup");
         assert!(matches!(err, ExtensionsError::AlreadyInstalled(_)));
     }
 
@@ -453,8 +487,8 @@ mod tests {
         // Validate-time the integrations crate will already complain about
         // the id, but our install_extension ALSO validates first; ensure
         // the right error class fires.
-        let err =
-            install_extension(&mut store_temp(), dir.path(), manifest.clone(), None, 1, true).expect_err("invalid id");
+        let err = install_extension(&mut store_temp(), dir.path(), manifest.clone(), None, ACTIVE, 1, true)
+            .expect_err("invalid id");
         // Could be either our InvalidId (preferred) or the integrations
         // crate's identifier check (also acceptable). Accept either.
         match err {
@@ -472,8 +506,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         // Empty keyring; no signature.
         let manifest = fixture_manifest("ext.example.unsigned", "p_alice");
-        let err =
-            install_extension(&mut store_temp(), dir.path(), manifest, None, 1, false).expect_err("unsigned must fail");
+        let err = install_extension(&mut store_temp(), dir.path(), manifest, None, ACTIVE, 1, false)
+            .expect_err("unsigned must fail");
         assert!(matches!(
             err,
             ExtensionsError::ManifestInvalid(IntegrationError::SignatureRequired)
@@ -485,7 +519,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let manifest = fixture_manifest("ext.example.unsigned", "p_alice");
         let mut store = FactStore::new();
-        let installed = install_extension(&mut store, dir.path(), manifest, None, 1, true).expect("bypass");
+        let installed = install_extension(&mut store, dir.path(), manifest, None, ACTIVE, 1, true).expect("bypass");
         assert_eq!(installed.trust_tier, TrustTier::Unknown);
     }
 
@@ -504,7 +538,8 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("integrations").join("audit.jsonl")).expect("blocking directory");
 
         let mut store = FactStore::new();
-        let installed = install_extension(&mut store, dir.path(), manifest, None, 1, true).expect("install succeeds");
+        let installed =
+            install_extension(&mut store, dir.path(), manifest, None, ACTIVE, 1, true).expect("install succeeds");
         assert_eq!(installed.manifest.id, "ext.example.audit-failure");
         assert!(get_extension(&store, "ext.example.audit-failure").is_some());
     }
@@ -521,8 +556,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let manifest = fixture_manifest("ext.example.quote", "p_alice");
         let mut store = FactStore::new();
-        let installed =
-            install_extension(&mut store, dir.path(), manifest, None, 17_700_000_000_000, true).expect("install");
+        let installed = install_extension(&mut store, dir.path(), manifest, None, ACTIVE, 17_700_000_000_000, true)
+            .expect("install");
 
         let attribution = PackAttribution::from_installed(&installed);
         assert_eq!(attribution.extension_id, "ext.example.quote");
@@ -557,9 +592,9 @@ mod tests {
         assert_eq!(first.version, second.version);
 
         let mut store_a = FactStore::new();
-        let a = install_extension(&mut store_a, dir.path(), first, None, 1, true).expect("install a");
+        let a = install_extension(&mut store_a, dir.path(), first, None, ACTIVE, 1, true).expect("install a");
         let mut store_b = FactStore::new();
-        let b = install_extension(&mut store_b, dir.path(), second, None, 2, true).expect("install b");
+        let b = install_extension(&mut store_b, dir.path(), second, None, ACTIVE, 2, true).expect("install b");
 
         assert_ne!(
             PackAttribution::from_installed(&a).actor(),
