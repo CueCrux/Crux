@@ -801,22 +801,44 @@ pub(super) async fn invoke_extension_tool(
     let calling_clone = calling_passport.clone();
     let rid = request_id.clone();
     let data_dir = state.data_dir.clone();
+    // A staged call takes the unaudited variant: the staged branch below
+    // writes an `extension_invoke_staged` row instead, so exactly one audit
+    // row describes this call and it says which mode the call ran in.
+    // Without that, `extension_invoke_ok` would mean "live or replayed" and
+    // the per-pack outcome stream would credit a pack for being replayed.
+    let live = lifecycle.commits_writes();
     let dispatch_result = tokio::task::spawn_blocking(move || {
         let transport = crate::extension_outbound::UreqTransport;
-        crate::extension_outbound::dispatch_external_tool(
-            &transport,
-            &rate_table,
-            &cfg,
-            &data_dir,
-            &manifest_clone,
-            &attribution,
-            &grant_clone,
-            &tool_name,
-            &args,
-            &calling_clone,
-            &rid,
-            None, // M5 will pull the auth secret via `encrypted_secrets`
-        )
+        if live {
+            crate::extension_outbound::dispatch_external_tool(
+                &transport,
+                &rate_table,
+                &cfg,
+                &data_dir,
+                &manifest_clone,
+                &attribution,
+                &grant_clone,
+                &tool_name,
+                &args,
+                &calling_clone,
+                &rid,
+                None, // M5 will pull the auth secret via `encrypted_secrets`
+            )
+        } else {
+            crate::extension_outbound::dispatch_external_tool_staged(
+                &transport,
+                &rate_table,
+                &cfg,
+                &manifest_clone,
+                &attribution,
+                &grant_clone,
+                &tool_name,
+                &args,
+                &calling_clone,
+                &rid,
+                None,
+            )
+        }
     })
     .await;
 
@@ -880,6 +902,121 @@ pub(super) async fn invoke_extension_tool(
             )
                 .into_response()
         }
+    }
+}
+
+// ── Outcome events (buyer-fit M5 frontier seam) ──────────────────────────
+
+/// `GET /v1/extensions/{id}/outcomes` — what became of this pack's writes,
+/// plus its dispatch and lifecycle history.
+///
+/// Mostly *derived* rather than stored: corrections, supersessions and decay
+/// are re-computed from the fact store on every read, and dispatch history
+/// is re-read from the audit tail. Each event names the fact or audit row it
+/// came from, which is what makes the score
+/// `proof-carrying-adaptive-packs-2026-07-13` M3 builds on this traceable
+/// rather than asserted.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn list_extension_outcomes(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    let audit = crux_integrations::read_audit_tail(&state.data_dir, crate::pack_outcomes::AUDIT_TAIL_SCAN_LIMIT)
+        .unwrap_or_default();
+    let store = state.fact_store.read().await;
+    if crate::extension_registry::get_extension(&store, &id).is_none() {
+        drop(store);
+        return problem_response(StatusCode::NOT_FOUND, format!("extension '{id}' not installed"));
+    }
+    let events = crate::pack_outcomes::collect_outcomes(
+        &store,
+        &audit,
+        &corecrux_memory::fact_store::default_tenant_hash(),
+        &id,
+        chrono::Utc::now(),
+    );
+    drop(store);
+
+    let totals = crate::pack_outcomes::totals(&events);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "schema": "crux.extensions.outcomes.v1",
+            "extension_id": id,
+            "count": events.len(),
+            "totals": totals,
+            "events": events,
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct RecordOutcomeBody {
+    pub kind: crate::pack_outcomes::PackOutcomeKind,
+    #[serde(default)]
+    pub subject: Option<crate::pack_outcomes::PackOutcomeSubject>,
+    /// Why the caller is asserting this. Free-form, but it is the only thing
+    /// standing behind a recorded outcome, so an empty object makes for a
+    /// score movement nobody can explain later.
+    #[serde(default)]
+    pub evidence: serde_json::Value,
+}
+
+/// `POST /v1/extensions/{id}/outcomes` — record a judgement the daemon
+/// cannot derive: a rejected or accepted recall, or a cross-agent signal.
+///
+/// Derivable kinds are refused. Accepting a posted `correction` or `decayed`
+/// would let a caller assert what the fact store contradicts, and the whole
+/// value of this seam is that most of the evidence is re-checkable.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn record_extension_outcome(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<RecordOutcomeBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
+        return problem.into_response();
+    }
+    let actor = extract_passport_id(&headers);
+    let now = now_unix_ms();
+    let nonce = make_request_id();
+    let mut store = state.fact_store.write().await;
+    let Some(installed) = crate::extension_registry::get_extension(&store, &id) else {
+        drop(store);
+        return problem_response(StatusCode::NOT_FOUND, format!("extension '{id}' not installed"));
+    };
+    let attribution = crate::extension_registry::PackAttribution::from_installed(&installed);
+    let mut evidence = body.evidence;
+    if let Some(object) = evidence.as_object_mut() {
+        // Who asserted this is part of the evidence, not metadata: a
+        // recorded outcome is one party's judgement and has to say whose.
+        object.insert("reported_by".to_string(), serde_json::json!(actor));
+    }
+    let result = crate::pack_outcomes::record_outcome(
+        &mut store,
+        &id,
+        crate::pack_outcomes::RecordOutcomeInput {
+            pack: attribution,
+            kind: body.kind,
+            subject: body.subject,
+            evidence,
+            now_unix_ms: now,
+            nonce,
+        },
+    );
+    drop(store);
+    match result {
+        Ok(event) => (StatusCode::CREATED, Json(event)).into_response(),
+        Err(err @ crate::pack_outcomes::OutcomeError::NotRecordable(_)) => {
+            problem_response(StatusCode::UNPROCESSABLE_ENTITY, err.to_string())
+        }
+        Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
     }
 }
 
@@ -950,20 +1087,20 @@ async fn run_staged_operation(
 
     let cfg = crate::extension_outbound::OutboundConfig::from_env();
     let rate_table = state.extension_rate_table.clone();
-    let data_dir = state.data_dir.clone();
     let manifest_clone = manifest.clone();
     let attribution_clone = attribution.clone();
     let grant_clone = grant.clone();
     let tool = tool_name.to_string();
     let passport = calling_passport.to_string();
     let request_id = make_request_id();
+    // Unaudited: a replay is not an invocation. The conformance run writes
+    // one `extension_conformance_run` row for the whole run instead.
     let dispatched = tokio::task::spawn_blocking(move || {
         let transport = crate::extension_outbound::UreqTransport;
-        crate::extension_outbound::dispatch_external_tool(
+        crate::extension_outbound::dispatch_external_tool_staged(
             &transport,
             &rate_table,
             &cfg,
-            &data_dir,
             &manifest_clone,
             &attribution_clone,
             &grant_clone,

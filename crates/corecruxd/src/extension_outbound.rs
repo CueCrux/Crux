@@ -425,6 +425,52 @@ pub fn dispatch_external_tool(
     result
 }
 
+/// [`dispatch_external_tool`] for a call that is **not live** — a staged
+/// invoke or a conformance replay.
+///
+/// Identical dispatch; the only difference is that it writes no
+/// `extension_invoke_*` audit row. The caller writes an
+/// `extension_invoke_staged` or `extension_conformance_run` row instead,
+/// so exactly one row describes each call and it says which mode the call
+/// ran in.
+///
+/// This exists because the alternative is worse. Leaving the audited path
+/// in place for staged calls made `extension_invoke_ok` mean "an outbound
+/// call succeeded, live or replayed", and the per-pack outcome stream
+/// built on that trail then reported a `dispatch_ok` for every replay —
+/// which would let a pack accumulate operational credit purely by being
+/// replayed. `dispatch_ok` has to mean *the pack worked in production*, or
+/// the score `proof-carrying-adaptive-packs-2026-07-13` M3 derives from it
+/// is gameable by construction.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_external_tool_staged(
+    transport: &dyn OutboundTransport,
+    rate_table: &RateTable,
+    config: &OutboundConfig,
+    manifest: &IntegrationManifest,
+    attribution: &PackAttribution,
+    grant: &crate::extension_grants::ExtensionGrant,
+    tool_name: &str,
+    args: &serde_json::Value,
+    calling_passport_fpr: &str,
+    request_id: &str,
+    auth_secret_resolved: Option<String>,
+) -> Result<(DispatchOutcome, ExternalToolResponse), OutboundError> {
+    dispatch_external_tool_inner(
+        transport,
+        rate_table,
+        config,
+        manifest,
+        attribution,
+        grant,
+        tool_name,
+        args,
+        calling_passport_fpr,
+        request_id,
+        auth_secret_resolved,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_external_tool_inner(
     transport: &dyn OutboundTransport,
@@ -1572,6 +1618,63 @@ mod tests {
                 event.action
             );
         }
+    }
+
+    /// A replay is not an invocation. If a staged call wrote an
+    /// `extension_invoke_ok` row, the per-pack outcome stream built on the
+    /// audit trail would report a `dispatch_ok` for every replay — letting
+    /// a pack accumulate operational credit purely by being replayed.
+    #[test]
+    fn a_staged_dispatch_writes_no_invoke_audit_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rates = RateTable::new();
+        let m = manifest("ext.example.unaudited");
+        let g = grant("ext.example.unaudited", "p_alice");
+
+        let transport = MockTransport::new(vec![happy_response()]);
+        let (staged, _) = dispatch_external_tool_staged(
+            &transport,
+            &rates,
+            &OutboundConfig::default(),
+            &m,
+            &attribution_for(&m),
+            &g,
+            "quote.daily",
+            &serde_json::json!({}),
+            "p_alice",
+            "req-staged",
+            None,
+        )
+        .expect("staged dispatch still dispatches");
+        assert_eq!(staged.accepted_fact_writes, 1, "the call itself is unchanged");
+        assert!(
+            crux_integrations::read_audit_tail(dir.path(), 50)
+                .expect("audit")
+                .is_empty(),
+            "a staged dispatch must leave the invoke audit trail untouched"
+        );
+
+        // The live path over the same inputs still audits — the difference
+        // is the mode, not the transport.
+        let transport = MockTransport::new(vec![happy_response()]);
+        dispatch_external_tool(
+            &transport,
+            &rates,
+            &OutboundConfig::default(),
+            dir.path(),
+            &m,
+            &attribution_for(&m),
+            &g,
+            "quote.daily",
+            &serde_json::json!({}),
+            "p_alice",
+            "req-live",
+            None,
+        )
+        .expect("live dispatch");
+        let audit = crux_integrations::read_audit_tail(dir.path(), 50).expect("audit");
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].action, AUDIT_EXTENSION_INVOKE_OK);
     }
 
     /// Storage half: every write this call persists is stamped, and the

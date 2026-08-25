@@ -15,7 +15,7 @@
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
 //
-// 195 read endpoints, generated from the route manifest.
+// 196 read endpoints, generated from the route manifest.
 
 /**
  * Append a plain query object to a path as a URL search string.
@@ -407,6 +407,9 @@ const CruxApi = Object.freeze({
   },
   extensionsByIdGrants(id, query) {
     return fetch(withQuery(`/v1/extensions/${encodeURIComponent(id)}/grants`, query), { credentials: 'same-origin' });
+  },
+  extensionsByIdOutcomes(id, query) {
+    return fetch(withQuery(`/v1/extensions/${encodeURIComponent(id)}/outcomes`, query), { credentials: 'same-origin' });
   },
   facts(query) {
     return fetch(withQuery(`/v1/facts`, query), { credentials: 'same-origin' });
