@@ -2175,6 +2175,89 @@ mod tests {
         assert!(other_build.reason.contains("different build"), "{other_build}");
     }
 
+    /// The gate across both of the ways a pack goes live, end to end.
+    ///
+    /// Installing a pack live is not a lifecycle *transition*, so it never
+    /// reaches [`crate::pack_lifecycle::set_lifecycle`]; without
+    /// [`crate::pack_lifecycle::initial_install_state`] an enforcing
+    /// operator would get the gate on the transition route and a live,
+    /// never-replayed pack on the install route. Here the enforced install
+    /// lands staged, promotion is refused while nothing has been proved,
+    /// and a passing replay of that exact build is what takes it live —
+    /// the gate refuses an unproved pack without stranding a good one.
+    #[test]
+    fn an_enforced_install_lands_staged_and_goes_live_only_on_a_passing_replay() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = FactStore::new();
+        let mut manifest = conforming_manifest();
+        // The registry validates what the replay fixtures do not need.
+        for definition in &mut manifest.tools {
+            definition.description = "Remembers and recalls notes.".to_string();
+        }
+
+        let initial = crate::pack_lifecycle::initial_install_state(
+            PackLifecycleState::Active,
+            ActivationGate::Enforced,
+            &manifest,
+        );
+        assert_eq!(
+            initial,
+            PackLifecycleState::Staged,
+            "install is a way of going live, so the gate has to reach it"
+        );
+        let installed = crate::extension_registry::install_extension(
+            &mut store,
+            dir.path(),
+            manifest.clone(),
+            None,
+            initial,
+            17_700_000_000_000,
+            true,
+        )
+        .expect("install");
+        assert_eq!(installed.lifecycle, PackLifecycleState::Staged);
+
+        let promote = |store: &mut FactStore, now| {
+            crate::pack_lifecycle::set_lifecycle(
+                store,
+                dir.path(),
+                "ext.example.notes",
+                PackLifecycleState::Active,
+                None,
+                None,
+                now,
+                ActivationGate::Enforced,
+            )
+        };
+        let err = promote(&mut store, 17_700_000_001_000).expect_err("nothing has been proved yet");
+        assert!(
+            matches!(err, crate::pack_lifecycle::LifecycleError::ActivationBlocked(_)),
+            "{err}"
+        );
+
+        // Replay this exact build against its own corpus, staged, twice.
+        let pack = PackAttribution::from_installed(&installed);
+        let mut first = clean_run(3, 1);
+        let mut second = clean_run(11, 2);
+        first.pack = pack.clone();
+        second.pack = pack.clone();
+        let record = evaluate(ReplayInput {
+            pack,
+            manifest: &manifest,
+            corpus: &loaded_corpus(),
+            first: &first,
+            second: &second,
+            started_at_unix_ms: 17_700_000_002_000,
+        })
+        .expect("evaluate");
+        assert_eq!(record.verdict, ReplayVerdict::Pass);
+        put_replay_record(&mut store, &record).expect("store record");
+
+        let (promoted, transition) = promote(&mut store, 17_700_000_003_000).expect("a passing replay licenses it");
+        assert_eq!(promoted.lifecycle, PackLifecycleState::Active);
+        assert_eq!(transition.from, PackLifecycleState::Staged);
+    }
+
     /// A pack that declares nothing is never blocked. It made no promise, so
     /// there is nothing a replay could contradict — and every pack installed
     /// before this milestone is in exactly that position.
