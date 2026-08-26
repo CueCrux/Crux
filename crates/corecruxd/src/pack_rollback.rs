@@ -487,6 +487,7 @@ mod tests {
             Some("contradiction rate"),
             None,
             4,
+            crate::pack_replay::ActivationGate::Advisory,
         )
         .expect("quarantine");
         assert_eq!(

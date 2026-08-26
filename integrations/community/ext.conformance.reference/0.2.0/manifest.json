@@ -32,13 +32,13 @@
     "max_output_bytes": 16384
   },
   "hashes": {
-    "manifest": "blake3:00e1c65eb1b2f3d52a3e650a6a32865ecf9d9782ff5b8e43145da4bd2cb80478"
+    "manifest": "blake3:282cb46643752d9867e3cbf908191235f5f378d07b1c921e853bf15753323615"
   },
   "signature": {
     "alg": "ed25519",
     "passport_fpr": "p_ecd0588a5ccd437d9a6a5544d858939d",
     "public_key_hex": "b791b18a7eeb32c7f9149f30ba7270a8f41df434e731a704cd8e1d73e76f9848",
-    "sig": "8+SsjxyK2DP7aCdc0kBzPDZANp3nH188n9NgXDJJHbeT/F2uYbWFB7+xlRkYsoGxsEHOXuIcqVkk8hemQHzzAA=="
+    "sig": "ixnkFvGIk9wn0dOxlGW9ZNWPxFV1cojndlocfs40lRwEKa9EsqjXtOH/G/BAq6fW5uQwKKbt8xZOC0sJyZ5oBA=="
   },
   "external_tool_endpoint": "https://reference.pack.invalid/tools",
   "tools": [
@@ -104,7 +104,7 @@
     "replay_corpus": {
       "corpus_id": "conformance-reference-v1",
       "path": "replay-corpus.json",
-      "sha256": "d9e28bdc05f55eb88260cea15ee4614d0f048b6c5dd4b542559e8d69b9abc449",
+      "sha256": "b160a35eeca1d3a4defc25481035d05c7da95826e0a50809de9adde5d63dd526",
       "cases": [
         {
           "case_id": "recall-default",

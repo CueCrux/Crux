@@ -1265,6 +1265,13 @@ pub(crate) fn router_with_route_auth(
             "/v1/extensions/{id}/outcomes",
             axum::routing::post(self::extensions::record_extension_outcome),
         )
+        // Shadow-corpus staging + replay (proof-carrying-adaptive-packs M1):
+        // the conformance hook's evidence, judged against the pack's signed
+        // envelope, ending in a stored verdict.
+        .route(
+            "/v1/extensions/{id}/replay",
+            axum::routing::post(self::extensions::run_extension_replay),
+        )
         // Buyer-fit M5 atomic-rollback seam: the install record's own
         // version chain is the pin ledger; a rollback is one write.
         .route(

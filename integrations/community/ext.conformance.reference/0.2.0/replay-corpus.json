@@ -1,6 +1,46 @@
 {
+  "schema": "crux.pack.shadow_corpus.v1",
   "corpus_id": "conformance-reference-v1",
-  "description": "Three declared operations replayed against a local shadow corpus: two reads that must be deterministic, and one write that must stay inside the declared namespace and be reversible.",
+  "description": "Three declared operations replayed against a local shadow corpus: two reads that must be deterministic, and one write that must stay inside the declared namespace and be reversible. Seeded, offline, and content-addressed — no network, no customer data.",
+  "seed_facts": [
+    {
+      "entity": "ext.conformance.reference::notes::seed-1",
+      "key": "content",
+      "value": "A pack is trusted from behavioural evidence, not from a download count.",
+      "confidence": 1.0,
+      "private": false
+    },
+    {
+      "entity": "ext.conformance.reference::notes::seed-2",
+      "key": "content",
+      "value": "Conformance is declared before it is replayed.",
+      "confidence": 0.9,
+      "private": false
+    },
+    {
+      "entity": "personal::journal::example",
+      "key": "content",
+      "value": "example-private-line-never-echoed",
+      "confidence": 1.0,
+      "private": true
+    }
+  ],
+  "probes": [
+    {
+      "probe_id": "evidence-stays-citable",
+      "query": "behavioural evidence",
+      "expect_entities": [
+        "ext.conformance.reference::notes::seed-1"
+      ]
+    },
+    {
+      "probe_id": "declaration-stays-citable",
+      "query": "declared",
+      "expect_entities": [
+        "ext.conformance.reference::notes::seed-2"
+      ]
+    }
+  ],
   "cases": [
     {
       "case_id": "recall-default",

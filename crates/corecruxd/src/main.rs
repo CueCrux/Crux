@@ -106,6 +106,7 @@ mod ops_events;
 mod pack_conformance;
 mod pack_lifecycle;
 mod pack_outcomes;
+mod pack_replay;
 mod pack_rollback;
 mod passports;
 mod plane_layer_sync;

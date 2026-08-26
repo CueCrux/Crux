@@ -131,6 +131,12 @@ pub struct LifecycleTransition {
 pub enum LifecycleError {
     #[error("extension '{0}' not found")]
     NotFound(String),
+    /// The pre-enable shadow replay refused this build
+    /// (`proof-carrying-adaptive-packs-2026-07-13` M1). Only reachable with
+    /// [`crate::pack_replay::ActivationGate::Enforced`]; the pack stays
+    /// where it was.
+    #[error(transparent)]
+    ActivationBlocked(#[from] crate::pack_replay::ActivationBlocked),
     /// Leaving quarantine is the one transition that must not be silent:
     /// it re-admits a pack that something already judged unsafe, so the
     /// justification is part of the record, not an afterthought.
@@ -152,6 +158,15 @@ pub enum LifecycleError {
 /// A no-op transition (`from == to`) is still recorded. That is deliberate:
 /// a re-affirmation of "yes, this stays quarantined" carries an actor and a
 /// reason, and dropping it would lose the operator's decision.
+///
+/// `gate` decides whether a move *into* [`PackLifecycleState::Active`] has
+/// to be licensed by a passing shadow replay
+/// (`proof-carrying-adaptive-packs-2026-07-13` M1). It is a parameter
+/// rather than an env read for the same reason `initial_state` is: this
+/// stays a pure function of its arguments and tests never race on process
+/// env. Every path that takes a pack live goes through here, so the check
+/// lives in one place rather than at whichever caller remembered it.
+#[allow(clippy::too_many_arguments)]
 pub fn set_lifecycle(
     store: &mut FactStore,
     data_dir: impl AsRef<Path>,
@@ -160,6 +175,7 @@ pub fn set_lifecycle(
     reason: Option<&str>,
     actor: Option<&str>,
     now_unix_ms: u64,
+    gate: crate::pack_replay::ActivationGate,
 ) -> Result<(InstalledExtension, LifecycleTransition), LifecycleError> {
     let mut record =
         get_extension(store, extension_id).ok_or_else(|| LifecycleError::NotFound(extension_id.to_string()))?;
@@ -168,6 +184,9 @@ pub fn set_lifecycle(
 
     if from == PackLifecycleState::Quarantined && to != PackLifecycleState::Quarantined && reason.is_none() {
         return Err(LifecycleError::ReasonRequired);
+    }
+    if to == PackLifecycleState::Active && gate == crate::pack_replay::ActivationGate::Enforced {
+        crate::pack_replay::check_activation(store, extension_id, &record.manifest, &record.manifest_hash)?;
     }
 
     record.lifecycle = to;
@@ -395,6 +414,7 @@ mod tests {
             Some("replay clean"),
             Some("agent-claude"),
             17_700_000_000_001,
+            crate::pack_replay::ActivationGate::Advisory,
         )
         .expect("activate");
 
@@ -434,6 +454,7 @@ mod tests {
             Some("cost blowup"),
             None,
             2,
+            crate::pack_replay::ActivationGate::Advisory,
         )
         .expect("quarantine");
         assert_eq!(PackAttribution::from_installed(&record).actor(), before);
@@ -454,6 +475,7 @@ mod tests {
             Some("contradiction rate"),
             None,
             2,
+            crate::pack_replay::ActivationGate::Advisory,
         )
         .expect("quarantine");
 
@@ -465,6 +487,7 @@ mod tests {
             Some("   "),
             None,
             3,
+            crate::pack_replay::ActivationGate::Advisory,
         )
         .expect_err("blank reason is no reason");
         assert!(matches!(err, LifecycleError::ReasonRequired));
@@ -483,6 +506,7 @@ mod tests {
             Some("operator override: false positive"),
             Some("p_alice"),
             4,
+            crate::pack_replay::ActivationGate::Advisory,
         )
         .expect("override with a reason is allowed");
     }
@@ -502,6 +526,7 @@ mod tests {
             None,
             None,
             2,
+            crate::pack_replay::ActivationGate::Advisory,
         )
         .expect("quarantine without a reason");
         assert_eq!(record.lifecycle, PackLifecycleState::Quarantined);
@@ -607,6 +632,131 @@ mod tests {
         }
     }
 
+    /// The pre-enable gate, at the one function every lifecycle move goes
+    /// through: with enforcement on, a declaring pack whose shadow replay
+    /// was blocked cannot be taken live, and it stays exactly where it was
+    /// (`proof-carrying-adaptive-packs-2026-07-13` M1).
+    #[test]
+    fn an_envelope_violating_pack_cannot_be_taken_live_when_the_gate_is_enforced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = FactStore::new();
+        let mut manifest = fixture_manifest("ext.example.quote");
+        // A conformance block only means something on a pack that executes,
+        // so the declaration validator refuses any other entry kind.
+        manifest.entry.kind = crux_integrations::EntryKind::ExternalTool;
+        manifest.external_tool_endpoint = Some("https://quote.pack.invalid/tools".to_string());
+        manifest.network.allowed_hosts = vec!["quote.pack.invalid".to_string()];
+        manifest.tools = vec![crux_integrations::ExternalToolDefinition {
+            name: "ext.example.quote.daily".to_string(),
+            description: "Returns a quote.".to_string(),
+            input_schema: serde_json::json!({}),
+            consequence_metadata: None,
+            auth_shared_secret_id: None,
+        }];
+        manifest.conformance = Some(declaring_conformance());
+        let installed = install_extension(
+            &mut store,
+            dir.path(),
+            manifest,
+            None,
+            PackLifecycleState::Staged,
+            17_700_000_000_000,
+            true,
+        )
+        .expect("install");
+
+        // No replay on record at all: a declaring pack has proved nothing.
+        let err = set_lifecycle(
+            &mut store,
+            dir.path(),
+            "ext.example.quote",
+            PackLifecycleState::Active,
+            None,
+            None,
+            1,
+            crate::pack_replay::ActivationGate::Enforced,
+        )
+        .expect_err("an unproved declaring pack must not go live");
+        assert!(matches!(err, LifecycleError::ActivationBlocked(_)), "{err}");
+        assert_eq!(
+            get_extension(&store, "ext.example.quote").expect("re-read").lifecycle,
+            PackLifecycleState::Staged,
+            "a refused activation must leave the pack staged"
+        );
+
+        // Advisory (the shipped default) reports rather than refuses, so no
+        // pack changes behaviour until an operator turns the gate on.
+        set_lifecycle(
+            &mut store,
+            dir.path(),
+            "ext.example.quote",
+            PackLifecycleState::Active,
+            None,
+            None,
+            2,
+            crate::pack_replay::ActivationGate::Advisory,
+        )
+        .expect("advisory must permit");
+        assert_eq!(
+            PackAttribution::from_installed(&installed).manifest_hash,
+            installed.manifest_hash
+        );
+    }
+
+    /// The smallest declaration that parses: enough to make the pack a
+    /// *declaring* pack, which is what arms the gate.
+    fn declaring_conformance() -> crux_integrations::conformance::PackConformance {
+        use crux_integrations::conformance::*;
+        PackConformance {
+            schema: PACK_CONFORMANCE_SCHEMA_V1.to_string(),
+            claimed_capabilities: vec!["facts:read".to_string()],
+            expected_mutations: ExpectedMutations {
+                facts: Vec::new(),
+                receipts: Vec::new(),
+            },
+            replay_corpus: ReplayCorpus {
+                corpus_id: "quote-shadow-v1".to_string(),
+                path: "replay-corpus.json".to_string(),
+                sha256: "0".repeat(64),
+                cases: vec![DeclaredCase {
+                    case_id: "daily".to_string(),
+                    tool_name: "ext.example.quote.daily".to_string(),
+                    args: serde_json::json!({}),
+                }],
+            },
+            invariants: vec![InvariantTest {
+                id: "egress-pinned".to_string(),
+                description: "The pack reaches no host outside network.allowed_hosts.".to_string(),
+                kind: InvariantKind::NoEgressOutsideAllowlist,
+                applies_to_cases: Vec::new(),
+            }],
+            envelope: BehaviouralEnvelope {
+                max_tokens_per_call: 128,
+                max_tokens_per_run: 512,
+                max_latency_ms_per_call: 1_000,
+                max_latency_ms_per_run: 4_000,
+                max_response_bytes_per_call: 4_096,
+                max_fact_writes_per_call: 0,
+                decay: DecayEnvelope {
+                    min_half_life_seconds: 0,
+                    max_refreshes_per_call: 0,
+                },
+                max_contradiction_rate_ppm: 0,
+                undo: UndoEnvelope {
+                    max_operations_per_call: 0,
+                    max_latency_ms: 100,
+                },
+            },
+            compatibility: CompatibilityAssertions {
+                min_daemon_version: "0.5.0".to_string(),
+                manifest_schema: crux_integrations::INTEGRATION_SCHEMA_V1.to_string(),
+                supersedes: Vec::new(),
+                migrations: Vec::new(),
+                rollback_safe: true,
+            },
+        }
+    }
+
     #[test]
     fn transition_on_a_missing_extension_is_not_found() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -619,6 +769,7 @@ mod tests {
             None,
             None,
             1,
+            crate::pack_replay::ActivationGate::Advisory,
         )
         .expect_err("not found");
         assert!(matches!(err, LifecycleError::NotFound(_)));

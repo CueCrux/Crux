@@ -419,6 +419,14 @@ impl IntegrationAuditEvent {
     }
 }
 
+/// One pre-enable shadow replay of a staged pack against its declared,
+/// content-addressed corpus, ending in a verdict
+/// (`proof-carrying-adaptive-packs-2026-07-13` M1). Distinct from
+/// [`AUDIT_EXTENSION_CONFORMANCE_RUN`], which records the evidence a replay
+/// is built from and reaches no verdict — a reader has to be able to tell
+/// "the pack was observed" from "the pack was judged".
+pub const AUDIT_EXTENSION_REPLAY_RUN: &str = "extension_replay_run";
+
 pub const AUDIT_EXTENSION_INSTALL: &str = "extension_install";
 pub const AUDIT_EXTENSION_UNINSTALL: &str = "extension_uninstall";
 pub const AUDIT_EXTENSION_GRANT_ADDED: &str = "extension_grant_added";

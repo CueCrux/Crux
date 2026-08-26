@@ -263,6 +263,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/extensions/{id}/lifecycle", methods: &["POST"], tag: "Extensions", auth: "write", summary: "Extensions {id} lifecycle" },
     RouteEntry { path: "/v1/extensions/{id}/outcomes", methods: &["GET", "POST"], tag: "Extensions", auth: "read-write", summary: "Extensions {id} outcomes" },
     RouteEntry { path: "/v1/extensions/{id}/pins", methods: &["GET"], tag: "Extensions", auth: "read", summary: "Extensions {id} pins" },
+    RouteEntry { path: "/v1/extensions/{id}/replay", methods: &["POST"], tag: "Extensions", auth: "write", summary: "Extensions {id} shadow-corpus replay" },
     RouteEntry { path: "/v1/extensions/{id}/rollback", methods: &["POST"], tag: "Extensions", auth: "write", summary: "Extensions {id} rollback" },
     RouteEntry { path: "/v1/extensions/{id}/tools/{tool_name}/invoke", methods: &["POST"], tag: "Extensions", auth: "write", summary: "Extensions {id} tools {tool name} invoke" },
     RouteEntry { path: "/v1/facts", methods: &["GET", "PUT"], tag: "Facts", auth: "read-write", summary: "Facts" },
