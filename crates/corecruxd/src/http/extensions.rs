@@ -189,13 +189,20 @@ pub(super) async fn register_extension(
         }
     }
 
+    // Both env reads happen at the boundary, so the domain functions stay
+    // pure functions of their arguments.
+    let initial_state = crate::pack_lifecycle::initial_install_state(
+        crate::pack_lifecycle::default_install_state(),
+        crate::pack_replay::ActivationGate::from_env(),
+        &manifest,
+    );
     let mut store = state.fact_store.write().await;
     let result = crate::extension_registry::install_extension(
         &mut store,
         &state.data_dir,
         manifest,
         installed_by,
-        crate::pack_lifecycle::default_install_state(),
+        initial_state,
         now_unix_ms(),
         bypass,
     );
@@ -337,13 +344,18 @@ pub(super) async fn install_from_registry(
         );
     }
 
+    let initial_state = crate::pack_lifecycle::initial_install_state(
+        crate::pack_lifecycle::default_install_state(),
+        crate::pack_replay::ActivationGate::from_env(),
+        &manifest,
+    );
     let mut store = state.fact_store.write().await;
     let result = crate::extension_registry::install_extension(
         &mut store,
         &state.data_dir,
         manifest,
         installed_by,
-        crate::pack_lifecycle::default_install_state(),
+        initial_state,
         now_unix_ms(),
         bypass,
     );
