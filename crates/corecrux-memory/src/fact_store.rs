@@ -2981,7 +2981,15 @@ fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
 }
 
-fn polarity_class_v1(value: &str) -> Option<&'static str> {
+/// Deterministic polarity class of a fact value, or `None` when the value
+/// carries no polarity.
+///
+/// Public because a pack's pre-enable shadow replay
+/// (`corecruxd::pack_replay`) has to ask the same question the
+/// contradiction pass asks — "did this write reverse what memory held" —
+/// and two copies of the vocabulary would drift the moment one of them
+/// gained a term.
+pub fn polarity_class_v1(value: &str) -> Option<&'static str> {
     let v = value
         .trim()
         .trim_matches(|c: char| !c.is_alphanumeric() && c != '_')

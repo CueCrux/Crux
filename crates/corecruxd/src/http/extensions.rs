@@ -1308,6 +1308,53 @@ async fn run_staged_wasm_operation(
     Err("wasm extensions require building corecruxd with --features wasm-extensions".to_string())
 }
 
+/// Replay one corpus of declared cases against a staged pack and fold the
+/// results into a [`crate::pack_conformance::ConformanceRun`].
+///
+/// Shared by the conformance hook and by the M1 shadow replay, which needs
+/// the same run twice to establish that the pack reproduces itself. Two
+/// copies of this loop would let the evidence one route produces differ
+/// from the evidence the other judges.
+#[allow(clippy::too_many_arguments)]
+async fn replay_declared_cases(
+    state: &AppState,
+    id: &str,
+    manifest: &IntegrationManifest,
+    attribution: &crate::extension_registry::PackAttribution,
+    grant: &crate::extension_grants::ExtensionGrant,
+    cases: &[crate::pack_conformance::ConformanceCase],
+    calling_passport: &str,
+    lifecycle: crate::pack_lifecycle::PackLifecycleState,
+    corpus_id: &str,
+) -> crate::pack_conformance::ConformanceRun {
+    let started_at_unix_ms = now_unix_ms();
+    let mut observations = Vec::with_capacity(cases.len());
+    for case in cases {
+        // Sequentially, in declaration order: a pack's later operations can
+        // depend on what its earlier ones did, so a parallel run would not
+        // be the replay the corpus describes.
+        let outcome = run_staged_operation(
+            state,
+            id,
+            manifest,
+            attribution,
+            grant,
+            &case.tool_name,
+            case.args.clone(),
+            calling_passport,
+        )
+        .await;
+        observations.push(crate::pack_conformance::observe(case, outcome));
+    }
+    crate::pack_conformance::build_run(
+        attribution.clone(),
+        lifecycle,
+        corpus_id,
+        started_at_unix_ms,
+        observations,
+    )
+}
+
 /// `POST /v1/extensions/{id}/conformance` — replay a staged pack's declared
 /// operations and return what each one would have done.
 ///
@@ -1368,27 +1415,18 @@ pub(super) async fn run_extension_conformance(
         return problem_response(status, err.to_string());
     }
 
-    let started_at_unix_ms = now_unix_ms();
-    let mut observations = Vec::with_capacity(cases.len());
-    for case in &cases {
-        // Sequentially, in declaration order: a pack's later operations can
-        // depend on what its earlier ones did, so a parallel run would not
-        // be the replay the corpus describes.
-        let outcome = run_staged_operation(
-            &state,
-            &id,
-            &manifest,
-            &attribution,
-            &grant,
-            &case.tool_name,
-            case.args.clone(),
-            &calling_passport,
-        )
-        .await;
-        observations.push(crate::pack_conformance::observe(case, outcome));
-    }
-
-    let run = crate::pack_conformance::build_run(attribution, lifecycle, corpus_id, started_at_unix_ms, observations);
+    let run = replay_declared_cases(
+        &state,
+        &id,
+        &manifest,
+        &attribution,
+        &grant,
+        &cases,
+        &calling_passport,
+        lifecycle,
+        &corpus_id,
+    )
+    .await;
     append_audit_event(
         &state.data_dir,
         &IntegrationAuditEvent::extension(
@@ -1407,6 +1445,159 @@ pub(super) async fn run_extension_conformance(
         ),
     );
     (StatusCode::OK, Json(run)).into_response()
+}
+
+// ── Shadow-corpus replay (proof-carrying-adaptive-packs M1) ──────────────
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct ReplayBody {
+    /// The shadow-corpus document, verbatim — the exact bytes the pack's
+    /// signed manifest content-addresses. Sent as text rather than as JSON
+    /// so the daemon hashes what the publisher hashed: a re-serialised
+    /// object differs from the file on whitespace alone, and the digest
+    /// would never match.
+    pub corpus_json: String,
+    #[serde(default)]
+    pub passport_fpr: Option<String>,
+}
+
+/// `POST /v1/extensions/{id}/replay` — stage-replay a pack against its
+/// declared shadow corpus and judge the result.
+///
+/// The pre-enable gate of `proof-carrying-adaptive-packs-2026-07-13` M1.
+/// Unlike `POST …/conformance`, which reports evidence and no verdict, this
+/// route runs the declared cases **twice** (reproducibility is only
+/// observable by running a pack twice), measures what the pack did to a
+/// local shadow store, compares all of it to the signed
+/// `pack.conformance.v1` envelope, and stores a
+/// [`crate::pack_replay::ReplayRecord`] carrying the verdict. Whether a
+/// `blocked` verdict actually refuses activation is
+/// `CORECRUXD_PACK_REPLAY_GATE`; the record and the audit row are produced
+/// either way.
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn run_extension_replay(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ReplayBody>,
+) -> impl IntoResponse {
+    // `facts:write` for the same reason the conformance hook needs it: a
+    // staged run writes nothing, but it executes the pack's code.
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
+        return problem.into_response();
+    }
+    let calling_passport = body.passport_fpr.clone().or_else(|| extract_passport_id(&headers));
+    let Some(calling_passport) = calling_passport else {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "passport_fpr required (body field or X-Corecrux-Passport-Id header)",
+        );
+    };
+
+    let (manifest, attribution, lifecycle, grant) = {
+        let store = state.fact_store.read().await;
+        let Some(installed) = crate::extension_registry::get_extension(&store, &id) else {
+            return problem_response(StatusCode::NOT_FOUND, format!("extension '{id}' not installed"));
+        };
+        let Some(grant) = crate::extension_grants::get_grant(&store, &id, &calling_passport) else {
+            return problem_response(
+                StatusCode::FORBIDDEN,
+                format!("passport '{calling_passport}' has no grant for extension '{id}'"),
+            );
+        };
+        let attribution = crate::extension_registry::PackAttribution::from_installed(&installed);
+        (installed.manifest, attribution, installed.lifecycle, grant)
+    };
+
+    let Some(declaration) = manifest.conformance.clone() else {
+        return problem_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            crate::pack_replay::ReplayError::NoDeclaration(id.clone()).to_string(),
+        );
+    };
+    let corpus = match crate::pack_replay::load_corpus(body.corpus_json.as_bytes(), &declaration.replay_corpus) {
+        Ok(corpus) => corpus,
+        Err(err) => return problem_response(StatusCode::UNPROCESSABLE_ENTITY, err.to_string()),
+    };
+
+    let cases = crate::pack_conformance::cases_from_manifest(&manifest);
+    let corpus_id = corpus.corpus.corpus_id.clone();
+    if let Err(err) = crate::pack_conformance::precheck(&id, lifecycle, &corpus_id, &cases) {
+        let status = match err {
+            crate::pack_conformance::ConformanceError::NotStaged(_, _) => StatusCode::CONFLICT,
+            _ => StatusCode::UNPROCESSABLE_ENTITY,
+        };
+        return problem_response(status, err.to_string());
+    }
+
+    let started_at_unix_ms = now_unix_ms();
+    let mut runs = Vec::with_capacity(2);
+    for _ in 0..2 {
+        runs.push(
+            replay_declared_cases(
+                &state,
+                &id,
+                &manifest,
+                &attribution,
+                &grant,
+                &cases,
+                &calling_passport,
+                lifecycle,
+                &corpus_id,
+            )
+            .await,
+        );
+    }
+    let (first, second) = (&runs[0], &runs[1]);
+
+    let record = match crate::pack_replay::evaluate(crate::pack_replay::ReplayInput {
+        pack: attribution,
+        manifest: &manifest,
+        corpus: &corpus,
+        first,
+        second,
+        started_at_unix_ms,
+    }) {
+        Ok(record) => record,
+        Err(err) => return problem_response(StatusCode::UNPROCESSABLE_ENTITY, err.to_string()),
+    };
+
+    {
+        let mut store = state.fact_store.write().await;
+        if let Err(err) = crate::pack_replay::put_replay_record(&mut store, &record) {
+            drop(store);
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not persist the replay record: {err}"),
+            );
+        }
+    }
+
+    append_audit_event(
+        &state.data_dir,
+        &IntegrationAuditEvent::extension(
+            now_unix_ms(),
+            crux_integrations::AUDIT_EXTENSION_REPLAY_RUN,
+            Some(&calling_passport),
+            &record.pack.extension_id,
+            Some(&record.pack.extension_version),
+            record.verdict.as_str(),
+            serde_json::json!({
+                "manifest_hash": record.pack.manifest_hash,
+                "corpus_id": record.corpus_id,
+                "corpus_sha256": record.corpus_sha256,
+                "observed_digest": record.observed_digest,
+                "record_digest": record.record_digest,
+                "replay_stable": record.replay_stable,
+                "reasons": record.verdict_reasons(),
+                "gate": match crate::pack_replay::ActivationGate::from_env() {
+                    crate::pack_replay::ActivationGate::Enforced => "enforced",
+                    crate::pack_replay::ActivationGate::Advisory => "advisory",
+                },
+            }),
+        ),
+    );
+    (StatusCode::OK, Json(record)).into_response()
 }
 
 // ── Staged activation (buyer-fit M5 frontier seam) ───────────────────────
@@ -1448,6 +1639,9 @@ pub(super) async fn set_extension_lifecycle(
         body.reason.as_deref(),
         actor.as_deref(),
         now_unix_ms(),
+        // Read at the boundary, mirroring `default_install_state`, so the
+        // domain function stays a pure function of its arguments.
+        crate::pack_replay::ActivationGate::from_env(),
     );
     drop(store);
     match result {
@@ -1465,6 +1659,11 @@ pub(super) async fn set_extension_lifecycle(
         }
         Err(err @ crate::pack_lifecycle::LifecycleError::ReasonRequired) => {
             problem_response(StatusCode::UNPROCESSABLE_ENTITY, err.to_string())
+        }
+        // 409: the request is well-formed and the pack exists; it has simply
+        // not earned the right to be enabled yet.
+        Err(err @ crate::pack_lifecycle::LifecycleError::ActivationBlocked(_)) => {
+            problem_response(StatusCode::CONFLICT, err.to_string())
         }
         Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
     }

@@ -83,9 +83,13 @@ The daemon's conformance hook (`corecruxd::pack_conformance`, the
 operations and reports **evidence, never a verdict**. `cases_from_manifest` now
 takes its cases from this block when a pack ships one, falling back to the
 one-empty-args-case-per-tool floor when it does not; `POST /v1/extensions/{id}/conformance`
-defaults its `corpus_id` to the declared `replay_corpus.corpus_id`. Comparing
-observed behaviour against the declared envelope, and signing the verdict into a
-CROWN receipt, are M1 and M2 of `proof-carrying-adaptive-packs-2026-07-13`.
+defaults its `corpus_id` to the declared `replay_corpus.corpus_id`.
+
+Comparing that observed behaviour against the declared envelope is M1, and it
+is what turns a declaration into a verdict: see
+[Shadow-corpus staging + replay](pack-shadow-replay-v1.md) for the corpus
+format, what each invariant becomes at replay time, and the pre-enable gate.
+Signing the verdict into a CROWN receipt is M2.
 
 ## Validate a block
 

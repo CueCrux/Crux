@@ -36,6 +36,12 @@ const PACK_ID: &str = "ext.conformance.reference";
 const PACK_VERSION: &str = "0.2.0";
 const PACK_DIR: &str = "integrations/community/ext.conformance.reference/0.2.0";
 const CORPUS_ID: &str = "conformance-reference-v1";
+
+/// Schema tag of the shadow-corpus document, mirroring
+/// `corecruxd::pack_replay::SHADOW_CORPUS_SCHEMA_V1`. The daemon crate is
+/// a binary and cannot be depended on from here, so the constant is
+/// restated and pinned by the daemon-side test that loads this same file.
+const SHADOW_CORPUS_SCHEMA_V1: &str = "crux.pack.shadow_corpus.v1";
 const CORPUS_FILE: &str = "replay-corpus.json";
 const TOOLS_FILE: &str = "tools/ext.conformance.reference.json";
 
@@ -178,6 +184,40 @@ fn reference_pack_replay_corpus_is_content_addressed() {
     assert_eq!(corpus["cases"], declared);
 }
 
+/// The corpus is a *shadow* corpus, not just a case list: it carries the
+/// memory the pack is replayed against and the probes its recall is measured
+/// with (`proof-carrying-adaptive-packs-2026-07-13` M1). A corpus with no
+/// seeds would make every recall measurement vacuous, and a pack replayed
+/// against an empty store cannot damage anything.
+#[test]
+fn reference_pack_corpus_is_a_seeded_shadow_corpus() {
+    let manifest = read_reference_manifest();
+    let declaration = manifest.conformance.as_ref().expect("declaration");
+    let corpus_path = pack_dir().join(&declaration.replay_corpus.path);
+    let bytes = fs::read(&corpus_path).unwrap_or_else(|err| panic!("read {}: {err}", corpus_path.display()));
+    let corpus: serde_json::Value = serde_json::from_slice(&bytes).expect("parse corpus");
+
+    assert_eq!(corpus["schema"], SHADOW_CORPUS_SCHEMA_V1);
+    let seeds = corpus["seed_facts"].as_array().expect("seed_facts");
+    assert!(!seeds.is_empty(), "a shadow corpus with no seeds measures nothing");
+    assert!(
+        seeds.iter().any(|seed| seed["private"] == serde_json::json!(true)),
+        "the corpus must seed at least one private fact, or the no-private-access invariant has nothing to catch"
+    );
+    let probes = corpus["probes"].as_array().expect("probes");
+    assert!(!probes.is_empty(), "recall behaviour needs at least one probe");
+    for probe in probes {
+        let expected = probe["expect_entities"].as_array().expect("expect_entities");
+        assert!(!expected.is_empty(), "a probe expecting nothing is always satisfied");
+        for entity in expected {
+            assert!(
+                seeds.iter().any(|seed| seed["entity"] == *entity),
+                "probe expects {entity}, which the corpus never seeds"
+            );
+        }
+    }
+}
+
 #[test]
 #[ignore = "writer: run with -- --ignored regen_conformance_reference_pack to regenerate the reference pack"]
 fn regen_conformance_reference_pack() {
@@ -196,8 +236,44 @@ fn regen_conformance_reference_pack() {
 
     let cases = reference_cases();
     let corpus_document = serde_json::json!({
+        "schema": SHADOW_CORPUS_SCHEMA_V1,
         "corpus_id": CORPUS_ID,
-        "description": "Three declared operations replayed against a local shadow corpus: two reads that must be deterministic, and one write that must stay inside the declared namespace and be reversible.",
+        "description": "Three declared operations replayed against a local shadow corpus: two reads that must be deterministic, and one write that must stay inside the declared namespace and be reversible. Seeded, offline, and content-addressed — no network, no customer data.",
+        "seed_facts": [
+            {
+                "entity": "ext.conformance.reference::notes::seed-1",
+                "key": "content",
+                "value": "A pack is trusted from behavioural evidence, not from a download count.",
+                "confidence": 1.0,
+                "private": false
+            },
+            {
+                "entity": "ext.conformance.reference::notes::seed-2",
+                "key": "content",
+                "value": "Conformance is declared before it is replayed.",
+                "confidence": 0.9,
+                "private": false
+            },
+            {
+                "entity": "personal::journal::example",
+                "key": "content",
+                "value": "example-private-line-never-echoed",
+                "confidence": 1.0,
+                "private": true
+            }
+        ],
+        "probes": [
+            {
+                "probe_id": "evidence-stays-citable",
+                "query": "behavioural evidence",
+                "expect_entities": ["ext.conformance.reference::notes::seed-1"]
+            },
+            {
+                "probe_id": "declaration-stays-citable",
+                "query": "declared",
+                "expect_entities": ["ext.conformance.reference::notes::seed-2"]
+            }
+        ],
         "cases": cases,
     });
     let corpus_bytes = write_pretty(&dir.join(CORPUS_FILE), &corpus_document);
@@ -422,7 +498,7 @@ resolve. It exists to be read, copied, and parsed.
 | Claimed capabilities | `facts:read`, `facts:write` — equal to the manifest's declared set, which the validator requires |
 | Expected fact mutations | one write per call under `ext.conformance.reference::notes::`, key `content`, non-private |
 | Expected receipt mutations | one `dispatch` and one `fact_write` per call |
-| Replay corpus | `replay-corpus.json`, content-addressed by SHA-256, three declared cases |
+| Replay corpus | `replay-corpus.json`, content-addressed by SHA-256: three declared cases plus the seeded shadow memory and recall probes the replay measures against |
 | Invariants | writes stay in namespace, no private reads, egress pinned, reads are deterministic, the write is reversible |
 | Behavioural envelope | 512 tokens/call (2048/run), 2000 ms/call (8000 ms/run), 16 KiB/call, 1 fact write/call, 7-day minimum half-life, zero new contradictions, one-operation undo within 500 ms |
 | Compatibility | daemon >= 0.5.0, supersedes 0.1.0 with a reversible `supersede_facts` migration, rollback-safe |
@@ -435,6 +511,16 @@ A real publisher signs with their own key and gets their own passport
 fingerprint. The declaration is inside the manifest's signing payload, so
 widening a bound after signing invalidates the signature — that is the property
 the whole trust layer rests on.
+
+## The shadow corpus
+
+`replay-corpus.json` is a `crux.pack.shadow_corpus.v1` document: the declared
+cases, the `seed_facts` an M1 replay loads into a local in-memory store before
+the pack runs, and the `probes` that measure whether the corpus's own facts stay
+citable afterwards. One seed is `private`, so the `no_private_fact_access`
+invariant has something real to catch. The corpus is offline by construction and
+carries no customer data. Format:
+[`docs/spec/pack-shadow-replay-v1.md`](../../../../docs/spec/pack-shadow-replay-v1.md).
 
 ## Regenerate
 
