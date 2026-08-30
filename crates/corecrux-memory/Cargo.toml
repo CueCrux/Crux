@@ -39,7 +39,7 @@ ureq = { workspace = true, features = ["json"] }
 # is enabled; the default build never compiles or downloads it. rustls (not
 # native-tls) so it builds without system OpenSSL — correct for minimal /
 # Chainguard runtime images too.
-fastembed = { version = "5", optional = true, default-features = false, features = [
+fastembed = { version = "6", optional = true, default-features = false, features = [
   "ort-download-binaries-rustls-tls",
   "hf-hub-rustls-tls",
 ] }
