@@ -26,7 +26,7 @@ tracing = { workspace = true }
 
 # Polyglot extraction: one tree-sitter grammar per supported non-Rust language.
 # Rust itself is handled by `syn` above, not by a grammar.
-tree-sitter = "0.26.10"
+tree-sitter = "0.27.0"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-python = "0.25.0"
 tree-sitter-go = "0.25.0"
