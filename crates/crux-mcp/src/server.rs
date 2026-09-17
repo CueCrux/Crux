@@ -23,6 +23,7 @@ use crate::agent::AgentIdentity;
 use crate::dispatch::{self, McpContext, PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION};
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, METHOD_NOT_FOUND, PARSE_ERROR};
 use crate::sse::{RegisterError, Registration};
+use crate::tools;
 
 /// MCP Streamable HTTP session-correlation header.
 const MCP_SESSION_HEADER: &str = "mcp-session-id";
@@ -128,31 +129,15 @@ async fn handle_mcp_post(State(state): State<Arc<McpHttpState>>, headers: Header
     };
 
     // Build a per-request context with the agent identity attached (if any).
-    let req_ctx = if let Some(identity) = agent {
-        ctx.with_agent(identity)
-    } else {
-        McpContext {
-            fact_store: Arc::clone(&ctx.fact_store),
-            session_store: Arc::clone(&ctx.session_store),
-            retrieval_index: Arc::clone(&ctx.retrieval_index),
-            update_status: Arc::clone(&ctx.update_status),
-            agent_registry: ctx.agent_registry.clone(),
-            agent: None,
-            node_id: ctx.node_id.clone(),
-            handoff_key: ctx.handoff_key,
-            daemon_base_url: ctx.daemon_base_url.clone(),
-            rcx_router: ctx.rcx_router.clone(),
-            data_dir: ctx.data_dir.clone(),
-            passport_public_key_hex: ctx.passport_public_key_hex.clone(),
-            entity_store: Arc::clone(&ctx.entity_store),
-            edge_store: Arc::clone(&ctx.edge_store),
-            kind_registry: Arc::clone(&ctx.kind_registry),
-            artefact_store: Arc::clone(&ctx.artefact_store),
-            agent_passports_enabled: ctx.agent_passports_enabled,
-            passport_mint_requests_enabled: ctx.passport_mint_requests_enabled,
-            agent_passport_map: ctx.agent_passport_map.clone(),
-            revocation_enforced: ctx.revocation_enforced,
-            dense_provider_factory: ctx.dense_provider_factory.clone(),
+    // `McpContext` is `Clone` (shallow — every store is an `Arc` handle), so the
+    // no-agent arm is a clone with `agent` cleared rather than a field-by-field
+    // literal that every new context field has to be threaded through.
+    let mut req_ctx = match agent {
+        Some(identity) => ctx.with_agent(identity),
+        None => {
+            let mut anon = ctx.clone();
+            anon.agent = None;
+            anon
         }
     };
 
@@ -218,10 +203,11 @@ async fn handle_mcp_post(State(state): State<Arc<McpHttpState>>, headers: Header
     // can open a matching SSE stream; an intent-bearing `cuecrux_session` call
     // triggers a `tools/list_changed` push to that session's stream (if open).
     let is_initialize = req.method == "initialize";
-    let push_list_changed = is_cuecrux_session_with_intent(&req);
+    let intent_declared = is_cuecrux_session_with_intent(&req);
 
-    let resp = dispatch::dispatch(req, &req_ctx, None).await;
-
+    // The session id is settled BEFORE dispatch (prompt-cache M1) so the
+    // monotone offered-tool union is keyed by the same `Mcp-Session-Id` the
+    // client will send back, including on the `initialize` that mints it.
     let session_id = incoming_session.unwrap_or_else(|| {
         if is_initialize {
             uuid::Uuid::new_v4().simple().to_string()
@@ -229,8 +215,22 @@ async fn handle_mcp_post(State(state): State<Arc<McpHttpState>>, headers: Header
             String::new()
         }
     });
-    if !session_id.is_empty() && push_list_changed {
-        crate::sse::notify_list_changed(&session_id);
+    if !session_id.is_empty() {
+        req_ctx = req_ctx.with_mcp_session_id(session_id.clone());
+    }
+
+    let resp = dispatch::dispatch(req, &req_ctx, None).await;
+
+    // prompt-cache M1: a `list_changed` push makes the client re-list, and a
+    // re-list that returns the same set is a wasted round trip while a re-list
+    // that returns FEWER tools rewrites the whole cached prefix at 2x. With the
+    // monotone union the second case cannot happen; this gate removes the
+    // first, so the push fires only when the union would actually grow.
+    if !session_id.is_empty() && intent_declared && crate::sse::is_registered(&session_id) {
+        let shaped = tools::preview_shaped_tool_names(&req_ctx, dispatch::current_unix_seconds()).await;
+        if tools::surface::would_grow(&tools::surface_session_key(&req_ctx), &shaped) {
+            crate::sse::notify_list_changed(&session_id);
+        }
     }
 
     let mut response = json_rpc_response_with_crux_mode(resp);

@@ -28,7 +28,7 @@
 //!   opens the `GET /mcp` SSE stream (M3.5, see [`crate::sse`]) additionally gets
 //!   a live `tools/list_changed` push when the intent changes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 use crux_session::intent::default_intent_table;
@@ -41,9 +41,17 @@ use crate::traces::TraceEntry;
 /// still a large cut from the full ~95, but with the right tools for the task.
 pub const DYNAMIC_TOP_N: usize = 12;
 
-/// How long a declared intent keeps shaping the surface (seconds). A stale
+/// How long a declared intent keeps *boosting* the surface (seconds). A stale
 /// intent must not pin an old shape forever; matches the default session TTL.
-const INTENT_TTL_SECONDS: i64 = 3600;
+///
+/// **prompt-cache M1:** expiry stops the intent from *promoting* new tools; it
+/// no longer removes anything. The monotone per-session union
+/// ([`merge_offered`]) keeps every tool the session was already offered, so a
+/// session that idles past this TTL sees the same `tools/list` it saw before
+/// rather than collapsing back to [`CORE_FLOOR`] — which is what rewrote
+/// 311,754 cached tokens in one measured event on corpus
+/// `drivew-host-claude-transcripts-2026-09`.
+pub const INTENT_TTL_SECONDS: i64 = 3600;
 
 /// Always-surfaced core set (ExecPlan C4). Lets an agent with zero prior calls
 /// run the core loop — discover (`cuecrux_session`), retrieve (`query*`),
@@ -137,11 +145,12 @@ pub fn apply_surface_mode(tools: Vec<ToolDefinition>, mode: ToolSurfaceMode) -> 
 
 // ── M2: intent capture (persisted per-passport interaction signal) ──────────
 //
-// The MCP transport is stateless HTTP POST (one request → one response, no
-// server→client channel), so `tools/list_changed` cannot be pushed. Instead the
-// agent's declared intent is persisted here, keyed by passport, and read on the
-// *next* `tools/list` to shape the surface. Mirrors the process-global pattern
-// of [`crate::traces`] — no `McpContext` field churn.
+// The base MCP transport is request/response over `POST /mcp`, so the declared
+// intent is persisted here, keyed by passport, and read on the *next*
+// `tools/list` to shape the surface. A client that opened the M3.5 `GET /mcp`
+// SSE stream additionally gets a `tools/list_changed` push (see
+// [`crate::sse`]). Mirrors the process-global pattern of [`crate::traces`] —
+// no `McpContext` field churn.
 
 #[derive(Clone)]
 struct IntentRecord {
@@ -177,17 +186,252 @@ pub fn record_intent(passport: &str, intent: &str) {
 }
 
 /// The agent's current (non-expired) intent, if any. Expired records are
-/// evicted on read so a long-idle passport falls back to the floor.
-pub fn current_intent(passport: &str) -> Option<String> {
+/// evicted on read so a long-idle passport stops *boosting*.
+///
+/// `now_unix_seconds` is injected by the caller (the `tools/list` serve path
+/// already receives the request clock), so the expiry edge is testable without
+/// sleeping an hour.
+///
+/// **prompt-cache M1:** losing the intent no longer shrinks the listing — see
+/// [`INTENT_TTL_SECONDS`] and [`merge_offered`].
+pub fn current_intent(passport: &str, now_unix_seconds: i64) -> Option<String> {
     let mut store = intent_store().lock().unwrap_or_else(|p| p.into_inner());
     match store.get(passport) {
-        Some(rec) if now_unix().saturating_sub(rec.set_at_unix) <= INTENT_TTL_SECONDS => Some(rec.intent.clone()),
+        Some(rec) if now_unix_seconds.saturating_sub(rec.set_at_unix) <= INTENT_TTL_SECONDS => Some(rec.intent.clone()),
         Some(_) => {
             store.remove(passport);
             None
         }
         None => None,
     }
+}
+
+// ── prompt-cache M1: monotone per-session offered set ───────────────────────
+//
+// ExecPlan `crux-prompt-cache-1h-ttl-2026-09-17` M1. Claude Code caches the
+// prompt prefix for an hour; a `tools/list` that returns a PROPER SUBSET of
+// what the same `Mcp-Session-Id` already saw invalidates that prefix and the
+// whole conversation is re-billed at 2x. Additions never invalidated in the
+// measured corpus (`drivew-host-claude-transcripts-2026-09`); removals always
+// did. So the offered set is made monotone per session: it may grow, it may
+// never shrink.
+//
+// Capability withdrawal (RCX token expiry, tier change) is NOT expressed by
+// removing the advertisement any more. The tool stays listed and
+// `enforce_rcx_tool_capability` refuses the `tools/call` with the existing
+// `denied:capability_not_permitted` structured refusal. That is a deliberate
+// widening of *advertisement* only — never of authorisation, which is still
+// decided per call by the router.
+
+/// Feature flag for the monotone surface. **Default ON**; `0`/`false`/`off`
+/// restores the pre-M1 shrink-capable behaviour for one release
+/// (`Rollout/rollback` in the ExecPlan), after which the flag is removed.
+pub const MONOTONE_ENV: &str = "CORECRUXD_SURFACE_MONOTONE";
+
+/// Read [`MONOTONE_ENV`]. Unset ⇒ enabled.
+pub fn monotone_enabled() -> bool {
+    match std::env::var(MONOTONE_ENV) {
+        Ok(raw) => {
+            let v = raw.trim();
+            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => true,
+    }
+}
+
+/// Ceiling on a `dynamic` session's offered set. A long session that keeps
+/// declaring new intents would otherwise grow to the whole ~132-tool catalogue
+/// and give back the token win the dynamic surface exists for. At the cap the
+/// surface stops *adding*; it never starts removing.
+pub fn monotone_growth_cap() -> usize {
+    CORE_FLOOR.len() + 2 * DYNAMIC_TOP_N
+}
+
+/// The cap that applies to `mode`. `Full` is the whole catalogue and `Minimal`
+/// is a fixed floor — neither can grow past its own natural bound, so capping
+/// them would only truncate a surface that was never the problem.
+fn growth_cap_for(mode: ToolSurfaceMode) -> Option<usize> {
+    match mode {
+        ToolSurfaceMode::Dynamic => Some(monotone_growth_cap()),
+        ToolSurfaceMode::Full | ToolSurfaceMode::Minimal => None,
+    }
+}
+
+/// Most sessions a single process tracks before the least-recently-listed one
+/// is evicted. Mirrors `crate::sse`'s registry bound; an evicted session simply
+/// starts its union again (it is a cache, not a ledger).
+const MAX_TRACKED_SESSIONS: usize = 1024;
+
+#[derive(Default)]
+struct SessionSurface {
+    /// `CORECRUXD_TOOL_SURFACE` as read on this session's FIRST listing. Read
+    /// once per session, not per request, so a mid-session env change cannot
+    /// reshape a live client's prefix.
+    mode: Option<ToolSurfaceMode>,
+    /// The union, in first-offer order. Order is pinned because a reordered
+    /// tools array is a different prefix and busts the cache just as a removal
+    /// would.
+    offered: Vec<String>,
+    offered_set: HashSet<String>,
+    /// What the previous `tools/list` actually returned, for the ledger delta.
+    last_returned: Vec<String>,
+    /// Monotonic touch counter driving LRU eviction.
+    touched: u64,
+}
+
+fn surface_store() -> &'static Mutex<HashMap<String, SessionSurface>> {
+    static STORE: OnceLock<Mutex<HashMap<String, SessionSurface>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_touch() -> u64 {
+    static TICK: OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
+    TICK.get_or_init(|| std::sync::atomic::AtomicU64::new(0))
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn evict_if_needed(store: &mut HashMap<String, SessionSurface>) {
+    while store.len() > MAX_TRACKED_SESSIONS {
+        let Some(oldest) = store.iter().min_by_key(|(_, s)| s.touched).map(|(k, _)| k.clone()) else {
+            return;
+        };
+        store.remove(&oldest);
+    }
+}
+
+/// What one `tools/list` offered relative to the previous one for the same
+/// session. Recorded on `agent.tools_offered.v1` so the M0 cache ledger can
+/// prove `removed` is always empty while the monotone flag is on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OfferedDelta {
+    /// Final offered names, in listing order.
+    pub names: Vec<String>,
+    /// Names in `names` that the previous listing for this session did not have.
+    pub added: Vec<String>,
+    /// Names the previous listing had that `names` does not. Always empty while
+    /// [`monotone_enabled`] is true — that is the M1 invariant.
+    pub removed: Vec<String>,
+    /// True when `added` is non-empty, i.e. a `tools/list_changed` push is
+    /// warranted. A re-list that offers the same set is not worth a push.
+    pub grew: bool,
+}
+
+/// Surface mode for this session, read from the environment ONCE (on the
+/// session's first listing) and reused thereafter.
+///
+/// Per-request `from_env()` meant a deploy-time or operator env change could
+/// reshape a live client's tool surface mid-conversation, which is precisely
+/// the invalidation M1 exists to stop.
+pub fn session_mode(session_key: &str) -> ToolSurfaceMode {
+    let mut store = surface_store().lock().unwrap_or_else(|p| p.into_inner());
+    let touched = next_touch();
+    let entry = store.entry(session_key.to_string()).or_default();
+    entry.touched = touched;
+    let mode = *entry.mode.get_or_insert_with(ToolSurfaceMode::from_env);
+    evict_if_needed(&mut store);
+    mode
+}
+
+/// Fold `shaped` (this request's freshly-computed surface) into the session's
+/// running union and return the set to serve.
+///
+/// With the flag on the result is `previously_offered ∪ shaped`, in first-offer
+/// order, capped by [`growth_cap_for`]. With the flag off the result is
+/// `shaped` unchanged — the delta is still recorded so `removed[]` stays
+/// honest and the rollback path is observable.
+pub fn merge_offered(session_key: &str, mode: ToolSurfaceMode, shaped: &[String]) -> OfferedDelta {
+    let monotone = monotone_enabled();
+    let cap = growth_cap_for(mode);
+    let mut store = surface_store().lock().unwrap_or_else(|p| p.into_inner());
+    let touched = next_touch();
+    let entry = store.entry(session_key.to_string()).or_default();
+    entry.touched = touched;
+    entry.mode.get_or_insert(mode);
+
+    for name in shaped {
+        if entry.offered_set.contains(name) {
+            continue;
+        }
+        if cap.is_some_and(|c| entry.offered.len() >= c) {
+            // At the cap: stop adding. Never start removing.
+            continue;
+        }
+        entry.offered.push(name.clone());
+        entry.offered_set.insert(name.clone());
+    }
+
+    let names: Vec<String> = if monotone {
+        entry.offered.clone()
+    } else {
+        shaped.to_vec()
+    };
+
+    let previous: HashSet<&str> = entry.last_returned.iter().map(String::as_str).collect();
+    let current: HashSet<&str> = names.iter().map(String::as_str).collect();
+    let added: Vec<String> = names
+        .iter()
+        .filter(|n| !previous.contains(n.as_str()))
+        .cloned()
+        .collect();
+    let removed: Vec<String> = entry
+        .last_returned
+        .iter()
+        .filter(|n| !current.contains(n.as_str()))
+        .cloned()
+        .collect();
+
+    entry.last_returned.clone_from(&names);
+    let grew = !added.is_empty();
+    evict_if_needed(&mut store);
+    OfferedDelta {
+        names,
+        added,
+        removed,
+        grew,
+    }
+}
+
+/// Would serving `shaped` to `session_key` grow its offered set? Read-only —
+/// used to decide whether a `notifications/tools/list_changed` push is worth
+/// sending, without recording an offer that never reached the client.
+pub fn would_grow(session_key: &str, shaped: &[String]) -> bool {
+    let store = surface_store().lock().unwrap_or_else(|p| p.into_inner());
+    let Some(entry) = store.get(session_key) else {
+        return true; // nothing offered yet — the first listing is always new
+    };
+    if entry.last_returned.is_empty() {
+        return true;
+    }
+    let cap = entry.mode.and_then(growth_cap_for);
+    if cap.is_some_and(|c| entry.offered.len() >= c) {
+        return false; // capped: nothing more can be added
+    }
+    let served: HashSet<&str> = entry.last_returned.iter().map(String::as_str).collect();
+    shaped.iter().any(|n| !served.contains(n.as_str()))
+}
+
+/// Re-project a name list back onto tool definitions.
+///
+/// `shaped` supplies the definitions for everything this request computed;
+/// `catalogue` is the pre-authz build catalogue, consulted only for a name the
+/// session was already offered but that this request's authz filter dropped
+/// (an expired RCX token, a tier change). A name in neither is skipped — a tool
+/// deleted from the binary cannot be listed, and that is a deploy boundary, not
+/// a mid-session change.
+pub fn project_to_names(
+    names: &[String],
+    shaped: Vec<ToolDefinition>,
+    catalogue: &[ToolDefinition],
+) -> Vec<ToolDefinition> {
+    let mut by_name: HashMap<String, ToolDefinition> = shaped.into_iter().map(|t| (t.name.clone(), t)).collect();
+    names
+        .iter()
+        .filter_map(|n| {
+            by_name
+                .remove(n)
+                .or_else(|| catalogue.iter().find(|t| &t.name == n).cloned())
+        })
+        .collect()
 }
 
 // ── M3: intent-weighted dynamic shaping ─────────────────────────────────────
@@ -394,6 +638,16 @@ pub fn clear_intent_for_test(passport: &str) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .remove(passport);
+}
+
+/// Drop a session's monotone union so an in-crate test can re-drive the same
+/// key from a clean slate. Integration tests use a unique session id instead.
+#[cfg(test)]
+pub fn clear_session_for_test(session_key: &str) {
+    surface_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(session_key);
 }
 
 #[cfg(test)]
@@ -666,12 +920,12 @@ mod tests {
     fn intent_record_and_current_roundtrip() {
         let pk = "__test_intent_roundtrip__";
         clear_intent_for_test(pk);
-        assert_eq!(current_intent(pk), None, "no intent initially");
+        assert_eq!(current_intent(pk, now_unix()), None, "no intent initially");
         record_intent(pk, "audit_review");
-        assert_eq!(current_intent(pk).as_deref(), Some("audit_review"));
+        assert_eq!(current_intent(pk, now_unix()).as_deref(), Some("audit_review"));
         // Blank intent clears it.
         record_intent(pk, "  ");
-        assert_eq!(current_intent(pk), None, "blank intent clears");
+        assert_eq!(current_intent(pk, now_unix()), None, "blank intent clears");
         clear_intent_for_test(pk);
     }
 
@@ -681,9 +935,214 @@ mod tests {
         clear_intent_for_test(a);
         clear_intent_for_test(b);
         record_intent(a, "audit_review");
-        assert_eq!(current_intent(a).as_deref(), Some("audit_review"));
-        assert_eq!(current_intent(b), None, "intent must not leak across passports");
+        assert_eq!(current_intent(a, now_unix()).as_deref(), Some("audit_review"));
+        assert_eq!(
+            current_intent(b, now_unix()),
+            None,
+            "intent must not leak across passports"
+        );
         clear_intent_for_test(a);
+    }
+
+    // ── prompt-cache M1: monotone union ────────────────────────────────────
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn merge_offered_never_shrinks_and_reports_no_removals() {
+        let key = "__test_monotone_never_shrinks__";
+        clear_session_for_test(key);
+        let first = merge_offered(key, ToolSurfaceMode::Dynamic, &names(&["a", "b", "c"]));
+        assert_eq!(first.names, names(&["a", "b", "c"]));
+        assert_eq!(first.added, names(&["a", "b", "c"]));
+        assert!(first.grew);
+
+        // The shaper drops `b` and `c` (intent expired) and promotes `d`.
+        let second = merge_offered(key, ToolSurfaceMode::Dynamic, &names(&["a", "d"]));
+        assert_eq!(
+            second.names,
+            names(&["a", "b", "c", "d"]),
+            "union in first-offer order — a reordered array busts the prefix too"
+        );
+        assert_eq!(second.added, names(&["d"]));
+        assert!(second.removed.is_empty(), "M1 invariant");
+        assert!(second.grew);
+
+        // A re-list with nothing new is not a growth event.
+        let third = merge_offered(key, ToolSurfaceMode::Dynamic, &names(&["a"]));
+        assert_eq!(third.names, names(&["a", "b", "c", "d"]));
+        assert!(third.added.is_empty());
+        assert!(third.removed.is_empty());
+        assert!(!third.grew);
+        clear_session_for_test(key);
+    }
+
+    #[test]
+    fn merge_offered_is_session_scoped() {
+        let (a, b) = ("__test_monotone_sess_a__", "__test_monotone_sess_b__");
+        clear_session_for_test(a);
+        clear_session_for_test(b);
+        merge_offered(a, ToolSurfaceMode::Dynamic, &names(&["x", "y"]));
+        let other = merge_offered(b, ToolSurfaceMode::Dynamic, &names(&["z"]));
+        assert_eq!(other.names, names(&["z"]), "one session's union must not leak");
+        clear_session_for_test(a);
+        clear_session_for_test(b);
+    }
+
+    #[test]
+    fn merge_offered_caps_growth_without_removing() {
+        let key = "__test_monotone_cap__";
+        clear_session_for_test(key);
+        let cap = monotone_growth_cap();
+        let wide: Vec<String> = (0..cap + 25).map(|i| format!("t{i}")).collect();
+        let first = merge_offered(key, ToolSurfaceMode::Dynamic, &wide);
+        assert_eq!(first.names.len(), cap, "capped at CORE_FLOOR + 2 * DYNAMIC_TOP_N");
+
+        // At the cap a brand-new tool is refused entry — and nothing is evicted
+        // to make room for it.
+        let second = merge_offered(key, ToolSurfaceMode::Dynamic, &names(&["late_arrival"]));
+        assert_eq!(second.names.len(), cap);
+        assert!(!second.names.iter().any(|n| n == "late_arrival"));
+        assert!(second.removed.is_empty(), "the cap must never cause a removal");
+        clear_session_for_test(key);
+    }
+
+    #[test]
+    fn full_and_minimal_modes_are_not_capped() {
+        let key = "__test_monotone_full_uncapped__";
+        clear_session_for_test(key);
+        let wide: Vec<String> = (0..monotone_growth_cap() + 25).map(|i| format!("t{i}")).collect();
+        let listed = merge_offered(key, ToolSurfaceMode::Full, &wide);
+        assert_eq!(
+            listed.names.len(),
+            wide.len(),
+            "`full` is the whole catalogue — capping it would regress a surface that was already monotone"
+        );
+        clear_session_for_test(key);
+    }
+
+    #[test]
+    fn would_grow_is_read_only_and_matches_merge() {
+        let key = "__test_monotone_would_grow__";
+        clear_session_for_test(key);
+        assert!(would_grow(key, &names(&["a"])), "first listing is always new");
+        merge_offered(key, ToolSurfaceMode::Dynamic, &names(&["a", "b"]));
+        assert!(!would_grow(key, &names(&["a"])), "a subset adds nothing");
+        assert!(!would_grow(key, &names(&["a", "b"])), "the same set adds nothing");
+        assert!(would_grow(key, &names(&["c"])), "a new name would grow the union");
+        // The preview must not have recorded anything.
+        let after = merge_offered(key, ToolSurfaceMode::Dynamic, &names(&["a"]));
+        assert_eq!(after.names, names(&["a", "b"]), "would_grow must not record");
+        clear_session_for_test(key);
+    }
+
+    #[test]
+    fn project_to_names_recovers_definitions_dropped_by_authz() {
+        let catalogue = list_tools();
+        let dropped = catalogue
+            .iter()
+            .find(|t| t.name == "store_fact")
+            .cloned()
+            .expect("store_fact exists");
+        // `shaped` no longer carries `store_fact` (its RCX capability lapsed),
+        // but the session was already offered it, so it stays listed and is
+        // refused at `tools/call` instead.
+        let shaped: Vec<ToolDefinition> = catalogue.iter().filter(|t| t.name != "store_fact").cloned().collect();
+        let projected = project_to_names(&names(&["cuecrux_session", "store_fact"]), shaped, &catalogue);
+        let got: Vec<&str> = projected.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(got, vec!["cuecrux_session", "store_fact"]);
+        assert_eq!(
+            projected[1].description, dropped.description,
+            "recovered definition must be byte-identical to the catalogue's"
+        );
+    }
+
+    #[test]
+    fn project_to_names_skips_a_name_in_neither_source() {
+        let catalogue = list_tools();
+        let projected = project_to_names(
+            &names(&["cuecrux_session", "tool_deleted_in_a_later_build"]),
+            vec![],
+            &catalogue,
+        );
+        let got: Vec<&str> = projected.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(got, vec!["cuecrux_session"]);
+    }
+
+    #[test]
+    fn intent_expiry_stops_boosting_but_removes_nothing() {
+        let pk = "__test_intent_expiry_edge__";
+        clear_intent_for_test(pk);
+        record_intent(pk, "audit_review");
+        // `record_intent` stamps wall-clock now; drive the edge off that stamp.
+        let set_at = now_unix();
+        assert_eq!(
+            current_intent(pk, set_at + INTENT_TTL_SECONDS).as_deref(),
+            Some("audit_review"),
+            "still boosting at the TTL boundary"
+        );
+        assert_eq!(
+            current_intent(pk, set_at + INTENT_TTL_SECONDS + 1),
+            None,
+            "one second past the TTL the intent stops boosting"
+        );
+
+        // …and the shaped surface collapsing to the floor is NOT what the
+        // client sees, because the union keeps the earlier offer.
+        let key = "__test_intent_expiry_edge_session__";
+        clear_session_for_test(key);
+        let boosted: Vec<String> = shape_dynamic(list_tools(), Some("audit_review"), DYNAMIC_TOP_N)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        merge_offered(key, ToolSurfaceMode::Dynamic, &boosted);
+        let floor_only: Vec<String> = shape_dynamic(list_tools(), None, DYNAMIC_TOP_N)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        let after = merge_offered(key, ToolSurfaceMode::Dynamic, &floor_only);
+        assert_eq!(after.names, boosted, "expiry must not shrink the listing");
+        assert!(after.removed.is_empty());
+        clear_intent_for_test(pk);
+        clear_session_for_test(key);
+    }
+
+    #[tokio::test]
+    async fn monotone_flag_defaults_on_and_reads_falsey_values() {
+        let _g = crate::test_env_lock().lock().await;
+        std::env::remove_var(MONOTONE_ENV);
+        assert!(monotone_enabled(), "launch default is ON");
+        for falsey in ["0", "false", "FALSE", " off "] {
+            std::env::set_var(MONOTONE_ENV, falsey);
+            assert!(!monotone_enabled(), "`{falsey}` must disable the monotone surface");
+        }
+        for truthy in ["1", "true", "yes", ""] {
+            std::env::set_var(MONOTONE_ENV, truthy);
+            assert!(monotone_enabled(), "only an explicit falsey value rolls back");
+        }
+        std::env::remove_var(MONOTONE_ENV);
+    }
+
+    #[tokio::test]
+    async fn session_mode_is_read_once_per_session() {
+        let _g = crate::test_env_lock().lock().await;
+        let key = "__test_session_mode_pinned__";
+        clear_session_for_test(key);
+        std::env::set_var("CORECRUXD_TOOL_SURFACE", "dynamic");
+        assert_eq!(session_mode(key), ToolSurfaceMode::Dynamic);
+        // Changing the process flag mid-session must NOT reshape a live
+        // client's surface — that reshape is itself a prefix invalidation.
+        std::env::set_var("CORECRUXD_TOOL_SURFACE", "full");
+        assert_eq!(session_mode(key), ToolSurfaceMode::Dynamic, "pinned for the session");
+        // A NEW session picks up the new value.
+        let fresh = "__test_session_mode_pinned_fresh__";
+        clear_session_for_test(fresh);
+        assert_eq!(session_mode(fresh), ToolSurfaceMode::Full);
+        std::env::remove_var("CORECRUXD_TOOL_SURFACE");
+        clear_session_for_test(key);
+        clear_session_for_test(fresh);
     }
 
     fn trace_entry(tool: &str) -> TraceEntry {
