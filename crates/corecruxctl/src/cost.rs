@@ -348,6 +348,54 @@ fn parse_rfc3339_systemtime(s: &str) -> Option<std::time::SystemTime> {
 
 // ── rendering ───────────────────────────────────────────────────────────────
 
+/// The prompt-cache section: how warm the prefix stayed, which TTL tier paid
+/// for the writes, and how much of the write spend was **re-writing** a prefix
+/// that had already been cached (the movable half). Silent on a session that
+/// never wrote to the cache — there is nothing to say.
+fn render_cache_ledger(r: &CostReport) -> String {
+    use std::fmt::Write as _;
+    let h = &r.headline;
+    if r.measured.cache_creation == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "  cache hits     {:.1}%   ({} written: {} @1h \u{b7} {} @5m)",
+        h.cache_hit_rate * 100.0,
+        fmt_k(r.measured.cache_creation),
+        fmt_k(h.cache_creation_1h),
+        fmt_k(h.cache_creation_5m)
+    );
+    if h.invalidations.is_empty() {
+        return out;
+    }
+    let _ = writeln!(
+        out,
+        "  prefix rewrite {:.0}% of writes   ({} over {} event{})",
+        h.rewrite_share * 100.0,
+        fmt_k(h.invalidation_tokens),
+        h.invalidations.len(),
+        if h.invalidations.len() == 1 { "" } else { "s" }
+    );
+    // Per-class rollup, biggest first — the ledger's point is *why*.
+    let mut by_class: Vec<(&str, u64, u64)> = Vec::new();
+    for inv in &h.invalidations {
+        match by_class.iter_mut().find(|(c, _, _)| *c == inv.class.as_str()) {
+            Some((_, events, tokens)) => {
+                *events += 1;
+                *tokens = tokens.saturating_add(inv.tokens);
+            }
+            None => by_class.push((inv.class.as_str(), 1, inv.tokens)),
+        }
+    }
+    by_class.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(b.0)));
+    for (class, events, tokens) in by_class {
+        let _ = writeln!(out, "    {class:<22} {events:>3} \u{d7}  {}", fmt_k(tokens));
+    }
+    out
+}
+
 /// Render the shareable, screenshot-worthy table. Writing into a `String` via
 /// `write!` is infallible, so the `Result`s are intentionally discarded.
 fn render_table(r: &CostReport) -> String {
@@ -383,6 +431,7 @@ fn render_table(r: &CostReport) -> String {
         fmt_k(r.measured.output)
     );
 
+    out.push_str(&render_cache_ledger(r));
     out.push_str(&render_model_axis(r));
 
     if !r.buckets.is_empty() {
@@ -633,6 +682,30 @@ mod tests {
         );
         // `<synthetic>` appears, but named as not-a-model.
         assert!(table.contains("not a model"));
+    }
+
+    /// The cache section names the rewrite spend and what caused it, and stays
+    /// silent on a session that never wrote to the cache.
+    #[test]
+    fn cache_section_renders_the_rewrite_ledger() {
+        // Two turns two hours apart, the second re-writing the first's prefix.
+        let lines = [
+            r#"{"type":"assistant","sessionId":"c","timestamp":"2026-09-17T09:00:00.000Z","message":{"role":"assistant","id":"m1","usage":{"input_tokens":100,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":30000,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":30000}},"content":[{"type":"text","text":"a"}]}}"#,
+            r#"{"type":"assistant","sessionId":"c","timestamp":"2026-09-17T11:05:00.000Z","message":{"role":"assistant","id":"m2","usage":{"input_tokens":5,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":31000,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":31000}},"content":[{"type":"text","text":"b"}]}}"#,
+        ];
+        let table = render_table(&crux_cost::analyze_str(&lines.join("\n"), "c.jsonl"));
+        assert!(table.contains("cache hits"), "{table}");
+        assert!(table.contains("@1h"), "the TTL tier split must be visible");
+        assert!(table.contains("prefix rewrite"), "{table}");
+        assert!(table.contains("ttl_expiry"), "the cause must be named");
+    }
+
+    /// A session that never wrote to the cache gets no cache section at all,
+    /// rather than a row of zeros implying something was measured.
+    #[test]
+    fn cache_section_is_absent_without_cache_writes() {
+        let table = render_table(&fixture_report());
+        assert!(!table.contains("cache hits"));
     }
 
     #[test]

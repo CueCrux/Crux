@@ -150,7 +150,8 @@ pub struct ModelBurn {
     /// Normalised model id, or the raw string verbatim when unrecognised — a
     /// new id becomes its own visible row rather than merging into an old one.
     pub model: String,
-    /// Records attributed to this model.
+    /// API calls attributed to this model (deduped by `message.id`, so on the
+    /// same denominator as [`Headline::assistant_turns`]).
     pub turns: u64,
     /// The four measured `usage` accumulators over those records.
     pub measured: Measured,
