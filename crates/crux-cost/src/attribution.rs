@@ -171,6 +171,7 @@ pub fn analyze(events: &[Event]) -> CostReport {
         cache_creation_5m: ledger.cache_creation_5m,
         cache_creation_1h: ledger.cache_creation_1h,
         invalidations: ledger.invalidations,
+        last_turn_context_tokens: ledger.last_turn_context,
     };
 
     let levers = levers::generate(&headline, &buckets, &all_blocks);

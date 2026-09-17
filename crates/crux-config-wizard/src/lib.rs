@@ -108,7 +108,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         compose_file(dir.path(), Target::ClaudeMd, &selected, false, false).unwrap();
         let txt = std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
-        assert!(txt.contains("BEGIN-CRUX-MANAGED:boot-banner v1"));
+        // v2 added the prompt-cache clock to channels 1 and 2. The marker
+        // carries the version so a stale rendered CLAUDE.md is detectable.
+        assert!(txt.contains("BEGIN-CRUX-MANAGED:boot-banner v2"));
         assert!(txt.contains("## Crux Boot Banner"));
     }
 

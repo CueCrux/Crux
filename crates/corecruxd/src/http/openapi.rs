@@ -450,6 +450,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/session/schemas/{file}", methods: &["GET"], tag: "Sessions", auth: "public", summary: "Advertised capability schema document (hash-pinned)" },
     RouteEntry { path: "/v1/sessions/active", methods: &["GET"], tag: "Sessions", auth: "read", summary: "Sessions active" },
     RouteEntry { path: "/v1/sessions/{sessionId}/archive", methods: &["POST"], tag: "Sessions", auth: "write", summary: "Sessions {sessionId} archive" },
+    RouteEntry { path: "/v1/sessions/{sessionId}/cache", methods: &["GET"], tag: "Sessions", auth: "read", summary: "Prompt-cache warmth + TTL clock for a session" },
     RouteEntry { path: "/v1/sessions/{sessionId}/observations", methods: &["GET", "POST"], tag: "Sessions", auth: "read-write", summary: "Sessions {sessionId} observations" },
     RouteEntry { path: "/v1/sessions/{sessionId}/observations/batch", methods: &["POST"], tag: "Sessions", auth: "write", summary: "Sessions {sessionId} observations batch" },
     RouteEntry { path: "/v1/sessions/{sessionId}/plan", methods: &["GET"], tag: "Sessions", auth: "read", summary: "Sessions {sessionId} plan" },

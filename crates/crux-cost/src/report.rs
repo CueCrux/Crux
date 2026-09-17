@@ -241,6 +241,15 @@ pub struct Headline {
     /// classifier blames it on. Bounded by [`crate::MAX_INVALIDATIONS`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invalidations: Vec<CacheInvalidation>,
+    /// `cache_read + cache_creation + input` on the session's **last** API turn
+    /// — the size of the prefix currently sitting in the prompt cache, and so
+    /// the number of tokens the next prompt re-writes if the 1-hour TTL lapses
+    /// first. This is the estimate `GET /v1/sessions/{id}/cache` reports as
+    /// `est_rewrite_tokens`; `None` when the transcript carried no API turn
+    /// with usage, in which case the endpoint reports `null` rather than
+    /// guessing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_context_tokens: Option<u64>,
 }
 
 /// What a single prompt-cache invalidation is blamed on.

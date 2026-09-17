@@ -7,10 +7,12 @@
 
 Hot path: read a 60s-TTL cache, render one ANSI line (<50ms, no network); if the
 cache is stale/missing, render stale data and spawn a detached `--refresh` that
-does the network I/O and rewrites the cache. Stdin (any shape/empty) is ignored.
+does the network I/O and rewrites the cache. Stdin is parsed for `session_id`
+only (any other shape, or empty, is tolerated) so the prompt-cache clock can be
+scoped to the session being rendered.
 SECURITY: tokens are read from files into request headers only, never logged.
 """
-import json, os, re, subprocess, sys, tempfile, time, urllib.request
+import datetime, json, os, re, subprocess, sys, tempfile, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 ENV_FILE = os.path.expanduser("~/.config/cuecrux/env")
@@ -141,6 +143,58 @@ def f_mcp(cfg):
         pass
     return out
 
+# Prompt-cache entries retained across refreshes. Several Claude Code sessions
+# share this one cache file, so the clock is keyed by session and a handful of
+# peers are kept warm rather than the newest refresh evicting everyone else.
+CACHE_SESSIONS_MAX = 8
+
+def f_cache(cfg, session_id, prior=None):
+    """Prompt-cache clock for this session (M3 of crux-prompt-cache-1h-ttl).
+
+    Stores the *timestamp*, not the countdown: the hot path re-derives
+    `ttl_seconds_remaining` from it on every render, so the number stays honest
+    between 60s refreshes instead of ageing with the cache file.
+
+    `prior` carries the previous refresh's per-session entries forward, so a
+    sibling session's statusline does not go blank every time this one refreshes.
+    """
+    kept = {k: v for k, v in (prior or {}).items() if isinstance(v, dict)}
+    if not session_id:
+        return {"cache_by_session": kept}
+    try:
+        _, body = _api(cfg, f"/v1/sessions/{session_id}/cache")
+        inner = json.loads(body)
+        at = _epoch(inner.get("last_request_at"))
+        if at is not None:
+            tokens = inner.get("est_rewrite_tokens")
+            kept[session_id] = {
+                "at": at,
+                # "5m" is the API-key/credit billing TTL; "1h" and "unknown"
+                # both count down from an hour (the endpoint reports which in
+                # `ttl_policy_basis`).
+                "ttl": 300 if inner.get("ttl_policy") == "5m" else 3600,
+                "est": tokens if isinstance(tokens, int) else None,
+                "seen": time.time(),
+            }
+    except Exception:
+        # A 404 (session never observed) or an unreachable daemon leaves any
+        # previous entry in place; it ages out on its own.
+        pass
+    if len(kept) > CACHE_SESSIONS_MAX:
+        stale = sorted(kept, key=lambda k: kept[k].get("seen", 0))[: len(kept) - CACHE_SESSIONS_MAX]
+        for k in stale:
+            kept.pop(k, None)
+    return {"cache_by_session": kept}
+
+def _epoch(rfc3339):
+    """RFC3339 -> epoch seconds, or None. Tolerates the trailing `Z`."""
+    if not isinstance(rfc3339, str) or not rfc3339:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(rfc3339.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
 def f_update(cfg):
     # basis "binary" = drift of the running daemon (post-M6a); "checkout"/absent
     # = the src clone update_status tracks — rendered dim as ▲src<n>, never as
@@ -155,11 +209,14 @@ def f_update(cfg):
         pass
     return out
 
-def refresh():
+def refresh(session_id=None):
     cfg = read_env()
     cache = {"ts": time.time()}
-    with ThreadPoolExecutor(max_workers=7) as ex:
-        for frag in ex.map(lambda fn: fn(cfg), (f_ready, f_work, f_gate, f_coord, f_engine, f_mcp, f_update)):
+    prior = (load_cache() or {}).get("cache_by_session")
+    fetchers = [f_ready, f_work, f_gate, f_coord, f_engine, f_mcp, f_update,
+                lambda c: f_cache(c, session_id, prior)]
+    with ThreadPoolExecutor(max_workers=len(fetchers)) as ex:
+        for frag in ex.map(lambda fn: fn(cfg), fetchers):
             cache.update(frag)
     save_cache(cache)
 
@@ -168,7 +225,38 @@ def refresh():
 def _vis(s):
     return len(re.sub(r"\033\[[0-9;]*m", "", s))
 
-def render(c, now):
+def _tokens(n):
+    """Coarse token count for a statusline cell: 181,447 -> `181k`."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{round(n / 1_000)}k"
+    return str(n)
+
+def cache_segment(c, now, session_id):
+    """The prompt-cache clock cell, or None when it does not apply.
+
+    Derived from `last_request_at` + the TTL policy, never from a stored
+    countdown, so it stays correct however stale the cache file is. Scoped to
+    `session_id`: a cell fetched for another session is not shown.
+    """
+    if not session_id:
+        return None
+    entry = (c.get("cache_by_session") or {}).get(session_id)
+    if not isinstance(entry, dict):
+        return None
+    at, ttl = entry.get("at"), entry.get("ttl")
+    if at is None or not ttl:
+        return None
+    remaining = ttl - (now - at)
+    if remaining <= 0:
+        tokens = entry.get("est")
+        return f"{Y}cache COLD{X}" if tokens is None else f"{Y}cache COLD ~{_tokens(tokens)}{X}"
+    mins = int(remaining // 60)
+    # Amber inside the last 10 minutes: still recoverable by prompting now.
+    return f"{Y}cache {mins}m{X}" if remaining < 600 else f"cache {mins}m"
+
+def render(c, now, session_id=None):
     if c is None:
         return f"{D}⧉ CRUX … warming{X}"
     age = now - c.get("ts", now)
@@ -188,6 +276,11 @@ def render(c, now):
             segs.append(c["mode"])
         if c.get("facts") is not None:
             segs.append(f"{c['facts']:,} facts")
+        # Early in the list deliberately: the ponytail below drops from the tail,
+        # and a cold cache is the most expensive thing the line can tell you.
+        cache_cell = cache_segment(c, now, session_id)
+        if cache_cell:
+            segs.append(cache_cell)
         if c.get("upd_behind"):
             if c.get("upd_basis") == "binary":
                 segs.append(f"{Y}▲{c['upd_behind']}{X}")
@@ -211,7 +304,7 @@ def render(c, now):
         line += f" {D}(stale {int(age // 60)}m){X}"
     return line
 
-def maybe_spawn_refresh():
+def maybe_spawn_refresh(session_id=None):
     lp = lock_path()
     try:
         if os.path.exists(lp) and time.time() - os.path.getmtime(lp) < 30:
@@ -222,22 +315,34 @@ def maybe_spawn_refresh():
         os.makedirs(os.path.dirname(lp), exist_ok=True)
         with open(lp, "w") as f:
             f.write(str(time.time()))
-        subprocess.Popen([sys.executable, os.path.abspath(__file__), "--refresh"],
+        argv = [sys.executable, os.path.abspath(__file__), "--refresh"]
+        if session_id:
+            argv.append(session_id)
+        subprocess.Popen(argv,
                          start_new_session=True, stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
-def hot_path():
+def read_session_id():
+    """`session_id` off the statusline payload, or None. Never raises."""
     try:
-        sys.stdin.read()  # consume payload; shape is irrelevant to the statusline
+        raw = sys.stdin.read()
     except Exception:
-        pass
+        return None
+    try:
+        sid = json.loads(raw).get("session_id")
+    except (ValueError, AttributeError):
+        return None
+    return sid if isinstance(sid, str) and sid else None
+
+def hot_path():
+    session_id = read_session_id()
     c = load_cache()
     now = time.time()
     if c is None or now - c.get("ts", 0) > 60:
-        maybe_spawn_refresh()
-    sys.stdout.write(render(c, now) + "\n")
+        maybe_spawn_refresh(session_id)
+    sys.stdout.write(render(c, now, session_id) + "\n")
 
 def selfcheck():
     d = tempfile.mkdtemp(prefix="crux-sl-")
@@ -255,6 +360,44 @@ def selfcheck():
         for sub in checks:
             assert sub in line, f"expected {sub!r} in {line!r}"
     assert "⚠" not in render(healthy, now), "healthy must not warn"
+
+    # --- prompt-cache clock (M3 of crux-prompt-cache-1h-ttl-2026-09-17) -------
+    sid = "sess-abc"
+    def fx(at, est=181_447, ttl=3600, other=None):
+        by = {sid: {"at": at, "ttl": ttl, "est": est, "seen": now}}
+        if other:
+            by.update(other)
+        return {**healthy, "cache_by_session": by}
+    warm = fx(now - 1560)
+    # 3600 - 1560 = 2040s left -> 34m, not amber.
+    assert "cache 34m" in render(warm, now, sid), render(warm, now, sid)
+    assert f"{Y}cache 34m" not in render(warm, now, sid), "34m left must not be amber"
+    # The countdown is derived from last_request_at, so it ages with wall clock
+    # and not with the cache file: same fixture, 10 minutes later.
+    assert "cache 24m" in render(warm, now + 600, sid), "countdown must track wall clock"
+    # The 5m (API-key billing) policy shortens the countdown.
+    assert "cache 3m" in render(fx(now - 120, ttl=300), now, sid)
+    assert f"{Y}cache 5m{X}" in render(fx(now - 3300), now, sid), "under 10m must be amber"
+    cold = fx(now - 4000)
+    assert "cache COLD ~181k" in render(cold, now, sid), render(cold, now, sid)
+    # Never borrow another session's clock, and never invent one.
+    assert "cache" not in render(cold, now, "other-session")
+    assert "cache" not in render(cold, now, None)
+    assert "cache" not in render(healthy, now, sid)
+    # Sibling sessions share this cache file: each reads its own entry.
+    both = fx(now - 4000, other={"peer": {"at": now - 60, "ttl": 3600, "est": 9000, "seen": now}})
+    assert "cache COLD" in render(both, now, sid), "this session is cold"
+    assert "cache 59m" in render(both, now, "peer"), "the peer is still warm"
+    # An un-costed session reports null tokens: say COLD without a number.
+    assert "cache COLD" in render(fx(now - 4000, est=None), now, sid)
+    assert "~" not in render(fx(now - 4000, est=None), now, sid)
+    # A malformed entry is ignored rather than crashing the hot path.
+    assert "cache" not in render({**healthy, "cache_by_session": {sid: "nope"}}, now, sid)
+    assert "cache" not in render({**healthy, "cache_by_session": {sid: {"at": None, "ttl": 3600}}}, now, sid)
+    # A malformed/empty statusline payload must never break the hot path.
+    assert _epoch(None) is None and _epoch("not-a-date") is None
+    assert _epoch("2026-09-17T14:02:00Z") is not None
+
     os.unlink(cache_path())
     assert "warming" in render(load_cache(), now), "no-cache hot path must show warming"
     print("selfcheck OK")
@@ -262,7 +405,7 @@ def selfcheck():
 def main():
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
     if arg == "--refresh":
-        refresh()
+        refresh(sys.argv[2] if len(sys.argv) > 2 else None)
     elif arg == "--selfcheck":
         selfcheck()
     else:
