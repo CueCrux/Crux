@@ -26,8 +26,7 @@ the daemon `/v1/cost/report` endpoint (reader/store), and the console `cx-cost` 
   (`tests/fixtures/cache-invalidations.jsonl`) — no operator transcript reaches CI. The
   real-corpus gate is opt-in:
   `CRUX_COST_CACHE_CORPUS=~/.claude/projects cargo test -p crux-cost --test cache_ledger -- --ignored --nocapture`,
-  held to the frozen `drivew-host-claude-transcripts-2026-09` baseline in
-  `PlanCrux/.agent/research/prompt-cache-claude-code-2026-09-17/`.
+  held to the frozen `drivew-host-claude-transcripts-2026-09` baseline pinned in that test.
 
 ## Local rules
 - **`CostReport` is a cross-binary contract**: `corecruxctl` produces it, `corecruxd`

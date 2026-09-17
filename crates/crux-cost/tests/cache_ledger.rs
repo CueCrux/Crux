@@ -10,7 +10,13 @@
 //! check is [`corpus_reproduces_frozen_baseline`], which is skipped unless
 //! `CRUX_COST_CACHE_CORPUS` points at a transcript root.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::print_stdout)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::float_cmp
+)]
 
 use crux_cost::report::{CacheClass, ToolDeltaKind};
 use crux_cost::{analyze_str, CostReport};
@@ -268,7 +274,9 @@ fn legacy_report_without_cache_fields_still_deserialises() {
 /// Reproduce the frozen baseline for corpus
 /// **`drivew-host-claude-transcripts-2026-09`** — the 27 most recent Claude Code
 /// sessions with ≥ 5 API turns under `~/.claude/projects` on drivew-host, read
-/// 2026-09-17 (`PlanCrux/.agent/research/prompt-cache-claude-code-2026-09-17/`).
+/// 2026-09-17. The expected numbers below *are* the frozen baseline: they were
+/// measured once, by hand, before any of this code existed, and this test is
+/// what keeps the Rust honest against them.
 ///
 /// Skipped unless `CRUX_COST_CACHE_CORPUS` names the transcript root, because
 /// the corpus is one operator's private transcripts and does not belong in CI.
@@ -278,8 +286,8 @@ fn legacy_report_without_cache_fields_still_deserialises() {
 /// CRUX_COST_CACHE_CORPUS=~/.claude/projects cargo test -p crux-cost --test cache_ledger -- --ignored --nocapture
 /// ```
 ///
-/// The corpus is live (sessions keep growing), so every total is held to the
-/// plan's ±1%; the event counts and the ≥ 85% attribution bar are the gate.
+/// The corpus is live (sessions keep growing), so every total is held to ±1%;
+/// the event counts and the ≥ 85% attribution bar are the gate.
 #[test]
 #[ignore = "reads the operator's local transcripts; set CRUX_COST_CACHE_CORPUS"]
 fn corpus_reproduces_frozen_baseline() {
@@ -297,7 +305,9 @@ fn corpus_reproduces_frozen_baseline() {
     // of which the ones with ≥ 5 API turns are the corpus.
     let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
     for project in std::fs::read_dir(&root).expect("read corpus root").flatten() {
-        let Ok(inner) = std::fs::read_dir(project.path()) else { continue };
+        let Ok(inner) = std::fs::read_dir(project.path()) else {
+            continue;
+        };
         for entry in inner.flatten() {
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "jsonl") {
@@ -356,11 +366,14 @@ fn corpus_reproduces_frozen_baseline() {
         println!("  gap {band:<12} {n:3} events {t:>10}");
     }
     for (class, (n, t)) in &by_class {
-        println!("  {class:<22} {n:3} events {t:>10}  ({:.1}%)", 100.0 * *t as f64 / inv_tokens as f64);
+        println!(
+            "  {class:<22} {n:3} events {t:>10}  ({:.1}%)",
+            100.0 * *t as f64 / inv_tokens as f64
+        );
     }
     println!("attributed to a named class: {attributed:.2}%");
 
-    // Frozen baseline (05-baseline.py, snapshots/cache-before.txt).
+    // Frozen baseline, measured 2026-09-17 before this code existed.
     let within_1pct = |got: u64, frozen: u64, what: &str| {
         let drift = 100.0 * (got as f64 - frozen as f64).abs() / frozen as f64;
         assert!(drift <= 1.0, "{what}: {got} vs frozen {frozen} — {drift:.2}% drift");
@@ -384,5 +397,8 @@ fn corpus_reproduces_frozen_baseline() {
         assert_eq!(n, events, "gap band {band} event count");
         within_1pct(t, tokens, &format!("gap band {band} tokens"));
     }
-    assert!(attributed >= 85.0, "only {attributed:.2}% of rewritten tokens attributed (gate: 85%)");
+    assert!(
+        attributed >= 85.0,
+        "only {attributed:.2}% of rewritten tokens attributed (gate: 85%)"
+    );
 }

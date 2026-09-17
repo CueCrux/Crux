@@ -18,9 +18,9 @@
 
 use std::collections::HashMap;
 
+use crate::cache;
 use crate::levers;
 use crate::report::{BlockCost, Bucket, CostReport, Headline, Measured, COST_REPORT_SCHEMA};
-use crate::cache;
 use crate::transcript::{Event, EventKind, ExecPlanSignal, SignalStrength};
 use crate::{MAX_EXECPLAN_SLUGS, TOP_BLOCKS};
 

@@ -309,7 +309,7 @@ pub enum ToolDeltaKind {
 /// One detected prompt-cache invalidation: an API turn that re-wrote a prefix
 /// the previous turn had already cached.
 ///
-/// Detection rule (the measured baseline rule, `05-baseline.py`): with
+/// Detection rule (the rule the 2026-09 baseline was measured with): with
 /// `ctx_prev = prev.cache_read + prev.cache_creation + prev.input`, a turn is an
 /// invalidation when `cur.cache_read < 0.5 × ctx_prev` **and**
 /// `cur.cache_creation > 0.4 × ctx_prev`. Windows with `ctx_prev < 5000` (no

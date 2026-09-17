@@ -455,7 +455,11 @@ fn parse_record(value: &Value, state: &mut ParseState, capture: bool) -> Event {
 /// Extract the classifier-relevant shape of a `type:"attachment"` record.
 fn parse_attachment_info(value: &Value) -> Option<AttachmentInfo> {
     let a = value.get("attachment")?;
-    let kind = a.get("type").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())?;
+    let kind = a
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
     let names = |key: &str| -> Vec<String> {
         a.get(key)
             .and_then(Value::as_array)
