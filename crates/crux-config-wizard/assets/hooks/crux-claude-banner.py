@@ -230,7 +230,7 @@ def live_sessions(coord: dict):
                 overlap = pp
     return live, sess, overlap
 
-def build(data: dict, card_mode: str) -> dict:
+def build(data: dict, card_mode: str, cold_line: str | None = None) -> dict:
     """Pure renderer: data dict -> hook JSON dict. Testable offline."""
     ss = data.get("sync_status") or {}
     bp = data.get("get_bootstrap") or {}
@@ -368,6 +368,12 @@ def build(data: dict, card_mode: str) -> dict:
         card = ("\n---\nOpen your first reply with this single line, then "
                 f"continue normally:\n⧉ Crux engaged · {mode} · {facts_s} facts · {wip} wip")
 
+    # The cold-cache warning is volatile and goes LAST, after every other line:
+    # it is the tail of the brief, never ahead of content the reader relies on.
+    # Importance 1 so it is the first thing shed if the cap bites.
+    if cold_line:
+        lines = list(lines) + [(1, cold_line)]
+
     brief = fit_brief(lines, card, BRIEF_CAP)
 
     title = f"CRUX · {need_you} need you · {wip} wip"
@@ -378,6 +384,85 @@ def build(data: dict, card_mode: str) -> dict:
         "sessionTitle": title,
         "systemMessage": oneliner,
     }
+
+def read_hook_input() -> dict:
+    """SessionStart hook JSON from stdin: {session_id, source, ...}.
+
+    Guarded: a tty, no data, or malformed JSON all yield {}. The banner must
+    never block or crash on stdin — it is on the boot path of every session.
+    """
+    try:
+        if sys.stdin is None or sys.stdin.isatty():
+            return {}
+        raw = sys.stdin.read()
+    except (OSError, ValueError):
+        return {}
+    if not raw or not raw.strip():
+        return {}
+    try:
+        obj = json.loads(raw)
+    except (ValueError, json.JSONDecodeError):
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def is_url_path_safe(session_id: str) -> bool:
+    """Session ids are UUIDs; anything else does not go into a URL path."""
+    return bool(session_id) and len(session_id) <= 128 and re.fullmatch(r"[A-Za-z0-9._-]+", session_id) is not None
+
+
+def coarse_tokens(n: int) -> str:
+    """Round to a shape a human acts on: 947k, not 946,786."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}m".replace(".0m", "m")
+    if n >= 1_000:
+        return f"{n // 1_000}k"
+    return str(n)
+
+
+def cold_context_line(cache: dict) -> str | None:
+    """Render the cold-cache warning, or None when the cache is not known cold.
+
+    Mirrors the Rust hook (crux-claude-hooks session_start). Absent or true
+    `warm` means "not known to be cold" and says nothing: a line that fired on a
+    warm cache would be worse than no line at all.
+    """
+    if not isinstance(cache, dict) or "_error" in cache:
+        return None
+    warm = cache.get("warm")
+    if warm is None or warm:
+        return None
+    since = cache.get("last_request_at")
+    if not isinstance(since, str):
+        return None
+    m = re.search(r"T(\d{2}):(\d{2})", since)
+    if not m:
+        return None
+    hhmm = f"{m.group(1)}:{m.group(2)}"
+    tokens = cache.get("est_rewrite_tokens")
+    if isinstance(tokens, int) and tokens > 0:
+        cost = f"next prompt rewrites ~{coarse_tokens(tokens)} tokens"
+    else:
+        # Never costed: name the shape of the cost without inventing a size.
+        cost = "the next prompt re-writes the whole prefix"
+    return f"**Crux cache** cold since {hhmm}Z \u2014 {cost}; /compact first if the context is stale"
+
+
+def cold_context_section(http_url: str, jwt: str, hook: dict) -> str | None:
+    """Resume boots only, silent on every failure.
+
+    A cold-cache warning is worth nothing if it can break a boot, so every
+    failure path returns None rather than raising.
+    """
+    if (hook.get("source") or "") != "resume":
+        return None
+    if (os.environ.get("CRUX_HOOK_CACHE_CLOCK") or "").lower() == "off":
+        return None
+    session_id = hook.get("session_id") or ""
+    if not isinstance(session_id, str) or not is_url_path_safe(session_id):
+        return None
+    return cold_context_line(http_get(f"{http_url}/v1/sessions/{session_id}/cache", jwt))
+
 
 def fit_brief(lines: list[tuple[int, str]], card: str, cap: int) -> str:
     """Assemble brief+card; while over cap, drop the least-important line."""
@@ -407,6 +492,7 @@ def emit_degraded(reason: str) -> None:
     })
 
 def main() -> None:
+    hook = read_hook_input()
     if os.environ.get("CRUX_BANNER_AGENT", "brief").lower() == "off":
         emit({})
         return
@@ -414,7 +500,11 @@ def main() -> None:
     mcp_url = os.environ.get("CRUX_MCP_URL") or cfg.get("CRUX_MCP_URL") or "https://crux.cuecrux.com/mcp"
     http_url = (os.environ.get("CRUX_HTTP_URL") or cfg.get("CRUX_HTTP_URL") or "http://100.70.12.73:14800").rstrip("/")
     jwt = cfg.get("CRUX_AGENT_TOKEN", "")  # env-file only: wrapper may repurpose the env var
-    mcp_token = read_mcp_token()
+    # Fall back to the env-file JWT: the crux-tokens/ file is the preferred rail,
+    # but MCP has accepted the HS256 JWT since the daemon redeploy, and a missing
+    # token file otherwise 401s every MCP call into a silent mode=unreachable
+    # banner while the daemon itself is healthy (2026-08-04).
+    mcp_token = read_mcp_token() or jwt
     card_mode = (os.environ.get("CRUX_BANNER_CARD") or cfg.get("CRUX_BANNER_CARD") or "auto").lower()
 
     if not jwt and not mcp_token:
@@ -429,7 +519,7 @@ def main() -> None:
         h = (data.get("work") or {}).get("_error", "http down")
         emit_degraded(f"all calls failed — mcp: {m}; http: {h}")
         return
-    emit(build(data, card_mode))
+    emit(build(data, card_mode, cold_context_section(http_url, jwt, hook)))
 
 def _selfcheck() -> int:
     # Maximal: long patterns, 58 wip / 5 blocked / 165 planned, degraded, behind,
@@ -487,6 +577,23 @@ def _selfcheck() -> int:
     dj = json.loads(buf.getvalue())
     check(set(dj) >= {"hookSpecificOutput", "sessionTitle", "systemMessage"}, "degraded three fields")
     check(dj["sessionTitle"] == "CRUX · degraded", "degraded title")
+
+    # --- cold-context line (prompt-cache M3, python path) ---
+    check(cold_context_line({"warm": True, "last_request_at": "2026-09-17T14:02:00Z"}) is None, "warm -> no cold line")
+    check(cold_context_line({"last_request_at": "2026-09-17T14:02:00Z"}) is None, "warm absent -> no cold line")
+    check(cold_context_line({"_error": "boom"}) is None, "error payload -> no cold line")
+    check(cold_context_line({"warm": False}) is None, "no timestamp -> no cold line")
+    cl = cold_context_line({"warm": False, "last_request_at": "2026-09-17T14:02:33Z", "est_rewrite_tokens": 182_000})
+    check(cl == "**Crux cache** cold since 14:02Z \u2014 next prompt rewrites ~182k tokens; /compact first if the context is stale", f"cold line text: {cl}")
+    cl2 = cold_context_line({"warm": False, "last_request_at": "2026-09-17T14:02:33Z"})
+    check(cl2 is not None and "re-writes the whole prefix" in cl2, "uncosted cold line names the shape, not a size")
+    check(coarse_tokens(946_786) == "946k" and coarse_tokens(1_200_000) == "1.2m", "coarse tokens")
+    check(is_url_path_safe("ffd2bbf5-821e-4a28") and not is_url_path_safe("../etc/passwd"), "url path safety")
+    check(cold_context_section("http://x", "t", {"source": "startup", "session_id": "abc"}) is None, "non-resume boot -> silent")
+    warm_brief = build(clean, "auto")["hookSpecificOutput"]["additionalContext"]
+    cold_brief = build(clean, "auto", "**Crux cache** cold since 14:02Z \u2014 x")["hookSpecificOutput"]["additionalContext"]
+    check(cold_brief.startswith(warm_brief.rstrip("\n")[:40]), "cold line appends; it does not reorder the head")
+    check("cold since" in cold_brief and "cold since" not in warm_brief, "cold line present only when passed")
 
     for m in fails:
         sys.stderr.write(f"selfcheck FAIL: {m}\n")
