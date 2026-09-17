@@ -687,6 +687,7 @@ mod tests {
                     cache_read_to_output_ratio: 50.0,
                     measured_context_total: 12_345,
                     prefix_pct: 50.0,
+                    ..crux_cost::Headline::default()
                 },
                 measured: crux_cost::Measured {
                     input: 1,

@@ -18,7 +18,7 @@
 //! I/O"). Thinking-block previews are deliberately redacted — raw reasoning is
 //! never surfaced, even in a cost summary.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
@@ -144,6 +144,81 @@ pub struct Event {
     /// The record's `cwd`. Varies within a session (a `cd` moves it), so the
     /// report carries the most common one, like [`Self::git_branch`].
     pub cwd: Option<String>,
+    /// The assistant record's `message.id` — the **API call** identity.
+    ///
+    /// Claude Code writes one JSONL line per content block, so a single API
+    /// response appears as several `assistant` records that all repeat the same
+    /// `message.id` *and the same `usage` object*. Summing usage per record
+    /// therefore multi-counts: on the `drivew-host-claude-transcripts-2026-09`
+    /// corpus the raw sum over-states `cache_creation` by 193% (18,154 records
+    /// for 8,082 API calls). See [`Self::duplicate_api_line`].
+    pub message_id: Option<String>,
+    /// `true` when this assistant record repeats a `message.id` already seen
+    /// earlier in the transcript — i.e. it is a continuation line of an API call
+    /// already accounted for, not a new call. Its [`Self::usage`] is cleared at
+    /// parse time so every consumer sums each API call exactly once; its content
+    /// blocks are kept, because they are genuinely distinct content.
+    pub duplicate_api_line: bool,
+    /// `cache_creation.ephemeral_5m_input_tokens` — the 5-minute-TTL share of
+    /// this turn's [`Measured::cache_creation`]. `0` when the record used the
+    /// flat `cache_creation_input_tokens` shape or carried no 5m writes.
+    pub cache_creation_5m: u64,
+    /// `cache_creation.ephemeral_1h_input_tokens` — the 1-hour-TTL share of this
+    /// turn's [`Measured::cache_creation`]. Claude Code on a subscription writes
+    /// the 1h tier almost exclusively (99.4% of writes on
+    /// `drivew-host-claude-transcripts-2026-09`), billed at 2x.
+    pub cache_creation_1h: u64,
+    /// Details of a `type:"attachment"` record — the harness-injected context
+    /// (effort switches, date rollover, deferred-tool deltas, hook output) that
+    /// sits *between* two API turns and explains why the second one rewrote the
+    /// prompt cache. `None` on every non-attachment record.
+    pub attachment: Option<AttachmentInfo>,
+}
+
+/// What a `type:"attachment"` record injected, reduced to what the
+/// cache-invalidation classifier needs.
+///
+/// Claude Code's attachment payloads are undocumented and drift; this keeps the
+/// `type` discriminator verbatim plus the two name lists a
+/// `deferred_tools_delta` carries, and ignores everything else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentInfo {
+    /// The payload's `type`, verbatim (`deferred_tools_delta`, `date_change`,
+    /// `ultra_effort_enter`, `hook_additional_context`, …). Unknown kinds are
+    /// carried through rather than dropped, so a new one shows up as its own
+    /// visible value instead of silently becoming `unattributed`.
+    pub kind: String,
+    /// `addedNames` on a `deferred_tools_delta` / `mcp_instructions_delta`.
+    pub added_names: Vec<String>,
+    /// `removedNames` on a `deferred_tools_delta`. Non-empty is the harmful
+    /// case: measured add-only deltas never invalidated the cache, removals did.
+    pub removed_names: Vec<String>,
+}
+
+impl AttachmentInfo {
+    /// The MCP server a deferred-tool delta is about, by tool-name prefix:
+    /// `mcp__<server>__<tool>` → `<server>`, anything else → `builtin`. Returns
+    /// the server owning the most names in the delta, `None` when it named none.
+    #[must_use]
+    pub fn dominant_server(&self) -> Option<String> {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for name in self.added_names.iter().chain(self.removed_names.iter()) {
+            *counts.entry(server_of(name)).or_default() += 1;
+        }
+        // Count desc, then name — deterministic, no clock and no hash order.
+        counts
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+            .map(|(server, _)| server.to_owned())
+    }
+}
+
+/// `mcp__crux__query` → `crux`; `Bash` → `builtin`.
+fn server_of(tool_name: &str) -> &str {
+    tool_name
+        .strip_prefix("mcp__")
+        .and_then(|rest| rest.split_once("__"))
+        .map_or("builtin", |(server, _)| server)
 }
 
 /// Model-id normalisation, applied at parse time.
@@ -226,7 +301,7 @@ fn parse_file_opts(path: &Path, capture: bool) -> std::io::Result<Vec<Event>> {
 /// Parse from any reader, line by line, skipping malformed lines. `capture`
 /// fills [`ContentBlock::text`] with the full block text.
 pub fn parse_reader<R: Read>(reader: BufReader<R>, capture: bool) -> Vec<Event> {
-    let mut tool_names: HashMap<String, String> = HashMap::new();
+    let mut state = ParseState::default();
     let mut events = Vec::new();
     for line in reader.lines() {
         let Ok(line) = line else { continue };
@@ -235,7 +310,7 @@ pub fn parse_reader<R: Read>(reader: BufReader<R>, capture: bool) -> Vec<Event> 
             continue;
         }
         if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-            events.push(parse_record(&value, &mut tool_names, capture));
+            events.push(parse_record(&value, &mut state, capture));
         }
     }
     events
@@ -255,16 +330,25 @@ pub fn parse_str_capturing(text: &str) -> Vec<Event> {
 }
 
 fn parse_str_opts(text: &str, capture: bool) -> Vec<Event> {
-    let mut tool_names: HashMap<String, String> = HashMap::new();
+    let mut state = ParseState::default();
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .map(|v| parse_record(&v, &mut tool_names, capture))
+        .map(|v| parse_record(&v, &mut state, capture))
         .collect()
 }
 
-fn parse_record(value: &Value, tool_names: &mut HashMap<String, String>, capture: bool) -> Event {
+/// Line-to-line parser state: `tool_use.id` → tool name (so a later
+/// `tool_result` can be labelled), plus the set of `message.id`s already seen
+/// (so a continuation line of an API call is not counted as a second call).
+#[derive(Default)]
+struct ParseState {
+    tool_names: HashMap<String, String>,
+    seen_message_ids: HashSet<String>,
+}
+
+fn parse_record(value: &Value, state: &mut ParseState, capture: bool) -> Event {
     let session_id = value.get("sessionId").and_then(Value::as_str).map(str::to_owned);
     let timestamp = value
         .get("timestamp")
@@ -286,10 +370,26 @@ fn parse_record(value: &Value, tool_names: &mut HashMap<String, String>, capture
     };
 
     let message = value.get("message");
-    let usage = message
+    let message_id = message
+        .and_then(|m| m.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    // One API response is written as several `assistant` lines that repeat the
+    // same `message.id` *and* the same `usage`. Only the first carries the
+    // usage; the rest are continuation lines of a call already counted.
+    let duplicate_api_line = message_id
+        .as_ref()
+        .is_some_and(|id| !state.seen_message_ids.insert(id.clone()));
+    let parsed_usage = message
         .and_then(|m| m.get("usage"))
         .or_else(|| value.get("usage"))
         .and_then(parse_usage);
+    let (usage, cache_creation_5m, cache_creation_1h) = match parsed_usage {
+        Some(u) if !duplicate_api_line => (Some(u.measured), u.ephemeral_5m, u.ephemeral_1h),
+        _ => (None, 0, 0),
+    };
 
     let mut execplan_signals: Vec<ExecPlanSignal> = Vec::new();
     let blocks = if rtype == Some("attachment") {
@@ -297,7 +397,7 @@ fn parse_record(value: &Value, tool_names: &mut HashMap<String, String>, capture
     } else {
         match (kind, message) {
             (EventKind::Assistant | EventKind::User, Some(msg)) => {
-                extract_blocks(msg, kind, tool_names, capture, &mut execplan_signals)
+                extract_blocks(msg, kind, &mut state.tool_names, capture, &mut execplan_signals)
             }
             _ => Vec::new(),
         }
@@ -327,6 +427,12 @@ fn parse_record(value: &Value, tool_names: &mut HashMap<String, String>, capture
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
 
+    let attachment = if rtype == Some("attachment") {
+        parse_attachment_info(value)
+    } else {
+        None
+    };
+
     Event {
         kind,
         usage,
@@ -338,7 +444,29 @@ fn parse_record(value: &Value, tool_names: &mut HashMap<String, String>, capture
         model,
         effort,
         cwd,
+        message_id,
+        duplicate_api_line,
+        cache_creation_5m,
+        cache_creation_1h,
+        attachment,
     }
+}
+
+/// Extract the classifier-relevant shape of a `type:"attachment"` record.
+fn parse_attachment_info(value: &Value) -> Option<AttachmentInfo> {
+    let a = value.get("attachment")?;
+    let kind = a.get("type").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())?;
+    let names = |key: &str| -> Vec<String> {
+        a.get(key)
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+            .unwrap_or_default()
+    };
+    Some(AttachmentInfo {
+        kind: kind.to_owned(),
+        added_names: names("addedNames"),
+        removed_names: names("removedNames"),
+    })
 }
 
 /// `effort` is a plain top-level string in every Claude Code transcript measured
@@ -393,23 +521,77 @@ fn is_compaction(value: &Value) -> bool {
     false
 }
 
-fn parse_usage(raw: &Value) -> Option<Measured> {
+/// One record's `usage`, with the cache-write total kept **and** split by TTL
+/// tier. The two tiers are priced differently (a 1h write costs 2x base, a 5m
+/// write 1.25x), so a merged total cannot say what a rewrite cost.
+pub(crate) struct ParsedUsage {
+    /// The four accumulators, unchanged — `cache_creation` is still the total.
+    pub measured: Measured,
+    /// `cache_creation.ephemeral_5m_input_tokens`.
+    pub ephemeral_5m: u64,
+    /// `cache_creation.ephemeral_1h_input_tokens`.
+    pub ephemeral_1h: u64,
+}
+
+fn parse_usage(raw: &Value) -> Option<ParsedUsage> {
     let obj = raw.as_object()?;
     let u64_at = |k: &str| obj.get(k).and_then(Value::as_u64).unwrap_or(0);
-    // Newer API nests cache_creation as {ephemeral_5m_input_tokens, …}.
+    // Newer API nests cache_creation as {ephemeral_5m_input_tokens, …}. The
+    // nested map is authoritative for the per-tier split; the flat
+    // `cache_creation_input_tokens` is the total and stays the total.
+    let nested = raw.get("cache_creation").and_then(Value::as_object);
+    let nested_at = |k: &str| nested.and_then(|m| m.get(k)).and_then(Value::as_u64).unwrap_or(0);
     let cache_creation = match u64_at("cache_creation_input_tokens") {
-        0 => raw
-            .get("cache_creation")
-            .and_then(Value::as_object)
-            .map_or(0, |m| m.values().filter_map(Value::as_u64).sum()),
+        0 => nested.map_or(0, |m| m.values().filter_map(Value::as_u64).sum()),
         direct => direct,
     };
-    Some(Measured {
-        input: u64_at("input_tokens"),
-        output: u64_at("output_tokens"),
-        cache_read: u64_at("cache_read_input_tokens"),
-        cache_creation,
+    Some(ParsedUsage {
+        measured: Measured {
+            input: u64_at("input_tokens"),
+            output: u64_at("output_tokens"),
+            cache_read: u64_at("cache_read_input_tokens"),
+            cache_creation,
+        },
+        ephemeral_5m: nested_at("ephemeral_5m_input_tokens"),
+        ephemeral_1h: nested_at("ephemeral_1h_input_tokens"),
     })
+}
+
+/// Seconds since the Unix epoch for a fixed-width RFC3339 UTC instant
+/// (`2026-06-25T11:38:40.060Z`), or `None` when the string is not that shape.
+///
+/// Deliberately hand-rolled: the crate's only dependencies are `serde` and
+/// `serde_json`, and the one thing needed here is a difference between two
+/// timestamps from the same transcript. Fractional seconds are ignored (the
+/// classifier's smallest bucket is five minutes).
+#[must_use]
+pub fn epoch_seconds(ts: &str) -> Option<i64> {
+    if !looks_like_rfc3339_utc(ts) {
+        return None;
+    }
+    let b = ts.as_bytes();
+    let num = |from: usize, to: usize| ts.get(from..to)?.parse::<i64>().ok();
+    if b.get(4) != Some(&b'-') || b.get(7) != Some(&b'-') || b.get(13) != Some(&b':') || b.get(16) != Some(&b':') {
+        return None;
+    }
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec)
+}
+
+/// Days since 1970-01-01 for a proleptic-Gregorian date (Howard Hinnant's
+/// `days_from_civil`).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 fn extract_blocks(
