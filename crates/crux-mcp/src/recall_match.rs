@@ -80,11 +80,11 @@ pub const SUGGEST_NO_MATCH: &str = "no fact cleared the match floor. Address the
 
 /// Minimum length of a content-bearing query term. Shorter runs are punctuation
 /// or noise for substring matching.
-const MIN_TERM_LEN: usize = 3;
+pub const MIN_TERM_LEN: usize = 3;
 
 /// Weight for a term found only as a bare substring (e.g. `cache` inside
 /// `cached_at`) rather than as a whole word. Counts, but counts for less.
-const SUBSTRING_WEIGHT: f64 = 0.5;
+pub const SUBSTRING_WEIGHT: f64 = 0.5;
 
 /// English/query stopwords dropped before scoring. Keeping them would let a
 /// fact match on `the` and clear any floor.
