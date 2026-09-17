@@ -165,3 +165,125 @@ jobs:
 
       - name: Check licenses
         run: cargo deny check licenses
+
+  # ── Alerting ─────────────────────────────────────────────────────────
+  # The three jobs above have caught real problems on `main` for months.
+  # Nothing was listening. The scheduled run failed on 2026-08-31,
+  # 2026-09-07 and 2026-09-14 — three consecutive weeks, every one of them
+  # a genuine red — and no issue was opened, so `main` sat with a failing
+  # advisory gate and every open PR blocked behind it until someone went
+  # looking by hand (Crux #785).
+  #
+  # A scheduled failure is the one case with no audience: a PR failure is on
+  # the PR, a push failure is in front of whoever pushed, but a cron failure
+  # on `main` is a red square on a page nobody opens. So this job exists only
+  # for `schedule`, and turns that red square into an issue.
+  #
+  # It also closes the issue when a later scheduled run comes back green, so
+  # the presence of an open `security-audit-failure` issue means "main's
+  # advisory gate is red right now" rather than "was red once".
+  #
+  # Deliberately NOT a required check and never fails the run: this reports
+  # on the audit, it does not add a second way for the audit to break. Every
+  # step is best-effort, and a failure to file is surfaced in the log rather
+  # than masking the advisory result that prompted it.
+  report:
+    name: Report scheduled audit failure
+    if: always() && github.event_name == 'schedule'
+    needs: [advisories, cargo-audit, licenses]
+    # GitHub-hosted on purpose: this is a couple of `gh` calls with no Rust in
+    # it, so it has no business taking a slot in the self-hosted CI pool.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      DENY_RESULT: ${{ needs.advisories.result }}
+      AUDIT_RESULT: ${{ needs.cargo-audit.result }}
+      LICENCE_RESULT: ${{ needs.licenses.result }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      LABEL: security-audit-failure
+    steps:
+      - name: File or clear the advisory-gate issue
+        run: |
+          set -uo pipefail
+
+          failed=""
+          [ "$DENY_RESULT" = "success" ]    || failed="${failed}- \`Cargo deny policy\` — ${DENY_RESULT}"$'\n'
+          [ "$AUDIT_RESULT" = "success" ]   || failed="${failed}- \`Cargo audit\` — ${AUDIT_RESULT}"$'\n'
+          [ "$LICENCE_RESULT" = "success" ] || failed="${failed}- \`Licence check\` — ${LICENCE_RESULT}"$'\n'
+
+          # The label has to exist before --label will accept it, and it may
+          # not on a fresh clone of this policy. Idempotent either way.
+          gh label create "$LABEL" \
+            --description "main's scheduled advisory gate is currently red" \
+            --color B60205 >/dev/null 2>&1 || true
+
+          existing=$(gh issue list --label "$LABEL" --state open --limit 1 \
+            --json number -q '.[0].number // ""' 2>/dev/null || echo "")
+
+          if [ -z "$failed" ]; then
+            if [ -n "$existing" ]; then
+              echo "Advisory gate green again; closing #${existing}."
+              gh issue comment "$existing" --body \
+                "Scheduled audit is green again as of [this run](${RUN_URL}). Closing." || true
+              gh issue close "$existing" --reason completed || true
+            else
+              echo "Advisory gate green, nothing open. Nothing to do."
+            fi
+            exit 0
+          fi
+
+          echo "::warning::Scheduled security audit failed on main — filing/updating an issue."
+
+          body=$(cat <<EOF
+          The scheduled security audit on \`main\` failed.
+
+          Failing jobs:
+
+          ${failed}
+          Run: ${RUN_URL}
+          Commit: \`${GITHUB_SHA}\`
+
+          ---
+
+          **This usually is not caused by a code change.** \`cargo deny\` and
+          \`cargo audit\` read the RustSec advisory database, which updates
+          daily, so a lockfile that was green when it merged goes red on its
+          own — a newly yanked crate or a newly published advisory against a
+          dependency you already had.
+
+          Two things follow from that:
+
+          - Every open PR is blocked too, because these are required checks.
+          - The failure will not fix itself, and reading an older run's log
+            understates it — that log only lists the advisories that existed
+            when it ran.
+
+          Reproduce against today's database before fixing:
+
+          \`\`\`
+          cargo deny check
+          cargo audit
+          \`\`\`
+
+          Prefer a lockfile-only, semver-compatible bump
+          (\`cargo update -p <crate> --precise <version>\`) over a manifest
+          change, and keep any major bump as its own reviewed PR.
+
+          Closed automatically when a later scheduled run comes back green.
+          EOF
+          )
+
+          if [ -n "$existing" ]; then
+            echo "Updating existing issue #${existing}."
+            gh issue comment "$existing" --body "$body" \
+              || echo "::error::Could not comment on #${existing} — the audit is still red, see ${RUN_URL}"
+          else
+            gh issue create \
+              --title "Scheduled security audit failing on main" \
+              --label "$LABEL" \
+              --body "$body" \
+              || echo "::error::Could not open an issue — the audit is still red, see ${RUN_URL}"
+          fi
