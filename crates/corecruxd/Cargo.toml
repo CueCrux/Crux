@@ -114,7 +114,7 @@ sha2 = { workspace = true }
 # with a dedicated P-256 key. Already a workspace dep via corecrux-receipts.
 p256 = { workspace = true, default-features = false, features = ["std", "ecdsa", "pem"] }
 notify = "8"
-tree-sitter = "0.26.10"
+tree-sitter = "0.27.0"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-python = "0.25.0"
 tree-sitter-go = "0.25.0"
