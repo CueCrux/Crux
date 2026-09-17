@@ -113,16 +113,20 @@ fn configured_roots() -> Option<Vec<std::path::PathBuf>> {
     Some(roots)
 }
 
-/// Authorize, then run one read-only ingest pass. `Err` is a ready response.
-fn authorized_ingest(state: &AppState, headers: &HeaderMap) -> Result<NativeMemoryIngestV1, axum::response::Response> {
+/// Authorize, then run one read-only ingest pass. `Err` is a ready response,
+/// boxed because an axum `Response` is a large `Err` variant to carry inline.
+fn authorized_ingest(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<NativeMemoryIngestV1, Box<axum::response::Response>> {
     if let Err(problem) = require_http_any_scope(&state.auth, headers, READ_SCOPES) {
-        return Err(problem.into_response());
+        return Err(Box::new(problem.into_response()));
     }
     let Some(roots) = configured_roots() else {
-        return Err(problem_response(
+        return Err(Box::new(problem_response(
             StatusCode::NOT_FOUND,
             format!("native memory projection is disabled; set {NATIVE_MEMORY_ROOT_ENV}"),
-        ));
+        )));
     };
     let ingest = ingest_native_memory(&roots, NativeMemoryIngestOptions::default());
     // Counts only. A body — or a description — can quote a credential, so
@@ -171,7 +175,7 @@ pub(super) async fn list_native_memory(
 ) -> impl IntoResponse {
     let ingest = match authorized_ingest(&state, &headers) {
         Ok(ingest) => ingest,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let limit = clamp_limit(query.limit, DEFAULT_LIST_LIMIT);
     let group = query.group.as_deref().filter(|s| !s.trim().is_empty());
@@ -219,7 +223,7 @@ pub(super) async fn search_native_memory(
 ) -> impl IntoResponse {
     let ingest = match authorized_ingest(&state, &headers) {
         Ok(ingest) => ingest,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let q = query.q.unwrap_or_default();
     if q.trim().is_empty() {
@@ -255,7 +259,7 @@ pub(super) async fn get_native_memory(
 ) -> impl IntoResponse {
     let ingest = match authorized_ingest(&state, &headers) {
         Ok(ingest) => ingest,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Some(entry) = ingest.get(&slug) else {
         return problem_response(StatusCode::NOT_FOUND, format!("no native memory with slug {slug:?}")).into_response();

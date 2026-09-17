@@ -1156,7 +1156,21 @@ fn redact_token(token: &str) -> Option<String> {
             return Some(format!("{key}={REDACTION_PLACEHOLDER}"));
         }
     }
-    if SECRET_PREFIXES.iter().any(|p| core.starts_with(p)) && core.len() >= 12 {
+    // A credential is a solid run of credential characters. Prose that merely
+    // *names* a prefix — "the secret is `base64:`-prefixed" — is not one, and
+    // redacting it would eat the sentence that makes the memory useful.
+    if !core
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '+' | '/' | '='))
+    {
+        return None;
+    }
+    // The prefix identifies the issuer; the credential body has to actually be
+    // there, so require at least 12 characters after it.
+    if SECRET_PREFIXES
+        .iter()
+        .any(|p| core.starts_with(p) && core.len() >= p.len() + 12)
+    {
         return Some(REDACTION_PLACEHOLDER.to_string());
     }
     if is_jwt_shaped(core) {
@@ -1338,7 +1352,9 @@ mod tests {
 
     #[test]
     fn index_rows_split_title_target_and_hook() {
-        let row = parse_index_row("[Title here](slug-one.md) — the recall hook").expect("row parses");
+        let Some(row) = parse_index_row("[Title here](slug-one.md) — the recall hook") else {
+            unreachable!("index row parses")
+        };
         assert_eq!(row.title, "Title here");
         assert_eq!(row.target, "slug-one.md");
         assert_eq!(row.slug.as_deref(), Some("slug-one"));
@@ -1353,6 +1369,19 @@ mod tests {
         let (out, hit) = redact_secret_shaped("fixed in a413ce6f and 20ae0539abcdef0123456789abcdef0123456789");
         assert!(!hit);
         assert!(out.contains("a413ce6f"));
+    }
+
+    /// Prose that *names* a credential prefix is not a credential. Observed on
+    /// the operator's real store: "the secret is `base64:`-prefixed when
+    /// re-minting" was being swallowed whole by a prefix-only rule.
+    #[test]
+    fn redaction_spares_prose_that_only_names_a_prefix() {
+        let (out, hit) = redact_secret_shaped("the secret is `base64:`-prefixed when re-minting");
+        assert!(!hit, "prose mentioning a prefix must survive: {out}");
+        assert!(out.contains("base64:"));
+        let (out, hit) = redact_secret_shaped("set CRUX_ADMIN_JWT to the base64:QUJDREVGR0hJSktMTU5PUA value");
+        assert!(hit);
+        assert!(out.contains(REDACTION_PLACEHOLDER));
     }
 
     #[test]
