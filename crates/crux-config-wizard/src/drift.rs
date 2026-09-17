@@ -11,6 +11,8 @@ use std::path::Path;
 
 use crate::compose::compose_file;
 use crate::config::AgentProfileConfig;
+use crate::digest::load_workspace_profiles;
+#[cfg(test)]
 use crate::profile::load_bundled_profiles;
 use crate::Target;
 
@@ -78,7 +80,7 @@ pub fn check_workspace(workspace_root: &Path) -> std::io::Result<DriftReport> {
             });
         }
     };
-    let bundled = match load_bundled_profiles() {
+    let bundled = match load_workspace_profiles(workspace_root) {
         Ok(b) => b,
         Err(e) => {
             return Ok(DriftReport {

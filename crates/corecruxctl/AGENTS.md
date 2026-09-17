@@ -17,6 +17,9 @@ run it locally against a stopped or quiesced daemon. ~33k LOC — index only.
   that is `crux-lens-features`; see CODEMAP "Notes")
 - `src/receipts.rs`, `src/inspect_receipt.rs`, `src/c2pa_x509.rs` — receipt
   verification surface; `src/audit_pack.rs` / `src/audit_export.rs` — audit bundles
+- `src/memory_distill.rs` — the curated memory tier: seeds engrams from the
+  harness-native memory projection, proposes more from the fact store, and
+  renders the always-loaded digest (`memory distill` / `memory digest`)
 
 ## Key symbols
 - `start::run` — the on-ramp entry point
@@ -35,6 +38,11 @@ run it locally against a stopped or quiesced daemon. ~33k LOC — index only.
 - `cargo test -p corecruxctl`
 
 ## Local rules
+- `memory_distill::render_digest` is a pure function of `(catalog, budget)`, and has
+  to stay one: its output is prompt-prefix content in every session of the
+  workspace, so a timestamp, a run count or a non-total ordering would re-bill the
+  whole prefix at write price on every boot. Distillation stays proposal-only —
+  the tier is valuable because it is curated, not because it is large.
 - `verify-store` and `replay` are the trust tools: they must stay offline,
   deterministic, and fail-closed — never add network calls or "warn and pass" paths.
 - `start` is the canonical on-ramp; new onboarding behaviour goes through it (or

@@ -71,6 +71,11 @@ anyhow = { workspace = true }
 [dev-dependencies]
 serial_test = { workspace = true }
 rcgen = { workspace = true, features = ["x509-parser"] }
+# The M3 gate of crux-memory-parity-and-codex-bridge-2026-09-17 is end to end:
+# render the digest here, compose it there, assert the drift check stays clean.
+# Testing either half alone would miss the seam that actually breaks.
+crux-config-wizard = { path = "../crux-config-wizard" }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

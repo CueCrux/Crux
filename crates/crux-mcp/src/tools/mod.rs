@@ -206,8 +206,9 @@ pub fn list_tools_with_flags(
                           catalog. Without `names`: returns the content-free engram manifest for \
                           your capability class (session discovery). With `names` \
                           (`name@version`, max 20): returns full engram content when your \
-                          capability class allows. Flag-gated by CORECRUXD_FEATURE_ENGRAM_MCP \
-                          (off by default)."
+                          capability class allows. This is the catalog behind the always-loaded \
+                          memory digest: a digest line names `<slug>`, and `<slug>@v1` resolves \
+                          its body. On by default; CORECRUXD_FEATURE_ENGRAM_MCP=0 disables it."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -2934,7 +2935,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "cuecrux_session",    "output": "SessionPlan (see agents.cuecrux.com/schemas/SessionPlan.v1). Contains plan_id, session_id, passport, channels {bulk?, mcp}, capability_graph[], receipt {hash, signature?, signer_kid?, mode}, budget, minted_at, session_ttl_s." },
         { "tool": "autonomy_contract",  "output": "{ feature_enabled, passport_id, tier, token_id, token_hash, capabilities: [{name, allowed, scope, backend_id, mode, cost_credits, why_denied?}], summary: {total_tools, returned, allowed, denied, truncated_by_token_budget} }. Disabled when CORECRUXD_FEATURE_AUTONOMY_CONTRACT is off (feature_enabled=false, empty capabilities)." },
         { "tool": "reuse_check",        "output": "{ schema, verdict: 'reuse-candidate-found'|'nothing-found', candidates: [{kind: 'capability'|'retrieval_pointer', path, file_line, score|overlap_terms, ...}], retrieval_candidates: [{kind, result_id, rank, score, doc_length_tokens, path: null, file_line: null}], capability_candidates: [{kind, id, name, system, maturity, files, overlap_terms, path, file_line}], token_budget, tokens_returned, budget_truncated, guidance }. `file_line` comes from Features-lens `files` entries with a `<path>:<line>` suffix; retrieval hits are pointers (expand via query_expand). CAPABILITY_DENIED when CORECRUXD_FEATURE_REUSE_CHECK is off (default)." },
-        { "tool": "engram_resolve",     "output": "manifest mode: { schema, capability_class, engram_manifest }; resolve mode: { schema, capability_class, engrams: [{name, version, intent_bucket, content, prompt_hash, applicable_why}], engram_set_hash, manifest_hash }. CAPABILITY_DENIED when CORECRUXD_FEATURE_ENGRAM_MCP is off (default)." },
+        { "tool": "engram_resolve",     "output": "manifest mode: { schema, capability_class, engram_manifest }; resolve mode: { schema, capability_class, engrams: [{name, version, intent_bucket, content, prompt_hash, applicable_why}], engram_set_hash, manifest_hash }. CAPABILITY_DENIED when CORECRUXD_FEATURE_ENGRAM_MCP is explicitly set to 0/false/off; on by default." },
         { "tool": "query",              "output": "{ results: [{doc_id, score, segment_index, token_count}], coverage: {score, gaps, below_floor}, meta: {backend, took_ms, segments_searched} }" },
         { "tool": "query_scan",         "output": "{ results: [{doc_id, score, token_count}], meta: {took_ms, segments_searched} }" },
         { "tool": "query_expand",       "output": "{ results: [{doc_id, content, token_count}] }" },
