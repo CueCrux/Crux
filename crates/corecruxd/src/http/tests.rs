@@ -3293,6 +3293,7 @@ async fn query_facts_by_keyword() {
         top_k: None,
         token_budget: None,
         as_of: None,
+        include_fallback: None,
     };
 
     let resp = facts::query_facts(State(state), HeaderMap::new(), Query(params))
@@ -3354,6 +3355,7 @@ async fn query_facts_as_of_filters_world_time() {
         top_k: Some(10),
         token_budget: None,
         as_of: Some("2026-03-01T00:00:00Z".to_string()),
+        include_fallback: None,
     };
     let resp = facts::query_facts(State(state.clone()), HeaderMap::new(), Query(params))
         .await
@@ -3384,6 +3386,7 @@ async fn query_facts_as_of_filters_world_time() {
         top_k: None,
         token_budget: None,
         as_of: Some("nope".to_string()),
+        include_fallback: None,
     };
     let resp = facts::query_facts(State(state), HeaderMap::new(), Query(bad))
         .await
@@ -3419,6 +3422,7 @@ async fn query_facts_no_params_returns_all() {
         top_k: None,
         token_budget: None,
         as_of: None,
+        include_fallback: None,
     };
     let resp = facts::query_facts(State(state), HeaderMap::new(), Query(params))
         .await
@@ -3460,6 +3464,7 @@ async fn query_facts_min_effective_confidence_floor_filters_and_counts() {
         top_k: None,
         token_budget: None,
         as_of: None,
+        include_fallback: None,
     };
     let resp = facts::query_facts(State(state), HeaderMap::new(), Query(params))
         .await
@@ -3486,6 +3491,7 @@ async fn query_facts_rejects_out_of_range_floor() {
         top_k: None,
         token_budget: None,
         as_of: None,
+        include_fallback: None,
     };
     let resp = facts::query_facts(State(state), HeaderMap::new(), Query(params))
         .await
@@ -3590,6 +3596,7 @@ async fn query_facts_accepts_admin_read_fallback_in_dev_scopes_mode() {
         top_k: None,
         token_budget: None,
         as_of: None,
+        include_fallback: None,
     };
     let resp = facts::query_facts(State(state), dev_scope_headers("admin:read"), Query(params))
         .await
@@ -4318,6 +4325,177 @@ async fn fact_and_session_endpoints_use_read_and_write_scopes_in_dev_scopes_mode
     assert_eq!(session_body["session_id"], "sess-admin-write");
 }
 
+// ── memory-parity M1: match floor, honest misses, whole-response budget ──────
+//
+// ExecPlan `crux-memory-parity-and-codex-bridge-2026-09-17`. Measured defect on
+// `GET /v1/facts`: a topic search that matched nothing returned the store's most
+// recent facts with no signal it had fallen back (0 honest misses in 98 gold
+// queries), and `token_budget` capped only the fact tier.
+
+/// Seed a store whose recent, high-confidence facts are the recency filler the
+/// pre-M1 path returned for any query: they share no content with the probe.
+async fn match_floor_state() -> AppState {
+    let state = test_app_state(16);
+    for (entity, key, value) in [
+        (
+            "execplan:alpha",
+            "gate:M2",
+            "status green, tests passing, commit abc123",
+        ),
+        ("execplan:beta", "gate:M3", "status green, tests passing, commit def456"),
+        (
+            "incident:2026-08-25",
+            "cause",
+            "erasure reclaim wedged on dirrun run_id collision",
+        ),
+    ] {
+        let _ = facts::put_fact(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: entity.to_string(),
+                key: key.to_string(),
+                value: value.to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            }),
+        )
+        .await
+        .into_response();
+    }
+    state
+}
+
+fn query_params(query: &str, token_budget: Option<usize>) -> QueryFactsParams {
+    QueryFactsParams {
+        min_effective_confidence: None,
+        query: Some(query.to_string()),
+        entity: None,
+        entity_prefix: None,
+        top_k: Some(10),
+        token_budget,
+        as_of: None,
+        include_fallback: None,
+    }
+}
+
+#[tokio::test]
+async fn query_facts_unmatched_topic_search_is_an_honest_miss_not_recency_filler() {
+    let state = match_floor_state().await;
+    // Shares one incidental term ("status") with two stored facts, so the
+    // pre-M1 OR-filter admitted them and ranked them by recency.
+    let resp = facts::query_facts(
+        State(state),
+        HeaderMap::new(),
+        Query(query_params("prompt caching ephemeral ttl status", None)),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["facts"].as_array().map(Vec::len), Some(0), "no recency filler");
+    assert_eq!(body["match"], "none", "the miss is stated, not implied");
+    assert!(body["candidates_below_floor"].as_u64().unwrap_or(0) > 0, "{body}");
+    assert!(
+        body["suggest"].as_str().is_some_and(|s| s.contains("entity")),
+        "a miss points at the addressing shape that resolves"
+    );
+}
+
+#[tokio::test]
+async fn query_facts_relevant_topic_search_still_answers_and_is_labelled() {
+    let state = match_floor_state().await;
+    let resp = facts::query_facts(
+        State(state),
+        HeaderMap::new(),
+        Query(query_params("erasure reclaim wedged dirrun collision", None)),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    let rows = body["facts"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "the one genuinely relevant fact is returned: {body}");
+    assert_eq!(rows[0]["entity"], "incident:2026-08-25");
+    assert_eq!(body["match"], "strong");
+    assert_eq!(rows[0]["match_tier"], "strong");
+    assert!(rows[0]["match_score"].as_f64().unwrap_or(0.0) >= 0.7);
+}
+
+#[tokio::test]
+async fn query_facts_entity_lookups_are_exempt_from_the_floor() {
+    let state = match_floor_state().await;
+    // An address-shaped free-text query: the shape that already scored 1.00.
+    let resp = facts::query_facts(
+        State(state.clone()),
+        HeaderMap::new(),
+        Query(query_params("execplan:alpha", None)),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    let rows = body["facts"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "address-shaped query must still resolve: {body}");
+    assert_eq!(rows[0]["value"], "status green, tests passing, commit abc123");
+
+    // And the explicit `entity_prefix` plane is never scored at all.
+    let mut params = query_params("anything unrelated whatsoever", None);
+    params.query = None;
+    params.entity_prefix = Some("execplan:".to_string());
+    let resp = facts::query_facts(State(state), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["facts"].as_array().map(Vec::len), Some(2));
+    assert!(body.get("match").is_none(), "addressed recall is not scored");
+}
+
+#[tokio::test]
+async fn query_facts_match_floor_flag_off_restores_the_pre_m1_path() {
+    let _guard = crux_mcp::test_env_lock().lock().await;
+    let state = match_floor_state().await;
+    std::env::set_var(crux_mcp::recall_match::MATCH_FLOOR_ENV, "0");
+    let resp = facts::query_facts(
+        State(state),
+        HeaderMap::new(),
+        Query(query_params("prompt caching ephemeral ttl status", None)),
+    )
+    .await
+    .into_response();
+    std::env::remove_var(crux_mcp::recall_match::MATCH_FLOOR_ENV);
+    let body = json_body(resp).await;
+    assert!(
+        !body["facts"].as_array().unwrap().is_empty(),
+        "flag-off returns the pre-M1 recency fallback"
+    );
+    assert!(body.get("match").is_none(), "flag-off adds no match keys");
+}
+
+#[tokio::test]
+async fn query_facts_token_budget_governs_the_whole_http_response() {
+    let state = match_floor_state().await;
+    for budget in [300usize, 600, 4000] {
+        let resp = facts::query_facts(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(query_params("erasure reclaim wedged dirrun collision", Some(budget))),
+        )
+        .await
+        .into_response();
+        let body = json_body(resp).await;
+        let serialised = serde_json::to_string(&body).unwrap();
+        let tokens = serialised.len() / 4;
+        assert!(
+            tokens <= budget,
+            "token_budget={budget} must govern the whole response, got {tokens} ({serialised})"
+        );
+        assert_eq!(body["budget"]["governs"], "whole_response");
+        assert_eq!(body["budget"]["within_budget"], serde_json::json!(true));
+    }
+}
+
 #[tokio::test]
 async fn query_facts_supports_entity_prefix_top_k_and_token_budget() {
     let state = test_app_state(16);
@@ -4353,6 +4531,7 @@ async fn query_facts_supports_entity_prefix_top_k_and_token_budget() {
         top_k: Some(99),
         token_budget: Some(1),
         as_of: None,
+        include_fallback: None,
     };
 
     let resp = facts::query_facts(State(state), HeaderMap::new(), Query(params))
@@ -4414,6 +4593,7 @@ async fn query_facts_applies_passport_private_visibility() {
         top_k: Some(10),
         token_budget: None,
         as_of: None,
+        include_fallback: None,
     };
     let alice = facts::query_facts(
         State(state.clone()),
@@ -4437,6 +4617,7 @@ async fn query_facts_applies_passport_private_visibility() {
         top_k: Some(10),
         token_budget: None,
         as_of: None,
+        include_fallback: None,
     };
     let anonymous = facts::query_facts(
         State(state.clone()),
@@ -4459,6 +4640,7 @@ async fn query_facts_applies_passport_private_visibility() {
         top_k: Some(10),
         token_budget: None,
         as_of: None,
+        include_fallback: None,
     };
     let admin = facts::query_facts(State(state), dev_scope_headers("admin:read"), Query(admin_params))
         .await

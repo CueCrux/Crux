@@ -495,6 +495,25 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     // the emitted tier to budget. Legacy contract OR holdout control (`unshaped`) ⇒
     // legacy budget-drop.
     let reversible = !unshaped && token_budget.is_some() && crate::crc_v1::enabled(args);
+    // M1 (memory-parity) — match floor. It governs free-text SEARCH only:
+    // addressed recall (`entity`) and a query-less listing are exempt by
+    // construction, which is what keeps `execplan:<slug>` / `gate:M2` shaped
+    // lookups at their measured 1.00 coverage. `include_fallback` opts back into
+    // the below-floor candidates, which are then LABELLED as filler rather than
+    // passed off as answers.
+    // `unshaped` is the CO-4 holdout control arm: it must stay a true pre-M1
+    // control, so the floor is off there for the same reason the efficiency
+    // flags are (it is a sampled fraction, 0 by default).
+    let include_fallback = args.get("include_fallback").and_then(Value::as_bool).unwrap_or(false);
+    let match_policy = if unshaped || entity.is_some() || query.is_none() {
+        crate::recall_match::MatchPolicy::disabled()
+    } else {
+        crate::recall_match::MatchPolicy::from_env()
+    };
+    // Under the floor the store must return the FULL scored candidate set, not a
+    // budget-truncated prefix of the recency ranking — otherwise the best match
+    // can be cut before it is ever scored.
+    let defer_budget = reversible || match_policy.enabled;
     let q = FactQuery {
         min_effective_confidence,
         tenant_hash: Some(ctx.scope_tenant()),
@@ -505,12 +524,20 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
         top_k,
         // Suppress the store-level drop under reversible mode; the demotion
         // boundary is computed from the full ranked set below.
-        token_budget: if reversible { None } else { token_budget },
+        token_budget: if defer_budget { None } else { token_budget },
     };
 
     let store = ctx.fact_store.read().await;
-    let (visible, filtered_below_threshold) =
-        query_visible_facts_opts_as_of(&store, &q, id_ref, &alias_refs, include_superseded, as_of);
+    let (visible, filtered_below_threshold, match_stats, match_scores) = query_visible_facts_scored(
+        &store,
+        &q,
+        id_ref,
+        &alias_refs,
+        include_superseded,
+        as_of,
+        match_policy,
+        include_fallback,
+    );
     drop(store);
 
     // M2 salience: record that these facts were just recalled so they decay
@@ -527,14 +554,52 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
         // confidence floor" so the caller can fall back to a non-LLM path
         // instead of padding context with junk. `filtered_below_threshold` is
         // surfaced in both the text and structured surfaces.
-        let text = if filtered_below_threshold > 0 {
+        // M1: an honest miss is distinct from an empty store. Say which, say how
+        // many candidates the floor held back, and point at the query shape that
+        // resolves exactly instead of leaving the caller to retry the same search.
+        // `below_floor == 0` means nothing even term-matched: the store has
+        // nothing, which is the pre-M1 message and still the right one. The new
+        // message is for the case the floor actually held candidates back.
+        let text = if match_stats.is_miss() && match_stats.below_floor > 0 {
+            format!(
+                "no fact matched \"{}\" above the match floor ({:.2}); {} candidate(s) scored below it. {}",
+                query.as_deref().unwrap_or(""),
+                match_stats.floor,
+                match_stats.below_floor,
+                crate::recall_match::SUGGEST_NO_MATCH
+            )
+        } else if filtered_below_threshold > 0 {
             format!("no facts above confidence floor ({filtered_below_threshold} below threshold)")
         } else {
             "no facts found".to_string()
         };
+        let mut structured = json!({ "rows": [], "filtered_below_threshold": filtered_below_threshold });
+        if let Some(map) = structured.as_object_mut() {
+            if match_stats.applied {
+                map.insert("match".into(), json!(match_stats.marker()));
+                map.insert("match_floor".into(), json!(match_stats.floor));
+                map.insert("candidates_below_floor".into(), json!(match_stats.below_floor));
+                if match_stats.is_miss() {
+                    map.insert("suggest".into(), json!(crate::recall_match::SUGGEST_NO_MATCH));
+                }
+            }
+            // Only when the floor actually ran: with it off this branch stays
+            // byte-identical to pre-M1 (no `crc_v1`, no match keys).
+            if match_stats.applied && crate::crc_v1::enabled(args) {
+                let info = crate::crc_v1::FactMatchInfo {
+                    stats: match_stats,
+                    scores: &[],
+                    suggest: Some(crate::recall_match::SUGGEST_NO_MATCH),
+                };
+                map.insert(
+                    "crc_v1".into(),
+                    crate::crc_v1::wrap_facts_scored(&[], entity.as_deref(), query.as_deref(), 0, 0, Some(&info)),
+                );
+            }
+        }
         return Ok(json!({
             "content": [{ "type": "text", "text": text }],
-            "structuredContent": { "rows": [], "filtered_below_threshold": filtered_below_threshold }
+            "structuredContent": structured
         }));
     }
 
@@ -548,7 +613,7 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
 
     let mut lines: Vec<String> = Vec::with_capacity(visible.len());
     let mut rows: Vec<Value> = Vec::with_capacity(visible.len());
-    for f in &visible {
+    for (ix, f) in visible.iter().enumerate() {
         let entity = scope::visible_entity_for_identity(f, id_ref, &alias_refs).unwrap_or_else(|| f.entity.clone());
         let class = crate::tools::freshness::projection_class_of(f.horizon_class);
         // Salience-aware (M2): the surfaced freshness/effective_confidence
@@ -557,17 +622,31 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
         let effective_confidence = decay::effective_confidence(f.confidence as f64, fresh);
         let anchor = f.reverified_at.unwrap_or(f.stored_at);
         let age_hours = (now - anchor).num_hours().max(0);
+        // M1: label relevance in the text surface too — a text-reading agent
+        // must be able to tell a scored match from labelled filler.
+        let tier_suffix = if match_stats.applied {
+            match match_scores.get(ix) {
+                Some(score) => format!(
+                    ", match={}, match_score={score:.2}",
+                    crate::recall_match::MatchTier::classify(*score, &match_policy).as_str()
+                ),
+                None => String::new(),
+            }
+        } else {
+            String::new()
+        };
         lines.push(format!(
-            "[{}] {} = {} (confidence={:.2}, effective_confidence={:.2}, freshness={}, age_hours={})",
+            "[{}] {} = {} (confidence={:.2}, effective_confidence={:.2}, freshness={}, age_hours={}{})",
             entity,
             f.key,
             f.value,
             f.confidence,
             effective_confidence,
             fresh.as_str(),
-            age_hours
+            age_hours,
+            tier_suffix
         ));
-        rows.push(json!({
+        let mut row = json!({
             "fact_id": f.fact_id,
             "entity": entity,
             "key": f.key,
@@ -583,7 +662,15 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
             // M3: attribution surfaced on read. Null for legacy/flag-off
             // writes; the stored actor (never inferred or backfilled).
             "actor": f.actor,
-        }));
+        });
+        if let (true, Some(score), Some(map)) = (match_stats.applied, match_scores.get(ix), row.as_object_mut()) {
+            map.insert("match_score".into(), json!((score * 1000.0).round() / 1000.0));
+            map.insert(
+                "match_tier".into(),
+                json!(crate::recall_match::MatchTier::classify(*score, &match_policy).as_str()),
+            );
+        }
+        rows.push(row);
     }
 
     // CRC-v1 (kind=fact addressed recall) when negotiated. We KEEP the legacy
@@ -592,40 +679,205 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     // `structuredContent.envelope`) composes without collision. content[text]
     // carries the CRC-v1 envelope for text-reading agents. Absent contract →
     // legacy shape, byte-identical.
+    let total_candidates = rows.len();
+    // M3: minified text surface unconditionally (since CO-5). CO-4: unshaped
+    // control forces pretty.
+    let compact = !unshaped;
+
     if crate::crc_v1::enabled(args) {
-        // M1 part 2/3: under reversible mode, hydrate `full_count` facts full and
-        // demote the rest to epitome-only — but **budget the emitted tier** (M1
-        // pt3 / CO-6): emit only `emit_count` pointers (full + epitomes that fit
-        // the budget), drop the rest, and disclose the full count via
-        // `total_candidates` so the agent re-queries for the remainder. This keeps
-        // the emitted payload within `token_budget` (QC.2), which the uncapped
-        // pt2 path violated by emitting a pointer for every candidate.
-        let crc = if reversible {
-            let costs: Vec<usize> = visible.iter().map(|f| f.tokens).collect();
-            let budget = token_budget.unwrap_or(0);
-            let (full_count, emit_count) = crate::budget::fact_emit_within_budget(&costs, budget);
-            let total = rows.len();
-            let emitted = &rows[..emit_count.min(rows.len())];
-            crate::crc_v1::wrap_facts_tiered(emitted, entity.as_deref(), query.as_deref(), full_count, total)
-        } else {
-            crate::crc_v1::wrap_facts(&rows, entity.as_deref(), query.as_deref())
+        // M1 (memory-parity): `token_budget` governs the WHOLE serialised
+        // response, envelope scaffolding included — not just the fact tier.
+        // `render_crc` can draw the response at any `(full, emitted)` hydration
+        // pair; `response_budget::fit` picks the largest pair that fits. With no
+        // budget set, the `(total, total)` render is byte-identical to pre-M1.
+        let render_crc = |full: usize, emitted: usize| -> Value {
+            let emitted = emitted.min(total_candidates);
+            let full = full.min(emitted);
+            let info = crate::crc_v1::FactMatchInfo {
+                stats: match_stats,
+                scores: &match_scores,
+                suggest: Some(crate::recall_match::SUGGEST_NO_MATCH),
+            };
+            let crc = crate::crc_v1::wrap_facts_scored(
+                &rows[..emitted],
+                entity.as_deref(),
+                query.as_deref(),
+                full,
+                total_candidates,
+                match_stats.applied.then_some(&info),
+            );
+            let text = crate::payload::serialize_with(&crc, compact);
+            let mut out = json!({
+                "content": [{ "type": "text", "text": text }],
+                "structuredContent": {
+                    "rows": structured_rows(&rows, full, emitted),
+                    "crc_v1": crc,
+                    "filtered_below_threshold": filtered_below_threshold,
+                }
+            });
+            insert_budget_block(&mut out, token_budget, full, emitted, total_candidates);
+            out
         };
-        // M3: minified text surface unconditionally (since CO-5); the structured
-        // `crc_v1` Value below is unchanged. CO-4: unshaped control forces pretty.
-        let compact = !unshaped;
-        let text = crate::payload::serialize_with(&crc, compact);
-        crate::holdout::record_sample(unshaped, crate::token_estimate::estimate_tokens_str(&text));
-        crate::holdout::sample_compaction(&args.to_string(), &crc); // CO-5 compaction-only
-        return Ok(json!({
-            "content": [{ "type": "text", "text": text }],
-            "structuredContent": { "rows": rows, "crc_v1": crc, "filtered_below_threshold": filtered_below_threshold }
-        }));
+        // Rung 2 — one copy of the envelope. `structuredContent.crc_v1` is
+        // byte-identical to `content[0].text`, so under budget pressure the
+        // duplicate goes first: no information is lost, ~a third of the bytes are.
+        let render_compact = |full: usize, emitted: usize| -> Value {
+            let mut value = render_crc(full, emitted);
+            if let Some(map) = value.pointer_mut("/structuredContent").and_then(Value::as_object_mut) {
+                map.remove("crc_v1");
+                map.insert("crc_v1_inline_only".into(), json!(true));
+            }
+            value
+        };
+        // Rung 3 — minimal envelope: ids + epitomes only. See
+        // [`crate::crc_v1::wrap_facts_minimal`] for why dropping rows alone
+        // could not honour a small budget.
+        let render_minimal = |_full: usize, emitted: usize| -> Value {
+            let emitted = emitted.min(total_candidates);
+            let crc = crate::crc_v1::wrap_facts_minimal(
+                &rows[..emitted],
+                total_candidates,
+                match_stats.applied.then(|| match_stats.marker()),
+            );
+            let mut out = json!({
+                "content": [{ "type": "text", "text": crate::payload::serialize_with(&crc, true) }],
+                "structuredContent": { "rows": [], "crc_v1": crc, "filtered_below_threshold": filtered_below_threshold }
+            });
+            insert_budget_block(&mut out, token_budget, 0, emitted, total_candidates);
+            out
+        };
+        let (mut result, outcome) = match token_budget {
+            Some(budget) if !unshaped => {
+                let (value, outcome) = crate::response_budget::fit(budget, total_candidates, render_crc);
+                if outcome.fits && outcome.full == total_candidates && outcome.emitted == total_candidates {
+                    (value, outcome)
+                } else {
+                    let (value, outcome) = crate::response_budget::fit(budget, total_candidates, render_compact);
+                    if outcome.fits && outcome.emitted > 0 {
+                        (value, outcome)
+                    } else {
+                        crate::response_budget::fit(budget, total_candidates, render_minimal)
+                    }
+                }
+            }
+            _ if reversible => {
+                // Legacy reversible path (no whole-response accounting): the
+                // pre-M1 fact-tier-only cut, retained for the holdout control arm.
+                let costs: Vec<usize> = visible.iter().map(|f| f.tokens).collect();
+                let budget = token_budget.unwrap_or(0);
+                let (full_count, emit_count) = crate::budget::fact_emit_within_budget(&costs, budget);
+                (
+                    render_crc(full_count, emit_count),
+                    crate::response_budget::FitOutcome {
+                        full: full_count,
+                        emitted: emit_count,
+                        tokens: 0,
+                        fits: true,
+                    },
+                )
+            }
+            _ => (
+                render_crc(total_candidates, total_candidates),
+                crate::response_budget::FitOutcome {
+                    full: total_candidates,
+                    emitted: total_candidates,
+                    tokens: 0,
+                    fits: true,
+                },
+            ),
+        };
+        if let Some(budget) = token_budget {
+            crate::response_budget::finalize_block(&mut result, "/structuredContent/budget", budget);
+        }
+        let _ = &outcome;
+        let text_tokens = result
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .map_or(0, crate::token_estimate::estimate_tokens_str);
+        crate::holdout::record_sample(unshaped, text_tokens);
+        if let Some(crc) = result.pointer("/structuredContent/crc_v1") {
+            crate::holdout::sample_compaction(&args.to_string(), crc); // CO-5 compaction-only
+        }
+        return Ok(result);
     }
 
-    Ok(json!({
-        "content": [{ "type": "text", "text": lines.join("\n") }],
-        "structuredContent": { "rows": rows, "filtered_below_threshold": filtered_below_threshold }
-    }))
+    // Legacy (non-CRC-v1) surface: no pointer tier to demote into, so the budget
+    // ladder is "drop the value, then drop the row", both disclosed.
+    let render_legacy = |full: usize, emitted: usize| -> Value {
+        let emitted = emitted.min(total_candidates);
+        let full = full.min(emitted);
+        let mut out = json!({
+            "content": [{ "type": "text", "text": lines[..full].join("\n") }],
+            "structuredContent": {
+                "rows": structured_rows(&rows, full, emitted),
+                "filtered_below_threshold": filtered_below_threshold,
+            }
+        });
+        insert_budget_block(&mut out, token_budget, full, emitted, total_candidates);
+        out
+    };
+    let (mut result, outcome) = match token_budget {
+        Some(budget) if !unshaped => crate::response_budget::fit(budget, total_candidates, render_legacy),
+        _ => (
+            render_legacy(total_candidates, total_candidates),
+            crate::response_budget::FitOutcome {
+                full: total_candidates,
+                emitted: total_candidates,
+                tokens: 0,
+                fits: true,
+            },
+        ),
+    };
+    if let Some(budget) = token_budget {
+        crate::response_budget::finalize_block(&mut result, "/structuredContent/budget", budget);
+    }
+    let _ = &outcome;
+    Ok(result)
+}
+
+/// Render `structuredContent.rows` at a hydration boundary: the first `full`
+/// rows keep their `value`; rows in `full..emitted` are emitted WITHOUT it and
+/// flagged `value_omitted` (the row stays addressable by `fact_id`/`entity`+`key`
+/// so nothing is silently lost); rows beyond `emitted` are dropped and disclosed
+/// via `meta.total_candidates` / the `budget` block.
+///
+/// `full == emitted == rows.len()` reproduces the pre-M1 array exactly.
+fn structured_rows(rows: &[Value], full: usize, emitted: usize) -> Vec<Value> {
+    let emitted = emitted.min(rows.len());
+    let full = full.min(emitted);
+    let mut out = Vec::with_capacity(emitted);
+    out.extend(rows[..full].iter().cloned());
+    for row in &rows[full..emitted] {
+        let mut trimmed = row.clone();
+        if let Some(map) = trimmed.as_object_mut() {
+            map.remove("value");
+            map.insert("value_omitted".into(), json!(true));
+        }
+        out.push(trimmed);
+    }
+    out
+}
+
+/// Insert the M1 whole-response budget disclosure, in its widest placeholder
+/// form, so the disclosure is itself inside the budget it reports on.
+/// [`crate::response_budget::finalize_block`] settles the numbers afterwards.
+/// Absent when no `token_budget` was requested — an unbudgeted response is
+/// unchanged from pre-M1.
+fn insert_budget_block(
+    result: &mut Value,
+    token_budget: Option<usize>,
+    full: usize,
+    emitted: usize,
+    total_candidates: usize,
+) {
+    let Some(budget) = token_budget else { return };
+    let Some(structured) = result.pointer_mut("/structuredContent").and_then(Value::as_object_mut) else {
+        return;
+    };
+    structured.insert(
+        "budget".into(),
+        crate::response_budget::placeholder_block(budget, "whole_response", full, emitted, total_candidates),
+    );
 }
 
 /// `delete_fact` — soft-delete a fact by its ID.
@@ -774,6 +1026,43 @@ fn query_visible_facts_opts_as_of(
     include_superseded: bool,
     as_of: Option<DateTime<Utc>>,
 ) -> (Vec<Fact>, usize) {
+    let (facts, filtered, _, _) = query_visible_facts_scored(
+        store,
+        q,
+        identity,
+        aliases,
+        include_superseded,
+        as_of,
+        crate::recall_match::MatchPolicy::disabled(),
+        false,
+    );
+    (facts, filtered)
+}
+
+/// As [`query_visible_facts_opts_as_of`] but with the M1 match floor
+/// (`crux-memory-parity-and-codex-bridge-2026-09-17`).
+///
+/// With `policy.enabled` the candidate set — the same OR-over-terms set the
+/// pre-M1 path produced — is **scored** against the query, ranked by relevance
+/// first (effective confidence and recency demoted to tiebreaks) and cut at the
+/// floor. Below-floor rows are dropped unless `keep_fallback`, in which case
+/// they are kept for the caller to label. Returns the selected facts, the P2
+/// below-confidence-floor count, the [`crate::recall_match::MatchStats`], and
+/// the per-fact relevance scores aligned with the returned facts.
+///
+/// `policy.enabled == false` is byte-for-byte the pre-M1 behaviour: no scoring,
+/// no re-rank, scores all-zero and stats `applied: false`.
+#[allow(clippy::too_many_arguments)]
+fn query_visible_facts_scored(
+    store: &corecrux_memory::FactStore,
+    q: &FactQuery,
+    identity: Option<&str>,
+    aliases: &[&str],
+    include_superseded: bool,
+    as_of: Option<DateTime<Utc>>,
+    policy: crate::recall_match::MatchPolicy,
+    keep_fallback: bool,
+) -> (Vec<Fact>, usize, crate::recall_match::MatchStats, Vec<f64>) {
     let mut results: Vec<&Fact> = store
         .all_facts()
         .filter(|fact| !fact.deleted)
@@ -804,12 +1093,12 @@ fn query_visible_facts_opts_as_of(
     // (`apply_at_chrono` + `projection_class_of`) used elsewhere. Tie-break
     // on `stored_at` desc so the most-recent fact wins on equal effective
     // confidence.
-    let policy = decay::DecayPolicy::from_env();
+    let decay_policy = decay::DecayPolicy::from_env();
     let now = Utc::now();
     // M2 salience: a frequently-recalled fact decays slower, so it resists the
     // stale demotion longer. `access_count == 0` (every fact until salience is
     // enabled and accrues recalls) makes this identical to `apply_at_chrono`.
-    let eff = |fact: &Fact| -> f64 { crate::tools::freshness::fact_effective_confidence(fact, now, policy) };
+    let eff = |fact: &Fact| -> f64 { crate::tools::freshness::fact_effective_confidence(fact, now, decay_policy) };
     results.sort_by(|left, right| {
         eff(right)
             .partial_cmp(&eff(left))
@@ -834,24 +1123,50 @@ fn query_visible_facts_opts_as_of(
         });
     }
 
+    // M1 match floor — relevance before recency. The confidence/recency order
+    // above survives as the stable tiebreak within an equal score, so a
+    // flag-OFF run is byte-for-byte the pre-M1 ranking.
+    let mut scores: Vec<f64> = vec![0.0; results.len()];
+    let mut stats = crate::recall_match::MatchStats::default();
+    if policy.enabled {
+        let shape = crate::recall_match::analyze(q.query.as_deref().unwrap_or(""));
+        scores = results
+            .iter()
+            .map(|fact| {
+                let entity =
+                    scope::visible_entity_for_identity(fact, identity, aliases).unwrap_or_else(|| fact.entity.clone());
+                crate::recall_match::score_fact(&shape, &entity, &fact.key, &fact.value)
+            })
+            .collect();
+        stats = crate::recall_match::apply_floor(&mut results, &mut scores, &policy, keep_fallback);
+    }
+
     if let Some(budget) = q.token_budget {
         let mut used = 0usize;
         let mut selected = Vec::new();
-        for fact in results {
+        let mut selected_scores = Vec::new();
+        for (fact, score) in results.into_iter().zip(scores) {
             if used + fact.tokens > budget && !selected.is_empty() {
                 break;
             }
             used += fact.tokens;
             selected.push(fact.clone());
+            selected_scores.push(score);
             if used >= budget {
                 break;
             }
         }
-        return (selected, filtered_below_threshold);
+        return (selected, filtered_below_threshold, stats, selected_scores);
     }
 
     results.truncate(q.top_k);
-    (results.into_iter().cloned().collect(), filtered_below_threshold)
+    scores.truncate(q.top_k);
+    (
+        results.into_iter().cloned().collect(),
+        filtered_below_threshold,
+        stats,
+        scores,
+    )
 }
 
 fn fact_matches_query(fact: &Fact, query: &str, identity: Option<&str>, aliases: &[&str]) -> bool {
@@ -997,39 +1312,94 @@ mod tests {
         assert!(off_crc["meta"].get("demoted").is_none(), "unshaped must not demote");
         assert!(off_rows < 6, "unshaped drops overflow (kept {off_rows} of 6)");
 
-        // Shaped (holdout=0 ⇒ reversible): M1 pt3 budgets the emitted tier —
-        // hydrate the within-budget head full, demote some to epitome if the
-        // budget allows, and DROP the rest beyond the cap (disclosed via
-        // total_candidates).
+        // Shaped (holdout=0): since memory-parity M1 the budget governs the WHOLE
+        // serialised response, not just the fact tier. 80 tokens cannot hold the
+        // full CRC envelope at all, so the ladder falls to the minimal rung:
+        // id + epitome pointers, `total_candidates` disclosing the remainder,
+        // and — the point of M1 — the response actually fits the number asked for.
         std::env::set_var(crate::holdout::HOLDOUT_ENV, "0");
         let on = handle_query_facts(&args, &ctx).await.unwrap();
-        let on_crc = &on["structuredContent"]["crc_v1"];
         std::env::remove_var(crate::holdout::HOLDOUT_ENV);
         crate::holdout::accumulator().lock().unwrap().clear_for_test();
+        let on_crc = &on["structuredContent"]["crc_v1"];
 
-        let pointers = on_crc["pointers"].as_array().unwrap().len() as u64;
-        let content = on_crc["content"].as_array().unwrap().len() as u64;
-        let emitted_full = on_crc["meta"]["emitted_full"].as_u64().unwrap();
-        let capped = on_crc["meta"]["capped"].as_u64().unwrap_or(0);
+        assert_eq!(on_crc["envelope"], "minimal", "80 tokens forces the minimal rung");
+        assert_eq!(on_crc["hydrate_tier"], "pointer");
         assert_eq!(on_crc["meta"]["total_candidates"], 6);
-        // QC.2 — the emitted tier is BUDGETED, so at this tight budget it does NOT
-        // emit all 6; the overflow is capped (dropped beyond budget), not emitted.
-        assert!(
-            pointers < 6 && capped > 0,
-            "cap must engage: emitted {pointers}, capped {capped}"
-        );
-        // Conservation: emitted + capped == all candidates (nothing silently lost).
-        assert_eq!(pointers + capped, 6);
-        // content[] is exactly the full hydrations; the rest of the emitted tier
-        // (if any) are epitome pointers.
-        assert_eq!(content, emitted_full);
-        // Drop→demote parity: the full-hydration count == the legacy drop count.
+        let pointers = on_crc["pointers"].as_array().unwrap().len() as u64;
+        // Conservation: nothing is silently lost — what is not emitted is
+        // disclosed by `total_candidates`, and every pointer stays addressable.
+        assert!(pointers < 6, "cap must engage: emitted {pointers} of 6");
+        assert!(on_crc["pointers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["id"].is_string()));
+        // 80 tokens cannot fit even the minimal envelope with one pointer. The
+        // contract there is to return the pointer tier and SAY SO, not to
+        // silently overrun: `within_budget: false` is the disclosure.
+        let emitted = crate::token_estimate::estimate_tokens(&on);
+        assert_eq!(on["structuredContent"]["budget"]["governs"], json!("whole_response"));
         assert_eq!(
-            emitted_full as usize, off_rows,
-            "emitted_full must match the legacy drop count"
+            on["structuredContent"]["budget"]["within_budget"],
+            json!(false),
+            "a budget too small for one pointer must be disclosed, not hidden ({emitted} tokens)"
         );
-        // Recall is still ≥ the legacy drop (cap only drops what won't fit budget).
-        assert!(pointers >= off_rows as u64, "reversible recall ≥ legacy drop");
+        // `tokens_emitted` is measured with the widest placeholder still in
+        // place, so it is an upper bound: it never understates the cost.
+        assert!(
+            on["structuredContent"]["budget"]["tokens_emitted"]
+                .as_u64()
+                .is_some_and(|reported| reported >= emitted),
+            "tokens_emitted must not understate the payload"
+        );
+    }
+
+    /// M1 gate (memory-parity): `token_budget=300` must produce <= 300 tokens
+    /// measured on the WHOLE serialised response — envelope, `cost_estimate`,
+    /// `agent_decision`, `next`, `meta` and the inline `content[]` included.
+    /// The pre-M1 path returned 12,034 bytes for exactly this call.
+    #[tokio::test]
+    async fn query_facts_token_budget_governs_the_whole_response() {
+        let _g = crate::test_env_lock().lock().await;
+        let ctx = test_ctx();
+        {
+            let mut store = ctx.fact_store.write().await;
+            for i in 0..20 {
+                store.store(StoreFact {
+                    tenant_hash: "default".to_string(),
+                    entity: "proj".to_string(),
+                    key: format!("k{i}"),
+                    value: format!("needle {}", "lorem ipsum dolor sit amet ".repeat(20)),
+                    source_receipt: None,
+                    confidence: 1.0,
+                    private: false,
+                    horizon_class: None,
+                    actor: None,
+                });
+            }
+        }
+        for budget in [300u64, 600, 1200, 4000] {
+            let res = handle_query_facts(&json!({"query": "needle", "token_budget": budget, "top_k": 50}), &ctx)
+                .await
+                .unwrap();
+            let emitted = crate::token_estimate::estimate_tokens(&res);
+            assert!(
+                emitted <= budget,
+                "token_budget={budget} must govern the whole response, got {emitted}"
+            );
+            assert_eq!(res["structuredContent"]["budget"]["within_budget"], json!(true));
+            // Nothing is silently lost: the full candidate count is disclosed.
+            assert!(
+                res["structuredContent"]["budget"]["rows_dropped"].as_u64().is_some(),
+                "dropped rows must be disclosed"
+            );
+        }
+        // No budget => unchanged, unbounded response.
+        let free = handle_query_facts(&json!({"query": "needle", "top_k": 50}), &ctx)
+            .await
+            .unwrap();
+        assert!(free["structuredContent"].get("budget").is_none());
     }
 
     // ── D1: bi-temporal as_of on query_facts ────────────────────────
@@ -1404,7 +1774,11 @@ mod tests {
 
         // A work-tenant read sees both attributed collaborators, but not the
         // legacy fact in `default`.
-        let res = handle_query_facts(&json!({"query": "needle", "token_budget": 500}), &claude)
+        // 2000, not 500: since memory-parity M1 the budget governs the whole
+        // serialised response, and two hydrated rows plus the CRC envelope do
+        // not fit 500. This test is about attribution and tenant visibility, so
+        // it asks for room rather than asserting a budget boundary.
+        let res = handle_query_facts(&json!({"query": "needle", "token_budget": 2000}), &claude)
             .await
             .unwrap();
         let rows = res["structuredContent"]["rows"].as_array().unwrap();

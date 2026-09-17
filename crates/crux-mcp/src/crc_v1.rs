@@ -237,6 +237,37 @@ pub fn wrap_facts_tiered(
     full_count: usize,
     total_candidates: usize,
 ) -> Value {
+    wrap_facts_scored(rows, entity, query, full_count, total_candidates, None)
+}
+
+/// Relevance labelling for [`wrap_facts_scored`] — the M1 match floor's view of
+/// one result set (ExecPlan `crux-memory-parity-and-codex-bridge-2026-09-17`).
+///
+/// This EXTENDS the envelope's existing `hydrate_tier` / `demoted` /
+/// `emitted_full` / `total_candidates` vocabulary; it does not replace it.
+/// `reason` keeps describing hydration (`Exact` / `Demoted`); the new
+/// `match_tier` describes relevance (`strong` / `partial` / `fallback`), so a
+/// caller can tell a genuine scored match from a row that is only filler.
+pub struct FactMatchInfo<'a> {
+    /// What the floor did to the candidate set.
+    pub stats: crate::recall_match::MatchStats,
+    /// Per-row relevance scores, parallel to `rows`.
+    pub scores: &'a [f64],
+    /// Hint rendered under `next.suggest` when nothing cleared the floor.
+    pub suggest: Option<&'a str>,
+}
+
+/// As [`wrap_facts_tiered`], plus the M1 relevance labelling when `info` is
+/// `Some`. `info: None` is byte-identical to [`wrap_facts_tiered`] — the
+/// flag-OFF net.
+pub fn wrap_facts_scored(
+    rows: &[Value],
+    entity: Option<&str>,
+    query: Option<&str>,
+    full_count: usize,
+    total_candidates: usize,
+    info: Option<&FactMatchInfo<'_>>,
+) -> Value {
     let mut pointers = Vec::with_capacity(rows.len());
     let mut content = Vec::with_capacity(rows.len());
     let mut memories_used = Vec::with_capacity(rows.len());
@@ -257,26 +288,40 @@ pub fn wrap_facts_tiered(
         }
         full_cost += (val.len() / 4) as u64;
         let is_demoted = emitted_ix >= full_count;
-        if is_demoted {
+        let mut pointer = if is_demoted {
             demoted += 1;
             // Epitome-only pointer: no inline content, carry the content hash so
             // a re-address (entity+key) can detect a changed/forgotten value.
-            pointers.push(json!({
+            json!({
                 "id": fid,
                 "score": r.get("effective_confidence").cloned().unwrap_or(Value::Null),
                 "epitome": epitome,
                 "reason": "Demoted",
                 "content_hash": crate::budget::content_hash(&val),
-            }));
+            })
         } else {
-            pointers.push(json!({
+            content.push(json!({"id": fid, "text": val}));
+            json!({
                 "id": fid,
                 "score": r.get("effective_confidence").cloned().unwrap_or(Value::Null),
                 "epitome": epitome,
                 "reason": "Exact",
-            }));
-            content.push(json!({"id": fid, "text": val}));
+            })
+        };
+        // M1: label relevance alongside hydration. `reason` still says how the
+        // row was hydrated; `match_tier` says whether it answered the query.
+        if let Some(info) = info.filter(|i| i.stats.applied) {
+            if let (Some(slot), Some(map)) = (info.scores.get(emitted_ix), pointer.as_object_mut()) {
+                let policy = crate::recall_match::MatchPolicy {
+                    enabled: true,
+                    floor: info.stats.floor,
+                };
+                let tier = crate::recall_match::MatchTier::classify(*slot, &policy);
+                map.insert("match_tier".into(), json!(tier.as_str()));
+                map.insert("match_score".into(), json!((slot * 1000.0).round() / 1000.0));
+            }
         }
+        pointers.push(pointer);
         memories_used.push(json!({
             "fact_id": fid,
             "topic": ent,
@@ -306,9 +351,18 @@ pub fn wrap_facts_tiered(
     out.insert("kind".into(), json!("fact"));
     // `full` when nothing demoted (byte-identical to pre-M1-part-2); `mixed`
     // once the reversible budget demotes overflow facts to epitome-only.
+    // M1: an honest miss hydrates nothing — `none` is distinct from an empty
+    // `full` tier, which would read as "the store is empty".
+    let miss = info.is_some_and(|i| i.stats.is_miss()) && pointers.is_empty();
     out.insert(
         "hydrate_tier".into(),
-        json!(if demoted == 0 { "full" } else { "mixed" }),
+        json!(if miss {
+            "none"
+        } else if demoted == 0 {
+            "full"
+        } else {
+            "mixed"
+        }),
     );
     out.insert("pointers".into(), Value::Array(pointers));
     out.insert("content".into(), Value::Array(content));
@@ -327,18 +381,31 @@ pub fn wrap_facts_tiered(
             "links": {"open_in_console": "https://crux.cuecrux.com/console#/facts"}
         }),
     );
-    out.insert(
-        "next".into(),
-        json!({
-            "canonical_slug": canonical_slug,
-            "resolution_pointer": Value::Null,
-            "expand": Value::Null,
-        }),
-    );
+    let mut next = json!({
+        "canonical_slug": canonical_slug,
+        "resolution_pointer": Value::Null,
+        "expand": Value::Null,
+    });
+    // M1: on a miss the affordance is the hint, not a pointer to nothing.
+    if let (Some(info), Some(map)) = (info, next.as_object_mut()) {
+        if let Some(suggest) = info.suggest.filter(|_| info.stats.is_miss()) {
+            map.insert("suggest".into(), json!(suggest));
+        }
+    }
+    out.insert("next".into(), next);
     let mut meta = json!({
         "resolved_by": if addressed { "entity+key" } else { "query" },
         "ranked": query.is_some() && !addressed,
     });
+    // M1 disclosure: whether the floor ran, where it sat, and how many
+    // candidates it held back — so "nothing matched" is never confusable with
+    // "the store is empty" or with a silent recency substitution.
+    if let (Some(info), Some(map)) = (info.filter(|i| i.stats.applied), meta.as_object_mut()) {
+        map.insert("match".into(), json!(info.stats.marker()));
+        map.insert("match_floor".into(), json!(info.stats.floor));
+        map.insert("candidates_below_floor".into(), json!(info.stats.below_floor));
+        map.insert("candidates_above_floor".into(), json!(info.stats.above_floor));
+    }
     let total = total_candidates as u64;
     let capped = total.saturating_sub(n); // facts dropped beyond the budget cap
     if demoted > 0 || capped > 0 {
@@ -355,6 +422,52 @@ pub fn wrap_facts_tiered(
         }
     }
     out.insert("meta".into(), meta);
+    Value::Object(out)
+}
+
+/// Minimal fact envelope — M1's tightest budget rung.
+///
+/// ExecPlan `crux-memory-parity-and-codex-bridge-2026-09-17`. Measured: the full
+/// [`wrap_facts_scored`] envelope costs ~180 tokens with **zero** rows in it
+/// (`cost_estimate`, `agent_decision`, `envelope.freshness/receipts/autonomy/links`,
+/// `next`, `meta`), which is why a `token_budget=300` call could not be honoured
+/// by dropping rows alone. When even the compact rung will not fit, this drops
+/// the scaffolding to the three things a caller cannot reconstruct — what it is,
+/// what was found, and how to address it — and says so with
+/// `envelope: "minimal"`.
+///
+/// Each pointer keeps `id` and a short `epitome` so every row stays addressable
+/// by `fact_id`; `total_candidates` discloses everything not emitted.
+pub fn wrap_facts_minimal(rows: &[Value], total_candidates: usize, match_marker: Option<&str>) -> Value {
+    let pointers: Vec<Value> = rows
+        .iter()
+        .filter_map(|r| {
+            let fid = r.get("fact_id").and_then(Value::as_str)?;
+            let ent = r.get("entity").and_then(Value::as_str).unwrap_or("");
+            let key = r.get("key").and_then(Value::as_str).unwrap_or("");
+            let mut epitome = format!("{ent} {key}");
+            if epitome.len() > 60 {
+                epitome.truncate(60);
+            }
+            Some(json!({"id": fid, "epitome": epitome}))
+        })
+        .collect();
+    let mut out = Map::new();
+    out.insert("contract".into(), json!("crc-v1"));
+    out.insert("kind".into(), json!("fact"));
+    out.insert("hydrate_tier".into(), json!("pointer"));
+    out.insert("envelope".into(), json!("minimal"));
+    if let Some(marker) = match_marker {
+        out.insert("match".into(), json!(marker));
+    }
+    out.insert("pointers".into(), Value::Array(pointers));
+    out.insert(
+        "meta".into(),
+        json!({
+            "total_candidates": total_candidates,
+            "re_address": "query_facts {entity, key} for any pointer id",
+        }),
+    );
     Value::Object(out)
 }
 
