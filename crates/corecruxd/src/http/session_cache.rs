@@ -216,9 +216,8 @@ pub(super) fn build_response(
 }
 
 /// Just the timestamp off an observation line. Deserialising the whole
-/// [`corecrux_receipts::observation_envelope::ObservationRecordV1`] would pull
-/// every capped payload into memory for a number the tip of the file already
-/// carries.
+/// `ObservationRecordV1` would pull every capped payload into memory for a
+/// number the tip of the file already carries.
 #[derive(Deserialize)]
 struct ObservationTs {
     ts: DateTime<Utc>,
