@@ -14,6 +14,7 @@ use std::path::Path;
 
 use crate::compose::{compose_file, ComposeError};
 use crate::config::{workspace_fingerprint, AgentProfileConfig};
+use crate::digest::load_workspace_profiles;
 use crate::drift::check_workspace;
 use crate::profile::load_bundled_profiles;
 use crate::Target;
@@ -60,7 +61,7 @@ pub fn run_init(workspace: &Path, profile_names: &[String]) -> std::io::Result<C
             ),
         ));
     }
-    let bundled = load_bundled_profiles().map_err(std::io::Error::other)?;
+    let bundled = load_workspace_profiles(workspace).map_err(std::io::Error::other)?;
     for n in profile_names {
         if !bundled.iter().any(|f| &f.frontmatter.name == n) {
             return Err(std::io::Error::other(format!("unknown profile '{n}'")));
@@ -103,7 +104,7 @@ pub fn run_init(workspace: &Path, profile_names: &[String]) -> std::io::Result<C
 
 pub fn run_regenerate(workspace: &Path, force: bool) -> std::io::Result<CommandReport> {
     let mut cfg = AgentProfileConfig::load(workspace).map_err(std::io::Error::other)?;
-    let bundled = load_bundled_profiles().map_err(std::io::Error::other)?;
+    let bundled = load_workspace_profiles(workspace).map_err(std::io::Error::other)?;
     let enabled: Vec<_> = bundled
         .into_iter()
         .filter(|f| cfg.profiles.contains_key(&f.frontmatter.name))
@@ -390,8 +391,8 @@ mod tests {
     fn list_without_init_shows_all_unchecked() {
         let ws = fresh_ws();
         let r = run_list(ws.path()).unwrap();
-        // 13 bundled, none enabled.
-        assert_eq!(r.stdout.matches("[ ]").count(), 13);
+        // 14 bundled, none enabled.
+        assert_eq!(r.stdout.matches("[ ]").count(), 14);
         assert_eq!(r.stdout.matches("[x]").count(), 0);
     }
 

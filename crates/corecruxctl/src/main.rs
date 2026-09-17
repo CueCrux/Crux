@@ -20,10 +20,10 @@ use corecruxctl::verify_escrow;
 use corecruxctl::{
     admin, agent_wiring, attest_companions, audit_export, audit_pack, c2pa_x509, code_chain, code_health,
     compaction_sync, config_bundle, cost, deploy_audit, evidence, explain, export, extensions, fixture_digest, gaps,
-    hooks, identity_cli, incident, ingest, inspect_receipt, learn, login, machine, memory, memory_pack, observe_ingest,
-    openclaw, output_verify, parity, projections, rebuild_companions, receipts, reconcile, redact_sweep,
-    repair_manifest, replay, repo, session_sync, shard, shardmap, smoke, snapshot, stage1_import, start, storage,
-    structured_log, studio, tooling_env, verify_store,
+    hooks, identity_cli, incident, ingest, inspect_receipt, learn, login, machine, memory, memory_distill, memory_pack,
+    observe_ingest, openclaw, output_verify, parity, projections, rebuild_companions, receipts, reconcile,
+    redact_sweep, repair_manifest, replay, repo, session_sync, shard, shardmap, smoke, snapshot, stage1_import, start,
+    storage, structured_log, studio, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -1433,6 +1433,52 @@ enum MemoryCommand {
         #[arg(long = "map-principal")]
         map_principal: Vec<String>,
         /// Verify + plan only; write nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+    /// Propose curated-tier engrams from the fact store (read-only).
+    ///
+    /// Prints candidates with the `fact_id` and date each came from. Nothing is
+    /// promoted: acceptance is `memory digest --accept …`.
+    Distill {
+        /// Harness-native memory roots (`:`-separated, `~` and one `*` segment
+        /// expand). Defaults to CORECRUXD_NATIVE_MEMORY_ROOT — the already
+        /// catalogued memories a proposal is de-duplicated against.
+        #[arg(long)]
+        native_root: Option<String>,
+        /// Facts to read per entity family.
+        #[arg(long, default_value_t = 500)]
+        top_k: usize,
+        /// Maximum proposals to print.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Render the always-loaded memory digest fragment.
+    ///
+    /// Seeds the curated tier from the harness-native memory store, accepts the
+    /// proposals named, renders one line per entry under the token budget, and
+    /// writes the fragment `crux-config-wizard` composes into CLAUDE.md and
+    /// AGENTS.md. Read-only against the memory store.
+    Digest {
+        /// Harness-native memory roots (see `memory distill`).
+        #[arg(long)]
+        native_root: Option<String>,
+        /// Write the fragment here (default `<cwd>/.crux/memory-digest.md`).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Token ceiling for the rendered digest.
+        #[arg(long, default_value_t = memory_distill::DIGEST_TOKEN_BUDGET)]
+        budget: usize,
+        /// Accept the first N ranked distillation proposals into the catalog.
+        #[arg(long, default_value_t = 0)]
+        accept: usize,
+        /// Accept one proposal by name (repeatable).
+        #[arg(long = "accept-name")]
+        accept_name: Vec<String>,
+        /// Facts to read per entity family when distilling.
+        #[arg(long, default_value_t = 500)]
+        top_k: usize,
+        /// Render and report without writing the fragment.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
@@ -4556,6 +4602,29 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     );
                     Ok(())
                 }
+                MemoryCommand::Distill {
+                    native_root,
+                    top_k,
+                    limit,
+                } => run_memory_distill(&client, native_root.as_deref(), top_k, limit),
+                MemoryCommand::Digest {
+                    native_root,
+                    out,
+                    budget,
+                    accept,
+                    accept_name,
+                    top_k,
+                    dry_run,
+                } => run_memory_digest(
+                    &client,
+                    native_root.as_deref(),
+                    out.as_deref(),
+                    budget,
+                    accept,
+                    &accept_name,
+                    top_k,
+                    dry_run,
+                ),
                 MemoryCommand::Export {
                     data_dir,
                     out,
@@ -5407,6 +5476,120 @@ fn rebuild_ccxi_from_segment(
     std::fs::rename(&tmp_path, ccxi_path)?;
 
     Ok(indexed)
+}
+
+// ── memory-parity M2/M3 runners ──────────────────────────────────────────────
+
+/// Resolve the harness-native memory roots and project them.
+///
+/// Read-only: `ingest_native_memory` opens files with `.read(true)` and nothing
+/// else. The memory directory is the operator's live store, loaded into the
+/// first user message of every concurrent session, so the discipline is
+/// structural rather than conventional.
+fn project_native_memory(
+    native_root: Option<&str>,
+) -> Result<corecrux_projections::native_memory::NativeMemoryIngestV1, Box<dyn std::error::Error + Send + Sync>> {
+    use corecrux_projections::native_memory as nm;
+    let spec = match native_root {
+        Some(spec) => spec.to_string(),
+        None => std::env::var(nm::NATIVE_MEMORY_ROOT_ENV).map_err(|_| {
+            format!(
+                "no memory root: pass --native-root or set {}",
+                nm::NATIVE_MEMORY_ROOT_ENV
+            )
+        })?,
+    };
+    let home = std::env::var("HOME").ok().map(PathBuf::from);
+    let roots = nm::resolve_roots(&spec, home.as_deref());
+    if roots.is_empty() {
+        return Err(format!("no readable memory root resolved from '{spec}'").into());
+    }
+    Ok(nm::ingest_native_memory(
+        &roots,
+        nm::NativeMemoryIngestOptions::default(),
+    ))
+}
+
+/// Read the fact families the distillation signals key on.
+///
+/// A failure on one family is reported and skipped rather than aborting: a
+/// daemon that will not serve `execplan:` facts can still yield incident
+/// proposals, and half a review queue beats none.
+fn collect_distillation_facts(client: &memory::MemoryClient, top_k: usize) -> Vec<memory::MemoryFact> {
+    let mut facts = Vec::new();
+    for prefix in ["incident:", "decision:", "execplan:"] {
+        match client.list_by_entity_prefix(prefix, top_k) {
+            Ok(mut rows) => facts.append(&mut rows),
+            Err(err) => eprintln!("warning: could not read '{prefix}' facts: {err}"),
+        }
+    }
+    facts
+}
+
+fn now_unix_ms() -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(1).max(1)
+}
+
+fn run_memory_distill(
+    client: &memory::MemoryClient,
+    native_root: Option<&str>,
+    top_k: usize,
+    limit: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ingest = project_native_memory(native_root)?;
+    let seeds = memory_distill::seed_engrams(&ingest, now_unix_ms());
+    let facts = collect_distillation_facts(client, top_k);
+    let options = memory_distill::DistillOptions {
+        existing: seeds,
+        max_proposals: limit,
+        ..memory_distill::DistillOptions::default()
+    };
+    let proposals = memory_distill::distill_proposals(&facts, &options);
+    println!("{}", serde_json::to_string_pretty(&proposals)?);
+    eprintln!(
+        "{} proposal(s) from {} fact(s); accept with `memory digest --accept N` or --accept-name <name>",
+        proposals.len(),
+        facts.len()
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_memory_digest(
+    client: &memory::MemoryClient,
+    native_root: Option<&str>,
+    out: Option<&std::path::Path>,
+    budget: usize,
+    accept: usize,
+    accept_names: &[String],
+    top_k: usize,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ingest = project_native_memory(native_root)?;
+    let facts = if accept > 0 || !accept_names.is_empty() {
+        collect_distillation_facts(client, top_k)
+    } else {
+        Vec::new()
+    };
+    let build = memory_distill::build_catalog(&ingest, &facts, accept, accept_names, now_unix_ms());
+    let render = memory_distill::render_catalog_digest(&build.catalog, budget);
+
+    let path = out.map_or_else(
+        || PathBuf::from(memory_distill::DIGEST_FRAGMENT_PATH),
+        std::path::Path::to_path_buf,
+    );
+    let written = if dry_run {
+        None
+    } else {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, &render.body)?;
+        Some(path.display().to_string())
+    };
+    let report = memory_distill::digest_report(&build, &render, &ingest, written);
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 // ── tests ──────────────────────────────────────────────────────────────

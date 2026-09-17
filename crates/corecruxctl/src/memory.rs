@@ -188,6 +188,41 @@ impl MemoryClient {
         Ok(out)
     }
 
+    /// Query `/v1/facts` for one entity prefix (`incident:`, `decision:`, …).
+    ///
+    /// The distillation pass reads by prefix rather than by keyword: the
+    /// signals it keys on are structural (entity family, key shape), so a
+    /// relevance search would be the wrong instrument.
+    pub fn list_by_entity_prefix(&self, prefix: &str, top_k: usize) -> Result<Vec<MemoryFact>, MemoryCliError> {
+        let url = self.url("/v1/facts");
+        let req = self.apply_auth(
+            self.agent
+                .get(&url)
+                .query("entity_prefix", prefix)
+                .query("top_k", top_k.to_string()),
+        );
+        let resp = req.call().map_err(MemoryCliError::transport)?;
+        let status = resp.status().as_u16();
+        let body = resp.into_body().read_to_string().map_err(MemoryCliError::transport)?;
+        if status >= 400 {
+            return Err(MemoryCliError::UpstreamStatus { status, body });
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&body)?;
+        let facts_arr = parsed
+            .get("facts")
+            .and_then(|v| v.as_array())
+            .ok_or(MemoryCliError::MissingField("facts"))?;
+        let mut out = Vec::new();
+        for f in facts_arr {
+            let fact: MemoryFact = serde_json::from_value(f.clone())?;
+            if fact.deleted || entity_is_reserved(&fact.entity) {
+                continue;
+            }
+            out.push(fact);
+        }
+        Ok(out)
+    }
+
     pub fn show(&self, fact_id: &str) -> Result<MemoryFact, MemoryCliError> {
         let url = self.url(&format!("/v1/facts/{fact_id}"));
         let req = self.apply_auth(self.agent.get(&url));

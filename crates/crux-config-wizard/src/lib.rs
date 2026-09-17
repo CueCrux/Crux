@@ -17,6 +17,7 @@
 pub mod commands;
 pub mod compose;
 pub mod config;
+pub mod digest;
 pub mod drift;
 pub mod hooks_install;
 pub mod profile;
@@ -25,6 +26,7 @@ pub mod skills_install;
 
 pub use compose::{compose_file, ComposeError, ComposeReport};
 pub use config::{AgentProfileConfig, ConfigError, ProfileEntry};
+pub use digest::{load_workspace_profiles, DigestRejection};
 pub use drift::{check_workspace, DriftReport};
 pub use hooks_install::{audit as audit_hooks, ComponentState, InstallAudit};
 pub use profile::{load_bundled_profiles, ProfileError, ProfileFragment, ProfileFrontmatter};
@@ -43,6 +45,7 @@ pub use skills_install::{bundled_skill_names, FileState};
 /// still on pre-Claude-5 models.
 pub const DEFAULT_PROFILES: &[&str] = &[
     "memory-practices",
+    "memory-digest",
     "claude-5",
     "agent-harness-parity",
     "execplan-discipline",
@@ -84,7 +87,7 @@ mod tests {
 
     #[test]
     fn default_profiles_present_and_unique() {
-        assert_eq!(DEFAULT_PROFILES.len(), 11);
+        assert_eq!(DEFAULT_PROFILES.len(), 12);
         let mut seen = std::collections::HashSet::new();
         for p in DEFAULT_PROFILES {
             assert!(seen.insert(*p), "duplicate default profile '{p}'");

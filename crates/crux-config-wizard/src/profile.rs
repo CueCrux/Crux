@@ -110,6 +110,7 @@ impl ProfileFragment {
 fn bundled_raw() -> Vec<(&'static str, &'static str)> {
     vec![
         ("memory-practices.md", include_str!("../profiles/memory-practices.md")),
+        ("memory-digest.md", include_str!("../profiles/memory-digest.md")),
         (
             "token-conservation.md",
             include_str!("../profiles/token-conservation.md"),
@@ -235,7 +236,7 @@ This is the body.
     #[test]
     fn bundled_load_returns_all_in_order() {
         let bundled = load_bundled_profiles().unwrap();
-        assert_eq!(bundled.len(), 13);
+        assert_eq!(bundled.len(), 14);
         for win in bundled.windows(2) {
             assert!(
                 win[0].frontmatter.order <= win[1].frontmatter.order,

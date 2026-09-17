@@ -39,6 +39,7 @@
 //! byte-identical, and `digest_render_is_byte_stable` pins that.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 use corecrux_memory::engrams::{
     build_engram_manifest, squeeze_whitespace, validate_local_engram, LocalEngram, ENGRAM_ENTITY_PREFIX,
@@ -185,18 +186,25 @@ pub fn seed_engrams(ingest: &NativeMemoryIngestV1, created_at_unix_ms: u64) -> V
         let mut content = String::new();
         content.push_str(&description);
         content.push('\n');
-        content.push_str(&format!("memory_md_ref: {}\n", entry.file_name));
+        // `writeln!` into a String is infallible; the Results are discarded
+        // deliberately rather than unwrapped.
+        let _ = writeln!(content, "memory_md_ref: {}", entry.file_name);
         if let Some(group) = entry.group.as_deref() {
-            content.push_str(&format!("group: {group}\n"));
+            let _ = writeln!(content, "group: {group}");
         }
-        if let Some(hook) = entry.index_hook.as_deref().map(squeeze_whitespace).filter(|h| !h.is_empty()) {
-            content.push_str(&format!("index_hook: {hook}\n"));
+        if let Some(hook) = entry
+            .index_hook
+            .as_deref()
+            .map(squeeze_whitespace)
+            .filter(|h| !h.is_empty())
+        {
+            let _ = writeln!(content, "index_hook: {hook}");
         }
         if !entry.links.is_empty() {
-            content.push_str(&format!("links: {}\n", entry.links.join(", ")));
+            let _ = writeln!(content, "links: {}", entry.links.join(", "));
         }
         if let Some(modified) = entry.modified.as_deref() {
-            content.push_str(&format!("modified: {modified}\n"));
+            let _ = writeln!(content, "modified: {modified}");
         }
         let (content, _) = redact_secret_shaped(&content);
         let engram = LocalEngram {
@@ -353,7 +361,10 @@ pub fn distill_proposals(facts: &[MemoryFact], options: &DistillOptions) -> Vec<
     // or accumulated several keys under one entity.
     let mut decisions: BTreeMap<String, Vec<&MemoryFact>> = BTreeMap::new();
     for fact in facts.iter().filter(|f| f.entity.starts_with("decision:")) {
-        decisions.entry(decision_topic_stem(&fact.entity)).or_default().push(fact);
+        decisions
+            .entry(decision_topic_stem(&fact.entity))
+            .or_default()
+            .push(fact);
     }
     for (stem, group) in &decisions {
         let dates: BTreeSet<&str> = group.iter().map(|f| date_of(&f.stored_at)).collect();
@@ -445,11 +456,7 @@ fn dedupe_and_rank(mut proposals: Vec<DistillProposal>, options: &DistillOptions
         if !seen.insert(proposal.name.clone()) {
             continue;
         }
-        let terms = distinctive_terms(&format!(
-            "{} {}",
-            proposal.name.replace('-', " "),
-            proposal.description
-        ));
+        let terms = distinctive_terms(&format!("{} {}", proposal.name.replace('-', " "), proposal.description));
         let duplicate = existing_terms
             .iter()
             .chain(accepted_terms.iter())
@@ -531,7 +538,11 @@ fn incident_proposal(fact: &MemoryFact) -> Option<DistillProposal> {
         (Some(symptom), Some(cause)) => format!("{} — {}", first_clause(symptom), first_clause(cause)),
         (Some(symptom), None) => first_clause(symptom),
         (None, Some(cause)) => first_clause(cause),
-        (None, None) => squeeze_whitespace(&fact.value),
+        // An `incident:` fact that carries neither a symptom nor a cause is a
+        // bag of fields, not a lesson. Dumping its JSON into a recall line
+        // would spend digest budget on something no agent can act on, so it is
+        // left for a human to rewrite rather than auto-proposed.
+        (None, None) => return None,
     };
     let description = squeeze_whitespace(&description);
     if description.is_empty() {
@@ -540,7 +551,7 @@ fn incident_proposal(fact: &MemoryFact) -> Option<DistillProposal> {
     let mut content = String::new();
     for (label, value) in [("symptom", &symptom), ("cause", &cause), ("fix", &fix)] {
         if let Some(value) = value {
-            content.push_str(&format!("{label}: {value}\n"));
+            let _ = writeln!(content, "{label}: {value}");
         }
     }
     if content.is_empty() {
@@ -561,9 +572,12 @@ fn incident_proposal(fact: &MemoryFact) -> Option<DistillProposal> {
 
 fn decision_proposal(stem: &str, group: &[&MemoryFact], support: usize) -> Option<DistillProposal> {
     let name = sanitise_name(&format!("decision-{stem}"))?;
-    // Newest fact in the family carries the provenance; oldest date shows how
-    // long the topic has been recurring.
-    let newest = group.iter().max_by(|a, b| a.stored_at.cmp(&b.stored_at))?;
+    // The provenance fact is the newest one in the family whose value actually
+    // reads like a lesson. A family of paths and status blobs yields no
+    // proposal at all, which is the correct outcome.
+    let mut ordered: Vec<&&MemoryFact> = group.iter().collect();
+    ordered.sort_by(|a, b| b.stored_at.cmp(&a.stored_at));
+    let newest = ordered.into_iter().find(|f| is_prose_lesson(&f.value))?;
     let keys: Vec<&str> = {
         let mut keys: Vec<&str> = group.iter().map(|f| f.key.as_str()).collect();
         keys.sort_unstable();
@@ -595,7 +609,11 @@ fn decision_proposal(stem: &str, group: &[&MemoryFact], support: usize) -> Optio
 
 fn gate_proposal(key: &str, group: &[&MemoryFact]) -> Option<DistillProposal> {
     let name = sanitise_name(&format!("gate-lesson-{key}"))?;
-    let newest = group.iter().max_by(|a, b| a.stored_at.cmp(&b.stored_at))?;
+    let mut ordered: Vec<&&MemoryFact> = group.iter().collect();
+    ordered.sort_by(|a, b| b.stored_at.cmp(&a.stored_at));
+    // A `gate:M<n>` fact is normally a JSON status record for one plan, not a
+    // lesson about the gate. Only a prose value earns a proposal.
+    let newest = ordered.into_iter().find(|f| is_prose_lesson(&f.value))?;
     let gist = first_clause(&squeeze_whitespace(&newest.value));
     if gist.is_empty() {
         return None;
@@ -614,6 +632,30 @@ fn gate_proposal(key: &str, group: &[&MemoryFact]) -> Option<DistillProposal> {
         signal: DistillSignal::RepeatedGate,
         support: group.len(),
     })
+}
+
+/// True when a fact value reads like a lesson rather than a record.
+///
+/// The fact store is full of machine-shaped values — `gate:M<n>` status blobs,
+/// artefact paths, URLs — that are perfectly good ledger entries and useless as
+/// recall lines. Proposing one would spend digest budget on something no agent
+/// can act on, and would be the "distillation manufactures plausible memories"
+/// failure the plan calls out. A candidate has to be prose to get proposed.
+fn is_prose_lesson(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.len() < 40 {
+        return false;
+    }
+    if trimmed.starts_with('{') || trimmed.starts_with('[') || trimmed.starts_with('/') {
+        return false;
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return false;
+    }
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok_and(|v| !v.is_string()) {
+        return false;
+    }
+    trimmed.split_whitespace().count() >= 6
 }
 
 /// First sentence-ish clause of `text`, so a recall line does not drag a whole
@@ -722,11 +764,7 @@ pub fn digest_entries(catalog: &[LocalEngram]) -> Vec<DigestEntry> {
             })
         })
         .collect();
-    out.sort_by(|a, b| {
-        a.intent_bucket
-            .cmp(&b.intent_bucket)
-            .then_with(|| a.slug.cmp(&b.slug))
-    });
+    out.sort_by(|a, b| a.intent_bucket.cmp(&b.intent_bucket).then_with(|| a.slug.cmp(&b.slug)));
     out.dedup_by(|a, b| a.slug == b.slug);
     out
 }
@@ -891,6 +929,120 @@ pub fn digest_manifest_hash(catalog: &[LocalEngram]) -> String {
 pub fn render_catalog_digest(catalog: &[LocalEngram], budget: usize) -> DigestRender {
     let hash = digest_manifest_hash(catalog);
     render_digest(&digest_entries(catalog), &hash, budget)
+}
+
+// ── Catalog assembly and the operator-facing passes ──────────────────────────
+
+/// Where the entries in an assembled catalog came from.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CatalogBuild {
+    /// The assembled catalog, name-ordered.
+    pub catalog: Vec<LocalEngram>,
+    /// Entries seeded from the harness-native memory store.
+    pub seeded: usize,
+    /// Entries accepted from distillation proposals.
+    pub distilled: usize,
+    /// Proposals that were produced but not accepted — the review queue.
+    pub pending: Vec<DistillProposal>,
+}
+
+/// Assemble a catalog from native-memory seeds plus accepted proposals.
+///
+/// `accept_top` takes the first N of the ranked proposal list; `accept_names`
+/// takes specific proposals by name. Both are explicit caller decisions: with
+/// neither set, nothing is distilled into the catalog and the tier is the seed
+/// set alone. That is the curation rule from the plan — 14,800 facts do not get
+/// to promote themselves.
+pub fn build_catalog(
+    ingest: &NativeMemoryIngestV1,
+    facts: &[MemoryFact],
+    accept_top: usize,
+    accept_names: &[String],
+    now_unix_ms: u64,
+) -> CatalogBuild {
+    let seeds = seed_engrams(ingest, now_unix_ms);
+    let options = DistillOptions {
+        existing: seeds.clone(),
+        ..DistillOptions::default()
+    };
+    let proposals = distill_proposals(facts, &options);
+    let wanted: BTreeSet<&str> = accept_names.iter().map(String::as_str).collect();
+
+    let mut catalog = seeds.clone();
+    let mut pending = Vec::new();
+    let mut accepted = 0usize;
+    for (idx, proposal) in proposals.into_iter().enumerate() {
+        let take = idx < accept_top || wanted.contains(proposal.name.as_str());
+        if !take {
+            pending.push(proposal);
+            continue;
+        }
+        match proposal_to_engram(&proposal, now_unix_ms) {
+            Ok(engram) => {
+                catalog.push(engram);
+                accepted += 1;
+            }
+            Err(_) => pending.push(proposal),
+        }
+    }
+    catalog.sort_by(|a, b| a.name.cmp(&b.name));
+    CatalogBuild {
+        seeded: seeds.len(),
+        distilled: accepted,
+        catalog,
+        pending,
+    }
+}
+
+/// Machine-readable outcome of `corecruxctl memory digest`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DigestReport {
+    /// Corpus the numbers belong to. A recall figure without its corpus is
+    /// worthless, so the report carries one by construction.
+    pub corpus: String,
+    pub native_roots: Vec<String>,
+    pub memories_projected: usize,
+    pub seeded: usize,
+    pub distilled: usize,
+    pub pending_proposals: usize,
+    pub catalog_entries: usize,
+    /// True when the catalog sits inside the plan's 100–250 band.
+    pub within_target_band: bool,
+    pub manifest_hash: String,
+    pub token_estimate: usize,
+    pub token_budget: usize,
+    pub rendered: usize,
+    pub omitted: usize,
+    pub description_allowance: usize,
+    pub redacted: usize,
+    pub fragment_path: Option<String>,
+}
+
+/// Build the report for an assembled catalog and its render.
+pub fn digest_report(
+    build: &CatalogBuild,
+    render: &DigestRender,
+    ingest: &NativeMemoryIngestV1,
+    fragment_path: Option<String>,
+) -> DigestReport {
+    DigestReport {
+        corpus: "drivew-host-memory-gold-v1".to_string(),
+        native_roots: ingest.roots.clone(),
+        memories_projected: ingest.memories,
+        seeded: build.seeded,
+        distilled: build.distilled,
+        pending_proposals: build.pending.len(),
+        catalog_entries: build.catalog.len(),
+        within_target_band: (CATALOG_MIN_ENTRIES..=CATALOG_MAX_ENTRIES).contains(&build.catalog.len()),
+        manifest_hash: render.manifest_hash.clone(),
+        token_estimate: render.token_estimate,
+        token_budget: render.token_budget,
+        rendered: render.rendered,
+        omitted: render.omitted,
+        description_allowance: render.description_allowance,
+        redacted: render.redacted,
+        fragment_path,
+    }
 }
 
 #[cfg(test)]
