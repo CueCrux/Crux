@@ -56,6 +56,11 @@ pub mod invocation;
 mod legal_holds;
 mod local_ingest;
 mod memory_import;
+// Read-only projection over the harness-native memory store
+// (`~/.claude/projects/*/memory/*.md`). Default OFF: unset
+// `CORECRUXD_NATIVE_MEMORY_ROOT` makes every route 404 without touching disk.
+// ExecPlan `crux-memory-parity-and-codex-bridge-2026-09-17` M4.
+mod native_memory;
 pub(crate) mod observations;
 mod observe;
 mod observe_audit;
@@ -753,6 +758,19 @@ pub(crate) fn router_with_route_auth(
         .route("/v1/facts/bulk", axum::routing::put(self::facts::put_facts_bulk))
         .route("/v1/facts/aggregate", axum::routing::post(self::facts::post_aggregate))
         .route("/v1/memory/import", axum::routing::post(self::memory_import::post_memory_import))
+        // Native-memory bridge (memory-parity M4). Strictly read-only: these
+        // routes never write the memory directory and never write a fact. The
+        // static `native` segment is declared before `/v1/memory/{...}` style
+        // paths so it can never be shadowed.
+        .route("/v1/memory/native", get(self::native_memory::list_native_memory))
+        .route(
+            "/v1/memory/native/search",
+            get(self::native_memory::search_native_memory),
+        )
+        .route(
+            "/v1/memory/native/{slug}",
+            get(self::native_memory::get_native_memory),
+        )
         .route(
             "/v1/identity/links",
             axum::routing::post(self::identity_links::post_identity_link),
