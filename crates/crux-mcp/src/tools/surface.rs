@@ -336,7 +336,9 @@ pub fn session_mode(session_key: &str) -> ToolSurfaceMode {
 /// running union and return the set to serve.
 ///
 /// With the flag on the result is `previously_offered ∪ shaped`, in first-offer
-/// order, capped by [`growth_cap_for`]. With the flag off the result is
+/// order, capped by [`monotone_growth_cap`] in `dynamic` mode (`full` and
+/// `minimal` are bounded by their own shape and are not capped). With the flag
+/// off the result is
 /// `shaped` unchanged — the delta is still recorded so `removed[]` stays
 /// honest and the rollback path is observable.
 pub fn merge_offered(session_key: &str, mode: ToolSurfaceMode, shaped: &[String]) -> OfferedDelta {
