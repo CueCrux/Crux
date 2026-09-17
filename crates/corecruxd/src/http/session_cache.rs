@@ -156,7 +156,7 @@ pub(super) fn resolve_ttl_policy(env_value: Option<&str>, headline: Option<&Head
                     seconds: TTL_5M_SECONDS,
                 }
             }
-            // An unparseable override is ignored, not obeyed half-way.
+            // An unparsable override is ignored, not obeyed half-way.
             _ => {}
         }
     }
@@ -266,7 +266,7 @@ fn last_observation_at(file_path: &Path) -> std::io::Result<Option<DateTime<Utc>
     // The window held no parseable record (one line longer than it, or a
     // partially-written tail). Fall back to the whole file rather than
     // reporting a session cold that is not.
-    Ok(full_scan_last_ts(file_path)?)
+    full_scan_last_ts(file_path)
 }
 
 /// Full-file fallback for [`last_observation_at`]: the newest `ts` anywhere in
@@ -502,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unparseable_override_falls_through_rather_than_half_applying() {
+    fn an_unparsable_override_falls_through_rather_than_half_applying() {
         let p = resolve_ttl_policy(Some("half an hour"), Some(&headline_with(0, 900_000)));
         assert_eq!(p.label, "1h");
         assert_eq!(p.basis, TtlBasis::Measured);

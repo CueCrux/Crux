@@ -2907,6 +2907,30 @@ For large corpora, use the two-pass pattern:
 
 This avoids pulling content you will discard.
 
+### Pace self-paced loops under the prompt-cache TTL
+
+A `/loop` (or any self-paced wakeup) that sleeps an hour pays for the sleep.
+
+Claude Code caches the prompt prefix with a **1-hour TTL measured from request start**, so a
+3600-second delay *plus* the time the previous turn took to answer lands past the TTL, and the
+next prompt re-writes the entire prefix at the 2x (1h) cache-write rate. Nothing about the loop
+looks wrong when this happens — the work still completes, it just costs double on that turn.
+
+**Cap a self-paced wakeup interval at ~50 minutes** (`/loop 45m`, not `/loop 60m`), or decide
+deliberately to eat the rewrite.
+
+Measured on corpus `drivew-host-claude-transcripts-2026-09` (the 27 most recent Claude Code
+sessions with >= 5 API turns on drivew-host, read 2026-09-17): idle TTL expiry caused **77.4%**
+of all rewritten cache tokens — 76 events, 29.0M tokens — and **7 of those 76 were 60-65 minute
+gaps**, i.e. a wakeup that missed the TTL by minutes and is free to recover by shortening the
+interval.
+
+To see the clock rather than guess at it, read
+`GET /v1/sessions/{sessionId}/cache`, which reports `ttl_seconds_remaining` and the
+`est_rewrite_tokens` a lapse would cost. The Crux statusline renders the same countdown
+(`cache 34m`, amber under 10 minutes, `cache COLD ~180k` once it has lapsed) at zero prompt
+tokens, because statusline text is not part of the prompt.
+
 ## Example Workflow: Research, Store, Save, Handoff
 
 A complete agent workflow showing all patterns together:

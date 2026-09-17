@@ -33,7 +33,7 @@
 
 use serde_json::{json, Value};
 
-use crate::{config_audit, hook_input::HookInput, hook_output::HookOutput, mcp_client, snapshot_crypto};
+use crate::{config_audit, daemon_client, hook_input::HookInput, hook_output::HookOutput, mcp_client, snapshot_crypto};
 
 const BOOTSTRAP_TOKEN_BUDGET: u64 = 500;
 
@@ -99,6 +99,83 @@ fn selfcheck_section(sync_degraded: bool, bootstrap_loaded: bool) -> Option<Stri
             .is_some_and(|c| c.installed_version.is_some() && !c.launcher_current()),
     };
     crux_config_wizard::selfcheck::render_section(&crux_config_wizard::selfcheck::evaluate(&obs))
+}
+
+// ── Cold-context line (M3 of `crux-prompt-cache-1h-ttl-2026-09-17`) ─────────
+//
+// On a resume the operator has usually been away long enough for Claude Code's
+// prompt-cache TTL to lapse, and the next prompt silently re-writes the whole
+// prefix at the 2x write rate. On corpus `drivew-host-claude-transcripts-2026-09`
+// that class is 77.4% of every rewritten cache token (76 events, 29.0M). One
+// line, on resume only, when the cache is actually cold.
+
+/// Coarse token count for a one-line banner cell: `181447` -> `181k`.
+fn coarse_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        // Integer tenths of a million — a float cast here would be a lossy
+        // `u64 as f64` for a number the banner only ever shows to 1 dp anyway.
+        let tenths = n / 100_000;
+        format!("{}.{}M", tenths / 10, tenths % 10)
+    } else if n >= 1_000 {
+        format!("{}k", n.div_ceil(1_000))
+    } else {
+        n.to_string()
+    }
+}
+
+/// `HH:MM` (UTC) out of an RFC3339 timestamp, without pulling in a date crate.
+/// UTC is labelled at the call site rather than converted, so the line can never
+/// be off by an hour in the reader's head.
+fn hhmm_utc(rfc3339: &str) -> Option<&str> {
+    let time = rfc3339.split('T').nth(1)?;
+    let hhmm = time.get(..5)?;
+    let (h, m) = hhmm.split_once(':')?;
+    (h.len() == 2 && m.len() == 2 && h.bytes().chain(m.bytes()).all(|b| b.is_ascii_digit())).then_some(hhmm)
+}
+
+/// The single cold-context line, or `None` when the cache is still warm (or the
+/// response is not one we can read). Pure — the HTTP call is the caller's.
+fn cold_context_line(cache: &Value) -> Option<String> {
+    // Absent/!=false `warm` means "not known to be cold": say nothing. A banner
+    // line that fires on a warm cache would be worse than no line at all.
+    if cache.get("warm")?.as_bool()? {
+        return None;
+    }
+    let since = hhmm_utc(cache.get("last_request_at")?.as_str()?)?;
+    let cost = match cache.get("est_rewrite_tokens").and_then(Value::as_u64) {
+        Some(tokens) => format!("next prompt rewrites ~{} tokens", coarse_tokens(tokens)),
+        // Never costed: name the shape of the cost without inventing a size.
+        None => "the next prompt re-writes the whole prefix".to_string(),
+    };
+    Some(format!(
+        "**Crux cache** cold since {since}Z — {cost}; /compact first if the context is stale"
+    ))
+}
+
+/// Session ids are UUIDs; anything else does not go into a URL path.
+fn is_url_path_safe(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= 128
+        && session_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// Ask the daemon for this session's prompt-cache clock and render the cold
+/// line. Resume boots only, and silent on every failure — a cold-cache warning
+/// is worth nothing if it can break a boot.
+fn cold_context_section(source: Option<&str>, session_id: &str) -> Option<String> {
+    if source != Some("resume") {
+        return None;
+    }
+    if std::env::var("CRUX_HOOK_CACHE_CLOCK").as_deref() == Ok("off") {
+        return None;
+    }
+    if !is_url_path_safe(session_id) {
+        return None;
+    }
+    let cache = daemon_client::get_json(&format!("/v1/sessions/{session_id}/cache")).ok()?;
+    cold_context_line(&cache)
 }
 
 pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
@@ -238,6 +315,13 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
             // Volatile: reflects live daemon/hook state, not stable playbook text.
             sections.push((Stability::Volatile, section));
         }
+    }
+
+    // Cold-context line, last of all: it is the most volatile thing the banner
+    // can carry (it changes every boot by construction), so the stable partition
+    // puts it at the very tail where it can shift no other section's bytes.
+    if let Some(line) = cold_context_section(source, session_id) {
+        sections.push((Stability::Volatile, line));
     }
 
     // CO-5: cache alignment is unconditional (the env flag was removed).
@@ -950,6 +1034,115 @@ mod tests {
         let text = r#"{"now_unix_ms":1,"presence_ttl_secs":900,"active_sessions":[],"work_in_flight":[]}"#;
         assert!(render_coord_digest(text).is_none());
         assert!(render_coord_digest("not json").is_none());
+    }
+
+    // ---- M3 — cold-context line --------------------------------------------
+
+    fn cache(warm: bool, est: Option<u64>) -> Value {
+        let mut v = json!({"warm": warm, "last_request_at": "2026-09-17T14:02:11.482Z"});
+        if let Some(t) = est {
+            v["est_rewrite_tokens"] = json!(t);
+        }
+        v
+    }
+
+    #[test]
+    fn cold_line_names_the_time_and_the_rewrite_size() {
+        let line = cold_context_line(&cache(false, Some(181_447))).expect("cold cache must warn");
+        assert_eq!(
+            line,
+            "**Crux cache** cold since 14:02Z — next prompt rewrites ~182k tokens; \
+             /compact first if the context is stale"
+        );
+        assert_eq!(line.lines().count(), 1, "the cold line is exactly one line");
+    }
+
+    #[test]
+    fn a_warm_cache_produces_no_line_at_all() {
+        assert!(cold_context_line(&cache(true, Some(181_447))).is_none());
+        // Anything we cannot read as "definitely cold" stays silent.
+        assert!(cold_context_line(&json!({})).is_none());
+        assert!(cold_context_line(&json!({"warm": "no"})).is_none());
+        assert!(cold_context_line(&json!({"warm": false})).is_none(), "no timestamp");
+        assert!(
+            cold_context_line(&json!({"warm": false, "last_request_at": "nonsense"})).is_none(),
+            "an unparsable timestamp must not render half a line"
+        );
+    }
+
+    #[test]
+    fn an_uncosted_session_says_so_rather_than_inventing_a_size() {
+        let line = cold_context_line(&cache(false, None)).expect("still cold");
+        assert!(line.contains("re-writes the whole prefix"), "{line}");
+        assert!(!line.contains('~'), "no fabricated number: {line}");
+    }
+
+    #[test]
+    fn the_line_only_fires_on_a_resume() {
+        // No daemon is reachable in the test env, so a non-resume source must
+        // short-circuit before any I/O and a resume must still fail silently.
+        assert!(cold_context_section(Some("startup"), "sess-1").is_none());
+        assert!(cold_context_section(None, "sess-1").is_none());
+        assert!(cold_context_section(Some("resume"), "").is_none());
+        // A session id that is not URL-path-safe never reaches the daemon.
+        assert!(!is_url_path_safe("../../etc/passwd"));
+        assert!(!is_url_path_safe("a/b"));
+        assert!(!is_url_path_safe(""));
+        assert!(is_url_path_safe("0199c1f2-3ab4-7cde-8f01-23456789abcd"));
+    }
+
+    #[test]
+    fn token_counts_are_coarsened_and_never_round_a_warning_to_zero() {
+        assert_eq!(coarse_tokens(181_447), "182k");
+        assert_eq!(coarse_tokens(1_240_000), "1.2M");
+        assert_eq!(coarse_tokens(940), "940");
+        // A rewrite under 1000 tokens still reads as a number, never "0k".
+        assert_eq!(coarse_tokens(1), "1");
+        assert_eq!(coarse_tokens(1_001), "2k");
+    }
+
+    #[test]
+    fn hhmm_rejects_what_it_cannot_parse() {
+        assert_eq!(hhmm_utc("2026-09-17T14:02:11.482Z"), Some("14:02"));
+        assert_eq!(hhmm_utc("2026-09-17T14:02:00+00:00"), Some("14:02"));
+        assert_eq!(hhmm_utc("2026-09-17"), None);
+        assert_eq!(hhmm_utc("2026-09-17Txx:yy:00Z"), None);
+        assert_eq!(hhmm_utc(""), None);
+    }
+
+    #[test]
+    fn gate_m3_the_cold_line_is_volatile_and_leaves_the_stable_region_untouched() {
+        // The M3 constraint: adding the cold line must not reorder or alter the
+        // brief's byte-stable region. Same two boots as the M2 gate, one of them
+        // additionally cold.
+        let baseline = order_sections(boot_sections("42"), true).join("\n\n");
+
+        let mut with_cold = boot_sections("42");
+        with_cold.push((
+            Stability::Volatile,
+            cold_context_line(&cache(false, Some(181_447))).expect("cold"),
+        ));
+        let with_cold = order_sections(with_cold, true).join("\n\n");
+
+        // The stable region is byte-identical, and the cold line is not in it.
+        let prefix_end = baseline.find("**Crux sync_status**").expect("volatile tail present");
+        assert_eq!(&baseline[..prefix_end], &with_cold[..prefix_end]);
+        assert!(!with_cold[..prefix_end].contains("**Crux cache**"));
+        // The whole baseline is a prefix of the cold variant: nothing moved, one
+        // section was appended at the tail.
+        assert!(
+            with_cold.starts_with(&baseline),
+            "the cold line must append, never reorder"
+        );
+        assert!(with_cold.ends_with("/compact first if the context is stale"));
+
+        // And a warm boot is byte-identical to the baseline — the line costs
+        // nothing at all when there is nothing to say.
+        let mut warm = boot_sections("42");
+        if let Some(line) = cold_context_line(&cache(true, Some(181_447))) {
+            warm.push((Stability::Volatile, line));
+        }
+        assert_eq!(order_sections(warm, true).join("\n\n"), baseline);
     }
 
     // ---- M2 — cache-aligned boot banner ------------------------------------
