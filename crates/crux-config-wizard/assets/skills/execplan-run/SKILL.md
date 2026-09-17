@@ -76,6 +76,16 @@ as far as the board is concerned — that is exactly how 25 plans reached `in_pr
 **Worktrees are reaped at close**, not left for later. 20 stale worktrees were sitting in the
 workspace when this skill was written.
 
+**Self-paced wakeups cap at 50 minutes.** Claude Code caches the prompt prefix with a 1-hour
+TTL measured from request start, so a 3600-second sleep plus the previous turn's response time
+lands past it and the next prompt re-writes the whole prefix at the 2x write rate. On corpus
+`drivew-host-claude-transcripts-2026-09`, idle TTL expiry caused 77.4% of all rewritten cache
+tokens (76 events, 29.0M), and 7 of those 76 were 60-65 minute gaps — loop pacing that missed by
+minutes. When a phase waits (`ep pr watch`, a nightly, an operator decision), poll at <= 50 min
+or accept the rewrite deliberately. `GET /v1/sessions/{sessionId}/cache` reports
+`ttl_seconds_remaining` and what a lapse would cost; the statusline shows the same countdown for
+free.
+
 **ODs batch to the edges.** Score and register open decisions at preflight (step 2) or
 closeout (step 6). Mid-milestone OD work is only justified when the milestone genuinely
 cannot proceed without the decision — and then it becomes a `blocked` transition with a

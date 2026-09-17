@@ -86,6 +86,7 @@ mod result_envelope;
 mod route_auth;
 mod routing;
 pub mod session;
+mod session_cache;
 mod storybook;
 mod stream_receipts;
 mod studio_library;
@@ -915,6 +916,12 @@ pub(crate) fn router_with_route_auth(
         )
         .route("/v1/sessions/active", get(self::session::get_active_sessions))
         .route("/v1/sessions/{sessionId}/plan", get(self::session::get_session_plan))
+        // Prompt-cache clock (M3 of crux-prompt-cache-1h-ttl-2026-09-17): how
+        // long this session's cached prefix stays warm, and what a lapse costs.
+        .route(
+            "/v1/sessions/{sessionId}/cache",
+            get(self::session_cache::get_session_cache),
+        )
         // Invocation verification (master-plan §8).
         .route(
             "/invocation/verify",

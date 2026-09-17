@@ -77,6 +77,10 @@ pub struct Ledger {
     /// The detected invalidations, transcript order, bounded by
     /// [`MAX_INVALIDATIONS`].
     pub invalidations: Vec<CacheInvalidation>,
+    /// Context carried by the **last** API turn — the prefix that is warm right
+    /// now, and therefore what a TTL lapse would cost to re-write. `None` when
+    /// the transcript held no API turn with usage.
+    pub last_turn_context: Option<u64>,
 }
 
 /// Build the cache-invalidation ledger for a parsed transcript.
@@ -89,6 +93,7 @@ pub fn ledger(events: &[Event]) -> Ledger {
         cache_creation_1h: turns.iter().map(|t| t.ephemeral_1h).sum(),
         invalidation_tokens: 0,
         invalidations: Vec::new(),
+        last_turn_context: turns.last().map(Turn::context),
     };
 
     for (i, pair) in turns.windows(2).enumerate() {
