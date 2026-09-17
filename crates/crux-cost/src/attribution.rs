@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 
+use crate::cache;
 use crate::levers;
 use crate::report::{BlockCost, Bucket, CostReport, Headline, Measured, COST_REPORT_SCHEMA};
 use crate::transcript::{Event, EventKind, ExecPlanSignal, SignalStrength};
@@ -89,8 +90,16 @@ pub fn analyze(events: &[Event]) -> CostReport {
                 );
             }
             EventKind::Assistant => {
-                assistant_turns += 1;
-                seg_turn += 1;
+                // One API response is several JSONL lines sharing a
+                // `message.id`; the continuation lines carry new content blocks
+                // but are not new turns (their usage was already cleared at
+                // parse time). Counting them as turns divides the measured
+                // total by the wrong denominator — 18,154 records against 8,082
+                // real calls on `drivew-host-claude-transcripts-2026-09`.
+                if !ev.duplicate_api_line {
+                    assistant_turns += 1;
+                    seg_turn += 1;
+                }
                 park_blocks(ev, seg_turn, &mut seg);
             }
             EventKind::User => {
@@ -145,6 +154,9 @@ pub fn analyze(events: &[Event]) -> CostReport {
     } else {
         0
     };
+    // The cache-invalidation ledger: which turns re-wrote an already-cached
+    // prefix, and why (M0 of `crux-prompt-cache-1h-ttl-2026-09-17`).
+    let ledger = cache::ledger(events);
     let headline = Headline {
         assistant_turns,
         tasks,
@@ -153,6 +165,12 @@ pub fn analyze(events: &[Event]) -> CostReport {
         cache_read_to_output_ratio: ratio2(measured.cache_read, measured.output),
         measured_context_total,
         prefix_pct: pct_of(session_prefix, measured_context_total),
+        cache_hit_rate: ratio4(measured.cache_read, measured_context_total),
+        rewrite_share: ratio4(ledger.invalidation_tokens, measured.cache_creation),
+        invalidation_tokens: ledger.invalidation_tokens,
+        cache_creation_5m: ledger.cache_creation_5m,
+        cache_creation_1h: ledger.cache_creation_1h,
+        invalidations: ledger.invalidations,
     };
 
     let levers = levers::generate(&headline, &buckets, &all_blocks);
@@ -327,6 +345,19 @@ fn pct_of(part: u64, whole: u64) -> f64 {
 )]
 fn ratio2(num: u64, den: u64) -> f64 {
     round2(num as f64 / den.max(1) as f64)
+}
+
+/// A 0..1 ratio at 4 dp — enough to tell a 98.17% hit rate from a 98.2% one.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "token counts are < 2^53, exactly representable in f64"
+)]
+fn ratio4(num: u64, den: u64) -> f64 {
+    if den == 0 {
+        0.0
+    } else {
+        ((num as f64 / den as f64) * 10_000.0).round() / 10_000.0
+    }
 }
 
 fn round2(x: f64) -> f64 {

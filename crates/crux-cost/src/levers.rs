@@ -12,7 +12,8 @@
 //! over-budget `MEMORY.md`, not rewording `CLAUDE.md` (editable files were only
 //! ~8% of the measured prefix).
 
-use crate::report::{BlockCost, Bucket, Headline, Lever, Severity};
+use crate::cache::dominant_class;
+use crate::report::{BlockCost, Bucket, CacheClass, Headline, Lever, Severity};
 
 /// Generate the ordered lever list (High → Low, then by addressable share).
 #[must_use]
@@ -38,6 +39,33 @@ pub fn generate(headline: &Headline, buckets: &[Bucket], top_blocks: &[BlockCost
                  schema saves its tokens on every turn, not once."
             ),
             est_pct: prefix_pct,
+        });
+    }
+
+    // 1b. Prompt-cache thrash — the prefix is being re-written, not re-read.
+    // Fires on `rewrite_share` (rewrites ÷ all cache writes), which is the
+    // movable half of cache spend: first-time writes are unavoidable, rewrites
+    // are pacing and surface churn, and a 1h write costs 2x base against a
+    // 0.1x read.
+    let rewrite_share = headline.rewrite_share;
+    if rewrite_share >= 0.4 {
+        let rewrite_pct = rewrite_share * 100.0;
+        let cause = dominant_class(&headline.invalidations).map_or_else(
+            || "no single cause dominates".to_owned(),
+            |(class, tokens)| format!("{} accounts for the most of it ({tokens} tokens)", cause_phrase(class)),
+        );
+        levers.push(Lever {
+            id: "cache-thrash".to_owned(),
+            severity: sev(rewrite_pct, 60.0),
+            title: "Stop re-writing the prompt cache".to_owned(),
+            detail: format!(
+                "{rewrite_pct:.0}% of this session's cache-write tokens ({} across {} rewrite(s)) \
+                 re-wrote a prefix that was already cached — billed at the 2x write rate \
+                 instead of re-read at 0.1x. {cause}.",
+                headline.invalidation_tokens,
+                headline.invalidations.len(),
+            ),
+            est_pct: rewrite_pct,
         });
     }
 
@@ -135,6 +163,20 @@ pub fn generate(headline: &Headline, buckets: &[Bucket], top_blocks: &[BlockCost
             .then_with(|| b.est_pct.partial_cmp(&a.est_pct).unwrap_or(std::cmp::Ordering::Equal))
     });
     levers
+}
+
+/// Human phrasing for the dominant invalidation class, naming the actor who
+/// can actually move it.
+fn cause_phrase(class: CacheClass) -> &'static str {
+    match class {
+        CacheClass::TtlExpiry => "idle gaps past the 1-hour TTL (loop/operator pacing)",
+        CacheClass::EffortChange => "effort-level switches rewriting the system prompt",
+        CacheClass::DateChange => "the daily date rollover in the prefix",
+        CacheClass::ToolDelta => "changes to the offered tool surface",
+        CacheClass::McpInstructionsDelta => "MCP server instructions entering or leaving the prefix",
+        CacheClass::HookBlock => "hook-injected context",
+        CacheClass::Unattributed => "no identified cause",
+    }
 }
 
 fn bucket_pct(buckets: &[Bucket], source: &str) -> f64 {

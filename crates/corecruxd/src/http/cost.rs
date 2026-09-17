@@ -165,8 +165,11 @@ pub(super) async fn get_cost_report(
     .into_response()
 }
 
-/// Trim the heaviest field (top_blocks) until the report fits the budget. The
-/// headline + buckets + levers (the screenshot-worthy core) are always kept.
+/// Trim the heaviest fields (top_blocks, then the cache-invalidation list)
+/// until the report fits the budget. The headline scalars + buckets + levers
+/// (the screenshot-worthy core) are always kept — including `cache_hit_rate`,
+/// `rewrite_share` and `invalidation_tokens`, so a trimmed report still carries
+/// the cache totals even when the per-event list is dropped.
 fn fit_budget(mut stored: StoredReport, budget: u64) -> StoredReport {
     let est = |s: &StoredReport| {
         serde_json::to_value(s)
@@ -175,6 +178,9 @@ fn fit_budget(mut stored: StoredReport, budget: u64) -> StoredReport {
     };
     while !stored.report.top_blocks.is_empty() && est(&stored) > budget {
         stored.report.top_blocks.pop();
+    }
+    while !stored.report.headline.invalidations.is_empty() && est(&stored) > budget {
+        stored.report.headline.invalidations.pop();
     }
     stored
 }
@@ -217,6 +223,7 @@ mod tests {
                 cache_read_to_output_ratio: 50.0,
                 measured_context_total: 10_000,
                 prefix_pct: 50.0,
+                ..crux_cost::Headline::default()
             },
             measured: crux_cost::Measured::default(),
             buckets: Vec::new(),
@@ -378,6 +385,77 @@ mod tests {
         for f in ["model", "effort", "cwd", "git_branch", "breakdown"] {
             assert!(r.get(f).is_none(), "{f} must not be invented on a legacy report");
         }
+        std::env::remove_var("CORECRUXD_FEATURE_COST_LENS");
+    }
+
+    /// A transcript with one prefix rewrite: a 2-hour idle gap between two
+    /// turns, the second re-writing what the first had cached.
+    fn cache_thrash_transcript() -> String {
+        [
+            r#"{"type":"assistant","sessionId":"cache","timestamp":"2026-09-17T09:00:00.000Z","message":{"role":"assistant","id":"m1","model":"claude-opus-5","usage":{"input_tokens":100,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":30000,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":30000}},"content":[{"type":"text","text":"a"}]}}"#,
+            r#"{"type":"assistant","sessionId":"cache","timestamp":"2026-09-17T11:05:00.000Z","message":{"role":"assistant","id":"m2","model":"claude-opus-5","usage":{"input_tokens":5,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":31000,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":31000}},"content":[{"type":"text","text":"b"}]}}"#,
+        ]
+        .join("\n")
+    }
+
+    /// The cache-invalidation ledger survives POST → GET intact: the headline
+    /// scalars, the per-event list with its class and sub-bucket, and the
+    /// `cache-thrash` lever.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn post_then_get_round_trips_the_cache_ledger() {
+        std::env::set_var("CORECRUXD_FEATURE_COST_LENS", "1");
+        let state = crate::http::tests::test_app_state(1);
+        let report = crux_cost::analyze_str(&cache_thrash_transcript(), "cache.jsonl");
+        assert_eq!(report.headline.invalidations.len(), 1, "producer found the rewrite");
+
+        let resp = post_cost_report(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(PostCostBody {
+                tenant_id: "default".to_owned(),
+                session_id: None,
+                report,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = get_cost_report(
+            State(state),
+            HeaderMap::new(),
+            Query(HashMap::from([
+                ("tenant_id".to_owned(), "default".to_owned()),
+                ("token_budget".to_owned(), "8000".to_owned()),
+                ("session".to_owned(), "cache".to_owned()),
+            ])),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let h = &v["report"]["report"]["headline"];
+
+        assert_eq!(h["invalidation_tokens"], 31_000);
+        assert_eq!(h["cache_creation_1h"], 61_000);
+        assert_eq!(h["cache_creation_5m"], 0);
+        assert_eq!(h["cache_hit_rate"], 0.0);
+        assert_eq!(h["rewrite_share"], 0.5082);
+        let inv = h["invalidations"].as_array().expect("invalidations");
+        assert_eq!(inv.len(), 1);
+        assert_eq!(inv[0]["class"], "ttl_expiry");
+        assert_eq!(inv[0]["sub_bucket"], "120-480m");
+        assert_eq!(inv[0]["tokens"], 31_000);
+        assert_eq!(inv[0]["gap_minutes"], 125.0);
+        // Fields that do not apply to this class stay off the wire.
+        assert!(inv[0].get("server").is_none());
+        assert!(inv[0].get("tool_delta").is_none());
+
+        let levers = v["report"]["report"]["levers"].as_array().expect("levers");
+        assert!(
+            levers.iter().any(|l| l["id"] == "cache-thrash"),
+            "the cache-thrash lever must reach the console"
+        );
         std::env::remove_var("CORECRUXD_FEATURE_COST_LENS");
     }
 }

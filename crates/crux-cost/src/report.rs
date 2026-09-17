@@ -150,7 +150,8 @@ pub struct ModelBurn {
     /// Normalised model id, or the raw string verbatim when unrecognised — a
     /// new id becomes its own visible row rather than merging into an old one.
     pub model: String,
-    /// Records attributed to this model.
+    /// API calls attributed to this model (deduped by `message.id`, so on the
+    /// same denominator as [`Headline::assistant_turns`]).
     pub turns: u64,
     /// The four measured `usage` accumulators over those records.
     pub measured: Measured,
@@ -186,7 +187,11 @@ pub struct EffortBurn {
 
 /// The top-line numbers — the wedge. The headline metric is
 /// `context_tokens_per_turn`, the average context re-read on every model call.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// `Default` exists so a caller building one field-by-field (tests, fixtures)
+/// does not have to restate the whole struct each time a field is added
+/// additively; the analyzer always sets every field explicitly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Headline {
     /// Number of assistant (model) turns in the transcript.
     pub assistant_turns: u64,
@@ -206,6 +211,136 @@ pub struct Headline {
     /// `session_prefix` (system prompt + tool schemas + CLAUDE.md/MEMORY.md),
     /// as a percentage 0..100.
     pub prefix_pct: f64,
+    /// `cache_read / (cache_read + cache_creation + input)`, 0..1, rounded to
+    /// 4 dp. How often the prompt prefix was still warm. Additive since the
+    /// cache-invalidation ledger (M0); a pre-ledger report deserialises with
+    /// `0.0` here.
+    #[serde(default)]
+    pub cache_hit_rate: f64,
+    /// Share of *all* `cache_creation` tokens that were **rewrites of an
+    /// already-cached prefix** rather than first-time content, 0..1, rounded to
+    /// 4 dp. This is the movable number: first-time writes are unavoidable,
+    /// rewrites are pacing and surface churn, and both are billed at the same
+    /// 2x (1h) write rate.
+    #[serde(default)]
+    pub rewrite_share: f64,
+    /// Σ `cache_creation` over the turns flagged as invalidations — the
+    /// numerator of [`Self::rewrite_share`].
+    #[serde(default)]
+    pub invalidation_tokens: u64,
+    /// Σ `cache_creation.ephemeral_5m_input_tokens` over the session's API
+    /// turns (1.25x write rate).
+    #[serde(default)]
+    pub cache_creation_5m: u64,
+    /// Σ `cache_creation.ephemeral_1h_input_tokens` over the session's API
+    /// turns (2x write rate). Claude Code on a subscription writes this tier
+    /// almost exclusively.
+    #[serde(default)]
+    pub cache_creation_1h: u64,
+    /// Every detected prefix rewrite, in transcript order, with what the
+    /// classifier blames it on. Bounded by [`crate::MAX_INVALIDATIONS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invalidations: Vec<CacheInvalidation>,
+}
+
+/// What a single prompt-cache invalidation is blamed on.
+///
+/// Evaluated in **declaration order** — the first match wins — against the
+/// harness attachments sitting between the two API turns. The order is the
+/// measured one, not a guess: `hook_*` attachments appear in 17.6% of
+/// invalidating windows against a 0.11% base rate on
+/// `drivew-host-claude-transcripts-2026-09`, but they fire at SessionStart /
+/// resume, which is *also* when a long idle gap has just expired the cache. A
+/// hook is a marker of a cold resume, not its cause, so it must never outrank
+/// [`Self::TtlExpiry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheClass {
+    /// Wall-clock gap ≥ 60 min between the two turns: the 1-hour TTL ran out.
+    /// The largest class by tokens; owned by operator/loop pacing, not the
+    /// daemon.
+    TtlExpiry,
+    /// An `ultra_effort_enter` / `ultra_effort_exit` attachment — the harness
+    /// rewrote the system prompt for a new effort level.
+    EffortChange,
+    /// A `date_change` attachment — the date line in the prefix rolled over.
+    DateChange,
+    /// A `deferred_tools_delta` — the offered tool surface changed. See
+    /// [`CacheInvalidation::server`] and [`CacheInvalidation::tool_delta`]:
+    /// measured add-only deltas did not invalidate, removals did.
+    ToolDelta,
+    /// An `mcp_instructions_delta` — a connected MCP server's instructions block
+    /// entered or left the prefix.
+    McpInstructionsDelta,
+    /// A `hook_*` attachment with **no** qualifying idle gap — a hook injected
+    /// or blocked enough to move the prefix on its own.
+    HookBlock,
+    /// Nothing in the window explains it. Kept as its own visible class: an
+    /// unattributed rewrite is a question, not a rounding error.
+    Unattributed,
+}
+
+impl CacheClass {
+    /// Stable wire string (`"ttl_expiry"`, `"tool_delta"`, …).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheClass::TtlExpiry => "ttl_expiry",
+            CacheClass::EffortChange => "effort_change",
+            CacheClass::DateChange => "date_change",
+            CacheClass::ToolDelta => "tool_delta",
+            CacheClass::McpInstructionsDelta => "mcp_instructions_delta",
+            CacheClass::HookBlock => "hook_block",
+            CacheClass::Unattributed => "unattributed",
+        }
+    }
+}
+
+/// Whether a `deferred_tools_delta` only added names or also removed some.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolDeltaKind {
+    /// Only `addedNames`. Measured: 0 of 3 add-only crux deltas invalidated.
+    AddOnly,
+    /// At least one `removedNames` entry — the harmful case (one measured event
+    /// removed 11 tools and rewrote 311,754 tokens).
+    WithRemovals,
+}
+
+/// One detected prompt-cache invalidation: an API turn that re-wrote a prefix
+/// the previous turn had already cached.
+///
+/// Detection rule (the rule the 2026-09 baseline was measured with): with
+/// `ctx_prev = prev.cache_read + prev.cache_creation + prev.input`, a turn is an
+/// invalidation when `cur.cache_read < 0.5 × ctx_prev` **and**
+/// `cur.cache_creation > 0.4 × ctx_prev`. Windows with `ctx_prev < 5000` (no
+/// meaningful prefix yet) and windows containing a compaction boundary (the
+/// context was *supposed* to be rebuilt) are excluded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CacheInvalidation {
+    /// 0-based index of the invalidating turn among the session's **API turns**
+    /// (deduped by `message.id`), not among transcript lines.
+    pub index: u64,
+    /// What it is blamed on.
+    pub class: CacheClass,
+    /// For [`CacheClass::TtlExpiry`], which idle band: `60-65m`, `65-120m`,
+    /// `120-480m`, `480m+`. `None` for every other class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_bucket: Option<String>,
+    /// `cache_creation` on the invalidating turn — the tokens the rewrite cost.
+    pub tokens: u64,
+    /// Wall-clock minutes between the two turns' timestamps, 1 dp. `None` when
+    /// either record carried no parseable timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_minutes: Option<f64>,
+    /// For [`CacheClass::ToolDelta`], the MCP server owning most of the changed
+    /// names (`crux`, `builtin`, …) — so the ledger can say *whose* surface
+    /// churn it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    /// For [`CacheClass::ToolDelta`], whether the delta was add-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_delta: Option<ToolDeltaKind>,
 }
 
 /// The four measured `usage` accumulators (ground truth from the transcript).
