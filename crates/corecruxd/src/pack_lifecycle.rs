@@ -42,12 +42,15 @@
 //! deserializes as live and no installed pack changes behaviour. Whether a
 //! *new* install lands staged is the operator's call via
 //! `CORECRUXD_PACK_STAGING` (default off ⇒ installs stay immediately live,
-//! exactly as before). Transitions are always available regardless of the
-//! flag; the flag only picks the initial state.
+//! exactly as before) — or, once the operator enforces the pre-enable
+//! replay gate, [`initial_install_state`] stages a *declaring* pack no
+//! matter how that flag is set, because install is a way of going live too.
+//! Transitions are always available regardless of the flag; the flag only
+//! picks the initial state.
 
 use crate::extension_registry::{get_extension, put_record, ExtensionsError, InstalledExtension};
 use corecrux_memory::fact_store::FactStore;
-use crux_integrations::{append_audit_event, IntegrationAuditEvent, AUDIT_EXTENSION_LIFECYCLE};
+use crux_integrations::{append_audit_event, IntegrationAuditEvent, IntegrationManifest, AUDIT_EXTENSION_LIFECYCLE};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -109,6 +112,35 @@ pub fn default_install_state() -> PackLifecycleState {
     } else {
         PackLifecycleState::Active
     }
+}
+
+/// The state a freshly installed pack actually starts in.
+///
+/// Install is the *other* path that takes a pack live, and it does not run
+/// through [`set_lifecycle`], so the pre-enable gate
+/// (`proof-carrying-adaptive-packs-2026-07-13` M1) has to be applied here
+/// too or an enforcing operator gets it on the transition route only. A
+/// pack that declares a `pack.conformance.v1` envelope has not earned
+/// `active` until a replay of *this build* says so, and at install time no
+/// replay can exist yet.
+///
+/// It is staged rather than refused: the pack has to be installed before
+/// `POST /v1/extensions/{id}/replay` has anything to replay. Nothing
+/// changes for a pack that declares no envelope (it promised nothing, so
+/// there is nothing a replay could contradict) or while the gate is
+/// [`crate::pack_replay::ActivationGate::Advisory`], which is the default.
+pub fn initial_install_state(
+    default_state: PackLifecycleState,
+    gate: crate::pack_replay::ActivationGate,
+    manifest: &IntegrationManifest,
+) -> PackLifecycleState {
+    if default_state == PackLifecycleState::Active
+        && gate == crate::pack_replay::ActivationGate::Enforced
+        && manifest.conformance.is_some()
+    {
+        return PackLifecycleState::Staged;
+    }
+    default_state
 }
 
 /// What a completed transition records. Returned to the caller and mirrored
@@ -700,6 +732,59 @@ mod tests {
         assert_eq!(
             PackAttribution::from_installed(&installed).manifest_hash,
             installed.manifest_hash
+        );
+    }
+
+    /// The other way a pack goes live is by being installed live, and that
+    /// path does not run through [`set_lifecycle`]. With enforcement on, a
+    /// declaring pack lands staged instead — it cannot have been replayed
+    /// yet, so it has not earned `active`
+    /// (`proof-carrying-adaptive-packs-2026-07-13` M1).
+    #[test]
+    fn a_declaring_pack_is_not_installed_live_while_the_gate_is_enforced() {
+        let mut declaring = fixture_manifest("ext.example.quote");
+        declaring.conformance = Some(declaring_conformance());
+        let silent = fixture_manifest("ext.example.legacy");
+
+        assert_eq!(
+            initial_install_state(
+                PackLifecycleState::Active,
+                crate::pack_replay::ActivationGate::Enforced,
+                &declaring,
+            ),
+            PackLifecycleState::Staged,
+            "an enforcing operator must not get a live, never-replayed declaring pack"
+        );
+
+        // A pack that declared no envelope promised nothing, so there is
+        // nothing a replay could contradict and nothing to gate.
+        assert_eq!(
+            initial_install_state(
+                PackLifecycleState::Active,
+                crate::pack_replay::ActivationGate::Enforced,
+                &silent,
+            ),
+            PackLifecycleState::Active
+        );
+
+        // Advisory is the shipped default: no install changes state.
+        assert_eq!(
+            initial_install_state(
+                PackLifecycleState::Active,
+                crate::pack_replay::ActivationGate::Advisory,
+                &declaring,
+            ),
+            PackLifecycleState::Active
+        );
+
+        // And `CORECRUXD_PACK_STAGING` still wins where it already applied.
+        assert_eq!(
+            initial_install_state(
+                PackLifecycleState::Staged,
+                crate::pack_replay::ActivationGate::Advisory,
+                &silent,
+            ),
+            PackLifecycleState::Staged
         );
     }
 

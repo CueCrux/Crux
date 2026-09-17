@@ -26,6 +26,12 @@ This layer is the half that judges, and it runs **before the pack is enabled**:
 4. **Enable** — or not. With `CORECRUXD_PACK_REPLAY_GATE` on, a declaring pack
    with no passing replay of *this exact build* cannot move to `active`.
 
+A pack goes live two ways, and the gate covers both. `set_lifecycle` is the
+only lifecycle *transition*, but installing a pack live is not a transition —
+so with the gate on, a **declaring pack installs `staged`** whatever
+`CORECRUXD_PACK_STAGING` says. It is staged rather than refused: a pack has to
+be installed before there is anything to replay. Step 4 then promotes it.
+
 ## The corpus is bytes
 
 `replay_corpus.sha256` in the signed declaration is a digest over the corpus
@@ -149,6 +155,6 @@ the audit row are produced either way; only the refusal is gated. That matches
 the plan's advisory-first rollout — the behavioural trust surface shows the
 evidence first and becomes the default enablement gate after M6's go/no-go.
 
-A pack that ships **no** conformance block is never gated. It declared no
-envelope, so there is nothing a replay could contradict, and every pack
-installed before this milestone is in exactly that position.
+A pack that ships **no** conformance block is never gated — on either path. It
+declared no envelope, so there is nothing a replay could contradict, and every
+pack installed before this milestone is in exactly that position.
