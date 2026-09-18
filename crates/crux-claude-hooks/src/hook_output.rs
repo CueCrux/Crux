@@ -110,6 +110,32 @@ impl PreToolUseOutput {
     }
 }
 
+/// Protocol-aware result of a `PreToolUse` decision.
+///
+/// Claude tools retain their explicit allow/deny envelope. A conflict-free
+/// Codex `apply_patch` uses [`Self::NoDecision`], because Codex permits an
+/// explicit allow only alongside a complete `updatedInput`.
+#[derive(Debug)]
+pub enum PreToolUseDecision {
+    Output(PreToolUseOutput),
+    NoDecision,
+}
+
+impl PreToolUseDecision {
+    /// Preserve the existing Claude output path.
+    pub fn output(output: PreToolUseOutput) -> Self {
+        Self::Output(output)
+    }
+
+    /// Emit either the structured decision or exactly zero stdout bytes.
+    pub fn emit(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Output(output) => output.emit(),
+            Self::NoDecision => Ok(()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +180,10 @@ mod tests {
             json["hookSpecificOutput"]["permissionDecisionReason"],
             "file held by another passport"
         );
+    }
+
+    #[test]
+    fn no_decision_serializes_to_zero_output_path() {
+        assert!(PreToolUseDecision::NoDecision.emit().is_ok());
     }
 }
