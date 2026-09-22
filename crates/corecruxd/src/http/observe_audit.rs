@@ -175,7 +175,11 @@ fn node_from_payload(payload: &Value) -> Option<TraceNode> {
 /// Collect every live `agent_trace_node` for `session_id`, ordered by `seq`
 /// then `node_id` (stable tie-break). Reads under the entity-store read lock.
 async fn session_nodes(state: &AppState, session_id: &str) -> Vec<TraceNode> {
-    let store = state.entity_store.read().await;
+    nodes_in(&*state.entity_store.read().await, session_id)
+}
+
+/// [`session_nodes`] against a store the caller has already locked.
+fn nodes_in(store: &corecrux_memory::EntityStore, session_id: &str) -> Vec<TraceNode> {
     let query = EntityQuery {
         kind: Some(AGENT_TRACE_NODE_KIND.to_string()),
         limit: None,
@@ -192,24 +196,34 @@ async fn session_nodes(state: &AppState, session_id: &str) -> Vec<TraceNode> {
 }
 
 /// Next monotonic `seq` for `session_id` — `max(existing) + 1`, or `1` when the
-/// session has no nodes yet. Caller holds no lock; this takes the read lock.
-async fn next_seq(state: &AppState, session_id: &str) -> u64 {
-    session_nodes(state, session_id)
-        .await
+/// session has no nodes yet.
+fn next_seq(store: &corecrux_memory::EntityStore, session_id: &str) -> u64 {
+    nodes_in(store, session_id)
         .iter()
         .map(|n| n.seq)
         .max()
         .map_or(1, |m| m.saturating_add(1))
 }
 
-/// Persist a [`TraceNode`] to the `agent_trace_node` substrate kind and emit
-/// the `AuditStep` SSE event. Returns the stored payload value on success.
-async fn upsert_node(state: &AppState, node: &TraceNode, actor: &str) -> Result<Value, Response> {
-    let payload = serde_json::to_value(node)
-        .map_err(|e| problem_response(StatusCode::INTERNAL_SERVER_ERROR, format!("encode trace node: {e}")))?;
+/// Persist the [`TraceNode`] `build` returns to the `agent_trace_node`
+/// substrate kind and emit the `AuditStep` SSE event. Returns the stored
+/// payload value on success.
+///
+/// `build` runs under the entity-store write lock that stores its node, so a
+/// `seq` minted there with [`next_seq`] cannot be minted twice: read under a
+/// separate lock, two concurrent opens both took `max + 1`, and the second
+/// overwrote the first's default `node_id`.
+async fn upsert_node(
+    state: &AppState,
+    actor: &str,
+    build: impl FnOnce(&corecrux_memory::EntityStore) -> TraceNode,
+) -> Result<Value, Response> {
     let registry = state.kind_registry.read().await;
     let registry_opt = registry.is_registered(AGENT_TRACE_NODE_KIND).then_some(&*registry);
     let mut store = state.entity_store.write().await;
+    let node = build(&store);
+    let payload = serde_json::to_value(&node)
+        .map_err(|e| problem_response(StatusCode::INTERNAL_SERVER_ERROR, format!("encode trace node: {e}")))?;
     let rec = store
         .upsert(AGENT_TRACE_NODE_KIND, &node.node_id, payload, actor, registry_opt)
         .map_err(|e| problem_response(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -217,8 +231,8 @@ async fn upsert_node(state: &AppState, node: &TraceNode, actor: &str) -> Result<
     drop(store);
     drop(registry);
     state.event_bus.emit(CruxEvent::AuditStep {
-        node_id: node.node_id.clone(),
-        session_id: node.session_id.clone(),
+        node_id: node.node_id,
+        session_id: node.session_id,
         seq: node.seq,
     });
     Ok(rec.payload)
@@ -295,36 +309,37 @@ pub(super) async fn open_step(
     // built and folded into the signed chain.
     redact_input_refs(&Redactor::with_mode(observe_redact_mode()), &mut body.inputs);
 
-    let seq = next_seq(&state, &session_id).await;
-    let node_id = body
-        .node_id
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| format!("trace_{session_id}_{seq}"));
-
-    let node = TraceNode {
-        contract_version: CONTRACT_VERSION,
-        node_id,
-        session_id,
-        parent_id: body.parent_id,
-        seq,
-        kind: body.kind,
-        label: body.label,
-        actor: body.actor,
-        risk_class: body.risk_class,
-        ts_start: body.ts_start,
-        ts_end: None,
-        tokens: None,
-        status: StepStatus::Running,
-        inputs: body.inputs,
-        reasoning_ref: None,
-        outputs: vec![],
-        receipt_id: None,
-        enrich_ref: body.enrich_ref,
-        private: body.private,
+    let actor = body.actor.clone();
+    let build = |store: &corecrux_memory::EntityStore| {
+        let seq = next_seq(store, &session_id);
+        let node_id = body
+            .node_id
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("trace_{session_id}_{seq}"));
+        TraceNode {
+            contract_version: CONTRACT_VERSION,
+            node_id,
+            session_id,
+            parent_id: body.parent_id,
+            seq,
+            kind: body.kind,
+            label: body.label,
+            actor: body.actor,
+            risk_class: body.risk_class,
+            ts_start: body.ts_start,
+            ts_end: None,
+            tokens: None,
+            status: StepStatus::Running,
+            inputs: body.inputs,
+            reasoning_ref: None,
+            outputs: vec![],
+            receipt_id: None,
+            enrich_ref: body.enrich_ref,
+            private: body.private,
+        }
     };
 
-    let actor = node.actor.clone();
-    match upsert_node(&state, &node, &actor).await {
+    match upsert_node(&state, &actor, build).await {
         Ok(payload) => (StatusCode::CREATED, Json(json!({ "node": payload }))).into_response(),
         Err(resp) => resp,
     }
@@ -380,7 +395,7 @@ pub(super) async fn close_step(
     apply_close(&mut node, body);
 
     let actor = node.actor.clone();
-    match upsert_node(&state, &node, &actor).await {
+    match upsert_node(&state, &actor, |_| node).await {
         Ok(payload) => (StatusCode::OK, Json(json!({ "node": payload }))).into_response(),
         Err(resp) => resp,
     }
@@ -1108,6 +1123,50 @@ mod tests {
             seqs.push(v["node"]["seq"].as_u64().unwrap());
         }
         assert_eq!(seqs, vec![1, 2, 3], "seq must be monotonic per session");
+    }
+
+    // QA audit M7 (audit-step seq TOCTOU): two opens racing on one session
+    // must mint distinct seqs. Holding the entity-store write lock parks both
+    // opens before they read the session; releasing it lets them run together.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn concurrent_opens_mint_distinct_seqs() {
+        let _guard = OBSERVE_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvVarGuard::set("CORECRUXD_OBSERVE", "1");
+        let state = test_app_state(1);
+        crate::agentgraph_kinds::bootstrap(&mut *state.kind_registry.write().await).expect("bootstrap kinds");
+        let app = router(state.clone());
+        let open = |app: Router| async move {
+            let body = json!({ "label": "step", "actor": "ce:1:local", "ts_start": "2026-05-29T00:00:00Z" });
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/observe/sessions/race/steps")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            json_body(resp).await["node"]["seq"].as_u64().unwrap()
+        };
+
+        let held = state.entity_store.write().await;
+        let first = tokio::spawn(open(app.clone()));
+        let second = tokio::spawn(open(app));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(held);
+
+        let mut seqs = vec![first.await.unwrap(), second.await.unwrap()];
+        seqs.sort_unstable();
+        assert_eq!(seqs, vec![1, 2], "concurrent opens must not share a seq");
+        assert_eq!(
+            session_nodes(&state, "race").await.len(),
+            2,
+            "neither node may overwrite the other"
+        );
     }
 
     #[tokio::test]
