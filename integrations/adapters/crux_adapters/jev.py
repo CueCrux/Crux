@@ -508,19 +508,33 @@ def _cbor_decode(data: bytes) -> Any:
 _OBSERVATION_WINDOW = 1000  # the daemon's cap on GET /v1/observations/aggregate
 
 
-def _signed_body(client: Any, receipt_id: str) -> dict[str, Any]:
+def _blake3() -> Callable[[bytes], str]:
+    """``bytes -> blake3 hex``, from the optional ``blake3`` package; fails closed without it."""
+    try:
+        from blake3 import blake3
+    except ImportError as err:
+        raise ImportError(
+            "replay() hashes the signed receipt body with BLAKE3, which needs the "
+            "'blake3' package: pip install 'cuecrux-adapters[jev-replay]'"
+        ) from err
+    return lambda data: blake3(data).hexdigest()
+
+
+def _signed_body(client: Any, receipt_id: str, blake3: Callable[[bytes], str]) -> dict[str, Any]:
     """A ``model_invocation`` receipt's signed body, decoded, once the daemon verifies it.
 
-    ``/verification`` checks the Ed25519 signature. The body comes from the
-    mediation observation log (``GET /v1/observations/aggregate``), the place a
-    daemon without a dataplane serves it; that record must be the only one
-    claiming ``receipt_id``, and its ``body_hash`` the payload hash the daemon
-    just verified, so the bytes decoded are the bytes whose signature was
-    checked.
+    ``/verification`` checks the Ed25519 signature and reports ``payload_hash``,
+    the BLAKE3 of the body bytes it checked. The bytes come from the mediation
+    observation log (``GET /v1/observations/aggregate``), the place a daemon
+    without a dataplane serves them. Anyone who can post session observations
+    can add records to that listing, so every field of a listed record is
+    untrusted: the body used is the one whose bytes hash, here, to the verified
+    ``payload_hash``. Other records claiming ``receipt_id`` are ignored.
     """
     report = client.verify_receipt(receipt_id, tenant_id="local")
     if report.get("signature_valid") is not True or report.get("error_code") != "OK":
         raise TamperedRequest(f"receipt {receipt_id} does not verify ({report.get('error_code')})")
+    verified = report.get("payload_hash")
     # ponytail: only the newest 1000 model_invocation observations are
     # searched (no by-id lookup without a dataplane); older receipts raise
     # LookupError. Add a receipt_id filter to the aggregate route if that bites.
@@ -532,10 +546,19 @@ def _signed_body(client: Any, receipt_id: str) -> dict[str, Any]:
             f"receipt {receipt_id} is not among the daemon's newest "
             f"{_OBSERVATION_WINDOW} model_invocation observations"
         )
-    if len(found) > 1 or found[0].get("body_hash") != f"blake3:{report.get('payload_hash')}":
-        raise TamperedRequest(f"receipt {receipt_id}: the listed body is not the one verified")
+    raw = None
+    for payload in found:
+        try:
+            data = bytes.fromhex(payload.get("body_cbor_hex"))
+        except (TypeError, ValueError):
+            continue
+        if isinstance(verified, str) and blake3(data) == verified:
+            raw = data
+            break
+    if raw is None:
+        raise TamperedRequest(f"receipt {receipt_id}: no listed body hashes to the one verified")
     try:
-        body = _cbor_decode(bytes.fromhex(str(found[0].get("body_cbor_hex"))))
+        body = _cbor_decode(raw)
     except ValueError as err:
         raise TamperedRequest(f"receipt {receipt_id}: signed body is malformed ({err})") from err
     if (
@@ -563,10 +586,14 @@ def replay(
     original is re-sent, so an alias such as ``jev-latest`` reaches whatever
     version it names today.
 
+    Needs the ``blake3`` package (``pip install 'cuecrux-adapters[jev-replay]'``);
+    without it replay raises ``ImportError`` before reading anything.
+
     Before Jev is called, both facts must name the same ``source_receipt``,
     the daemon must report that receipt's signature valid, and the receipt's
-    **signed** body -- decoded here from the daemon's observation log, never
-    the unsigned copies in the facts or next to the body -- must match:
+    **signed** body -- the listed bytes whose BLAKE3 is the payload hash the
+    daemon verified, never the unsigned copies in the facts or next to the
+    body -- must match:
 
     * ``prompt_hash``: the stored ``{state, questions}``, re-hashed;
     * ``model_id``: the stored request's ``model``;
@@ -577,6 +604,8 @@ def replay(
 
     Otherwise :class:`TamperedRequest`. A receipt older than the daemon's
     newest 1000 ``model_invocation`` observations raises ``LookupError``.
+    Jev is sent exactly ``model``, ``state`` and ``questions``: any other key
+    in the stored request is outside ``prompt_hash``, so it is dropped.
 
     So rewriting both facts consistently is caught. Still trusted: the
     daemon's own signature check, and anyone who can mint receipts on it
@@ -586,6 +615,7 @@ def replay(
     receipt, no fact.
     """
     call = jev or jev_http()
+    blake3 = _blake3()
     ref = decision_key.removeprefix("decision:")
     decision = _latest_fact(client, f"jev:{entity}", decision_key)
     stored = _latest_fact(client, f"__jev__::{entity}", f"request:{ref}")
@@ -603,7 +633,7 @@ def replay(
     except (ValueError, AttributeError) as err:  # not JSON, not objects, or NaN
         raise TamperedRequest(f"jev:{entity} / {decision_key} cannot be checked ({err})") from err
 
-    signed = _signed_body(client, receipt_id)
+    signed = _signed_body(client, receipt_id, blake3)
     signed = {**signed, "provider_request_id": signed.get("provider_request_id") or signed.get("invocation_id")}
     differ = [name for name, value in ours.items() if signed.get(name) != value]
     if differ:
@@ -611,7 +641,10 @@ def replay(
             f"{', '.join(differ)} of jev:{entity} / {decision_key} differ from signed receipt {receipt_id}"
         )
 
-    raw, request_id = call({**request, "model": model} if model else request)
+    # Only what the receipt covers: prompt_hash is over state + questions.
+    raw, request_id = call(
+        {"model": model or request["model"], "state": request["state"], "questions": request["questions"]}
+    )
     return ReplayResult(
         old_answers=record["answers"],
         new_answers=raw["answers"],

@@ -188,6 +188,10 @@ decision.answers["block"]["noul"], decision.receipt_id, decision.request_id
   recomputed from the fact alone and checked against the signed receipt.
 - **Failures are loud.** If the receipt or the fact is not written, the call
   raises `DecisionNotRecorded`, and `.decision` still holds the answers.
+- **Replay** (`store_state=True`, then `crux_adapters.jev.replay`) checks the
+  stored request against the receipt's signed body before re-sending it, and
+  needs `pip install 'cuecrux-adapters[jev-replay]'` (BLAKE3); without it
+  replay refuses with `ImportError`.
 
 A receipt shows what was asked, of which model version, on what evidence, and
 what came back, **as the calling process reported it**: the daemon never talks

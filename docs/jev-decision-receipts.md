@@ -49,7 +49,9 @@ Every hash is `digest(value)`, which is exactly:
   escapes. Strings get only JSON's mandatory escapes: `\"`, `\\`, `\b`, `\f`,
   `\n`, `\r`, `\t`, and `\u00XX` (lower-case hex) for other control
   characters below U+0020. `/` and U+007F are not escaped.
-- **Numbers:** integers in plain decimal, any size. Floats as Python's
+- **Numbers:** integers in plain decimal, up to Python's integer-string
+  limit (4300 digits by default, `sys.set_int_max_str_digits`); a longer
+  integer is refused (`ValueError`) rather than hashed. Floats as Python's
   `repr`: shortest round-trip digits, always with a `.` or exponent (`1.0`,
   `0.1`, `2e-05`, `1e+16`, `-0.0`), exponent form when the exponent is below
   -4 or at least 16. `1` and `1.0` hash differently. NaN and infinities are
@@ -317,8 +319,12 @@ may already have run the call, and billed it. To use the official
 
 ## Replaying a decision against a new model version
 
-Opt in per decision with `store_state=True`; `replay` then re-sends the exact
-stored request and shows whether the verdict moved:
+Opt in per decision with `store_state=True`; `replay` then re-sends the
+stored request -- exactly its `model`, `state` and `questions`, the fields the
+receipt covers -- and shows whether the verdict moved. It needs BLAKE3, which
+the standard library lacks: `pip install 'cuecrux-adapters[jev-replay]'`
+(the `blake3` package). Without it `replay` raises `ImportError` before it
+reads anything, rather than skip the check.
 
 ```python
 from crux_adapters.jev import TamperedRequest, decide, replay
@@ -341,11 +347,14 @@ can write facts could rewrite both facts to agree with each other):
 2. The daemon reports that receipt's signature valid
    (`GET /v1/receipts/{id}/verification`: `signature_valid` and
    `error_code: OK`).
-3. The signed body is read from `GET /v1/observations/aggregate?kind=model_invocation`
-   (the record must be the only one claiming that receipt id, and its
-   `body_hash` must be the payload hash the daemon just verified), and its
-   CBOR is decoded by a strict decoder in `crux_adapters.jev`. The unsigned
-   hashes listed next to the body are ignored.
+3. The signed body is read from `GET /v1/observations/aggregate?kind=model_invocation`.
+   Anyone with `sessions:write` can add records to that listing, so nothing
+   in a listed record is taken on trust: `replay` hashes each candidate's
+   `body_cbor_hex` bytes with BLAKE3 itself and uses the one that equals the
+   `payload_hash` the daemon just verified (other records claiming the same
+   receipt id are ignored; if none match, `TamperedRequest`). Its CBOR is
+   decoded by a strict decoder in `crux_adapters.jev`. The listed `body_hash`
+   and the unsigned hashes next to the body are ignored.
 4. From that decoded body: `prompt_hash` must equal the stored
    `{state, questions}` re-hashed, `model_id` the stored request's model,
    `provider_request_id` (or `invocation_id` when Jev sent none) the request id

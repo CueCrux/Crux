@@ -22,6 +22,9 @@ crewai = ["crewai>=0.80"]
 # crux_adapters.jev_langchain: receipts for Jev calls made by langchain-typesafe
 # (TypeSafeClassifier and its agent middleware). Alpha upstream; tested on 0.0.1a3.
 jev-langchain = ["langchain-typesafe[experimental]>=0.0.1a3,<0.0.2"]
+# crux_adapters.jev.replay: checks the signed receipt body's BLAKE3 against the
+# daemon-verified payload hash (hashlib has no BLAKE3). Without it replay refuses.
+jev-replay = ["blake3>=0.4,<2"]
 
 [project.urls]
 Homepage = "https://github.com/CueCrux/Crux"
