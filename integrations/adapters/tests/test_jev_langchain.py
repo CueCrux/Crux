@@ -18,6 +18,7 @@ import os
 import sys
 import unittest
 import uuid
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -254,6 +255,18 @@ class ClassifierDecisions(unittest.TestCase):
 
 @unittest.skipIf(JevReceiptHandler is None, "langchain-typesafe[experimental] not installed")
 @unittest.skipUnless(os.environ.get("CRUX_FIXTURE_URL"), "CRUX_FIXTURE_URL not set")
+
+class PythonVersionWarning(unittest.TestCase):
+    def test_warns_on_python_310_only(self):
+        daemon = FakeDaemon()
+        with mock.patch.object(sys, "version_info", (3, 10, 20)):
+            with self.assertWarns(RuntimeWarning):
+                JevReceiptHandler(daemon.client(), entity="e")
+        with mock.patch.object(sys, "version_info", (3, 12, 0)):
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                JevReceiptHandler(daemon.client(), entity="e")
+
 class FixtureDaemon(unittest.TestCase):
     def test_signed_body_has_no_retrieval_set_hash(self) -> None:
         from cuecrux_client import CueCruxClient

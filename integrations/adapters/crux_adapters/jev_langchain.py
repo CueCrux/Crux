@@ -35,6 +35,8 @@ Install with the extra::
 
 from __future__ import annotations
 
+import sys
+import warnings
 from typing import Any
 from uuid import UUID
 
@@ -64,6 +66,14 @@ class JevReceiptHandler(BaseCallbackHandler):
     ``False`` to log recording failures and carry on."""
 
     def __init__(self, client: Any, *, entity: str) -> None:
+        if sys.version_info < (3, 11):
+            warnings.warn(
+                "JevReceiptHandler on Python 3.10: async agent runs (middleware "
+                "ainvoke without config) do not reach callbacks, so those Jev "
+                "decisions are NOT recorded. Use Python >=3.11 or sync runs.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         self.client = client
         self.entity = entity
         self._pending: dict[UUID, tuple[str, Any, str, str]] = {}
