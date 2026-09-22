@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`coord_announce` no longer accepts a spoofed `by_passport`.** An unbound
+  session could announce an intent under any passport it named, planting focus
+  claims and overlap warnings attributed to another principal. On an unbound
+  session, `POST /v1/coord/announce` now answers 403 unless `by_passport` names
+  the caller's own authenticated passport. An `admin:write` caller acting for
+  another passport goes through the existing `X-Corecrux-Passport-Id` override.
+  A session binding is still authoritative (custody/coord review D5).
+
 ### Fixed
 
 - **One tenant erasure could wedge every write on the shard.** `forget-tenants`
