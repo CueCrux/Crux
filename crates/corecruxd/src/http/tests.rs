@@ -4385,6 +4385,9 @@ fn query_params(query: &str, token_budget: Option<usize>) -> QueryFactsParams {
 
 #[tokio::test]
 async fn query_facts_unmatched_topic_search_is_an_honest_miss_not_recency_filler() {
+    // Serialised with the flag-off test, which flips the floor env var
+    // process-wide; unlocked, this test can read the floor as disabled.
+    let _guard = crux_mcp::test_env_lock().lock().await;
     let state = match_floor_state().await;
     // Shares one incidental term ("status") with two stored facts, so the
     // pre-M1 OR-filter admitted them and ranked them by recency.
@@ -4407,6 +4410,9 @@ async fn query_facts_unmatched_topic_search_is_an_honest_miss_not_recency_filler
 
 #[tokio::test]
 async fn query_facts_relevant_topic_search_still_answers_and_is_labelled() {
+    // Serialised with the flag-off test, which flips the floor env var
+    // process-wide; unlocked, this test can read the floor as disabled.
+    let _guard = crux_mcp::test_env_lock().lock().await;
     let state = match_floor_state().await;
     let resp = facts::query_facts(
         State(state),
@@ -4426,6 +4432,9 @@ async fn query_facts_relevant_topic_search_still_answers_and_is_labelled() {
 
 #[tokio::test]
 async fn query_facts_entity_lookups_are_exempt_from_the_floor() {
+    // Serialised with the flag-off test, which flips the floor env var
+    // process-wide; unlocked, this test can read the floor as disabled.
+    let _guard = crux_mcp::test_env_lock().lock().await;
     let state = match_floor_state().await;
     // An address-shaped free-text query: the shape that already scored 1.00.
     let resp = facts::query_facts(
@@ -4475,6 +4484,9 @@ async fn query_facts_match_floor_flag_off_restores_the_pre_m1_path() {
 
 #[tokio::test]
 async fn query_facts_token_budget_governs_the_whole_http_response() {
+    // Serialised with the flag-off test, which flips the floor env var
+    // process-wide; unlocked, this test can read the floor as disabled.
+    let _guard = crux_mcp::test_env_lock().lock().await;
     let state = match_floor_state().await;
     for budget in [300usize, 600, 4000] {
         let resp = facts::query_facts(
