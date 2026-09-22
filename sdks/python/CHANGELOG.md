@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.0 — 2026-09-22
+
+- Add `post_mediation_receipt(draft)` to both clients: `POST
+  /v1/mediation/receipts`, which mints a signed receipt from a draft
+  (`model_invocation` and the other stream kinds need
+  `CORECRUXD_STREAM_RECEIPTS=1` on the daemon). Callers no longer have to
+  reach for the private `_request`.
+- Add `verify_receipt(receipt_id, tenant_id=...)` to both clients:
+  `GET /v1/receipts/{id}/verification`. `tenant_id` is required, as it is
+  daemon-side; stream-kind receipts are minted under `"local"`.
+- Fix: `query_facts(..., token_budget=...)` raised `KeyError: 'value'` once
+  the result crossed the budget's hydration boundary, because the daemon drops
+  `value` from those rows and sets `value_omitted: true`. `Fact.value` is now
+  `None` on such rows and the new `Fact.value_omitted` flag says why.
+
+0.3.0 was never tagged or published to PyPI (the last `sdk-python-v*` tag is
+0.2.0), so 0.4.0 is the first `cuecrux-client` release and carries the 0.3.0
+rename below as well — the same path `@cuecrux/client` took to its 0.4.0.
+
 ## 0.3.0 — 2026-08-08
 
 **Renamed.** This package was published as `corecrux-client` through 0.2.0.

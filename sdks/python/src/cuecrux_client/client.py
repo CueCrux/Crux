@@ -125,7 +125,8 @@ def _to_fact(d: dict[str, Any]) -> Fact:
         fact_id=d["fact_id"],
         entity=d["entity"],
         key=d["key"],
-        value=d["value"],
+        # Absent (with value_omitted) on rows past a token_budget's hydration boundary.
+        value=d.get("value"),
         confidence=d["confidence"],
         stored_at=d["stored_at"],
         tokens=d["tokens"],
@@ -134,6 +135,7 @@ def _to_fact(d: dict[str, Any]) -> Fact:
         source_receipt=d.get("source_receipt"),
         supersedes=d.get("supersedes"),
         private=d.get("private", False),
+        value_omitted=d.get("value_omitted", False),
     )
 
 
@@ -681,6 +683,32 @@ class CueCruxClient:
                 dry_run=dry_run,
                 principal_map=principal_map,
             ),
+        )
+
+    # -- receipts --
+
+    def post_mediation_receipt(self, draft: dict[str, Any]) -> dict[str, Any]:
+        """POST /v1/mediation/receipts -- mint a signed receipt from a draft.
+
+        ``draft["kind"]`` picks the receipt. ``model_invocation``,
+        ``context_injected``, ``stream_completed`` and ``stream_aborted``
+        drafts need ``CORECRUXD_STREAM_RECEIPTS=1`` (``usage_ping`` needs
+        ``CORECRUXD_FEATURE_USAGE_RECEIPTS=1``); with the flag off they fall
+        through to the tool-call receipt parse and are rejected (422). Returns
+        the daemon's JSON: ``receipt_id``, ``body_hash``, ``signature_hex``, ...
+        """
+        return self._request("POST", "/v1/mediation/receipts", json=draft)
+
+    def verify_receipt(self, receipt_id: str, *, tenant_id: str) -> dict[str, Any]:
+        """GET /v1/receipts/{receiptId}/verification -- check a receipt's signature.
+
+        ``tenant_id`` is required by the daemon and must be one the token is
+        authorized for; stream-kind receipts (``model_invocation`` and the
+        rest) are minted under ``"local"``. The report carries ``signature_valid`` and
+        ``error_code`` (``"OK"`` when it verifies).
+        """
+        return self._request(
+            "GET", f"/v1/receipts/{receipt_id}/verification", params={"tenant_id": tenant_id}
         )
 
     # -- extensions --
@@ -1290,6 +1318,32 @@ class AsyncCueCruxClient:
                 dry_run=dry_run,
                 principal_map=principal_map,
             ),
+        )
+
+    # -- receipts --
+
+    async def post_mediation_receipt(self, draft: dict[str, Any]) -> dict[str, Any]:
+        """POST /v1/mediation/receipts -- mint a signed receipt from a draft.
+
+        ``draft["kind"]`` picks the receipt. ``model_invocation``,
+        ``context_injected``, ``stream_completed`` and ``stream_aborted``
+        drafts need ``CORECRUXD_STREAM_RECEIPTS=1`` (``usage_ping`` needs
+        ``CORECRUXD_FEATURE_USAGE_RECEIPTS=1``); with the flag off they fall
+        through to the tool-call receipt parse and are rejected (422). Returns
+        the daemon's JSON: ``receipt_id``, ``body_hash``, ``signature_hex``, ...
+        """
+        return await self._request("POST", "/v1/mediation/receipts", json=draft)
+
+    async def verify_receipt(self, receipt_id: str, *, tenant_id: str) -> dict[str, Any]:
+        """GET /v1/receipts/{receiptId}/verification -- check a receipt's signature.
+
+        ``tenant_id`` is required by the daemon and must be one the token is
+        authorized for; stream-kind receipts (``model_invocation`` and the
+        rest) are minted under ``"local"``. The report carries ``signature_valid`` and
+        ``error_code`` (``"OK"`` when it verifies).
+        """
+        return await self._request(
+            "GET", f"/v1/receipts/{receipt_id}/verification", params={"tenant_id": tenant_id}
         )
 
     # -- extensions --

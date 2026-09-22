@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cuecrux-client"
-version = "0.3.0"
+version = "0.4.0"
 description = "Python client for Crux Daemon"
 readme = "README.md"
 license = "Apache-2.0"

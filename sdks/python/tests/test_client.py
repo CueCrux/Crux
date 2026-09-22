@@ -95,6 +95,23 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        if path == "/v1/facts" and call["method"] == "GET":
+            # Two rows, the second past the token_budget's hydration boundary:
+            # the daemon drops `value` and flags it (`http_fact_rows`,
+            # crates/corecruxd/src/http/facts.rs).
+            row = {"fact_id": "f_1", "entity": "e", "key": "k", "value": "v", "confidence": 1.0,
+                   "stored_at": "2026-09-22T00:00:00Z", "tokens": 3, "deleted": False, "version": 1}
+            trimmed = {k: v for k, v in row.items() if k != "value"}
+            body = json.dumps(
+                {"facts": [row, {**trimmed, "fact_id": "f_2", "value_omitted": True}], "total_tokens": 3}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if path == "/v1/context" and "render=markdown" in query:
             body = b"# Crux context\n"
             self.send_response(200)
@@ -265,6 +282,27 @@ class WireShapeTest(unittest.TestCase):
         call = self.assertCall("POST", "/v1/memory/import")
         self.assertEqual(call["body"], {"tenant_id": "tenant", "pack": {"manifest": {}}, "dry_run": True})
 
+    # -- facts --
+
+    def test_query_facts_tolerates_a_budget_omitted_value(self) -> None:
+        result = self.client.query_facts(entity="e", token_budget=500)
+        self.assertEqual(self.assertCall("GET", "/v1/facts")["query"], "entity=e&token_budget=500")
+        full, omitted = result.facts
+        self.assertEqual((full.value, full.value_omitted), ("v", False))
+        self.assertEqual((omitted.fact_id, omitted.value, omitted.value_omitted), ("f_2", None, True))
+
+    # -- receipts --
+
+    def test_verify_receipt_passes_the_tenant(self) -> None:
+        self.client.verify_receipt("r_1", tenant_id="local")
+        self.assertEqual(self.assertCall("GET", "/v1/receipts/r_1/verification")["query"], "tenant_id=local")
+
+    def test_post_mediation_receipt_sends_the_draft_untouched(self) -> None:
+        draft = {"kind": "model_invocation", "invocation_id": "i_1", "prompt_hash": "sha256:ab", "model_version": None}
+        self.client.post_mediation_receipt(draft)
+        # Posted as-is: an explicit null stays null rather than being dropped.
+        self.assertEqual(self.assertCall("POST", "/v1/mediation/receipts")["body"], draft)
+
     # -- extensions --
 
     def test_extension_routes(self) -> None:
@@ -379,6 +417,9 @@ class AsyncParityTest(unittest.TestCase):
                 await client.undo_consolidation("f_canon")
                 await client.local_ingest("t", "c", [])
                 await client.import_memory_pack("t", {}, dry_run=True)
+                await client.post_mediation_receipt({"kind": "model_invocation"})
+                await client.verify_receipt("r_1", tenant_id="local")
+                self.assertTrue((await client.query_facts(entity="e", token_budget=5)).facts[1].value_omitted)
                 await client.list_extensions()
                 self.assertIsNone(await client.get_extension("missing"))
                 self.assertFalse(await client.delete_extension("missing"))
@@ -397,6 +438,8 @@ class AsyncParityTest(unittest.TestCase):
         self.assertIn(("POST", "/v1/console/review/consolidations/undo"), seen)
         self.assertIn(("POST", "/v1/local/ingest"), seen)
         self.assertIn(("POST", "/v1/memory/import"), seen)
+        self.assertIn(("POST", "/v1/mediation/receipts"), seen)
+        self.assertIn(("GET", "/v1/receipts/r_1/verification"), seen)
         self.assertIn(("POST", "/v1/extensions/ext-1/tools/search/invoke"), seen)
         self.assertIn(("GET", "/v1/events/stream"), seen)
 

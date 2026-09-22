@@ -17,7 +17,8 @@ class Fact:
     fact_id: str
     entity: str
     key: str
-    value: str
+    value: str | None
+    """``None`` only when ``value_omitted``."""
     confidence: float
     stored_at: str
     tokens: int
@@ -26,6 +27,9 @@ class Fact:
     source_receipt: str | None = None
     supersedes: str | None = None
     private: bool = False
+    value_omitted: bool = False
+    """The row fell past a ``token_budget``'s hydration boundary: the daemon
+    dropped ``value`` but kept the row addressable. Fetch it with ``get_fact``."""
 
 
 @dataclass
