@@ -18,12 +18,13 @@ use corecrux_receipts::{
     coverage_window_report_canonical_json_v1, encode_cose_sign1_v1, extract_linked_receipts_v1,
     seal_crypto_shred_payload_v1, update_subject_index_v1, verify_chain_reanchor_body_v1, verify_cose_sign1,
     verify_coverage_window_body_v1, verify_external_anchor_body_v1, verify_rfc3161_timestamp_token_binding_v1,
-    verify_rfc3161_timestamp_token_strict_v1, ChainReanchorBodyInputV1, CoverageAttestationBodyInputV1,
-    CoverageWindowBodyInputV1, CoverageWindowCountsV1, CoverageWindowReportV1, CrownReceiptV1,
-    CryptoShredDestroyMarkerInputV1, CryptoShredSealInputV1, Ed25519KeyEntryV1, Ed25519KeyRingV1,
+    verify_rfc3161_timestamp_token_strict_v1, verify_stream_receipt_payload_v1, ChainReanchorBodyInputV1,
+    CoverageAttestationBodyInputV1, CoverageWindowBodyInputV1, CoverageWindowCountsV1, CoverageWindowReportV1,
+    CrownReceiptV1, CryptoShredDestroyMarkerInputV1, CryptoShredSealInputV1, Ed25519KeyEntryV1, Ed25519KeyRingV1,
     ExternalAnchorBodyInputV1, ReceiptSigV1, RedactionReceiptBodyInputV1, Rfc3161StrictValidationOptionsV1,
-    Rfc3161StrictValidationReportV1, Rfc3161TimestampBodyInputV1, CONTENT_TYPE_RECEIPT_BODY_V1,
-    CONTENT_TYPE_RECEIPT_SIG_V1, EVT_RECEIPT_BODY_V1, EVT_RECEIPT_SIG_V1, STREAM_TYPE_RECEIPT,
+    Rfc3161StrictValidationReportV1, Rfc3161TimestampBodyInputV1, VerifiedStreamReceiptPayloadV1,
+    CONTENT_TYPE_RECEIPT_BODY_V1, CONTENT_TYPE_RECEIPT_SIG_V1, EVT_RECEIPT_BODY_V1, EVT_RECEIPT_SIG_V1,
+    STREAM_TYPE_RECEIPT,
 };
 use corecrux_segment::decode_frame_v1;
 use corecrux_storage::{AppendEventInput, ShardStorage, ShardStorageOptions};
@@ -131,6 +132,31 @@ pub fn verify_cose_file_v1(
         public_key_b64: base64::engine::general_purpose::STANDARD.encode(verifying_key.as_bytes()),
         development_key,
     })
+}
+
+/// Verify a daemon stream receipt (`model_invocation`, `context_injected`,
+/// `stream_completed`, `stream_aborted`) offline. `input` is one observation
+/// record (e.g. an element of `/v1/observations/aggregate` `observations[]`)
+/// or its bare `payload`; `keyring_path` is a pinned `Ed25519KeyRingV1` JSON
+/// (`{"v":1,"keys":[{"keyId":<passport fpr>,"pubKeyBase64":...}]}`). This
+/// checks the daemon's own signature; unlike `export-cose` nothing is
+/// re-signed and no key is read from the input.
+pub fn verify_stream_receipt_file_v1(
+    input: &Path,
+    keyring_path: &Path,
+    tenant_id: &str,
+) -> Result<VerifiedStreamReceiptPayloadV1, Box<dyn std::error::Error + Send + Sync>> {
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(input)?)?;
+    let payload = value.get("payload").unwrap_or(&value);
+    let keyring = Ed25519KeyRingV1::parse_json(&std::fs::read_to_string(keyring_path)?)?;
+    let verified_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    Ok(verify_stream_receipt_payload_v1(
+        payload,
+        tenant_id,
+        &keyring,
+        &verified_at,
+        &corecrux_types::build_info(),
+    )?)
 }
 
 fn resolve_cose_signing_key_v1(
@@ -1846,6 +1872,92 @@ fn list_shards(shard_root: &Path) -> Result<Vec<u32>, Box<dyn std::error::Error 
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// End to end over files: an observation record as `/v1/observations/aggregate`
+    /// returns it verifies against the pinned daemon key, and the same record
+    /// with its decision digest rewritten (and body_hash made consistent) fails.
+    #[test]
+    fn verify_stream_receipt_file_accepts_daemon_record_and_rejects_edit() {
+        let daemon = SigningKey::from_bytes(&[7u8; 32]);
+        let record = |output_hash: &str| {
+            let (body, hash) =
+                corecrux_receipts::build_model_invocation_body_v1(&corecrux_receipts::ModelInvocationBodyInputV1 {
+                    tenant_id: "local",
+                    receipt_id: "r_jev_1",
+                    invocation_id: "inv-1",
+                    actor_passport: "operator",
+                    provider: "typesafe",
+                    model_id: "jev",
+                    model_version: None,
+                    provider_request_id: None,
+                    prompt_hash: "blake3:prompt",
+                    retrieval_set_hash: None,
+                    output_hash: Some(output_hash),
+                    temperature: None,
+                    top_p: None,
+                    seed: None,
+                    max_tokens: None,
+                    started_at: "2026-09-22T00:00:00Z",
+                    completed_at: None,
+                    created_at: "2026-09-22T00:00:00Z",
+                });
+            let sig = corecrux_receipts::sign_model_invocation_v1(
+                "r_jev_1",
+                &body,
+                hash,
+                &daemon,
+                "fpr-daemon",
+                "2026-09-22T00:00:00Z",
+            );
+            (body, hash, sig)
+        };
+        let (_, _, genuine_sig) = record("blake3:allow");
+        let (edited_body, edited_hash, _) = record("blake3:deny");
+        let write_record = |dir: &Path, body: &[u8], hash: [u8; 32]| {
+            let path = dir.join("record.json");
+            let value = serde_json::json!({
+                "observation_id": "obs-1",
+                "kind": "model_invocation",
+                "payload": {
+                    "receipt_id": "r_jev_1",
+                    "body_cbor_hex": hex::encode(body),
+                    "body_hash": format!("blake3:{}", hex::encode(hash)),
+                    "sig": {
+                        "schema": genuine_sig.schema,
+                        "alg": genuine_sig.alg,
+                        "key_id": genuine_sig.key_id,
+                        "signed_at": genuine_sig.signed_at,
+                        "signature_hex": hex::encode(&genuine_sig.signature),
+                    },
+                },
+            });
+            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            path
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let keyring = dir.path().join("keyring.json");
+        std::fs::write(
+            &keyring,
+            serde_json::json!({"v": 1, "keys": [{
+                "keyId": "fpr-daemon",
+                "pubKeyBase64": base64::engine::general_purpose::STANDARD.encode(daemon.verifying_key().as_bytes()),
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+
+        let (body, hash, _) = record("blake3:allow");
+        let ok = verify_stream_receipt_file_v1(&write_record(dir.path(), &body, hash), &keyring, "local").unwrap();
+        assert!(ok.is_verified(), "{:?}", ok.report);
+        assert_eq!(ok.kind.as_deref(), Some("model_invocation"));
+
+        let edited =
+            verify_stream_receipt_file_v1(&write_record(dir.path(), &edited_body, edited_hash), &keyring, "local")
+                .unwrap();
+        assert!(!edited.is_verified());
+        assert_eq!(edited.report.error_code, "SIG_INVALID");
+    }
 
     #[test]
     fn hex32_zero_bytes() {

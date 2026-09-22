@@ -1121,6 +1121,29 @@ typed payload, and CWT subject binding. Legacy canonical-JSON `receipt-hash`
 recomputation and SCITT Transparency Service inclusion verification remain
 separate checks.
 
+`export-cose` covers retrieval receipts only: the profile requires `snap-id`,
+`answer-id`, `fusion`, `retrieval`, `selection`, and `timings`, which
+`model_invocation` and the other stream receipts do not carry, and a COSE
+signature cannot reuse the daemon's signature over the raw body bytes.
+
+## Offline stream-receipt verification
+
+Stream receipts (`model_invocation`, `context_injected`, `stream_completed`,
+`stream_aborted`) are signed by the daemon's passport key over the canonical
+CBOR body bytes. Verify one offline from its observation record (an element of
+`GET /v1/observations/aggregate?kind=model_invocation` `observations[]`, or its
+bare `payload`) against a pinned public keyring:
+
+```bash
+corecruxctl receipts verify-stream-receipt record.json --keyring keyring.json
+```
+
+`keyring.json` is `{"v":1,"keys":[{"keyId":"<passport fingerprint>","pubKeyBase64":"<ed25519 public key>"}]}`.
+The command checks the daemon's own signature (nothing is re-signed and no key
+is read from the record) and exits non-zero unless the signature is valid, the
+body hash matches, and the signed body names the tenant (`--tenant-id`, default
+`local`) and the receipt id.
+
 ## Body Event
 
 The generic receipt body event uses:
@@ -4499,6 +4522,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > here — if you tag a release, you write its entry.
 
 ## [Unreleased]
+
+### Added
+
+- **`corecruxctl receipts verify-stream-receipt`** verifies a daemon stream
+  receipt (`model_invocation`, `context_injected`, `stream_completed`,
+  `stream_aborted`) offline from its observation record against a pinned
+  public keyring, checking the daemon's own signature over the canonical body.
+  Library entry point: `corecrux_receipts::verify_stream_receipt_payload_v1`.
 
 ## [0.5.65] - 2026-09-22
 

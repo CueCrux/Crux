@@ -2223,6 +2223,21 @@ enum ReceiptsCommand {
         pubkey_b64: Option<String>,
     },
 
+    /// Verify a daemon stream receipt (e.g. `model_invocation`) offline against a pinned keyring.
+    /// Checks the daemon's own ed25519 signature over the canonical body; exits non-zero unless
+    /// the signature is valid and the signed body names the tenant and receipt id.
+    #[command(name = "verify-stream-receipt")]
+    VerifyStreamReceipt {
+        /// Observation record JSON (one `/v1/observations/aggregate` entry) or its bare `payload`.
+        input: PathBuf,
+        /// Pinned public keyring JSON: `{"v":1,"keys":[{"keyId","pubKeyBase64"}]}`.
+        #[arg(long)]
+        keyring: PathBuf,
+        /// Tenant the signed body must name (local daemons mint stream receipts under `local`).
+        #[arg(long, default_value = "local")]
+        tenant_id: String,
+    },
+
     /// Seed a minimal receipt body+sig into a shard directory (offline, dev-only).
     #[command(name = "seed-minimal")]
     SeedMinimal {
@@ -3646,6 +3661,24 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     "COSE_Sign1 verification OK: snap-id={} kid={} iss={} dev-key={} file={}",
                     report.snap_id, report.kid, report.issuer, report.development_key, report.input_path
                 );
+                Ok(())
+            }
+            ReceiptsCommand::VerifyStreamReceipt {
+                input,
+                keyring,
+                tenant_id,
+            } => {
+                let verified = receipts::verify_stream_receipt_file_v1(&input, &keyring, &tenant_id)?;
+                println!("{}", serde_json::to_string_pretty(&verified)?);
+                if !verified.is_verified() {
+                    return Err(format!(
+                        "stream receipt NOT verified: error_code={} tenant_bound={} receipt_id_bound={}",
+                        verified.report.error_code,
+                        verified.report.binding.tenant_bound,
+                        verified.report.binding.receipt_id_bound
+                    )
+                    .into());
+                }
                 Ok(())
             }
             ReceiptsCommand::SeedMinimal {
@@ -6389,6 +6422,36 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_receipts_verify_stream_receipt() {
+        let cli = Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "verify-stream-receipt",
+            "/tmp/record.json",
+            "--keyring",
+            "/tmp/keyring.json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Receipts {
+                command:
+                    ReceiptsCommand::VerifyStreamReceipt {
+                        input,
+                        keyring,
+                        tenant_id,
+                    },
+            } => {
+                assert_eq!(input, PathBuf::from("/tmp/record.json"));
+                assert_eq!(keyring, PathBuf::from("/tmp/keyring.json"));
+                assert_eq!(tenant_id, "local");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        // The keyring is the only trust input, so it is mandatory.
+        assert!(Cli::try_parse_from(["corecruxctl", "receipts", "verify-stream-receipt", "/tmp/record.json"]).is_err());
     }
 
     #[test]

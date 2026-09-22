@@ -39,6 +39,29 @@ typed payload, and CWT subject binding. Legacy canonical-JSON `receipt-hash`
 recomputation and SCITT Transparency Service inclusion verification remain
 separate checks.
 
+`export-cose` covers retrieval receipts only: the profile requires `snap-id`,
+`answer-id`, `fusion`, `retrieval`, `selection`, and `timings`, which
+`model_invocation` and the other stream receipts do not carry, and a COSE
+signature cannot reuse the daemon's signature over the raw body bytes.
+
+## Offline stream-receipt verification
+
+Stream receipts (`model_invocation`, `context_injected`, `stream_completed`,
+`stream_aborted`) are signed by the daemon's passport key over the canonical
+CBOR body bytes. Verify one offline from its observation record (an element of
+`GET /v1/observations/aggregate?kind=model_invocation` `observations[]`, or its
+bare `payload`) against a pinned public keyring:
+
+```bash
+corecruxctl receipts verify-stream-receipt record.json --keyring keyring.json
+```
+
+`keyring.json` is `{"v":1,"keys":[{"keyId":"<passport fingerprint>","pubKeyBase64":"<ed25519 public key>"}]}`.
+The command checks the daemon's own signature (nothing is re-signed and no key
+is read from the record) and exits non-zero unless the signature is valid, the
+body hash matches, and the signed body names the tenant (`--tenant-id`, default
+`local`) and the receipt id.
+
 ## Body Event
 
 The generic receipt body event uses:
