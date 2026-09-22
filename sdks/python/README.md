@@ -127,6 +127,7 @@ Methods that naturally return "not found" (`get_fact`, `get_session`, `delete_fa
 | `POST /v1/memory/import` | `import_memory_pack()` | `import_memory_pack()` |
 | `POST /v1/mediation/receipts` | `post_mediation_receipt()` | `post_mediation_receipt()` |
 | `GET /v1/receipts/{id}/verification` | `verify_receipt()` | `verify_receipt()` |
+| `GET /v1/observations/aggregate` | `aggregate_observations()` | `aggregate_observations()` |
 | `GET /v1/extensions` | `list_extensions()` | `list_extensions()` |
 | `GET /v1/extensions/{id}` | `get_extension()` | `get_extension()` |
 | `POST /v1/extensions/register` | `register_extension()` | `register_extension()` |

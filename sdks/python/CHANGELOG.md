@@ -10,6 +10,14 @@
 - Add `verify_receipt(receipt_id, tenant_id=...)` to both clients:
   `GET /v1/receipts/{id}/verification`. `tenant_id` is required, as it is
   daemon-side; stream-kind receipts are minted under `"local"`.
+- Add `aggregate_observations(kind=..., limit=..., ...)` to both clients:
+  `GET /v1/observations/aggregate`, where a daemon without a dataplane serves
+  stream receipts' signed bodies (`payload.body_cbor_hex`).
+- Fix: values interpolated into a URL path (`get_facts_by_entity(entity)`,
+  session, fact, receipt, candidate and extension ids) were sent unencoded, so
+  an entity containing `/` got a 404 and one containing `?`, `#` or `%` quietly
+  read a different entity (usually an empty list). Each is now
+  percent-encoded as a single path segment; the daemon decodes it back.
 - Fix: `query_facts(..., token_budget=...)` raised `KeyError: 'value'` once
   the result crossed the budget's hydration boundary, because the daemon drops
   `value` from those rows and sets `value_omitted: true`. `Fact.value` is now

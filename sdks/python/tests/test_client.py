@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
+import uuid
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,6 +34,12 @@ from cuecrux_client.client import (  # noqa: E402
     _sse_event,
 )
 from cuecrux_client.errors import CueCruxError  # noqa: E402
+from cuecrux_client.types import StoreFact  # noqa: E402
+
+# Every character that breaks an unencoded path: a separator, a query and a
+# fragment start, an escape, a space and a non-ASCII character.
+AWKWARD = "repo:a/b?c=1#d%2F e·"
+AWKWARD_PATH = "repo%3Aa%2Fb%3Fc%3D1%23d%252F%20e%C2%B7"
 
 # Requests the stub server saw, oldest first.
 CALLS: list[dict[str, object]] = []
@@ -291,6 +299,27 @@ class WireShapeTest(unittest.TestCase):
         self.assertEqual((full.value, full.value_omitted), ("v", False))
         self.assertEqual((omitted.fact_id, omitted.value, omitted.value_omitted), ("f_2", None, True))
 
+    # -- path values --
+
+    def test_path_values_are_sent_as_one_encoded_segment(self) -> None:
+        self.client.get_facts_by_entity(AWKWARD)
+        self.assertEqual(self.assertCall("GET", f"/v1/facts/entity/{AWKWARD_PATH}")["query"], "")
+        self.client.reject_candidate(AWKWARD, "dup")
+        self.assertCall("POST", f"/v1/memory/candidates/{AWKWARD_PATH}/reject")
+        self.client.verify_receipt("r/1", tenant_id="local")
+        self.assertCall("GET", "/v1/receipts/r%2F1/verification")
+
+    def test_plain_ids_are_unchanged(self) -> None:
+        self.client.get_facts_by_entity("jev:invoice-42_x.y~z")
+        self.assertCall("GET", "/v1/facts/entity/jev%3Ainvoice-42_x.y~z")
+
+    # -- observations --
+
+    def test_aggregate_observations_sends_only_the_filters_set(self) -> None:
+        self.client.aggregate_observations(kind="model_invocation", limit=1000)
+        call = self.assertCall("GET", "/v1/observations/aggregate")
+        self.assertEqual(sorted(str(call["query"]).split("&")), ["kind=model_invocation", "limit=1000"])
+
     # -- receipts --
 
     def test_verify_receipt_passes_the_tenant(self) -> None:
@@ -419,6 +448,8 @@ class AsyncParityTest(unittest.TestCase):
                 await client.import_memory_pack("t", {}, dry_run=True)
                 await client.post_mediation_receipt({"kind": "model_invocation"})
                 await client.verify_receipt("r_1", tenant_id="local")
+                await client.aggregate_observations(kind="model_invocation")
+                await client.get_facts_by_entity(AWKWARD)
                 self.assertTrue((await client.query_facts(entity="e", token_budget=5)).facts[1].value_omitted)
                 await client.list_extensions()
                 self.assertIsNone(await client.get_extension("missing"))
@@ -440,6 +471,8 @@ class AsyncParityTest(unittest.TestCase):
         self.assertIn(("POST", "/v1/memory/import"), seen)
         self.assertIn(("POST", "/v1/mediation/receipts"), seen)
         self.assertIn(("GET", "/v1/receipts/r_1/verification"), seen)
+        self.assertIn(("GET", "/v1/observations/aggregate"), seen)
+        self.assertIn(("GET", f"/v1/facts/entity/{AWKWARD_PATH}"), seen)
         self.assertIn(("POST", "/v1/extensions/ext-1/tools/search/invoke"), seen)
         self.assertIn(("GET", "/v1/events/stream"), seen)
 
@@ -451,6 +484,22 @@ class AsyncParityTest(unittest.TestCase):
         async_only = surface(AsyncCueCruxClient) - surface(CueCruxClient)
         self.assertEqual(sync_only, set(), "sync client has methods the async client lacks")
         self.assertEqual(async_only, set(), "async client has methods the sync client lacks")
+
+
+@unittest.skipUnless(os.environ.get("CRUX_FIXTURE_URL"), "CRUX_FIXTURE_URL not set")
+class FixtureDaemon(unittest.TestCase):
+    """Against a real daemon: it must decode the segment back to the entity."""
+
+    def test_awkward_entity_round_trips(self) -> None:
+        token_file = os.environ.get("CRUX_TOKEN_FILE")
+        token = Path(token_file).read_text().strip() if token_file else None
+        with CueCruxClient(os.environ["CRUX_FIXTURE_URL"], token=token) as client:
+            entity = f"test-sdk-{uuid.uuid4().hex[:8]}:{AWKWARD}"
+            stored = client.store_fact(StoreFact(entity=entity, key="k", value="v"))
+            (fact,) = client.get_facts_by_entity(entity)
+            self.assertEqual((fact.fact_id, fact.entity), (stored.fact_id, entity))
+            # Control: the prefix before the "/" is a different entity with no facts.
+            self.assertEqual(client.get_facts_by_entity(entity.split("/")[0]), [])
 
 
 if __name__ == "__main__":
