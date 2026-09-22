@@ -11,16 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- **Capability-graph shape metrics on the session handshake.**
-  `vaultcrux_session_capability_graph_edges{origin,tier}` records the number
-  of edges in each issued plan. `vaultcrux_session_excluded_count{origin,reason}`
-  records, for each exclusion reason, the number of capabilities excluded for
-  it. A plan with no exclusions, or one minted with `hide_exclusions`, records
-  no exclusion series. Community Edition's synthesised local passport excludes
-  nothing, so there only the edge histogram emits. (#813)
-
 ## [0.5.65] - 2026-09-22
 
 ### Added
