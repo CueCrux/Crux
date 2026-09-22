@@ -254,8 +254,6 @@ class ClassifierDecisions(unittest.TestCase):
 
 
 @unittest.skipIf(JevReceiptHandler is None, "langchain-typesafe[experimental] not installed")
-@unittest.skipUnless(os.environ.get("CRUX_FIXTURE_URL"), "CRUX_FIXTURE_URL not set")
-
 class PythonVersionWarning(unittest.TestCase):
     def test_warns_on_python_310_only(self):
         daemon = FakeDaemon()
@@ -267,6 +265,9 @@ class PythonVersionWarning(unittest.TestCase):
                 warnings.simplefilter("error")
                 JevReceiptHandler(daemon.client(), entity="e")
 
+
+@unittest.skipIf(JevReceiptHandler is None, "langchain-typesafe[experimental] not installed")
+@unittest.skipUnless(os.environ.get("CRUX_FIXTURE_URL"), "CRUX_FIXTURE_URL not set")
 class FixtureDaemon(unittest.TestCase):
     def test_signed_body_has_no_retrieval_set_hash(self) -> None:
         from cuecrux_client import CueCruxClient
