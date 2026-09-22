@@ -157,6 +157,8 @@ Noul) about a `state` and keeps nothing. `crux_adapters.jev.decide` gives each
 call a record: Crux builds the state, Jev answers, the daemon signs a
 `model_invocation` receipt, and the decision is stored as a fact linked to that
 receipt. Needs `CORECRUXD_STREAM_RECEIPTS=1` and `CORECRUXD_CONTEXT_SURFACE=1`.
+Setup, a runnable guardrail example and receipt verification are in the
+[Jev decision receipts cookbook](../../docs/jev-decision-receipts.md).
 
 ```python
 from crux_adapters.jev import decide
