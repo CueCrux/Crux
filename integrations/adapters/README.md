@@ -181,7 +181,8 @@ decision.answers["block"]["noul"], decision.receipt_id, decision.request_id
   covers the evidence (`[id, digest(text)]` per item) and `output_hash` covers
   `{model, answers}`. Each is sha256 over compact JSON with key order
   preserved, because Jev reads key order too: reordering a Choice's options
-  changes the prompt.
+  changes the prompt. The exact serialiser is in the cookbook's
+  [Canonical hashing](../../docs/jev-decision-receipts.md#canonical-hashing).
 - **Fact**: `jev:<entity>` / `decision:<request_id>`, with `source_receipt`.
   The value holds the answers and the evidence list, so both hashes can be
   recomputed from the fact alone and checked against the signed receipt.
@@ -189,7 +190,11 @@ decision.answers["block"]["noul"], decision.receipt_id, decision.request_id
   raises `DecisionNotRecorded`, and `.decision` still holds the answers.
 
 A receipt shows what was asked, of which model version, on what evidence, and
-what came back. It does not show that the decision was right.
+what came back, **as the calling process reported it**: the daemon never talks
+to Jev, it signs the hashes it is sent, so it vouches for when and by whom a
+decision was recorded, not that Jev produced it (`provider_request_id` is what
+reconciles a receipt with TypeSafe's own logs). It does not show that the
+decision was right.
 
 ## Layout
 

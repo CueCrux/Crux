@@ -113,7 +113,7 @@ class JevReceiptHandler(BaseCallbackHandler):
             invocation_id=str(run_id),
             prompt_hash=prompt_hash,
             retrieval_set_hash=None,  # LangChain built the state, not Crux
-            output_hash=digest({"model": raw["model"], "answers": raw["answers"]}),
+            output_hash="",  # set by _mint
             state=state,
             bundle=None,
             raw=raw,

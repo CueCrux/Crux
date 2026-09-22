@@ -11,7 +11,8 @@
 The daemon needs ``CORECRUXD_STREAM_RECEIPTS=1`` and ``CORECRUXD_CONTEXT_SURFACE=1``.
 The Jev key comes from ``~/.config/typesafe/api_key`` or ``TYPESAFE_API_KEY``.
 With neither, an OFFLINE STUB answers in Jev's place so the Crux half still
-runs; the output says so, and the receipt records model ``offline-stub``.
+runs; the output says so, and the receipt records model and provider
+``offline-stub``.
 See docs/jev-decision-receipts.md.
 """
 
@@ -100,6 +101,7 @@ def main() -> int:
                 token_budget=1000,
                 untrusted=UNTRUSTED,
                 jev=jev or offline_stub,
+                provider="typesafe" if jev else "offline-stub",  # the receipt's label
             )
         except DecisionNotRecorded as err:
             # Jev answered but the record did not land. A guardrail fails closed.

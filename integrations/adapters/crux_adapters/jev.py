@@ -23,28 +23,39 @@ nothing. :func:`decide` wraps one call so the decision leaves a record:
    fact alone and compared with the signed receipt.
 
 A receipt records what was asked, of which model, on what evidence, and what
-came back. It does not show the decision was right, or that anyone acted on it.
+came back -- as this process reported it: the daemon never talks to Jev, it
+signs the hashes the caller sends. It does not show the decision was right, or
+that anyone acted on it.
 
 **Replay** is opt-in. ``decide(..., store_state=True)`` also stores the exact
 Jev request as ``__jev__::<entity>`` / ``request:<request_id>``, linked to the
 same receipt; :func:`replay` re-sends it (to a newer model if asked) after
-checking it still hashes to the receipt's ``prompt_hash``. HTTP fact writes
-cannot be private (``private=true`` is MCP-only), so that fact is an ordinary
-one: it holds ``untrusted_input`` verbatim, anyone who can read the tenant's
-facts can read it, and it is push-eligible on sync. The ``__`` namespace keeps
-it out of undirected ``/v1/context`` recall, so a later :func:`decide` cannot
-pull the stored untrusted input back in as ``trusted_context``.
+checking it against the receipt's *signed* body -- see :func:`replay` for
+exactly what is checked and what is still trusted. HTTP fact writes cannot be
+private (``private=true`` is MCP-only), so that fact is an ordinary one: it
+holds ``untrusted_input`` verbatim, anyone who can read the tenant's facts can
+read it, and it is push-eligible on sync. The ``__`` namespace keeps it out of
+undirected ``/v1/context`` recall, so a later :func:`decide` cannot pull the
+stored untrusted input back in as ``trusted_context``.
 
-Every hash is :func:`digest`: sha256 over compact UTF-8 JSON with key order
-**preserved**. Key order is part of what Jev reads -- a Choice's option order
-included -- so reordering options is a different prompt and hashes differently.
+Every hash is :func:`digest`: ``sha256`` over ``json.dumps(value,
+ensure_ascii=False, separators=(",", ":"), allow_nan=False)`` encoded as UTF-8.
+Key order is **preserved**, not sorted (so this is not RFC 8785 / JCS): key
+order is part of what Jev reads -- a Choice's option order included -- so
+reordering options is a different prompt and hashes differently. A text
+evidence digest is therefore over the JSON string literal, quotes and escapes
+included, not the raw text. The cookbook's "Canonical hashing" section says
+what a non-Python verifier must reproduce.
 """
 
 from __future__ import annotations
 
+import email.utils
 import hashlib
 import json
+import math
 import os
+import struct
 import time
 import uuid
 from collections.abc import Callable, Iterable
@@ -74,34 +85,72 @@ __all__ = [
 JevCaller = Callable[[dict[str, Any]], tuple[dict[str, Any], str | None]]
 
 
+def _json(value: Any) -> str:
+    """The one serialiser: what is hashed, sent to Jev and stored. Key order kept."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
 def digest(value: Any) -> str:
-    """``sha256:<hex>`` over compact UTF-8 JSON, key order preserved."""
-    raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    """``sha256:<hex>`` over compact UTF-8 JSON, key order preserved.
+
+    Exactly ``sha256(json.dumps(value, ensure_ascii=False, separators=(",", ":"),
+    allow_nan=False).encode("utf-8"))``. NaN and infinities raise ``ValueError``.
+    """
+    return "sha256:" + hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
 
 
 def evidence(items: Iterable[ContextItem]) -> list[list[str]]:
     """``[[item id, digest(text)], ...]`` in bundle order: the retrieval set.
 
     Fact ids are version-specific, and the text digest pins aux items (session
-    state, dossier) whose ids are not.
+    state, dossier) whose ids are not. ``digest(text)`` hashes the JSON string
+    literal (``"..."``, escapes included), not the raw text.
     """
     return [[item.id, digest(item.text)] for item in items]
 
 
 _ATTEMPTS = 3
+_MAX_WAIT = 60.0
+# The request was not processed: rate-limited (429), overloaded (529),
+# unavailable (503) or never fully received (408). A 500, 502 or 504 may come
+# after Jev ran, and the call is paid, so those are not retried.
+_RETRYABLE = frozenset({408, 429, 503, 529})
 
 
-def _retry_delay(resp: httpx.Response, attempt: int) -> float:
-    """``retry-after-ms`` or ``Retry-After`` (seconds) when sane, else 0.5s, 1s, ..."""
-    for header, scale in (("retry-after-ms", 0.001), ("retry-after", 1.0)):
-        try:
-            wait = float(resp.headers[header]) * scale
-        except (KeyError, ValueError):
-            continue  # absent, or an HTTP-date: fall back to backoff
-        if 0 <= wait <= 60:
+def _asked_wait(headers: httpx.Headers) -> float | None:
+    """Seconds ``retry-after-ms`` / ``Retry-After`` ask for; ``None`` if absent or unusable.
+
+    ``Retry-After`` is delay-seconds (ASCII digits) or an HTTP-date (a past date
+    means now). Negative, non-finite and unparseable values are ignored.
+    """
+    try:
+        wait = float(headers["retry-after-ms"]) / 1000
+        if math.isfinite(wait) and wait >= 0:
             return wait
-    return min(8.0, 0.5 * 2 ** (attempt - 1))
+    except (KeyError, ValueError):
+        pass
+    value = headers.get("retry-after", "").strip()
+    if value.isascii() and value.isdigit():
+        return float(value)  # a huge value becomes inf, which is > 60: stop
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if when.tzinfo is None:  # "-0000": UTC, per RFC 5322
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
+def _retry_delay(resp: httpx.Response, attempt: int) -> float | None:
+    """How long to wait before retrying ``resp``, or ``None``: do not retry.
+
+    What the server asks, up to 60s; asked for longer, give up now rather than
+    retry early. Asked nothing usable: 0.5s, 1s, ... capped at 8s.
+    """
+    wait = _asked_wait(resp.headers)
+    if wait is None:
+        return min(8.0, 0.5 * 2 ** (attempt - 1))
+    return wait if wait <= _MAX_WAIT else None
 
 
 def jev_http(
@@ -117,13 +166,18 @@ def jev_http(
     ``TYPESAFE_BASE_URL``, the official SDK's variables. The request id comes
     from the ``x-typesafe-request-id`` response header.
 
-    408, 429 and 5xx (529 included) are retried, up to three attempts in all,
-    waiting what ``retry-after-ms`` / ``Retry-After`` asks (up to 60s) or else
-    backing off exponentially. Other errors (401, 403, 422, ...) are never
-    retried. A final failure raises ``httpx.HTTPStatusError``.
+    Only statuses that mean the request was not processed are retried -- 408,
+    429, 503 and 529 -- up to three attempts in all, waiting what
+    ``retry-after-ms`` / ``Retry-After`` asks (delay-seconds or HTTP-date) or
+    else backing off exponentially. A server asking for more than 60s is not
+    retried at all. 500, 502, 504, transport errors and timeouts are never
+    retried: Jev may already have run the call, and billed it. Nor are other
+    4xx. A final failure raises ``httpx.HTTPStatusError``.
+
+    The body is sent as :func:`digest`'s serialisation, so the bytes on the
+    wire are the bytes hashed and stored, whatever the ``httpx`` version.
     """
-    # ponytail: transport errors are not retried (a timed-out POST may have
-    # been billed); no jitter. Inject a typesafe-sdk-backed caller for more.
+    # ponytail: no jitter. Inject a typesafe-sdk-backed caller for more.
     key = (api_key if api_key is not None else os.environ.get("TYPESAFE_API_KEY", "")).strip()
     if not key:
         raise ValueError("no Jev API key: pass api_key or set TYPESAFE_API_KEY")
@@ -134,13 +188,17 @@ def jev_http(
         attempt = 1
         while True:
             resp = (http or httpx).post(
-                url, json=body, headers={"Authorization": f"Bearer {key}"}, timeout=30.0
+                url,
+                content=_json(body).encode("utf-8"),
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                timeout=30.0,
             )
-            code = resp.status_code
-            if attempt < _ATTEMPTS and (code in (408, 429) or code >= 500):
-                sleep(_retry_delay(resp, attempt))
-                attempt += 1
-                continue
+            if attempt < _ATTEMPTS and resp.status_code in _RETRYABLE:
+                delay = _retry_delay(resp, attempt)
+                if delay is not None:
+                    sleep(delay)
+                    attempt += 1
+                    continue
             resp.raise_for_status()
             return resp.json(), resp.headers.get("x-typesafe-request-id")
 
@@ -191,13 +249,32 @@ def _now() -> str:
 
 
 def _mint(
-    client: Any, decision: JevDecision, model: str, started_at: str, completed_at: str
+    client: Any,
+    decision: JevDecision,
+    model: str,
+    started_at: str,
+    completed_at: str,
+    provider: str = "typesafe",
 ) -> JevDecision:
-    """Sign ``decision`` as a ``model_invocation`` receipt; set ``receipt_id``."""
+    """Hash Jev's output and sign ``decision`` as a ``model_invocation`` receipt.
+
+    Sets ``output_hash`` and ``receipt_id``. Jev has answered, and been paid, by
+    now, so answers that cannot be hashed (NaN, infinity) raise
+    :class:`DecisionNotRecorded` with the answers kept, like any other failure
+    to record.
+    """
+    try:
+        output_hash = digest({"model": decision.model_version, "answers": decision.answers})
+    except ValueError as err:
+        raise DecisionNotRecorded(
+            f"Jev answered but its answers cannot be hashed ({err}); nothing was recorded",
+            decision,
+        ) from err
+    decision = replace(decision, output_hash=output_hash)
     draft = {
         "kind": "model_invocation",
         "invocation_id": decision.invocation_id,
-        "provider": "typesafe",
+        "provider": provider,
         "model_id": model,
         "model_version": decision.model_version,
         "provider_request_id": decision.request_id,
@@ -238,7 +315,7 @@ def _store_decision(
             StoreFact(
                 entity=f"jev:{entity}",
                 key=f"decision:{decision.request_id or decision.invocation_id}",
-                value=json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+                value=_json(record),
                 source_receipt=decision.receipt_id,
             )
         )
@@ -261,6 +338,7 @@ def decide(
     jev: JevCaller | None = None,
     model: str = "jev-latest",
     store_state: bool = False,
+    provider: str = "typesafe",
 ) -> JevDecision:
     """Build state from Crux, ask Jev, sign a receipt, store the decision.
 
@@ -272,10 +350,12 @@ def decide(
     ``jev`` defaults to :func:`jev_http` with the environment's key.
     ``store_state=True`` also stores the exact request for :func:`replay` --
     ``untrusted`` included, in an ordinary (not private) fact; see the module
-    docstring before turning it on.
+    docstring before turning it on. ``provider`` is the receipt's provider
+    label: set it when ``jev`` is not TypeSafe's Jev (a stub, a proxy).
 
-    Retrieval and Jev errors propagate before anything is recorded. A receipt
-    or fact failure after Jev answered raises :class:`DecisionNotRecorded`.
+    Retrieval and Jev errors propagate before anything is recorded. After Jev
+    answered, any failure to record -- receipt, fact, or answers that cannot
+    be hashed -- raises :class:`DecisionNotRecorded`.
     """
     call = jev or jev_http()  # a missing key fails before any request
     bundle = fetch_bundle(client, entity=entity, query=crux_query, token_budget=token_budget)
@@ -300,13 +380,13 @@ def decide(
         invocation_id=str(uuid.uuid4()),
         prompt_hash=prompt_hash,
         retrieval_set_hash=digest(retrieved),
-        output_hash=digest({"model": model_version, "answers": answers}),
+        output_hash="",  # set by _mint
         state=state,
         bundle=bundle,
         raw=raw,
     )
 
-    decision = _mint(client, decision, model, started_at, completed_at)
+    decision = _mint(client, decision, model, started_at, completed_at, provider)
     ref = request_id or decision.invocation_id
 
     if store_state:
@@ -315,7 +395,7 @@ def decide(
                 StoreFact(
                     entity=f"__jev__::{entity}",
                     key=f"request:{ref}",
-                    value=json.dumps(request, ensure_ascii=False, separators=(",", ":")),
+                    value=_json(request),
                     source_receipt=decision.receipt_id,
                 )
             )
@@ -331,7 +411,7 @@ def decide(
 
 
 class TamperedRequest(Exception):
-    """A stored Jev request no longer matches the decision it was stored with."""
+    """A stored Jev request, or its decision, no longer matches the signed receipt."""
 
 
 @dataclass(frozen=True)
@@ -356,6 +436,117 @@ def _latest_fact(client: Any, entity: str, key: str) -> Any:
     return max(found, key=lambda f: f.version)
 
 
+_CBOR_MAX_DEPTH = 16
+_CBOR_FLOATS = {2: ">e", 4: ">f", 8: ">d"}
+
+
+def _cbor_item(data: bytes, pos: int, depth: int) -> tuple[Any, int]:
+    """The CBOR item at ``pos`` and the position after it. See :func:`_cbor_decode`."""
+    if depth > _CBOR_MAX_DEPTH:
+        raise ValueError("CBOR nested too deep")
+    if pos >= len(data):
+        raise ValueError("CBOR truncated")
+    major, info = data[pos] >> 5, data[pos] & 0x1F
+    pos += 1
+    if info > 27:
+        raise ValueError(f"CBOR additional info {info} (indefinite length or reserved)")
+    size = 0 if info < 24 else 1 << (info - 24)
+    if size > len(data) - pos:
+        raise ValueError("CBOR truncated")
+    raw, pos = data[pos : pos + size], pos + size
+    arg = int.from_bytes(raw, "big") if size else info
+    if major == 0:
+        return arg, pos
+    if major == 1:
+        return -1 - arg, pos
+    if major in (2, 3):
+        if arg > len(data) - pos:
+            raise ValueError("CBOR string runs past the end")
+        chunk = data[pos : pos + arg]
+        return (chunk if major == 2 else chunk.decode("utf-8")), pos + arg
+    if major in (4, 5):
+        if arg * (major - 3) > len(data) - pos:  # every item takes at least a byte
+            raise ValueError("CBOR container runs past the end")
+        if major == 4:
+            items = []
+            for _ in range(arg):
+                item, pos = _cbor_item(data, pos, depth + 1)
+                items.append(item)
+            return items, pos
+        out: dict[str, Any] = {}
+        for _ in range(arg):
+            key, pos = _cbor_item(data, pos, depth + 1)
+            if not isinstance(key, str):
+                raise ValueError("CBOR map key is not text")
+            if key in out:
+                raise ValueError(f"CBOR map repeats key {key!r}")
+            out[key], pos = _cbor_item(data, pos, depth + 1)
+        return out, pos
+    if major == 7 and size == 0 and arg in (20, 21, 22):
+        return (False, True, None)[arg - 20], pos
+    if major == 7 and size in _CBOR_FLOATS:
+        return struct.unpack(_CBOR_FLOATS[size], raw)[0], pos
+    raise ValueError(f"CBOR major type {major} with additional info {info} not accepted")
+
+
+def _cbor_decode(data: bytes) -> Any:
+    """Strictly decode the CBOR subset the daemon signs receipt bodies in.
+
+    Definite-length maps (text keys, none repeated), arrays, text and byte
+    strings, integers, half/single/double floats, booleans and null: what
+    ``ciborium`` emits for ``crates/corecrux-receipts`` bodies. The input is
+    untrusted, so anything else -- tags, indefinite lengths, ``undefined`` and
+    other simple values, a length past the end, invalid UTF-8, nesting deeper
+    than 16, trailing bytes -- raises ``ValueError``.
+    """
+    value, end = _cbor_item(data, 0, 0)
+    if end != len(data):
+        raise ValueError("CBOR has trailing bytes")
+    return value
+
+
+_OBSERVATION_WINDOW = 1000  # the daemon's cap on GET /v1/observations/aggregate
+
+
+def _signed_body(client: Any, receipt_id: str) -> dict[str, Any]:
+    """A ``model_invocation`` receipt's signed body, decoded, once the daemon verifies it.
+
+    ``/verification`` checks the Ed25519 signature. The body comes from the
+    mediation observation log (``GET /v1/observations/aggregate``), the place a
+    daemon without a dataplane serves it; that record must be the only one
+    claiming ``receipt_id``, and its ``body_hash`` the payload hash the daemon
+    just verified, so the bytes decoded are the bytes whose signature was
+    checked.
+    """
+    report = client.verify_receipt(receipt_id, tenant_id="local")
+    if report.get("signature_valid") is not True or report.get("error_code") != "OK":
+        raise TamperedRequest(f"receipt {receipt_id} does not verify ({report.get('error_code')})")
+    # ponytail: only the newest 1000 model_invocation observations are
+    # searched (no by-id lookup without a dataplane); older receipts raise
+    # LookupError. Add a receipt_id filter to the aggregate route if that bites.
+    listing = client.aggregate_observations(kind="model_invocation", limit=_OBSERVATION_WINDOW)
+    payloads = (o.get("payload") for o in listing.get("observations", []))
+    found = [p for p in payloads if isinstance(p, dict) and p.get("receipt_id") == receipt_id]
+    if not found:
+        raise LookupError(
+            f"receipt {receipt_id} is not among the daemon's newest "
+            f"{_OBSERVATION_WINDOW} model_invocation observations"
+        )
+    if len(found) > 1 or found[0].get("body_hash") != f"blake3:{report.get('payload_hash')}":
+        raise TamperedRequest(f"receipt {receipt_id}: the listed body is not the one verified")
+    try:
+        body = _cbor_decode(bytes.fromhex(str(found[0].get("body_cbor_hex"))))
+    except ValueError as err:
+        raise TamperedRequest(f"receipt {receipt_id}: signed body is malformed ({err})") from err
+    if (
+        not isinstance(body, dict)
+        or body.get("kind") != "model_invocation"
+        or body.get("receipt_id") != receipt_id
+    ):
+        raise TamperedRequest(f"receipt {receipt_id}: signed body is not this model_invocation")
+    return body
+
+
 def replay(
     client: Any,
     entity: str,
@@ -372,29 +563,52 @@ def replay(
     original is re-sent, so an alias such as ``jev-latest`` reaches whatever
     version it names today.
 
-    Before Jev is called, the stored request must carry the decision's
-    ``source_receipt`` and model, and ``{state, questions}`` must still hash
-    to its ``prompt_hash``; otherwise :class:`TamperedRequest`. Replay writes
-    nothing to Crux -- no receipt, no fact.
+    Before Jev is called, both facts must name the same ``source_receipt``,
+    the daemon must report that receipt's signature valid, and the receipt's
+    **signed** body -- decoded here from the daemon's observation log, never
+    the unsigned copies in the facts or next to the body -- must match:
+
+    * ``prompt_hash``: the stored ``{state, questions}``, re-hashed;
+    * ``model_id``: the stored request's ``model``;
+    * ``provider_request_id`` (``invocation_id`` when Jev sent none): the
+      ``<request_id>`` both fact keys carry;
+    * ``output_hash``: the decision fact's ``{model_version, answers}``, so
+      ``old_answers`` are the answers that were signed.
+
+    Otherwise :class:`TamperedRequest`. A receipt older than the daemon's
+    newest 1000 ``model_invocation`` observations raises ``LookupError``.
+
+    So rewriting both facts consistently is caught. Still trusted: the
+    daemon's own signature check, and anyone who can mint receipts on it
+    (``POST /v1/mediation/receipts``), since the daemon signs whatever hashes
+    it is sent. To take the daemon out of the signature check, verify the
+    receipt offline (see the cookbook). Replay writes nothing to Crux -- no
+    receipt, no fact.
     """
     call = jev or jev_http()
+    ref = decision_key.removeprefix("decision:")
     decision = _latest_fact(client, f"jev:{entity}", decision_key)
-    stored = _latest_fact(
-        client, f"__jev__::{entity}", "request:" + decision_key.removeprefix("decision:")
-    )
-    record, request = json.loads(decision.value), json.loads(stored.value)
-    # ponytail: checked against the decision fact's copy of the receipt's
-    # prompt_hash. The signed receipt body is only readable with a dataplane
-    # (GET /v1/receipts/{id} is 501 without one); compare against it there.
-    if (
-        not decision.source_receipt
-        or stored.source_receipt != decision.source_receipt
-        or request.get("model") != record["model_id"]
-        or digest({"state": request.get("state"), "questions": request.get("questions")})
-        != record["prompt_hash"]
-    ):
+    stored = _latest_fact(client, f"__jev__::{entity}", f"request:{ref}")
+    receipt_id = decision.source_receipt
+    if not receipt_id or stored.source_receipt != receipt_id:
+        raise TamperedRequest(f"__jev__::{entity} / {stored.key} is not linked to receipt {receipt_id}")
+    try:
+        record, request = json.loads(decision.value), json.loads(stored.value)
+        ours = {
+            "prompt_hash": digest({"state": request.get("state"), "questions": request.get("questions")}),
+            "model_id": request.get("model"),
+            "provider_request_id": ref,
+            "output_hash": digest({"model": record.get("model_version"), "answers": record.get("answers")}),
+        }
+    except (ValueError, AttributeError) as err:  # not JSON, not objects, or NaN
+        raise TamperedRequest(f"jev:{entity} / {decision_key} cannot be checked ({err})") from err
+
+    signed = _signed_body(client, receipt_id)
+    signed = {**signed, "provider_request_id": signed.get("provider_request_id") or signed.get("invocation_id")}
+    differ = [name for name, value in ours.items() if signed.get(name) != value]
+    if differ:
         raise TamperedRequest(
-            f"__jev__::{entity} / {stored.key} does not match receipt {decision.source_receipt}"
+            f"{', '.join(differ)} of jev:{entity} / {decision_key} differ from signed receipt {receipt_id}"
         )
 
     raw, request_id = call({**request, "model": model} if model else request)

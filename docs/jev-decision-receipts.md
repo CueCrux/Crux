@@ -17,21 +17,54 @@ One `decide(...)` call does four things:
 2. **Calls Jev once** (`POST /v1/systemone`).
 3. **Mints a signed CROWN `model_invocation` receipt.** The daemon signs
    (Ed25519) a body binding:
-   - `prompt_hash`: sha256 over `{state, questions}`
-   - `retrieval_set_hash`: sha256 over `[[item id, sha256(text)], ...]` for the
-     retrieved context
-   - `output_hash`: sha256 over `{model, answers}`
-   - the model alias and exact `model_version`, and Jev's
-     `x-typesafe-request-id` as `provider_request_id`
+   - `prompt_hash`: `digest({state, questions})`
+   - `retrieval_set_hash`: `digest([[item id, digest(text)], ...])` for the
+     retrieved context, where `digest(text)` hashes the text as a JSON string
+     literal, quotes included (see [Canonical hashing](#canonical-hashing))
+   - `output_hash`: `digest({model, answers})`
+   - the model alias and exact `model_version`, Jev's `x-typesafe-request-id`
+     as `provider_request_id`, and a `provider` label (`typesafe`, or what you
+     pass as `decide(..., provider=...)`)
 4. **Stores the decision as a fact**: entity `jev:<entity>`, key
    `decision:<request_id>`, `source_receipt` set to the receipt id. The fact
    value holds the answers, the evidence list and the three hashes, so you can
    query past decisions per entity and recompute two of the hashes from the
    fact alone.
 
-Every hash is sha256 over compact UTF-8 JSON with key order **preserved**. Jev
-reads key order, so reordering a Choice's options is a different prompt and
-hashes differently.
+### Canonical hashing
+
+Every hash is `digest(value)`, which is exactly:
+
+```python
+"sha256:" + hashlib.sha256(
+    json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    .encode("utf-8")
+).hexdigest()
+```
+
+- **Key order is preserved, not sorted.** This is *not* RFC 8785 / JCS, which
+  sorts keys: Jev reads key order, so reordering a Choice's options is a
+  different prompt and must hash differently. Sorting would erase exactly that.
+- **Compact:** no whitespace. Non-ASCII is written as raw UTF-8, not `\u`
+  escapes. Strings get only JSON's mandatory escapes: `\"`, `\\`, `\b`, `\f`,
+  `\n`, `\r`, `\t`, and `\u00XX` (lower-case hex) for other control
+  characters below U+0020. `/` and U+007F are not escaped.
+- **Numbers:** integers in plain decimal, any size. Floats as Python's
+  `repr`: shortest round-trip digits, always with a `.` or exponent (`1.0`,
+  `0.1`, `2e-05`, `1e+16`, `-0.0`), exponent form when the exponent is below
+  -4 or at least 16. `1` and `1.0` hash differently. NaN and infinities are
+  refused (`ValueError`).
+- **Strings are hashed as JSON too.** An evidence digest is over `"text"`,
+  quotes and escapes included, not over the raw text:
+  `digest("approver: dana")` is `sha256` of the 16 bytes `"approver: dana"`.
+
+A verifier in another language must parse the stored JSON into an
+**order-preserving** map, keep each number's integer-or-float identity, and
+re-serialise by the rules above; JavaScript's `JSON.stringify` differs on
+floats (`1.0` becomes `1`, `2e-05` becomes `0.00002`), and a plain
+`JSON.parse` has already lost `1.0` vs `1`. The adapters' tests pin a golden
+vector (`tests/test_jev.py`, `test_golden_vector`) so any drift in this
+serialiser fails CI.
 
 ## What a receipt proves, and what it does not
 
@@ -49,7 +82,9 @@ It does **not** prove:
 - **that Jev produced it.** The daemon never talks to Jev. It signs the hashes
   your process reports. `provider_request_id` is what lets you reconcile a
   receipt against TypeSafe's own logs. The offline stub below is the proof: its
-  canned answers get a valid receipt, with `model_version: offline-stub`.
+  canned answers get a valid receipt, with `model_version: offline-stub` (and
+  `provider: offline-stub`, because the example says so: the provider label is
+  the caller's claim too).
 - **what the state said, from the fact alone.** The fact stores digests of the
   trusted context, not the text, and does not store `untrusted_input`. To
   re-check `prompt_hash` later, or replay a state against a newer model, keep
@@ -265,15 +300,20 @@ except DecisionNotRecorded as err:
 ```
 
 The usual cause is a daemon without `CORECRUXD_STREAM_RECEIPTS=1`: the message
-says so. Failures before Jev is called raise as usual, and nothing is
-recorded: a `CueCruxError` 404 from `GET /v1/context` means
-`CORECRUXD_CONTEXT_SURFACE` is off, and Jev errors (429 and 529 included)
-arrive as `httpx.HTTPStatusError` once retries are spent. `jev_http` retries
-408, 429 and 5xx (529 included) up to 3 attempts, honouring `retry-after-ms`
-/ `Retry-After`; it never retries other 4xx or connection errors (a timed-out
-POST may already have been billed). To use the official `typesafe-sdk` client
-instead, wrap it in a callable with the same shape (request body in,
-`(response JSON, request id)` out) and pass it as `jev=`.
+says so. Answers Jev returns with a NaN or infinity cannot be hashed; that
+raises `DecisionNotRecorded` too, answers kept. Failures before Jev is called
+raise as usual, and nothing is recorded: a `CueCruxError` 404 from
+`GET /v1/context` means `CORECRUXD_CONTEXT_SURFACE` is off, and Jev errors
+arrive as `httpx.HTTPStatusError` once retries are spent.
+
+`jev_http` retries only the statuses that mean the request was not processed
+-- 408, 429, 503 and 529 -- up to 3 attempts, waiting what `retry-after-ms` /
+`Retry-After` (seconds or an HTTP-date) asks, or backing off 0.5s, 1s. A
+server that asks for more than 60s gets no retry: the error is raised at once.
+500, 502, 504, timeouts and connection errors are never retried, because Jev
+may already have run the call, and billed it. To use the official
+`typesafe-sdk` client instead, wrap it in a callable with the same shape
+(request body in, `(response JSON, request id)` out) and pass it as `jev=`.
 
 ## Replaying a decision against a new model version
 
@@ -293,9 +333,39 @@ if result.changed:
     print(result.old_answers, "->", result.new_answers)
 ```
 
-Before calling Jev, `replay` checks that the stored request still hashes to
-the decision's `prompt_hash` and names the same receipt, and raises
-`TamperedRequest` if not. Replay writes nothing: no receipt, no fact.
+Before calling Jev, `replay` checks the stored request against the receipt's
+**signed body**, not against the copies of the hashes in the facts (anyone who
+can write facts could rewrite both facts to agree with each other):
+
+1. Both facts name the same `source_receipt`.
+2. The daemon reports that receipt's signature valid
+   (`GET /v1/receipts/{id}/verification`: `signature_valid` and
+   `error_code: OK`).
+3. The signed body is read from `GET /v1/observations/aggregate?kind=model_invocation`
+   (the record must be the only one claiming that receipt id, and its
+   `body_hash` must be the payload hash the daemon just verified), and its
+   CBOR is decoded by a strict decoder in `crux_adapters.jev`. The unsigned
+   hashes listed next to the body are ignored.
+4. From that decoded body: `prompt_hash` must equal the stored
+   `{state, questions}` re-hashed, `model_id` the stored request's model,
+   `provider_request_id` (or `invocation_id` when Jev sent none) the request id
+   in the fact keys, and `output_hash` the decision fact's
+   `{model_version, answers}`, so the old answers `replay` reports are the
+   signed ones.
+
+Any mismatch raises `TamperedRequest`. Replay writes nothing: no receipt, no
+fact.
+
+What is still trusted: the daemon itself, twice. Its `/verification` does the
+Ed25519 check (replay does not hold the public key), and it signs whatever
+hashes a caller with receipt-minting scopes (`facts:write` +
+`sessions:write`) sends, so such a caller can mint a matching receipt for
+forged facts. For a check that trusts only the public key, verify the receipt
+offline as in [Verifying a receipt](#verifying-a-receipt), or with
+`corecruxctl receipts verify-stream-receipt` where your `corecruxctl` has it,
+and compare the hashes in the body yourself. Replay only searches the daemon's
+newest 1000 `model_invocation` observations (the route's cap); an older
+receipt raises `LookupError` rather than being skipped.
 
 The stored request includes your `untrusted` input verbatim, in an ordinary
 fact under `__jev__::<entity>` (HTTP fact writes cannot be private), so anyone

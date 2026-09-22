@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "sdks" / "python" / "src"))
 
-from crux_adapters.jev import DecisionNotRecorded, digest  # noqa: E402
+from crux_adapters.jev import DecisionNotRecorded, _cbor_decode, digest  # noqa: E402
 from test_jev import FakeDaemon  # noqa: E402
 
 try:
@@ -285,17 +285,17 @@ class FixtureDaemon(unittest.TestCase):
         (fact,) = client.get_facts_by_entity(f"jev:{entity}")
         record = json.loads(fact.value)
         self.assertEqual(client.verify_receipt(fact.source_receipt, tenant_id="local")["error_code"], "OK")
-        observations = client._client.get(
-            "/v1/observations/aggregate", params={"kind": "model_invocation", "limit": 500}
-        ).json()["observations"]
+        observations = client.aggregate_observations(kind="model_invocation", limit=1000)["observations"]
         (body,) = [
-            bytes.fromhex(o["payload"]["body_cbor_hex"])
+            _cbor_decode(bytes.fromhex(o["payload"]["body_cbor_hex"]))
             for o in observations
             if o["payload"].get("receipt_id") == fact.source_receipt
         ]
-        self.assertIn(record["prompt_hash"].encode(), body)  # the right body, keys in clear
-        self.assertIn(b"prompt_hash", body)
-        self.assertNotIn(b"retrieval_set_hash", body)
+        self.assertEqual(  # the signed body, decoded: the right one, and no retrieval claim
+            (body["prompt_hash"], body["output_hash"], body["provider"]),
+            (record["prompt_hash"], record["output_hash"], "typesafe"),
+        )
+        self.assertNotIn("retrieval_set_hash", body)
 
 
 if __name__ == "__main__":
