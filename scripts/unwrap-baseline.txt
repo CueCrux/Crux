@@ -38,6 +38,9 @@
 # that only fails on programmer error) moved with it. Whole-tree total is
 # unchanged at 369. corecrux-billing and corecrux-providers were added by the
 # same split and carry no non-test sites.
+# 2026-09-22: corecruxd 45 -> 24. SessionMetrics registration now threads
+# prometheus::Result through try_new with `?`; its 22 per-metric expect()
+# sites collapse into the single one in SessionMetrics::new.
 corecrux-billing 0
 corecrux-frame 0
 corecrux-index 3
@@ -53,7 +56,7 @@ corecrux-storage 47
 corecrux-types 1
 corecrux-workspace-scan 0
 corecruxctl 9
-corecruxd 45
+corecruxd 24
 crux-claude-hooks 1
 crux-config-wizard 8
 crux-contrib 0
