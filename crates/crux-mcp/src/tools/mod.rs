@@ -1544,8 +1544,9 @@ pub fn list_tools_with_flags(
                           Defaults to the caller's own passport (self-revoke); pass \
                           `target_passport` to revoke another. Authorized for: self, the \
                           passport's sponsor, or an elite-tier operator. Writes a receipted \
-                          revocation event. Access refusal is gated behind \
-                          CRUX_PASSPORT_REVOCATION=1."
+                          revocation event. Access is refused by default \
+                          (CRUX_PASSPORT_REVOCATION=0 disables it); sync and \
+                          operator-tier tools refuse a revoked passport regardless."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -3102,8 +3103,8 @@ pub async fn handle_get_agent_identity(_args: &Value, ctx: &McpContext) -> Resul
 
 /// Dispatch a tool call by name. Returns the MCP `content` array.
 pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
-    // passport-revocation M3: when enforcement is on (CRUX_PASSPORT_REVOCATION=1,
-    // default-off), a REVOKED passport is refused every tool except a tiny
+    // passport-revocation M3: when enforcement is on (default; CRUX_PASSPORT_REVOCATION=0
+    // disables it), a REVOKED passport is refused every tool except a tiny
     // read-only allowlist (so it can learn why — M4). The fact store is
     // in-process/in-memory, so the per-call passport read is a cheap
     // RwLock+indexed lookup; no TTL cache is used (it would only add revocation

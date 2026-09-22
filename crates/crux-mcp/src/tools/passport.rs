@@ -211,6 +211,19 @@ pub(crate) async fn require_passport_tier(ctx: &McpContext, required_tier: &str)
             }],
             "isError": true
         })),
+        // D8: a revoked passport is refused here unconditionally — this gate
+        // must not depend on the dispatch-wide `CRUX_PASSPORT_REVOCATION` flag.
+        Some(p) if p.revoked_at.is_some() => Err(json!({
+            "content": [{
+                "type": "text",
+                "text": format!(
+                    "passport revoked — this operation is refused (reason: {}). \
+                     Call get_passport for your revocation status.",
+                    p.revoked_reason.as_deref().unwrap_or("none")
+                )
+            }],
+            "isError": true
+        })),
         Some(p) if tier_rank(&p.reputation_tier) < tier_rank(required_tier) => Err(json!({
             "content": [{
                 "type": "text",
@@ -474,8 +487,9 @@ pub async fn handle_get_passport(_args: &Value, ctx: &McpContext) -> Result<Valu
 ///
 /// Terminal + supersede-don't-delete: the passport fact stays (revoked), and a
 /// separate `revocation` audit fact records who/why/when (RCX
-/// `AttestationRevokedReceipt` semantics). Enforcement (refusing a revoked
-/// passport's calls) is M3, gated behind `CRUX_PASSPORT_REVOCATION=1`.
+/// `AttestationRevokedReceipt` semantics). Enforcement: the dispatch gate (M3)
+/// refuses a revoked passport's calls unless `CRUX_PASSPORT_REVOCATION=0`;
+/// `require_passport_tier` refuses it regardless of that flag.
 pub async fn handle_revoke_passport(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let Some(caller_key) = passport_key_name(ctx) else {
         return Err(JsonRpcError {
@@ -567,8 +581,9 @@ pub async fn handle_revoke_passport(args: &Value, ctx: &McpContext) -> Result<Va
     }
 
     Ok(json!({"content": [{"type": "text", "text": format!(
-        "passport '{}' revoked by '{}' (reason={}). Access is refused once revocation \
-         enforcement (CRUX_PASSPORT_REVOCATION=1) is enabled.",
+        "passport '{}' revoked by '{}' (reason={}). Access is refused unless revocation \
+         enforcement is disabled (CRUX_PASSPORT_REVOCATION=0); sync and operator-tier \
+         tools refuse it regardless.",
         target_key,
         caller_key,
         reason.as_deref().unwrap_or("none")
@@ -1264,5 +1279,45 @@ mod tests {
         assert!(require_passport_tier(&alice, "basic").await.is_ok());
         assert!(require_passport_tier(&alice, "unverified").await.is_ok());
         assert!(require_passport_tier(&alice, "established").await.is_err());
+    }
+
+    /// D8: the sync / operator tier gate refuses a revoked passport even with
+    /// the dispatch-wide revocation gate switched off (`CRUX_PASSPORT_REVOCATION=0`).
+    #[tokio::test]
+    async fn require_tier_denies_revoked_passport_regardless_of_flag() {
+        let ctx = test_ctx().with_revocation_enforced(false);
+        let alice = alice_ctx(&ctx);
+        handle_issue_passport(&json!({}), &alice).await.unwrap();
+        {
+            let mut store = ctx.fact_store.write().await;
+            for i in 0..10 {
+                store.store(StoreFact {
+                    tenant_hash: "default".to_string(),
+                    entity: format!("r-{i}"),
+                    key: "k".to_string(),
+                    value: "v".to_string(),
+                    source_receipt: Some(format!("receipt-{i}")),
+                    confidence: 1.0,
+                    private: false,
+                    horizon_class: None,
+                    actor: None,
+                });
+            }
+        }
+        handle_get_passport(&json!({}), &alice).await.unwrap();
+
+        // Positive control: the same passport at the same tier passes while active.
+        assert!(require_passport_tier(&alice, "basic").await.is_ok());
+
+        handle_revoke_passport(&json!({"reason": "key leaked"}), &alice)
+            .await
+            .unwrap();
+
+        for tier in ["basic", "unverified"] {
+            let err = require_passport_tier(&alice, tier).await.unwrap_err();
+            let text = err["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("revoked"), "tier {tier}: {text}");
+            assert!(text.contains("key leaked"), "tier {tier}: {text}");
+        }
     }
 }
