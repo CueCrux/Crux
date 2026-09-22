@@ -11,6 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Behaviour change: `pro_claim_placements` is derived from where a claim is
+  implemented, not from which list it is in.** `/v1/version` and the cloud
+  access contract now report a Pro claim as `daemon` only when a named gate
+  site refuses it, and as `hosted_control_plane` only when a named hosted
+  implementation backs it. A claim with neither now reports `unimplemented`,
+  which replaces the old `contracted_external` label. Three hosted claims with
+  no implementation found (`sync:managed_backup`, `audit:central_retention`
+  and `control_plane:hosted`) now report `unimplemented` with
+  `hosted_control_plane: false`. They are still listed in
+  `capability_catalog.pro` and `hosted_control_plane_pro_claims`, and only
+  their placement changed. No gate or entitlement behaviour changed. (#811)
+
 ## [0.5.65] - 2026-09-22
 
 ### Added
