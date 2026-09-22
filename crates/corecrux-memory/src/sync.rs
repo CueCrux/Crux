@@ -388,6 +388,27 @@ pub fn promotion_preview(
     }
 }
 
+/// Refuse a promotion batch that names any tenant other than `tenant_id`.
+///
+/// Promotion records are caller-supplied, so the path tenant is the only
+/// authority. Every fact's entity must sit in that tenant's namespace (the
+/// predicate [`promotion_preview`] selects by), and its storage stamp must be
+/// the path tenant or the shared `default` partition a local store writes.
+/// Run over the whole batch before the first apply, so a refused batch leaves
+/// nothing behind.
+pub fn check_promoted_records_tenant(tenant_id: &str, records: &[SyncCollectionRecord]) -> Result<(), String> {
+    for fact in records.iter().filter_map(|record| record.fact.as_ref()) {
+        let stamp_ok = fact.tenant_hash == tenant_id || fact.tenant_hash == crate::fact_store::default_tenant_hash();
+        if !stamp_ok || !fact_belongs_to_tenant(fact, tenant_id) {
+            return Err(format!(
+                "promotion record '{}' (entity '{}', tenant stamp '{}') does not belong to tenant '{tenant_id}'",
+                fact.fact_id, fact.entity, fact.tenant_hash
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn apply_promoted_records(store: &mut FactStore, records: &[SyncCollectionRecord], remote_url: &str) -> usize {
     let mut applied = 0;
     for record in records {
