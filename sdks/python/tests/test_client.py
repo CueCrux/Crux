@@ -313,6 +313,24 @@ class WireShapeTest(unittest.TestCase):
         self.client.get_facts_by_entity("jev:invoice-42_x.y~z")
         self.assertCall("GET", "/v1/facts/entity/jev%3Ainvoice-42_x.y~z")
 
+    def test_dot_segments_are_encoded_not_resolved(self) -> None:
+        # Bare, httpx resolves them: /v1/facts/entity/.. would reach /v1/facts.
+        self.client.get_facts_by_entity("..")
+        self.assertCall("GET", "/v1/facts/entity/%2E%2E")
+        self.client.get_facts_by_entity(".")
+        self.assertCall("GET", "/v1/facts/entity/%2E")
+        self.client.reject_candidate("..", "dup")
+        self.assertCall("POST", "/v1/memory/candidates/%2E%2E/reject")
+        self.client.get_facts_by_entity("...")  # not a dot-segment
+        self.assertCall("GET", "/v1/facts/entity/...")
+
+    def test_non_string_ids_are_stringified(self) -> None:
+        receipt = uuid.UUID("12345678-1234-5678-1234-567812345678")
+        self.client.verify_receipt(receipt, tenant_id="local")
+        self.assertCall("GET", f"/v1/receipts/{receipt}/verification")
+        self.client.reject_candidate(42, "dup")
+        self.assertCall("POST", "/v1/memory/candidates/42/reject")
+
     # -- observations --
 
     def test_aggregate_observations_sends_only_the_filters_set(self) -> None:
@@ -500,6 +518,13 @@ class FixtureDaemon(unittest.TestCase):
             self.assertEqual((fact.fact_id, fact.entity), (stored.fact_id, entity))
             # Control: the prefix before the "/" is a different entity with no facts.
             self.assertEqual(client.get_facts_by_entity(entity.split("/")[0]), [])
+
+            # A literal ".." entity: sent bare it would read GET /v1/facts, i.e.
+            # other entities' facts (the one just stored among them).
+            stored = client.store_fact(StoreFact(entity="..", key=f"k-{uuid.uuid4().hex[:8]}", value="v"))
+            facts = client.get_facts_by_entity("..")
+            self.assertIn(stored.fact_id, [f.fact_id for f in facts])
+            self.assertEqual({f.entity for f in facts}, {".."})
 
 
 if __name__ == "__main__":

@@ -17,7 +17,11 @@
   session, fact, receipt, candidate and extension ids) were sent unencoded, so
   an entity containing `/` got a 404 and one containing `?`, `#` or `%` quietly
   read a different entity (usually an empty list). Each is now
-  percent-encoded as a single path segment; the daemon decodes it back.
+  percent-encoded as a single path segment; the daemon decodes it back. A
+  value of `.` or `..` is sent as `%2E` / `%2E%2E`, since httpx resolves bare
+  dot-segments (`get_facts_by_entity("..")` would otherwise read
+  `GET /v1/facts`, other entities' facts). Non-string ids (a `UUID`, an
+  `int`) are sent as `str(value)`, as before the encoding change.
 - Fix: `query_facts(..., token_budget=...)` raised `KeyError: 'value'` once
   the result crossed the budget's hydration boundary, because the daemon drops
   `value` from those rows and sets `value_omitted: true`. `Fact.value` is now

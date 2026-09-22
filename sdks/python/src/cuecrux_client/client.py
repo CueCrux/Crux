@@ -59,13 +59,16 @@ def _parse_json(resp: httpx.Response) -> dict[str, Any]:
     return resp.json()
 
 
-def _seg(value: str) -> str:
-    """Percent-encode ``value`` as ONE path segment: ``/``, ``?``, ``#`` and ``%`` included.
+def _seg(value: Any) -> str:
+    """Percent-encode ``str(value)`` as ONE path segment: ``/``, ``?``, ``#`` and ``%`` included.
 
     Entities such as ``repo:a/b`` would otherwise split the path or start a
     query string, and the daemon answers an empty list rather than an error.
+    A value of ``.`` or ``..`` is sent as ``%2E`` / ``%2E%2E``: left bare, httpx
+    resolves it as a dot-segment (``/v1/facts/entity/..`` becomes ``/v1/facts``).
     """
-    return quote(value, safe="")
+    seg = quote(str(value), safe="")
+    return seg.replace(".", "%2E") if seg in (".", "..") else seg
 
 
 def _params(**kwargs: Any) -> dict[str, Any]:
