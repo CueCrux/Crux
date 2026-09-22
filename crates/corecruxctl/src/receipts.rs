@@ -22,9 +22,8 @@ use corecrux_receipts::{
     CoverageAttestationBodyInputV1, CoverageWindowBodyInputV1, CoverageWindowCountsV1, CoverageWindowReportV1,
     CrownReceiptV1, CryptoShredDestroyMarkerInputV1, CryptoShredSealInputV1, Ed25519KeyEntryV1, Ed25519KeyRingV1,
     ExternalAnchorBodyInputV1, ReceiptSigV1, RedactionReceiptBodyInputV1, Rfc3161StrictValidationOptionsV1,
-    Rfc3161StrictValidationReportV1, Rfc3161TimestampBodyInputV1, VerifiedStreamReceiptPayloadV1,
-    CONTENT_TYPE_RECEIPT_BODY_V1, CONTENT_TYPE_RECEIPT_SIG_V1, EVT_RECEIPT_BODY_V1, EVT_RECEIPT_SIG_V1,
-    STREAM_TYPE_RECEIPT,
+    Rfc3161StrictValidationReportV1, Rfc3161TimestampBodyInputV1, CONTENT_TYPE_RECEIPT_BODY_V1,
+    CONTENT_TYPE_RECEIPT_SIG_V1, EVT_RECEIPT_BODY_V1, EVT_RECEIPT_SIG_V1, STREAM_TYPE_RECEIPT,
 };
 use corecrux_segment::decode_frame_v1;
 use corecrux_storage::{AppendEventInput, ShardStorage, ShardStorageOptions};
@@ -141,22 +140,51 @@ pub fn verify_cose_file_v1(
 /// (`{"v":1,"keys":[{"keyId":<passport fpr>,"pubKeyBase64":...}]}`). This
 /// checks the daemon's own signature; unlike `export-cose` nothing is
 /// re-signed and no key is read from the input.
+///
+/// `Ok` carries the fields decoded from the SIGNED body
+/// (`VerifiedStreamReceiptPayloadV1::signed`) — the only signature-covered
+/// values; the record's own `payload.output_hash` etc. are unsigned copies.
+/// `Err` when the receipt does not verify, is not a stream receipt kind, or
+/// its signed `receipt_id` / `kind` differ from `expect_receipt_id` /
+/// `expect_kind` when given.
 pub fn verify_stream_receipt_file_v1(
     input: &Path,
     keyring_path: &Path,
     tenant_id: &str,
-) -> Result<VerifiedStreamReceiptPayloadV1, Box<dyn std::error::Error + Send + Sync>> {
+    expect_receipt_id: Option<&str>,
+    expect_kind: Option<&str>,
+) -> Result<std::collections::BTreeMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
     let value: serde_json::Value = serde_json::from_slice(&std::fs::read(input)?)?;
     let payload = value.get("payload").unwrap_or(&value);
     let keyring = Ed25519KeyRingV1::parse_json(&std::fs::read_to_string(keyring_path)?)?;
     let verified_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    Ok(verify_stream_receipt_payload_v1(
+    let verified = verify_stream_receipt_payload_v1(
         payload,
         tenant_id,
         &keyring,
         &verified_at,
         &corecrux_types::build_info(),
-    )?)
+    )?;
+    let signed = |name: &str| verified.signed.get(name).map(String::as_str);
+    let mut failures = Vec::new();
+    if !verified.is_verified() {
+        failures.push(format!(
+            "error_code={} tenant_bound={} receipt_id_bound={} signed_kind={:?}",
+            verified.report.error_code,
+            verified.report.binding.tenant_bound,
+            verified.report.binding.receipt_id_bound,
+            signed("kind"),
+        ));
+    }
+    for (name, expected) in [("receipt_id", expect_receipt_id), ("kind", expect_kind)] {
+        if let Some(expected) = expected.filter(|expected| signed(name) != Some(*expected)) {
+            failures.push(format!("signed {name}={:?}, expected {expected:?}", signed(name)));
+        }
+    }
+    if !failures.is_empty() {
+        return Err(format!("stream receipt NOT verified: {}", failures.join("; ")).into());
+    }
+    Ok(verified.signed)
 }
 
 fn resolve_cose_signing_key_v1(
@@ -1948,15 +1976,20 @@ mod tests {
         .unwrap();
 
         let (body, hash, _) = record("blake3:allow");
-        let ok = verify_stream_receipt_file_v1(&write_record(dir.path(), &body, hash), &keyring, "local").unwrap();
-        assert!(ok.is_verified(), "{:?}", ok.report);
-        assert_eq!(ok.kind.as_deref(), Some("model_invocation"));
+        let ok = verify_stream_receipt_file_v1(&write_record(dir.path(), &body, hash), &keyring, "local", None, None)
+            .unwrap();
+        assert_eq!(ok["kind"], "model_invocation");
+        assert_eq!(ok["output_hash"], "blake3:allow");
 
-        let edited =
-            verify_stream_receipt_file_v1(&write_record(dir.path(), &edited_body, edited_hash), &keyring, "local")
-                .unwrap();
-        assert!(!edited.is_verified());
-        assert_eq!(edited.report.error_code, "SIG_INVALID");
+        let edited = verify_stream_receipt_file_v1(
+            &write_record(dir.path(), &edited_body, edited_hash),
+            &keyring,
+            "local",
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(edited.to_string().contains("error_code=SIG_INVALID"), "{edited}");
     }
 
     #[test]

@@ -1135,14 +1135,28 @@ CBOR body bytes. Verify one offline from its observation record (an element of
 bare `payload`) against a pinned public keyring:
 
 ```bash
-corecruxctl receipts verify-stream-receipt record.json --keyring keyring.json
+corecruxctl receipts verify-stream-receipt record.json --keyring keyring.json \
+  --expect-receipt-id <receipt id> --kind model_invocation
 ```
 
 `keyring.json` is `{"v":1,"keys":[{"keyId":"<passport fingerprint>","pubKeyBase64":"<ed25519 public key>"}]}`.
 The command checks the daemon's own signature (nothing is re-signed and no key
 is read from the record) and exits non-zero unless the signature is valid, the
-body hash matches, and the signed body names the tenant (`--tenant-id`, default
-`local`) and the receipt id.
+body hash matches, the signed body names the tenant (`--tenant-id`, default
+`local`) and the receipt id, and the signed `kind` is one of the four stream
+kinds. Other receipt classes the daemon signs with the same key and tenant
+(e.g. `usage_ping`) share the record shape and are rejected on `kind`.
+`--expect-receipt-id` and `--kind`, when given, must match the signed body.
+
+On success it prints, as JSON on stdout, the fields decoded from the signed
+body: `kind`, `receipt_id`, `tenant_id` and, for `model_invocation`,
+`invocation_id`, `provider`, `model_id`, `model_version`,
+`provider_request_id`, `prompt_hash`, `retrieval_set_hash`, `output_hash`
+(absent optional fields are omitted). Only these printed fields are
+signature-verified. The record's top-level `kind` and the payload's own
+`invocation_id`, `prompt_hash`, `retrieval_set_hash`, `output_hash`,
+`session_id`, `stable_hash` and `injected_stable_hash` are unsigned copies:
+read the command's output, not `payload.output_hash`.
 
 ## Body Event
 
@@ -4529,6 +4543,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   receipt (`model_invocation`, `context_injected`, `stream_completed`,
   `stream_aborted`) offline from its observation record against a pinned
   public keyring, checking the daemon's own signature over the canonical body.
+  It rejects other receipt classes signed by the same key (e.g. `usage_ping`)
+  on the signed `kind`, takes optional `--expect-receipt-id` / `--kind`
+  checks, and on success prints only fields decoded from the signed body —
+  the record's `payload.output_hash` and similar copies are unsigned.
   Library entry point: `corecrux_receipts::verify_stream_receipt_payload_v1`.
 
 ## [0.5.65] - 2026-09-22
