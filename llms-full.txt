@@ -3083,7 +3083,7 @@ Protocol for multi-session work: announce your focus at boot and on every execpl
 - `sync_status()` — Check whether this node is local-only, sync-enabled, or degraded before planning remote integration work.
 - `update_status()` — Check whether this checkout is current, behind, ahead, diverged, disabled, or unavailable before proposing an upgrade.
 - `get_gaps(query)` — Check what the corpus doesn't know.
-- `get_bootstrap(topic, query?)` — Learn best practices and pull onboarding playbooks (topics: "patterns", "docs", "errors").
+- `get_bootstrap(topic, query?, token_budget?)` — Learn best practices and pull onboarding playbooks (topics: "patterns", "docs", "errors").
 
 ## Substrate (M1–M2)
 The substrate hosts arbitrary domain data as `(kind, id, payload)` entities + labelled edges between them. Lens crates register kinds at daemon startup; agents can read and write via these generic tools.
@@ -4501,6 +4501,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+
+- **MCP `get_bootstrap` now honours `token_budget`.** The tool's schema had no
+  `token_budget` and the handler hard-coded none, so the cold-start call every
+  agent makes with `token_budget=500` returned up to 100 full bootstrap facts.
+  The budget is now advertised and applied with the same fact-tier semantics as
+  `query_facts`. (QA audit M4, C1)
 
 - **One tenant erasure could wedge every write on the shard.** `forget-tenants`
   with `reclaim: true` retires a segment together with the L0 directory run

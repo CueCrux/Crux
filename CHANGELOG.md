@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MCP `get_bootstrap` now honours `token_budget`.** The tool's schema had no
+  `token_budget` and the handler hard-coded none, so the cold-start call every
+  agent makes with `token_budget=500` returned up to 100 full bootstrap facts.
+  The budget is now advertised and applied with the same fact-tier semantics as
+  `query_facts`. (QA audit M4, C1)
+
 - **One tenant erasure could wedge every write on the shard.** `forget-tenants`
   with `reclaim: true` retires a segment together with the L0 directory run
   whose `run_id` equals its `segment_seq`. That pairing is not reliable:
