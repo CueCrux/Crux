@@ -332,3 +332,52 @@ get_client().update_current_span(metadata={
     "jev_model_version": decision.model_version,
 })
 ```
+
+## Jev through LangChain (`langchain-typesafe`)
+
+If your agent reaches Jev through
+[`langchain-typesafe`](https://pypi.org/project/langchain-typesafe/)
+(`TypeSafeClassifier`, or the `ModelRouterMiddleware` and `AutoModeMiddleware`
+that each build one), you do not call `decide`. Pass a callback handler in the
+run config instead; LangChain hands it to every Jev call in the run, the
+middleware's included:
+
+```bash
+pip install 'cuecrux-adapters[jev-langchain]'   # langchain-typesafe[experimental], tested on 0.0.1a3
+```
+
+```python
+from crux_adapters.jev_langchain import JevReceiptHandler
+
+handler = JevReceiptHandler(client, entity="agent:build-bot")
+agent = create_agent(model, tools=[read_file, delete_file],
+                     middleware=[ModelRouterMiddleware(...), AutoModeMiddleware(tools=[delete_file])])
+agent.invoke({"messages": [...]}, config={"callbacks": [handler]})
+```
+
+Each Jev call gets the same receipt and `jev:<entity>` / `decision:<request_id>`
+fact as `decide` produces, with these differences:
+
+- **Crux did not build the state, LangChain did.** `retrieval_set_hash` is
+  null in the receipt draft (so the signed body has none) and in the fact, and
+  the fact has no `retrieved` list. The receipt makes no claim about Crux
+  retrieval.
+- `prompt_hash` covers `{state, questions}` as the classifier sends them, with
+  LangChain messages already converted to role/content JSON. `output_hash`
+  covers `{model, answers}` as the classifier parsed them, so fields Jev adds
+  that `langchain-typesafe` does not model are not covered.
+- `invocation_id` is the LangChain run id, so a LangSmith trace and its receipt
+  share an id.
+- No replay: nothing is stored under `__jev__::`.
+- **Python 3.10, async agents:** the middleware calls the classifier's
+  `ainvoke` without a config, and asyncio on 3.10 cannot carry LangChain's
+  callbacks into it, so those decisions are **not recorded** and nothing says
+  so. Use Python 3.11+ or a sync run. A direct
+  `classifier.ainvoke(request, config={"callbacks": [handler]})` is recorded on
+  3.10 too.
+
+If the receipt or the fact cannot be written, the handler raises
+`DecisionNotRecorded` out of the classifier call. `AutoModeMiddleware` treats
+that like any classifier failure: the tool does not run. Set
+`handler.raise_error = False` to log the failure and let the agent continue
+without a record.

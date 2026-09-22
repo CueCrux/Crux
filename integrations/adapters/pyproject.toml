@@ -19,6 +19,9 @@ dependencies = ["cuecrux-client>=0.4"]
 langchain = ["langchain-core>=0.3"]
 llamaindex = ["llama-index-core>=0.11"]
 crewai = ["crewai>=0.80"]
+# crux_adapters.jev_langchain: receipts for Jev calls made by langchain-typesafe
+# (TypeSafeClassifier and its agent middleware). Alpha upstream; tested on 0.0.1a3.
+jev-langchain = ["langchain-typesafe[experimental]>=0.0.1a3,<0.0.2"]
 
 [project.urls]
 Homepage = "https://github.com/CueCrux/Crux"

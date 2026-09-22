@@ -160,12 +160,14 @@ class JevDecision:
     request_id: str | None
     invocation_id: str
     prompt_hash: str
-    retrieval_set_hash: str
+    retrieval_set_hash: str | None
+    """``None`` when Crux did not build the state (:mod:`.jev_langchain`)."""
     output_hash: str
     state: Any
     """The exact state sent, for replay against a later model version."""
-    bundle: ContextBundle
-    """The retrieved context. ``bundle.truncated`` means the budget cut it."""
+    bundle: ContextBundle | None
+    """The retrieved context. ``bundle.truncated`` means the budget cut it.
+    ``None`` when Crux did not build the state."""
     raw: dict[str, Any]
     receipt_id: str | None = None
     fact_id: str | None = None
@@ -186,6 +188,66 @@ class DecisionNotRecorded(Exception):
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _mint(
+    client: Any, decision: JevDecision, model: str, started_at: str, completed_at: str
+) -> JevDecision:
+    """Sign ``decision`` as a ``model_invocation`` receipt; set ``receipt_id``."""
+    draft = {
+        "kind": "model_invocation",
+        "invocation_id": decision.invocation_id,
+        "provider": "typesafe",
+        "model_id": model,
+        "model_version": decision.model_version,
+        "provider_request_id": decision.request_id,
+        "prompt_hash": decision.prompt_hash,
+        "retrieval_set_hash": decision.retrieval_set_hash,
+        "output_hash": decision.output_hash,
+        "started_at": started_at,
+        "completed_at": completed_at,
+    }
+    try:
+        minted = client.post_mediation_receipt(draft)
+    except (CueCruxError, httpx.HTTPError) as err:
+        raise DecisionNotRecorded(
+            f"Jev answered but no receipt was minted ({err}); "
+            "the daemon needs CORECRUXD_STREAM_RECEIPTS=1",
+            decision,
+        ) from err
+    return replace(decision, receipt_id=minted["receipt_id"])
+
+
+def _store_decision(
+    client: Any, decision: JevDecision, entity: str, model: str, **extra: Any
+) -> JevDecision:
+    """Store ``jev:<entity>`` / ``decision:<ref>`` linked to the receipt; set ``fact_id``."""
+    record = {
+        "answers": decision.answers,
+        "model_id": model,
+        "model_version": decision.model_version,
+        "request_id": decision.request_id,
+        "invocation_id": decision.invocation_id,
+        "prompt_hash": decision.prompt_hash,
+        "retrieval_set_hash": decision.retrieval_set_hash,
+        "output_hash": decision.output_hash,
+        **extra,
+    }
+    try:
+        fact = client.store_fact(
+            StoreFact(
+                entity=f"jev:{entity}",
+                key=f"decision:{decision.request_id or decision.invocation_id}",
+                value=json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+                source_receipt=decision.receipt_id,
+            )
+        )
+    except (CueCruxError, httpx.HTTPError) as err:
+        raise DecisionNotRecorded(
+            f"receipt {decision.receipt_id} minted but the decision fact was not stored ({err})",
+            decision,
+        ) from err
+    return replace(decision, fact_id=fact.fact_id)
 
 
 def decide(
@@ -244,28 +306,7 @@ def decide(
         raw=raw,
     )
 
-    draft = {
-        "kind": "model_invocation",
-        "invocation_id": decision.invocation_id,
-        "provider": "typesafe",
-        "model_id": model,
-        "model_version": model_version,
-        "provider_request_id": request_id,
-        "prompt_hash": decision.prompt_hash,
-        "retrieval_set_hash": decision.retrieval_set_hash,
-        "output_hash": decision.output_hash,
-        "started_at": started_at,
-        "completed_at": completed_at,
-    }
-    try:
-        minted = client.post_mediation_receipt(draft)
-    except (CueCruxError, httpx.HTTPError) as err:
-        raise DecisionNotRecorded(
-            f"Jev answered but no receipt was minted ({err}); "
-            "the daemon needs CORECRUXD_STREAM_RECEIPTS=1",
-            decision,
-        ) from err
-    decision = replace(decision, receipt_id=minted["receipt_id"])
+    decision = _mint(client, decision, model, started_at, completed_at)
     ref = request_id or decision.invocation_id
 
     if store_state:
@@ -284,33 +325,9 @@ def decide(
                 decision,
             ) from err
 
-    record = {
-        "answers": answers,
-        "model_id": model,
-        "model_version": model_version,
-        "request_id": request_id,
-        "invocation_id": decision.invocation_id,
-        "prompt_hash": decision.prompt_hash,
-        "retrieval_set_hash": decision.retrieval_set_hash,
-        "output_hash": decision.output_hash,
-        "retrieved": retrieved,
-        "retrieval_truncated": bundle.truncated,
-    }
-    try:
-        fact = client.store_fact(
-            StoreFact(
-                entity=f"jev:{entity}",
-                key=f"decision:{ref}",
-                value=json.dumps(record, ensure_ascii=False, separators=(",", ":")),
-                source_receipt=decision.receipt_id,
-            )
-        )
-    except (CueCruxError, httpx.HTTPError) as err:
-        raise DecisionNotRecorded(
-            f"receipt {decision.receipt_id} minted but the decision fact was not stored ({err})",
-            decision,
-        ) from err
-    return replace(decision, fact_id=fact.fact_id)
+    return _store_decision(
+        client, decision, entity, model, retrieved=retrieved, retrieval_truncated=bundle.truncated
+    )
 
 
 class TamperedRequest(Exception):
