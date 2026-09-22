@@ -22,15 +22,17 @@ carries no ``retrieved`` list. The receipt claims no Crux retrieval.
 ``prompt_hash`` is over ``{state, questions}`` as the classifier puts them on
 the wire (messages converted to role/content JSON); ``output_hash`` is over
 ``{model, answers}`` as the classifier parsed them. As with :func:`~.jev.decide`,
-a record that fails raises :class:`~.jev.DecisionNotRecorded` out of the
-classifier call (``raise_error``), so ``AutoModeMiddleware`` fails closed.
+a record that fails -- an HTTP error or a daemon reply that is not a receipt
+or a fact -- raises :class:`~.jev.DecisionNotRecorded` out of the classifier
+call (``raise_error``), so ``AutoModeMiddleware`` fails closed.
 
 On Python 3.10, async agent runs do not reach this handler for middleware
 calls (they ``ainvoke`` the classifier with no config), so those go unrecorded.
 
-Install with the extra::
+Install with the ``jev-langchain`` extra, from a Crux checkout until the
+packages are on PyPI::
 
-    pip install 'cuecrux-adapters[jev-langchain]'
+    pip install -e sdks/python -e 'integrations/adapters[jev-langchain]'
 """
 
 from __future__ import annotations

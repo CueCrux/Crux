@@ -190,8 +190,9 @@ decision.answers["block"]["noul"], decision.receipt_id, decision.request_id
   raises `DecisionNotRecorded`, and `.decision` still holds the answers.
 - **Replay** (`store_state=True`, then `crux_adapters.jev.replay`) checks the
   stored request against the receipt's signed body before re-sending it, and
-  needs `pip install 'cuecrux-adapters[jev-replay]'` (BLAKE3); without it
-  replay refuses with `ImportError`.
+  needs the `jev-replay` extra (BLAKE3); without it replay refuses with
+  `ImportError`. The packages are not on PyPI yet, so from this repository:
+  `pip install -e sdks/python -e 'integrations/adapters[jev-replay]'`.
 
 A receipt shows what was asked, of which model version, on what evidence, and
 what came back, **as the calling process reported it**: the daemon never talks

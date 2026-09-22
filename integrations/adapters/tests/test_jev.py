@@ -13,8 +13,10 @@ Two opt-in layers:
 * ``CRUX_FIXTURE_URL`` set -- run against a real daemon started with
   ``CORECRUXD_STREAM_RECEIPTS=1`` and ``CORECRUXD_CONTEXT_SURFACE=1``
   (``CRUX_TOKEN_FILE`` names a bearer-token file if it needs auth). Jev is
-  stubbed unless a key file exists.
-* ``~/.config/typesafe/api_key`` exists -- one real Jev call, mocked daemon.
+  stubbed unless the live layer below is on.
+* ``JEV_LIVE=1`` **and** ``~/.config/typesafe/api_key`` exists -- real, paid Jev
+  calls: one with a mocked daemon, and the fixture layer's. A key file alone
+  is not consent to spend.
 """
 
 from __future__ import annotations
@@ -53,6 +55,7 @@ from crux_adapters.jev import (
 from cuecrux_client import CueCruxClient, CueCruxError, StoreFact
 
 KEY_FILE = Path.home() / ".config" / "typesafe" / "api_key"
+LIVE_JEV = os.environ.get("JEV_LIVE") == "1" and KEY_FILE.exists()
 
 try:  # the jev-replay extra; replay() refuses to run without it
     from blake3 import blake3 as _blake3
@@ -60,7 +63,7 @@ try:  # the jev-replay extra; replay() refuses to run without it
     HAVE_BLAKE3 = True
 except ImportError:
     HAVE_BLAKE3 = False
-needs_blake3 = unittest.skipUnless(HAVE_BLAKE3, "blake3 not installed (cuecrux-adapters[jev-replay])")
+needs_blake3 = unittest.skipUnless(HAVE_BLAKE3, "blake3 not installed (the jev-replay extra)")
 
 
 def b3(data: bytes) -> str:
@@ -196,6 +199,9 @@ class FakeDaemon:
         self.observations: list[dict] = []
         self.signature_valid = True
         self.listed = True
+        # Replies that override the receipt / fact routes: what a broken proxy sends.
+        self.receipt_reply: httpx.Response | None = None
+        self.fact_reply: httpx.Response | None = None
         # What /verification reports per receipt: the hash of the body as minted.
         # Tests edit ``observations`` to model what the listing returns instead.
         self.verified: dict[str, str] = {}
@@ -225,6 +231,8 @@ class FakeDaemon:
                 return httpx.Response(self.context_status, json={"detail": "not found"})
             return httpx.Response(200, json=BUNDLE)
         if route == ("POST", "/v1/mediation/receipts"):
+            if self.receipt_reply is not None:
+                return self.receipt_reply
             draft = json.loads(request.content)
             if self.receipt_status != 201:
                 # What a flag-off daemon says: the draft hits the legacy parse.
@@ -260,6 +268,8 @@ class FakeDaemon:
                 },
             )
         if route == ("PUT", "/v1/facts"):
+            if self.fact_reply is not None:
+                return self.fact_reply
             if self.fact_status != 201:
                 return httpx.Response(self.fact_status, json={"detail": "store failed"})
             body = json.loads(request.content)
@@ -560,6 +570,51 @@ class Failures(unittest.TestCase):
                 self.assertIsInstance(caught.exception.__cause__, ValueError)
                 self.assertEqual(daemon.sent("POST", "/v1/mediation/receipts"), [])
                 self.assertEqual(daemon.sent("PUT", "/v1/facts"), [])
+
+    def test_malformed_daemon_replies_raise_decision_not_recorded(self) -> None:
+        # Not HTTP errors, so the old (CueCruxError, httpx.HTTPError) net missed
+        # them and the paid-for answers escaped as a bare KeyError & co.
+        html = httpx.Response(200, text="<html>proxy login</html>")
+        empty = httpx.Response(200, json={})
+        array_502 = httpx.Response(502, json=["bad gateway"])
+        null_id = httpx.Response(200, json={"receipt_id": None})
+        cases = [  # (route, reply, store_state, cause, recorded receipt)
+            ("receipt", html, False, json.JSONDecodeError, None),
+            ("receipt", empty, False, KeyError, None),
+            ("receipt", array_502, False, AttributeError, None),
+            ("receipt", null_id, False, ValueError, None),
+            ("fact", empty, False, KeyError, "r_test"),
+            ("fact", array_502, False, AttributeError, "r_test"),
+            ("fact", html, True, json.JSONDecodeError, "r_test"),  # the replay request store
+        ]
+        for route, reply, store_state, cause, receipt_id in cases:
+            with self.subTest(route=route, body=reply.content[:20], store_state=store_state):
+                daemon = FakeDaemon()
+                setattr(daemon, f"{route}_reply", reply)
+                with self.assertRaises(DecisionNotRecorded) as caught:
+                    run(daemon=daemon, store_state=store_state)
+                self.assertIsInstance(caught.exception.__cause__, cause)
+                self.assertEqual(caught.exception.decision.answers, JEV_RESPONSE["answers"])
+                self.assertEqual(caught.exception.decision.receipt_id, receipt_id)
+                self.assertIsNone(caught.exception.decision.fact_id)
+                if receipt_id is None:
+                    self.assertEqual(daemon.sent("PUT", "/v1/facts"), [])  # no unlinked fact
+
+    def test_answers_json_cannot_hold_raise_decision_not_recorded(self) -> None:
+        # A custom JevCaller can hand back anything; a set is not JSON.
+        answers = {"block": {"type": "noul", "noul": {0.5}}}
+        daemon = FakeDaemon()
+        with self.assertRaises(DecisionNotRecorded) as caught:
+            decide(daemon.client(), QUESTIONS, entity="invoice:42", token_budget=500,
+                   jev=lambda body: ({"model": "custom", "answers": answers}, "req_set"))
+        self.assertIsInstance(caught.exception.__cause__, TypeError)
+        self.assertIs(caught.exception.decision.answers, answers)
+        self.assertEqual(daemon.sent("POST", "/v1/mediation/receipts"), [])
+
+    def test_decide_lets_the_daemon_choose_the_receipt_id(self) -> None:
+        # Ids are caller-choosable daemon-side; decide never picks one.
+        _, daemon, _ = run()
+        self.assertNotIn("receipt_id", json.loads(daemon.sent("POST", "/v1/mediation/receipts")[0].content))
 
     def test_provider_label_is_the_callers(self) -> None:
         _, daemon, _ = run(provider="offline-stub")
@@ -884,19 +939,33 @@ class Replay(unittest.TestCase):
                 self.assertEqual(jev.requests, [])
 
     @needs_blake3
-    def test_the_genuine_body_among_junk_claims_still_replays(self) -> None:
-        # Junk records claiming the receipt id must not make the genuine
-        # decision look tampered: the one whose bytes verify is used.
+    def test_a_receipt_id_claimed_by_two_distinct_bodies_is_refused(self) -> None:
+        # The daemon lets a minter choose receipt_id, and /verification resolves
+        # an id to one record, so a second body under the id could shadow the
+        # first. Refuse to pick: fail closed, even though junk blocks replay.
         _, daemon, _ = run(store_state=True)
         genuine = daemon.observations[0]
         body = _cbor_decode(bytes.fromhex(genuine["body_cbor_hex"]))
-        junk = [
+        for junk in (
             dict(genuine, body_cbor_hex=cbor({**body, "output_hash": "sha256:" + "0" * 64}).hex()),
             dict(genuine, body_cbor_hex="zz"),
             {"receipt_id": "r_test", "body_cbor_hex": None},
             {"receipt_id": "r_test"},
-        ]
-        daemon.observations = junk[:2] + [genuine] + junk[2:] + [dict(genuine)]
+            {"receipt_id": "r_test", "body_cbor_hex": ["unhashable"]},
+        ):
+            for order in ((junk, genuine), (genuine, junk)):
+                with self.subTest(junk=str(junk.get("body_cbor_hex", "<missing>"))[:16], genuine_first=order[0] is genuine):
+                    daemon.observations = list(order)
+                    jev = FakeJev()
+                    with self.assertRaisesRegex(TamperedRequest, "claimed by 2 distinct bodies"):
+                        replay(daemon.client(), "invoice:42", "decision:req_123", jev=jev.caller())
+                    self.assertEqual(jev.requests, [])
+
+    @needs_blake3
+    def test_one_body_listed_twice_still_replays(self) -> None:
+        # Positive control for the refusal above: identical bytes are one body.
+        _, daemon, _ = run(store_state=True)
+        daemon.observations = [daemon.observations[0], dict(daemon.observations[0])]
         jev = FakeJev()
         result = replay(daemon.client(), "invoice:42", "decision:req_123", jev=jev.caller())
         self.assertFalse(result.changed)
@@ -928,7 +997,7 @@ class Replay(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"blake3": None}):  # import blake3 -> ImportError
             with self.assertRaises(ImportError) as caught:
                 replay(daemon.client(), "invoice:42", "decision:req_123", jev=jev.caller())
-        self.assertIn("cuecrux-adapters[jev-replay]", str(caught.exception))
+        self.assertIn("integrations/adapters[jev-replay]", str(caught.exception))
         self.assertEqual((jev.requests, len(daemon.requests)), ([], before))  # nothing read, Jev not called
 
     @needs_blake3
@@ -1024,7 +1093,7 @@ class FixtureDaemonEndToEnd(unittest.TestCase):
         client.store_fact(
             StoreFact(entity=entity, key="policy", value="over 10k needs two approvals")
         )
-        if KEY_FILE.exists():
+        if LIVE_JEV:
             self.jev = jev_http(api_key=KEY_FILE.read_text())
         else:
             self.jev = lambda body: (JEV_RESPONSE, f"stub-{uuid.uuid4().hex[:8]}")
@@ -1112,7 +1181,7 @@ class FixtureDaemonEndToEnd(unittest.TestCase):
             replay(client, entity, key, jev=lambda body: self.fail("Jev called on forged facts"))
 
 
-@unittest.skipUnless(KEY_FILE.exists(), f"{KEY_FILE} not present")
+@unittest.skipUnless(LIVE_JEV, f"paid Jev call: set JEV_LIVE=1 and provide {KEY_FILE}")
 class LiveJev(unittest.TestCase):
     def test_one_real_call_matches_the_documented_contract(self) -> None:
         daemon = FakeDaemon()

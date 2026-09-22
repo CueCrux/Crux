@@ -244,6 +244,22 @@ class ClassifierDecisions(unittest.TestCase):
         asyncio.run(jev.classifier().ainvoke(classifier_request(), config={"callbacks": [handler]}))
         self.check(jev, daemon)
 
+    def test_malformed_daemon_reply_fails_closed(self) -> None:
+        # A 200 that is not a receipt / fact is a failure to record, not a
+        # KeyError: DecisionNotRecorded, answers kept, raised out of the call.
+        import httpx
+
+        for route, receipt_id in (("receipt", None), ("fact", "r_test")):
+            with self.subTest(route=route):
+                jev, daemon = FakeJev(), FakeDaemon()
+                setattr(daemon, f"{route}_reply", httpx.Response(200, json={}))
+                handler = JevReceiptHandler(daemon.client(), entity="ticket:7")
+                with self.assertRaises(DecisionNotRecorded) as caught:
+                    jev.classifier().invoke(classifier_request(), config={"callbacks": [handler]})
+                self.assertIsInstance(caught.exception.__cause__, KeyError)
+                self.assertEqual(caught.exception.decision.answers, jev.replies[0]["answers"])
+                self.assertEqual(caught.exception.decision.receipt_id, receipt_id)
+
     def test_jev_failure_records_nothing(self) -> None:
         jev, daemon = FakeJev(status=500), FakeDaemon()
         handler = JevReceiptHandler(daemon.client(), entity="ticket:7")

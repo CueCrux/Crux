@@ -135,6 +135,11 @@ python3 -m venv .venv && . .venv/bin/activate    # or: uv venv && . .venv/bin/ac
 pip install -e sdks/python -e integrations/adapters  # or: uv pip install -e ... -e ...
 ```
 
+`cuecrux-client` and `cuecrux-adapters` are not on PyPI yet, so install both
+from the checkout, as above, with any extra on the adapters path
+(`-e 'integrations/adapters[jev-replay]'`). A plain `pip install` from PyPI
+will follow the first release.
+
 **Jev key.** Keep it out of code and out of the repository. Either a file:
 
 ```bash
@@ -144,6 +149,13 @@ mkdir -p ~/.config/typesafe && (umask 077; cat > ~/.config/typesafe/api_key)   #
 or the `TYPESAFE_API_KEY` environment variable, which is what `jev_http()`
 reads by default (and `TYPESAFE_BASE_URL` to override the endpoint).
 `jev_http(api_key=...)` refuses a blank key before any request.
+
+**Tests.** `python -m unittest discover -s tests` in `integrations/adapters`
+runs against mocked HTTP and never reaches TypeSafe. The layers that make
+real, billed Jev calls run only with `JEV_LIVE=1` set **and** the key file
+present; a key on disk is not consent to spend. `CRUX_FIXTURE_URL` (plus
+`CRUX_TOKEN_FILE`) points the fixture layer at a real daemon, with Jev stubbed
+unless `JEV_LIVE=1`.
 
 ## A guardrail: should this shell command be blocked?
 
@@ -238,13 +250,21 @@ live in the mediation observation log:
 
 ```bash
 crux "/v1/observations/aggregate?kind=model_invocation&limit=500" \
-  | jq --arg r "$RID" '[.observations[] | select(.payload.receipt_id == $r)][0].payload' > receipt.json
+  | jq --arg r "$RID" '[.observations[] | select(.payload.receipt_id == $r) | .payload]' > claims.json
+# One distinct body, or stop: the daemon does not keep receipt ids unique.
+[ "$(jq '[.[].body_cbor_hex] | unique | length' claims.json)" = 1 ] \
+  && jq '.[0]' claims.json > receipt.json \
+  || echo "STOP: $RID is claimed by no body or by several distinct bodies" >&2
 jq -r .body_cbor_hex receipt.json | xxd -r -p > body.cbor
 jq -r .sig.signature_hex receipt.json | xxd -r -p > sig.bin
 
 openssl pkeyutl -verify -pubin -inkey "$CRUX_DAEMON_PUBKEY_PEM" -rawin -in body.cbor -sigfile sig.bin
 grep -qaF "$PROMPT_HASH" body.cbor && echo "prompt_hash is in the signed body"
 ```
+
+A minting caller may choose a stream receipt's `receipt_id`, and the daemon
+does not refuse a repeat, so one id can name two signed bodies; taking the
+first match could check the wrong one. Refuse instead of picking.
 
 `openssl pkeyutl -rawin` needs OpenSSL 3. The fixture writes the public key as
 `daemon.pub.pem`. For another daemon, an operator reads it from
@@ -322,9 +342,10 @@ may already have run the call, and billed it. To use the official
 Opt in per decision with `store_state=True`; `replay` then re-sends the
 stored request -- exactly its `model`, `state` and `questions`, the fields the
 receipt covers -- and shows whether the verdict moved. It needs BLAKE3, which
-the standard library lacks: `pip install 'cuecrux-adapters[jev-replay]'`
-(the `blake3` package). Without it `replay` raises `ImportError` before it
-reads anything, rather than skip the check.
+the standard library lacks: the `jev-replay` extra (the `blake3` package),
+from the checkout `pip install -e sdks/python -e 'integrations/adapters[jev-replay]'`.
+Without it `replay` raises `ImportError` before it reads anything, rather
+than skip the check.
 
 ```python
 from crux_adapters.jev import TamperedRequest, decide, replay
@@ -349,12 +370,14 @@ can write facts could rewrite both facts to agree with each other):
    `error_code: OK`).
 3. The signed body is read from `GET /v1/observations/aggregate?kind=model_invocation`.
    Anyone with `sessions:write` can add records to that listing, so nothing
-   in a listed record is taken on trust: `replay` hashes each candidate's
-   `body_cbor_hex` bytes with BLAKE3 itself and uses the one that equals the
-   `payload_hash` the daemon just verified (other records claiming the same
-   receipt id are ignored; if none match, `TamperedRequest`). Its CBOR is
-   decoded by a strict decoder in `crux_adapters.jev`. The listed `body_hash`
-   and the unsigned hashes next to the body are ignored.
+   in a listed record is taken on trust: `replay` hashes the listed
+   `body_cbor_hex` bytes with BLAKE3 itself and requires them to equal the
+   `payload_hash` the daemon just verified. Every listed record claiming the
+   receipt id must carry the same body: two distinct bodies raise
+   `TamperedRequest` rather than pick one. That fails closed, so a junk record
+   claiming the id blocks replay of the genuine decision. The CBOR is decoded
+   by a strict decoder in `crux_adapters.jev`. The listed `body_hash` and the
+   unsigned hashes next to the body are ignored.
 4. From that decoded body: `prompt_hash` must equal the stored
    `{state, questions}` re-hashed, `model_id` the stored request's model,
    `provider_request_id` (or `invocation_id` when Jev sent none) the request id
@@ -369,18 +392,24 @@ What is still trusted: the daemon itself, twice. Its `/verification` does the
 Ed25519 check (replay does not hold the public key), and it signs whatever
 hashes a caller with receipt-minting scopes (`facts:write` +
 `sessions:write`) sends, so such a caller can mint a matching receipt for
-forged facts. For a check that trusts only the public key, verify the receipt
-offline as in [Verifying a receipt](#verifying-a-receipt), or with
-`corecruxctl receipts verify-stream-receipt` where your `corecruxctl` has it,
-and compare the hashes in the body yourself. Replay only searches the daemon's
+forged facts. Nor does the daemon keep receipt ids unique yet: a caller with
+those scopes may choose an id already in use, which is why replay and the
+offline recipe refuse an id claimed by more than one body. For a check that
+trusts only the public key, verify the receipt offline as in
+[Verifying a receipt](#verifying-a-receipt) and compare the hashes in the body
+yourself. A dedicated offline verifier CLI is proposed in a separate change;
+until it lands, use the openssl check above. Replay only searches the daemon's
 newest 1000 `model_invocation` observations (the route's cap); an older
 receipt raises `LookupError` rather than being skipped.
 
 The stored request includes your `untrusted` input verbatim, in an ordinary
 fact under `__jev__::<entity>` (HTTP fact writes cannot be private), so anyone
 who can read the tenant's facts can read it. The `__` namespace keeps it out of
-`/v1/context`, so a stored injection never comes back as trusted context in a
-later `decide`. Leave `store_state` off for inputs you should not retain.
+undirected `/v1/context` recall (a `query=` or the default bundle), so a
+stored injection does not come back as trusted context in a later `decide`,
+which names `<entity>`, never `__jev__::<entity>`. A request that names
+`__jev__::<entity>` itself still gets it back. Leave `store_state` off for
+inputs you should not retain.
 
 ## Linking the receipt from your traces
 
@@ -422,7 +451,8 @@ run config instead; LangChain hands it to every Jev call in the run, the
 middleware's included:
 
 ```bash
-pip install 'cuecrux-adapters[jev-langchain]'   # langchain-typesafe[experimental], tested on 0.0.1a3
+# From the checkout until the packages are on PyPI.
+pip install -e sdks/python -e 'integrations/adapters[jev-langchain]'   # langchain-typesafe[experimental], tested on 0.0.1a3
 ```
 
 ```python

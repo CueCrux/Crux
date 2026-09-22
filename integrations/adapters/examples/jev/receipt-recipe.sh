@@ -36,7 +36,10 @@ api() { # api METHOD PATH [curl args...] -> body in $OUT/resp.json, echoes statu
   curl -s -o resp.json -w '%{http_code}' -X "$m" "$B$p" -H @auth.h "$@"
 }
 
-# ── the Jev call being recorded (canonical JSON: sorted keys, no spaces) ──
+# ── the Jev call being recorded ────────────────────────────────────────────
+# Demo digests only: sha256 over these exact file bytes, trailing newline
+# included. Not the adapter's form (compact JSON of {state, questions}, key
+# order preserved, not sorted); see the cookbook's "Canonical hashing".
 cat > state.json <<'EOF'
 {"options":["approve","escalate","reject"],"questions":["Should this invoice be paid?"],"state":{"amount_eur":1840.5,"invoice_id":"INV-4711","vendor":"acme-gmbh"}}
 EOF
@@ -91,8 +94,13 @@ pass "c. /verification signature_valid=true error_code=OK chain_position_checked
 
 code="$(api GET "/v1/observations/aggregate?kind=model_invocation&limit=500")"
 [ "$code" = 200 ] || fail "c. observations HTTP $code"
-jq --arg r "$RID" '[.observations[] | select(.payload.receipt_id == $r)] | first' resp.json > record.json
-[ "$(jq -r .payload.receipt_id record.json)" = "$RID" ] || fail "c. receipt not in mediation log"
+jq --arg r "$RID" '[.observations[] | select(.payload.receipt_id == $r)]' resp.json > claims.json
+# A minter may choose receipt_id and the daemon does not refuse a repeat, so
+# one id can name two signed bodies. Exactly one distinct body, or stop.
+n="$(jq '[.[].payload.body_cbor_hex] | unique | length' claims.json)"
+[ "$n" != 0 ] || fail "c. receipt not in mediation log"
+[ "$n" = 1 ] || fail "c. receipt id $RID claimed by $n distinct bodies"
+jq '.[0]' claims.json > record.json
 jq -r .payload.body_cbor_hex record.json | xxd -r -p > body.cbor
 jq -r .payload.sig.signature_hex record.json | xxd -r -p > sig.bin
 pass "c. body ($(wc -c < body.cbor) bytes CBOR) + ed25519 sig ($(wc -c < sig.bin) bytes) from /v1/observations/aggregate"

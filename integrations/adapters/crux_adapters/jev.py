@@ -35,8 +35,9 @@ exactly what is checked and what is still trusted. HTTP fact writes cannot be
 private (``private=true`` is MCP-only), so that fact is an ordinary one: it
 holds ``untrusted_input`` verbatim, anyone who can read the tenant's facts can
 read it, and it is push-eligible on sync. The ``__`` namespace keeps it out of
-undirected ``/v1/context`` recall, so a later :func:`decide` cannot pull the
-stored untrusted input back in as ``trusted_context``.
+undirected ``/v1/context`` recall, so a later :func:`decide` on ``<entity>``
+cannot pull the stored untrusted input back in as ``trusted_context``; only a
+request naming ``__jev__::<entity>`` itself gets it back.
 
 Every hash is :func:`digest`: ``sha256`` over ``json.dumps(value,
 ensure_ascii=False, separators=(",", ":"), allow_nan=False)`` encoded as UTF-8.
@@ -64,7 +65,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import httpx
-from cuecrux_client import CueCruxError, StoreFact
+from cuecrux_client import StoreFact
 
 from .core import ContextBundle, ContextItem, fetch_bundle
 
@@ -248,6 +249,13 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def _id(value: Any, field: str) -> str:
+    """``value`` if it is a non-empty string; a reply without one recorded nothing."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"the daemon's reply has no usable {field} ({value!r})")
+    return value
+
+
 def _mint(
     client: Any,
     decision: JevDecision,
@@ -259,13 +267,13 @@ def _mint(
     """Hash Jev's output and sign ``decision`` as a ``model_invocation`` receipt.
 
     Sets ``output_hash`` and ``receipt_id``. Jev has answered, and been paid, by
-    now, so answers that cannot be hashed (NaN, infinity) raise
-    :class:`DecisionNotRecorded` with the answers kept, like any other failure
-    to record.
+    now, so answers that cannot be hashed (NaN, infinity, values JSON cannot
+    hold) raise :class:`DecisionNotRecorded` with the answers kept, like any
+    other failure to record -- an HTTP error or a reply that is not a receipt.
     """
     try:
         output_hash = digest({"model": decision.model_version, "answers": decision.answers})
-    except ValueError as err:
+    except (ValueError, TypeError) as err:
         raise DecisionNotRecorded(
             f"Jev answered but its answers cannot be hashed ({err}); nothing was recorded",
             decision,
@@ -284,15 +292,17 @@ def _mint(
         "started_at": started_at,
         "completed_at": completed_at,
     }
+    # Exception, not just HTTP errors: a 200 that is HTML, {} or a list must
+    # not escape as a bare KeyError with the paid-for answers lost.
     try:
-        minted = client.post_mediation_receipt(draft)
-    except (CueCruxError, httpx.HTTPError) as err:
+        receipt_id = _id(client.post_mediation_receipt(draft)["receipt_id"], "receipt_id")
+    except Exception as err:
         raise DecisionNotRecorded(
-            f"Jev answered but no receipt was minted ({err}); "
+            f"Jev answered but no receipt was minted ({err!r}); "
             "the daemon needs CORECRUXD_STREAM_RECEIPTS=1",
             decision,
         ) from err
-    return replace(decision, receipt_id=minted["receipt_id"])
+    return replace(decision, receipt_id=receipt_id)
 
 
 def _store_decision(
@@ -319,12 +329,13 @@ def _store_decision(
                 source_receipt=decision.receipt_id,
             )
         )
-    except (CueCruxError, httpx.HTTPError) as err:
+        fact_id = _id(fact.fact_id, "fact_id")
+    except Exception as err:
         raise DecisionNotRecorded(
-            f"receipt {decision.receipt_id} minted but the decision fact was not stored ({err})",
+            f"receipt {decision.receipt_id} minted but the decision fact was not stored ({err!r})",
             decision,
         ) from err
-    return replace(decision, fact_id=fact.fact_id)
+    return replace(decision, fact_id=fact_id)
 
 
 def decide(
@@ -354,8 +365,9 @@ def decide(
     label: set it when ``jev`` is not TypeSafe's Jev (a stub, a proxy).
 
     Retrieval and Jev errors propagate before anything is recorded. After Jev
-    answered, any failure to record -- receipt, fact, or answers that cannot
-    be hashed -- raises :class:`DecisionNotRecorded`.
+    answered, any failure to record -- receipt, fact, a daemon reply that is
+    not what it should be, or answers that cannot be hashed -- raises
+    :class:`DecisionNotRecorded`.
     """
     call = jev or jev_http()  # a missing key fails before any request
     bundle = fetch_bundle(client, entity=entity, query=crux_query, token_budget=token_budget)
@@ -399,9 +411,9 @@ def decide(
                     source_receipt=decision.receipt_id,
                 )
             )
-        except (CueCruxError, httpx.HTTPError) as err:
+        except Exception as err:
             raise DecisionNotRecorded(
-                f"receipt {decision.receipt_id} minted but the replay request was not stored ({err})",
+                f"receipt {decision.receipt_id} minted but the replay request was not stored ({err!r})",
                 decision,
             ) from err
 
@@ -515,7 +527,8 @@ def _blake3() -> Callable[[bytes], str]:
     except ImportError as err:
         raise ImportError(
             "replay() hashes the signed receipt body with BLAKE3, which needs the "
-            "'blake3' package: pip install 'cuecrux-adapters[jev-replay]'"
+            "'blake3' package (the jev-replay extra). From a Crux checkout: "
+            "pip install -e sdks/python -e 'integrations/adapters[jev-replay]'"
         ) from err
     return lambda data: blake3(data).hexdigest()
 
@@ -528,8 +541,14 @@ def _signed_body(client: Any, receipt_id: str, blake3: Callable[[bytes], str]) -
     observation log (``GET /v1/observations/aggregate``), the place a daemon
     without a dataplane serves them. Anyone who can post session observations
     can add records to that listing, so every field of a listed record is
-    untrusted: the body used is the one whose bytes hash, here, to the verified
-    ``payload_hash``. Other records claiming ``receipt_id`` are ignored.
+    untrusted: the body's bytes must hash, here, to the verified
+    ``payload_hash``.
+
+    A receipt id does not name one body: the daemon lets the minting caller
+    choose it and does not refuse a repeat. So the listed records claiming
+    ``receipt_id`` must all carry the same ``body_cbor_hex``; two distinct
+    bodies raise :class:`TamperedRequest` rather than pick one. Fail closed:
+    a junk record claiming the id blocks replay of the genuine one.
     """
     report = client.verify_receipt(receipt_id, tenant_id="local")
     if report.get("signature_valid") is not True or report.get("error_code") != "OK":
@@ -546,17 +565,15 @@ def _signed_body(client: Any, receipt_id: str, blake3: Callable[[bytes], str]) -
             f"receipt {receipt_id} is not among the daemon's newest "
             f"{_OBSERVATION_WINDOW} model_invocation observations"
         )
-    raw = None
-    for payload in found:
-        try:
-            data = bytes.fromhex(payload.get("body_cbor_hex"))
-        except (TypeError, ValueError):
-            continue
-        if isinstance(verified, str) and blake3(data) == verified:
-            raw = data
-            break
-    if raw is None:
-        raise TamperedRequest(f"receipt {receipt_id}: no listed body hashes to the one verified")
+    distinct = {json.dumps(p.get("body_cbor_hex")) for p in found}  # any JSON value, hashable
+    if len(distinct) > 1:
+        raise TamperedRequest(f"receipt id {receipt_id} claimed by {len(distinct)} distinct bodies")
+    try:
+        raw = bytes.fromhex(found[0].get("body_cbor_hex"))
+    except (TypeError, ValueError):
+        raw = None
+    if raw is None or not isinstance(verified, str) or blake3(raw) != verified:
+        raise TamperedRequest(f"receipt {receipt_id}: the listed body does not hash to the one verified")
     try:
         body = _cbor_decode(raw)
     except ValueError as err:
@@ -586,7 +603,8 @@ def replay(
     original is re-sent, so an alias such as ``jev-latest`` reaches whatever
     version it names today.
 
-    Needs the ``blake3`` package (``pip install 'cuecrux-adapters[jev-replay]'``);
+    Needs the ``blake3`` package, the ``jev-replay`` extra (from a Crux
+    checkout: ``pip install -e sdks/python -e 'integrations/adapters[jev-replay]'``);
     without it replay raises ``ImportError`` before reading anything.
 
     Before Jev is called, both facts must name the same ``source_receipt``,
@@ -602,8 +620,10 @@ def replay(
     * ``output_hash``: the decision fact's ``{model_version, answers}``, so
       ``old_answers`` are the answers that were signed.
 
-    Otherwise :class:`TamperedRequest`. A receipt older than the daemon's
-    newest 1000 ``model_invocation`` observations raises ``LookupError``.
+    Otherwise :class:`TamperedRequest` -- also when the listing holds more
+    than one distinct body for the receipt id (see :func:`_signed_body`). A
+    receipt older than the daemon's newest 1000 ``model_invocation``
+    observations raises ``LookupError``.
     Jev is sent exactly ``model``, ``state`` and ``questions``: any other key
     in the stored request is outside ``prompt_hash``, so it is dropped.
 
