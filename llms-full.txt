@@ -108,7 +108,7 @@ To understand what makes this tamper-evident, read these symbols in order:
 
 ## Build / test
 
-- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.64
+- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.65
   (`[workspace.package]` in `Cargo.toml` is authoritative, and
   `scripts/check-agent-docs.sh` fails the build when this line disagrees with it).
 - `cargo build --workspace --locked`
@@ -530,7 +530,7 @@ schema: crux-agent-manifest/v1
 summary: Local-first, tamper-evident retrieval + memory engine with signed, replayable receipts.
 msrv: "1.88.0"
 edition: "2021"
-workspace_version: "0.5.64"
+workspace_version: "0.5.65"
 
 verify_commands:
   - cargo test --workspace
@@ -4500,6 +4500,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.65] - 2026-09-22
+
+### Added
+
+- **Memory parity.** Recall applies a match floor and reports honest misses
+  instead of padding weak hits (#791); a curated engram tier plus a memory
+  digest is rendered into `CLAUDE.md` and `AGENTS.md`, with engrams on by
+  default (#792); read-only native memory ingest as a projection (#787).
+- **Prompt-cache awareness.** A cache-invalidation ledger (#788), a monotone
+  MCP tool surface per session so the tool list stops churning the cache
+  (#789), and cold-context awareness (#790). The boot banner's Python renderer
+  gained the cold-cache line and a token fallback (#793).
+- **Proof-carrying adaptive packs, first steps.** The `pack.conformance.v1`
+  manifest format (#767) and shadow-corpus staging with a replay harness
+  (#768, #769).
+- **Extension lifecycle seams.** Staged activation (#763), a conformance hook
+  (#764), per-pack outcome events (#765), and atomic rollback to a pinned prior
+  build (#766).
+- **Delegated embedding has one payer per daemon** (#760).
+- An `escrow_recovery_code` fuzz target (#758) and an enforced-by lint for
+  load-bearing auth claims (#748).
+
+### Changed
+
+- Four Pro claims that had no gate in the daemon were withdrawn from sale
+  rather than advertised (#761).
+
+### Security
+
+- Unwedged the security gates: yanked crates replaced and two live advisories
+  resolved (#785). A failing scheduled security audit now notifies someone
+  instead of failing silently (#786).
+- Dependency bumps: blake3, syn, wat, crc32fast, uuid, and CI actions
+  (#749, #756, #771, #772, #773, #775, #776, #780, #781, #784).
+
 ### Fixed
 
 - **One tenant erasure could wedge every write on the shard.** `forget-tenants`
@@ -5778,7 +5813,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-deny` supply chain and licence audit in CI
 - `cargo-audit` CVE scanning in CI
 
-[unreleased]: https://github.com/CueCrux/Crux/compare/v0.5.63...HEAD
+[unreleased]: https://github.com/CueCrux/Crux/compare/v0.5.65...HEAD
+[0.5.65]: https://github.com/CueCrux/Crux/compare/v0.5.64...v0.5.65
 [0.5.64]: https://github.com/CueCrux/Crux/compare/v0.5.63...v0.5.64
 [0.5.63]: https://github.com/CueCrux/Crux/compare/v0.5.62...v0.5.63
 [0.5.62]: https://github.com/CueCrux/Crux/compare/v0.5.61...v0.5.62
