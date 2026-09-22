@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`context_custody_audit` no longer reports a false all-green.** REMEMBER was
+  hardcoded `strong` and `trust_posture.standing_gap` was a literal "none" even
+  for a caller that could not write a single fact. REMEMBER is now scored for
+  the calling agent's passport (missing, revoked, or category-less under
+  `CORECRUXD_AGENT_PASSPORTS` → `partial`). PROVE is `strong` only once
+  `CRUX_EXPORT_VERIFY_PUBLIC_KEY_HEX` pins the export signer, since an
+  unpinned export only proves internal consistency. `standing_gap` names each
+  gap that remains (custody/coord review D1).
+
 ## [0.5.65] - 2026-09-22
 
 ### Added
@@ -47,15 +58,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#749, #756, #771, #772, #773, #775, #776, #780, #781, #784).
 
 ### Fixed
-
-- **`context_custody_audit` no longer reports a false all-green.** REMEMBER was
-  hardcoded `strong` and `trust_posture.standing_gap` was a literal "none" even
-  for a caller that could not write a single fact. REMEMBER is now scored for
-  the calling agent's passport (missing, revoked, or category-less under
-  `CORECRUXD_AGENT_PASSPORTS` → `partial`). PROVE is `strong` only once
-  `CRUX_EXPORT_VERIFY_PUBLIC_KEY_HEX` pins the export signer, since an
-  unpinned export only proves internal consistency. `standing_gap` names each
-  gap that remains (custody/coord review D1).
 
 - **One tenant erasure could wedge every write on the shard.** `forget-tenants`
   with `reclaim: true` retires a segment together with the L0 directory run
