@@ -14,9 +14,15 @@
 # - auth: jwt_hs256 with a per-fixture random secret; start registers the
 #   passport "jev-agent" (category work) and mints ONE token for it carrying
 #   only the scopes the receipt path needs (see SCOPES below)
-# - no phone-home: clean env (env -i), passport claim + update check off
-# - stop kills only the PID in the pidfile, and only if that PID is still
-#   this binary running from this fixture dir
+# - no phone-home: scrubbed env (nothing inherited), passport claim + update
+#   check off
+# - no secret ever sits in an argv (ps-visible): the HS256 secret reaches the
+#   daemon only through its environment, the admin JWT reaches curl through a
+#   0600 header file
+# - the pidfile records "<pid> <start time>" (/proc/<pid>/stat field 22);
+#   stop kills only a PID whose start time and cwd still match, so a rebuilt
+#   binary or a different CORECRUXD_BIN cannot orphan the daemon. A live PID
+#   that cannot be proven ours is never killed and its pidfile is kept.
 #
 # Env: CORECRUXD_BIN (default: corecruxd on PATH), JEV_FIXTURE_DIR
 # (default: ${TMPDIR:-/tmp}/jev-crux-fixture), JEV_FIXTURE_HTTP_PORT,
@@ -50,15 +56,31 @@ AUD="corecrux-fixture"
 
 die() { echo "fixture: $*" >&2; exit 1; }
 
-# PID from the pidfile, only if it is alive AND is our binary running in $FIX.
-our_pid() {
+# Start time of a PID in clock ticks since boot (/proc/<pid>/stat field 22).
+# comm (field 2) may contain spaces, so count from the last ')'.
+proc_start() {
+  local stat f
+  stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  read -ra f <<< "${stat##*) }"
+  echo "${f[19]}"
+}
+
+# Prints the pidfile PID. Returns 0 if it is alive and provably ours (same
+# start time as recorded at launch, cwd still $FIX), 1 if there is no
+# pidfile or the PID is dead, 2 if it is alive but not provably ours.
+pidfile_pid() {
   [ -f "$PIDFILE" ] || return 1
-  local pid; pid="$(cat "$PIDFILE")"
+  local pid start
+  read -r pid start < "$PIDFILE" || true
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
-  [ "$(readlink -f "/proc/$pid/exe" 2>/dev/null)" = "$(readlink -f "$BIN")" ] || return 1
-  [ "$(readlink -f "/proc/$pid/cwd" 2>/dev/null)" = "$(readlink -f "$FIX")" ] || return 1
+  [ -d "/proc/$pid" ] || return 1
   echo "$pid"
+  [ -n "$start" ] && [ "$(proc_start "$pid")" = "$start" ] \
+    && [ "$(readlink "/proc/$pid/cwd" 2>/dev/null)" = "$(readlink -f "$FIX")" ] || return 2
+}
+
+not_ours() {
+  die "pidfile $PIDFILE names live pid $1 but it cannot be proven to be this fixture's daemon; pidfile kept, nothing killed. Inspect: ls -l /proc/$1/exe /proc/$1/cwd; if it is the fixture, stop it with: kill $1 && rm $PIDFILE"
 }
 
 port_busy() { ss -Hltn "sport = :$1" | grep -q .; }
@@ -84,13 +106,15 @@ PY2
 
 # Fact writes by a passport-bearing token require a registered passport with a
 # category (crux-mcp category_enforce.rs). Register it once with a 60s
-# admin:write bootstrap token that only ever lives in this shell variable.
+# admin:write bootstrap token that only lives in a 0600 header file for the call.
 register_passport() {
-  local admin code
-  admin="$(mint_jwt "admin:write" 60)"
+  local code hdr="$FIX/admin.h"
+  # printf is a builtin: the JWT goes straight to the 0600 file, never argv.
+  (umask 077; printf 'Authorization: Bearer %s\n' "$(mint_jwt "admin:write" 60)" > "$hdr")
   code="$(curl -s -o "$FIX/passport.create.json" -w '%{http_code}' -X POST "$BASE/v1/passports" \
-    -H "Authorization: Bearer $admin" -H 'content-type: application/json' \
-    --data "{\"id\":\"$PASSPORT\",\"category\":\"work\",\"name\":\"Jev decision recorder (fixture)\"}")"
+    -H @"$hdr" -H 'content-type: application/json' \
+    --data "{\"id\":\"$PASSPORT\",\"category\":\"work\",\"name\":\"Jev decision recorder (fixture)\"}")" || code=000
+  rm -f "$hdr"
   case "$code" in
     201|409) ;;
     *) die "passport registration failed: HTTP $code $(cat "$FIX/passport.create.json")" ;;
@@ -108,7 +132,12 @@ export_pubkey() {
 
 cmd_start() {
   [ -x "$BIN" ] || die "corecruxd binary not found (set CORECRUXD_BIN)"
-  if pid="$(our_pid)"; then echo "fixture: already running pid=$pid $BASE"; return 0; fi
+  local pid rc=0
+  pid="$(pidfile_pid)" || rc=$?
+  case "$rc" in
+    0) echo "fixture: already running pid=$pid $BASE"; return 0 ;;
+    2) not_ours "$pid" ;;
+  esac
   for p in "$HTTP_PORT" "$GRPC_PORT"; do
     port_busy "$p" && die "port $p already in use; set JEV_FIXTURE_*_PORT"
   done
@@ -117,33 +146,40 @@ cmd_start() {
   if [ ! -s "$FIX/jwt.secret" ]; then
     (umask 077; printf 'base64:%s\n' "$(openssl rand -base64 48 | tr -d '\n')" > "$FIX/jwt.secret")
   fi
-  local secret; secret="$(cat "$FIX/jwt.secret")"
 
   cd "$FIX"
-  # env -i: nothing inherited (no CRUX_AGENT_TOKEN, no sync remotes, no
-  # XDG config). setsid in a non-interactive shell does not fork, and env
-  # execs the daemon, so $! is the daemon's own PID.
-  setsid env -i \
-    PATH=/usr/bin:/bin \
-    HOME="$FIX/home" \
-    CORECRUXD_DATA_DIR="$FIX/data" \
-    CORECRUXD_STATE_DIR="$FIX/data" \
-    CORECRUXD_HTTP_HOST=127.0.0.1 CORECRUXD_HTTP_PORT="$HTTP_PORT" \
-    CORECRUXD_GRPC_HOST=127.0.0.1 CORECRUXD_GRPC_PORT="$GRPC_PORT" \
-    CORECRUXD_MCP_HOST=127.0.0.1 CORECRUXD_MCP_PORT="$MCP_PORT" \
-    CORECRUXD_MCP_ENABLED=0 \
-    CORECRUXD_AUTH_MODE=jwt_hs256 \
-    CORECRUXD_JWT_HS256_SECRET="$secret" \
-    CORECRUXD_JWT_ISS="$ISS" CORECRUXD_JWT_AUD="$AUD" \
-    CORECRUXD_ROUTE_AUTH=enforce \
-    CORECRUXD_STREAM_RECEIPTS=1 \
-    CORECRUXD_CONTEXT_SURFACE=1 \
-    CORECRUXD_PASSPORT_CLAIM_ON_STARTUP=0 \
-    CORECRUXD_UPDATE_CHECK_ENABLED=0 \
-    "$BIN" > "$FIX/daemon.log" 2>&1 < /dev/null &
-  local pid=$!
+  # Subshell: un-export everything inherited (no CRUX_AGENT_TOKEN, no sync
+  # remotes, no XDG config), export only what the daemon needs, then exec.
+  # corecruxd has no *_FILE form of the HS256 secret, so it travels in the
+  # environment (readable only by this user), never in an argv. setsid in a
+  # non-interactive shell does not fork and the subshell execs it, so $! is
+  # the daemon's own PID.
+  (
+    mapfile -t inherited < <(compgen -e)
+    export -n "${inherited[@]}"
+    CORECRUXD_JWT_HS256_SECRET="$(cat "$FIX/jwt.secret")"
+    export CORECRUXD_JWT_HS256_SECRET \
+      PATH=/usr/bin:/bin \
+      HOME="$FIX/home" \
+      CORECRUXD_DATA_DIR="$FIX/data" \
+      CORECRUXD_STATE_DIR="$FIX/data" \
+      CORECRUXD_HTTP_HOST=127.0.0.1 CORECRUXD_HTTP_PORT="$HTTP_PORT" \
+      CORECRUXD_GRPC_HOST=127.0.0.1 CORECRUXD_GRPC_PORT="$GRPC_PORT" \
+      CORECRUXD_MCP_HOST=127.0.0.1 CORECRUXD_MCP_PORT="$MCP_PORT" \
+      CORECRUXD_MCP_ENABLED=0 \
+      CORECRUXD_AUTH_MODE=jwt_hs256 \
+      CORECRUXD_JWT_ISS="$ISS" CORECRUXD_JWT_AUD="$AUD" \
+      CORECRUXD_ROUTE_AUTH=enforce \
+      CORECRUXD_STREAM_RECEIPTS=1 \
+      CORECRUXD_CONTEXT_SURFACE=1 \
+      CORECRUXD_PASSPORT_CLAIM_ON_STARTUP=0 \
+      CORECRUXD_UPDATE_CHECK_ENABLED=0
+    exec setsid "$BIN"
+  ) > "$FIX/daemon.log" 2>&1 < /dev/null &
+  pid=$!
   disown "$pid" 2>/dev/null || true
-  echo "$pid" > "$PIDFILE"
+  # Start time is fixed at fork, so it is already final before the exec.
+  echo "$pid $(proc_start "$pid")" > "$PIDFILE"
 
   for _ in $(seq 1 120); do
     if curl -sf "$BASE/readyz" >/dev/null 2>&1; then break; fi
@@ -169,11 +205,12 @@ EOF
 }
 
 cmd_stop() {
-  local pid
-  if ! pid="$(our_pid)"; then
-    echo "fixture: not running (no live pidfile process owned by this fixture)"
-    rm -f "$PIDFILE"; return 0
-  fi
+  local pid rc=0
+  pid="$(pidfile_pid)" || rc=$?
+  case "$rc" in
+    1) echo "fixture: not running (no pidfile, or its pid is dead)"; rm -f "$PIDFILE"; return 0 ;;
+    2) not_ours "$pid" ;;
+  esac
   kill -TERM "$pid"
   for _ in $(seq 1 60); do
     kill -0 "$pid" 2>/dev/null || { rm -f "$PIDFILE"; echo "fixture: stopped pid=$pid"; return 0; }
@@ -183,8 +220,12 @@ cmd_stop() {
 }
 
 cmd_status() {
-  local pid
-  if ! pid="$(our_pid)"; then echo "fixture: stopped"; return 1; fi
+  local pid rc=0
+  pid="$(pidfile_pid)" || rc=$?
+  case "$rc" in
+    1) echo "fixture: stopped"; return 1 ;;
+    2) echo "fixture: pidfile pid=$pid is alive but not provably this fixture's daemon" >&2; return 1 ;;
+  esac
   local ready=no; curl -sf "$BASE/readyz" >/dev/null 2>&1 && ready=yes
   # Any TCP socket of ours whose peer is not loopback = egress.
   local egress; egress="$(ss -Htnp state established 2>/dev/null | grep "pid=$pid," \
