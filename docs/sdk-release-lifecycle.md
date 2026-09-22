@@ -59,7 +59,28 @@ No registry token is read by any workflow. What remains is registry-side
    `sdk-python.yml`). Generates PEP 740 attestations automatically. The
    `PYPI_TOKEN`/`NPM_TOKEN` secrets are deleted after cutover.
 
+3. **Publish only a clean, reproducible build.** Both PyPI publish jobs
+   upload only the artifact of a `build` job that installs nothing but the
+   pinned toolchain (`build==1.5.0`, `hatchling==1.31.0`), builds the sdist
+   and wheel twice under `SOURCE_DATE_EPOCH` (last commit time) and fails if
+   the two sha256 sets differ. Test dependencies (unpinned `httpx`, the
+   adapter frameworks) are installed only in separate jobs whose output is
+   never published. In `sdk-python.yml` the unit tests run in a `test` job
+   and `publish` needs `[test, build]`. In `adapters.yml` the `build` job is
+   tag-only and also runs the tag==version check and, after the upload, the
+   "published dependencies resolve from PyPI" dry-run;
+   `publish` needs `[conformance, build]` and downloads only `build`'s
+   artifact. The `conformance` job installs unpinned framework trees
+   (`crewai`, `llama-index-core`, `langchain-core`) whose transitive deps
+   survive its uninstall step, so its PR-time package build is never
+   uploaded — a compromised dependency there cannot reach `dist/` on PyPI.
+
 Do not add token-secret publish jobs.
+
+The publish jobs have no GitHub `environment:` gate. Adding one (e.g.
+`environment: pypi`) requires changing the PyPI trusted-publisher entry to
+the same environment name — it is currently blank, and a mismatch makes the
+OIDC exchange fail. Operator decision; change both sides together.
 
 ## Release procedure (per SDK)
 

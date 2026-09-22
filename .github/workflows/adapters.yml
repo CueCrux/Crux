@@ -28,16 +28,6 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.12'
-      - name: Require adapters tag to match package version
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/adapters-v')
-        run: |
-          set -euo pipefail
-          package_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
-          tag_version="${GITHUB_REF_NAME#adapters-v}"
-          if [[ "$tag_version" != "$package_version" ]]; then
-            echo "::error::adapters tag version $tag_version does not match pyproject.toml version $package_version"
-            exit 1
-          fi
 
       # The mapping layer covers reshaping and needs no daemon, so it runs on
       # every PR. The live layer needs a built corecruxd and runs locally via
@@ -76,35 +66,78 @@ jobs:
           python -m pip uninstall -y langchain-core llama-index-core crewai
           python -m conformance --mapping
 
+      # PR-time packaging check only. This environment has had unpinned
+      # framework trees installed (their transitive deps survive the
+      # uninstall above), so its output is never uploaded or published --
+      # the release artifact comes from the clean `build` job below.
       - name: Package builds
         run: |
           python -m pip install 'build==1.5.0' 'hatchling==1.31.0'
-          python -m build --no-isolation --outdir dist
+          python -m build --no-isolation --outdir "${RUNNER_TEMP}/adapters-conformance-dist"
 
-      # CI imports the SDK from sdks/python/src, but a user's pip resolves
-      # cuecrux-client from PyPI. Refuse to publish an adapters release that
-      # cannot install: registry versions are immutable, so it could only be
-      # superseded, never fixed. Release cuecrux-client (sdk-python-v*) first.
-      - name: Published dependencies resolve from PyPI
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/adapters-v')
-        run: python -m pip install --dry-run --ignore-installed dist/*.whl
-
+  build:
+    name: Build reproducibly (clean environment)
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/adapters-v')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: integrations/adapters
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+      - name: Require adapters tag to match package version
+        run: |
+          set -euo pipefail
+          package_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          tag_version="${GITHUB_REF_NAME#adapters-v}"
+          if [[ "$tag_version" != "$package_version" ]]; then
+            echo "::error::adapters tag version $tag_version does not match pyproject.toml version $package_version"
+            exit 1
+          fi
+      # Nothing but the pinned build toolchain is installed before the build.
+      - name: Install pinned build toolchain
+        run: python -m pip install 'build==1.5.0' 'hatchling==1.31.0'
+      - name: Build twice and verify reproducibility
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          first="${RUNNER_TEMP}/adapters-build-first"
+          second="${RUNNER_TEMP}/adapters-build-second"
+          rm -rf "$first" "$second" dist
+          mkdir -p "$first" "$second" dist
+          python -m build --no-isolation --outdir "$first"
+          python -m build --no-isolation --outdir "$second"
+          (cd "$first" && sha256sum -- *) >"${RUNNER_TEMP}/adapters-first.sha256"
+          (cd "$second" && sha256sum -- *) >"${RUNNER_TEMP}/adapters-second.sha256"
+          diff -u "${RUNNER_TEMP}/adapters-first.sha256" "${RUNNER_TEMP}/adapters-second.sha256"
+          cp "$first"/* dist/
       - name: Upload built distributions
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/adapters-v')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: adapters-${{ github.sha }}
           path: integrations/adapters/dist/*
           if-no-files-found: error
           retention-days: 7
+      # CI imports the SDK from sdks/python/src, but a user's pip resolves
+      # cuecrux-client from PyPI. Refuse to publish an adapters release that
+      # cannot install: registry versions are immutable, so it could only be
+      # superseded, never fixed. Release cuecrux-client (sdk-python-v*) first.
+      # Runs after the upload so nothing this resolution fetches can touch
+      # the sealed artifact; a failure here still blocks `publish`.
+      - name: Published dependencies resolve from PyPI
+        run: python -m pip install --dry-run --ignore-installed dist/*.whl
 
   publish:
     name: Publish to PyPI
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/adapters-v')
-    needs: conformance
+    needs: [conformance, build]
     runs-on: ubuntu-latest
     # PyPI Trusted Publishing (OIDC) — no PYPI_TOKEN secret. The PyPI-side
     # publisher for cuecrux-adapters must name this file (adapters.yml).
+    # Uploads only the clean `build` job's artifact, never a rebuild.
     permissions:
       contents: read
       id-token: write
