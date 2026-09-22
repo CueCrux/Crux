@@ -11,15 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
-
-- **A revoked passport could still pass the sync and operator-tier gates.**
-  `require_passport_tier` checked only the reputation tier, so with the
-  dispatch-wide revocation gate disabled (`CRUX_PASSPORT_REVOCATION=0`) a
-  revoked passport could still `sync_push` / `sync_pull` and call the
-  operator-tier identity tools. The gate now refuses a revoked passport
-  regardless of that flag (custody/coord review D8).
-
 ## [0.5.65] - 2026-09-22
 
 ### Added
