@@ -11,6 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Promotion confirm no longer applies records for another tenant.**
+  `POST /v1/sync/tenants/{tenantId}/promotions/confirm` authorized only the path
+  tenant, then applied caller-supplied `records` verbatim, so a caller allowed
+  to write tenant A could plant facts in tenant B's namespace or storage
+  partition. The whole batch is now refused (403) before any record applies
+  when a record's entity is outside the path tenant's namespace, its
+  `tenant_hash` names a tenant other than the path tenant or `default`, or the
+  caller's passport may not write the entity. **Behaviour change:** clients that
+  promoted such records get 403 instead of a partial apply. (QA audit M3)
+
 ## [0.5.65] - 2026-09-22
 
 ### Added
@@ -100,18 +112,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dense-lane-and-extraction-upsell-2026-06-26`. A regression test asserts
   exactly that: a query touching more segments than the budget can hold scores
   identically to one with an unbounded cache. (#740)
-
-### Security
-
-- **Promotion confirm no longer applies records for another tenant.**
-  `POST /v1/sync/tenants/{tenantId}/promotions/confirm` authorized only the path
-  tenant, then applied caller-supplied `records` verbatim, so a caller allowed
-  to write tenant A could plant facts in tenant B's namespace or storage
-  partition. The whole batch is now refused (403) before any record applies
-  when a record's entity is outside the path tenant's namespace, its
-  `tenant_hash` names a tenant other than the path tenant or `default`, or the
-  caller's passport may not write the entity. **Behaviour change:** clients that
-  promoted such records get 403 instead of a partial apply. (QA audit M3)
 
 ## [0.5.64] - 2026-08-23
 
