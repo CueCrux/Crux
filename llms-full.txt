@@ -4500,22 +4500,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
-
-- **The observation aggregate feed no longer shows other passports' sessions.**
-  `GET /v1/observations/aggregate` without `session_id` read every session's
-  observation journal, so any `query:read` caller received every passport's
-  prompts, responses and mediation receipts. The feed now carries only the
-  caller's own sessions, matched on each record's scoped session id. An unbound
-  operator (raw `admin:read`, no passport) keeps the full cross-session view.
-  **Behaviour change** for passport-bound callers. (QA audit M2, B3)
-- **Concurrent observe step opens no longer share a `seq`.** `POST
-  /v1/observe/sessions/{id}/steps` minted `seq` under a read lock and stored
-  the node under a later write lock, so two racing opens both took `max + 1`
-  and the second overwrote the first's default `node_id`, dropping a step from
-  the audit chain. The seq is now minted under the write lock that stores the
-  node. (QA audit M7)
-
 ## [0.5.65] - 2026-09-22
 
 ### Added
