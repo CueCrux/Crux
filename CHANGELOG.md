@@ -11,6 +11,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Promotion confirm refuses records for another tenant.**
+  `POST /v1/sync/tenants/{tenantId}/promotions/confirm` authorized only the path
+  tenant, then applied the caller-supplied records as sent, so a caller allowed
+  to write tenant A could plant facts in tenant B. The whole batch is now
+  refused (403) before anything applies when a record's entity is outside the
+  path tenant's namespace, its tenant stamp names another tenant, or the
+  caller's passport may not write the entity. **Behaviour change:** such
+  batches get 403 instead of a partial apply. (#808)
+- **The observation aggregate feed no longer shows other passports' sessions.**
+  `GET /v1/observations/aggregate` without `session_id` returned every
+  passport's prompts, responses and mediation receipts to any `query:read`
+  caller. A passport-bound caller now sees only its own sessions; an unbound
+  operator with raw `admin:read` keeps the full view. **Behaviour change** for
+  passport-bound callers. (#814)
+- **A revoked passport is refused at the sync and operator-tier gates even
+  with `CRUX_PASSPORT_REVOCATION=0`.** `require_passport_tier` checked only the
+  reputation tier, so with the dispatch-wide gate off a revoked passport could
+  still `sync_push` / `sync_pull` and call operator-tier identity tools. (#806)
+- **`coord_announce` can no longer attribute an intent to someone else.** On an
+  unbound session, `by_passport` was trusted as given. It must now name the
+  caller's own passport (403 otherwise); an admin acts for another passport
+  through the existing passport-header override. **Behaviour change:** an
+  unbound announce naming a passport the caller doesn't hold is refused. (#812)
+
+### Fixed
+
+- **`context_custody_audit` no longer reports a false all-green.** REMEMBER is
+  scored for the calling agent's passport (missing, revoked, or category-less →
+  `partial`); PROVE is `strong` only once `CRUX_EXPORT_VERIFY_PUBLIC_KEY_HEX`
+  pins the export signer; `standing_gap` names what remains. Expect PROVE to
+  read `partial` on nodes without a pinned signer. (#807)
+- **MCP `get_bootstrap` honours `token_budget`.** The schema lacked it and the
+  handler passed none, so a cold-start call with `token_budget=500` could
+  return up to 100 full bootstrap facts. (#810)
+- **Concurrent observe step opens no longer share a `seq`.** The seq was minted
+  under a read lock and stored under a later write lock, so two racing opens
+  could both take `max + 1` and drop a step from the audit chain. (#814)
+
+### Changed
+
+- **Pro claim placements are derived from named implementation sites.** A
+  claim now earns `daemon` or `hosted_control_plane` only by naming where it
+  is implemented. **Behaviour change in `/v1/version`:** a claim with no site
+  reports `unimplemented` (previously `contracted_external`), and
+  `sync:managed_backup`, `audit:central_retention` and `control_plane:hosted`
+  no longer report as `hosted_control_plane`. (#811)
+
+### Added
+
+- Session metrics `vaultcrux_session_capability_graph_edges{origin,tier}` and
+  `vaultcrux_session_excluded_count{origin,reason}` for issued session plans.
+  (#813)
+
 ## [0.5.65] - 2026-09-22
 
 ### Added
