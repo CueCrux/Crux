@@ -11,14 +11,18 @@
 //! `Metrics` owns it as a plain field and exposes the same `inc_*` /
 //! `observe_*` pattern everything else in the codebase uses.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crux_session::plan::Exclusion;
 use prometheus::{CounterVec, Gauge, HistogramOpts, HistogramVec, Opts, Registry};
 
 pub struct SessionMetrics {
     pub handshakes_total: CounterVec,                     // labels: origin, outcome
     pub handshake_latency_seconds: HistogramVec,          // labels: origin
     pub capability_graph_size: HistogramVec,              // labels: origin, tier
+    pub capability_graph_edges: HistogramVec,             // labels: origin, tier
+    pub excluded_count: HistogramVec,                     // labels: origin, reason
     pub active: Gauge,                                    // no labels on Crux Daemon (single install)
     pub expired_total: CounterVec,                        // labels: origin, reason
     pub plan_bytes: HistogramVec,                         // labels: encoding (cbor|json)
@@ -31,17 +35,18 @@ pub struct SessionMetrics {
 
 impl SessionMetrics {
     pub fn new(registry: &Arc<Registry>) -> Self {
+        Self::try_new(registry).expect("register session metrics")
+    }
+
+    fn try_new(registry: &Arc<Registry>) -> prometheus::Result<Self> {
         let handshakes_total = CounterVec::new(
             Opts::new(
                 "vaultcrux_session_handshakes_total",
                 "Session handshake requests, labelled by origin and outcome",
             ),
             &["origin", "outcome"],
-        )
-        .expect("counter");
-        registry
-            .register(Box::new(handshakes_total.clone()))
-            .expect("register handshakes_total");
+        )?;
+        registry.register(Box::new(handshakes_total.clone()))?;
 
         let handshake_latency_seconds = HistogramVec::new(
             HistogramOpts::new(
@@ -50,11 +55,8 @@ impl SessionMetrics {
             )
             .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0]),
             &["origin"],
-        )
-        .expect("histogram");
-        registry
-            .register(Box::new(handshake_latency_seconds.clone()))
-            .expect("register handshake_latency");
+        )?;
+        registry.register(Box::new(handshake_latency_seconds.clone()))?;
 
         let capability_graph_size = HistogramVec::new(
             HistogramOpts::new(
@@ -63,18 +65,34 @@ impl SessionMetrics {
             )
             .buckets(vec![0.0, 1.0, 2.0, 4.0, 8.0, 12.0, 20.0, 40.0, 80.0]),
             &["origin", "tier"],
-        )
-        .expect("histogram");
-        registry
-            .register(Box::new(capability_graph_size.clone()))
-            .expect("register capability_graph_size");
+        )?;
+        registry.register(Box::new(capability_graph_size.clone()))?;
+
+        let capability_graph_edges = HistogramVec::new(
+            HistogramOpts::new(
+                "vaultcrux_session_capability_graph_edges",
+                "Number of capability-graph edges in issued session plans",
+            )
+            .buckets(vec![0.0, 1.0, 2.0, 4.0, 8.0, 12.0, 20.0, 40.0, 80.0]),
+            &["origin", "tier"],
+        )?;
+        registry.register(Box::new(capability_graph_edges.clone()))?;
+
+        let excluded_count = HistogramVec::new(
+            HistogramOpts::new(
+                "vaultcrux_session_excluded_count",
+                "Capabilities excluded from an issued session plan, per exclusion reason",
+            )
+            .buckets(vec![0.0, 1.0, 2.0, 4.0, 8.0, 12.0, 20.0, 40.0, 80.0]),
+            &["origin", "reason"],
+        )?;
+        registry.register(Box::new(excluded_count.clone()))?;
 
         let active = Gauge::new(
             "vaultcrux_session_active",
             "Currently-active sessions in the local registry",
-        )
-        .expect("gauge");
-        registry.register(Box::new(active.clone())).expect("register active");
+        )?;
+        registry.register(Box::new(active.clone()))?;
 
         let expired_total = CounterVec::new(
             Opts::new(
@@ -82,21 +100,15 @@ impl SessionMetrics {
                 "Sessions removed by reason (ttl_expired | client_closed | admin_closed)",
             ),
             &["origin", "reason"],
-        )
-        .expect("counter");
-        registry
-            .register(Box::new(expired_total.clone()))
-            .expect("register expired_total");
+        )?;
+        registry.register(Box::new(expired_total.clone()))?;
 
         let plan_bytes = HistogramVec::new(
             HistogramOpts::new("vaultcrux_session_plan_bytes", "Size of issued session plans")
                 .buckets(vec![256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0, 32768.0]),
             &["encoding"],
-        )
-        .expect("histogram");
-        registry
-            .register(Box::new(plan_bytes.clone()))
-            .expect("register plan_bytes");
+        )?;
+        registry.register(Box::new(plan_bytes.clone()))?;
 
         let invocation_receipts_total = CounterVec::new(
             Opts::new(
@@ -104,11 +116,8 @@ impl SessionMetrics {
                 "Per-capability invocation receipt counts",
             ),
             &["channel", "capability", "outcome"],
-        )
-        .expect("counter");
-        registry
-            .register(Box::new(invocation_receipts_total.clone()))
-            .expect("register invocation_receipts_total");
+        )?;
+        registry.register(Box::new(invocation_receipts_total.clone()))?;
 
         let invocation_receipt_latency_seconds = HistogramVec::new(
             HistogramOpts::new(
@@ -117,43 +126,33 @@ impl SessionMetrics {
             )
             .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0]),
             &["channel", "capability"],
-        )
-        .expect("histogram");
-        registry
-            .register(Box::new(invocation_receipt_latency_seconds.clone()))
-            .expect("register invocation_receipt_latency");
+        )?;
+        registry.register(Box::new(invocation_receipt_latency_seconds.clone()))?;
 
         let invocation_verify_total = CounterVec::new(
             Opts::new("vaultcrux_invocation_verify_total", "POST /invocation/verify outcomes"),
             &["outcome"],
-        )
-        .expect("counter");
-        registry
-            .register(Box::new(invocation_verify_total.clone()))
-            .expect("register invocation_verify_total");
+        )?;
+        registry.register(Box::new(invocation_verify_total.clone()))?;
 
         let plan_sealer_errors_total = Gauge::new(
             "vaultcrux_session_plan_sealer_errors_total",
             "Cumulative segment-seal errors during session mint",
-        )
-        .expect("gauge");
-        registry
-            .register(Box::new(plan_sealer_errors_total.clone()))
-            .expect("register plan_sealer_errors");
+        )?;
+        registry.register(Box::new(plan_sealer_errors_total.clone()))?;
 
         let segment_seal_failures_total = Gauge::new(
             "vaultcrux_session_segment_seal_failures_total",
             "Cumulative always-store segment-seal failures that caused a handshake to fail closed",
-        )
-        .expect("gauge");
-        registry
-            .register(Box::new(segment_seal_failures_total.clone()))
-            .expect("register segment_seal_failures");
+        )?;
+        registry.register(Box::new(segment_seal_failures_total.clone()))?;
 
-        Self {
+        Ok(Self {
             handshakes_total,
             handshake_latency_seconds,
             capability_graph_size,
+            capability_graph_edges,
+            excluded_count,
             active,
             expired_total,
             plan_bytes,
@@ -162,14 +161,17 @@ impl SessionMetrics {
             invocation_verify_total,
             plan_sealer_errors_total,
             segment_seal_failures_total,
-        }
+        })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn handshake_ok(
         &self,
         origin: &str,
         latency_secs: f64,
         graph_size: usize,
+        edge_count: usize,
+        excluded: Option<&[Exclusion]>,
         tier: &str,
         plan_bytes: usize,
         encoding: &str,
@@ -181,6 +183,19 @@ impl SessionMetrics {
         self.capability_graph_size
             .with_label_values(&[origin, tier])
             .observe(graph_size as f64);
+        self.capability_graph_edges
+            .with_label_values(&[origin, tier])
+            .observe(edge_count as f64);
+        // `None` when the client asked for `hide_exclusions`: nothing to count.
+        let mut by_reason: BTreeMap<&str, usize> = BTreeMap::new();
+        for exclusion in excluded.unwrap_or_default() {
+            *by_reason.entry(exclusion.reason.as_str()).or_default() += 1;
+        }
+        for (reason, count) in by_reason {
+            self.excluded_count
+                .with_label_values(&[origin, reason])
+                .observe(count as f64);
+        }
         self.plan_bytes
             .with_label_values(&[encoding])
             .observe(plan_bytes as f64);
@@ -228,6 +243,8 @@ impl Clone for SessionMetrics {
             handshakes_total: self.handshakes_total.clone(),
             handshake_latency_seconds: self.handshake_latency_seconds.clone(),
             capability_graph_size: self.capability_graph_size.clone(),
+            capability_graph_edges: self.capability_graph_edges.clone(),
+            excluded_count: self.excluded_count.clone(),
             active: self.active.clone(),
             expired_total: self.expired_total.clone(),
             plan_bytes: self.plan_bytes.clone(),
@@ -249,7 +266,7 @@ mod tests {
     fn metrics_register_and_increment() {
         let registry = Arc::new(Registry::new());
         let metrics = SessionMetrics::new(&registry);
-        metrics.handshake_ok("ce", 0.012, 4, "local", 987, "json");
+        metrics.handshake_ok("ce", 0.012, 4, 0, None, "local", 987, "json");
         metrics.handshake_failed("ce", "bad_request");
         metrics.handshake_seal_failure("ce");
         metrics.invocation_observe("bulk", "retrieve", "ok", 0.007);
@@ -274,5 +291,71 @@ mod tests {
                 "expected `{needle}` in metrics output:\n{rendered}"
             );
         }
+    }
+
+    fn exclusion(cap: &str, reason: &str) -> Exclusion {
+        Exclusion {
+            cap: cap.to_string(),
+            reason: reason.to_string(),
+            layer: "passport".to_string(),
+            hint: None,
+        }
+    }
+
+    fn render(registry: &Registry) -> String {
+        let mut buf = Vec::new();
+        prometheus::TextEncoder::new()
+            .encode(&registry.gather(), &mut buf)
+            .unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// Edge count and per-reason exclusion counts land on their histograms,
+    /// one observation per handshake per reason (grouped, not per exclusion).
+    #[test]
+    fn handshake_ok_observes_graph_edges_and_exclusions_by_reason() {
+        let registry = Arc::new(Registry::new());
+        let metrics = SessionMetrics::new(&registry);
+        let excluded = [
+            exclusion("a", "tier_insufficient"),
+            exclusion("b", "passport_denied"),
+            exclusion("c", "tier_insufficient"),
+        ];
+        metrics.handshake_ok("ce", 0.01, 14, 8, Some(&excluded), "local", 900, "json");
+        metrics.handshake_ok("ce", 0.01, 14, 3, Some(&[]), "local", 900, "json");
+
+        let rendered = render(&registry);
+        for needle in [
+            "vaultcrux_session_capability_graph_edges_sum{origin=\"ce\",tier=\"local\"} 11",
+            "vaultcrux_session_capability_graph_edges_count{origin=\"ce\",tier=\"local\"} 2",
+            "vaultcrux_session_excluded_count_sum{origin=\"ce\",reason=\"tier_insufficient\"} 2",
+            "vaultcrux_session_excluded_count_count{origin=\"ce\",reason=\"tier_insufficient\"} 1",
+            "vaultcrux_session_excluded_count_sum{origin=\"ce\",reason=\"passport_denied\"} 1",
+            "vaultcrux_session_excluded_count_count{origin=\"ce\",reason=\"passport_denied\"} 1",
+        ] {
+            assert!(
+                rendered.contains(needle),
+                "expected `{needle}` in metrics output:\n{rendered}"
+            );
+        }
+    }
+
+    /// A plan whose exclusions are hidden (`hide_exclusions`) carries `None`
+    /// and records no exclusion series; its edge count is still observed.
+    #[test]
+    fn hidden_exclusions_record_no_reason_series() {
+        let registry = Arc::new(Registry::new());
+        let metrics = SessionMetrics::new(&registry);
+        metrics.handshake_ok("ce", 0.01, 14, 5, None, "local", 900, "json");
+
+        let rendered = render(&registry);
+        assert!(
+            rendered.contains("vaultcrux_session_capability_graph_edges_sum{origin=\"ce\",tier=\"local\"} 5"),
+            "edge count must be observed:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("vaultcrux_session_excluded_count_count"),
+            "no exclusion series expected:\n{rendered}"
+        );
     }
 }
