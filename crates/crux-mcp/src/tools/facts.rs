@@ -1190,10 +1190,11 @@ const BOOTSTRAP_PREFIX: &str = "__bootstrap__::";
 ///
 /// Accepts an optional `topic` parameter ("patterns", "docs", "errors") to
 /// filter bootstrap facts by sub-entity, plus an optional `query` term to
-/// narrow the result set.
+/// narrow the result set and an optional `token_budget` to cap it.
 pub async fn handle_get_bootstrap(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let topic = args.get("topic").and_then(|v| v.as_str()).map(|s| s.to_string());
     let query = args.get("query").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let token_budget = args.get("token_budget").and_then(|v| v.as_u64()).map(|v| v as usize);
 
     let prefix = match &topic {
         Some(t) => format!("{BOOTSTRAP_PREFIX}{}:", normalize_bootstrap_topic(t)),
@@ -1207,7 +1208,7 @@ pub async fn handle_get_bootstrap(args: &Value, ctx: &McpContext) -> Result<Valu
         entity: None,
         entity_prefix: Some(prefix),
         top_k: 100,
-        token_budget: None,
+        token_budget,
     };
 
     let store = ctx.fact_store.read().await;
@@ -2081,6 +2082,42 @@ mod tests {
         let result = handle_get_bootstrap(&json!({"topic": "patterns"}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("no bootstrap knowledge for topic 'patterns'"));
+    }
+
+    // QA audit M4 (C1): `token_budget` is the cold-start ritual's only output
+    // cap, so get_bootstrap must honour it rather than return up to 100 facts.
+    #[tokio::test]
+    async fn get_bootstrap_token_budget_bounds_output() {
+        let ctx = test_ctx();
+        {
+            let mut store = ctx.fact_store.write().await;
+            for i in 0..10 {
+                store.store(StoreFact {
+                    tenant_hash: "default".to_string(),
+                    entity: format!("__bootstrap__::pattern:p{i}"),
+                    key: "k".to_string(),
+                    // 400 bytes ≈ 100 tokens per fact.
+                    value: "x".repeat(400),
+                    source_receipt: None,
+                    confidence: 1.0,
+                    private: true,
+                    horizon_class: None,
+                    actor: Some("daemon:bootstrap".to_string()),
+                });
+            }
+        }
+        let text_for = |result: Value| result["content"][0]["text"].as_str().unwrap().to_string();
+
+        let unbudgeted = text_for(handle_get_bootstrap(&json!({"topic": "patterns"}), &ctx).await.unwrap());
+        assert_eq!(unbudgeted.lines().count(), 10);
+
+        let budgeted = text_for(
+            handle_get_bootstrap(&json!({"topic": "patterns", "token_budget": 250}), &ctx)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(budgeted.lines().count(), 2, "250 tokens holds two ~100-token facts");
+        assert!(crate::token_estimate::estimate_tokens_str(&budgeted) <= 250);
     }
 
     #[tokio::test]

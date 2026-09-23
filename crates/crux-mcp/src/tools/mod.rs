@@ -411,10 +411,14 @@ pub fn list_tools_with_flags(
                     "query": {
                         "type": "string",
                         "description": "Optional search term to narrow the matching bootstrap facts."
+                    },
+                    "token_budget": {
+                        "type": "integer",
+                        "description": "Token ceiling for the returned facts. Pass on every call; 500 is the conventional cold-start budget."
                     }
                 },
                 "examples": [
-                    { "topic": "patterns" },
+                    { "topic": "patterns", "token_budget": 500 },
                     { "topic": "docs", "query": "integration" },
                     { "topic": "errors" }
                 ]

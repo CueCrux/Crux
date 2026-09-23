@@ -3083,7 +3083,7 @@ Protocol for multi-session work: announce your focus at boot and on every execpl
 - `sync_status()` — Check whether this node is local-only, sync-enabled, or degraded before planning remote integration work.
 - `update_status()` — Check whether this checkout is current, behind, ahead, diverged, disabled, or unavailable before proposing an upgrade.
 - `get_gaps(query)` — Check what the corpus doesn't know.
-- `get_bootstrap(topic, query?)` — Learn best practices and pull onboarding playbooks (topics: "patterns", "docs", "errors").
+- `get_bootstrap(topic, query?, token_budget?)` — Learn best practices and pull onboarding playbooks (topics: "patterns", "docs", "errors").
 
 ## Substrate (M1–M2)
 The substrate hosts arbitrary domain data as `(kind, id, payload)` entities + labelled edges between them. Lens crates register kinds at daemon startup; agents can read and write via these generic tools.
