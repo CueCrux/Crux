@@ -910,6 +910,161 @@ async fn sync_promotion_confirm_applies_remote_records() {
         .starts_with("sync-promotion:http:node-a:"));
 }
 
+fn promotion_record(fact_id: &str, tenant_hash: &str, entity: &str) -> corecrux_memory::sync::SyncCollectionRecord {
+    let stored_at = chrono::Utc::now();
+    corecrux_memory::sync::SyncCollectionRecord {
+        collection: "facts".to_string(),
+        record_id: fact_id.to_string(),
+        entity: entity.to_string(),
+        key: "summary".to_string(),
+        identity_hash: "blake3:identity".to_string(),
+        content_hash: "blake3:content".to_string(),
+        value_hash: "blake3:test".to_string(),
+        updated_at: stored_at.to_rfc3339(),
+        deleted: false,
+        source_receipt: None,
+        semantic_profile_id: None,
+        local_semantic_profile_id: None,
+        fact: Some(corecrux_memory::fact_store::Fact {
+            fact_id: fact_id.to_string(),
+            tenant_hash: tenant_hash.to_string(),
+            entity: entity.to_string(),
+            key: "summary".to_string(),
+            value: "promoted".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            stored_at,
+            tokens: 1,
+            deleted: false,
+            version: 1,
+            supersedes: None,
+            private: false,
+            horizon_class: corecrux_memory::HorizonClass::None,
+            reverified_at: None,
+            superseded_by: None,
+            actor: None,
+            valid_from: None,
+            valid_to: None,
+            access_count: 0,
+            last_accessed_at: None,
+        }),
+    }
+}
+
+async fn confirm_promotion(
+    state: &AppState,
+    headers: HeaderMap,
+    records: Vec<corecrux_memory::sync::SyncCollectionRecord>,
+) -> Response {
+    super::sync::post_promotion_confirm(
+        State(state.clone()),
+        headers,
+        Path("business::acme".to_string()),
+        Json(super::sync::PromotionRequest {
+            allowlist: Vec::new(),
+            include_content: false,
+            confirm_hash: None,
+            records,
+        }),
+    )
+    .await
+}
+
+// QA audit M3 (cross-tenant promotion confirm): records are caller-supplied,
+// so one naming another tenant must refuse the whole batch before any apply.
+#[tokio::test]
+async fn sync_promotion_confirm_refuses_records_for_another_tenant() {
+    let state = test_app_state(1);
+    let own = || promotion_record("f_own", "default", "business::acme::note");
+
+    // Entity outside the path tenant's namespace, behind a valid record.
+    let resp = confirm_promotion(
+        &state,
+        HeaderMap::new(),
+        vec![
+            own(),
+            promotion_record("f_foreign_entity", "default", "business::other::note"),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Entity inside the namespace, but stamped for another tenant's partition.
+    let resp = confirm_promotion(
+        &state,
+        HeaderMap::new(),
+        vec![
+            own(),
+            promotion_record("f_foreign_stamp", "business::other", "business::acme::other"),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let store = state.fact_store.read().await;
+    for fact_id in ["f_own", "f_foreign_entity", "f_foreign_stamp"] {
+        assert!(store.get(fact_id).is_none(), "{fact_id} must not be applied");
+    }
+}
+
+#[tokio::test]
+async fn sync_promotion_confirm_accepts_path_tenant_stamp() {
+    let state = test_app_state(1);
+    let resp = confirm_promotion(
+        &state,
+        HeaderMap::new(),
+        vec![promotion_record(
+            "f_path_stamp",
+            "business::acme",
+            "business::acme::note",
+        )],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["applied_count"], 1);
+    assert!(state.fact_store.read().await.get("f_path_stamp").is_some());
+}
+
+#[tokio::test]
+async fn sync_promotion_confirm_checks_passport_category_per_record() {
+    let state = test_app_state(1);
+    {
+        let mut store = state.fact_store.write().await;
+        for (passport, category) in [("p_personal", "personal"), ("p_work", "work")] {
+            store.store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: format!("__passport__::{passport}"),
+                key: "record".to_string(),
+                value: serde_json::json!({ "category": category }).to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+        }
+    }
+
+    // `business::` has no category prefix, so it classifies as work.
+    let resp = confirm_promotion(
+        &state,
+        dev_scope_passport_headers("facts:write", "p_personal"),
+        vec![promotion_record("f_personal", "default", "business::acme::note")],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(state.fact_store.read().await.get("f_personal").is_none());
+
+    let resp = confirm_promotion(
+        &state,
+        dev_scope_passport_headers("facts:write", "p_work"),
+        vec![promotion_record("f_work", "default", "business::acme::note")],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(state.fact_store.read().await.get("f_work").is_some());
+}
+
 #[tokio::test]
 async fn sync_offboard_signs_wipe_receipt_and_stores_proof() {
     let mut state = test_app_state(1);
