@@ -28,7 +28,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use super::facts::{require_fact_read_ctx, require_session_write_ctx, scoped_session_id_for_http};
+use super::facts::{raw_admin_read, require_fact_read_ctx, require_session_write_ctx, scoped_session_id_for_http};
 use super::{problem_response, AppState};
 
 /// Default maximum JSON-payload size we accept per observation (bytes). Hooks &
@@ -1754,7 +1754,9 @@ pub(super) async fn get_observations(
 }
 
 /// `GET /v1/observations/aggregate` — cross-session observation feed.
-/// Scans every session JSONL under `<data_dir>/observations/`, applies
+/// Scans every session JSONL under `<data_dir>/observations/`, keeps only the
+/// caller's own sessions (every session for an unbound `admin:read` operator),
+/// applies
 /// the optional `since`/`provider`/`kind`/`session_id` filters, then
 /// returns the result merged + sorted by `ts` descending and capped by
 /// `limit`. Each session's chain status is included so callers can spot
@@ -1787,6 +1789,14 @@ pub(super) async fn get_observations_aggregate(
         .as_deref()
         .map(|sid| scoped_session_id_for_http(&ctx, sid));
 
+    // Only the caller's own sessions, matched on each record's exact scoped
+    // session id (filenames are lossy). An unbound operator (raw `admin:read`,
+    // no passport) keeps the cross-session feed.
+    let sees_all = raw_admin_read(&ctx);
+    let visible = |record: &ObservationRecordV1| {
+        sees_all || crux_mcp::scope::visible_session_for_agent(&record.session_id, ctx.passport_id.as_deref()).is_some()
+    };
+
     let mut all: Vec<ObservationRecordV1> = Vec::new();
     let mut chains: std::collections::BTreeMap<String, ChainStatusJson> = Default::default();
 
@@ -1803,7 +1813,7 @@ pub(super) async fn get_observations_aggregate(
             }
         }
 
-        let records = match read_observations(&path) {
+        let mut records = match read_observations(&path) {
             Ok(records) => records,
             Err(err) => {
                 tracing::warn!(
@@ -1815,7 +1825,13 @@ pub(super) async fn get_observations_aggregate(
                 continue;
             }
         };
+        // Chain status describes the whole file, so it is taken before the
+        // visibility filter, and reported only for a file the caller can see.
         let chain = validate_chain(&records).into();
+        records.retain(&visible);
+        if records.is_empty() && !sees_all {
+            continue;
+        }
         chains.insert(on_disk_session_id, chain);
 
         for record in records {
@@ -3381,6 +3397,77 @@ mod tests {
         assert_eq!(body["observations"].as_array().unwrap().len(), 1);
         assert_eq!(body["provider_counts"]["claude-code"], 2);
         assert_eq!(body["provider_counts"]["openai"], 2);
+    }
+
+    // QA audit M2 (cross-passport observation disclosure): with no
+    // `session_id`, the aggregate feed must still return only the caller's
+    // own sessions, never another passport's prompts and responses.
+    #[tokio::test]
+    async fn get_observations_aggregate_is_scoped_to_the_callers_passport() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("passport.key");
+        let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        for (passport, session) in [
+            ("passport-a", "shared"),
+            ("passport-b", "shared"),
+            ("passport-b", "b-only"),
+        ] {
+            append_one(
+                &state,
+                &crux_mcp::scope::scoped_session_id(Some(passport), session),
+                passport,
+                PostObservationBody {
+                    kind: "tool_use".to_string(),
+                    provider: "claude-code".to_string(),
+                    client_ts: None,
+                    payload: serde_json::Value::Null,
+                },
+                None,
+            )
+            .unwrap();
+        }
+
+        let aggregate = |passport: Option<&'static str>| {
+            let state = state.clone();
+            async move {
+                let mut headers = HeaderMap::new();
+                if let Some(passport) = passport {
+                    headers.insert("x-corecrux-passport-id", passport.parse().unwrap());
+                }
+                let resp = get_observations_aggregate(
+                    State(state),
+                    headers,
+                    Query(AggregateObservationsQuery {
+                        since: None,
+                        provider: None,
+                        kind: None,
+                        session_id: None,
+                        limit: None,
+                    }),
+                )
+                .await;
+                response_to_json(resp).await
+            }
+        };
+
+        let a = aggregate(Some("passport-a")).await;
+        assert_eq!(a["matched"], 1);
+        assert_eq!(a["principal_counts"]["passport-a"], 1);
+        assert!(a["principal_counts"].get("passport-b").is_none());
+        assert_eq!(a["chains"].as_object().unwrap().len(), 1);
+
+        let b = aggregate(Some("passport-b")).await;
+        assert_eq!(b["matched"], 2);
+        assert_eq!(b["principal_counts"]["passport-b"], 2);
+        assert!(b["principal_counts"].get("passport-a").is_none());
+        assert_eq!(b["chains"].as_object().unwrap().len(), 2);
+
+        // The unbound operator keeps the full cross-session feed.
+        let operator = aggregate(None).await;
+        assert_eq!(operator["matched"], 3);
+        assert_eq!(operator["chains"].as_object().unwrap().len(), 3);
     }
 
     // ── Receipts listing (M6) ──────────────────────────────────────────────
