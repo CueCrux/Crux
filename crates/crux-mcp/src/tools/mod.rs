@@ -1920,7 +1920,7 @@ pub fn list_tools_with_flags(
                 "properties": {
                     "session_id":    { "type": "string", "description": "Your bound session id (hex) — the one cuecrux_session minted." },
                     "project_id":    { "type": "string" },
-                    "by_passport":   { "type": "string", "description": "Optional; the session binding's passport wins when the session is bound." },
+                    "by_passport":   { "type": "string", "description": "Optional; the session binding's passport wins when the session is bound. On an unbound session it must name your own passport, or the announce is refused." },
                     "execplan_slug": { "type": "string" },
                     "milestone":     { "type": "string" },
                     "deploy_target": { "type": "string", "description": "Optional deploy-axis focus (e.g. \"deploy:crux\"). When a live peer announces the same target, the response overlaps[] carries a deploy_target warning — serialise the deploy, don't double-cut. Advisory only." },
