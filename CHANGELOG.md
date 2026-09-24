@@ -11,6 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`corecruxctl receipts verify-stream-receipt`** verifies a daemon stream
+  receipt (`model_invocation`, `context_injected`, `stream_completed`,
+  `stream_aborted`) offline from its observation record against a pinned
+  public keyring, checking the daemon's own signature over the canonical body.
+  It rejects other receipt classes signed by the same key (e.g. `usage_ping`)
+  on the signed `kind`, takes optional `--expect-receipt-id` / `--kind`
+  checks, and on success prints only fields decoded from the signed body —
+  the record's `payload.output_hash` and similar copies are unsigned.
+  Library entry point: `corecrux_receipts::verify_stream_receipt_payload_v1`.
+
 ## [0.5.65] - 2026-09-22
 
 ### Added

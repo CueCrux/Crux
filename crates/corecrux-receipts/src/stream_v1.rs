@@ -40,8 +40,12 @@
 use ciborium::value::Value as CborValue;
 use ed25519_dalek::{Signer as _, SigningKey};
 
+use std::collections::BTreeMap;
+
+use crate::audit_gap_v1::MODEL_INVOCATION_KIND_V1;
+use crate::keyring_v1::Ed25519KeyRingV1;
 use crate::memory_use_v1::{filter_reserved_entries, MemoryUseEntryV1};
-use crate::verify_v1::ReceiptSigV1;
+use crate::verify_v1::{verify_receipt_v1, ReceiptSigV1, VerificationReportV1, VerifyReceiptInput};
 
 /// Receipt schema string — same body schema family as the other v1
 /// receipt classes.
@@ -286,6 +290,142 @@ pub fn stream_links_injection_v1(injected_body: &[u8], stream_body: &[u8]) -> bo
     injected_hash == linked_hash && injected_session == stream_session
 }
 
+/// Kinds [`verify_stream_receipt_payload_v1`] accepts. Other receipt classes
+/// (e.g. `usage_ping`) share the payload shape, key and tenant, so the
+/// signed body's `kind` must be checked, not assumed.
+const STREAM_RECEIPT_KINDS_V1: [&str; 4] = [
+    CONTEXT_INJECTED_KIND_V1,
+    STREAM_COMPLETED_KIND_V1,
+    STREAM_ABORTED_KIND_V1,
+    MODEL_INVOCATION_KIND_V1,
+];
+
+/// Signed-body fields reported for every stream receipt kind.
+const SIGNED_FIELDS_V1: [&str; 3] = ["kind", "receipt_id", "tenant_id"];
+
+/// Extra signed-body fields reported for `model_invocation`.
+const MODEL_INVOCATION_SIGNED_FIELDS_V1: [&str; 8] = [
+    "invocation_id",
+    "provider",
+    "model_id",
+    "model_version",
+    "provider_request_id",
+    "prompt_hash",
+    "retrieval_set_hash",
+    "output_hash",
+];
+
+/// Result of [`verify_stream_receipt_payload_v1`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct VerifiedStreamReceiptPayloadV1 {
+    /// Text fields decoded from the SIGNED body: `kind`, `receipt_id`,
+    /// `tenant_id`, plus for `model_invocation` `invocation_id`, `provider`,
+    /// `model_id`, `model_version`, `provider_request_id`, `prompt_hash`,
+    /// `retrieval_set_hash`, `output_hash` (absent optionals are omitted).
+    /// The payload's own top-level copies of these are unsigned and never read.
+    pub signed: BTreeMap<String, String>,
+    pub report: VerificationReportV1,
+}
+
+impl VerifiedStreamReceiptPayloadV1 {
+    /// `kind` from the signed body.
+    pub fn kind(&self) -> Option<&str> {
+        self.signed.get("kind").map(String::as_str)
+    }
+
+    /// Signature valid over the body, body hash matches, the signed body
+    /// itself names the tenant and receipt id that were checked, and its
+    /// `kind` is a stream receipt kind. Every daemon-minted stream receipt
+    /// body carries both ids, so an unbound one is a relabelled payload
+    /// rather than a legacy receipt.
+    pub fn is_verified(&self) -> bool {
+        self.report.error_code == "OK"
+            && self.report.signature_valid
+            && self.report.binding.tenant_bound
+            && self.report.binding.receipt_id_bound
+            && self.kind().is_some_and(|kind| STREAM_RECEIPT_KINDS_V1.contains(&kind))
+    }
+}
+
+/// Verify a daemon stream receipt (`context_injected`, `stream_completed`,
+/// `stream_aborted`, `model_invocation`) offline from the observation
+/// `payload` the daemon persists for it — e.g. one record's `payload` from
+/// `GET /v1/observations/aggregate?kind=model_invocation`.
+///
+/// The ed25519 signature covers the canonical body bytes alone, so the
+/// unpacked `sig{schema,alg,key_id,signed_at,signature_hex}` fields are
+/// rebuilt into a [`ReceiptSigV1`] (as the daemon's local verifier does) and
+/// handed to [`verify_receipt_v1`]. Trust comes only from `keyring`, looked
+/// up by the envelope `key_id`; no key is taken from the payload.
+///
+/// `Err` means the payload is malformed. A cryptographic, binding or kind
+/// failure is an `Ok` result for which
+/// [`VerifiedStreamReceiptPayloadV1::is_verified`] is `false`. Only the
+/// fields in [`VerifiedStreamReceiptPayloadV1::signed`] are covered by the
+/// signature; the payload's `kind`, `prompt_hash`, `output_hash`, ... are
+/// unsigned copies.
+pub fn verify_stream_receipt_payload_v1(
+    payload: &serde_json::Value,
+    tenant_id: &str,
+    keyring: &Ed25519KeyRingV1,
+    verified_at: &str,
+    verifier_build: &corecrux_types::BuildInfo,
+) -> Result<VerifiedStreamReceiptPayloadV1, String> {
+    let text = |value: &serde_json::Value, field: &str| {
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("stream receipt payload is missing {field}"))
+    };
+    let receipt_id = text(payload, "receipt_id")?;
+    let body_bytes =
+        hex::decode(text(payload, "body_cbor_hex")?).map_err(|err| format!("body_cbor_hex is not hex: {err}"))?;
+    let body_hash: [u8; 32] = text(payload, "body_hash")?
+        .strip_prefix("blake3:")
+        .and_then(|hex_digest| hex::decode(hex_digest).ok())
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or("body_hash must be blake3:<64 hex>")?;
+    let sig = payload.get("sig").ok_or("stream receipt payload is missing sig")?;
+    let envelope = ReceiptSigV1 {
+        schema: text(sig, "schema")?,
+        receipt_id: receipt_id.clone(),
+        alg: text(sig, "alg")?,
+        key_id: text(sig, "key_id")?,
+        signed_at: text(sig, "signed_at")?,
+        signature: hex::decode(text(sig, "signature_hex")?)
+            .map_err(|err| format!("signature_hex is not hex: {err}"))?,
+        signed_payload_hash: body_hash.to_vec(),
+    };
+    let mut sig_bytes = Vec::new();
+    ciborium::ser::into_writer(&envelope, &mut sig_bytes).map_err(|err| format!("encode sig envelope: {err}"))?;
+
+    let report = verify_receipt_v1(VerifyReceiptInput {
+        tenant_id,
+        receipt_id: &receipt_id,
+        body_bytes: &body_bytes,
+        stored_body_payload_hash: body_hash,
+        sig_bytes: Some(&sig_bytes),
+        keyring: Some(keyring),
+        verified_at,
+        verifier_build,
+        recompute_candidate_digest: false,
+    })
+    .map_err(|err| err.to_string())?;
+    let extra: &[&str] = if top_level_text(&body_bytes, "kind").as_deref() == Some(MODEL_INVOCATION_KIND_V1) {
+        &MODEL_INVOCATION_SIGNED_FIELDS_V1
+    } else {
+        &[]
+    };
+    let signed = SIGNED_FIELDS_V1
+        .iter()
+        .chain(extra)
+        .copied()
+        .filter_map(|field| top_level_text(&body_bytes, field).map(|value| (field.to_string(), value)))
+        .collect();
+    Ok(VerifiedStreamReceiptPayloadV1 { signed, report })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +582,210 @@ mod tests {
         assert!(vk
             .verify_strict(&tampered, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
             .is_err());
+    }
+
+    // ── offline verification of a persisted model_invocation payload ──
+
+    const DAEMON_KEY_ID: &str = "fpr-daemon";
+
+    /// The payload shape `corecruxd`'s `mint_stream_receipt` persists for a
+    /// `model_invocation` draft (the object `/v1/observations/aggregate`
+    /// returns as each record's `payload`).
+    fn model_invocation_payload(signing_key: &SigningKey, body_edit: Option<&str>) -> serde_json::Value {
+        let input = crate::audit_gap_v1::ModelInvocationBodyInputV1 {
+            tenant_id: "local",
+            receipt_id: "r_jev_1",
+            invocation_id: "inv-1",
+            actor_passport: "passport:jev",
+            provider: "typesafe",
+            model_id: "jev",
+            model_version: Some("1.0.0"),
+            provider_request_id: None,
+            prompt_hash: "blake3:prompt",
+            retrieval_set_hash: None,
+            output_hash: Some("blake3:decision-allow"),
+            temperature: Some(0.0),
+            top_p: None,
+            seed: Some(7),
+            max_tokens: None,
+            started_at: "2026-09-22T00:00:00Z",
+            completed_at: Some("2026-09-22T00:00:01Z"),
+            created_at: "2026-09-22T00:00:01Z",
+        };
+        let (body, hash) = crate::audit_gap_v1::build_model_invocation_body_v1(&input);
+        let sig = crate::audit_gap_v1::sign_model_invocation_v1(
+            "r_jev_1",
+            &body,
+            hash,
+            signing_key,
+            DAEMON_KEY_ID,
+            "2026-09-22T00:00:01Z",
+        );
+        let (body, hash) = match body_edit {
+            None => (body, hash),
+            // Post-signing edit of the decision digest, with the payload's
+            // body_hash recomputed so only the signature can catch it.
+            Some(new_output_hash) => {
+                let CborValue::Map(mut map) = ciborium::de::from_reader(body.as_slice()).unwrap() else {
+                    panic!("body map")
+                };
+                for (k, v) in &mut map {
+                    if *k == CborValue::Text("output_hash".into()) {
+                        *v = CborValue::Text(new_output_hash.into());
+                    }
+                }
+                encode(map)
+            }
+        };
+        serde_json::json!({
+            "receipt_id": "r_jev_1",
+            "kind": "model_invocation",
+            "body_schema": "cuecrux.receipt.body.v1",
+            "body_cbor_hex": hex::encode(&body),
+            "body_hash": format!("blake3:{}", hex::encode(hash)),
+            "sig": {
+                "schema": sig.schema,
+                "alg": sig.alg,
+                "key_id": sig.key_id,
+                "signed_at": sig.signed_at,
+                "signature_hex": hex::encode(&sig.signature),
+            },
+        })
+    }
+
+    fn pinned_keyring(key_id: &str, key: &SigningKey) -> Ed25519KeyRingV1 {
+        use base64::Engine as _;
+        Ed25519KeyRingV1 {
+            v: 1,
+            keys: vec![crate::keyring_v1::Ed25519KeyEntryV1 {
+                key_id: key_id.to_string(),
+                pub_key_base64: base64::engine::general_purpose::STANDARD.encode(key.verifying_key().as_bytes()),
+            }],
+        }
+    }
+
+    fn verify_payload(payload: &serde_json::Value, keyring: &Ed25519KeyRingV1) -> VerifiedStreamReceiptPayloadV1 {
+        let build = corecrux_types::BuildInfo {
+            version: "test".into(),
+            commit: "test".into(),
+        };
+        verify_stream_receipt_payload_v1(payload, "local", keyring, "2026-09-22T00:00:02Z", &build).unwrap()
+    }
+
+    #[test]
+    fn model_invocation_payload_verifies_offline_against_pinned_daemon_key() {
+        let daemon = SigningKey::from_bytes(&[7u8; 32]);
+        // The daemon also persists UNSIGNED copies beside the body; editing
+        // them must neither break verification nor leak into `signed`.
+        let mut payload = model_invocation_payload(&daemon, None);
+        payload["kind"] = "usage_ping".into();
+        payload["output_hash"] = "blake3:decision-deny".into();
+        payload["prompt_hash"] = "blake3:forged".into();
+        let verified = verify_payload(&payload, &pinned_keyring(DAEMON_KEY_ID, &daemon));
+        assert!(verified.is_verified(), "{:?}", verified.report);
+        assert_eq!(verified.kind(), Some("model_invocation"));
+        assert!(verified.report.binding.tenant_bound);
+        assert!(verified.report.binding.receipt_id_bound);
+        assert_eq!(verified.report.signature.key_id.as_deref(), Some(DAEMON_KEY_ID));
+        let expected: BTreeMap<String, String> = [
+            ("kind", "model_invocation"),
+            ("receipt_id", "r_jev_1"),
+            ("tenant_id", "local"),
+            ("invocation_id", "inv-1"),
+            ("provider", "typesafe"),
+            ("model_id", "jev"),
+            ("model_version", "1.0.0"),
+            ("prompt_hash", "blake3:prompt"),
+            ("output_hash", "blake3:decision-allow"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(verified.signed, expected);
+    }
+
+    #[test]
+    fn genuine_non_stream_receipt_under_the_same_key_is_not_a_stream_receipt() {
+        // A usage_ping has the same payload shape, key and tenant as a stream
+        // receipt; only the signed `kind` tells them apart.
+        let daemon = SigningKey::from_bytes(&[7u8; 32]);
+        let (body, hash) =
+            crate::usage_receipt_v1::build_usage_ping_body_v1(&crate::usage_receipt_v1::UsagePingBodyInputV1 {
+                tenant_id: "local",
+                receipt_id: "r_ping_1",
+                passport_fpr: DAEMON_KEY_ID,
+                event_class: crate::usage_receipt_v1::UsageEventClassV1::Session,
+                count: 1,
+                created_at: "2026-09-22T00:00:00Z",
+            });
+        let sig = crate::usage_receipt_v1::sign_usage_ping_v1("r_ping_1", &body, hash, &daemon, DAEMON_KEY_ID, "t");
+        let payload = serde_json::json!({
+            "receipt_id": "r_ping_1",
+            "kind": "model_invocation",
+            "body_cbor_hex": hex::encode(&body),
+            "body_hash": format!("blake3:{}", hex::encode(hash)),
+            "sig": {
+                "schema": sig.schema,
+                "alg": sig.alg,
+                "key_id": sig.key_id,
+                "signed_at": sig.signed_at,
+                "signature_hex": hex::encode(&sig.signature),
+            },
+        });
+        let verified = verify_payload(&payload, &pinned_keyring(DAEMON_KEY_ID, &daemon));
+        assert!(verified.report.signature_valid);
+        assert!(verified.report.binding.tenant_bound && verified.report.binding.receipt_id_bound);
+        assert_eq!(verified.kind(), Some("usage_ping"));
+        assert!(!verified.is_verified());
+    }
+
+    #[test]
+    fn tampered_or_foreign_model_invocation_payloads_fail() {
+        let daemon = SigningKey::from_bytes(&[7u8; 32]);
+        let keyring = pinned_keyring(DAEMON_KEY_ID, &daemon);
+
+        // Decision digest edited after signing, body_hash made consistent.
+        let tampered = verify_payload(
+            &model_invocation_payload(&daemon, Some("blake3:decision-deny")),
+            &keyring,
+        );
+        assert!(!tampered.is_verified());
+        assert!(!tampered.report.signature_valid);
+        assert_eq!(tampered.report.error_code, "SIG_INVALID");
+
+        // Body edited but body_hash left stale.
+        let mut stale = model_invocation_payload(&daemon, None);
+        stale["body_cbor_hex"] =
+            model_invocation_payload(&daemon, Some("blake3:decision-deny"))["body_cbor_hex"].clone();
+        assert_eq!(verify_payload(&stale, &keyring).report.error_code, "BODY_HASH_MISMATCH");
+
+        // Signed by some other key under the pinned key id.
+        let impostor = SigningKey::from_bytes(&[8u8; 32]);
+        let forged = verify_payload(&model_invocation_payload(&impostor, None), &keyring);
+        assert!(!forged.is_verified());
+        assert_eq!(forged.report.error_code, "SIG_INVALID");
+
+        // Key id the pinned keyring does not hold.
+        let other_ring = pinned_keyring("fpr-other", &daemon);
+        let unknown = verify_payload(&model_invocation_payload(&daemon, None), &other_ring);
+        assert_eq!(unknown.report.error_code, "KEY_NOT_FOUND");
+
+        // Genuine body relabelled under another receipt id: the signature
+        // still checks, but the signed body does not name that receipt.
+        let mut relabelled = model_invocation_payload(&daemon, None);
+        relabelled["receipt_id"] = "r_other".into();
+        let relabelled = verify_payload(&relabelled, &keyring);
+        assert!(relabelled.report.signature_valid);
+        assert!(!relabelled.report.binding.receipt_id_bound);
+        assert!(!relabelled.is_verified());
+
+        // Malformed payloads are errors, not reports.
+        let mut no_sig = model_invocation_payload(&daemon, None);
+        no_sig.as_object_mut().unwrap().remove("sig");
+        let build = corecrux_types::BuildInfo {
+            version: "test".into(),
+            commit: "test".into(),
+        };
+        assert!(verify_stream_receipt_payload_v1(&no_sig, "local", &keyring, "t", &build).is_err());
     }
 }
