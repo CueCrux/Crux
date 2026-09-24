@@ -1,11 +1,11 @@
 # SDK release lifecycle
 
 Policy for every published CueCrux SDK package. In this repo:
-`@cuecrux/client` (npm, `sdks/typescript/`) and `cuecrux-client` (PyPI,
-`sdks/python/`). The same policy governs portfolio packages published from
-other repos (`@cuecrux/engine-client`, future `cuecrux-*` integration
-packages such as the LangChain adapter) — link here rather than fork the
-rules.
+`@cuecrux/client` (npm, `sdks/typescript/`), `cuecrux-client` (PyPI,
+`sdks/python/`) and `cuecrux-adapters` (PyPI, `integrations/adapters/`,
+depends on `cuecrux-client`). The same policy governs portfolio packages
+published from other repos (`@cuecrux/engine-client`) — link here rather
+than fork the rules.
 
 This is a **policy document**: it changes how releases are made, but reading
 it never publishes anything, and adopting it is gated (see "Adoption gates").
@@ -16,9 +16,11 @@ it never publishes anything, and adopting it is gated (see "Adoption gates").
   default, or wire expectation → major. Additive → minor. Fix → patch.
 - SDK versions are **decoupled from the daemon version**. Daemon `v*` tags
   build and package both SDKs but never receive registry-write permission.
-  Publishing requires an explicit `sdk-python-vX.Y.Z` or
-  `sdk-typescript-vX.Y.Z` tag, and the tag must exactly match the package
-  version in `pyproject.toml`/`package.json`.
+  Publishing requires an explicit `sdk-python-vX.Y.Z`,
+  `sdk-typescript-vX.Y.Z` or `adapters-vX.Y.Z` tag, and the tag must
+  exactly match the package version in `pyproject.toml`/`package.json`.
+  `adapters-v*` refuses to publish until its `cuecrux-client` requirement
+  resolves from PyPI, so release the Python SDK first.
 - Each SDK declares the **API version it was generated/tested against** in
   its README and in package metadata, pinned to the daemon's
   `/v1/openapi.json` at the release commit. Generated clients are regenerated
@@ -41,9 +43,10 @@ it never publishes anything, and adopting it is gated (see "Adoption gates").
 
 ## Publish integrity (T.5)
 
-Target state — both items are workflow changes, **gated** until the
-supply-chain release pipeline (PR #172) merges so the changes ride one
-review:
+Current state: all three publish jobs use OIDC (`sdk-python.yml` since
+#180, `sdk-typescript.yml` since `0e1b4903`, `adapters.yml` publish job).
+No registry token is read by any workflow. What remains is registry-side
+(see "Adoption gates").
 
 1. **npm: provenance attestation.** `npm publish --access public
    --provenance` with `permissions: id-token: write` on the publish job.
@@ -56,8 +59,28 @@ review:
    `sdk-python.yml`). Generates PEP 740 attestations automatically. The
    `PYPI_TOKEN`/`NPM_TOKEN` secrets are deleted after cutover.
 
-Until cutover, the existing token-based publishes remain (they are
-tag-triggered and self-hosted); do not add new token-secret publish jobs.
+3. **Publish only a clean, reproducible build.** Both PyPI publish jobs
+   upload only the artifact of a `build` job that installs nothing but the
+   pinned toolchain (`build==1.5.0`, `hatchling==1.31.0`), builds the sdist
+   and wheel twice under `SOURCE_DATE_EPOCH` (last commit time) and fails if
+   the two sha256 sets differ. Test dependencies (unpinned `httpx`, the
+   adapter frameworks) are installed only in separate jobs whose output is
+   never published. In `sdk-python.yml` the unit tests run in a `test` job
+   and `publish` needs `[test, build]`. In `adapters.yml` the `build` job is
+   tag-only and also runs the tag==version check and, after the upload, the
+   "published dependencies resolve from PyPI" dry-run;
+   `publish` needs `[conformance, build]` and downloads only `build`'s
+   artifact. The `conformance` job installs unpinned framework trees
+   (`crewai`, `llama-index-core`, `langchain-core`) whose transitive deps
+   survive its uninstall step, so its PR-time package build is never
+   uploaded — a compromised dependency there cannot reach `dist/` on PyPI.
+
+Do not add token-secret publish jobs.
+
+The publish jobs have no GitHub `environment:` gate. Adding one (e.g.
+`environment: pypi`) requires changing the PyPI trusted-publisher entry to
+the same environment name — it is currently blank, and a mismatch makes the
+OIDC exchange fail. Operator decision; change both sides together.
 
 ## Release procedure (per SDK)
 
@@ -66,8 +89,8 @@ tag-triggered and self-hosted); do not add new token-secret publish jobs.
    regenerated client in the same PR with the API version pin updated.
 3. Tests and reproducible packaging green in PR CI. Daemon tags repeat the
    build/package job but skip the publish job.
-4. Push `sdk-python-vX.Y.Z` or `sdk-typescript-vX.Y.Z`. A manual dispatch
-   is build-only and cannot publish.
+4. Push `sdk-python-vX.Y.Z`, `sdk-typescript-vX.Y.Z` or `adapters-vX.Y.Z`.
+   A manual dispatch is build-only and cannot publish.
 5. Post-publish: `npm audit signatures` / check the PyPI attestation badge;
    yank only for malware/credential incidents — broken releases are
    superseded by a patch, never unpublished (matches the binary-release
@@ -79,13 +102,17 @@ change that was not accompanied by a version bump.
 
 ## Adoption gates (operator actions — nothing here is done by docs alone)
 
-- [ ] PR #172 merged (workflow-change freeze lifts).
-- [ ] npm: enable Trusted Publishing for `@cuecrux/client`; edit
-      `sdk-typescript.yml` (add `id-token: write`, `--provenance`, drop
-      `NODE_AUTH_TOKEN`).
-- [ ] PyPI: add trusted publisher for `cuecrux-client`; edit
-      `sdk-python.yml` (swap twine for `pypa/gh-action-pypi-publish`).
-- [ ] Delete `NPM_TOKEN` / `PYPI_TOKEN` secrets after one successful
-      OIDC publish each.
+- [x] PR #172 merged (workflow-change freeze lifts).
+- [x] Workflows on OIDC: `sdk-typescript.yml`, `sdk-python.yml`,
+      `adapters.yml` (no environment; PyPI/npm publisher environment blank).
+- [ ] npm: Trusted Publisher on `@cuecrux/client` = `CueCrux/Crux`,
+      workflow `sdk-typescript.yml`.
+- [ ] PyPI: pending publisher for `cuecrux-client` = `CueCrux/Crux`,
+      workflow `sdk-python.yml` (the existing publisher covers only the old
+      `corecrux-client` name).
+- [ ] PyPI: pending publisher for `cuecrux-adapters` = `CueCrux/Crux`,
+      workflow `adapters.yml`.
+- [ ] Delete the unused `NPM_TOKEN` repo secret after one successful
+      OIDC publish.
 - [ ] First provenance-attested releases verified (`npm audit signatures`,
       PyPI attestation present) and recorded in the release notes.
