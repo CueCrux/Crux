@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -56,6 +57,18 @@ def _parse_json(resp: httpx.Response) -> dict[str, Any]:
     if not resp.content:
         return {}
     return resp.json()
+
+
+def _seg(value: Any) -> str:
+    """Percent-encode ``str(value)`` as ONE path segment: ``/``, ``?``, ``#`` and ``%`` included.
+
+    Entities such as ``repo:a/b`` would otherwise split the path or start a
+    query string, and the daemon answers an empty list rather than an error.
+    A value of ``.`` or ``..`` is sent as ``%2E`` / ``%2E%2E``: left bare, httpx
+    resolves it as a dot-segment (``/v1/facts/entity/..`` becomes ``/v1/facts``).
+    """
+    seg = quote(str(value), safe="")
+    return seg.replace(".", "%2E") if seg in (".", "..") else seg
 
 
 def _params(**kwargs: Any) -> dict[str, Any]:
@@ -125,7 +138,8 @@ def _to_fact(d: dict[str, Any]) -> Fact:
         fact_id=d["fact_id"],
         entity=d["entity"],
         key=d["key"],
-        value=d["value"],
+        # Absent (with value_omitted) on rows past a token_budget's hydration boundary.
+        value=d.get("value"),
         confidence=d["confidence"],
         stored_at=d["stored_at"],
         tokens=d["tokens"],
@@ -134,6 +148,7 @@ def _to_fact(d: dict[str, Any]) -> Fact:
         source_receipt=d.get("source_receipt"),
         supersedes=d.get("supersedes"),
         private=d.get("private", False),
+        value_omitted=d.get("value_omitted", False),
     )
 
 
@@ -274,7 +289,7 @@ class CueCruxClient:
         Returns ``None`` if the fact does not exist (404).
         """
         try:
-            data = self._request("GET", f"/v1/facts/{fact_id}")
+            data = self._request("GET", f"/v1/facts/{_seg(fact_id)}")
             return _to_fact(data)
         except CueCruxError as exc:
             if exc.status_code == 404:
@@ -287,7 +302,7 @@ class CueCruxClient:
         Returns ``True`` if deleted, ``False`` if the fact was not found.
         """
         try:
-            data = self._request("DELETE", f"/v1/facts/{fact_id}")
+            data = self._request("DELETE", f"/v1/facts/{_seg(fact_id)}")
             return data.get("deleted", False)
         except CueCruxError as exc:
             if exc.status_code == 404:
@@ -296,7 +311,7 @@ class CueCruxClient:
 
     def get_facts_by_entity(self, entity: str) -> list[Fact]:
         """GET /v1/facts/entity/{entity} -- list all facts for an entity."""
-        data = self._request("GET", f"/v1/facts/entity/{entity}")
+        data = self._request("GET", f"/v1/facts/entity/{_seg(entity)}")
         return [_to_fact(f) for f in data.get("facts", [])]
 
     def query_facts(
@@ -347,7 +362,7 @@ class CueCruxClient:
 
     def put_session(self, session_id: str, state: dict[str, Any]) -> SessionState:
         """PUT /v1/sessions/{sessionId}/state -- store session state."""
-        data = self._request("PUT", f"/v1/sessions/{session_id}/state", json=state)
+        data = self._request("PUT", f"/v1/sessions/{_seg(session_id)}/state", json=state)
         return _to_session(data)
 
     def get_session(self, session_id: str) -> SessionState | None:
@@ -356,7 +371,7 @@ class CueCruxClient:
         Returns ``None`` if the session does not exist (404).
         """
         try:
-            data = self._request("GET", f"/v1/sessions/{session_id}/state")
+            data = self._request("GET", f"/v1/sessions/{_seg(session_id)}/state")
             return _to_session(data)
         except CueCruxError as exc:
             if exc.status_code == 404:
@@ -550,14 +565,14 @@ class CueCruxClient:
         """
         return self._request(
             "POST",
-            f"/v1/memory/candidates/{candidate_id}/promote",
+            f"/v1/memory/candidates/{_seg(candidate_id)}/promote",
             json=_body(reviewer=reviewer, auto_threshold=auto_threshold),
         )
 
     def reject_candidate(self, candidate_id: str, reason: str) -> dict[str, Any]:
         """POST /v1/memory/candidates/{id}/reject -- reject with a reason."""
         return self._request(
-            "POST", f"/v1/memory/candidates/{candidate_id}/reject", json={"reason": reason}
+            "POST", f"/v1/memory/candidates/{_seg(candidate_id)}/reject", json={"reason": reason}
         )
 
     # -- review: contradictions, queue, expiries --
@@ -683,6 +698,55 @@ class CueCruxClient:
             ),
         )
 
+    # -- receipts --
+
+    def post_mediation_receipt(self, draft: dict[str, Any]) -> dict[str, Any]:
+        """POST /v1/mediation/receipts -- mint a signed receipt from a draft.
+
+        ``draft["kind"]`` picks the receipt. ``model_invocation``,
+        ``context_injected``, ``stream_completed`` and ``stream_aborted``
+        drafts need ``CORECRUXD_STREAM_RECEIPTS=1`` (``usage_ping`` needs
+        ``CORECRUXD_FEATURE_USAGE_RECEIPTS=1``); with the flag off they fall
+        through to the tool-call receipt parse and are rejected (422). Returns
+        the daemon's JSON: ``receipt_id``, ``body_hash``, ``signature_hex``, ...
+        """
+        return self._request("POST", "/v1/mediation/receipts", json=draft)
+
+    def verify_receipt(self, receipt_id: str, *, tenant_id: str) -> dict[str, Any]:
+        """GET /v1/receipts/{receiptId}/verification -- check a receipt's signature.
+
+        ``tenant_id`` is required by the daemon and must be one the token is
+        authorized for; stream-kind receipts (``model_invocation`` and the
+        rest) are minted under ``"local"``. The report carries ``signature_valid`` and
+        ``error_code`` (``"OK"`` when it verifies).
+        """
+        return self._request(
+            "GET", f"/v1/receipts/{_seg(receipt_id)}/verification", params={"tenant_id": tenant_id}
+        )
+
+    def aggregate_observations(
+        self,
+        *,
+        kind: str | None = None,
+        provider: str | None = None,
+        session_id: str | None = None,
+        since: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """GET /v1/observations/aggregate -- observation records, newest first.
+
+        Stream receipts (``model_invocation`` and the rest) live here on a
+        daemon without a dataplane: each record's ``payload`` carries the
+        ``receipt_id``, the signed ``body_cbor_hex`` and its ``sig``. ``since``
+        is an RFC 3339 time; ``limit`` defaults to 100 and is capped at 1000
+        daemon-side (``matched`` vs ``returned`` says whether it cut).
+        """
+        return self._request(
+            "GET",
+            "/v1/observations/aggregate",
+            params=_params(kind=kind, provider=provider, session_id=session_id, since=since, limit=limit),
+        )
+
     # -- extensions --
 
     def list_extensions(self) -> dict[str, Any]:
@@ -692,7 +756,7 @@ class CueCruxClient:
     def get_extension(self, extension_id: str) -> dict[str, Any] | None:
         """GET /v1/extensions/{id} -- one extension, or None if absent."""
         try:
-            return self._request("GET", f"/v1/extensions/{extension_id}")
+            return self._request("GET", f"/v1/extensions/{_seg(extension_id)}")
         except CueCruxError as err:
             if err.status_code == 404:
                 return None
@@ -705,7 +769,7 @@ class CueCruxClient:
     def delete_extension(self, extension_id: str) -> bool:
         """DELETE /v1/extensions/{id} -- uninstall. False if not installed."""
         try:
-            self._request("DELETE", f"/v1/extensions/{extension_id}")
+            self._request("DELETE", f"/v1/extensions/{_seg(extension_id)}")
             return True
         except CueCruxError as err:
             if err.status_code == 404:
@@ -752,24 +816,24 @@ class CueCruxClient:
 
     def delete_trusted_key(self, passport_fpr: str) -> dict[str, Any]:
         """DELETE /v1/extensions/keys/{passport_fpr} -- untrust a signing key."""
-        return self._request("DELETE", f"/v1/extensions/keys/{passport_fpr}")
+        return self._request("DELETE", f"/v1/extensions/keys/{_seg(passport_fpr)}")
 
     def list_grants(self, extension_id: str) -> dict[str, Any]:
         """GET /v1/extensions/{id}/grants -- grants issued for an extension."""
-        return self._request("GET", f"/v1/extensions/{extension_id}/grants")
+        return self._request("GET", f"/v1/extensions/{_seg(extension_id)}/grants")
 
     def issue_grant(self, extension_id: str, passport_fpr: str, **options: Any) -> dict[str, Any]:
         """POST /v1/extensions/{id}/grants -- issue a per-passport capability grant."""
         return self._request(
             "POST",
-            f"/v1/extensions/{extension_id}/grants",
+            f"/v1/extensions/{_seg(extension_id)}/grants",
             json=_body(passport_fpr=passport_fpr, **options),
         )
 
     def revoke_grant(self, extension_id: str, passport_fpr: str) -> dict[str, Any]:
         """DELETE /v1/extensions/{id}/grants/{passport_fpr} -- revoke a grant."""
         return self._request(
-            "DELETE", f"/v1/extensions/{extension_id}/grants/{passport_fpr}"
+            "DELETE", f"/v1/extensions/{_seg(extension_id)}/grants/{_seg(passport_fpr)}"
         )
 
     def invoke_extension_tool(
@@ -786,7 +850,7 @@ class CueCruxClient:
         """
         return self._request(
             "POST",
-            f"/v1/extensions/{extension_id}/tools/{tool_name}/invoke",
+            f"/v1/extensions/{_seg(extension_id)}/tools/{_seg(tool_name)}/invoke",
             json=_body(args=args if args is not None else {}, passport_fpr=passport_fpr),
         )
 
@@ -892,7 +956,7 @@ class AsyncCueCruxClient:
     async def get_fact(self, fact_id: str) -> Fact | None:
         """GET /v1/facts/{factId} -- retrieve a fact by ID."""
         try:
-            data = await self._request("GET", f"/v1/facts/{fact_id}")
+            data = await self._request("GET", f"/v1/facts/{_seg(fact_id)}")
             return _to_fact(data)
         except CueCruxError as exc:
             if exc.status_code == 404:
@@ -902,7 +966,7 @@ class AsyncCueCruxClient:
     async def delete_fact(self, fact_id: str) -> bool:
         """DELETE /v1/facts/{factId} -- soft-delete a fact."""
         try:
-            data = await self._request("DELETE", f"/v1/facts/{fact_id}")
+            data = await self._request("DELETE", f"/v1/facts/{_seg(fact_id)}")
             return data.get("deleted", False)
         except CueCruxError as exc:
             if exc.status_code == 404:
@@ -911,7 +975,7 @@ class AsyncCueCruxClient:
 
     async def get_facts_by_entity(self, entity: str) -> list[Fact]:
         """GET /v1/facts/entity/{entity} -- list all facts for an entity."""
-        data = await self._request("GET", f"/v1/facts/entity/{entity}")
+        data = await self._request("GET", f"/v1/facts/entity/{_seg(entity)}")
         return [_to_fact(f) for f in data.get("facts", [])]
 
     async def query_facts(
@@ -962,13 +1026,13 @@ class AsyncCueCruxClient:
 
     async def put_session(self, session_id: str, state: dict[str, Any]) -> SessionState:
         """PUT /v1/sessions/{sessionId}/state -- store session state."""
-        data = await self._request("PUT", f"/v1/sessions/{session_id}/state", json=state)
+        data = await self._request("PUT", f"/v1/sessions/{_seg(session_id)}/state", json=state)
         return _to_session(data)
 
     async def get_session(self, session_id: str) -> SessionState | None:
         """GET /v1/sessions/{sessionId}/state -- retrieve session state."""
         try:
-            data = await self._request("GET", f"/v1/sessions/{session_id}/state")
+            data = await self._request("GET", f"/v1/sessions/{_seg(session_id)}/state")
             return _to_session(data)
         except CueCruxError as exc:
             if exc.status_code == 404:
@@ -1159,14 +1223,14 @@ class AsyncCueCruxClient:
         """
         return await self._request(
             "POST",
-            f"/v1/memory/candidates/{candidate_id}/promote",
+            f"/v1/memory/candidates/{_seg(candidate_id)}/promote",
             json=_body(reviewer=reviewer, auto_threshold=auto_threshold),
         )
 
     async def reject_candidate(self, candidate_id: str, reason: str) -> dict[str, Any]:
         """POST /v1/memory/candidates/{id}/reject -- reject with a reason."""
         return await self._request(
-            "POST", f"/v1/memory/candidates/{candidate_id}/reject", json={"reason": reason}
+            "POST", f"/v1/memory/candidates/{_seg(candidate_id)}/reject", json={"reason": reason}
         )
 
     # -- review: contradictions, queue, expiries --
@@ -1292,6 +1356,48 @@ class AsyncCueCruxClient:
             ),
         )
 
+    # -- receipts --
+
+    async def post_mediation_receipt(self, draft: dict[str, Any]) -> dict[str, Any]:
+        """POST /v1/mediation/receipts -- mint a signed receipt from a draft.
+
+        ``draft["kind"]`` picks the receipt. ``model_invocation``,
+        ``context_injected``, ``stream_completed`` and ``stream_aborted``
+        drafts need ``CORECRUXD_STREAM_RECEIPTS=1`` (``usage_ping`` needs
+        ``CORECRUXD_FEATURE_USAGE_RECEIPTS=1``); with the flag off they fall
+        through to the tool-call receipt parse and are rejected (422). Returns
+        the daemon's JSON: ``receipt_id``, ``body_hash``, ``signature_hex``, ...
+        """
+        return await self._request("POST", "/v1/mediation/receipts", json=draft)
+
+    async def verify_receipt(self, receipt_id: str, *, tenant_id: str) -> dict[str, Any]:
+        """GET /v1/receipts/{receiptId}/verification -- check a receipt's signature.
+
+        ``tenant_id`` is required by the daemon and must be one the token is
+        authorized for; stream-kind receipts (``model_invocation`` and the
+        rest) are minted under ``"local"``. The report carries ``signature_valid`` and
+        ``error_code`` (``"OK"`` when it verifies).
+        """
+        return await self._request(
+            "GET", f"/v1/receipts/{_seg(receipt_id)}/verification", params={"tenant_id": tenant_id}
+        )
+
+    async def aggregate_observations(
+        self,
+        *,
+        kind: str | None = None,
+        provider: str | None = None,
+        session_id: str | None = None,
+        since: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """GET /v1/observations/aggregate -- see :meth:`CueCruxClient.aggregate_observations`."""
+        return await self._request(
+            "GET",
+            "/v1/observations/aggregate",
+            params=_params(kind=kind, provider=provider, session_id=session_id, since=since, limit=limit),
+        )
+
     # -- extensions --
 
     async def list_extensions(self) -> dict[str, Any]:
@@ -1301,7 +1407,7 @@ class AsyncCueCruxClient:
     async def get_extension(self, extension_id: str) -> dict[str, Any] | None:
         """GET /v1/extensions/{id} -- one extension, or None if absent."""
         try:
-            return await self._request("GET", f"/v1/extensions/{extension_id}")
+            return await self._request("GET", f"/v1/extensions/{_seg(extension_id)}")
         except CueCruxError as err:
             if err.status_code == 404:
                 return None
@@ -1314,7 +1420,7 @@ class AsyncCueCruxClient:
     async def delete_extension(self, extension_id: str) -> bool:
         """DELETE /v1/extensions/{id} -- uninstall. False if not installed."""
         try:
-            await self._request("DELETE", f"/v1/extensions/{extension_id}")
+            await self._request("DELETE", f"/v1/extensions/{_seg(extension_id)}")
             return True
         except CueCruxError as err:
             if err.status_code == 404:
@@ -1361,24 +1467,24 @@ class AsyncCueCruxClient:
 
     async def delete_trusted_key(self, passport_fpr: str) -> dict[str, Any]:
         """DELETE /v1/extensions/keys/{passport_fpr} -- untrust a signing key."""
-        return await self._request("DELETE", f"/v1/extensions/keys/{passport_fpr}")
+        return await self._request("DELETE", f"/v1/extensions/keys/{_seg(passport_fpr)}")
 
     async def list_grants(self, extension_id: str) -> dict[str, Any]:
         """GET /v1/extensions/{id}/grants -- grants issued for an extension."""
-        return await self._request("GET", f"/v1/extensions/{extension_id}/grants")
+        return await self._request("GET", f"/v1/extensions/{_seg(extension_id)}/grants")
 
     async def issue_grant(self, extension_id: str, passport_fpr: str, **options: Any) -> dict[str, Any]:
         """POST /v1/extensions/{id}/grants -- issue a per-passport capability grant."""
         return await self._request(
             "POST",
-            f"/v1/extensions/{extension_id}/grants",
+            f"/v1/extensions/{_seg(extension_id)}/grants",
             json=_body(passport_fpr=passport_fpr, **options),
         )
 
     async def revoke_grant(self, extension_id: str, passport_fpr: str) -> dict[str, Any]:
         """DELETE /v1/extensions/{id}/grants/{passport_fpr} -- revoke a grant."""
         return await self._request(
-            "DELETE", f"/v1/extensions/{extension_id}/grants/{passport_fpr}"
+            "DELETE", f"/v1/extensions/{_seg(extension_id)}/grants/{_seg(passport_fpr)}"
         )
 
     async def invoke_extension_tool(
@@ -1395,7 +1501,7 @@ class AsyncCueCruxClient:
         """
         return await self._request(
             "POST",
-            f"/v1/extensions/{extension_id}/tools/{tool_name}/invoke",
+            f"/v1/extensions/{_seg(extension_id)}/tools/{_seg(tool_name)}/invoke",
             json=_body(args=args if args is not None else {}, passport_fpr=passport_fpr),
         )
 
