@@ -93,9 +93,11 @@ pub const FREE_CAPABILITY_CLAIMS: &[&str] = &[
 /// the surface returns `402 pro_service_not_enabled` until then, and
 /// `workbench_command_ledger_is_not_a_sold_claim_without_a_producer` pins
 /// that. Removing it from [`DAEMON_IMPLEMENTED_PRO_CLAIMS`] alone would have
-/// been worse than leaving it: `pro_claim_placements` would then report it as
-/// `contracted_external`, asserting an outside implementer that does not
-/// exist. See ExecPlan `crux-command-ledger-claim-truth-2026-07-30`.
+/// been worse than leaving it: `pro_claim_placements` then derived placement
+/// from membership and would have reported it as `contracted_external`,
+/// asserting an outside implementer that does not exist. Placement now comes
+/// from the site tables, so such a claim reports `unimplemented`. See ExecPlan
+/// `crux-command-ledger-claim-truth-2026-07-30`.
 pub const PRO_CAPABILITY_CLAIMS: &[&str] = &[
     "memorycrux:tenant",
     "gpu1:answer",
@@ -148,13 +150,14 @@ pub const DAEMON_IMPLEMENTED_PRO_CLAIMS: &[&str] = &[
 
 /// Where each [`DAEMON_IMPLEMENTED_PRO_CLAIMS`] entry is actually enforced.
 ///
-/// `pro_claim_placements` derives `implementation: "daemon"` from list
-/// membership alone — it never checks that a gate exists — so adding a string
-/// to two arrays is enough to make the daemon report a capability as
+/// `pro_claim_placements` used to derive `implementation: "daemon"` from list
+/// membership alone — it never checked that a gate exists — so adding a
+/// string to two arrays was enough to make the daemon report a capability as
 /// implemented. The M4 vow audit found four claims in exactly that state.
 ///
-/// This table is the missing check. A claim earns `daemon_implemented` by
-/// naming the `file:line` that refuses it, and
+/// This table is the check. `pro_claim_placements` reads it directly: a claim
+/// earns `daemon_implemented` only by naming the `file:line` that refuses it,
+/// and one without a `Some` row here reports `unimplemented`. And
 /// `daemon_implemented_pro_claims_have_a_gate_site` fails the build if the two
 /// lists drift apart in either direction.
 ///
@@ -194,15 +197,14 @@ pub const DAEMON_IMPLEMENTED_PRO_CLAIMS: &[&str] = &[
 ///
 /// Re-selling one means landing its gate in the same change: two array entries
 /// plus a `Some` row here. Note the `ledger:history` trap above — the two
-/// arrays are edited together or not at all, because dropping a claim from
-/// `DAEMON_IMPLEMENTED_PRO_CLAIMS` alone re-labels it `contracted_external`,
-/// asserting an outside implementer that does not exist.
+/// arrays are edited together or not at all; dropping a claim from
+/// `DAEMON_IMPLEMENTED_PRO_CLAIMS` alone leaves a stale row here, which
+/// `daemon_implemented_pro_claims_have_a_gate_site` refuses.
 ///
 /// The classification behind the sixteen claims declared daemon-implemented,
 /// for the record: five egress (the GPU-1 bridge, the only Pro handler that
 /// reaches the network), and eleven local compute that answers on a
 /// network-severed daemon.
-#[cfg(test)]
 const DAEMON_CLAIM_GATE_SITES: &[(&str, Option<&str>)] = &[
     ("gpu1:answer", Some("http/gpu1.rs:800 service_enabled")),
     ("gpu1:rerank", Some("http/gpu1.rs:800 service_enabled")),
@@ -244,6 +246,60 @@ pub const HOSTED_CONTROL_PLANE_PRO_CLAIMS: &[&str] = &[
     "materiality:custom",
     "control_plane:hosted",
     "credits:pooled",
+];
+
+/// Where each [`HOSTED_CONTROL_PLANE_PRO_CLAIMS`] entry is implemented, as
+/// `system: file` — the hosted twin of [`DAEMON_CLAIM_GATE_SITES`].
+///
+/// Rows come from the 2026-08-07 functional audit of the twelve hosted claims,
+/// which traced route → handler → backing logic across the CueCrux repos
+/// rather than searching for claim strings. `pro_claim_placements` reports a
+/// claim as `hosted_control_plane` only when its row here is `Some`.
+///
+/// The three `None` rows are audit findings, not placeholders: nothing was
+/// found behind them in fourteen repos. They report as `unimplemented` until
+/// an owner either names an implementation (and the row becomes `Some`) or
+/// withdraws the claim from both arrays together.
+/// `the_unfound_hosted_claims_are_exactly_the_audit_findings` pins that set,
+/// so a row cannot quietly drop to `None` nor quietly gain a site.
+///
+/// `exports:compliance` and `materiality:custom` are implemented **locally**
+/// in this repository; whether they belong on the hosted list at all is an
+/// open classification question, not settled here.
+const HOSTED_CLAIM_IMPLEMENTATION_SITES: &[(&str, Option<&str>)] = &[
+    (
+        "memorycrux:tenant",
+        Some("MemoryCrux: hosted tenant memory product (not yet in the Feature Registry)"),
+    ),
+    ("sync:managed_backup", None),
+    ("audit:central_retention", None),
+    ("policy_packs:team", Some("CruxEngine + VaultCrux: team policy packs")),
+    (
+        "decision_memory:shared",
+        Some("CoreCrux: decision-plane events (shared scope unverified)"),
+    ),
+    (
+        "sso:rbac",
+        Some("CruxEngine: packages/core/src/memory-rbac.ts, packages/core/src/seats.ts"),
+    ),
+    (
+        "passport_policy:org",
+        Some("CruxEngine + CueCrux-Shared: org passport policy"),
+    ),
+    (
+        "exports:compliance",
+        Some("Crux: crates/corecruxctl/src/export.rs (local)"),
+    ),
+    ("enrichers:custom", Some("RCX-Registry: crates/rcx-registry-enrich")),
+    (
+        "materiality:custom",
+        Some("Crux: crates/corecrux-memory/src/action_enrichment.rs (local)"),
+    ),
+    ("control_plane:hosted", None),
+    (
+        "credits:pooled",
+        Some("CruxEngine: packages/core/src/economy.ts pooled_conversion_key"),
+    ),
 ];
 
 pub const MAX_CAPABILITY_CLAIMS: &[&str] = &[
@@ -1431,16 +1487,31 @@ fn enabled_capability_claims(mode: OperatingMode) -> Vec<&'static str> {
 }
 
 fn pro_claim_placements() -> Vec<ProClaimPlacement> {
-    PRO_CAPABILITY_CLAIMS
+    place_claims(
+        PRO_CAPABILITY_CLAIMS,
+        DAEMON_CLAIM_GATE_SITES,
+        HOSTED_CLAIM_IMPLEMENTATION_SITES,
+    )
+}
+
+/// Placement is derived from the site tables, never from array membership: a
+/// claim is `daemon` / `hosted_control_plane` only where a row names its site,
+/// and a claim with no named site reports `unimplemented`.
+fn place_claims(
+    claims: &[&'static str],
+    daemon_sites: &[(&str, Option<&str>)],
+    hosted_sites: &[(&str, Option<&str>)],
+) -> Vec<ProClaimPlacement> {
+    claims
         .iter()
         .map(|claim| {
-            let daemon = contains_claim(DAEMON_IMPLEMENTED_PRO_CLAIMS, claim);
-            let hosted = contains_claim(HOSTED_CONTROL_PLANE_PRO_CLAIMS, claim);
+            let daemon = has_site(daemon_sites, claim);
+            let hosted = has_site(hosted_sites, claim);
             let implementation = match (daemon, hosted) {
                 (true, true) => "daemon_and_hosted_control_plane",
                 (true, false) => "daemon",
                 (false, true) => "hosted_control_plane",
-                (false, false) => "contracted_external",
+                (false, false) => "unimplemented",
             };
             ProClaimPlacement {
                 claim,
@@ -1450,6 +1521,10 @@ fn pro_claim_placements() -> Vec<ProClaimPlacement> {
             }
         })
         .collect()
+}
+
+fn has_site(sites: &[(&str, Option<&str>)], claim: &str) -> bool {
+    sites.iter().any(|(name, site)| *name == claim && site.is_some())
 }
 
 fn contains_claim(claims: &[&str], value: &str) -> bool {
@@ -1631,10 +1706,10 @@ mod tests {
     /// A claim may not be sold as daemon-implemented without a gate that
     /// refuses it.
     ///
-    /// `pro_claim_placements` reports `implementation: "daemon"` from list
-    /// membership, so without this the only thing standing between "we built
-    /// it" and "we added a string to an array" is review. M4 found four claims
-    /// that had crossed that line.
+    /// `pro_claim_placements` derives `implementation: "daemon"` from this
+    /// table, so a declared claim without a row would silently report
+    /// `unimplemented`; this keeps the declaration and the table in step. M4
+    /// found four claims sold on membership alone.
     #[test]
     fn daemon_implemented_pro_claims_have_a_gate_site() {
         for claim in DAEMON_IMPLEMENTED_PRO_CLAIMS {
@@ -1698,10 +1773,124 @@ mod tests {
             );
             assert!(
                 !contains_claim(DAEMON_IMPLEMENTED_PRO_CLAIMS, claim),
-                "{claim} must leave both arrays together — in DAEMON_IMPLEMENTED_PRO_CLAIMS alone \
-                 it would report as contracted_external, asserting an implementer that does not exist"
+                "{claim} must leave both arrays together — see the ledger:history note"
             );
         }
+    }
+
+    fn placement(placements: &[ProClaimPlacement], claim: &str) -> (&'static str, bool, bool) {
+        let p = placements
+            .iter()
+            .find(|p| p.claim == claim)
+            .unwrap_or_else(|| panic!("{claim} has no placement"));
+        (p.implementation, p.daemon_implemented, p.hosted_control_plane)
+    }
+
+    /// Placement is derived from the site tables, never from array membership.
+    ///
+    /// The mutation this guards: a claim string added to
+    /// `PRO_CAPABILITY_CLAIMS` and `DAEMON_IMPLEMENTED_PRO_CLAIMS` with no
+    /// gate-site row. Membership alone must not make it report as implemented.
+    #[test]
+    fn a_claim_without_a_site_reports_unimplemented() {
+        let unsited = ["impact:preflight_unsited", "sso:rbac_unsited"];
+        let placements = place_claims(&unsited, DAEMON_CLAIM_GATE_SITES, HOSTED_CLAIM_IMPLEMENTATION_SITES);
+        for claim in unsited {
+            assert_eq!(placement(&placements, claim), ("unimplemented", false, false));
+        }
+
+        // A row that exists but names no site is the same finding.
+        let placements = place_claims(
+            &["impact:preflight", "sso:rbac"],
+            &[("impact:preflight", None)],
+            &[("sso:rbac", None)],
+        );
+        assert_eq!(
+            placement(&placements, "impact:preflight"),
+            ("unimplemented", false, false)
+        );
+        assert_eq!(placement(&placements, "sso:rbac"), ("unimplemented", false, false));
+    }
+
+    /// Positive round-trip: a named site is what earns each placement.
+    #[test]
+    fn a_named_site_earns_its_placement() {
+        let site = Some("x.rs:1");
+        let placements = place_claims(
+            &["d:claim", "h:claim", "both:claim"],
+            &[("d:claim", site), ("both:claim", site)],
+            &[("h:claim", site), ("both:claim", site)],
+        );
+        assert_eq!(placement(&placements, "d:claim"), ("daemon", true, false));
+        assert_eq!(placement(&placements, "h:claim"), ("hosted_control_plane", false, true));
+        assert_eq!(
+            placement(&placements, "both:claim"),
+            ("daemon_and_hosted_control_plane", true, true)
+        );
+    }
+
+    /// What `/v1/version` reports for the real tables.
+    #[test]
+    fn live_placements_follow_the_site_tables() {
+        let placements = pro_claim_placements();
+        assert_eq!(placements.len(), PRO_CAPABILITY_CLAIMS.len());
+        assert_eq!(placement(&placements, "impact:preflight"), ("daemon", true, false));
+        assert_eq!(
+            placement(&placements, "sso:rbac"),
+            ("hosted_control_plane", false, true)
+        );
+        for claim in ["sync:managed_backup", "audit:central_retention", "control_plane:hosted"] {
+            assert_eq!(placement(&placements, claim), ("unimplemented", false, false));
+        }
+        let unimplemented: Vec<&str> = placements
+            .iter()
+            .filter(|p| p.implementation == "unimplemented")
+            .map(|p| p.claim)
+            .collect();
+        assert_eq!(
+            unimplemented,
+            ["sync:managed_backup", "audit:central_retention", "control_plane:hosted"],
+            "only the three audit findings may report unimplemented"
+        );
+    }
+
+    /// The hosted twin of `daemon_implemented_pro_claims_have_a_gate_site`.
+    #[test]
+    fn hosted_control_plane_pro_claims_have_an_implementation_site_row() {
+        for claim in HOSTED_CONTROL_PLANE_PRO_CLAIMS {
+            assert!(
+                HOSTED_CLAIM_IMPLEMENTATION_SITES.iter().any(|(name, _)| name == claim),
+                "{claim} is declared hosted but has no HOSTED_CLAIM_IMPLEMENTATION_SITES row. \
+                 Name the system and file that implement it — or `None` if nothing does, which \
+                 reports it as unimplemented."
+            );
+        }
+
+        for (claim, _) in HOSTED_CLAIM_IMPLEMENTATION_SITES {
+            assert!(
+                contains_claim(HOSTED_CONTROL_PLANE_PRO_CLAIMS, claim),
+                "{claim} has an implementation-site row but is no longer in \
+                 HOSTED_CONTROL_PLANE_PRO_CLAIMS; drop the stale row"
+            );
+        }
+    }
+
+    /// The three hosted claims the audit found nothing behind, and only those.
+    ///
+    /// Both directions: a listed claim losing its site fails here, and so does
+    /// one of the three gaining a site without this list shrinking with it.
+    #[test]
+    fn the_unfound_hosted_claims_are_exactly_the_audit_findings() {
+        let unfound: Vec<&str> = HOSTED_CLAIM_IMPLEMENTATION_SITES
+            .iter()
+            .filter_map(|(claim, site)| site.is_none().then_some(*claim))
+            .collect();
+        assert_eq!(
+            unfound,
+            ["sync:managed_backup", "audit:central_retention", "control_plane:hosted"],
+            "the set of hosted claims with no implementation site changed. Confirming one needs a \
+             named system and file; withdrawing one removes it from both arrays together."
+        );
     }
 
     #[test]

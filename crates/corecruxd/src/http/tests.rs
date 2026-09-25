@@ -9601,8 +9601,7 @@ async fn workbench_command_ledger_is_not_a_sold_claim_without_a_producer() {
         "ledger:history must not survive the PRO_CAPABILITY_CLAIMS filter"
     );
 
-    // It appears in no catalogue, so it can never be reported as
-    // `contracted_external` by `pro_claim_placements`.
+    // It appears in no catalogue, so `pro_claim_placements` never places it.
     assert!(!crate::product::PRO_CAPABILITY_CLAIMS.contains(&"ledger:history"));
     assert!(!crate::product::DAEMON_IMPLEMENTED_PRO_CLAIMS.contains(&"ledger:history"));
     assert!(!crate::product::HOSTED_CONTROL_PLANE_PRO_CLAIMS.contains(&"ledger:history"));
