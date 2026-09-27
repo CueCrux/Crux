@@ -124,7 +124,7 @@ zeroize = { version = "1", features = ["derive"] }
 x509-cert = { version = "0.3.0", default-features = false }
 xxhash-rust = "0.8.12"
 zip = { version = "8.6.0", default-features = false }
-zstd = "0.13.3"
+zstd = "0.14.0"
 
 # ── Strictest lint configuration ────────────────────────────────────
 # All clippy lint groups denied. Pedantic enabled. Specific overrides below.
