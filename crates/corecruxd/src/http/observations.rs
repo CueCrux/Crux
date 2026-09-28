@@ -259,6 +259,32 @@ pub(super) struct AggregateObservationsQuery {
     /// descending so the most recent observations always make the cut.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Which sessions `chains` reports on: `returned` (default) — only the
+    /// sessions that contributed a record to `observations`; `all` — every
+    /// visible session scanned, whatever the filters (the pre-bounding
+    /// behaviour); `none` — omit chain status.
+    #[serde(default)]
+    pub chains: Option<String>,
+}
+
+/// Scope of the `chains` map in an aggregate response. See
+/// [`AggregateObservationsQuery::chains`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggregateChainsScope {
+    Returned,
+    All,
+    None,
+}
+
+impl AggregateChainsScope {
+    fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(str::trim) {
+            None | Some("" | "returned") => Ok(Self::Returned),
+            Some("all") => Ok(Self::All),
+            Some("none") => Ok(Self::None),
+            Some(other) => Err(format!("chains must be one of returned, all, none (got '{other}')")),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -270,9 +296,11 @@ pub(super) struct AggregateObservationsResponse {
     pub provider_counts: std::collections::BTreeMap<String, usize>,
     pub principal_counts: std::collections::BTreeMap<String, usize>,
     pub kind_counts: std::collections::BTreeMap<String, usize>,
-    /// Per-session chain status keyed by `session_id`. Lets a caller spot
-    /// "the aggregate is fresh data, but session X's chain is broken on
-    /// disk" without a follow-up call.
+    /// Per-session chain status keyed by on-disk session id. Lets a caller
+    /// spot "the aggregate is fresh data, but session X's chain is broken on
+    /// disk" without a follow-up call. By default only the sessions behind
+    /// the returned `observations`; `?chains=all` reports every visible
+    /// session scanned (unbounded: one entry per session log on the node).
     pub chains: std::collections::BTreeMap<String, ChainStatusJson>,
     /// Total matched records *before* the `limit` truncation, so callers
     /// know whether they need to paginate via `since`.
@@ -1113,6 +1141,45 @@ pub(super) fn validate_chain(records: &[ObservationRecordV1]) -> ChainStatus {
     }
 }
 
+/// Stable `code` on the 422 a generic observation write gets for a reserved
+/// receipt kind.
+pub(super) const RESERVED_OBSERVATION_KIND_CODE: &str = "RESERVED_OBSERVATION_KIND";
+
+/// RFC 7807 problem with a stable machine-readable `code` extension (the
+/// `type` URI is derived from the code, as `cloud_witness_problem` does).
+pub(super) fn coded_problem(status: StatusCode, code: &str, title: &str, detail: impl Into<String>) -> Response {
+    let pd = corecrux_types::ProblemDetails::new(status.as_u16(), format!("https://errors.cuecrux.com/{code}"), title)
+        .with_detail(detail)
+        .with_extensions(serde_json::json!({ "code": code }));
+    crate::problem::ProblemResponse(pd).into_response()
+}
+
+/// Is `kind` one of the signed receipt kinds only the daemon's signing path
+/// (`POST /v1/mediation/receipts` -> `stream_receipts.rs`) may write?
+///
+/// `/v1/observations/aggregate` lists records by kind, and every observation
+/// line carries a genuine daemon envelope signature whoever posted it. If the
+/// generic route accepted these kinds, an unsigned look-alike
+/// (`kind: "model_invocation"` with a made-up payload) would list next to the
+/// real receipts and only a consumer that re-verifies the inner body
+/// signature could tell them apart. Matched after trimming and ASCII case
+/// folding so `Model_Invocation ` is not a way round it.
+pub(super) fn is_reserved_receipt_kind(kind: &str) -> bool {
+    let folded = kind.trim().to_ascii_lowercase();
+    super::stream_receipts::is_stream_receipt_kind(&folded) || super::stream_receipts::is_usage_receipt_kind(&folded)
+}
+
+fn reserved_receipt_kind_problem(kind: &str) -> Response {
+    coded_problem(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        RESERVED_OBSERVATION_KIND_CODE,
+        "Reserved Observation Kind",
+        format!(
+            "observation kind '{kind}' is reserved for daemon-signed receipts; mint it through POST /v1/mediation/receipts"
+        ),
+    )
+}
+
 #[tracing::instrument(level = "info", skip_all)]
 pub(super) async fn post_observation(
     State(state): State<AppState>,
@@ -1124,6 +1191,9 @@ pub(super) async fn post_observation(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
+    if is_reserved_receipt_kind(&body.kind) {
+        return reserved_receipt_kind_problem(&body.kind);
+    }
     let scoped = scoped_session_id_for_http(&ctx, &session_id);
     if is_reserved_work_gate_receipt_session(&session_id) || is_reserved_work_gate_receipt_session(&scoped) {
         return problem_response(StatusCode::FORBIDDEN, "reserved receipt session");
@@ -1149,6 +1219,11 @@ pub(super) async fn post_observations_batch(
     let scoped = scoped_session_id_for_http(&ctx, &session_id);
     if is_reserved_work_gate_receipt_session(&session_id) || is_reserved_work_gate_receipt_session(&scoped) {
         return problem_response(StatusCode::FORBIDDEN, "reserved receipt session");
+    }
+    // Reject the whole batch before appending anything, so a reserved kind
+    // part-way through cannot leave the earlier items written.
+    if let Some(item) = body.items.iter().find(|item| is_reserved_receipt_kind(&item.kind)) {
+        return reserved_receipt_kind_problem(&item.kind);
     }
     let principal = ctx.passport_id.clone().unwrap_or_else(|| state.passport_fpr.clone());
 
@@ -1436,10 +1511,7 @@ fn cloud_witness_problem(status: StatusCode, code: &'static str, detail: impl In
     } else {
         "Invalid Cloud-Witness Envelope"
     };
-    let pd = corecrux_types::ProblemDetails::new(status.as_u16(), format!("https://errors.cuecrux.com/{code}"), title)
-        .with_detail(detail)
-        .with_extensions(serde_json::json!({ "code": code }));
-    crate::problem::ProblemResponse(pd).into_response()
+    coded_problem(status, code, title, detail)
 }
 
 /// Verify and persist a nested cloud-witness envelope through the daemon's
@@ -1772,6 +1844,10 @@ pub(super) async fn get_observations_aggregate(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
+    let chains_scope = match AggregateChainsScope::parse(params.chains.as_deref()) {
+        Ok(scope) => scope,
+        Err(detail) => return problem_response(StatusCode::BAD_REQUEST, detail),
+    };
     let files = match list_observation_files(&state.data_dir) {
         Ok(files) => files,
         Err(err) => {
@@ -1797,8 +1873,10 @@ pub(super) async fn get_observations_aggregate(
         sees_all || crux_mcp::scope::visible_session_for_agent(&record.session_id, ctx.passport_id.as_deref()).is_some()
     };
 
-    let mut all: Vec<ObservationRecordV1> = Vec::new();
-    let mut chains: std::collections::BTreeMap<String, ChainStatusJson> = Default::default();
+    // Each matched record carries the index of its session in `sessions`, so
+    // the chains map can be cut down to the sessions actually returned.
+    let mut all: Vec<(usize, ObservationRecordV1)> = Vec::new();
+    let mut sessions: Vec<(String, ChainStatusJson)> = Vec::new();
 
     for path in files {
         let on_disk_session_id = match session_id_from_file(&path) {
@@ -1832,7 +1910,8 @@ pub(super) async fn get_observations_aggregate(
         if records.is_empty() && !sees_all {
             continue;
         }
-        chains.insert(on_disk_session_id, chain);
+        let session_index = sessions.len();
+        sessions.push((on_disk_session_id, chain));
 
         for record in records {
             if let Some(since) = params.since {
@@ -1850,7 +1929,7 @@ pub(super) async fn get_observations_aggregate(
                     continue;
                 }
             }
-            all.push(record);
+            all.push((session_index, record));
         }
     }
 
@@ -1858,17 +1937,35 @@ pub(super) async fn get_observations_aggregate(
     let mut provider_counts = std::collections::BTreeMap::new();
     let mut principal_counts = std::collections::BTreeMap::new();
     let mut kind_counts = std::collections::BTreeMap::new();
-    for record in &all {
+    for (_, record) in &all {
         count_observation_field(&mut provider_counts, &record.provider, "(missing)");
         count_observation_field(&mut principal_counts, &record.principal, "(missing)");
         count_observation_field(&mut kind_counts, &record.kind, "(missing)");
     }
-    all.sort_by(|a, b| b.ts.cmp(&a.ts));
+    all.sort_by(|a, b| b.1.ts.cmp(&a.1.ts));
     let limit = params.limit.unwrap_or(DEFAULT_AGGREGATE_LIMIT).min(MAX_AGGREGATE_LIMIT);
     if all.len() > limit {
         all.truncate(limit);
     }
     let returned = all.len();
+
+    // Unbounded, the map had one entry per session log on the node whatever
+    // `kind`/`limit` asked for (host crux: ~7.3 MB of chains around a 10-record
+    // answer). Default to the sessions the caller is actually shown.
+    let chains: std::collections::BTreeMap<String, ChainStatusJson> = match chains_scope {
+        AggregateChainsScope::All => sessions.into_iter().collect(),
+        AggregateChainsScope::None => std::collections::BTreeMap::new(),
+        AggregateChainsScope::Returned => {
+            let wanted: std::collections::BTreeSet<usize> = all.iter().map(|(index, _)| *index).collect();
+            sessions
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| wanted.contains(index))
+                .map(|(_, entry)| entry)
+                .collect()
+        }
+    };
+    let all: Vec<ObservationRecordV1> = all.into_iter().map(|(_, record)| record).collect();
 
     (
         StatusCode::OK,
@@ -3189,6 +3286,104 @@ mod tests {
         assert!(records[2].prev_hash.is_some());
     }
 
+    /// Only the signing path may write a receipt kind. A generic write of
+    /// one, even with a plausible-looking receipt payload, is refused with a
+    /// stable code and nothing lands on disk, so
+    /// `/v1/observations/aggregate?kind=model_invocation` lists only
+    /// daemon-signed receipts.
+    #[tokio::test]
+    async fn post_observation_rejects_reserved_receipt_kinds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("passport.key");
+        let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        for kind in [
+            "model_invocation",
+            "context_injected",
+            "stream_completed",
+            "stream_aborted",
+            "usage_ping",
+            // Case and whitespace variants must not slip past the check.
+            "Model_Invocation",
+            " stream_aborted ",
+        ] {
+            let resp = post_observation(
+                State(state.clone()),
+                HeaderMap::new(),
+                AxumPath("mediation::forge".to_string()),
+                Json(PostObservationBody {
+                    kind: kind.to_string(),
+                    provider: "llm_shim".to_string(),
+                    client_ts: None,
+                    payload: serde_json::json!({
+                        "receipt_id": "r_forged",
+                        "body_cbor_hex": "a0",
+                        "sig": {"signature_hex": "00"},
+                    }),
+                }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "kind {kind:?}");
+            let body = response_to_json(resp).await;
+            assert_eq!(body["code"], RESERVED_OBSERVATION_KIND_CODE, "kind {kind:?}");
+        }
+        assert!(
+            !observation_file_path(tmp.path(), "mediation::forge").exists(),
+            "a rejected write must not create the log"
+        );
+
+        // Control: an ordinary kind on the same session is still accepted.
+        let resp = post_observation(
+            State(state),
+            HeaderMap::new(),
+            AxumPath("mediation::forge".to_string()),
+            Json(PostObservationBody {
+                kind: "tool_use".to_string(),
+                provider: "llm_shim".to_string(),
+                client_ts: None,
+                payload: serde_json::json!({"tool": "Read"}),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// A reserved kind anywhere in a batch rejects the whole batch before
+    /// any item is appended.
+    #[tokio::test]
+    async fn post_observations_batch_rejects_reserved_kind_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("passport.key");
+        let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        let resp = post_observations_batch(
+            State(state),
+            HeaderMap::new(),
+            AxumPath("batch-forge".to_string()),
+            Json(PostObservationsBatchBody {
+                items: ["tool_use", "model_invocation"]
+                    .iter()
+                    .map(|kind| PostObservationBody {
+                        kind: (*kind).to_string(),
+                        provider: "openai".to_string(),
+                        client_ts: None,
+                        payload: serde_json::json!({}),
+                    })
+                    .collect(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = response_to_json(resp).await;
+        assert_eq!(body["code"], RESERVED_OBSERVATION_KIND_CODE);
+        assert!(
+            !observation_file_path(tmp.path(), "batch-forge").exists(),
+            "the leading ordinary item must not have been written"
+        );
+    }
+
     #[tokio::test]
     async fn get_observations_handler_returns_chain_block() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3301,6 +3496,7 @@ mod tests {
                 kind: None,
                 session_id: None,
                 limit: None,
+                chains: None,
             }),
         )
         .await;
@@ -3324,6 +3520,7 @@ mod tests {
                 kind: None,
                 session_id: None,
                 limit: None,
+                chains: None,
             }),
         )
         .await;
@@ -3345,6 +3542,7 @@ mod tests {
                 kind: Some("model_response".to_string()),
                 session_id: None,
                 limit: None,
+                chains: None,
             }),
         )
         .await;
@@ -3364,6 +3562,7 @@ mod tests {
                 kind: None,
                 session_id: Some("agg-a".to_string()),
                 limit: None,
+                chains: None,
             }),
         )
         .await;
@@ -3388,6 +3587,7 @@ mod tests {
                 kind: None,
                 session_id: None,
                 limit: Some(1),
+                chains: None,
             }),
         )
         .await;
@@ -3397,6 +3597,99 @@ mod tests {
         assert_eq!(body["observations"].as_array().unwrap().len(), 1);
         assert_eq!(body["provider_counts"]["claude-code"], 2);
         assert_eq!(body["provider_counts"]["openai"], 2);
+        // `chains` covers only the session behind the one returned record,
+        // not every session scanned.
+        let returned_session = body["observations"][0]["session_id"].as_str().unwrap().to_string();
+        let chains = body["chains"].as_object().unwrap();
+        assert_eq!(
+            chains.len(),
+            1,
+            "limit=1 must not carry chains for other sessions: {chains:?}"
+        );
+        assert!(chains.contains_key(&sanitize_session_id_for_filename(&returned_session)));
+    }
+
+    /// A filtered or limited aggregate must not carry chain status for
+    /// sessions it returns nothing from: on a node with many session logs
+    /// that map dwarfed the answer (host crux, 2026-09-28:
+    /// `?kind=model_invocation&limit=10` returned ~29 KB of records inside a
+    /// ~7.3 MB body, ~31 s). `?chains=all` keeps the old full map available,
+    /// `?chains=none` drops it.
+    #[tokio::test]
+    async fn aggregate_chains_are_bounded_to_returned_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("passport.key");
+        let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        // One session holds the kind asked for; twenty unrelated ones do not.
+        append_one(
+            &state,
+            "mediation::wanted",
+            key.passport_fpr(),
+            PostObservationBody {
+                kind: "wanted_kind".to_string(),
+                provider: "p".to_string(),
+                client_ts: None,
+                payload: serde_json::Value::Null,
+            },
+            None,
+        )
+        .unwrap();
+        for i in 0..20 {
+            append_one(
+                &state,
+                &format!("unrelated-{i}"),
+                key.passport_fpr(),
+                PostObservationBody {
+                    kind: "tool_use".to_string(),
+                    provider: "p".to_string(),
+                    client_ts: None,
+                    payload: serde_json::Value::Null,
+                },
+                None,
+            )
+            .unwrap();
+        }
+
+        let query = |kind: Option<&str>, limit: Option<usize>, chains: Option<&str>| AggregateObservationsQuery {
+            since: None,
+            provider: None,
+            kind: kind.map(str::to_string),
+            session_id: None,
+            limit,
+            chains: chains.map(str::to_string),
+        };
+        let run = |q: AggregateObservationsQuery| {
+            let state = state.clone();
+            async move { get_observations_aggregate(State(state), HeaderMap::new(), Query(q)).await }
+        };
+
+        let body = response_to_json(run(query(Some("wanted_kind"), Some(10), None)).await).await;
+        assert_eq!(body["returned"], 1);
+        let chains = body["chains"].as_object().unwrap();
+        assert_eq!(
+            chains.keys().cloned().collect::<Vec<_>>(),
+            vec![sanitize_session_id_for_filename("mediation::wanted")],
+            "only the returned session's chain"
+        );
+        assert_eq!(chains.values().next().unwrap()["status"], "ok");
+
+        // Nothing matched: no chains at all.
+        let body = response_to_json(run(query(Some("absent_kind"), None, None)).await).await;
+        assert_eq!(body["returned"], 0);
+        assert!(body["chains"].as_object().unwrap().is_empty());
+
+        // Opt back into the full map.
+        let body = response_to_json(run(query(Some("wanted_kind"), Some(10), Some("all"))).await).await;
+        assert_eq!(body["chains"].as_object().unwrap().len(), 21);
+
+        let body = response_to_json(run(query(None, None, Some("none"))).await).await;
+        assert_eq!(body["returned"], 21);
+        assert!(body["chains"].as_object().unwrap().is_empty());
+
+        let resp = run(query(None, None, Some("some"))).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     // QA audit M2 (cross-passport observation disclosure): with no
@@ -3445,6 +3738,7 @@ mod tests {
                         kind: None,
                         session_id: None,
                         limit: None,
+                        chains: None,
                     }),
                 )
                 .await;

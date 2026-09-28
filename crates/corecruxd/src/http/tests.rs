@@ -17743,6 +17743,7 @@ async fn work_gate_receipt_session_is_not_generic_observation_surface() -> Resul
             kind: None,
             session_id: None,
             limit: None,
+            chains: None,
         }),
     )
     .await;
@@ -25824,4 +25825,168 @@ async fn attention_summary_requires_admin_read() {
     .into_response();
 
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// An agent token on the default HTTP scope set can mint a stream receipt
+/// (`sessions:write`) and must also be able to verify it (`receipts:read`).
+/// Before `receipts:read` joined the default set, the mint returned 201 and
+/// the verification of that same receipt returned 403.
+#[tokio::test]
+#[serial_test::serial]
+async fn default_scoped_agent_token_can_verify_the_receipt_it_minted() -> Result<(), Box<dyn std::error::Error>> {
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    const AGENT_TOKEN: &str = "fedcba9876543210fedcba9876543210fedcba9876543210";
+    let _secret = EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", SECRET);
+    let _issuer = EnvVarGuard::unset("CORECRUXD_JWT_ISS");
+    let _audience = EnvVarGuard::unset("CORECRUXD_JWT_AUD");
+    let _accept = EnvVarGuard::set("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS", "1");
+    let _tokens = EnvVarGuard::set("CRUX_AGENT_TOKENS", &format!("jev-agent:{AGENT_TOKEN}"));
+    let _scopes = EnvVarGuard::unset("CORECRUXD_AGENT_TOKEN_HTTP_SCOPES");
+    let _tenant = EnvVarGuard::unset("CORECRUXD_AGENT_TOKEN_HTTP_TENANT");
+    let _passport_flag = EnvVarGuard::unset("CORECRUXD_AGENT_PASSPORTS");
+    let _passport_map = EnvVarGuard::unset("CRUX_AGENT_PASSPORTS");
+
+    let mut state = test_app_state_with_auth(16, AuthMode::Off);
+    state.auth = crate::auth::Authz::from_env(AuthMode::JwtHs256).expect("agent-token auth config");
+    let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).expect("init key");
+    state.passport_fpr = key.passport_fpr().to_string();
+    state.passport_public_key_hex = key.public_key_hex().to_string();
+    state.stream_receipts_enabled = true;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {AGENT_TOKEN}"))?,
+    );
+
+    let minted = super::observations::post_mediation_receipt(
+        State(state.clone()),
+        headers.clone(),
+        Json(serde_json::json!({
+            "kind": "model_invocation",
+            "session_id": "s-agent-verify",
+            "invocation_id": "inv-agent-verify",
+            "prompt_hash": "blake3:prompt",
+        })),
+    )
+    .await;
+    assert_eq!(minted.status(), StatusCode::CREATED);
+    let receipt_id = json_body(minted).await["receipt_id"]
+        .as_str()
+        .expect("minted receipt id")
+        .to_string();
+
+    let verified = get_receipt_verification_v1(
+        State(state.clone()),
+        Path(receipt_id),
+        Query(TenantQuery {
+            tenant_id: "local".to_string(),
+        }),
+        headers,
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        verified.status(),
+        StatusCode::OK,
+        "default agent scopes include receipts:read"
+    );
+    let report = json_body(verified).await;
+    assert_eq!(report["error_code"], "OK");
+    assert_eq!(report["signature_valid"], true);
+    Ok(())
+}
+
+/// `GET /v1/receipts/signing-keys` is public under enforced route auth, and
+/// what it serves is a keyring the offline verifier reads unchanged and that
+/// verifies a receipt this daemon minted.
+#[tokio::test]
+async fn receipt_signing_keys_are_public_and_verify_a_minted_receipt() {
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).expect("init key");
+    state.passport_fpr = key.passport_fpr().to_string();
+    state.passport_public_key_hex = key.public_key_hex().to_string();
+    state.stream_receipts_enabled = true;
+    let app = router_with_route_auth(state.clone(), test_case_store(), RouteAuthMode::Enforce);
+
+    let get = |uri: &str| {
+        axum::http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .expect("request")
+    };
+    // Control: the same setup does enforce auth on the neighbouring route.
+    let guarded = app
+        .clone()
+        .oneshot(get("/v1/receipts/r_x/verification?tenant_id=local"))
+        .await
+        .expect("guarded response");
+    assert!(
+        matches!(guarded.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+        "verification needs a credential, got {}",
+        guarded.status()
+    );
+
+    let response = app
+        .oneshot(get("/v1/receipts/signing-keys"))
+        .await
+        .expect("keyring response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let keyring_json = json_body(response).await;
+    let entry = &keyring_json["keys"][0];
+    assert_eq!(entry["keyId"], key.passport_fpr());
+    assert_eq!(entry["publicKeyHex"], key.public_key_hex());
+    assert_eq!(entry["alg"], "ed25519");
+    assert_eq!(entry["use"], "receipt-signing");
+    assert_eq!(keyring_json["keys"].as_array().map(Vec::len), Some(1));
+    assert!(
+        !keyring_json.to_string().contains(
+            &std::fs::read_to_string(&state.passport_key_path)
+                .expect("seed")
+                .trim()
+                .to_string()
+        ),
+        "the private seed must never be served"
+    );
+
+    let keyring =
+        corecrux_receipts::Ed25519KeyRingV1::parse_json(&keyring_json.to_string()).expect("keyring parses unchanged");
+    let minted = super::stream_receipts::mint_stream_receipt(
+        &state,
+        "operator",
+        &super::stream_receipts::StreamReceiptDraft {
+            kind: "model_invocation".to_string(),
+            session_id: Some("s-keyring".to_string()),
+            invocation_id: Some("inv-keyring".to_string()),
+            prompt_hash: Some("blake3:prompt".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("mint");
+    let path = super::observations::observation_file_path(&state.data_dir, "mediation::s-keyring");
+    let text = std::fs::read_to_string(path).expect("read log");
+    let record: serde_json::Value = serde_json::from_str(text.lines().next().expect("one record")).expect("record");
+    assert_eq!(record["payload"]["receipt_id"], minted.receipt_id);
+    let verified = corecrux_receipts::verify_stream_receipt_payload_v1(
+        &record["payload"],
+        "local",
+        &keyring,
+        "2026-09-28T00:00:00Z",
+        &state.build,
+    )
+    .expect("verify");
+    assert!(verified.is_verified(), "{:?}", verified.report);
+}
+
+/// If the published key would not be the signing key (fingerprint and public
+/// key disagree), the route publishes nothing rather than a wrong key.
+#[tokio::test]
+async fn receipt_signing_keys_fail_closed_on_an_inconsistent_key() {
+    let mut state = test_app_state(16);
+    let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).expect("init key");
+    state.passport_public_key_hex = key.public_key_hex().to_string();
+    state.passport_fpr = format!("p_{}", "0".repeat(32));
+    let response = super::receipts::get_receipt_signing_keys_v1(State(state)).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }

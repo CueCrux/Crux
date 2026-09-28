@@ -91,6 +91,9 @@ pub(crate) fn classify_route(method: &str, path: &str) -> Option<RouteAuthContra
             | "/invocation/verify"
             | "/v1/openapi.json"
             | "/v1/version"
+            // Receipt-signing public keyring: public key material only (key
+            // discovery, not trust; see `receipts::get_receipt_signing_keys_v1`).
+            | "/v1/receipts/signing-keys"
             | "/v1/witness/smoke"
             | "/v1/sync/handshake/nonce"
     ) {

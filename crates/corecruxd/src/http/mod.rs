@@ -929,6 +929,11 @@ pub(crate) fn router_with_route_auth(
         )
         // Production hardening: version endpoint
         .route("/v1/version", get(self::health::get_version))
+        // Public receipt-signing keyring (key discovery for offline verifiers).
+        .route(
+            "/v1/receipts/signing-keys",
+            get(self::receipts::get_receipt_signing_keys_v1),
+        )
         .route("/v1/actions/enrich", axum::routing::post(self::actions::post_action_enrich))
         .route("/v1/workbench/contract", get(self::workbench::get_workbench_contract))
         .route("/v1/workbench/brief", get(self::workbench::get_agent_brief))
