@@ -268,6 +268,41 @@ or `*TOKEN*`:
 The env file is `CRUX_ENV_FILE`, or `~/.config/cuecrux/env` if that is unset.
 Run `crux-jev --help` for the full request schema.
 
+### Verifying without trusting the daemon: `crux-jev verify`
+
+`crux-jev verify` checks receipts using only a pinned public key. It needs no
+`receipts:read`, and it never asks the daemon to vouch for its own records.
+It uses the `jev-verify` extra (`blake3` and `cryptography`).
+
+```bash
+crux-jev pin-key --from-pem daemon.pub.pem     # out of band: the stronger option
+crux-jev pin-key                               # or fetch it: trust on first use (needs admin:read,
+                                               # or GET /v1/receipts/signing-keys on newer daemons)
+crux-jev verify --entity paracrux:ci-triage r_… r_…
+```
+
+The keyring is `CRUX_RECEIPT_KEYRING`, or
+`~/.config/cuecrux/receipt-keyring.json` if that is unset. It uses
+`corecruxctl`'s Ed25519 keyring v1 format, so the same file works with
+`corecruxctl receipts verify-stream-receipt --keyring`. `pin-key` refuses to
+replace a pinned key with a different one unless you pass `--replace`, because
+a changed signing key is exactly what a pin exists to catch.
+
+For each receipt, `verify` checks all of the following:
+
+- exactly one signed body claims the id;
+- the Ed25519 signature verifies with a pinned key;
+- the key id is BLAKE3-bound to that key;
+- the body binds the id, `kind: model_invocation` and the schema.
+
+With `--entity`, it also checks that the decision fact under `jev:<entity>`
+matches the receipt: its output hash recomputes from its answers, and its
+hashes and request id equal the signed ones.
+
+Exit codes: 0 when everything verifies, 4 when any receipt fails, 2 on a
+usage or configuration error. A look-alike record posted under the same id
+makes the check fail closed, with "2 distinct bodies claim this id".
+
 ## Verifying a receipt
 
 **Online**, from the daemon that signed it. Stream receipts are minted under

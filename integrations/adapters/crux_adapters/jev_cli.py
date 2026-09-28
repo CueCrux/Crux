@@ -2,7 +2,17 @@
 # Licensed under the Apache License, Version 2.0.
 # See LICENSE in the repository root.
 
-"""``crux-jev``: record a Jev decision from any language.
+"""``crux-jev``: record and verify Jev decisions from any language.
+
+Subcommands (``decide`` is the default when none is given)::
+
+    crux-jev [decide]            JSON request on stdin -> recorded decision on stdout
+    crux-jev pin-key [--replace] [--from-pem F | --from-hex H]
+                                 pin the daemon's receipt-signing key: out of band from a
+                                 PEM/hex, or fetched from the daemon (trust on first use)
+    crux-jev verify [--entity E] RECEIPT_ID...
+                                 check receipts against the pinned key only; with
+                                 --entity also check each jev:E decision fact agrees
 
 Callers that are not Python (a Node build tool, a shell script, an agent's
 sandbox) get the same signed receipt and ``jev:<entity>`` fact as
@@ -21,7 +31,7 @@ Result: ``recorded``, ``answers``, ``model_version``, ``request_id``,
 ``invocation_id``, ``receipt_id``, ``fact_id``, the three hashes,
 ``context_items`` and ``context_truncated``. Nothing secret is ever printed.
 
-Exit codes: 0 recorded; 3 Jev answered but the decision was NOT recorded (the
+Exit codes (decide): 0 recorded; 3 Jev answered but the decision was NOT recorded (the
 result still carries the answers, with ``recorded: false`` and ``error``; a
 guardrail caller must fail closed); 2 bad request or missing configuration;
 1 Crux retrieval or Jev failed before any answer.
@@ -218,10 +228,100 @@ def run(
     return EXIT_OK
 
 
+EXIT_UNVERIFIED = 4
+
+
+def _client_from_env(env: Mapping[str, str] | None, client_factory: Callable[[str, str], Any] | None) -> Any:
+    env = os.environ if env is None else env
+    home = Path.home()
+    env_file = Path(env.get("CRUX_ENV_FILE") or home / ".config" / "cuecrux" / "env")
+    file_values = _read_env_file(env_file)
+    url = env.get("CRUX_BASE_URL") or env.get("CRUX_HTTP_URL") or file_values.get("CRUX_HTTP_URL")
+    if env.get("CRUX_TOKEN_FILE"):
+        token = _read_secret_file(env["CRUX_TOKEN_FILE"], "CRUX_TOKEN_FILE")
+    else:
+        token = (env.get("CRUX_AGENT_TOKEN") or file_values.get("CRUX_AGENT_TOKEN") or "").strip()
+    if not url or not token:
+        raise ConfigError(f"no daemon URL or token: see crux-jev --help (env file {env_file})")
+    if client_factory is None:
+        from cuecrux_client import CueCruxClient
+
+        return CueCruxClient(url, token=token)
+    return client_factory(url, token)
+
+
+def run_pin_key(args: list[str], stdout: TextIO, env: Mapping[str, str] | None = None, *, client_factory: Any = None) -> int:
+    from .jev_verify import default_keyring_path, pin_key, public_key_from_pem
+
+    try:
+        public_key = None
+        if "--from-pem" in args:
+            public_key = public_key_from_pem(Path(args[args.index("--from-pem") + 1]).read_bytes())
+        elif "--from-hex" in args:
+            public_key = bytes.fromhex(args[args.index("--from-hex") + 1])
+        client = None if public_key is not None else _client_from_env(env, client_factory)
+        result = pin_key(client, default_keyring_path(env), replace="--replace" in args, public_key=public_key)
+    except PermissionError as err:  # a changed key: the pin did its job
+        stdout.write(json.dumps({"pinned": False, "error": str(err)}) + "\n")
+        return EXIT_UNVERIFIED
+    except (ConfigError, ImportError, LookupError, ValueError, OSError, IndexError) as err:
+        stdout.write(json.dumps({"pinned": False, "error": str(err)}) + "\n")
+        return EXIT_USAGE
+    except Exception as err:  # e.g. a 403: the token may not read /v1/admin/version
+        stdout.write(json.dumps({"pinned": False, "error": f"{type(err).__name__}: {err}; pin out of band with --from-pem or --from-hex"}) + "\n")
+        return EXIT_FAILED
+    stdout.write(json.dumps({"pinned": True, **result}) + "\n")
+    return EXIT_OK
+
+
+def run_verify(args: list[str], stdout: TextIO, env: Mapping[str, str] | None = None, *, client_factory: Any = None) -> int:
+    from .jev_verify import default_keyring_path, load_keyring, verify_receipts
+
+    entity = None
+    ids: list[str] = []
+    it = iter(args)
+    for arg in it:
+        if arg == "--entity":
+            entity = next(it, None)
+        else:
+            ids.append(arg)
+    if not ids or (entity is not None and not entity):
+        stdout.write(json.dumps({"verified": False, "error": "usage: crux-jev verify [--entity E] RECEIPT_ID..."}) + "\n")
+        return EXIT_USAGE
+    path = default_keyring_path(env)
+    try:
+        keyring = load_keyring(path)
+        client = _client_from_env(env, client_factory)
+        checks = verify_receipts(client, ids, keyring, entity=entity)
+    except FileNotFoundError:
+        stdout.write(json.dumps({"verified": False, "error": f"no keyring at {path}: run `crux-jev pin-key` first"}) + "\n")
+        return EXIT_USAGE
+    except (ConfigError, ImportError, ValueError) as err:
+        stdout.write(json.dumps({"verified": False, "error": str(err)}) + "\n")
+        return EXIT_USAGE
+    except Exception as err:  # daemon unreachable, timeout, 403: nothing was verified
+        stdout.write(json.dumps({"verified": False, "error": f"{type(err).__name__}: {err}"}) + "\n")
+        return EXIT_FAILED
+    results = [c.as_json() for c in checks]
+    ok = all(c.verified for c in checks)
+    stdout.write(json.dumps({"verified": ok, "keyring": str(path), "receipts": results}, ensure_ascii=False) + "\n")
+    return EXIT_OK if ok else EXIT_UNVERIFIED
+
+
 def main() -> None:
-    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help"):
         print(__doc__)
         sys.exit(EXIT_OK)
+    if args and args[0] == "verify":
+        sys.exit(run_verify(args[1:], sys.stdout))
+    if args and args[0] == "pin-key":
+        sys.exit(run_pin_key(args[1:], sys.stdout))
+    if args and args[0] == "decide":
+        args = args[1:]
+    if args:
+        print(f"crux-jev: unknown arguments {args!r}; see --help", file=sys.stderr)
+        sys.exit(EXIT_USAGE)
     sys.exit(run(sys.stdin, sys.stdout))
 
 
