@@ -512,53 +512,55 @@ fn cbor_top_level_tenant(body_bytes: &[u8]) -> Option<String> {
 /// daemon envelope signature is re-verified before the receipt material
 /// is trusted; unmatched records in other files are not signature-checked
 /// (unlike the single-file approval chain) to keep lookup cost sane.
-// ponytail: O(files × records) scan per lookup, no r_id→file index — add one
-// at mint time in stream_receipts.rs if this ever gets slow.
+// ponytail: O(files × records) scan per lookup, no r_id→file index — the
+// mint side keeps an in-memory id set (`stream_receipts.rs`); reuse it here
+// if lookups ever get slow.
 pub(super) fn local_stream_receipt_verification(
     state: &AppState,
     receipt_id: &str,
-) -> Result<Option<LocalStreamReceipt>, String> {
+) -> Result<Option<LocalStreamReceipt>, LocalStreamReceiptError> {
     use corecrux_receipts::{verify_receipt_v1, Ed25519KeyEntryV1, Ed25519KeyRingV1, ReceiptSigV1, VerifyReceiptInput};
 
-    let obs_dir = state.data_dir.join("observations");
-    let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(&obs_dir) {
-        Ok(entries) => entries
-            .flatten()
-            .filter(|e| {
-                let name = e.file_name().to_string_lossy().to_string();
-                let is_jsonl = std::path::Path::new(&name)
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"));
-                is_jsonl && (name.starts_with("mediation__") || name.contains("__mediation__"))
-            })
-            .map(|e| e.path())
-            .collect(),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(err) => return Err(format!("list mediation observation logs: {err}")),
-    };
-    files.sort();
-
-    for path in files {
+    // Every file is scanned, not just up to the first hit: an id claimed by
+    // two stored bodies has no single answer, and resolving "the first one"
+    // lets whichever sorts first shadow the other.
+    let mut claim: Option<(Vec<super::observations::ObservationRecordV1>, usize)> = None;
+    let mut claims = 0usize;
+    for path in stream_receipt_log_files(&state.data_dir)? {
         let records = super::observations::read_observations_strict(&path)
             .map_err(|err| format!("read mediation observations {}: {err}", path.display()))?;
-        let Some(record) = records.iter().find(|r| {
-            r.payload.get("receipt_id").and_then(serde_json::Value::as_str) == Some(receipt_id)
-                && r.payload.get("body_cbor_hex").is_some()
-                && r.payload.get("sig").is_some()
-        }) else {
-            continue;
-        };
+        let matches: Vec<usize> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| stream_receipt_record_id(r) == Some(receipt_id))
+            .map(|(i, _)| i)
+            .collect();
+        claims += matches.len();
+        if let Some(&index) = matches.first() {
+            if claim.is_none() {
+                claim = Some((records, index));
+            }
+        }
+    }
+    if claims > 1 {
+        return Err(LocalStreamReceiptError::Ambiguous { claims });
+    }
+    let Some((records, index)) = claim else {
+        return Ok(None);
+    };
+    {
+        let record = &records[index];
         if !matches!(
             super::observations::validate_chain(&records),
             super::observations::ChainStatus::Ok { .. }
         ) {
-            return Err("local stream receipt observation chain is invalid".to_string());
+            return Err("local stream receipt observation chain is invalid".to_string().into());
         }
         verify_observation_envelope(state, record)?;
         require_chain_covered(record, "local stream receipt")?;
 
         let Some(body_hex) = record.payload.get("body_cbor_hex").and_then(serde_json::Value::as_str) else {
-            return Err("local stream receipt body is missing".to_string());
+            return Err("local stream receipt body is missing".to_string().into());
         };
         let sig_obj = record
             .payload
@@ -573,7 +575,7 @@ pub(super) fn local_stream_receipt_verification(
         };
         let signature_hex = sig_field("signature_hex")?;
         if body_hex.len() > 2_097_152 || signature_hex.len() > 16_384 {
-            return Err("local stream receipt material exceeds size limits".to_string());
+            return Err("local stream receipt material exceeds size limits".to_string().into());
         }
         let body_bytes =
             hex::decode(body_hex).map_err(|err| format!("local stream receipt body is not valid hex: {err}"))?;
@@ -582,7 +584,7 @@ pub(super) fn local_stream_receipt_verification(
         let body_hash = corecrux_frame::compute_payload_hash(&body_bytes);
         let expected_body_hash = format!("blake3:{}", hex::encode(body_hash));
         if record.payload.get("body_hash").and_then(serde_json::Value::as_str) != Some(expected_body_hash.as_str()) {
-            return Err("local stream receipt body hash binding mismatch".to_string());
+            return Err("local stream receipt body hash binding mismatch".to_string().into());
         }
 
         // Rebuild the CBOR sig envelope `verify_receipt_v1` expects from
@@ -634,12 +636,82 @@ pub(super) fn local_stream_receipt_verification(
         // The verifier sees one receipt and cannot check position; this
         // resolver just did, above, for the whole file and for this record.
         verification.binding.chain_position_checked = true;
-        return Ok(Some(LocalStreamReceipt {
+        Ok(Some(LocalStreamReceipt {
             tenant_id,
             verification,
-        }));
+        }))
     }
-    Ok(None)
+}
+
+/// Why [`local_stream_receipt_verification`] could not produce a report.
+#[derive(Debug)]
+pub(super) enum LocalStreamReceiptError {
+    /// More than one stored stream-receipt body claims the id. Fails closed:
+    /// the route answers 409 [`RECEIPT_ID_AMBIGUOUS_CODE`] instead of picking
+    /// one. The mint path refuses reused ids, so this only fires on logs
+    /// written before that check, or edited on disk.
+    Ambiguous { claims: usize },
+    /// The receipt material or its log failed an integrity check.
+    Invalid(String),
+}
+
+impl From<String> for LocalStreamReceiptError {
+    fn from(detail: String) -> Self {
+        Self::Invalid(detail)
+    }
+}
+
+impl std::fmt::Display for LocalStreamReceiptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ambiguous { claims } => {
+                write!(f, "{claims} stored stream receipt bodies claim this receipt id")
+            }
+            Self::Invalid(detail) => f.write_str(detail),
+        }
+    }
+}
+
+/// Stable `code` on the 409 `/verification` returns when a receipt id is
+/// claimed by more than one stored body.
+pub(super) const RECEIPT_ID_AMBIGUOUS_CODE: &str = "RECEIPT_ID_AMBIGUOUS";
+
+/// The mediation observation logs stream receipts are minted into
+/// (`mediation::<group>`, possibly under a passport scope prefix), sorted.
+pub(super) fn stream_receipt_log_files(data_dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+    let obs_dir = data_dir.join("observations");
+    let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(&obs_dir) {
+        Ok(entries) => entries
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                let is_jsonl = std::path::Path::new(&name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"));
+                is_jsonl && (name.starts_with("mediation__") || name.contains("__mediation__"))
+            })
+            .map(|e| e.path())
+            .collect(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(format!("list mediation observation logs: {err}")),
+    };
+    files.sort();
+    Ok(files)
+}
+
+/// The receipt id a stored record claims as a stream receipt, if it is one:
+/// a stream-receipt kind carrying a signed body and its sig envelope. Only
+/// the signing path can write these kinds (the generic observation route
+/// refuses them), so a record of any other kind that merely names a
+/// `receipt_id` is neither resolved nor counted as a claim.
+pub(super) fn stream_receipt_record_id(record: &super::observations::ObservationRecordV1) -> Option<&str> {
+    if !super::stream_receipts::is_stream_receipt_kind(&record.kind)
+        || record.payload.get("body_cbor_hex").is_none()
+        || record.payload.get("sig").is_none()
+    {
+        return None;
+    }
+    record.payload.get("receipt_id").and_then(serde_json::Value::as_str)
 }
 
 #[utoipa::path(
@@ -907,6 +979,21 @@ pub(super) async fn get_receipt_verification_v1(
         // mediation observation logs, not the dataplane — resolve and
         // verify them there instead of 501ing.
         return match local_stream_receipt_verification(&state, &receipt_id) {
+            Err(LocalStreamReceiptError::Ambiguous { claims }) => {
+                // Stream receipts mint under `local`: a caller not
+                // authorized there gets the missing-receipt 404, as below.
+                if require_http_scopes_for_tenant(&state.auth, &headers, &["receipts:read"], "local").is_err() {
+                    return problem_response(StatusCode::NOT_FOUND, "receipt body not found");
+                }
+                super::observations::coded_problem(
+                    StatusCode::CONFLICT,
+                    RECEIPT_ID_AMBIGUOUS_CODE,
+                    "Ambiguous Receipt Id",
+                    format!(
+                        "{claims} stored stream receipt bodies claim receipt id '{receipt_id}'; refusing to pick one"
+                    ),
+                )
+            }
             Ok(Some(found)) => {
                 // Re-gate against the receipt's OWN tenant (stream receipts
                 // mint under "local"; the query default is "default"). A
@@ -937,7 +1024,9 @@ pub(super) async fn get_receipt_verification_v1(
                 Ok(None) => problem_response(StatusCode::NOT_FOUND, "receipt body not found"),
                 Err(detail) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, detail),
             },
-            Err(detail) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, detail),
+            Err(LocalStreamReceiptError::Invalid(detail)) => {
+                problem_response(StatusCode::INTERNAL_SERVER_ERROR, detail)
+            }
         };
     }
 

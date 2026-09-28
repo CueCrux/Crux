@@ -176,6 +176,42 @@ pub(super) fn load_signing_key(state: &AppState) -> Result<SigningKey, String> {
     Ok(SigningKey::from_bytes(&seed))
 }
 
+/// Stable `code` on the 409 a stream-receipt mint gets when its
+/// `receipt_id` is already taken.
+pub(super) const RECEIPT_ID_CONFLICT_CODE: &str = "RECEIPT_ID_CONFLICT";
+
+/// Receipt ids already claimed by a stored stream receipt, per data dir.
+///
+/// A draft may carry its own `receipt_id`, and `/verification` resolves an id
+/// to a stored body, so a second mint under a used id would shadow (or be
+/// shadowed by) the first. The mint holds this lock across check → append →
+/// insert, which makes the check race-free within the daemon. Built lazily
+/// from the mediation logs on the first mint (one scan per data dir per
+/// process), then kept in step by each successful mint. Ids of erased
+/// receipts stay taken, which is the safe direction.
+///
+/// Scope: one data dir is one daemon store, and every stream receipt it
+/// mints is tenant `local`, so "unique per data dir" is "unique per tenant".
+static STREAM_RECEIPT_IDS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::collections::HashSet<String>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Every receipt id a stored stream receipt under `data_dir` claims.
+fn stored_stream_receipt_ids(data_dir: &std::path::Path) -> Result<std::collections::HashSet<String>, String> {
+    let mut ids = std::collections::HashSet::new();
+    for path in super::receipts::stream_receipt_log_files(data_dir)? {
+        let records = super::observations::read_observations_strict(&path)
+            .map_err(|err| format!("read mediation observations {}: {err}", path.display()))?;
+        ids.extend(
+            records
+                .iter()
+                .filter_map(super::receipts::stream_receipt_record_id)
+                .map(str::to_string),
+        );
+    }
+    Ok(ids)
+}
+
 /// Everything a lifted, signed receipt produces — fed both to the HTTP
 /// response and to the SSE-abort log line.
 #[derive(Debug)]
@@ -200,6 +236,29 @@ pub(super) fn mint_stream_receipt(
         .receipt_id
         .clone()
         .unwrap_or_else(|| format!("r_{}", uuid::Uuid::new_v4()));
+    if receipt_id.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "receipt_id must not be empty".to_string()));
+    }
+    // Held until the receipt is appended and its id recorded (see
+    // `STREAM_RECEIPT_IDS`).
+    let mut taken_ids = STREAM_RECEIPT_IDS.lock().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "stream receipt id index lock poisoned".to_string(),
+        )
+    })?;
+    let taken = match taken_ids.entry(state.data_dir.clone()) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+            stored_stream_receipt_ids(&state.data_dir).map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?,
+        ),
+    };
+    if taken.contains(&receipt_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("receipt_id '{receipt_id}' is already used by a stored receipt; omit receipt_id to have the daemon assign one"),
+        ));
+    }
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let created_at = draft.created_at.clone().unwrap_or_else(|| now.clone());
     let session_id = draft.session_id.clone().unwrap_or_else(|| actor.to_string());
@@ -368,6 +427,8 @@ pub(super) fn mint_stream_receipt(
         }),
     };
     let (resp, _tip) = append_one(state, &scoped, actor, obs_body, None)?;
+    taken.insert(receipt_id.clone());
+    drop(taken_ids);
     Ok(MintedStreamReceipt {
         receipt_id,
         kind: draft.kind.clone(),
@@ -409,6 +470,12 @@ pub(super) fn handle_stream_receipt_draft(state: &AppState, headers: &HeaderMap,
             })),
         )
             .into_response(),
+        Err((StatusCode::CONFLICT, msg)) => super::observations::coded_problem(
+            StatusCode::CONFLICT,
+            RECEIPT_ID_CONFLICT_CODE,
+            "Receipt Id Conflict",
+            msg,
+        ),
         Err((status, msg)) => problem_response(status, msg),
     }
 }
@@ -1327,11 +1394,170 @@ mod tests {
         );
 
         let err = crate::http::receipts::local_stream_receipt_verification(&state, &minted.receipt_id)
-            .expect_err("an unchained record must not resolve");
+            .expect_err("an unchained record must not resolve")
+            .to_string();
         assert!(
             err.contains("hash chain"),
             "the error names the missing chain coverage: {err}"
         );
+    }
+
+    /// A caller-chosen `receipt_id` that is already taken is refused, in the
+    /// same group or another one, so a later mint cannot shadow an earlier
+    /// receipt under the same id.
+    #[test]
+    fn mint_rejects_a_reused_receipt_id() {
+        let state = signing_state();
+        let mut first = injected_draft();
+        first.receipt_id = Some("r_chosen".to_string());
+        mint_stream_receipt(&state, "operator", &first).expect("first mint");
+
+        let (status, msg) = mint_stream_receipt(&state, "operator", &first).expect_err("same id, same group");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(msg.contains("r_chosen"), "{msg}");
+
+        let mut elsewhere = injected_draft();
+        elsewhere.receipt_id = Some("r_chosen".to_string());
+        elsewhere.session_id = Some("s-other".to_string());
+        let (status, _) = mint_stream_receipt(&state, "operator", &elsewhere).expect_err("same id, other group");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            read_mediation_records(&state, "s-other").is_empty(),
+            "a refused mint appends nothing"
+        );
+
+        // Daemon-assigned ids are unaffected.
+        mint_stream_receipt(&state, "operator", &injected_draft()).expect("fresh id");
+        let (status, _) = mint_stream_receipt(
+            &state,
+            "operator",
+            &StreamReceiptDraft {
+                receipt_id: Some("  ".to_string()),
+                ..injected_draft()
+            },
+        )
+        .expect_err("blank id");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// The id index is rebuilt from the logs when it is cold (a restart), so
+    /// an id minted by an earlier daemon process is still taken.
+    #[test]
+    fn mint_rejects_an_id_already_on_disk_when_the_index_is_cold() {
+        let state = signing_state();
+        let mut draft = injected_draft();
+        draft.receipt_id = Some("r_before_restart".to_string());
+        mint_stream_receipt(&state, "operator", &draft).expect("mint");
+
+        STREAM_RECEIPT_IDS.lock().expect("lock").remove(&state.data_dir);
+
+        let (status, _) = mint_stream_receipt(&state, "operator", &draft).expect_err("id is on disk");
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn mediation_route_answers_409_with_a_stable_code_for_a_reused_id() {
+        use axum::extract::State;
+
+        let state = signing_state();
+        let draft = serde_json::json!({
+            "kind": "model_invocation",
+            "receipt_id": "r_route_dup",
+            "session_id": "s-route-dup",
+            "invocation_id": "inv-route-dup",
+            "prompt_hash": "blake3:prompt",
+        });
+        let resp = crate::http::observations::post_mediation_receipt(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(draft.clone()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp =
+            crate::http::observations::post_mediation_receipt(State(state.clone()), HeaderMap::new(), Json(draft))
+                .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.expect("body");
+        let problem: Value = serde_json::from_slice(&bytes).expect("problem json");
+        assert_eq!(problem["code"], RECEIPT_ID_CONFLICT_CODE);
+        assert_eq!(read_mediation_records(&state, "s-route-dup").len(), 1);
+    }
+
+    /// Two stored stream-receipt bodies claiming one id (a log written before
+    /// the mint check, or edited on disk) must fail closed rather than
+    /// resolve to whichever file sorts first. A record of a non-receipt kind
+    /// that merely names the id is not a claim.
+    #[tokio::test]
+    async fn verification_fails_closed_when_two_bodies_claim_one_id() {
+        use axum::extract::{Path, Query, State};
+
+        let state = signing_state();
+        let minted = mint_stream_receipt(&state, "operator", &injected_draft()).expect("mint");
+        let genuine = read_mediation_records(&state, "s-1")
+            .into_iter()
+            .next()
+            .expect("minted record");
+
+        // A non-receipt kind naming the id is ignored.
+        crate::http::observations::append_one(
+            &state,
+            "mediation::s-noise",
+            "operator",
+            PostObservationBody {
+                kind: "tool_use".to_string(),
+                provider: "test".to_string(),
+                client_ts: None,
+                payload: genuine.payload.clone(),
+            },
+            None,
+        )
+        .expect("append noise");
+        let found = crate::http::receipts::local_stream_receipt_verification(&state, &minted.receipt_id)
+            .expect("resolve")
+            .expect("found");
+        assert_eq!(found.verification.error_code, "OK");
+
+        // A second receipt-kind record under the same id, bypassing the mint
+        // check, as a pre-fix log could hold.
+        crate::http::observations::append_one(
+            &state,
+            "mediation::a-shadow",
+            "operator",
+            PostObservationBody {
+                kind: genuine.kind.clone(),
+                provider: "test".to_string(),
+                client_ts: None,
+                payload: genuine.payload.clone(),
+            },
+            None,
+        )
+        .expect("append shadow");
+        let err = crate::http::receipts::local_stream_receipt_verification(&state, &minted.receipt_id)
+            .expect_err("two claims must not resolve");
+        assert!(
+            matches!(
+                err,
+                crate::http::receipts::LocalStreamReceiptError::Ambiguous { claims: 2 }
+            ),
+            "{err}"
+        );
+
+        let resp = crate::http::receipts::get_receipt_verification_v1(
+            State(state.clone()),
+            Path(minted.receipt_id.clone()),
+            Query(crate::http::TenantQuery {
+                tenant_id: "local".to_string(),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.expect("body");
+        let problem: Value = serde_json::from_slice(&bytes).expect("problem json");
+        assert_eq!(problem["code"], crate::http::receipts::RECEIPT_ID_AMBIGUOUS_CODE);
     }
 
     #[test]
@@ -1355,7 +1581,8 @@ mod tests {
         std::fs::write(&path, format!("{}\n", record)).expect("write tampered log");
 
         let err = crate::http::receipts::local_stream_receipt_verification(&state, &minted.receipt_id)
-            .expect_err("tampered log must not resolve");
+            .expect_err("tampered log must not resolve")
+            .to_string();
         assert!(
             err.contains("observation") || err.contains("chain") || err.contains("binding"),
             "error names the integrity failure: {err}"
