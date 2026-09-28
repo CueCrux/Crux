@@ -229,6 +229,45 @@ export RID=r_… PROMPT_HASH=sha256:…
 For your own daemon, set `CRUX_BASE_URL` and `CRUX_TOKEN_FILE` instead of
 sourcing `fixture.env`.
 
+## From another language: `crux-jev`
+
+Callers that are not Python get the same receipt and fact, with the same
+hashing, from the `crux-jev` command that the adapters install. It takes one
+JSON request on stdin and prints one JSON result on stdout. Neither secrets nor
+state ever appear in argv.
+
+```bash
+echo '{"entity": "paracrux:ci-triage",
+       "questions": {"failure_class": {"type": "choice", "instructions": "Classify the root cause",
+                                       "criteria": {"runner_infra": "the machine failed",
+                                                    "behaviour_regression": "a product test failed"}}},
+       "untrusted": "##[error]The runner has received a shutdown signal.",
+       "token_budget": 400}' | crux-jev
+```
+
+The result carries `recorded`, `answers`, `model_version`, `request_id`,
+`receipt_id`, `fact_id`, the three hashes and `context_items`. Exit codes:
+
+| Code | Meaning |
+|---|---|
+| 0 | recorded |
+| 3 | Jev answered but the decision was **not** recorded; the answers are still printed, so a guardrail must fail closed |
+| 2 | bad request or missing configuration |
+| 1 | retrieval or Jev failed before any answer |
+
+Configuration is read from the environment, then from files, so that it
+survives sandboxes (such as Codex) that strip variables named like `*KEY*`
+or `*TOKEN*`:
+
+| Setting | Sources, first match wins |
+|---|---|
+| Daemon URL | `CRUX_BASE_URL`, then `CRUX_HTTP_URL`, then `CRUX_HTTP_URL` in the env file |
+| Daemon token | the file named by `CRUX_TOKEN_FILE`, then `CRUX_AGENT_TOKEN`, then `CRUX_AGENT_TOKEN` in the env file |
+| Jev key | `TYPESAFE_API_KEY`, then the file named by `JEV_CREDENTIAL_FILE`, then `~/.config/typesafe/api_key` |
+
+The env file is `CRUX_ENV_FILE`, or `~/.config/cuecrux/env` if that is unset.
+Run `crux-jev --help` for the full request schema.
+
 ## Verifying a receipt
 
 **Online**, from the daemon that signed it. Stream receipts are minted under

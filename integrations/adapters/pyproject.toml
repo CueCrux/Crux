@@ -26,6 +26,11 @@ jev-langchain = ["langchain-typesafe[experimental]>=0.0.1a3,<0.0.2"]
 # daemon-verified payload hash (hashlib has no BLAKE3). Without it replay refuses.
 jev-replay = ["blake3>=0.4,<2"]
 
+[project.scripts]
+# Record a Jev decision from any language: JSON request on stdin, JSON result
+# (answers + receipt id + fact id) on stdout. See crux_adapters/jev_cli.py.
+crux-jev = "crux_adapters.jev_cli:main"
+
 [project.urls]
 Homepage = "https://github.com/CueCrux/Crux"
 Documentation = "https://github.com/CueCrux/Crux/tree/main/integrations/adapters"
