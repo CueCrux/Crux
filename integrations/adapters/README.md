@@ -159,6 +159,8 @@ call a record: Crux builds the state, Jev answers, the daemon signs a
 receipt. Needs `CORECRUXD_STREAM_RECEIPTS=1` and `CORECRUXD_CONTEXT_SURFACE=1`.
 Setup, a runnable guardrail example and receipt verification are in the
 [Jev decision receipts cookbook](../../docs/jev-decision-receipts.md).
+Non-Python callers can use the `crux-jev` command instead (JSON on stdin, receipt
+and fact ids on stdout; see the cookbook).
 
 ```python
 from crux_adapters.jev import decide

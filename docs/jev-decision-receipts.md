@@ -229,6 +229,103 @@ export RID=r_… PROMPT_HASH=sha256:…
 For your own daemon, set `CRUX_BASE_URL` and `CRUX_TOKEN_FILE` instead of
 sourcing `fixture.env`.
 
+## From another language: `crux-jev`
+
+Callers that are not Python get the same receipt and fact, with the same
+hashing, from the `crux-jev` command that the adapters install. It takes one
+JSON request on stdin and prints one JSON result on stdout. Neither secrets nor
+state ever appear in argv.
+
+```bash
+echo '{"entity": "paracrux:ci-triage",
+       "questions": {"failure_class": {"type": "choice", "instructions": "Classify the root cause",
+                                       "criteria": {"runner_infra": "the machine failed",
+                                                    "behaviour_regression": "a product test failed"}}},
+       "untrusted": "##[error]The runner has received a shutdown signal.",
+       "token_budget": 400}' | crux-jev
+```
+
+The result carries `recorded`, `answers`, `model_version`, `request_id`,
+`receipt_id`, `fact_id`, the three hashes and `context_items`. Exit codes:
+
+| Code | Meaning |
+|---|---|
+| 0 | recorded |
+| 3 | Jev answered but the decision was **not** recorded; the answers are still printed, so a guardrail must fail closed |
+| 2 | bad request or missing configuration |
+| 1 | retrieval or Jev failed before any answer |
+
+Configuration is read from the environment, then from files, so that it
+survives sandboxes (such as Codex) that strip variables named like `*KEY*`
+or `*TOKEN*`:
+
+| Setting | Sources, first match wins |
+|---|---|
+| Daemon URL | `CRUX_BASE_URL`, then `CRUX_HTTP_URL`, then `CRUX_HTTP_URL` in the env file |
+| Daemon token | the file named by `CRUX_TOKEN_FILE`, then `CRUX_AGENT_TOKEN`, then `CRUX_AGENT_TOKEN` in the env file |
+| Jev key | `TYPESAFE_API_KEY`, then the file named by `JEV_CREDENTIAL_FILE`, then `~/.config/typesafe/api_key` |
+
+The env file is `CRUX_ENV_FILE`, or `~/.config/cuecrux/env` if that is unset.
+Run `crux-jev --help` for the full request schema.
+
+### The measured state layout: `state_layout="split-v1"`
+
+`decide(..., state_layout="split-v1", untrusted_source="ci-log")` (or
+`"state_layout": "split-v1"` in a `crux-jev` request) sends Jev this state:
+
+```json
+{"policy": "…", "trusted_context": […], "untrusted_inputs": {"source": "ci-log", "content": …}}
+```
+
+This is the `split` arm of the AuditCrux injection benchmark (run
+`jev-injection-live-20260928T212018Z`: corpus `fixture-jev-injection-v1`,
+`jev-1.13.0`, 50 attack and 15 control cases). The injections tested flipped
+18% of verdicts with the flat layout and none with `split-v1`. None of the 15
+benign controls was over-blocked.
+
+Most of that gain comes from the policy line, `UNTRUSTED_POLICY_V1`, which is
+byte-identical to the benchmark's text. Edit it and the result no longer
+applies, so re-measure first.
+
+The default layout is still `v0` (`{trusted_context, untrusted_input}`), so
+existing prompt hashes and behaviour do not change under current callers. Use
+`split-v1` whenever the untrusted input could carry instructions.
+
+### Verifying without trusting the daemon: `crux-jev verify`
+
+`crux-jev verify` checks receipts using only a pinned public key. It needs no
+`receipts:read`, and it never asks the daemon to vouch for its own records.
+It uses the `jev-verify` extra (`blake3` and `cryptography`).
+
+```bash
+crux-jev pin-key --from-pem daemon.pub.pem     # out of band: the stronger option
+crux-jev pin-key                               # or fetch it: trust on first use (needs admin:read,
+                                               # or GET /v1/receipts/signing-keys on newer daemons)
+crux-jev verify --entity paracrux:ci-triage r_… r_…
+```
+
+The keyring is `CRUX_RECEIPT_KEYRING`, or
+`~/.config/cuecrux/receipt-keyring.json` if that is unset. It uses
+`corecruxctl`'s Ed25519 keyring v1 format, so the same file works with
+`corecruxctl receipts verify-stream-receipt --keyring`. `pin-key` refuses to
+replace a pinned key with a different one unless you pass `--replace`, because
+a changed signing key is exactly what a pin exists to catch.
+
+For each receipt, `verify` checks all of the following:
+
+- exactly one signed body claims the id;
+- the Ed25519 signature verifies with a pinned key;
+- the key id is BLAKE3-bound to that key;
+- the body binds the id, `kind: model_invocation` and the schema.
+
+With `--entity`, it also checks that the decision fact under `jev:<entity>`
+matches the receipt: its output hash recomputes from its answers, and its
+hashes and request id equal the signed ones.
+
+Exit codes: 0 when everything verifies, 4 when any receipt fails, 2 on a
+usage or configuration error. A look-alike record posted under the same id
+makes the check fail closed, with "2 distinct bodies claim this id".
+
 ## Verifying a receipt
 
 **Online**, from the daemon that signed it. Stream receipts are minted under
