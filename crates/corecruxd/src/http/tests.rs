@@ -25825,3 +25825,73 @@ async fn attention_summary_requires_admin_read() {
 
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+/// An agent token on the default HTTP scope set can mint a stream receipt
+/// (`sessions:write`) and must also be able to verify it (`receipts:read`).
+/// Before `receipts:read` joined the default set, the mint returned 201 and
+/// the verification of that same receipt returned 403.
+#[tokio::test]
+#[serial_test::serial]
+async fn default_scoped_agent_token_can_verify_the_receipt_it_minted() -> Result<(), Box<dyn std::error::Error>> {
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    const AGENT_TOKEN: &str = "fedcba9876543210fedcba9876543210fedcba9876543210";
+    let _secret = EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", SECRET);
+    let _issuer = EnvVarGuard::unset("CORECRUXD_JWT_ISS");
+    let _audience = EnvVarGuard::unset("CORECRUXD_JWT_AUD");
+    let _accept = EnvVarGuard::set("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS", "1");
+    let _tokens = EnvVarGuard::set("CRUX_AGENT_TOKENS", &format!("jev-agent:{AGENT_TOKEN}"));
+    let _scopes = EnvVarGuard::unset("CORECRUXD_AGENT_TOKEN_HTTP_SCOPES");
+    let _tenant = EnvVarGuard::unset("CORECRUXD_AGENT_TOKEN_HTTP_TENANT");
+    let _passport_flag = EnvVarGuard::unset("CORECRUXD_AGENT_PASSPORTS");
+    let _passport_map = EnvVarGuard::unset("CRUX_AGENT_PASSPORTS");
+
+    let mut state = test_app_state_with_auth(16, AuthMode::Off);
+    state.auth = crate::auth::Authz::from_env(AuthMode::JwtHs256).expect("agent-token auth config");
+    let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).expect("init key");
+    state.passport_fpr = key.passport_fpr().to_string();
+    state.passport_public_key_hex = key.public_key_hex().to_string();
+    state.stream_receipts_enabled = true;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {AGENT_TOKEN}"))?,
+    );
+
+    let minted = super::observations::post_mediation_receipt(
+        State(state.clone()),
+        headers.clone(),
+        Json(serde_json::json!({
+            "kind": "model_invocation",
+            "session_id": "s-agent-verify",
+            "invocation_id": "inv-agent-verify",
+            "prompt_hash": "blake3:prompt",
+        })),
+    )
+    .await;
+    assert_eq!(minted.status(), StatusCode::CREATED);
+    let receipt_id = json_body(minted).await["receipt_id"]
+        .as_str()
+        .expect("minted receipt id")
+        .to_string();
+
+    let verified = get_receipt_verification_v1(
+        State(state.clone()),
+        Path(receipt_id),
+        Query(TenantQuery {
+            tenant_id: "local".to_string(),
+        }),
+        headers,
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        verified.status(),
+        StatusCode::OK,
+        "default agent scopes include receipts:read"
+    );
+    let report = json_body(verified).await;
+    assert_eq!(report["error_code"], "OK");
+    assert_eq!(report["signature_valid"], true);
+    Ok(())
+}

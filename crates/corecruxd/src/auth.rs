@@ -182,12 +182,17 @@ fn build_agent_http_config() -> Option<AgentTokenHttpConfig> {
     })
 }
 
+/// Scopes an accepted agent token carries when `CORECRUXD_AGENT_TOKEN_HTTP_SCOPES`
+/// is unset. `receipts:read` is here because `sessions:write` can already mint
+/// signed receipts (`POST /v1/mediation/receipts`): an agent that can mint a
+/// receipt must also be able to verify it (`GET /v1/receipts/{id}/verification`).
 fn default_agent_http_scopes() -> BTreeSet<String> {
     [
         "admin:read",
         "admin:write",
         "facts:write",
         "query:read",
+        "receipts:read",
         "sessions:read",
         "sessions:write",
     ]
@@ -4925,12 +4930,13 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
             "admin:write",
             "facts:write",
             "query:read",
+            "receipts:read",
             "sessions:read",
             "sessions:write",
         ] {
             assert!(scopes.contains(expected), "missing {expected}");
         }
-        assert_eq!(scopes.len(), 6, "scope set must not silently grow");
+        assert_eq!(scopes.len(), 7, "scope set must not silently grow");
     }
 
     // ── JWKS: key selection + verification rejections ──────────────────────
