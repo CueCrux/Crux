@@ -65,6 +65,7 @@ use utoipa::OpenApi;
         super::receipts::get_receipt_body_v1,
         super::receipts::get_receipt_signature_v1,
         super::receipts::get_receipt_verification_v1,
+        super::receipts::get_receipt_signing_keys_v1,
         super::witness::get_witness_smoke,
     ),
     components(schemas(
@@ -418,6 +419,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/rcx/publish/projects/{projectId}/emit", methods: &["POST"], tag: "RCX", auth: "write", summary: "Rcx publish projects {projectId} emit" },
     RouteEntry { path: "/v1/rcx/publish/projects/{projectId}/preview", methods: &["POST"], tag: "RCX", auth: "write", summary: "Rcx publish projects {projectId} preview" },
     RouteEntry { path: "/v1/receipts/list", methods: &["GET"], tag: "Receipts", auth: "read", summary: "Receipts list" },
+    RouteEntry { path: "/v1/receipts/signing-keys", methods: &["GET"], tag: "Receipts", auth: "public", summary: "Receipts signing keys" },
     RouteEntry { path: "/v1/receipts/{receiptId}", methods: &["GET"], tag: "Receipts", auth: "read", summary: "Receipts {receiptId}" },
     RouteEntry { path: "/v1/receipts/{receiptId}/signature", methods: &["GET"], tag: "Receipts", auth: "read", summary: "Receipts {receiptId} signature" },
     RouteEntry { path: "/v1/receipts/{receiptId}/verification", methods: &["GET"], tag: "Receipts", auth: "read", summary: "Receipts {receiptId} verification" },

@@ -112,6 +112,11 @@ With auth on, the token needs these scopes:
 | `sessions:write` | the mediation receipt handler |
 | `receipts:read` | `GET /v1/receipts/{id}/verification` |
 
+An MCP agent token accepted over HTTP (`CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS=1`)
+with the default `CORECRUXD_AGENT_TOKEN_HTTP_SCOPES` carries all four; before
+this release the default set lacked `receipts:read`, so such a token could
+mint a receipt but not verify it.
+
 Fact writes from a passport-bearing token also need that passport registered
 with a category.
 
@@ -262,13 +267,18 @@ openssl pkeyutl -verify -pubin -inkey "$CRUX_DAEMON_PUBKEY_PEM" -rawin -in body.
 grep -qaF "$PROMPT_HASH" body.cbor && echo "prompt_hash is in the signed body"
 ```
 
-A minting caller may choose a stream receipt's `receipt_id`, and the daemon
-does not refuse a repeat, so one id can name two signed bodies; taking the
-first match could check the wrong one. Refuse instead of picking.
+A minting caller may choose a stream receipt's `receipt_id`. Daemons from
+this release refuse a reused id (409 `RECEIPT_ID_CONFLICT`) and `/verification`
+answers 409 `RECEIPT_ID_AMBIGUOUS` rather than picking when a log still holds
+two bodies for one id; older daemons did neither, so one id could name two
+signed bodies. Keep the check above either way: refuse instead of picking.
 
 `openssl pkeyutl -rawin` needs OpenSSL 3. The fixture writes the public key as
-`daemon.pub.pem`. For another daemon, an operator reads it from
-`GET /v1/admin/version` (`admin:read`) as `.passport.public_key_hex`:
+`daemon.pub.pem`. For another daemon, read it from the unauthenticated
+`GET /v1/receipts/signing-keys` as `.keys[0].publicKeyHex` (older daemons:
+`GET /v1/admin/version`, `admin:read`, as `.passport.public_key_hex`). Pin it
+at enrolment; a key fetched from the daemon that signed the receipt is
+discovery, not trust:
 
 ```bash
 { printf '302a300506032b6570032100'; printf '%s' "$PUBKEY_HEX"; } \
@@ -369,7 +379,9 @@ can write facts could rewrite both facts to agree with each other):
    (`GET /v1/receipts/{id}/verification`: `signature_valid` and
    `error_code: OK`).
 3. The signed body is read from `GET /v1/observations/aggregate?kind=model_invocation`.
-   Anyone with `sessions:write` can add records to that listing, so nothing
+   On older daemons anyone with `sessions:write` could add records of that
+   kind to the listing (current daemons refuse the stream-receipt kinds on the
+   generic observation route with 422 `RESERVED_OBSERVATION_KIND`), so nothing
    in a listed record is taken on trust: `replay` hashes the listed
    `body_cbor_hex` bytes with BLAKE3 itself and requires them to equal the
    `payload_hash` the daemon just verified. Every listed record claiming the

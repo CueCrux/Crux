@@ -925,6 +925,11 @@ for the Crux Daemon.
    with neither authentication rail configured permits anonymous access.
 5. Public `/v1/version` is redacted. Full operational version details live at
    `/v1/admin/version` behind `admin:read`.
+6. `GET /v1/receipts/signing-keys` is unauthenticated and serves only the
+   receipt-signing *public* key. It is discovery, not trust: a key fetched
+   from the daemon that signed a receipt proves nothing if that daemon or the
+   channel is compromised. Verifiers pin the key at enrolment (or cross-check
+   a witness) and treat a changed key as an alarm.
 
 ## Capability Token Trust and Revocation
 
@@ -1140,6 +1145,11 @@ corecruxctl receipts verify-stream-receipt record.json --keyring keyring.json \
 ```
 
 `keyring.json` is `{"v":1,"keys":[{"keyId":"<passport fingerprint>","pubKeyBase64":"<ed25519 public key>"}]}`.
+The daemon serves exactly this shape, unauthenticated, at
+`GET /v1/receipts/signing-keys` (each key also carries `publicKeyHex`,
+`alg: "ed25519"` and `use: "receipt-signing"`, which the keyring parser
+ignores). That route is key *discovery*, not trust: pin the key when you
+enrol the daemon, and treat a later change as an alarm rather than refetching.
 The command checks the daemon's own signature (nothing is re-signed and no key
 is read from the record) and exits non-zero unless the signature is valid, the
 body hash matches, the signed body names the tenant (`--tenant-id`, default
@@ -2049,6 +2059,7 @@ The generic `/v1/entities/{kind}/{id}` and MCP `entity_*` APIs reject governed
 | GET | `/v1/receipts/{receiptId}` | Retrieve a CROWN receipt body | `events:read` |
 | GET | `/v1/receipts/{receiptId}/signature` | Retrieve receipt Ed25519 signature | `events:read` |
 | GET | `/v1/receipts/{receiptId}/verification` | Verify receipt signature and chain | `events:read` |
+| GET | `/v1/receipts/signing-keys` | Receipt-signing public keyring (`Ed25519KeyRingV1`) for offline verifiers | public |
 
 ### Credits
 
@@ -2340,7 +2351,7 @@ controlled by `CORECRUXD_ROUTE_AUTH` (read once at startup):
 |-------|-----------|
 | `off` | Pass-through; the middleware does nothing. |
 | `shadow` | Evaluates the contract and logs a structured `route_auth_shadow_mismatch` warning on any would-deny, but never blocks. It is the derived default only for auth-off, loopback-only operation; otherwise it is an explicit migration override. |
-| `enforce` | Public routes (`/healthz`, `/readyz`, `/metrics`, `/session`, `/invocation/verify`, `/v1/openapi.json`, `/v1/version`, `/v1/witness/smoke`, and the `/v1/auth/*` bootstrap rails) pass with no auth headers. Every other route requires one of its contract scopes via the same primitive the handlers use. A route with **no** contract entry — or a request axum could not match to a route template — **fails closed with `403`**. |
+| `enforce` | Public routes (`/healthz`, `/readyz`, `/metrics`, `/session`, `/invocation/verify`, `/v1/openapi.json`, `/v1/version`, `/v1/receipts/signing-keys`, `/v1/witness/smoke`, and the `/v1/auth/*` bootstrap rails) pass with no auth headers. Every other route requires one of its contract scopes via the same primitive the handlers use. A route with **no** contract entry — or a request axum could not match to a route template — **fails closed with `403`**. |
 
 With the variable unset, authentication enabled or a non-loopback listener
 selects `enforce`; only auth-off plus loopback derives `shadow`. An empty or

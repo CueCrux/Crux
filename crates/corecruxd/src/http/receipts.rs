@@ -714,6 +714,65 @@ pub(super) fn stream_receipt_record_id(record: &super::observations::Observation
     record.payload.get("receipt_id").and_then(serde_json::Value::as_str)
 }
 
+/// Build the public receipt-signing keyring (`Ed25519KeyRingV1` plus
+/// informational fields `parse_json` ignores) from the node's passport key.
+///
+/// `keyId` is what every receipt this daemon signs carries as `sig.key_id`:
+/// the passport fingerprint, `p_` + hex of the first 16 bytes of
+/// `blake3(pubkey)`. It is recomputed from the public key and must equal the
+/// node's `passport_fpr`; a mismatch means the key the daemon would publish
+/// is not the one it signs with, so it publishes nothing.
+pub(super) fn receipt_signing_keyring_json(state: &AppState) -> Result<serde_json::Value, String> {
+    let public_key: [u8; 32] = hex::decode(&state.passport_public_key_hex)
+        .map_err(|err| format!("decode node passport public key: {err}"))?
+        .try_into()
+        .map_err(|bytes: Vec<u8>| format!("node passport public key is {} bytes", bytes.len()))?;
+    let key_id = crux_session::passport::passport_fpr_from_public_key(&public_key);
+    if key_id != state.passport_fpr {
+        return Err("node passport public key does not match the receipt signing key id".to_string());
+    }
+    Ok(serde_json::json!({
+        "v": 1,
+        "keys": [{
+            "keyId": key_id,
+            "pubKeyBase64": base64::engine::general_purpose::STANDARD.encode(public_key),
+            "publicKeyHex": hex::encode(public_key),
+            "alg": "ed25519",
+            "use": "receipt-signing",
+        }],
+    }))
+}
+
+/// `GET /v1/receipts/signing-keys` — the public key(s) this daemon signs
+/// receipts with, as an `Ed25519KeyRingV1` that
+/// `corecruxctl receipts verify-stream-receipt --keyring` reads unchanged.
+///
+/// Unauthenticated, like `/v1/version`: it is public key material only, and a
+/// verifier should not need `admin:read` (`/v1/admin/version`) to find it.
+/// This is key *discovery*, not trust: a key fetched from the daemon that
+/// signed the receipt proves nothing if that daemon or the channel is
+/// compromised. Verifiers pin the key at enrolment (or cross-check a
+/// witness) and treat a changed key as an alarm.
+#[utoipa::path(
+    get,
+    path = "/v1/receipts/signing-keys",
+    tag = "Receipts",
+    responses(
+        (status = 200, description = "Receipt-signing public keyring (Ed25519KeyRingV1)"),
+        (status = 503, description = "The node passport key is inconsistent; no key is published"),
+    )
+)]
+#[tracing::instrument(level = "info", skip_all)]
+pub(super) async fn get_receipt_signing_keys_v1(State(state): State<AppState>) -> Response {
+    match receipt_signing_keyring_json(&state) {
+        Ok(keyring) => (StatusCode::OK, Json(keyring)).into_response(),
+        Err(detail) => {
+            tracing::error!(target = "receipts", error = %detail, "receipt signing keyring unavailable");
+            problem_response(StatusCode::SERVICE_UNAVAILABLE, "receipt signing key is unavailable")
+        }
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/v1/receipts/{receiptId}",
