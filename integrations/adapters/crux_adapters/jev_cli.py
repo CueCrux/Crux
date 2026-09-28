@@ -25,7 +25,9 @@ hashing. One JSON request on stdin, one JSON result on stdout::
 
 Request fields: ``entity`` and ``questions`` (required); ``untrusted``,
 ``token_budget`` (default 400), ``crux_query``, ``model`` (default
-``jev-latest``), ``store_state`` (default false), ``provider``.
+``jev-latest``), ``store_state`` (default false), ``provider``,
+``state_layout`` (``v0`` default, or the measured ``split-v1``) and
+``untrusted_source`` (label for the untrusted input under ``split-v1``).
 
 Result: ``recorded``, ``answers``, ``model_version``, ``request_id``,
 ``invocation_id``, ``receipt_id``, ``fact_id``, the three hashes,
@@ -151,7 +153,8 @@ def parse_request(text: str) -> dict[str, Any]:
     budget = request.get("token_budget", DEFAULT_TOKEN_BUDGET)
     if not isinstance(budget, int) or isinstance(budget, bool) or budget < 0:
         raise ValueError("request.token_budget must be a non-negative integer")
-    known = {"entity", "questions", "untrusted", "token_budget", "crux_query", "model", "store_state", "provider"}
+    known = {"entity", "questions", "untrusted", "token_budget", "crux_query", "model", "store_state", "provider",
+             "state_layout", "untrusted_source"}
     unknown = sorted(set(request) - known)
     if unknown:
         raise ValueError(f"unknown request fields: {', '.join(unknown)}")
@@ -216,6 +219,10 @@ def run(
     }
     if request.get("provider"):
         kwargs["provider"] = request["provider"]
+    if request.get("state_layout"):
+        kwargs["state_layout"] = request["state_layout"]
+    if request.get("untrusted_source"):
+        kwargs["untrusted_source"] = request["untrusted_source"]
     try:
         decision = decide_fn(client, request["questions"], **kwargs)
     except DecisionNotRecorded as err:

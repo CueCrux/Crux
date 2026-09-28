@@ -268,6 +268,29 @@ or `*TOKEN*`:
 The env file is `CRUX_ENV_FILE`, or `~/.config/cuecrux/env` if that is unset.
 Run `crux-jev --help` for the full request schema.
 
+### The measured state layout: `state_layout="split-v1"`
+
+`decide(..., state_layout="split-v1", untrusted_source="ci-log")` (or
+`"state_layout": "split-v1"` in a `crux-jev` request) sends Jev this state:
+
+```json
+{"policy": "…", "trusted_context": […], "untrusted_inputs": {"source": "ci-log", "content": …}}
+```
+
+This is the `split` arm of the AuditCrux injection benchmark (run
+`jev-injection-live-20260928T212018Z`: corpus `fixture-jev-injection-v1`,
+`jev-1.13.0`, 50 attack and 15 control cases). The injections tested flipped
+18% of verdicts with the flat layout and none with `split-v1`. None of the 15
+benign controls was over-blocked.
+
+Most of that gain comes from the policy line, `UNTRUSTED_POLICY_V1`, which is
+byte-identical to the benchmark's text. Edit it and the result no longer
+applies, so re-measure first.
+
+The default layout is still `v0` (`{trusted_context, untrusted_input}`), so
+existing prompt hashes and behaviour do not change under current callers. Use
+`split-v1` whenever the untrusted input could carry instructions.
+
 ### Verifying without trusting the daemon: `crux-jev verify`
 
 `crux-jev verify` checks receipts using only a pinned public key. It needs no
