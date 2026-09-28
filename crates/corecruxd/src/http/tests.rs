@@ -17743,6 +17743,7 @@ async fn work_gate_receipt_session_is_not_generic_observation_surface() -> Resul
             kind: None,
             session_id: None,
             limit: None,
+            chains: None,
         }),
     )
     .await;
