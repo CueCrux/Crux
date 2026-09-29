@@ -32,6 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Passport-bound callers see and verify their own stream receipts.** With
+  `CORECRUXD_AGENT_PASSPORTS=1` an agent token is confined to its own tenant,
+  while the stream receipts it mints are signed under `local` and logged in
+  unscoped `mediation::<group>` sessions. `GET /v1/observations/aggregate`
+  now lists a daemon-signed receipt kind to the passport that minted it
+  (record `principal`), and `GET /v1/receipts/{id}/verification` lets a
+  `receipts:read` caller verify a stream receipt whose signed `actor_passport`
+  is its own passport, whatever `tenant_id` it asks under. Other kinds keep
+  session scoping; every other caller gets the same answer as for a missing
+  receipt.
 - **Agent tokens can verify receipts.** The default
   `CORECRUXD_AGENT_TOKEN_HTTP_SCOPES` set gains `receipts:read`, so a token
   that can mint a receipt (`sessions:write`) can also call
