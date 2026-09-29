@@ -115,7 +115,10 @@ With auth on, the token needs these scopes:
 An MCP agent token accepted over HTTP (`CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS=1`)
 with the default `CORECRUXD_AGENT_TOKEN_HTTP_SCOPES` carries all four; before
 this release the default set lacked `receipts:read`, so such a token could
-mint a receipt but not verify it.
+mint a receipt but not verify it. A token confined to one tenant
+(`CORECRUXD_AGENT_PASSPORTS=1`) can verify and list the receipts minted for
+its own passport even though they are signed under tenant `local`; it cannot
+see anyone else's.
 
 Fact writes from a passport-bearing token also need that passport registered
 with a category.

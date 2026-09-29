@@ -1869,8 +1869,22 @@ pub(super) async fn get_observations_aggregate(
     // session id (filenames are lossy). An unbound operator (raw `admin:read`,
     // no passport) keeps the cross-session feed.
     let sees_all = raw_admin_read(&ctx);
+    // A daemon-signed receipt kind is also visible to the passport it was
+    // minted for. The mint path records it in an unscoped `mediation::<group>`
+    // log with `principal` = the minting caller's passport, and since the
+    // generic route refuses these kinds only the signing path writes them, so
+    // `principal` names the owner. Other kinds keep the session scoping.
+    let owns_receipt = |record: &ObservationRecordV1| {
+        is_reserved_receipt_kind(&record.kind)
+            && ctx
+                .passport_id
+                .as_deref()
+                .is_some_and(|passport| record.principal == passport)
+    };
     let visible = |record: &ObservationRecordV1| {
-        sees_all || crux_mcp::scope::visible_session_for_agent(&record.session_id, ctx.passport_id.as_deref()).is_some()
+        sees_all
+            || crux_mcp::scope::visible_session_for_agent(&record.session_id, ctx.passport_id.as_deref()).is_some()
+            || owns_receipt(record)
     };
 
     // Each matched record carries the index of its session in `sessions`, so
