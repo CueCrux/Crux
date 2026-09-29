@@ -312,6 +312,9 @@ fn is_local_approval_receipt_id(receipt_id: &str) -> bool {
 #[derive(Debug)]
 pub(super) struct LocalStreamReceipt {
     pub(super) tenant_id: String,
+    /// The signed body's `actor_passport`: the passport the daemon minted
+    /// this receipt for.
+    pub(super) actor_passport: Option<String>,
     pub(super) verification: corecrux_receipts::VerificationReportV1,
 }
 
@@ -486,16 +489,32 @@ fn require_chain_covered(record: &super::observations::ObservationRecordV1, what
 
 /// Best-effort top-level `tenant_id` text field from a CBOR receipt body.
 fn cbor_top_level_tenant(body_bytes: &[u8]) -> Option<String> {
+    cbor_top_level_text(body_bytes, "tenant_id")
+}
+
+/// Best-effort top-level text field `key` from a CBOR receipt body.
+fn cbor_top_level_text(body_bytes: &[u8], key: &str) -> Option<String> {
     let value: ciborium::Value = ciborium::de::from_reader(std::io::Cursor::new(body_bytes)).ok()?;
     let ciborium::Value::Map(map) = value else { return None };
     for (k, v) in &map {
         if let (ciborium::Value::Text(k), ciborium::Value::Text(v)) = (k, v) {
-            if k == "tenant_id" {
+            if k == key {
                 return Some(v.clone());
             }
         }
     }
     None
+}
+
+/// The signed body's `actor_passport` for a stored stream-receipt record,
+/// if its body decodes. Used only to decide who may be told about an
+/// ambiguous id, never to trust the body.
+fn stream_record_actor_passport(record: &super::observations::ObservationRecordV1) -> Option<String> {
+    let body_hex = record.payload.get("body_cbor_hex")?.as_str()?;
+    if body_hex.len() > 2_097_152 {
+        return None;
+    }
+    cbor_top_level_text(&hex::decode(body_hex).ok()?, "actor_passport")
 }
 
 /// Locate and verify an `r_…` stream receipt (context-injected /
@@ -526,6 +545,7 @@ pub(super) fn local_stream_receipt_verification(
     // lets whichever sorts first shadow the other.
     let mut claim: Option<(Vec<super::observations::ObservationRecordV1>, usize)> = None;
     let mut claims = 0usize;
+    let mut actor_passports: Vec<String> = Vec::new();
     for path in stream_receipt_log_files(&state.data_dir)? {
         let records = super::observations::read_observations_strict(&path)
             .map_err(|err| format!("read mediation observations {}: {err}", path.display()))?;
@@ -536,6 +556,11 @@ pub(super) fn local_stream_receipt_verification(
             .map(|(i, _)| i)
             .collect();
         claims += matches.len();
+        actor_passports.extend(
+            matches
+                .iter()
+                .filter_map(|&index| stream_record_actor_passport(&records[index])),
+        );
         if let Some(&index) = matches.first() {
             if claim.is_none() {
                 claim = Some((records, index));
@@ -543,7 +568,10 @@ pub(super) fn local_stream_receipt_verification(
         }
     }
     if claims > 1 {
-        return Err(LocalStreamReceiptError::Ambiguous { claims });
+        return Err(LocalStreamReceiptError::Ambiguous {
+            claims,
+            actor_passports,
+        });
     }
     let Some((records, index)) = claim else {
         return Ok(None);
@@ -636,8 +664,10 @@ pub(super) fn local_stream_receipt_verification(
         // The verifier sees one receipt and cannot check position; this
         // resolver just did, above, for the whole file and for this record.
         verification.binding.chain_position_checked = true;
+        let actor_passport = cbor_top_level_text(&body_bytes, "actor_passport");
         Ok(Some(LocalStreamReceipt {
             tenant_id,
+            actor_passport,
             verification,
         }))
     }
@@ -649,8 +679,13 @@ pub(super) enum LocalStreamReceiptError {
     /// More than one stored stream-receipt body claims the id. Fails closed:
     /// the route answers 409 [`RECEIPT_ID_AMBIGUOUS_CODE`] instead of picking
     /// one. The mint path refuses reused ids, so this only fires on logs
-    /// written before that check, or edited on disk.
-    Ambiguous { claims: usize },
+    /// written before that check, or edited on disk. `actor_passports` are
+    /// the claiming bodies' `actor_passport`s, so the route can tell an
+    /// owner (and only an owner) about the conflict.
+    Ambiguous {
+        claims: usize,
+        actor_passports: Vec<String>,
+    },
     /// The receipt material or its log failed an integrity check.
     Invalid(String),
 }
@@ -664,7 +699,7 @@ impl From<String> for LocalStreamReceiptError {
 impl std::fmt::Display for LocalStreamReceiptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Ambiguous { claims } => {
+            Self::Ambiguous { claims, .. } => {
                 write!(f, "{claims} stored stream receipt bodies claim this receipt id")
             }
             Self::Invalid(detail) => f.write_str(detail),
@@ -675,6 +710,15 @@ impl std::fmt::Display for LocalStreamReceiptError {
 /// Stable `code` on the 409 `/verification` returns when a receipt id is
 /// claimed by more than one stored body.
 pub(super) const RECEIPT_ID_AMBIGUOUS_CODE: &str = "RECEIPT_ID_AMBIGUOUS";
+
+fn receipt_id_ambiguous_problem(claims: usize, receipt_id: &str) -> Response {
+    super::observations::coded_problem(
+        StatusCode::CONFLICT,
+        RECEIPT_ID_AMBIGUOUS_CODE,
+        "Ambiguous Receipt Id",
+        format!("{claims} stored stream receipt bodies claim receipt id '{receipt_id}'; refusing to pick one"),
+    )
+}
 
 /// The mediation observation logs stream receipts are minted into
 /// (`mediation::<group>`, possibly under a passport scope prefix), sorted.
@@ -1022,9 +1066,38 @@ pub(super) async fn get_receipt_verification_v1(
     Query(q): Query<TenantQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let local_stream_path = !is_local_approval_receipt_id(&receipt_id) && !state.http_dataplane.enabled();
     if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["receipts:read"], &q.tenant_id) {
+        // A caller confined to other tenants may still verify a stream
+        // receipt minted for its own passport (they sign under `local`).
+        // Anything else, found or not, gets the same error it always did,
+        // so this cannot be used to probe for receipts.
+        if local_stream_path {
+            if let Some(owner) = http_owner_passport_with_scopes(&state.auth, &headers, &["receipts:read"]) {
+                match local_stream_receipt_verification(&state, &receipt_id) {
+                    Ok(Some(found)) if found.actor_passport.as_deref() == Some(owner.as_str()) => {
+                        return (StatusCode::OK, Json(found.verification)).into_response();
+                    }
+                    Err(LocalStreamReceiptError::Ambiguous {
+                        claims,
+                        actor_passports,
+                    }) if actor_passports.contains(&owner) => {
+                        return receipt_id_ambiguous_problem(claims, &receipt_id);
+                    }
+                    _ => {}
+                }
+            }
+        }
         return problem.into_response();
     }
+    // The caller's passport, when it holds `receipts:read`: it may verify a
+    // stream receipt minted for it even without a grant on that receipt's
+    // own tenant.
+    let owns = |actor: Option<&str>| {
+        actor.is_some_and(|actor| {
+            http_owner_passport_with_scopes(&state.auth, &headers, &["receipts:read"]).as_deref() == Some(actor)
+        })
+    };
 
     if is_local_approval_receipt_id(&receipt_id) {
         return match local_approval_receipt(&state, &q.tenant_id, &receipt_id) {
@@ -1038,20 +1111,19 @@ pub(super) async fn get_receipt_verification_v1(
         // mediation observation logs, not the dataplane — resolve and
         // verify them there instead of 501ing.
         return match local_stream_receipt_verification(&state, &receipt_id) {
-            Err(LocalStreamReceiptError::Ambiguous { claims }) => {
-                // Stream receipts mint under `local`: a caller not
-                // authorized there gets the missing-receipt 404, as below.
-                if require_http_scopes_for_tenant(&state.auth, &headers, &["receipts:read"], "local").is_err() {
+            Err(LocalStreamReceiptError::Ambiguous {
+                claims,
+                actor_passports,
+            }) => {
+                // Stream receipts mint under `local`: a caller neither
+                // authorized there nor the owner of a claiming body gets the
+                // missing-receipt 404, as below.
+                if require_http_scopes_for_tenant(&state.auth, &headers, &["receipts:read"], "local").is_err()
+                    && !actor_passports.iter().any(|actor| owns(Some(actor)))
+                {
                     return problem_response(StatusCode::NOT_FOUND, "receipt body not found");
                 }
-                super::observations::coded_problem(
-                    StatusCode::CONFLICT,
-                    RECEIPT_ID_AMBIGUOUS_CODE,
-                    "Ambiguous Receipt Id",
-                    format!(
-                        "{claims} stored stream receipt bodies claim receipt id '{receipt_id}'; refusing to pick one"
-                    ),
-                )
+                receipt_id_ambiguous_problem(claims, &receipt_id)
             }
             Ok(Some(found)) => {
                 // Re-gate against the receipt's OWN tenant (stream receipts
@@ -1059,7 +1131,9 @@ pub(super) async fn get_receipt_verification_v1(
                 // caller not authorized for that tenant gets the same 404 as
                 // a missing receipt, so tenant probing can't confirm
                 // existence.
+                // The passport it was minted for may verify it too.
                 if require_http_scopes_for_tenant(&state.auth, &headers, &["receipts:read"], &found.tenant_id).is_err()
+                    && !owns(found.actor_passport.as_deref())
                 {
                     return problem_response(StatusCode::NOT_FOUND, "receipt body not found");
                 }

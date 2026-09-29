@@ -1539,7 +1539,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                crate::http::receipts::LocalStreamReceiptError::Ambiguous { claims: 2 }
+                crate::http::receipts::LocalStreamReceiptError::Ambiguous { claims: 2, .. }
             ),
             "{err}"
         );

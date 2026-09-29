@@ -1815,6 +1815,35 @@ pub fn require_http_scopes_for_tenant(
     Ok(TenantScope(tenant_id.to_string()))
 }
 
+/// The caller's bound passport, when it holds every scope in `required` and
+/// is authorized for at least one tenant — *which* tenant is not checked.
+///
+/// For owner-scoped reads whose object carries its own tenant that the caller
+/// may not be confined to: a passport-confined agent token (tenant `default`)
+/// verifying a stream receipt the daemon signed under tenant `local` for that
+/// same passport. The scope check is not bypassed; only the tenant match is
+/// replaced by the caller's ownership, which the handler must establish.
+/// `None` under `AuthMode::Off` (tenant gates already pass there) and for any
+/// caller without a bound passport.
+pub fn http_owner_passport_with_scopes(auth: &Authz, headers: &HeaderMap, required: &[&str]) -> Option<String> {
+    if auth.mode == AuthMode::Off {
+        return None;
+    }
+    let ctx = http_ctx(auth, headers).ok()?;
+    if !missing_scopes(&ctx.scopes, required).is_empty() {
+        return None;
+    }
+    match &ctx.tenants {
+        TenantAllow::Any => {}
+        TenantAllow::Only(set) if !set.is_empty() => {}
+        TenantAllow::Only(_) | TenantAllow::Missing => return None,
+    }
+    http_scope_context(auth, headers)
+        .ok()?
+        .passport_id
+        .filter(|passport| !passport.trim().is_empty())
+}
+
 #[allow(clippy::result_large_err, dead_code)]
 pub fn require_grpc_scopes(auth: &Authz, meta: &MetadataMap, required: &[&str]) -> Result<(), Status> {
     if auth.mode == AuthMode::Off {
