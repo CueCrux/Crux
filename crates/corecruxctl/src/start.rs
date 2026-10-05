@@ -118,7 +118,7 @@ fn mcp_url_for(url: Option<&str>) -> Result<String, DynErr> {
 
 /// The single "you're live" summary printed on success.
 ///
-/// `mcp` is the endpoint login registered ([`mcp_url_for`]); it used to be the
+/// `mcp` is the endpoint login registered (`mcp_url_for`); it used to be the
 /// HTTP URL relabelled as MCP whenever `--url` was given.
 pub fn live_summary(url: Option<&str>, mcp: &str) -> String {
     let http = url.unwrap_or("http://127.0.0.1:14800");
