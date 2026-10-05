@@ -1,0 +1,15 @@
+{
+  "name": "crux-desktop",
+  "version": "0.2.0",
+  "author": { "name": "CueCrux" },
+  "description": "Crux Daemon continuity for Claude Code: loads context at start, saves the session each turn and before compaction, and shows a live Crux pane",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "server": {
+      "type": "string",
+      "title": "Crux MCP server",
+      "description": "Name of the MCP server that reaches your Crux Daemon (as registered with Claude Code). Leave empty to try \"crux\" then \"Crux Daemon\".",
+      "default": ""
+    }
+  }
+}

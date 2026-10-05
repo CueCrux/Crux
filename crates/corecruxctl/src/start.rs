@@ -56,6 +56,7 @@ pub fn run(args: StartArgs) -> Result<(), DynErr> {
         // self-check is printed loudly but must not fail the command.
         strict_verify: false,
         no_hooks: false,
+        no_mod: false,
         no_register: false,
     });
 
@@ -81,7 +82,8 @@ pub fn run(args: StartArgs) -> Result<(), DynErr> {
                     }
                 }
             }
-            print!("{}", live_summary(args.url.as_deref()));
+            let mcp = mcp_url_for(args.url.as_deref()).unwrap_or_else(|_| "http://127.0.0.1:14801/mcp".to_string());
+            print!("{}", live_summary(args.url.as_deref(), &mcp));
             if let Some(agent) = args.agent {
                 println!("\nNext: restart {} and ask it to recall something.", agent.as_str());
             }
@@ -115,20 +117,16 @@ fn mcp_url_for(url: Option<&str>) -> Result<String, DynErr> {
 }
 
 /// The single "you're live" summary printed on success.
-pub fn live_summary(url: Option<&str>) -> String {
+///
+/// `mcp` is the endpoint login registered ([`mcp_url_for`]); it used to be the
+/// HTTP URL relabelled as MCP whenever `--url` was given.
+pub fn live_summary(url: Option<&str>, mcp: &str) -> String {
     let http = url.unwrap_or("http://127.0.0.1:14800");
-    // The MCP endpoint mirrors the HTTP host on the +1 port by convention; we
-    // only special-case the local default so the summary is concrete there.
-    let mcp = if url.is_none() {
-        "http://127.0.0.1:14801/mcp".to_string()
-    } else {
-        format!("{http} (MCP endpoint, registered by login)")
-    };
     format!(
         "\n✓ You're live.\n\
          \x20 daemon   {http}\n\
          \x20 mcp      {mcp}\n\
-         \x20 hooks    installed (banner + observe capture)\n\
+         \x20 claude   mod + hooks (see the mod:/hooks: lines above)\n\
          \x20 verified first fact round-trip OK\n\
          \n\
          Next:\n\
@@ -155,19 +153,23 @@ mod tests {
 
     #[test]
     fn live_summary_default_names_local_endpoints_and_next_steps() {
-        let s = live_summary(None);
+        let s = live_summary(None, "http://127.0.0.1:14801/mcp");
         assert!(s.contains("You're live"));
         assert!(s.contains("127.0.0.1:14800"));
         assert!(s.contains("127.0.0.1:14801/mcp"));
-        assert!(s.contains("hooks"));
+        assert!(s.contains("mod + hooks"));
         assert!(s.contains("first fact round-trip"));
         assert!(s.contains("Next:"));
     }
 
     #[test]
     fn live_summary_honours_explicit_url() {
-        let s = live_summary(Some("https://crux.example.com"));
+        let s = live_summary(Some("https://crux.example.com"), "https://crux.example.com:14801/mcp");
         assert!(s.contains("https://crux.example.com"));
+        assert!(
+            s.contains("mcp      https://crux.example.com:14801/mcp"),
+            "the MCP line names the MCP endpoint, not the HTTP URL: {s}"
+        );
     }
 
     #[test]

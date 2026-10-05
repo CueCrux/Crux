@@ -42,6 +42,10 @@ fn main() -> ExitCode {
         return run_skills(action);
     }
 
+    if let cli::Command::Mods { action } = args.command {
+        return run_mods(action);
+    }
+
     match run(&workspace, args.command) {
         Ok(code) => code,
         Err(e) => {
@@ -70,6 +74,16 @@ fn run(workspace: &Path, cmd: cli::Command) -> std::io::Result<ExitCode> {
         cli::Command::Regenerate { hooks: true, .. } => Some(hooks_bridge::Mode::Auto),
         _ => None,
     };
+    // `init` installs the mod with the hooks (it owns continuity, so the hooks
+    // step must see it installed); `regenerate --hooks` keeps whatever is there.
+    let install_mod = matches!(
+        &cmd,
+        cli::Command::Init {
+            no_hooks: false,
+            no_mod: false,
+            ..
+        }
+    );
 
     // Skills follow the same opt-out/opt-in shape as hooks, but need no
     // prompt: they touch no operator settings file, only `~/.claude/skills/`.
@@ -85,6 +99,7 @@ fn run(workspace: &Path, cmd: cli::Command) -> std::io::Result<ExitCode> {
             profiles,
             no_hooks: _,
             no_skills: _,
+            no_mod: _,
         } => init_dispatch(&workspace, non_interactive, profiles)?,
         cli::Command::Regenerate {
             force,
@@ -99,6 +114,7 @@ fn run(workspace: &Path, cmd: cli::Command) -> std::io::Result<ExitCode> {
         // Dispatched in `main` before this pipeline runs.
         cli::Command::Hooks { .. } => unreachable!("hooks is handled in main()"),
         cli::Command::Skills { .. } => unreachable!("skills is handled in main()"),
+        cli::Command::Mods { .. } => unreachable!("mods is handled in main()"),
     };
     emit(&report);
 
@@ -106,7 +122,7 @@ fn run(workspace: &Path, cmd: cli::Command) -> std::io::Result<ExitCode> {
     // problem is non-fatal and never changes the wizard's exit code.
     if matches!(report.outcome, CommandOutcome::Ok) {
         if let Some(mode) = hooks_plan {
-            hooks_bridge::ensure_hooks(mode);
+            hooks_bridge::ensure_hooks(mode, install_mod);
         }
         // Non-fatal, exactly like hooks: a skills problem is reported but never
         // changes the wizard's exit code, because the composed profile files —
@@ -198,6 +214,40 @@ fn run_skills(action: cli::SkillsAction) -> ExitCode {
         }
         Err(e) => {
             eprintln!("skills {what}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `mods install|uninstall|status` — the `crux-desktop` Claude Code mod.
+/// Per-user, like skills.
+fn run_mods(action: cli::ModsAction) -> ExitCode {
+    use crux_config_wizard::mods_install;
+    let (result, what) = match action {
+        cli::ModsAction::Install {
+            server,
+            mcp_url,
+            no_mcp,
+        } => {
+            let opts = mods_install::ModOptions {
+                server,
+                mcp_url,
+                mcp_token: None,
+                skip_mcp: no_mcp,
+            }
+            .with_saved_endpoint();
+            (mods_install::install(&opts), "install")
+        }
+        cli::ModsAction::Uninstall => (mods_install::uninstall(), "uninstall"),
+        cli::ModsAction::Status => (mods_install::status(), "status"),
+    };
+    match result {
+        Ok(out) => {
+            println!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("mods {what}: {e}");
             ExitCode::FAILURE
         }
     }

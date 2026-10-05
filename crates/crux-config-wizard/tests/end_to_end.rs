@@ -39,14 +39,14 @@ fn full_init_regenerate_loop() {
         .cloned()
         .collect();
 
-    // Both targets land 11 sections: 10 shared profiles, plus exactly one of the
+    // Both targets land 10 sections: 9 shared profiles, plus exactly one of the
     // target-split pair (claude-5 → CLAUDE.md, agent-harness-parity → AGENTS.md).
-    // `memory-digest` is one of the shared ten and lands in both, which is the
+    // `memory-digest` is one of the shared nine and lands in both, which is the
     // point of it: the same curated index reaches Claude Code and Codex.
     for t in [Target::ClaudeMd, Target::AgentsMd] {
         let r = compose_file(workspace, t, &enabled, false, false).unwrap();
         assert!(r.wrote);
-        assert_eq!(r.managed_sections_added, 11);
+        assert_eq!(r.managed_sections_added, 10);
     }
 
     // The two files must no longer be identical. CLAUDE.md omits the rules Claude

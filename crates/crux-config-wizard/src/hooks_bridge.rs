@@ -21,9 +21,7 @@
 //! Still best-effort: a hooks problem prints and never fails the wizard, because
 //! the profiles are already written by the time we run.
 
-use std::path::PathBuf;
-
-use crux_config_wizard::hooks_install;
+use crux_config_wizard::{hooks_install, mods_install};
 
 /// How to run the hooks step.
 #[derive(Clone, Copy)]
@@ -36,12 +34,30 @@ pub enum Mode {
 
 /// Install / refresh the Claude Code hooks into the user settings.
 /// Best-effort and non-fatal.
-pub fn ensure_hooks(mode: Mode) {
+///
+/// With `install_mod`, the `crux-desktop` mod goes in first: it owns session
+/// continuity, and the hooks step reads whether it is installed to decide
+/// whether to wire the banner and PreCompact save.
+pub fn ensure_hooks(mode: Mode, install_mod: bool) {
     if matches!(mode, Mode::Prompt) && !crate::interactive::confirm_install_hooks() {
-        println!("Skipped Claude Code hooks — run `crux-config-wizard hooks install --user` when you're ready.");
+        println!("Skipped Claude Code hooks — run `corecruxctl hooks install --user` when you're ready.");
         return;
     }
 
+    if install_mod {
+        println!("\nInstalling the Crux Claude Code mod…");
+        let opts = mods_install::ModOptions::default().with_saved_endpoint();
+        // `install_at`, not `install`: the hooks step below re-converges the
+        // classic hooks itself, so the mod step need not do it too.
+        match mods_install::ModPaths::resolve().and_then(|p| mods_install::install_at(&p, &opts)) {
+            Ok(summary) => println!("{summary}"),
+            Err(e) => eprintln!("could not install the Crux mod ({e}); the hooks keep the banner and PreCompact save."),
+        }
+    }
+    ensure_classic_hooks();
+}
+
+fn ensure_classic_hooks() {
     println!("\nInstalling Claude Code hooks…");
     match hooks_install::install(true, None) {
         Ok(summary) => {
@@ -65,10 +81,10 @@ pub fn ensure_hooks(mode: Mode) {
 /// Read-only probe — we never write that file from here (it is `corecruxctl
 /// login`'s, and it holds the bearer token).
 fn endpoint_configured() -> bool {
-    let Some(home) = std::env::var_os("HOME") else {
+    let Ok(home) = crux_config_wizard::paths::home_dir() else {
         return false;
     };
-    let env = PathBuf::from(home).join(".config").join("cuecrux").join("env");
+    let env = home.join(".config").join("cuecrux").join("env");
     std::fs::read_to_string(env).is_ok_and(|s| {
         s.lines()
             .any(|l| l.trim_start().starts_with("CRUX_HTTP_URL") || l.trim_start().starts_with("CORECRUXD_URL"))

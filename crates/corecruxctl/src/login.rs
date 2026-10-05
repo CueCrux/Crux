@@ -921,8 +921,11 @@ pub struct LoginArgs {
     /// `crux-pinned-defect-remediation-2026-07-31`, M5): an *unreachable*
     /// daemon is still tolerated, because that check could not run.
     pub strict_verify: bool,
-    /// Skip installing the Claude Code hooks (banner + observe capture).
+    /// Skip installing the Claude Code hooks and mod.
     pub no_hooks: bool,
+    /// Skip the `crux-desktop` Claude Code mod (the classic hooks then keep the
+    /// SessionStart banner and PreCompact save).
+    pub no_mod: bool,
     /// Skip registering this machine with the daemon.
     pub no_register: bool,
 }
@@ -1025,6 +1028,9 @@ pub fn run(args: LoginArgs) -> Result<(), DynErr> {
     };
     register_mcp(&cfg_dir, &http_base, &mcp_url, mcp_agent_token.as_deref())?;
     println!("registered MCP endpoint {mcp_url} → {}", env_file.display());
+    // What Claude Code should send to that endpoint: the same token the
+    // verification below authenticates MCP with.
+    let claude_mcp_token = mcp_agent_token.clone().or_else(|| ambient_token.clone());
 
     let mut verification_failed = false;
     if args.no_verify {
@@ -1055,11 +1061,29 @@ pub fn run(args: LoginArgs) -> Result<(), DynErr> {
         }
     }
 
-    // 6. orchestrate machine setup: install Claude Code hooks + register the
-    //    machine. Both best-effort (non-fatal) so login still succeeds offline.
+    // 6. orchestrate machine setup: install the Claude Code mod + hooks and
+    //    register the machine. All best-effort (non-fatal) so login still
+    //    succeeds offline. The mod goes first: it owns session continuity, and
+    //    the hooks install reads whether it is present to leave out the banner
+    //    and PreCompact save.
     if args.no_hooks {
         println!("hooks: skipped (--no-hooks)");
     } else {
+        if args.no_mod {
+            println!("mod: skipped (--no-mod)");
+        } else {
+            use crux_config_wizard::mods_install::{install_at, ModOptions, ModPaths};
+            let opts = ModOptions {
+                server: None,
+                mcp_url: Some(mcp_url.clone()),
+                mcp_token: claude_mcp_token,
+                skip_mcp: false,
+            };
+            match ModPaths::resolve().and_then(|p| install_at(&p, &opts)) {
+                Ok(summary) => println!("mod: {summary}"),
+                Err(e) => println!("mod: skipped ({e})"),
+            }
+        }
         match crate::hooks::install(true, None) {
             Ok(summary) => println!("hooks: {summary}"),
             Err(e) => println!("hooks: skipped ({e})"),
@@ -2566,6 +2590,7 @@ mod tests {
             no_verify: true,
             strict_verify: false,
             no_hooks: true,
+            no_mod: true,
             no_register: true,
             ..Default::default()
         })
@@ -2608,6 +2633,7 @@ mod tests {
             no_verify: true,
             strict_verify: false,
             no_hooks: true,
+            no_mod: true,
             no_register: true,
             ..Default::default()
         })
@@ -2656,6 +2682,7 @@ mod tests {
             no_verify: true,
             strict_verify: false,
             no_hooks: true,
+            no_mod: true,
             no_register: true,
             ..Default::default()
         })
@@ -2692,6 +2719,7 @@ mod tests {
             no_verify: true,
             strict_verify: false,
             no_hooks: true,
+            no_mod: true,
             no_register: true,
             ..Default::default()
         })

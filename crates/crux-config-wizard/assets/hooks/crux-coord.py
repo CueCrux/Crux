@@ -45,9 +45,35 @@ import sys
 import urllib.error
 import urllib.request
 
-HTTP = os.environ.get("CRUX_HTTP_URL", "http://100.70.12.73:14800").rstrip("/")
-MCP = os.environ.get("CRUX_MCP_URL", "http://100.70.12.73:14801/mcp")
-TOKEN = os.environ.get("CRUX_AGENT_TOKEN", "")
+def _saved_env():
+    # Hooks call this script directly, not through the launcher, so read the
+    # endpoint `corecruxctl login` saved; the process env still wins.
+    out = {}
+    try:
+        with open(os.path.expanduser("~/.config/cuecrux/env"), encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("export "):
+                    line = line[len("export "):]
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    out[k.strip()] = v.strip().strip("'\"")
+    except OSError:
+        pass
+    return out
+
+
+_SAVED = _saved_env()
+
+
+def _setting(key, default):
+    return os.environ.get(key) or _SAVED.get(key) or default
+
+
+# Unconfigured means the loopback daemon, as the hook launcher defaults.
+HTTP = _setting("CRUX_HTTP_URL", "http://127.0.0.1:14800").rstrip("/")
+MCP = _setting("CRUX_MCP_URL", "http://127.0.0.1:14801/mcp")
+TOKEN = _setting("CRUX_AGENT_TOKEN", "")
 PROJECT = os.environ.get("CRUX_COORD_PROJECT", "crux")
 TTL = int(os.environ.get("CRUX_COORD_TTL_SECS", "900"))
 CACHE = os.path.expanduser("~/.cache/crux-coord")
