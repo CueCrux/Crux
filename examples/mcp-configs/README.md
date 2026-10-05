@@ -2,10 +2,11 @@
 
 
 > **Prefer one command?** `corecruxctl start --agent cursor` writes the `crux`
-> server into `~/.cursor/mcp.json` for you (and `--agent claude` / `--agent codex`
-> do the equivalent for those clients). It merges rather than overwrites, so your
-> other MCP servers survive, and it is safe to re-run. The files here are for
-> wiring it by hand or for clients the flag does not cover.
+> server into `~/.cursor/mcp.json` for you, `--agent codex` does the equivalent
+> for Codex, and `--agent claude` registers it in `~/.claude.json` along with
+> the Crux Claude Code mod. Each merges rather than overwrites, so your other
+> MCP servers survive, and is safe to re-run. The files here are for wiring it
+> by hand or for clients the flag does not cover.
 
 Example configuration files for connecting MCP clients to a running Crux Daemon instance.
 
@@ -120,17 +121,30 @@ logged verbatim on startup, so a misconfiguration is visible immediately.
 
 ## Claude Code
 
-Add to your project's `.claude/settings.json`:
+`corecruxctl login` (and `start --agent claude`) registers the daemon for you
+as a user-scope server named `crux`, through `corecruxctl mods install`. By
+hand, use the CLI:
+
+```bash
+claude mcp add --scope user --transport http crux http://localhost:14801/mcp
+```
+
+or commit a project-scoped `.mcp.json` at the repository root:
 
 ```json
 {
   "mcpServers": {
     "crux": {
+      "type": "http",
       "url": "http://localhost:14801/mcp"
     }
   }
 }
 ```
+
+Claude Code does not read `mcpServers` from `.claude/settings.json`. A
+project-scoped `crux` server takes precedence over the user-scope one inside
+that project, so the Crux mod talks to whichever is in effect there.
 
 ## Cursor
 

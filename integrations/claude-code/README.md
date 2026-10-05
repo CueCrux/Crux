@@ -6,8 +6,41 @@ posts it to a running Crux Daemon. Each observation is Ed25519-signed by
 the daemon so the resulting log is **verifiable evidence**, not a
 self-reported file.
 
-This is a single bash hook script plus a `settings.json` snippet. No
-plugin, no MCP server, no extra dependencies beyond `curl` and `jq`.
+This is a single bash hook script plus a `settings.json` snippet, with no
+dependencies beyond `curl` and `jq`. Session continuity (the context brief at
+session start and the session save) is a separate piece, the Crux Claude Code
+mod, described next.
+
+## The Crux mod (session continuity)
+
+`corecruxctl login` installs `crux-desktop`, a Claude Code mod (a function-hook
+plugin), alongside these hooks. `corecruxctl mods install` installs it on its
+own. It:
+
+- injects a continuity block into the first prompt: the daemon it is connected
+  to, the previous session in this directory, and the bootstrap patterns;
+- saves the conversation with MCP `save_session` as `hook:session:<id>` after
+  every turn, before compaction and at session end;
+- shows `Crux ● · N facts` in the status line and opens a pane with `/crux`
+  (`/crux status`, `/crux save`).
+
+The installer writes three things:
+
+| Where | What |
+| --- | --- |
+| `~/.claude/mods/crux-desktop/` | The mod's files (source: `crates/crux-config-wizard/assets/mods/crux-desktop/`) |
+| `~/.claude/settings.json` | The folder appended to `env.CLAUDE_CODE_PLUGIN_DIRS`, and `pluginConfigs.crux-desktop.options.server`, the MCP server the mod uses |
+| `~/.claude.json` | A user-scope `crux` MCP server for the daemon, unless a server of that name already exists |
+
+With the mod installed it owns continuity, so `hooks install` leaves out the
+SessionStart banner and the PreCompact save; everything else here is unchanged.
+`corecruxctl mods uninstall` removes the mod and restores them. Opt out at login
+with `--no-mod`. `corecruxctl mods status` reports what is installed.
+
+A project can define its own `crux` MCP server (in `.mcp.json` or under
+`projects` in `~/.claude.json`); inside that project it wins over the user-scope
+one, and the installer says so. Point the mod at a different server with
+`corecruxctl mods install --server <name>`.
 
 ## How it works
 

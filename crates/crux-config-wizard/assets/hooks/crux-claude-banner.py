@@ -27,6 +27,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter
 
@@ -89,7 +90,7 @@ def call_tool(name: str, args: dict, mcp_url: str, token: str) -> dict:
     req = urllib.request.Request(
         mcp_url, data=payload, method="POST",
         headers={
-            "Authorization": f"Bearer {token}",
+            **_bearer(token),
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
         },
@@ -114,9 +115,18 @@ def call_tool(name: str, args: dict, mcp_url: str, token: str) -> dict:
     except json.JSONDecodeError:
         return {"_raw": text}
 
+def _bearer(token: str) -> dict:
+    # No header at all without a token: an empty `Bearer ` is a malformed
+    # credential to a daemon that would otherwise accept the anonymous call.
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+def _is_loopback(url: str) -> bool:
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    return host in ("127.0.0.1", "localhost", "::1")
+
 def http_get(url: str, token: str) -> dict:
     req = urllib.request.Request(url, headers={
-        "Authorization": f"Bearer {token}", "Accept": "application/json",
+        **_bearer(token), "Accept": "application/json",
     })
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
@@ -497,8 +507,9 @@ def main() -> None:
         emit({})
         return
     cfg = load_env_file()
-    mcp_url = os.environ.get("CRUX_MCP_URL") or cfg.get("CRUX_MCP_URL") or "https://crux.cuecrux.com/mcp"
-    http_url = (os.environ.get("CRUX_HTTP_URL") or cfg.get("CRUX_HTTP_URL") or "http://100.70.12.73:14800").rstrip("/")
+    # Unconfigured means the loopback daemon, as the hook launcher defaults.
+    mcp_url = os.environ.get("CRUX_MCP_URL") or cfg.get("CRUX_MCP_URL") or "http://127.0.0.1:14801/mcp"
+    http_url = (os.environ.get("CRUX_HTTP_URL") or cfg.get("CRUX_HTTP_URL") or "http://127.0.0.1:14800").rstrip("/")
     jwt = cfg.get("CRUX_AGENT_TOKEN", "")  # env-file only: wrapper may repurpose the env var
     # Fall back to the env-file JWT: the crux-tokens/ file is the preferred rail,
     # but MCP has accepted the HS256 JWT since the daemon redeploy, and a missing
@@ -507,7 +518,9 @@ def main() -> None:
     mcp_token = read_mcp_token() or jwt
     card_mode = (os.environ.get("CRUX_BANNER_CARD") or cfg.get("CRUX_BANNER_CARD") or "auto").lower()
 
-    if not jwt and not mcp_token:
+    # A local daemon with auth off (the default `corecruxctl login` on
+    # loopback saves no token) is healthy without one.
+    if not jwt and not mcp_token and not (_is_loopback(mcp_url) and _is_loopback(http_url)):
         emit_degraded(f"no auth tokens ({ENV_FILE}, {MCP_TOKEN_FILE})")
         return
 

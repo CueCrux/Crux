@@ -81,8 +81,7 @@ pub fn bundled_skill_names() -> Vec<&'static str> {
 }
 
 fn skills_dir() -> Result<PathBuf, DynErr> {
-    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
-    Ok(Path::new(&home).join(".claude").join("skills"))
+    Ok(crate::paths::claude_config_dir()?.join("skills"))
 }
 
 #[cfg(unix)]

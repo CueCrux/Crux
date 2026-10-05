@@ -20,6 +20,8 @@ pub mod config;
 pub mod digest;
 pub mod drift;
 pub mod hooks_install;
+pub mod mods_install;
+pub mod paths;
 pub mod profile;
 pub mod selfcheck;
 pub mod skills_install;
@@ -43,6 +45,10 @@ pub use skills_install::{bundled_skill_names, FileState};
 /// out), where `token-conservation` rendered one body with fixed numeric
 /// output caps into both. `token-conservation` stays bundled for workspaces
 /// still on pre-Claude-5 models.
+///
+/// `workspace-cuecrux` stays bundled but is not a default: it names CueCrux's
+/// own tailnet daemon, which `init --profiles=all` would otherwise write into
+/// every user's CLAUDE.md. The CueCrux workspace enables it with `add`.
 pub const DEFAULT_PROFILES: &[&str] = &[
     "memory-practices",
     "memory-digest",
@@ -55,7 +61,6 @@ pub const DEFAULT_PROFILES: &[&str] = &[
     "pre-deploy-gate",
     "eu-ai-act",
     "audit-soc2",
-    "workspace-cuecrux",
 ];
 
 /// Output target for a profile fragment.
@@ -87,7 +92,11 @@ mod tests {
 
     #[test]
     fn default_profiles_present_and_unique() {
-        assert_eq!(DEFAULT_PROFILES.len(), 12);
+        assert_eq!(DEFAULT_PROFILES.len(), 11);
+        assert!(
+            !DEFAULT_PROFILES.contains(&"workspace-cuecrux"),
+            "workspace-cuecrux names CueCrux's private daemon and must not ship in the default set"
+        );
         let mut seen = std::collections::HashSet::new();
         for p in DEFAULT_PROFILES {
             assert!(seen.insert(*p), "duplicate default profile '{p}'");

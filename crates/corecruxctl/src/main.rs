@@ -119,9 +119,13 @@ enum Command {
         /// `corecruxctl login` is expected to work offline.
         #[arg(long, default_value_t = false)]
         strict_verify: bool,
-        /// Skip installing the Claude Code hooks (banner + observe capture).
+        /// Skip installing the Claude Code hooks and mod.
         #[arg(long, default_value_t = false)]
         no_hooks: bool,
+        /// Skip the `crux-desktop` Claude Code mod; the classic hooks then keep
+        /// the SessionStart banner and PreCompact save.
+        #[arg(long, default_value_t = false)]
+        no_mod: bool,
         /// Skip registering this machine with the daemon.
         #[arg(long, default_value_t = false)]
         no_register: bool,
@@ -149,6 +153,14 @@ enum Command {
     Hooks {
         #[command(subcommand)]
         command: HooksCommand,
+    },
+
+    /// Install, remove or inspect the `crux-desktop` Claude Code mod (session
+    /// continuity, the `/crux` pane, and the daemon's MCP registration).
+    #[command(name = "mods")]
+    Mods {
+        #[command(subcommand)]
+        command: ModsCommand,
     },
 
     /// Register this machine with the daemon, or list registered machines.
@@ -1038,6 +1050,28 @@ enum HooksCommand {
         #[arg(long)]
         project: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ModsCommand {
+    /// Install the mod into ~/.claude/mods, add it to CLAUDE_CODE_PLUGIN_DIRS,
+    /// and register the daemon as a user-scope MCP server. The endpoint and
+    /// token default to what `login` saved in ~/.config/cuecrux/env.
+    Install {
+        /// MCP server name the mod uses (default: keep the current setting, or `crux`).
+        #[arg(long)]
+        server: Option<String>,
+        /// Daemon MCP endpoint to register (default: the saved one, else loopback).
+        #[arg(long)]
+        mcp_url: Option<String>,
+        /// Don't touch ~/.claude.json.
+        #[arg(long, default_value_t = false)]
+        no_mcp: bool,
+    },
+    /// Remove the mod and its settings entries (the MCP server is kept).
+    Uninstall,
+    /// Show whether the mod is installed, current and on the plugin path.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2876,6 +2910,7 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             no_verify,
             strict_verify,
             no_hooks,
+            no_mod,
             no_register,
         } => login::run(login::LoginArgs {
             url,
@@ -2884,6 +2919,7 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             no_verify,
             strict_verify,
             no_hooks,
+            no_mod,
             no_register,
         }),
         Command::Logout { url, all } => login::run_logout(login::LogoutArgs { url, all }),
@@ -2895,6 +2931,15 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 endpoint,
             } => hooks::run_install(user, project, endpoint),
             HooksCommand::Status { user, project } => hooks::run_status(user, project),
+        },
+        Command::Mods { command } => match command {
+            ModsCommand::Install {
+                server,
+                mcp_url,
+                no_mcp,
+            } => hooks::run_mods_install(server, mcp_url, no_mcp),
+            ModsCommand::Uninstall => hooks::run_mods_uninstall(),
+            ModsCommand::Status => hooks::run_mods_status(),
         },
         Command::Machine { command } => match command {
             MachineCommand::Register { url } => machine::run_register(url),

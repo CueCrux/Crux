@@ -44,6 +44,10 @@ pub enum Command {
         /// the hooks, for the same reason: one command sets up the workspace.
         #[arg(long)]
         no_skills: bool,
+        /// Don't install the `crux-desktop` Claude Code mod. Without it the
+        /// classic hooks keep the SessionStart banner and PreCompact save.
+        #[arg(long)]
+        no_mod: bool,
     },
     /// Re-compose CLAUDE.md and AGENTS.md from the saved .crux/agent-profile.toml.
     /// Refuses to overwrite hand-edited managed sections unless --force.
@@ -95,6 +99,37 @@ pub enum Command {
         #[command(subcommand)]
         action: SkillsAction,
     },
+    /// Install, remove or inspect the `crux-desktop` Claude Code mod.
+    ///
+    /// The mod owns session continuity (context on the first prompt, a save
+    /// after every turn and before compaction) and adds the `/crux` pane. It is
+    /// loaded from `~/.claude/mods/crux-desktop` via `CLAUDE_CODE_PLUGIN_DIRS`.
+    Mods {
+        #[command(subcommand)]
+        action: ModsAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ModsAction {
+    /// Write the mod, add it to `CLAUDE_CODE_PLUGIN_DIRS`, and register the
+    /// daemon as a user-scope MCP server (unless one of that name exists).
+    Install {
+        /// MCP server name the mod uses (default: keep the current setting, or
+        /// `crux`).
+        #[arg(long)]
+        server: Option<String>,
+        /// Daemon MCP endpoint to register (default: http://127.0.0.1:14801/mcp).
+        #[arg(long)]
+        mcp_url: Option<String>,
+        /// Don't touch `~/.claude.json`.
+        #[arg(long)]
+        no_mcp: bool,
+    },
+    /// Remove the mod and its settings entries. The MCP server is kept.
+    Uninstall,
+    /// Report whether the mod is installed, current and on the plugin path.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
