@@ -71,7 +71,10 @@ class Requests(unittest.TestCase):
     def test_bad_requests_are_refused(self) -> None:
         for bad in ["not json", "[]", json.dumps({"questions": {"a": {}}}), json.dumps({"entity": "e", "questions": {}}),
                     json.dumps({**REQUEST, "token_budget": -1}), json.dumps({**REQUEST, "token_budget": True}),
-                    json.dumps({**REQUEST, "surprise": 1})]:
+                    json.dumps({**REQUEST, "surprise": 1}),
+                    # "false" is truthy: it must be refused, not coerced into storing the input.
+                    json.dumps({**REQUEST, "store_state": "false"}),
+                    json.dumps({**REQUEST, "state_layout": "v9"})]:
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 parse_request(bad)
 
@@ -150,6 +153,131 @@ class Runs(unittest.TestCase):
 
         self.assertEqual(_run("nope", ENV, fake_decide)[0], EXIT_USAGE)
         self.assertEqual(_run(REQUEST, {"CRUX_ENV_FILE": "/nonexistent"}, fake_decide)[0], EXIT_USAGE)
+        self.assertEqual(_run({**REQUEST, "state_layout": "v9"}, ENV, fake_decide)[0], EXIT_USAGE)
+
+
+class HttpError(Exception):
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
+
+
+class FakeDaemon:
+    """Answers the read-only routes `doctor` probes."""
+
+    def __init__(self, *, stream_receipts: bool = True, context_surface: bool = True, scopes_ok: bool = True,
+                 public_key: bytes = b"\x01" * 32) -> None:
+        self.stream_receipts, self.context_surface, self.scopes_ok = stream_receipts, context_surface, scopes_ok
+        self.public_key = public_key
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        if path == "/v1/version":
+            return {"version": "0.5.66", "capabilities": {
+                "stream_receipts": {"enabled": self.stream_receipts},
+                "context_surface": {"enabled": self.context_surface}}}
+        if path == "/v1/receipts/signing-keys":
+            return {"v": 1, "keys": [{"publicKeyHex": self.public_key.hex()}]}
+        if path == "/v1/context" and not self.context_surface:
+            raise HttpError(404)
+        if not self.scopes_ok:
+            raise HttpError(403)
+        return {}
+
+
+try:
+    import blake3  # noqa: F401
+    import cryptography  # noqa: F401
+
+    HAVE_VERIFY_DEPS = True
+except ImportError:
+    HAVE_VERIFY_DEPS = False
+
+
+@unittest.skipUnless(HAVE_VERIFY_DEPS, "needs the jev-verify extra (blake3, cryptography)")
+class Doctor(unittest.TestCase):
+    def _doctor(self, daemon: FakeDaemon, env: dict[str, str], pin: bool = True) -> tuple[int, dict[str, Any], str]:
+        from crux_adapters.jev_cli import run_doctor
+        from crux_adapters.jev_verify import pin_key
+
+        with tempfile.TemporaryDirectory() as tmp:
+            keyring = Path(tmp) / "keyring.json"
+            if pin:
+                pin_key(None, keyring, public_key=daemon.public_key)
+            out = io.StringIO()
+            code = run_doctor(out, {**env, "CRUX_RECEIPT_KEYRING": str(keyring)}, client_factory=lambda u, t: daemon)
+        text = out.getvalue()
+        report = json.loads(text)
+        return code, {c["name"]: c for c in report["checks"]} | {"ready": report["ready"]}, text
+
+    def test_a_complete_setup_is_ready(self) -> None:
+        code, checks, text = self._doctor(FakeDaemon(), ENV)
+        self.assertEqual(code, EXIT_OK, text)
+        self.assertTrue(checks["ready"])
+        self.assertNotIn(SECRET_TOKEN, text)
+        self.assertNotIn(SECRET_KEY, text)
+
+    def test_each_missing_daemon_flag_is_named_with_its_fix(self) -> None:
+        code, checks, _ = self._doctor(FakeDaemon(stream_receipts=False, context_surface=False), ENV)
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("CORECRUXD_STREAM_RECEIPTS=1", checks["stream_receipts"]["fix"])
+        self.assertIn("context_surface: true", checks["context_surface"]["fix"])
+        self.assertIn("404", checks["token_reads_context"]["detail"])
+
+    def test_a_token_without_scopes_points_at_the_dev_scopes_trap(self) -> None:
+        _, checks, _ = self._doctor(FakeDaemon(scopes_ok=False), ENV)
+        self.assertFalse(checks["token_reads_receipts"]["ok"])
+        self.assertIn("query:read,facts:write,sessions:write,receipts:read", checks["token_reads_receipts"]["fix"])
+
+    def test_an_unpinned_or_rotated_key_is_reported(self) -> None:
+        _, checks, _ = self._doctor(FakeDaemon(), ENV, pin=False)
+        self.assertIn("crux-jev pin-key", checks["key_pinned"]["fix"])
+        from crux_adapters.jev_cli import run_doctor
+        from crux_adapters.jev_verify import pin_key
+
+        with tempfile.TemporaryDirectory() as tmp:
+            keyring = Path(tmp) / "keyring.json"
+            pin_key(None, keyring, public_key=b"\x02" * 32)
+            out = io.StringIO()
+            run_doctor(out, {**ENV, "CRUX_RECEIPT_KEYRING": str(keyring)}, client_factory=lambda u, t: FakeDaemon())
+        rotated = {c["name"]: c for c in json.loads(out.getvalue())["checks"]}["key_pinned"]
+        self.assertFalse(rotated["ok"])
+        self.assertIn("--replace", rotated["fix"])
+
+    def test_an_unreachable_daemon_exits_1(self) -> None:
+        class Down:
+            def _request(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+                raise ConnectionError("refused")
+
+        from crux_adapters.jev_cli import run_doctor
+
+        out = io.StringIO()
+        self.assertEqual(run_doctor(out, ENV, client_factory=lambda u, t: Down()), EXIT_FAILED)
+
+
+@unittest.skipUnless(HAVE_VERIFY_DEPS, "needs the jev-verify extra (blake3, cryptography)")
+class PinAndVerifyArgs(unittest.TestCase):
+    def test_pin_key_needs_no_token(self) -> None:
+        from crux_adapters.jev_cli import run_pin_key
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"CRUX_BASE_URL": "http://d", "CRUX_ENV_FILE": "/nonexistent",
+                   "CRUX_RECEIPT_KEYRING": str(Path(tmp) / "k.json")}
+            seen: list[str] = []
+
+            def factory(url: str, token: str) -> FakeDaemon:
+                seen.append(token)
+                return FakeDaemon()
+
+            out = io.StringIO()
+            self.assertEqual(run_pin_key([], out, env, client_factory=factory), EXIT_OK, out.getvalue())
+            self.assertEqual(seen, [""])
+
+    def test_verify_options_need_values(self) -> None:
+        from crux_adapters.jev_cli import run_verify
+
+        for args in (["--tenant"], ["r_1", "--actor"], []):
+            with self.subTest(args=args):
+                self.assertEqual(run_verify(args, io.StringIO(), ENV), EXIT_USAGE)
 
 
 if __name__ == "__main__":

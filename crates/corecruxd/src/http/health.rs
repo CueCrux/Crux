@@ -647,6 +647,9 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
             "coordination": { "enabled": state.coord_enabled },
             "consolidation_scheduler": { "enabled": state.consolidation_scheduler_enabled },
             "context_surface": { "enabled": state.context_surface_enabled },
+            // Gates `model_invocation` and the other stream receipt kinds
+            // (observations.rs), which a Jev integration mints per decision.
+            "stream_receipts": { "enabled": state.stream_receipts_enabled },
             "local_ingest": { "enabled": state.local_ingest_enabled },
             "auto_capture": { "enabled": state.auto_capture_enabled },
             "status_feed": { "enabled": crate::status_feed::status_feed_enabled() },

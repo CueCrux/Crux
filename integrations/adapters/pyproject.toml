@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "cuecrux-adapters"
 version = "0.1.0"
-description = "Framework adapters for the Crux Daemon context surface (LangChain, LlamaIndex, CrewAI)"
+description = "Framework adapters for the Crux Daemon context surface (LangChain, LlamaIndex, CrewAI) and Jev decision receipts"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"

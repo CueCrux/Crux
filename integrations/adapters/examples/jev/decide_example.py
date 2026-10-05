@@ -79,10 +79,15 @@ def main() -> int:
     token_file = os.environ.get("CRUX_TOKEN_FILE")
     token = Path(token_file).expanduser().read_text().strip() if token_file else None
 
-    if KEY_FILE.exists():
-        jev = jev_http(api_key=KEY_FILE.read_text())
-    elif os.environ.get("TYPESAFE_API_KEY"):
+    # Same order as `crux-jev`: the environment, then JEV_CREDENTIAL_FILE,
+    # then ~/.config/typesafe/api_key.
+    credential_file = os.environ.get("JEV_CREDENTIAL_FILE")
+    if os.environ.get("TYPESAFE_API_KEY", "").strip():
         jev = jev_http()
+    elif credential_file:
+        jev = jev_http(api_key=Path(credential_file).expanduser().read_text().strip())
+    elif KEY_FILE.exists():
+        jev = jev_http(api_key=KEY_FILE.read_text().strip())
     else:
         jev = None
 

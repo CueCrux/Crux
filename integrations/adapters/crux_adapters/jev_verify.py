@@ -9,18 +9,29 @@ receipt, and needs ``receipts:read``. This module checks a receipt the way an
 auditor would, with only the daemon's public key, pinned beforehand:
 
 1. **Exactly one signed body** claims the receipt id in
-   ``GET /v1/observations/aggregate?kind=model_invocation`` (the daemon does
-   not yet refuse a reused id, and anyone with ``sessions:write`` can list
-   look-alike records, so zero or several distinct bodies fail).
+   ``GET /v1/observations/aggregate?kind=model_invocation``. Current daemons
+   refuse a reused id (409) and refuse receipt kinds on the generic
+   observation route, so a second body means an older daemon or a tampered
+   store; zero or several distinct bodies fail either way.
 2. **Ed25519 over the body bytes** verifies with a key from the pinned keyring,
    and that key's id is ``p_`` + the first 32 hex of BLAKE3(public key), the
    same derivation the daemon uses.
-3. **The decoded body binds** the receipt id, ``kind: model_invocation`` and
-   the body schema.
-4. **The decision fact agrees** (when it can be found under ``jev:<entity>``):
-   its ``output_hash`` recomputes from its answers and equals the signed one,
-   its ``prompt_hash`` and ``retrieval_set_hash`` equal the signed ones, and
-   its request id equals the signed ``provider_request_id``.
+3. **The decoded body binds** the receipt id, ``kind: model_invocation``, the
+   body schema, and the tenant (``local`` unless told otherwise: every stream
+   receipt a daemon mints is). With ``actor`` it must also name that
+   ``actor_passport``, the minting caller.
+4. **The decision facts agree** (when ``jev:<entity>`` has any naming the
+   receipt; every one that does is checked, so a later edit cannot hide behind
+   an earlier good version): each one's ``output_hash`` recomputes from its
+   answers and equals the signed one, its ``prompt_hash`` and
+   ``retrieval_set_hash`` equal the signed ones, and its request id equals the
+   signed ``provider_request_id``.
+
+What a verified receipt does not prove: *when* the decision was made. The
+body's ``created_at`` / ``started_at`` / ``completed_at`` are supplied by the
+minting caller, so they are signed but not daemon-attested. The online
+``/v1/receipts/{id}/verification`` binds time through the observation chain;
+this offline check does not.
 
 The keyring file uses ``corecruxctl``'s Ed25519 keyring v1 format
 (``{"v": 1, "keys": [{"keyId": ..., "pubKeyBase64": ...}]}``), so the same
@@ -102,8 +113,10 @@ def _advertised_key(client: Any) -> bytes:
     try:
         doc = client._request("GET", "/v1/receipts/signing-keys")
         for entry in doc.get("keys") or []:
-            if entry.get("public_key_hex"):
-                return bytes.fromhex(entry["public_key_hex"])
+            # The daemon publishes the keyring v1 shape: `publicKeyHex` and
+            # `pubKeyBase64` carry the same key.
+            if entry.get("publicKeyHex"):
+                return bytes.fromhex(entry["publicKeyHex"])
             if entry.get("pubKeyBase64"):
                 return base64.b64decode(entry["pubKeyBase64"], validate=True)
     except Exception:  # older daemon: route absent
@@ -154,7 +167,11 @@ def pin_key(client: Any, path: Path, *, replace: bool = False, public_key: bytes
             )
         existing = []  # replace: the old key is dropped, not kept alongside
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"v": 1, "keys": existing + [entry]}, indent=2) + "\n")
+    # Write beside, then rename: a crash mid-write must not leave a truncated
+    # keyring that every later verify fails to load.
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"v": 1, "keys": existing + [entry]}, indent=2) + "\n")
+    os.replace(tmp, path)
     return {"key_id": key_id, "keyring": str(path), "changed": True}
 
 
@@ -200,28 +217,41 @@ class ReceiptCheck:
             "model_version": signed.get("model_version"),
             "provider": signed.get("provider"),
             "provider_request_id": signed.get("provider_request_id"),
+            "tenant_id": signed.get("tenant_id"),
+            "actor_passport": signed.get("actor_passport"),
+            # Caller-supplied, so signed but not daemon-attested.
             "created_at": signed.get("created_at"),
         }
 
 
 def _check_fact(check: ReceiptCheck, body: dict[str, Any], facts: Iterable[Any]) -> None:
-    fact = next((f for f in facts if getattr(f, "source_receipt", None) == check.receipt_id), None)
-    if fact is None or fact.value is None:
+    """Check every fact naming the receipt; any one that disagrees fails it."""
+    claiming = [f for f in facts if getattr(f, "source_receipt", None) == check.receipt_id]
+    if not claiming or any(f.value is None for f in claiming):
         check.checks["fact_found"] = False
         return
     check.checks["fact_found"] = True
-    record = json.loads(fact.value)
-    check.checks["fact_output_hash_recomputes"] = (
-        digest({"model": record.get("model_version"), "answers": record.get("answers")}) == body.get("output_hash")
-    )
-    check.checks["fact_hashes_match_signed"] = all(
-        record.get(k) == body.get(k) for k in ("output_hash", "prompt_hash", "retrieval_set_hash")
-    )
-    ref = record.get("request_id") or record.get("invocation_id")
     signed_ref = body.get("provider_request_id") or body.get("invocation_id")
-    check.checks["fact_request_id_matches_signed"] = ref == signed_ref and fact.key == f"decision:{ref}"
-    if "retrieved" in record:
-        check.checks["fact_retrieval_recomputes"] = digest(record["retrieved"]) == body.get("retrieval_set_hash")
+    results: dict[str, bool] = {}
+
+    def record_check(name: str, ok: bool) -> None:
+        results[name] = results.get(name, True) and ok
+
+    for fact in claiming:
+        record = json.loads(fact.value)
+        record_check(
+            "fact_output_hash_recomputes",
+            digest({"model": record.get("model_version"), "answers": record.get("answers")}) == body.get("output_hash"),
+        )
+        record_check(
+            "fact_hashes_match_signed",
+            all(record.get(k) == body.get(k) for k in ("output_hash", "prompt_hash", "retrieval_set_hash")),
+        )
+        ref = record.get("request_id") or record.get("invocation_id")
+        record_check("fact_request_id_matches_signed", ref == signed_ref and fact.key == f"decision:{ref}")
+        if "retrieved" in record:
+            record_check("fact_retrieval_recomputes", digest(record["retrieved"]) == body.get("retrieval_set_hash"))
+    check.checks.update(results)
 
 
 def verify_receipts(
@@ -231,6 +261,8 @@ def verify_receipts(
     *,
     entity: str | None = None,
     facts_for: Callable[[str], list[Any]] | None = None,
+    tenant: str = "local",
+    actor: str | None = None,
 ) -> list[ReceiptCheck]:
     """Check each receipt as described in the module docstring."""
     payloads = _receipt_records(client, set(receipt_ids))
@@ -268,6 +300,9 @@ def verify_receipts(
             check.checks["body_binds_receipt_id"] = body.get("receipt_id") == rid
             check.checks["body_kind_model_invocation"] = body.get("kind") == "model_invocation"
             check.checks["body_schema"] = body.get("schema") == BODY_SCHEMA
+            check.checks["body_binds_tenant"] = body.get("tenant_id") == tenant
+            if actor is not None:
+                check.checks["body_actor_matches"] = body.get("actor_passport") == actor
             if entity:
                 _check_fact(check, body, facts)
         except (KeyError, ValueError, TypeError) as err:
