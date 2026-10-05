@@ -122,9 +122,11 @@ register_passport() {
 }
 
 # Public verification key for offline checks. Derived here by the key
-# custodian from the daemon's local seed (piped, never printed): the HTTP
-# surface only exposes it on /v1/admin/version (admin:read). Receipts carry
-# key_id = "p_" + blake3(pubkey)[..16], so a verifier can bind this key.
+# custodian from the daemon's local seed (piped, never printed), which is the
+# out-of-band copy a verifier should pin; the daemon also publishes it at
+# GET /v1/receipts/signing-keys, but a key fetched from the signer is
+# discovery, not trust. Receipts carry key_id = "p_" + blake3(pubkey)[..16],
+# so a verifier can bind this key.
 export_pubkey() {
   { printf '302e020100300506032b657004220420'; tr -d '\n ' < "$FIX/data/passport.key"; } \
     | xxd -r -p | openssl pkey -inform DER -pubout -out "$FIX/daemon.pub.pem"
