@@ -11,8 +11,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`corecruxctl receipts verify-stream-receipt`** verifies a daemon stream
+  receipt (`model_invocation`, `context_injected`, `stream_completed`,
+  `stream_aborted`) offline from its observation record against a pinned
+  public keyring, checking the daemon's own signature over the canonical body.
+  It rejects other receipt classes signed by the same key (e.g. `usage_ping`)
+  on the signed `kind`, takes optional `--expect-receipt-id` / `--kind`
+  checks, and on success prints only fields decoded from the signed body —
+  the record's `payload.output_hash` and similar copies are unsigned.
+  Library entry point: `corecrux_receipts::verify_stream_receipt_payload_v1`.
+- **`GET /v1/receipts/signing-keys`** serves the daemon's receipt-signing
+  public key, unauthenticated, as an `Ed25519KeyRingV1` that
+  `verify-stream-receipt --keyring` reads unchanged (`keyId` is the passport
+  fingerprint receipts carry; also `publicKeyHex`, `alg`, `use`). Verifiers no
+  longer need `admin:read` on `/v1/admin/version`. Key discovery, not trust:
+  pin the key at enrolment.
+- `GET /v1/observations/aggregate` takes `chains=returned|all|none`.
+- Session metrics `vaultcrux_session_capability_graph_edges{origin,tier}` and
+  `vaultcrux_session_excluded_count{origin,reason}` for issued session plans.
+  (#813)
+
+### Changed
+
+- **Passport-bound callers see and verify their own stream receipts.** With
+  `CORECRUXD_AGENT_PASSPORTS=1` an agent token is confined to its own tenant,
+  while the stream receipts it mints are signed under `local` and logged in
+  unscoped `mediation::<group>` sessions. `GET /v1/observations/aggregate`
+  now lists a daemon-signed receipt kind to the passport that minted it
+  (record `principal`), and `GET /v1/receipts/{id}/verification` lets a
+  `receipts:read` caller verify a stream receipt whose signed `actor_passport`
+  is its own passport, whatever `tenant_id` it asks under. Other kinds keep
+  session scoping; every other caller gets the same answer as for a missing
+  receipt.
+- **Agent tokens can verify receipts.** The default
+  `CORECRUXD_AGENT_TOKEN_HTTP_SCOPES` set gains `receipts:read`, so a token
+  that can mint a receipt (`sessions:write`) can also call
+  `GET /v1/receipts/{id}/verification`.
+- **Aggregate `chains` is bounded.** `GET /v1/observations/aggregate` now
+  reports chain status only for the sessions behind the returned records
+  (it covered every session log: ~7.3 MB and ~31 s for a 10-record answer on
+  a busy node). `?chains=all` restores the full map.
+- **Pro claim placements are derived from named implementation sites.** A
+  claim now earns `daemon` or `hosted_control_plane` only by naming where it
+  is implemented. **Behaviour change in `/v1/version`:** a claim with no site
+  reports `unimplemented` (previously `contracted_external`), and
+  `sync:managed_backup`, `audit:central_retention` and `control_plane:hosted`
+  no longer report as `hosted_control_plane`. (#811)
+
+### Fixed
+
+- **`context_custody_audit` no longer reports a false all-green.** REMEMBER is
+  scored for the calling agent's passport (missing, revoked, or category-less →
+  `partial`); PROVE is `strong` only once `CRUX_EXPORT_VERIFY_PUBLIC_KEY_HEX`
+  pins the export signer; `standing_gap` names what remains. Expect PROVE to
+  read `partial` on nodes without a pinned signer. (#807)
+- **MCP `get_bootstrap` honours `token_budget`.** The schema lacked it and the
+  handler passed none, so a cold-start call with `token_budget=500` could
+  return up to 100 full bootstrap facts. (#810)
+- **Concurrent observe step opens no longer share a `seq`.** The seq was minted
+  under a read lock and stored under a later write lock, so two racing opens
+  could both take `max + 1` and drop a step from the audit chain. (#814)
+
 ### Security
 
+- **Stream receipt ids are unique.** `POST /v1/mediation/receipts` refuses a
+  stream-receipt draft whose `receipt_id` is already used (409
+  `RECEIPT_ID_CONFLICT`), and `/v1/receipts/{id}/verification` answers 409
+  `RECEIPT_ID_AMBIGUOUS` instead of the first match when a log holds more
+  than one body for an id, so a later mint cannot shadow an earlier receipt.
+- **Receipt kinds are reserved.** `POST /v1/sessions/{sid}/observations`
+  (and the batch route) refuse `model_invocation`, `context_injected`,
+  `stream_completed`, `stream_aborted` and `usage_ping` with 422
+  `RESERVED_OBSERVATION_KIND`; only the signing path writes them, so
+  `/v1/observations/aggregate?kind=model_invocation` no longer lists unsigned
+  imitations.
 - **Promotion confirm refuses records for another tenant.**
   `POST /v1/sync/tenants/{tenantId}/promotions/confirm` authorized only the path
   tenant, then applied the caller-supplied records as sent, so a caller allowed
@@ -36,35 +110,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caller's own passport (403 otherwise); an admin acts for another passport
   through the existing passport-header override. **Behaviour change:** an
   unbound announce naming a passport the caller doesn't hold is refused. (#812)
-
-### Fixed
-
-- **`context_custody_audit` no longer reports a false all-green.** REMEMBER is
-  scored for the calling agent's passport (missing, revoked, or category-less →
-  `partial`); PROVE is `strong` only once `CRUX_EXPORT_VERIFY_PUBLIC_KEY_HEX`
-  pins the export signer; `standing_gap` names what remains. Expect PROVE to
-  read `partial` on nodes without a pinned signer. (#807)
-- **MCP `get_bootstrap` honours `token_budget`.** The schema lacked it and the
-  handler passed none, so a cold-start call with `token_budget=500` could
-  return up to 100 full bootstrap facts. (#810)
-- **Concurrent observe step opens no longer share a `seq`.** The seq was minted
-  under a read lock and stored under a later write lock, so two racing opens
-  could both take `max + 1` and drop a step from the audit chain. (#814)
-
-### Changed
-
-- **Pro claim placements are derived from named implementation sites.** A
-  claim now earns `daemon` or `hosted_control_plane` only by naming where it
-  is implemented. **Behaviour change in `/v1/version`:** a claim with no site
-  reports `unimplemented` (previously `contracted_external`), and
-  `sync:managed_backup`, `audit:central_retention` and `control_plane:hosted`
-  no longer report as `hosted_control_plane`. (#811)
-
-### Added
-
-- Session metrics `vaultcrux_session_capability_graph_edges{origin,tier}` and
-  `vaultcrux_session_excluded_count{origin,reason}` for issued session plans.
-  (#813)
 
 ## [0.5.65] - 2026-09-22
 

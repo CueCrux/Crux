@@ -15,8 +15,8 @@
 //! * The four questions — **SEE / DO / REMEMBER / CHECK**.
 //! * The exit test — **EXPORT / INSPECT / REVOKE / ROUTE / KEEP-LOCAL / PROVE**.
 //!
-//! It is a pure read: it reads runtime flags and [`McpContext`] capability
-//! presence, never mutates. Crucially it reports the *runtime* state (a
+//! It is a pure read: it reads runtime flags, [`McpContext`] capability
+//! presence and the caller's passport standing, never mutates. Crucially it reports the *runtime* state (a
 //! capability that exists in code but is flag-gated OFF is `partial`, not
 //! `strong`) so the scorecard cannot overclaim — including Crux's own honest
 //! gap (PROVE: witness proofs exist but no dedicated end-to-end custody-proof
@@ -26,10 +26,13 @@
 //! the additive/flag-gated norm for new surfaces (cf. `audit_export_bundle`,
 //! passport-revocation, agent-card).
 
+use corecrux_receipts::{export_identity_posture_v1, ExportIdentityPostureV1, EXPORT_VERIFY_PUBLIC_KEY_ENV};
 use serde_json::{json, Value};
 
+use crate::category_enforce::passport_category_for;
 use crate::dispatch::{McpContext, SERVER_VERSION};
 use crate::protocol::JsonRpcError;
+use crate::tools::passport::get_agent_passport;
 
 /// Feature flag (default OFF). When unset, the tool returns a short disabled
 /// notice rather than running — so shipping the binary doesn't expose the
@@ -73,8 +76,8 @@ pub const CONTEXT_CUSTODY_AUDIT_DESCRIPTION: &str =
     "Score THIS Crux instance against the context-custody exit test: the four \
      questions (SEE / DO / REMEMBER / CHECK) and the exit test (EXPORT / INSPECT \
      / REVOKE / ROUTE / KEEP-LOCAL / PROVE). Pure read. Each verdict reports the \
-     RUNTIME state (a flag-gated-OFF capability is `partial`, not `strong`) and \
-     cites the backing capability, so the scorecard never overclaims. Returns a \
+     RUNTIME state (a flag-gated-OFF capability is `partial`, not `strong`) for \
+     the calling agent's passport, and cites the backing capability, so the scorecard never overclaims. Returns a \
      lock-in risk (1 trivial-to-leave .. 5 hostage) and a trust posture. Gated \
      behind CRUX_CONTEXT_CUSTODY_AUDIT.";
 
@@ -97,11 +100,68 @@ pub struct CustodyInputs {
     pub sync_remote_configured: bool,
     /// Local fact count — context surface size.
     pub fact_count: usize,
+    /// D1: the calling agent's passport standing — REMEMBER is scored for the
+    /// caller, not for the daemon.
+    pub caller_passport: CallerPassport,
+    /// D1: whether an export from this node can be traced to a pinned signer
+    /// (the D2 contract) — PROVE is only `strong` when it can.
+    pub export_identity: ExportIdentityPostureV1,
+}
+
+/// The calling agent's passport standing, judged the way `store_fact` judges it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallerPassport {
+    /// A live passport that can write.
+    Usable,
+    /// Anonymous caller, or no passport issued.
+    Missing,
+    /// The passport has been revoked.
+    Revoked,
+    /// Agent passports are enforced and no category resolves for this caller,
+    /// so `store_fact` refuses every write.
+    NoCategory,
+}
+
+impl CallerPassport {
+    /// Resolve the caller's standing from the fact store.
+    pub async fn resolve(ctx: &McpContext) -> Self {
+        let Some(scope_id) = ctx.scope_identity() else {
+            return Self::Missing;
+        };
+        let record = get_agent_passport(ctx).await;
+        if record.as_ref().is_some_and(|p| p.revoked_at.is_some()) {
+            return Self::Revoked;
+        }
+        if ctx.agent_passports_enabled {
+            // The same category lookup store_fact's write enforcement runs.
+            let store = ctx.fact_store.read().await;
+            return if passport_category_for(&store, &scope_id).is_some() {
+                Self::Usable
+            } else {
+                Self::NoCategory
+            };
+        }
+        if record.is_some() {
+            Self::Usable
+        } else {
+            Self::Missing
+        }
+    }
+
+    /// Why the caller cannot use its passport, or `None` when it can.
+    fn gap(self) -> Option<&'static str> {
+        match self {
+            Self::Usable => None,
+            Self::Missing => Some("this caller has no passport"),
+            Self::Revoked => Some("this caller's passport is revoked"),
+            Self::NoCategory => Some("this caller's passport carries no category, so store_fact refuses its writes"),
+        }
+    }
 }
 
 impl CustodyInputs {
     /// Gather inputs from process env + the request context.
-    pub fn gather(ctx: &McpContext, fact_count: usize) -> Self {
+    pub fn gather(ctx: &McpContext, fact_count: usize, caller_passport: CallerPassport) -> Self {
         Self {
             // Prefer the threaded runtime value over re-reading env, so a
             // test that sets it via `with_revocation_enforced` is honoured.
@@ -114,6 +174,8 @@ impl CustodyInputs {
             router_present: ctx.rcx_router.is_some(),
             sync_remote_configured: env_set_nonempty("CORECRUXD_SYNC_REMOTE_URL"),
             fact_count,
+            caller_passport,
+            export_identity: export_identity_posture_v1(),
         }
     }
 }
@@ -146,13 +208,17 @@ pub fn build_scorecard(inputs: &CustodyInputs) -> Value {
         "strong",
         "every state mutation emits a CROWN receipt (corecrux-receipts); high-risk actions pre-checked via enrich_action".to_string(),
     );
+    // REMEMBER answers for the caller: a daemon that can remember is no use to
+    // an agent whose own passport cannot write.
+    let caller_gap = inputs.caller_passport.gap();
     let remember = axis(
         "REMEMBER",
         "What does it accumulate, and where does that memory live?",
-        "strong",
+        if caller_gap.is_none() { "strong" } else { "partial" },
         format!(
-            "store_fact / query_facts over {} local fact(s); freshness horizon_class + supersedes keep recall honest; private facts scoped to the agent (fact_store.rs)",
-            inputs.fact_count
+            "store_fact / query_facts over {} local fact(s); freshness horizon_class + supersedes keep recall honest; private facts scoped to the agent (fact_store.rs); caller passport: {}",
+            inputs.fact_count,
+            caller_gap.unwrap_or("usable")
         ),
     );
     let check_verdict = if inputs.receipt_verify_enabled {
@@ -230,17 +296,18 @@ pub fn build_scorecard(inputs: &CustodyInputs) -> Value {
             }
         ),
     );
-    // PROVE: a first-class signed custody-proof export now ships
-    // (`corecruxctl context-export` → passport-signed manifest binding both
-    // component hashes + an embedded offline audit-verify report;
-    // `corecruxctl context-verify` re-checks it offline). receipt_verify
-    // additionally re-verifies individual receipts when enabled.
+    // PROVE: a signed custody-proof export ships (`corecruxctl context export`
+    // → `context verify`), but until an expected export signer is pinned every
+    // export verifies against the key embedded in it — internal consistency,
+    // not proof of origin — so PROVE is only strong when pinned.
+    let export_pinned = inputs.export_identity.is_pinned();
     let prove = axis(
         "PROVE",
         "Can I produce evidence of what it saw and did?",
-        "strong",
+        if export_pinned { "strong" } else { "partial" },
         format!(
-            "corecruxctl context export emits a passport-signed custody proof (manifest binds cruxpack + audit-bundle hashes + an offline audit-verify report); context verify re-checks it offline. receipt_verify (per-receipt) is {}. Transparency-log witness inclusion stays optional.",
+            "corecruxctl context export emits a passport-signed custody proof (manifest binds cruxpack + audit-bundle hashes + an offline audit-verify report); context verify re-checks it offline. Export signer: {} ({EXPORT_VERIFY_PUBLIC_KEY_ENV}). receipt_verify (per-receipt) is {}. Transparency-log witness inclusion stays optional.",
+            inputs.export_identity.label(),
             on_off(inputs.receipt_verify_enabled)
         ),
     );
@@ -280,6 +347,22 @@ pub fn build_scorecard(inputs: &CustodyInputs) -> Value {
         trust_recommendations.push("set CRUX_AGENT_CARD=1 for agent-card discovery".to_string());
     }
 
+    let mut gaps: Vec<String> = Vec::new();
+    if let Some(gap) = caller_gap {
+        gaps.push(gap.to_string());
+    }
+    if !export_pinned {
+        gaps.push(format!(
+            "export signer {} — set {EXPORT_VERIFY_PUBLIC_KEY_ENV} to pin it",
+            inputs.export_identity.label()
+        ));
+    }
+    let standing_gap = if gaps.is_empty() {
+        "none — signed custody-proof export with a pinned signer (corecruxctl context export -> context verify); transparency-log witness inclusion remains optional".to_string()
+    } else {
+        gaps.join("; ")
+    };
+
     json!({
         "daemon_version": SERVER_VERSION,
         "four_questions": [see, do_, remember, check],
@@ -288,10 +371,10 @@ pub fn build_scorecard(inputs: &CustodyInputs) -> Value {
         "lock_in_label": lock_in_label,
         "trust_posture": {
             "recommendations": trust_recommendations,
-            "standing_gap": "none — first-class signed custody-proof export shipped (corecruxctl context export -> context verify); transparency-log witness inclusion remains optional"
+            "standing_gap": standing_gap
         },
         "thesis": "A substrate you can leave is the product: useful (strong on the four questions) AND low lock-in (you keep custody, can export, and route to any model).",
-        "note": "Verdicts reflect this process's RUNTIME flags, not just what exists in code. A flag-gated-OFF capability is reported `partial`."
+        "note": "Verdicts reflect this process's RUNTIME flags, not just what exists in code. A flag-gated-OFF capability is reported `partial`. REMEMBER is scored for the calling agent's passport; PROVE for whether the export signer is pinned."
     })
 }
 
@@ -307,7 +390,8 @@ pub async fn handle_context_custody_audit(_args: &Value, ctx: &McpContext) -> Re
     }
 
     let fact_count = ctx.fact_store.read().await.count();
-    let inputs = CustodyInputs::gather(ctx, fact_count);
+    let caller_passport = CallerPassport::resolve(ctx).await;
+    let inputs = CustodyInputs::gather(ctx, fact_count, caller_passport);
     let scorecard = build_scorecard(&inputs);
     let text = serde_json::to_string_pretty(&scorecard).unwrap_or_default();
     Ok(json!({ "content": [{ "type": "text", "text": text }] }))
@@ -317,6 +401,9 @@ pub async fn handle_context_custody_audit(_args: &Value, ctx: &McpContext) -> Re
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::agent::AgentIdentity;
+    use crate::tools::passport::{handle_issue_passport, handle_revoke_passport};
+    use corecrux_memory::fact_store::StoreFact;
 
     fn inputs(strong: bool) -> CustodyInputs {
         CustodyInputs {
@@ -327,7 +414,24 @@ mod tests {
             router_present: strong,
             sync_remote_configured: false,
             fact_count: 42,
+            caller_passport: if strong {
+                CallerPassport::Usable
+            } else {
+                CallerPassport::Missing
+            },
+            export_identity: if strong {
+                ExportIdentityPostureV1::Pinned
+            } else {
+                ExportIdentityPostureV1::Unpinned
+            },
         }
+    }
+
+    fn with_agent(ctx: &McpContext, name: &str) -> McpContext {
+        ctx.with_agent(AgentIdentity {
+            name: name.to_string(),
+            token_hash: [0u8; 32],
+        })
     }
 
     fn find<'a>(card: &'a Value, group: &str, id: &str) -> &'a Value {
@@ -354,6 +458,87 @@ mod tests {
         // Trivial to leave.
         assert_eq!(card["lock_in_risk"], 1);
         assert_eq!(card["lock_in_label"], "trivial to leave");
+        // Usable caller passport + pinned export signer: no standing gap.
+        let gap = card["trust_posture"]["standing_gap"].as_str().unwrap();
+        assert!(gap.starts_with("none"), "{gap}");
+    }
+
+    /// D1: a caller that cannot write must not be told REMEMBER is strong, and
+    /// the standing gap must say why instead of claiming "none".
+    #[test]
+    fn caller_without_a_usable_passport_is_not_strong_on_remember() {
+        for caller in [
+            CallerPassport::Missing,
+            CallerPassport::Revoked,
+            CallerPassport::NoCategory,
+        ] {
+            let card = build_scorecard(&CustodyInputs {
+                caller_passport: caller,
+                ..inputs(true)
+            });
+            let remember = find(&card, "four_questions", "REMEMBER");
+            assert_eq!(remember["verdict"], "partial", "{caller:?}");
+            let reason = caller.gap().unwrap();
+            assert!(remember["evidence"].as_str().unwrap().contains(reason), "{caller:?}");
+            let gap = card["trust_posture"]["standing_gap"].as_str().unwrap();
+            assert!(!gap.starts_with("none"), "{caller:?}: {gap}");
+            assert!(gap.contains(reason), "{caller:?}: {gap}");
+            // The export half of the posture is still pinned, so PROVE holds.
+            assert_eq!(find(&card, "exit_test", "PROVE")["verdict"], "strong");
+        }
+    }
+
+    /// D1 (D2 contract): while no export signer is pinned, every export this
+    /// node produces verifies on its own embedded key, so PROVE is not strong.
+    #[test]
+    fn unpinned_export_signer_downgrades_prove_and_names_the_gap() {
+        let card = build_scorecard(&CustodyInputs {
+            export_identity: ExportIdentityPostureV1::Unpinned,
+            ..inputs(true)
+        });
+        let prove = find(&card, "exit_test", "PROVE");
+        assert_eq!(prove["verdict"], "partial");
+        assert!(prove["evidence"].as_str().unwrap().contains("UNPINNED"));
+        let gap = card["trust_posture"]["standing_gap"].as_str().unwrap();
+        assert!(!gap.starts_with("none"), "{gap}");
+        assert!(gap.contains(EXPORT_VERIFY_PUBLIC_KEY_ENV), "{gap}");
+        // The caller half is usable, so REMEMBER holds.
+        assert_eq!(find(&card, "four_questions", "REMEMBER")["verdict"], "strong");
+    }
+
+    #[tokio::test]
+    async fn caller_passport_tracks_issue_and_revoke() {
+        let ctx = McpContext::new_default("test-node");
+        assert_eq!(CallerPassport::resolve(&ctx).await, CallerPassport::Missing);
+        let alice = with_agent(&ctx, "alice");
+        assert_eq!(CallerPassport::resolve(&alice).await, CallerPassport::Missing);
+        handle_issue_passport(&json!({}), &alice).await.unwrap();
+        assert_eq!(CallerPassport::resolve(&alice).await, CallerPassport::Usable);
+        handle_revoke_passport(&json!({}), &alice).await.unwrap();
+        assert_eq!(CallerPassport::resolve(&alice).await, CallerPassport::Revoked);
+    }
+
+    #[tokio::test]
+    async fn caller_passport_needs_a_category_when_passports_are_enforced() {
+        let ctx = McpContext::new_default("test-node")
+            .with_agent_passports(true, crate::agent_passport::AgentPassportMap::builtin_default());
+        let alice = with_agent(&ctx, "alice");
+        // An unmapped agent's passport records no tenant group, hence no category.
+        handle_issue_passport(&json!({}), &alice).await.unwrap();
+        assert_eq!(CallerPassport::resolve(&alice).await, CallerPassport::NoCategory);
+
+        ctx.fact_store.write().await.store(StoreFact {
+            tenant_hash: "default".to_string(),
+            entity: "__passport__::alice".to_string(),
+            key: "record".to_string(),
+            value: json!({"id": "alice", "category": "work"}).to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: None,
+        });
+        assert_eq!(CallerPassport::resolve(&alice).await, CallerPassport::Usable);
     }
 
     #[test]
