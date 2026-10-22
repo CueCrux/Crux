@@ -144,6 +144,26 @@ commented at its site.
     a path outside the repo is not checkable by a reader.
 12. **`.ccxst` (navtree) is not ported at all** — 0% deployed, excluded by the ExecPlan.
 
+### Rust 1.99 lint adaptations
+
+The CE toolchain moved to Rust 1.99.1, whose clippy raises lints upstream's code (built
+on an older toolchain) does not meet. Each rewrite is behaviour-preserving; a re-port
+that restores the upstream form fails `cargo clippy -- -D warnings`.
+
+13. **`ccxe.rs` — two `Result::map(..).unwrap_or(..)` calls on `parse_v2_metadata`**
+    (`verify_footer_hashes`' turbo-params read and `CcxeReader::parse`) become
+    `.ok().and_then(..)` and `.map_or(..)` (`clippy::map_unwrap_or`). A metadata parse
+    error still yields `None` / `(None, None, None)`.
+14. **`ccxse.rs` — `decode_vec` iterates `slab.as_chunks::<N>().0`** instead of
+    `slab.chunks_exact(N)` (`clippy::chunks_exact_to_as_chunks`), reading each chunk with
+    `from_le_bytes(*chunk)` rather than indexing its bytes. Both forms drop a trailing
+    partial chunk, so a short slab decodes identically.
+15. **`turboquant.rs` — `nearest_code` carries `#[allow(clippy::manual_midpoint)]`** on
+    `0.5 * (levels[mid] + levels[mid + 1])`. The arithmetic is upstream's, unchanged.
+    The lint's suggested `f32::midpoint` rounds once via f64 and can move a decision
+    boundary by one ulp, which would re-quantise values already encoded on disk. Keep
+    the allow; do not take the suggestion.
+
 ## Drift
 
 These are copies, not a path dependency — the two repos are separate cargo workspaces

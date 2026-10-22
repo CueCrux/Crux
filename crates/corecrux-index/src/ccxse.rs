@@ -153,6 +153,8 @@ impl<'a> EmbeddingSlice<'a> {
     }
 }
 
+// CE divergence (VENDORED_FROM.md #14): `as_chunks::<N>()` replaces upstream's
+// `chunks_exact(N)` for clippy 1.99; both drop a trailing partial chunk.
 fn decode_vec(slab: &[u8], dim: usize, dtype: CcxseDtype) -> Vec<f32> {
     let mut out = Vec::with_capacity(dim);
     match dtype {
