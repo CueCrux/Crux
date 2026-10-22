@@ -391,8 +391,7 @@ pub fn routes(enabled: bool) -> Router {
 /// `admin:write`-gated server-side.
 async fn serve_activate() -> impl IntoResponse {
     let enabled = std::env::var("CORECRUXD_DEVICE_GRANT_ENABLED")
-        .ok()
-        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"));
+        .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"));
     if !enabled {
         return (
             axum::http::StatusCode::NOT_FOUND,

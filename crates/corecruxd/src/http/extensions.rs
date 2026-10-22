@@ -43,8 +43,7 @@ fn now_unix_ms() -> u64 {
 
 fn allow_unsigned_dev() -> bool {
     std::env::var(ALLOW_UNSIGNED_ENV)
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
 fn extract_passport_id(headers: &HeaderMap) -> Option<String> {

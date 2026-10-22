@@ -192,13 +192,7 @@ pub fn submit_usage_ping(
             "no collector endpoint (CORECRUXD_USAGE_RECEIPTS_ENDPOINT unset)",
         ));
     };
-    if cfg
-        .consent_at
-        .as_deref()
-        .map(str::trim)
-        .filter(|c| !c.is_empty())
-        .is_none()
-    {
+    if cfg.consent_at.as_deref().is_none_or(|c| c.trim().is_empty()) {
         return Ok(UsageSubmitOutcome::Skipped(
             "no recorded consent (CORECRUXD_USAGE_RECEIPTS_CONSENT_AT unset)",
         ));

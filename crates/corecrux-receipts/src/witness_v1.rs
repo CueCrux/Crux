@@ -502,7 +502,7 @@ pub fn verify_rfc6962_inclusion_proof_v1(
         }
         if fn_index % 2 == 1 || fn_index == sn {
             computed = rfc6962_node_hash(&sibling_hash, &computed);
-            while fn_index != 0 && fn_index % 2 == 0 {
+            while fn_index != 0 && fn_index.is_multiple_of(2) {
                 fn_index >>= 1;
                 sn >>= 1;
             }
@@ -1194,7 +1194,7 @@ fn parse_digest_hex(s: &str, expected_len: usize) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(expected_len);
-    for chunk in raw.as_bytes().chunks_exact(2) {
+    for chunk in raw.as_bytes().as_chunks::<2>().0 {
         let hi = hex_val(chunk[0])?;
         let lo = hex_val(chunk[1])?;
         out.push((hi << 4) | lo);
@@ -1256,7 +1256,7 @@ fn parse_sha256_hex(s: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut out = [0u8; 32];
-    for (i, chunk) in raw.as_bytes().chunks_exact(2).enumerate() {
+    for (i, chunk) in raw.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let hi = hex_val(chunk[0])?;
         let lo = hex_val(chunk[1])?;
         out[i] = (hi << 4) | lo;

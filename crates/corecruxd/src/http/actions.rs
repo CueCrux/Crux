@@ -74,9 +74,7 @@ pub(super) async fn post_action_enrich(
         if body
             .tenant_id
             .as_deref()
-            .map(str::trim)
-            .filter(|tenant_id| !tenant_id.is_empty())
-            .is_none()
+            .is_none_or(|tenant_id| tenant_id.trim().is_empty())
         {
             return problem_response(
                 StatusCode::BAD_REQUEST,

@@ -39,10 +39,10 @@ fn parse_lanes_used(retrieval_trace: &[(Value, Value)]) -> Result<Vec<String>, S
     let mut lanes = Vec::new();
     for el in arr {
         match el {
-            Value::Text(s) => lanes.push(s.to_string()),
+            Value::Text(s) => lanes.push(s.clone()),
             Value::Map(m) => {
                 if let Some(Value::Text(s)) = get_val(m, &["lane_key", "laneKey", "key"]) {
-                    lanes.push(s.to_string());
+                    lanes.push(s.clone());
                 }
             }
             _ => {}
@@ -65,7 +65,7 @@ fn parse_candidates(retrieval_trace: &[(Value, Value)]) -> Result<Vec<CandidateV
         let Value::Map(m) = el else { continue };
 
         let chunk_id = match get_val(m, &["chunk_id", "chunkId"]) {
-            Some(Value::Text(s)) => s.to_string(),
+            Some(Value::Text(s)) => s.clone(),
             _ => continue,
         };
 
@@ -79,7 +79,7 @@ fn parse_candidates(retrieval_trace: &[(Value, Value)]) -> Result<Vec<CandidateV
         if let Some(Value::Map(ls)) = get_val(m, &["lane_scores", "laneScores"]) {
             for (k, v) in ls {
                 if let Value::Text(lk) = k {
-                    lane_scores.insert(lk.to_string(), val_to_f64_opt(v));
+                    lane_scores.insert(lk.clone(), val_to_f64_opt(v));
                 }
             }
         }
@@ -105,7 +105,7 @@ fn compute_candidate_digest_bytes_v1(
     lanes_used: &[String],
     ordered_candidates: &[CandidateV1],
 ) -> Result<[u8; 32], String> {
-    let mut lanes: Vec<String> = lanes_used.iter().map(|s| s.to_string()).collect();
+    let mut lanes: Vec<String> = lanes_used.to_vec();
     lanes.sort();
     lanes.dedup();
     if lanes.len() > 27 {

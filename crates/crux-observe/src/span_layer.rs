@@ -306,7 +306,7 @@ impl SpanRing {
 
     /// Records currently retained.
     pub fn len(&self) -> usize {
-        self.inner.lock().map(|q| q.len()).unwrap_or(0)
+        self.inner.lock().map_or(0, |q| q.len())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -436,7 +436,7 @@ where
                 .map_or((id.into_u64(), 0, true), |p| (p.trace_id, p.depth + 1, p.sampled)),
             None => {
                 let n = self.traces_seen.fetch_add(1, Ordering::Relaxed);
-                (id.into_u64(), 0, n % self.sample_rate == 0)
+                (id.into_u64(), 0, n.is_multiple_of(self.sample_rate))
             }
         };
 

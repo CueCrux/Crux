@@ -2281,11 +2281,9 @@ fn walk_csharp_node(
                 );
             }
         }
-        "using_directive" => {
-            if node_text(node, src).contains('=') {
-                if let Some(name) = field_ident(node, src, "name") {
-                    push_symbol(file, "type", &name, node.start_position().row + 1, false);
-                }
+        "using_directive" if node_text(node, src).contains('=') => {
+            if let Some(name) = field_ident(node, src, "name") {
+                push_symbol(file, "type", &name, node.start_position().row + 1, false);
             }
         }
         _ => {}

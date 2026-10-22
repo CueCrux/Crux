@@ -50,7 +50,7 @@ edition = "2021"
 # fails any v* tag whose workspace version != the tag.
 version = "0.5.65"
 license = "Apache-2.0"
-rust-version = "1.88.0"
+rust-version = "1.99.1"
 # Apache-2.0 licensed but not (yet) published to crates.io: the workspace uses
 # unversioned `{ path = "../x" }` deps, which a registry publish would reject.
 # Marking the crates non-publishable also lets cargo-deny's `allow-wildcard-paths`

@@ -205,7 +205,7 @@ pub fn services_for(body: &str) -> Vec<&'static str> {
         }
     }
     // Descending by hits; ties keep table order, which is the rail order.
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.sort_by_key(|e| std::cmp::Reverse(e.1));
     scored.into_iter().take(SERVICE_MAX).map(|(name, _)| name).collect()
 }
 

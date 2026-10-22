@@ -50,7 +50,7 @@ pub const FEATURE_FLAG_ENV: &str = "CORECRUXD_FEATURE_TOOL_TRACES";
 
 /// Default sliding-window retention horizon (1 hour). Overridable via
 /// `CORECRUXD_FEATURE_TOOL_TRACES_TTL_SECS`.
-pub const DEFAULT_RETENTION: Duration = Duration::from_secs(60 * 60);
+pub const DEFAULT_RETENTION: Duration = Duration::from_hours(1);
 
 /// Per-passport ring-buffer hard cap. Tuned for interactive sessions —
 /// at ~50 tools/turn × 100 turns/h this still fits comfortably; older
@@ -85,11 +85,7 @@ pub fn traces_enabled() -> bool {
 /// [`DEFAULT_RETENTION`] when the env var is missing or unparseable.
 pub fn retention() -> Duration {
     match std::env::var("CORECRUXD_FEATURE_TOOL_TRACES_TTL_SECS") {
-        Ok(v) => v
-            .trim()
-            .parse::<u64>()
-            .map(Duration::from_secs)
-            .unwrap_or(DEFAULT_RETENTION),
+        Ok(v) => v.trim().parse::<u64>().map_or(DEFAULT_RETENTION, Duration::from_secs),
         Err(_) => DEFAULT_RETENTION,
     }
 }
@@ -275,9 +271,7 @@ pub fn trace_payload(entries: Vec<TraceEntry>, token_budget: Option<usize>) -> V
         let mut used: u64 = 0;
         let mut kept = Vec::new();
         for entry in entries {
-            let cost = serde_json::to_value(&entry)
-                .map(|v| crate::token_estimate::estimate_tokens(&v))
-                .unwrap_or(1);
+            let cost = serde_json::to_value(&entry).map_or(1, |v| crate::token_estimate::estimate_tokens(&v));
             if !kept.is_empty() && used.saturating_add(cost) > budget {
                 break;
             }

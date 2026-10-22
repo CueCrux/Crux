@@ -31,7 +31,7 @@ pub struct ExternalDep {
 }
 
 pub fn env_flag_enabled(name: &str) -> bool {
-    std::env::var(name).ok().is_some_and(|v| {
+    std::env::var(name).is_ok_and(|v| {
         let v = v.trim().to_ascii_lowercase();
         !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
     })
@@ -680,7 +680,7 @@ fn package_lock_versions(lock: &Path) -> Option<BTreeMap<String, String>> {
                 let Some(version) = package.get("version").and_then(serde_json::Value::as_str) else {
                     continue;
                 };
-                versions.insert(name.to_string(), version.to_string());
+                versions.insert(name.clone(), version.to_string());
             }
         }
         return Some(versions);

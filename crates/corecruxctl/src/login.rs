@@ -500,10 +500,7 @@ fn http_agent() -> ureq::Agent {
 
 /// Current unix time in seconds (CLI context — real clock is appropriate).
 fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// Call a GET and reduce it to an HTTP status code, treating a non-2xx response

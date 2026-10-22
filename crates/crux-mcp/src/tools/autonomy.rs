@@ -207,7 +207,7 @@ pub fn build_capability_matrix(router: &RcxRouter, now_unix_seconds: u64, is_ope
 fn approx_row_tokens(row: &CapabilityRow) -> usize {
     // 4 chars-per-token is a conservative proxy used elsewhere in
     // crux-mcp; matches the convention in `envelope.rs`.
-    let bytes = serde_json::to_string(row).map(|s| s.len()).unwrap_or(256);
+    let bytes = serde_json::to_string(row).map_or(256, |s| s.len());
     bytes.div_ceil(4)
 }
 
@@ -277,8 +277,7 @@ pub async fn handle_autonomy_contract(args: &Value, ctx: &McpContext) -> Result<
 
     let now_unix_seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
 
     // Operator-tier callers see reserved-prefix tools in their matrix; all
     // others see them as `allowed:false` with `why_denied: reserved-prefix

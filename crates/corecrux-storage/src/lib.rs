@@ -2089,7 +2089,7 @@ fn read_blocks_cpu(file: &File, blocks: &[BlockMetaV1], block_ids: &[u32]) -> Re
         if let Some(cur) = plans.last_mut() {
             let expected_next = cur.start.saturating_add(cur.len as u64);
             if b.file_offset == expected_next {
-                let rel_off = b.file_offset.checked_sub(cur.start).unwrap_or_default() as usize;
+                let rel_off = b.file_offset.saturating_sub(cur.start) as usize;
                 cur.parts.push((b.block_id, rel_off, disk_len, compressed_len));
                 cur.len = cur.len.saturating_add(disk_len);
                 continue;
@@ -2165,7 +2165,7 @@ fn read_selected_frames_codec_none_from_entries(
         if let Some(cur) = plans.last_mut() {
             let cur_end = cur.start.saturating_add(cur.len as u64);
             if file_off <= cur_end.saturating_add(FRAME_WINDOW_COALESCE_GAP_BYTES) {
-                let rel_off = file_off.checked_sub(cur.start).unwrap_or_default() as usize;
+                let rel_off = file_off.saturating_sub(cur.start) as usize;
                 cur.parts.push(FrameWindowPart {
                     entry_index,
                     rel_off,
@@ -2300,9 +2300,7 @@ fn clear_test_failpoint() {
 
 #[cfg(not(test))]
 fn failpoint_active(name: &str) -> bool {
-    std::env::var("CORECRUX_STORAGE_FAILPOINT")
-        .ok()
-        .is_some_and(|v| v == name)
+    std::env::var("CORECRUX_STORAGE_FAILPOINT").is_ok_and(|v| v == name)
 }
 
 #[cfg(test)]

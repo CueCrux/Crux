@@ -651,8 +651,7 @@ fn reservation_id_for(tenant_id: &str, operation_id: &str, cost: u64, payload_ha
 fn current_unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 pub fn mint_spend_receipt(

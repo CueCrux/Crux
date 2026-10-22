@@ -156,7 +156,7 @@ async fn handle_inner(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcEr
                 (overlap >= MIN_OVERLAP_TERMS).then_some((overlap, &r.payload))
             })
             .collect();
-        cap_matches.sort_by(|a, b| b.0.cmp(&a.0));
+        cap_matches.sort_by_key(|m| std::cmp::Reverse(m.0));
         cap_matches
             .into_iter()
             .take(limit)

@@ -1321,7 +1321,7 @@ pub fn list_execplans(store: &FactStore, root: &Path, now_unix_ms: u64) -> std::
     }
     apply_reciprocal_refs(&mut out);
     apply_open_decisions(&mut out, od_registry.as_ref(), &declared_blockers, now_unix_ms);
-    out.sort_by(|a, b| b.updated_at_unix_ms.cmp(&a.updated_at_unix_ms));
+    out.sort_by_key(|e| std::cmp::Reverse(e.updated_at_unix_ms));
     Ok(out)
 }
 

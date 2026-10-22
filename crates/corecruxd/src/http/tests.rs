@@ -9023,7 +9023,7 @@ async fn version_public_view_is_redacted() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
     assert_eq!(body["version"], "test");
-    assert_eq!(body["msrv"], "1.88.0");
+    assert_eq!(body["msrv"], "1.99.1");
     assert!(body["commit"].is_null());
     assert!(body["passport"].is_null());
     assert!(body["cloud"].is_null());

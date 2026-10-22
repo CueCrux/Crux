@@ -160,7 +160,7 @@ pub fn list_snapshots(opts: &SnapshotOptions) -> Result<SnapshotListReport, Box<
             let path = projections_dir.join(p.file);
             let exists = path.exists();
             let bytes = if exists {
-                std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+                std::fs::metadata(&path).map_or(0, |m| m.len())
             } else {
                 0
             };

@@ -403,7 +403,7 @@ impl SessionStore {
 
 /// Estimate tokens from a JSON value (serialized bytes / 4).
 fn estimate_tokens(value: &serde_json::Value) -> usize {
-    let bytes = serde_json::to_string(value).map(|s| s.len()).unwrap_or(0);
+    let bytes = serde_json::to_string(value).map_or(0, |s| s.len());
     bytes.div_ceil(4)
 }
 

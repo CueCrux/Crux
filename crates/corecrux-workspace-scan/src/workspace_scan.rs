@@ -322,7 +322,7 @@ pub fn run_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
 }
 
 pub fn ast_scan_enabled_from_env() -> bool {
-    std::env::var("CORECRUXD_AST_SCAN").ok().is_some_and(|v| {
+    std::env::var("CORECRUXD_AST_SCAN").is_ok_and(|v| {
         let v = v.trim().to_ascii_lowercase();
         !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
     })
@@ -1088,7 +1088,7 @@ fn expand_node(
         // Each entry: target_file -> (distinct symbols called, sum of call counts, same_file flag).
         type AggregatedEdge = (String, (Vec<String>, usize, bool));
         let mut ordered: Vec<AggregatedEdge> = by_target.into_iter().collect();
-        ordered.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+        ordered.sort_by_key(|e| std::cmp::Reverse(e.1 .1));
         for (target_file, (symbols, count, same)) in ordered {
             if *total >= STORYLINE_MAX_NODES {
                 *truncated_branches += 1;

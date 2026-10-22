@@ -171,7 +171,7 @@ fn engine_env_presence() -> Vec<(&'static str, bool)> {
     ]
     .into_iter()
     .map(|var| {
-        let present = std::env::var(var).ok().is_some_and(|v| !v.trim().is_empty());
+        let present = std::env::var(var).is_ok_and(|v| !v.trim().is_empty());
         (var, present)
     })
     .collect()

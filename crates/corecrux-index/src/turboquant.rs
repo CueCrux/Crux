@@ -154,6 +154,9 @@ fn nearest_code(x: f32, levels: &[f32]) -> u8 {
     let mut hi = levels.len() - 1;
     while lo < hi {
         let mid = usize::midpoint(lo, hi);
+        // Not `f32::midpoint`: it rounds once via f64, which can move a boundary
+        // by one ulp and re-quantise values already encoded on disk.
+        #[allow(clippy::manual_midpoint)]
         let boundary = 0.5 * (levels[mid] + levels[mid + 1]);
         if x <= boundary {
             hi = mid;

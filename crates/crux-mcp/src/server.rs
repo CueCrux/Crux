@@ -109,9 +109,7 @@ async fn handle_agent_card(State(state): State<Arc<McpHttpState>>) -> Response {
 /// ON — `/.well-known/agent-card` is exposed for A2A discovery. Explicit
 /// `CRUX_AGENT_CARD=0` disables it.
 pub(crate) fn agent_card_enabled() -> bool {
-    std::env::var("CRUX_AGENT_CARD")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true)
+    std::env::var("CRUX_AGENT_CARD").map_or(true, |v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 /// `POST /mcp` — JSON-RPC 2.0 endpoint (MCP Streamable HTTP).

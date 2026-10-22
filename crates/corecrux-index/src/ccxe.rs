@@ -649,8 +649,8 @@ pub fn verify_footer_hashes(data: &[u8]) -> crate::Result<()> {
     // Turbo modes size the vector area from the metadata params — mirror `parse`.
     let turbo_params = if version >= CCXE_VERSION_V2 && metadata_len > 0 {
         parse_v2_metadata(&data[CCXE_HEADER_LEN..metadata_end])
-            .map(|m| m.turbo_params)
-            .unwrap_or(None)
+            .ok()
+            .and_then(|m| m.turbo_params)
     } else {
         None
     };
@@ -800,9 +800,9 @@ impl CcxeReader {
             return Err(IndexError::BufferTooSmall);
         }
         let (build_fingerprint, calibration_vector, turbo_params) = if version >= CCXE_VERSION_V2 && metadata_len > 0 {
-            parse_v2_metadata(&data[CCXE_HEADER_LEN..metadata_end])
-                .map(|m| (m.build_fingerprint, m.calibration_vector, m.turbo_params))
-                .unwrap_or((None, None, None))
+            parse_v2_metadata(&data[CCXE_HEADER_LEN..metadata_end]).map_or((None, None, None), |m| {
+                (m.build_fingerprint, m.calibration_vector, m.turbo_params)
+            })
         } else {
             (None, None, None)
         };

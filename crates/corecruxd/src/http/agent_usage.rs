@@ -199,7 +199,7 @@ fn usage_rollup(passport: &str, payloads: &[Value], window: &str) -> Value {
             json!({
                 "tool": tool,
                 "calls": calls,
-                "avg_tokens": if calls > 0 { tokens / calls } else { 0 },
+                "avg_tokens": tokens.checked_div(calls).unwrap_or(0),
                 "p50_ms": p50_ms,
             })
         })
@@ -385,7 +385,7 @@ fn fleet_rollup(
                         "errors": agg.errors,
                         "error_rate": if agg.calls > 0 { ((agg.errors as f64 / agg.calls as f64) * 10_000.0).round() / 10_000.0 } else { 0.0 },
                         "passports": agg.passports.len(),
-                        "avg_tokens": if agg.calls > 0 { agg.tokens / agg.calls } else { 0 },
+                        "avg_tokens": agg.tokens.checked_div(agg.calls).unwrap_or(0),
                         "p50_ms": p50_ms,
                         "last_called": agg.last_called.map_or(Value::Null, |t| json!(t.to_rfc3339())),
                         "offered_passports": offered_to,

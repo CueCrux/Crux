@@ -46,6 +46,8 @@ pub(crate) struct GraphExpandRequest<'a> {
     pub include_state: bool,
 }
 
+// `async_trait` marks its boxed futures `#[must_use]`; they already are.
+#[allow(clippy::double_must_use)]
 #[tonic::async_trait]
 pub(crate) trait HttpDataplane: Send + Sync {
     fn enabled(&self) -> bool;

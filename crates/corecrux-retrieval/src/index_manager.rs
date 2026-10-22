@@ -842,7 +842,7 @@ fn delete_segment_group(ccxi_path: &Path) -> crate::Result<u64> {
         if !name.starts_with(&prefix) {
             continue;
         }
-        let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        let len = entry.metadata().map_or(0, |m| m.len());
         std::fs::remove_file(entry.path())?;
         freed += len;
     }
@@ -877,7 +877,7 @@ fn segment_group_sizes<'a, I: Iterator<Item = &'a Path>>(paths: I) -> std::colle
                 // `.ccxe.partial` and friends stem to "seg-…-….ccxe"; take the
                 // leading segment stem so partials count against their group.
                 let stem = stem.split_once(".ccx").map_or(stem, |(head, _)| head);
-                let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                let len = entry.metadata().map_or(0, |m| m.len());
                 *by_stem.entry(stem.to_string()).or_default() += len;
             }
         }

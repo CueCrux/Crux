@@ -352,18 +352,15 @@ impl SyncScheduler {
         }
         tracing::info!(jobs = self.jobs.len(), ids = ?self.job_ids(), "sync-scheduler-started");
         tokio::spawn(async move {
-            loop {
-                // Earliest deadline across all jobs; jobs are few (2 today) so a
-                // linear scan is cheaper than a heap and keeps ordering obvious.
-                let Some((index, deadline)) = self
-                    .jobs
-                    .iter()
-                    .enumerate()
-                    .map(|(index, job)| (index, job.next_run))
-                    .min_by_key(|(_, deadline)| *deadline)
-                else {
-                    break;
-                };
+            // Earliest deadline across all jobs; jobs are few (2 today) so a
+            // linear scan is cheaper than a heap and keeps ordering obvious.
+            while let Some((index, deadline)) = self
+                .jobs
+                .iter()
+                .enumerate()
+                .map(|(index, job)| (index, job.next_run))
+                .min_by_key(|(_, deadline)| *deadline)
+            {
                 tokio::select! {
                     _ = shutdown.recv() => break,
                     () = tokio::time::sleep_until(deadline) => {

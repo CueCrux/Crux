@@ -31,9 +31,7 @@ const CAPTURE_FLAG: &str = "CRUX_HOOK_OBSERVE_CAPTURE";
 
 /// Whether the operator has opted in to audit capture.
 pub fn capture_enabled() -> bool {
-    std::env::var(CAPTURE_FLAG)
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+    std::env::var(CAPTURE_FLAG).is_ok_and(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
 /// Deterministic node id shared by the open (PreToolUse) and close
@@ -219,7 +217,7 @@ pub fn open(input: &HookInput) {
     let mut body = json!({
         "node_id": node_id,
         "kind": "tool_call",
-        "label": format!("{tool}"),
+        "label": tool.to_string(),
         "actor": actor,
         "ts_start": now_rfc3339(),
         "inputs": inputs_for(tool, input.tool_input.as_ref()),

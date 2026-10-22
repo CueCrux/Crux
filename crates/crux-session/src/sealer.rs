@@ -81,7 +81,7 @@ impl InMemorySealer {
     }
 
     pub fn len(&self) -> usize {
-        self.events.lock().map(|g| g.len()).unwrap_or(0)
+        self.events.lock().map_or(0, |g| g.len())
     }
 
     pub fn is_empty(&self) -> bool {

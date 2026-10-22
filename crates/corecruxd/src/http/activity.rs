@@ -238,9 +238,7 @@ pub(super) async fn get_activity(
     let mut truncated = false;
     for entry in &entries {
         let row = ActivityRow::from_entry(entry, DEFAULT_PREVIEW_CHARS);
-        let cost = serde_json::to_value(&row)
-            .map(|v| crux_mcp::token_estimate::estimate_tokens(&v))
-            .unwrap_or(1);
+        let cost = serde_json::to_value(&row).map_or(1, |v| crux_mcp::token_estimate::estimate_tokens(&v));
         if !rows.is_empty() && used.saturating_add(cost) > token_budget {
             truncated = true;
             break;

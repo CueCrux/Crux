@@ -414,7 +414,7 @@ pub fn list_work(
             }
         }
     }
-    out.sort_by(|a, b| b.updated_at_unix_ms.cmp(&a.updated_at_unix_ms));
+    out.sort_by_key(|e| std::cmp::Reverse(e.updated_at_unix_ms));
     out
 }
 
@@ -633,7 +633,7 @@ pub fn list_comments(store: &FactStore, work_id: &str) -> Vec<WorkComment> {
             out.push(c);
         }
     }
-    out.sort_by(|a, b| a.posted_at_unix_ms.cmp(&b.posted_at_unix_ms));
+    out.sort_by_key(|a| a.posted_at_unix_ms);
     out
 }
 
@@ -697,7 +697,7 @@ pub fn list_pending_gates(
             }
         }
     }
-    out.sort_by(|a, b| a.requested_at_unix_ms.cmp(&b.requested_at_unix_ms));
+    out.sort_by_key(|a| a.requested_at_unix_ms);
     out
 }
 

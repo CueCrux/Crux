@@ -177,8 +177,7 @@ pub(super) struct ListIncidentsQuery {
 
 fn feature_enabled() -> bool {
     std::env::var(FEATURE_FLAG_ENV)
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
-        .unwrap_or(false)
+        .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
 }
 
 fn disabled_response() -> Response {

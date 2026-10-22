@@ -281,10 +281,7 @@ pub fn follow_up_query_command(daemon_url: &str, tenant: &str) -> String {
         "query": "YOUR QUERY",
         "limit": 10
     });
-    let auth = if std::env::var("CRUX_AGENT_TOKEN")
-        .ok()
-        .is_some_and(|token| !token.trim().is_empty())
-    {
+    let auth = if std::env::var("CRUX_AGENT_TOKEN").is_ok_and(|token| !token.trim().is_empty()) {
         " -H \"Authorization: Bearer $CRUX_AGENT_TOKEN\""
     } else {
         ""

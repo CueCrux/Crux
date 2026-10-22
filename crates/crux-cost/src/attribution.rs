@@ -146,14 +146,10 @@ pub fn analyze(events: &[Event]) -> CostReport {
             .then_with(|| a.source.cmp(&b.source))
     });
 
-    all_blocks.sort_by(|a, b| b.carried_cost.cmp(&a.carried_cost));
+    all_blocks.sort_by_key(|b| std::cmp::Reverse(b.carried_cost));
     all_blocks.truncate(TOP_BLOCKS);
 
-    let context_tokens_per_turn = if assistant_turns > 0 {
-        measured_context_total / assistant_turns
-    } else {
-        0
-    };
+    let context_tokens_per_turn = measured_context_total.checked_div(assistant_turns).unwrap_or(0);
     // The cache-invalidation ledger: which turns re-wrote an already-cached
     // prefix, and why (M0 of `crux-prompt-cache-1h-ttl-2026-09-17`).
     let ledger = cache::ledger(events);

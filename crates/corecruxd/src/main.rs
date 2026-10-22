@@ -1159,8 +1159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .map_or(0, |d| d.as_millis() as u64);
         let mut store = state.fact_store.write().await;
         let want_seed = std::env::var("CORECRUXD_SEED_DEFAULT_PASSPORTS")
-            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false);
+            .is_ok_and(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"));
         if want_seed {
             match crate::passports::seed_defaults_if_missing(&config.data_dir, &mut store, now_ms) {
                 Ok(0) => tracing::debug!("passport defaults already present"),
@@ -2217,8 +2216,7 @@ async fn reconcile_control_checkpoint_with_evidence(
 
 fn insecure_dev_auth_bind_allowed() -> bool {
     std::env::var("CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND")
-        .ok()
-        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 /// Dev-only escape hatch: when an agent-token env var is present but invalid,
@@ -2228,8 +2226,7 @@ const ALLOW_EMPTY_AGENT_REGISTRY_ENV: &str = "CRUX_MCP_ALLOW_EMPTY_AGENT_REGISTR
 
 fn allow_empty_agent_registry() -> bool {
     std::env::var(ALLOW_EMPTY_AGENT_REGISTRY_ENV)
-        .ok()
-        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 /// Decide the effective MCP agent registry, failing closed on an invalid
@@ -2262,9 +2259,7 @@ fn resolve_mcp_agent_registry(
 }
 
 fn replication_auth_bearer_configured() -> bool {
-    std::env::var("CORECRUXD_REPLICATION_AUTH_BEARER")
-        .ok()
-        .is_some_and(|v| !v.trim().is_empty())
+    std::env::var("CORECRUXD_REPLICATION_AUTH_BEARER").is_ok_and(|v| !v.trim().is_empty())
 }
 
 fn shard_map_advertise_addr(listen_addr: SocketAddr) -> String {

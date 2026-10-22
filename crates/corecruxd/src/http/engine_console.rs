@@ -273,8 +273,7 @@ fn upstream_unavailable() -> Response {
 fn now_unix_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis())
-        .unwrap_or(0)
+        .map_or(0, |elapsed| elapsed.as_millis())
 }
 
 /// A successful (2xx) upstream read: decoded JSON body + measured latency.

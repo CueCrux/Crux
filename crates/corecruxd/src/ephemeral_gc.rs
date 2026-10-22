@@ -131,7 +131,7 @@ pub fn select_ephemeral_candidates<'a>(
     }
     for (_passport, mut rows) in by_passport {
         // Newest first; protect the leading KEEP_N, collect aged-out remainder.
-        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        rows.sort_by_key(|e| std::cmp::Reverse(e.0));
         for (stored_at, fact_id) in rows.into_iter().skip(SESSION_BINDING_KEEP_N) {
             if (now - stored_at) > min_age {
                 out.push(fact_id);

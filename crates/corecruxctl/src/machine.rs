@@ -24,8 +24,7 @@ pub const MACHINES_ENTITY: &str = "__infra__::machines";
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Shared HTTP agent for the infra subcommands (machine / config / session).

@@ -64,9 +64,7 @@ const KEY_RETIRED: &str = "retired";
 const KEY_LINKED_DEVICE_PREFIX: &str = "linked_device:";
 
 fn feature_enabled() -> bool {
-    env::var(FEATURE_FLAG_ENV)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    env::var(FEATURE_FLAG_ENV).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 fn require_feature_flag() -> Result<(), JsonRpcError> {

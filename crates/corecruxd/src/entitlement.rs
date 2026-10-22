@@ -65,8 +65,9 @@ pub const ENTITLEMENT_REVOKED_KEY: &str = "revoked";
 
 /// Where entitlement is resolved from. `Env` exists for Max, air-gapped and dev
 /// deployments that cannot reach an issuer; it is an explicit, logged override.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EntitlementSource {
+    #[default]
     Rcx,
     Env,
 }
@@ -85,12 +86,6 @@ impl EntitlementSource {
             Self::Rcx => "rcx",
             Self::Env => "env",
         }
-    }
-}
-
-impl Default for EntitlementSource {
-    fn default() -> Self {
-        Self::Rcx
     }
 }
 

@@ -95,7 +95,7 @@ first-class, continuously-dogfooded path. WSL2 specifics are in
 
 ### Build from source
 
-Rust 1.88+, `protobuf-compiler`, then `cargo build --locked --release`. See
+Rust 1.99+, `protobuf-compiler`, then `cargo build --locked --release`. See
 the [README Quickstart](../README.md#quickstart).
 
 #### Cargo feature flags

@@ -106,6 +106,7 @@ enum JournalEvent {
 /// callers — strict backwards-compat).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum HorizonClass {
     /// Goes stale quickly (default policy: 24 hours). Use for deploy state,
     /// process IDs, currently-measured metrics that change daily.
@@ -117,6 +118,7 @@ pub enum HorizonClass {
     /// architectural counts, naming conventions, layout decisions.
     Stable,
     /// Never decays. Use for identity, immutable history, user-pinned facts.
+    #[default]
     None,
 }
 
@@ -163,14 +165,6 @@ impl HorizonClass {
         } else {
             Self::None
         }
-    }
-}
-
-impl Default for HorizonClass {
-    fn default() -> Self {
-        // Default for replay of pre-freshness journal entries: never
-        // decay, never lie about it.
-        Self::None
     }
 }
 
@@ -2359,7 +2353,7 @@ impl FactStore {
             // fact fields. These events contain no fact values and replay only
             // accepts them when the already-restored same-tenant edges match.
             let mut consolidations: Vec<_> = self.consolidation_sources.iter().collect();
-            consolidations.sort_by(|(left, _), (right, _)| left.cmp(right));
+            consolidations.sort_by_key(|(left, _)| *left);
             for (canonical_fact_id, source_fact_ids) in consolidations {
                 let Some(canonical) = self.facts.get(canonical_fact_id).filter(|fact| !fact.deleted) else {
                     continue;

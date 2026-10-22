@@ -35,10 +35,7 @@ use super::{BundleSource, ShimConfig, BUNDLE_VERSION, SHIM_RECEIPT_SCHEMA};
 /// RFC3339 UTC timestamp (second precision — receipt ordering inside one
 /// second is carried by the spool append order).
 pub fn now_rfc3339() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     epoch_secs_to_rfc3339(secs)
 }
 

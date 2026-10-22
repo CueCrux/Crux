@@ -283,11 +283,10 @@ pub fn generate(store: &corecrux_memory::FactStore, input: GenerateInput<'_>) ->
     md.insert_str(md.find("### ").unwrap_or(md.len()), &planes_section);
 
     // ── Coverage matrix ──────────────────────────────────────────────
-    if !planes.is_empty() && workspace_scan.is_some() {
+    if let Some(ws) = workspace_scan.as_ref().filter(|_| !planes.is_empty()) {
         let mut tab = String::from("## Coverage matrix\n\n");
         tab.push_str("| Plane | Vision | Goals | Mapped crates | Stubs | Dead code | Gap |\n");
         tab.push_str("|-------|--------|-------|---------------|-------|-----------|-----|\n");
-        let ws = workspace_scan.as_ref().unwrap();
         for plane in &planes {
             let plane_layers = read_plane_layers(store, input.project_id, &plane.id);
             let v = if plane_layers.contains_key("vision") {
@@ -376,7 +375,7 @@ pub fn generate(store: &corecrux_memory::FactStore, input: GenerateInput<'_>) ->
                 by_crate.entry(d.crate_name.clone()).or_default().push(d);
             }
             let mut crates: Vec<_> = by_crate.iter().collect();
-            crates.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+            crates.sort_by_key(|e| std::cmp::Reverse(e.1.len()));
             // The heading grades the count across tiers when a runtime window
             // exists. Previously it carried a permanent hedge — "Regex-based;
             // may miss macro / dynamic-dispatch usages" — which is true of the

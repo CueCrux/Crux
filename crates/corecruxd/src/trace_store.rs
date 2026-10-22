@@ -169,7 +169,7 @@ impl TraceStore {
         // O(store) and a flush is per-interval, so this is a bounded cost paid
         // rarely rather than a per-span tax on the hot path.
         let ceiling = tenant_ceiling();
-        let already = self.load_for_tenant_str(tenant_id).map(|v| v.len()).unwrap_or(0);
+        let already = self.load_for_tenant_str(tenant_id).map_or(0, |v| v.len());
         let mut headroom = ceiling.saturating_sub(already);
 
         let now = now_unix_ms();

@@ -180,7 +180,7 @@ pub fn time_range_scan(state: &ProjectionState, req: &TimeRangeRequest) -> TimeR
         .collect();
 
     // Sort by updated_at_micros descending (most recent first)
-    results.sort_by(|a, b| b.1.updated_at_micros.cmp(&a.1.updated_at_micros));
+    results.sort_by_key(|r| std::cmp::Reverse(r.1.updated_at_micros));
     results.truncate(limit);
 
     let total_changes = results.len() as u32;

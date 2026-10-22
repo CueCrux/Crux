@@ -783,6 +783,7 @@ pub(super) async fn get_api_drift(
 }
 
 #[tracing::instrument(level = "info", skip_all)]
+#[allow(clippy::result_large_err)]
 pub(super) async fn post_policy_simulation(
     State(state): State<AppState>,
     headers: HeaderMap,

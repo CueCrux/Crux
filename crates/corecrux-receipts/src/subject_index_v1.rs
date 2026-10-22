@@ -117,14 +117,13 @@ pub fn update_subject_index_v1(
                 cur.latest_verified = Some(candidate.clone());
             }
         }
-        "audit" => {
+        "audit"
             if cur
                 .latest_audit
                 .as_ref()
-                .is_none_or(|v| candidate.ingested_at > v.ingested_at)
-            {
-                cur.latest_audit = Some(candidate.clone());
-            }
+                .is_none_or(|v| candidate.ingested_at > v.ingested_at) =>
+        {
+            cur.latest_audit = Some(candidate.clone());
         }
         _ => {}
     }

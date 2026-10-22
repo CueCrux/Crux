@@ -77,13 +77,7 @@ pub fn hash_file(path: &std::path::Path) -> std::io::Result<Option<String>> {
         }
         hasher.update(&buf[..n]);
     }
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in &digest {
-        use std::fmt::Write as _;
-        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    Ok(Some(hex))
+    Ok(Some(hex::encode(hasher.finalize())))
 }
 
 /// Ask the daemon which entries are unaudited. On any error (daemon down,

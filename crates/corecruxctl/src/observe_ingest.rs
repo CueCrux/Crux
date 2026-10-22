@@ -145,7 +145,7 @@ pub fn run_ingest(
     // transcript yielded zero events, printed "0 nodes", returned `Ok(())` and
     // never opened a connection — identical to a genuinely empty session. A
     // file with bytes in it that produces no events did not parse.
-    if events.is_empty() && std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0) > 0 {
+    if events.is_empty() && std::fs::metadata(&path).map_or(0, |meta| meta.len()) > 0 {
         return Err(format!(
             "{} is non-empty but contains no parseable transcript records; refusing to report an empty ingest",
             path.display()

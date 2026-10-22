@@ -68,8 +68,7 @@ pub(super) struct PostAdminActionResponse {
 pub(super) fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis().min(u64::MAX as u128) as u64)
 }
 
 pub(super) fn is_known_admin_action(ty: &str) -> bool {

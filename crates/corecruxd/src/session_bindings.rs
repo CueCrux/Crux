@@ -110,7 +110,7 @@ pub fn list_bindings(store: &FactStore) -> Vec<SessionBinding> {
             out.push(b);
         }
     }
-    out.sort_by(|a, b| b.bound_at_unix_ms.cmp(&a.bound_at_unix_ms));
+    out.sort_by_key(|e| std::cmp::Reverse(e.bound_at_unix_ms));
     out
 }
 
