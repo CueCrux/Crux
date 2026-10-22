@@ -18,4 +18,19 @@ ignore = [
     "RUSTSEC-2026-0325",
     "RUSTSEC-2026-0326",
     "RUSTSEC-2026-0327",
+    # Same exposure, later batches (2026-10-06 .. 2026-10-21): fixed only in
+    # wasmtime >= 48.0.7 / 49.0.4, which need Rust 1.95+ as above.
+    "RUSTSEC-2026-0353",
+    "RUSTSEC-2026-0354",
+    "RUSTSEC-2026-0355",
+    "RUSTSEC-2026-0356",
+    "RUSTSEC-2026-0357",
+    "RUSTSEC-2026-0358",
+    "RUSTSEC-2026-0359",
+    "RUSTSEC-2026-0361",
+    "RUSTSEC-2026-0362",
+    "RUSTSEC-2026-0363",
+    "RUSTSEC-2026-0364",
+    "RUSTSEC-2026-0378",
+    "RUSTSEC-2026-0379",
 ]
