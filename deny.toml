@@ -17,6 +17,8 @@ ignore = [
     # through serde_yaml 0.9 (itself deprecated), used by corecrux-workspace-scan,
     # corecruxctl and corecruxd. serde_yaml_ng depends on it too. Remove this entry when
     # those crates move to a safe-Rust YAML parser (e.g. serde-saphyr).
+    # owner: CueCrux-Myles
+    # expires: 2027-01-20
     { id = "RUSTSEC-2024-0449", reason = "unmaintained, no fixed release; replace serde_yaml to drop it" },
 ]
 
