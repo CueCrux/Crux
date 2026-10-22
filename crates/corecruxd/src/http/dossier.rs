@@ -261,7 +261,7 @@ async fn list_dossier_ids_internal(
             Some((id, ts, agent))
         })
         .collect();
-    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out.sort_by_key(|e| std::cmp::Reverse(e.1));
     crux_observe::span_layer::OutcomeExt::record_outcome_through(out)
 }
 

@@ -64,7 +64,7 @@ pub const JOURNAL_ENTRY_SCHEMA_V1: &str = "crux.activity.journal_entry.v1";
 /// disk-durable (see [`JournalStore::open`]), so the default keeps activity for
 /// a year rather than the original 24h volatile window. Overridable via
 /// `CORECRUXD_FEATURE_ACTIVITY_LOG_TTL_SECS`.
-pub const DEFAULT_RETENTION: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+pub const DEFAULT_RETENTION: Duration = Duration::from_hours(365 * 24);
 
 /// Per-session ring hard cap. Older entries are evicted FIFO.
 pub const MAX_ENTRIES_PER_SESSION: usize = 5_000;
@@ -91,11 +91,7 @@ pub fn activity_log_enabled() -> bool {
 /// [`DEFAULT_RETENTION`] when the env var is missing or unparseable.
 pub fn retention() -> Duration {
     match std::env::var("CORECRUXD_FEATURE_ACTIVITY_LOG_TTL_SECS") {
-        Ok(v) => v
-            .trim()
-            .parse::<u64>()
-            .map(Duration::from_secs)
-            .unwrap_or(DEFAULT_RETENTION),
+        Ok(v) => v.trim().parse::<u64>().map_or(DEFAULT_RETENTION, Duration::from_secs),
         Err(_) => DEFAULT_RETENTION,
     }
 }
@@ -378,9 +374,7 @@ impl JournalStore {
             // `ts_us` is `#[serde(skip)]` (kept out of the public JSON), so it
             // deserialises to 0 — recompute the sort/eviction key from the
             // persisted RFC3339 `created_at`.
-            entry.ts_us = chrono::DateTime::parse_from_rfc3339(&entry.created_at)
-                .map(|d| d.timestamp_micros())
-                .unwrap_or(0);
+            entry.ts_us = chrono::DateTime::parse_from_rfc3339(&entry.created_at).map_or(0, |d| d.timestamp_micros());
             let log = self
                 .by_session
                 .entry((entry.tenant_id.clone(), entry.session_id.clone()))
@@ -390,7 +384,7 @@ impl JournalStore {
         }
         let ttl = retention();
         for log in self.by_session.values_mut() {
-            log.entries.sort_by(|a, b| a.ts_us.cmp(&b.ts_us));
+            log.entries.sort_by_key(|a| a.ts_us);
             Self::trim(&mut log.entries, ttl);
         }
         self.compact_to_disk(path);
@@ -402,7 +396,7 @@ impl JournalStore {
     /// fatal.
     fn compact_to_disk(&self, path: &Path) {
         let mut rows: Vec<&JournalEntry> = self.by_session.values().flat_map(|l| l.entries.iter()).collect();
-        rows.sort_by(|a, b| a.ts_us.cmp(&b.ts_us));
+        rows.sort_by_key(|a| a.ts_us);
         let mut buf = String::new();
         for e in rows {
             if let Ok(line) = serde_json::to_string(e) {
@@ -558,7 +552,7 @@ impl JournalStore {
             }
         }
         // Newest-first across sessions by absolute time, then cap to the page limit.
-        out.sort_by(|a, b| b.ts_us.cmp(&a.ts_us));
+        out.sort_by_key(|e| std::cmp::Reverse(e.ts_us));
         out.truncate(limit);
         out
     }

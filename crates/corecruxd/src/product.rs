@@ -8,8 +8,9 @@
 use corecrux_memory::sync::{SyncRuntimeStatus, SYNC_COLLECTIONS};
 use serde::Serialize;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OperatingMode {
+    #[default]
     FreeLocal,
     ProLocalFirst,
     ProCloudOnly,
@@ -19,12 +20,6 @@ pub enum OperatingMode {
     /// tier mapping and are retained for explicitly configured hosted deployments.
     GovernanceHosted,
     MaxPrivate,
-}
-
-impl Default for OperatingMode {
-    fn default() -> Self {
-        Self::FreeLocal
-    }
 }
 
 impl OperatingMode {

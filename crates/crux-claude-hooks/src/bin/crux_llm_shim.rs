@@ -157,8 +157,7 @@ fn run_local_shim(cli: Cli) -> anyhow::Result<()> {
     let session_id = cli.session_id.unwrap_or_else(|| {
         let epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         format!("shim-{}-{epoch}", std::process::id())
     });
 

@@ -108,7 +108,7 @@ To understand what makes this tamper-evident, read these symbols in order:
 
 ## Build / test
 
-- MSRV: **1.88.0** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.65
+- MSRV: **1.99.1** (`rust-toolchain.toml`); edition 2021; workspace version 0.5.65
   (`[workspace.package]` in `Cargo.toml` is authoritative, and
   `scripts/check-agent-docs.sh` fails the build when this line disagrees with it).
 - `cargo build --workspace --locked`
@@ -528,7 +528,7 @@ schema: crux-agent-manifest/v1
 # still exist, or CI fails. Anchor by symbol name, never line number.
 
 summary: Local-first, tamper-evident retrieval + memory engine with signed, replayable receipts.
-msrv: "1.88.0"
+msrv: "1.99.1"
 edition: "2021"
 workspace_version: "0.5.65"
 
@@ -1681,7 +1681,7 @@ first-class, continuously-dogfooded path. WSL2 specifics are in
 
 ### Build from source
 
-Rust 1.88+, `protobuf-compiler`, then `cargo build --locked --release`. See
+Rust 1.99+, `protobuf-compiler`, then `cargo build --locked --release`. See
 the [README Quickstart](../README.md#quickstart).
 
 #### Cargo feature flags
@@ -4032,7 +4032,7 @@ chmod +x crux
 CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR=./data ./crux
 ```
 
-**From source** (Rust 1.88+, `protobuf-compiler`):
+**From source** (Rust 1.99+, `protobuf-compiler`):
 
 ```bash
 git clone https://github.com/CueCrux/Crux.git && cd Crux
@@ -4351,7 +4351,7 @@ API surface: [`docs/developer-portal.md`](docs/developer-portal.md).
 | Path | Requirements |
 |---|---|
 | Docker | Docker or Docker Desktop. |
-| Build from source | Rust 1.88+, `protobuf-compiler`, and a C toolchain. |
+| Build from source | Rust 1.99+, `protobuf-compiler`, and a C toolchain. |
 | Shell examples | `curl`; `jq` recommended. |
 | Embeddings | Optional local or remote embedding endpoint. |
 

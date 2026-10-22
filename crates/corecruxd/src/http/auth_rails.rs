@@ -96,9 +96,7 @@ pub(super) struct TsPrincipal {
 
 /// Read a boolean opt-in env flag (`1`/`true`/`yes`, case-insensitive).
 pub(super) fn env_flag_enabled(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+    std::env::var(name).is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
 }
 
 /// Parse the tailnet identity allowlist. Malformed entries are skipped. Logins

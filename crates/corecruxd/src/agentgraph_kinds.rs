@@ -130,9 +130,7 @@ pub fn bootstrap(reg: &mut KindRegistry) -> Result<(), KindError> {
 
 /// Parse a boolean env var using the `main.rs` truthy idiom.
 fn env_truthy(var: &str) -> bool {
-    std::env::var(var)
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+    std::env::var(var).is_ok_and(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
 /// `CORECRUXD_OBSERVE` — gates the `/v1/observe/*` audit-chain surface.

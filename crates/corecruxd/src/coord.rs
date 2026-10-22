@@ -158,7 +158,7 @@ pub fn list_intents(store: &FactStore, project_id: Option<&str>) -> Vec<CoordInt
             out.push(intent);
         }
     }
-    out.sort_by(|a, b| b.announced_at_unix_ms.cmp(&a.announced_at_unix_ms));
+    out.sort_by_key(|e| std::cmp::Reverse(e.announced_at_unix_ms));
     out
 }
 

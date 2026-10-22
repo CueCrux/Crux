@@ -171,11 +171,7 @@ pub(super) async fn get_cost_report(
 /// `rewrite_share` and `invalidation_tokens`, so a trimmed report still carries
 /// the cache totals even when the per-event list is dropped.
 fn fit_budget(mut stored: StoredReport, budget: u64) -> StoredReport {
-    let est = |s: &StoredReport| {
-        serde_json::to_value(s)
-            .map(|v| crux_mcp::token_estimate::estimate_tokens(&v))
-            .unwrap_or(0)
-    };
+    let est = |s: &StoredReport| serde_json::to_value(s).map_or(0, |v| crux_mcp::token_estimate::estimate_tokens(&v));
     while !stored.report.top_blocks.is_empty() && est(&stored) > budget {
         stored.report.top_blocks.pop();
     }

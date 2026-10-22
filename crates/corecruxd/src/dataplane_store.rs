@@ -201,6 +201,7 @@ pub struct DataPlaneStore {
     dead_code,
     unused_variables,
     clippy::unused_async,
+    clippy::unused_async_trait_impl,
     clippy::unused_self,
     clippy::too_many_arguments
 )]

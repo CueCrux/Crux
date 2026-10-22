@@ -1939,8 +1939,7 @@ fn is_cgnat_shared_v4(v4: std::net::Ipv4Addr) -> bool {
 
 fn embedding_probe_private_targets_allowed(parsed: &url::Url) -> bool {
     if std::env::var("CORECRUXD_EMBEDDING_PROBE_ALLOW_LOCAL")
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
     {
         return true;
     }
@@ -2869,7 +2868,7 @@ fn gates_for_passport(store: &corecrux_memory::fact_store::FactStore, passport_i
             t.by_passport == passport_id && matches!(t.gate_status.as_str(), "approved" | "rejected" | "auto_approved")
         })
         .collect();
-    transitions.sort_by(|a, b| b.at_unix_ms.cmp(&a.at_unix_ms));
+    transitions.sort_by_key(|e| std::cmp::Reverse(e.at_unix_ms));
     transitions.truncate(50);
 
     // Resolve work titles once per distinct work id (bounded by the 50 cap).
@@ -2917,7 +2916,7 @@ fn linked_plans_for_passport(
         }
     }
     let mut rows: Vec<(String, u64, i64)> = by_entity.into_iter().map(|(k, (n, at))| (k, n, at)).collect();
-    rows.sort_by(|a, b| b.2.cmp(&a.2));
+    rows.sort_by_key(|e| std::cmp::Reverse(e.2));
     rows.truncate(5);
     rows.into_iter()
         .map(|(entity, matches, latest_at)| {

@@ -807,12 +807,10 @@ fn env_bounded_usize_or_zero(key: &str, default: usize, min: usize, max: usize) 
 /// Read a default-on environment flag. Only an explicit `0` or `false`
 /// (case-insensitive, with surrounding whitespace ignored) disables it.
 pub(crate) fn env_default_on(key: &str) -> bool {
-    std::env::var(key)
-        .map(|value| {
-            let value = value.trim();
-            value != "0" && !value.eq_ignore_ascii_case("false")
-        })
-        .unwrap_or(true)
+    std::env::var(key).map_or(true, |value| {
+        let value = value.trim();
+        value != "0" && !value.eq_ignore_ascii_case("false")
+    })
 }
 
 fn env_csv(key: &str) -> Option<Vec<String>> {
@@ -914,8 +912,7 @@ pub fn load_config() -> Config {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1000);
     let routing_strict_client_version = std::env::var("CORECRUXD_ROUTING_STRICT_CLIENT_VERSION")
-        .ok()
-        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+        .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
     let dev_split_shards = std::env::var("CORECRUXD_DEV_SPLIT_SHARDS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1017,8 +1014,7 @@ pub fn load_config() -> Config {
     let io_backend = std::env::var("CORECRUXD_IO_BACKEND").unwrap_or_else(|_| "cpu".to_string());
 
     let build_ccxi = std::env::var("CORECRUXD_BUILD_CCXI")
-        .ok()
-        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+        .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
 
     // agent-passport M1: default OFF. Only the env var enables it (no file
     // override needed — this is a deliberate, operator-set switch).
@@ -1026,8 +1022,7 @@ pub fn load_config() -> Config {
     let passport_mint_requests_enabled = env_bool("CORECRUXD_FEATURE_PASSPORT_MINT_REQUESTS").unwrap_or(false);
 
     let projections_enabled = std::env::var("CORECRUXD_PROJECTIONS_ENABLED")
-        .ok()
-        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+        .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
     let projections_batch_frames = std::env::var("CORECRUXD_PROJECTIONS_BATCH_FRAMES")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1038,8 +1033,7 @@ pub fn load_config() -> Config {
         .unwrap_or(1000);
 
     let admin_force_seal_enabled = std::env::var("CORECRUXD_ADMIN_FORCE_SEAL")
-        .ok()
-        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+        .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
 
     // Fact-store retention window in days. Unset (or 0) = retention off.
     let retention_days = std::env::var("CORECRUXD_RETENTION_DAYS")
@@ -1051,8 +1045,7 @@ pub fn load_config() -> Config {
         .ok()
         .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
     let receipts_recompute_candidate_digest = std::env::var("CORECRUXD_RECEIPTS_RECOMPUTE_CANDIDATE_DIGEST")
-        .ok()
-        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+        .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
     let receipts_keyring_path = std::env::var("CORECRUXD_RECEIPTS_KEYRING_PATH").ok().map(PathBuf::from);
     let receipts_keyring_json = std::env::var("CORECRUXD_RECEIPTS_KEYRING_JSON").ok();
     let witness_enabled = env_bool("CORECRUXD_WITNESS_ENABLED").unwrap_or(false);
@@ -1145,8 +1138,7 @@ pub fn load_config() -> Config {
         .clamp(5, 86_400);
 
     let scrub_scheduler_enabled = std::env::var("CORECRUXD_SCRUB_SCHEDULER_ENABLED")
-        .ok()
-        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+        .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
     let scrub_interval_secs = std::env::var("CORECRUXD_SCRUB_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1325,8 +1317,7 @@ pub fn load_config() -> Config {
         // Prefer batch-count boundary by default; keep bounded delay available via env override.
         .unwrap_or(0),
         enable_directory_compaction: std::env::var("CORECRUXD_ENABLE_DIRECTORY_COMPACTION")
-            .ok()
-            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
+            .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
         dir_l0_max_runs: std::env::var("CORECRUXD_DIR_L0_MAX_RUNS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1361,8 +1352,7 @@ pub fn load_config() -> Config {
         dense_model: std::env::var("CORECRUXD_DENSE_MODEL").ok().filter(|s| !s.is_empty()),
         semantic_dedup_threshold: {
             let enabled = std::env::var("CORECRUXD_SEMANTIC_DEDUP")
-                .ok()
-                .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+                .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
             enabled.then(|| {
                 std::env::var("CORECRUXD_SEMANTIC_DEDUP_THRESHOLD")
                     .ok()
@@ -1372,8 +1362,7 @@ pub fn load_config() -> Config {
         },
 
         sync_enabled: std::env::var("CORECRUXD_SYNC_ENABLED")
-            .ok()
-            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
+            .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
         sync_remote_url: std::env::var("CORECRUXD_SYNC_REMOTE_URL").unwrap_or_default(),
         sync_api_key: std::env::var("CORECRUXD_SYNC_API_KEY").unwrap_or_default(),
         sync_interval_secs: std::env::var("CORECRUXD_SYNC_INTERVAL_SECS")
@@ -1382,14 +1371,12 @@ pub fn load_config() -> Config {
             .unwrap_or(300)
             .max(10),
         sync_mutual_auth: std::env::var("CORECRUXD_SYNC_MUTUAL_AUTH")
-            .ok()
-            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
         sync_peer_trust_root: env_string("CORECRUXD_SYNC_PEER_TRUST_ROOT")
             .as_deref()
             .and_then(parse_sync_peer_trust_root),
         sync_delegation_enforce: std::env::var("CORECRUXD_SYNC_DELEGATION_ENFORCE")
-            .ok()
-            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
         update_check_enabled: std::env::var("CORECRUXD_UPDATE_CHECK_ENABLED")
             .ok()
             .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
@@ -1478,11 +1465,9 @@ pub fn load_config() -> Config {
             .ok()
             .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
         integrations_safe_mode: std::env::var("CORECRUXD_INTEGRATIONS_SAFE_MODE")
-            .ok()
-            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
+            .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
         integrations_allow_executable_helpers: std::env::var("CORECRUXD_INTEGRATIONS_ALLOW_EXECUTABLE_HELPERS")
-            .ok()
-            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
+            .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
         operating_mode,
         enabled_pro_services,
         ingress: IngressConfig::from_env(),

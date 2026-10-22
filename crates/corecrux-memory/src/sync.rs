@@ -1203,7 +1203,7 @@ impl SyncClient {
         }
 
         let mut entity_summary: Vec<(String, usize)> = entity_counts.into_iter().collect();
-        entity_summary.sort_by(|a, b| b.1.cmp(&a.1));
+        entity_summary.sort_by_key(|e| std::cmp::Reverse(e.1));
 
         SyncPushPreview {
             pushable_count,

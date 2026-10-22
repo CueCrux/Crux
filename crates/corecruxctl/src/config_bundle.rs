@@ -29,8 +29,7 @@ const MAX_BUNDLE_BYTES: usize = 1024 * 1024;
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 fn claude_dir() -> Result<PathBuf, DynErr> {

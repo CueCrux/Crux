@@ -71,9 +71,7 @@ fn feature_enabled() -> bool {
     // out of the box. It requires an authenticated passport and soft-deletes
     // within a recovery window. Explicit `CORECRUXD_FEATURE_SCOPED_FORGET=0`
     // disables the mutating tool.
-    env::var(FEATURE_FLAG_ENV)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true)
+    env::var(FEATURE_FLAG_ENV).map_or(true, |v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 fn recovery_window() -> Duration {
@@ -246,7 +244,7 @@ fn resolve_scope<'a>(
         }
     }
 
-    matches.sort_by(|left, right| left.stored_at.cmp(&right.stored_at));
+    matches.sort_by_key(|left| left.stored_at);
 
     if let Some(budget) = token_budget {
         let mut used = 0usize;

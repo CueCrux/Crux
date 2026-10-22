@@ -202,7 +202,7 @@ impl ArtefactStore {
             .filter(|r| !mime_is_reserved(&r.mime_type))
             .map(ArtefactRecord::to_metadata)
             .collect();
-        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        out.sort_by_key(|r| std::cmp::Reverse(r.created_at));
         out.truncate(top_k);
         out
     }

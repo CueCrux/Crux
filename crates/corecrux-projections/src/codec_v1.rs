@@ -50,7 +50,7 @@ pub fn decode_hot_ptrs_v1(input: &[u8]) -> Result<BTreeMap<(u64, u32), HotPtrEnt
         });
     }
     let mut out: BTreeMap<(u64, u32), HotPtrEntryV1> = BTreeMap::new();
-    for chunk in input.chunks_exact(HOT_PTR_ENTRY_STRIDE_V1) {
+    for chunk in input.as_chunks::<HOT_PTR_ENTRY_STRIDE_V1>().0 {
         let tenant_hash = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
         let artifact_id = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
         let edge_count = u32::from_le_bytes(chunk[12..16].try_into().unwrap());
@@ -105,7 +105,7 @@ pub fn decode_living_rows_v1(input: &[u8]) -> Result<BTreeMap<(u64, u32), Living
         });
     }
     let mut out: BTreeMap<(u64, u32), LivingStateRowV1> = BTreeMap::new();
-    for chunk in input.chunks_exact(LIVING_ROW_STRIDE_V1) {
+    for chunk in input.as_chunks::<LIVING_ROW_STRIDE_V1>().0 {
         let tenant_hash = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
         let artifact_id = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
         let living_status = crate::state::LivingStatusV1::from_u8(chunk[12]);
@@ -189,7 +189,7 @@ pub fn decode_relations_edges_v1(input: &[u8]) -> Result<BTreeMap<(u64, u32, u32
         });
     }
     let mut out: BTreeMap<(u64, u32, u32, u8), RelationEdgeV1> = BTreeMap::new();
-    for chunk in input.chunks_exact(RELATION_EDGE_STRIDE_V1) {
+    for chunk in input.as_chunks::<RELATION_EDGE_STRIDE_V1>().0 {
         let tenant_hash = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
         let src = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
         let dst = u32::from_le_bytes(chunk[12..16].try_into().unwrap());
@@ -259,7 +259,7 @@ pub fn decode_dependents_edges_v1(input: &[u8]) -> Result<BTreeMap<(u64, u32, u8
         });
     }
     let mut out: BTreeMap<(u64, u32, u8, uuid::Uuid), DependentEdgeV1> = BTreeMap::new();
-    for chunk in input.chunks_exact(DEPENDENT_EDGE_STRIDE_V1) {
+    for chunk in input.as_chunks::<DEPENDENT_EDGE_STRIDE_V1>().0 {
         let tenant_hash = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
         let artifact_id = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
         let dependent_type = chunk[12];
@@ -306,7 +306,7 @@ pub fn decode_pressure_rows_v1(input: &[u8]) -> Result<BTreeMap<(u64, u32, uuid:
         });
     }
     let mut out: BTreeMap<(u64, u32, uuid::Uuid), PressureEventRowV1> = BTreeMap::new();
-    for chunk in input.chunks_exact(PRESSURE_ROW_STRIDE_V1) {
+    for chunk in input.as_chunks::<PRESSURE_ROW_STRIDE_V1>().0 {
         let tenant_hash = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
         let artifact_id = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
         let mut eid = [0u8; 16];

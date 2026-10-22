@@ -336,8 +336,7 @@ fn tool_exists(bin: &str) -> bool {
     Command::new(bin)
         .arg("--version")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Walk a repo collecting `(repo_relative_path, content)` for source files we

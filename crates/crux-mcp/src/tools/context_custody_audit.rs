@@ -42,13 +42,11 @@ pub const FEATURE_FLAG_ENV: &str = "CRUX_CONTEXT_CUSTODY_AUDIT";
 /// Returns `true` for `1` / `true` / `yes` (case-insensitive), matching the
 /// flag-reading idiom used elsewhere in the crate.
 fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    std::env::var(name).is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn env_set_nonempty(name: &str) -> bool {
-    std::env::var(name).ok().is_some_and(|v| !v.trim().is_empty())
+    std::env::var(name).is_ok_and(|v| !v.trim().is_empty())
 }
 
 /// Is the audit surface enabled for this process?

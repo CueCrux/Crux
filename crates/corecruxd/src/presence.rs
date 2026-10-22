@@ -79,7 +79,7 @@ impl PresenceTracker {
     pub async fn snapshot(&self) -> Vec<PresenceEntry> {
         let map = self.inner.read().await;
         let mut out: Vec<PresenceEntry> = map.values().cloned().collect();
-        out.sort_by(|a, b| b.last_seen_at_unix_ms.cmp(&a.last_seen_at_unix_ms));
+        out.sort_by_key(|e| std::cmp::Reverse(e.last_seen_at_unix_ms));
         out
     }
 }

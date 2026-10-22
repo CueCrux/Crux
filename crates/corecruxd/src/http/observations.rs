@@ -1956,7 +1956,7 @@ pub(super) async fn get_observations_aggregate(
         count_observation_field(&mut principal_counts, &record.principal, "(missing)");
         count_observation_field(&mut kind_counts, &record.kind, "(missing)");
     }
-    all.sort_by(|a, b| b.1.ts.cmp(&a.1.ts));
+    all.sort_by_key(|e| std::cmp::Reverse(e.1.ts));
     let limit = params.limit.unwrap_or(DEFAULT_AGGREGATE_LIMIT).min(MAX_AGGREGATE_LIMIT);
     if all.len() > limit {
         all.truncate(limit);

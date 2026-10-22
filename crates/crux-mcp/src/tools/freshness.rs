@@ -130,7 +130,7 @@ pub async fn handle_memory_freshness(args: &Value, ctx: &McpContext) -> Result<V
         .collect();
 
     // Stalest first — sort by age descending (older = higher priority).
-    candidates.sort_by(|a, b| a.stored_at.cmp(&b.stored_at));
+    candidates.sort_by_key(|a| a.stored_at);
 
     for f in candidates.iter().take(top_k) {
         let anchor = f.reverified_at.unwrap_or(f.stored_at);
@@ -231,7 +231,7 @@ pub async fn handle_memory_sweep_candidates(args: &Value, ctx: &McpContext) -> R
 
     // Stalest first, then superseded — sort by age descending so the most
     // overdue archive candidates lead.
-    candidates.sort_by(|a, b| a.0.stored_at.cmp(&b.0.stored_at));
+    candidates.sort_by_key(|a| a.0.stored_at);
 
     let mut rows: Vec<Value> = Vec::new();
     let mut used_tokens: usize = 0;
@@ -302,7 +302,7 @@ pub async fn handle_memory_sweep_candidates(args: &Value, ctx: &McpContext) -> R
                 }
             })
             .collect();
-        ephemeral.sort_by(|a, b| a.stored_at.cmp(&b.stored_at));
+        ephemeral.sort_by_key(|a| a.stored_at);
         for f in ephemeral.iter().take(top_k) {
             let age_hours = (now - f.stored_at).num_hours().max(0);
             let topic = scope::visible_entity_for_identity(f, id_ref, &alias_refs).unwrap_or_else(|| f.entity.clone());

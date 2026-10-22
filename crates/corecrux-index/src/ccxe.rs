@@ -647,10 +647,12 @@ pub fn verify_footer_hashes(data: &[u8]) -> crate::Result<()> {
         return Err(IndexError::BufferTooSmall);
     }
     // Turbo modes size the vector area from the metadata params — mirror `parse`.
+    // CE divergence (VENDORED_FROM.md #13): `.ok().and_then` replaces upstream's
+    // `.map(..).unwrap_or(None)` for clippy 1.99; same result.
     let turbo_params = if version >= CCXE_VERSION_V2 && metadata_len > 0 {
         parse_v2_metadata(&data[CCXE_HEADER_LEN..metadata_end])
-            .map(|m| m.turbo_params)
-            .unwrap_or(None)
+            .ok()
+            .and_then(|m| m.turbo_params)
     } else {
         None
     };
@@ -799,10 +801,12 @@ impl CcxeReader {
         if metadata_end > data.len().saturating_sub(CCXE_FOOTER_LEN) {
             return Err(IndexError::BufferTooSmall);
         }
+        // CE divergence (VENDORED_FROM.md #13): `map_or` replaces upstream's
+        // `.map(..).unwrap_or(..)` for clippy 1.99; same result.
         let (build_fingerprint, calibration_vector, turbo_params) = if version >= CCXE_VERSION_V2 && metadata_len > 0 {
-            parse_v2_metadata(&data[CCXE_HEADER_LEN..metadata_end])
-                .map(|m| (m.build_fingerprint, m.calibration_vector, m.turbo_params))
-                .unwrap_or((None, None, None))
+            parse_v2_metadata(&data[CCXE_HEADER_LEN..metadata_end]).map_or((None, None, None), |m| {
+                (m.build_fingerprint, m.calibration_vector, m.turbo_params)
+            })
         } else {
             (None, None, None)
         };

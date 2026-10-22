@@ -24,8 +24,7 @@ use corecrux_projections::decay;
 /// OFF keeps recall strictly read-only and byte-identical to pre-M2.
 fn salience_enabled() -> bool {
     std::env::var("CORECRUXD_MEMORY_SALIENCE")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
 /// Resolve the (scope_identity, aliases) pair for `ctx` (agent-passport M5).

@@ -4,10 +4,10 @@
 # --- Builder stage ---
 # Chainguard exception (workspace CLAUDE.md §9): the build stage stays on the
 # upstream `rust` image because the workspace pins its toolchain via
-# rust-toolchain.toml (channel 1.88.0) and needs rustup to honour that pin;
+# rust-toolchain.toml (channel 1.99.1) and needs rustup to honour that pin;
 # cgr.dev/chainguard/rust free tier is :latest-only (floating toolchain), which
 # would silently drift the compiler under a pinned, reproducible release build.
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.99-bookworm AS builder
 
 RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
 

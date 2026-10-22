@@ -51,18 +51,14 @@ fn sync_data_dir() -> PathBuf {
 }
 
 fn sync_background_enabled() -> bool {
-    std::env::var("CORECRUXD_SYNC_ENABLED")
-        .ok()
-        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    std::env::var("CORECRUXD_SYNC_ENABLED").is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn sync_runtime_status() -> SyncRuntimeStatus {
     let remote_url = std::env::var("CORECRUXD_SYNC_REMOTE_URL")
         .ok()
         .filter(|value| !value.is_empty());
-    let api_key_configured = std::env::var("CORECRUXD_SYNC_API_KEY")
-        .ok()
-        .is_some_and(|value| !value.is_empty());
+    let api_key_configured = std::env::var("CORECRUXD_SYNC_API_KEY").is_ok_and(|value| !value.is_empty());
 
     let status = SyncRuntimeStatus::from_settings(sync_background_enabled(), remote_url.as_deref(), api_key_configured);
 

@@ -240,7 +240,7 @@ pub fn refresh(cfg: &GitConfig, root: &Path) -> SyncOutcome {
         // A non-empty non-repo directory is almost certainly the legacy rsync
         // root. Refuse rather than clone over it — the operator should move it
         // aside deliberately so nothing that was only ever there is lost.
-        if root.exists() && std::fs::read_dir(root).map(|mut d| d.next().is_some()).unwrap_or(false) {
+        if root.exists() && std::fs::read_dir(root).is_ok_and(|mut d| d.next().is_some()) {
             return SyncOutcome::failed(
                 &cfg.branch,
                 format!(

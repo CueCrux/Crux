@@ -31,9 +31,7 @@ pub(super) struct PostLegalHoldBody {
 }
 
 fn feature_enabled() -> bool {
-    std::env::var(LEGAL_HOLD_FEATURE_FLAG)
-        .ok()
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    std::env::var(LEGAL_HOLD_FEATURE_FLAG).is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
 fn feature_disabled_response() -> Response {
@@ -96,6 +94,7 @@ fn release_error_response(err: corecrux_memory::LegalHoldError) -> Response {
 /// Persist the signed release observation before committing released state.
 /// Receipt failure therefore leaves the hold active; commit failure can only
 /// leave an orphaned receipt, never an unreceipted release.
+#[allow(clippy::result_large_err)]
 async fn release_with_signed_receipt(
     state: &AppState,
     hold_id: &str,

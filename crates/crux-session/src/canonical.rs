@@ -105,16 +105,16 @@ fn write_head(major: u8, arg: u64, out: &mut Vec<u8>) {
     if arg < 24 {
         out.push(prefix | (arg as u8));
     } else if arg <= 0xFF {
-        out.push(prefix | 24);
+        out.push(prefix | 0x18);
         out.push(arg as u8);
     } else if arg <= 0xFFFF {
-        out.push(prefix | 25);
+        out.push(prefix | 0x19);
         out.extend_from_slice(&(arg as u16).to_be_bytes());
     } else if arg <= 0xFFFF_FFFF {
-        out.push(prefix | 26);
+        out.push(prefix | 0x1A);
         out.extend_from_slice(&(arg as u32).to_be_bytes());
     } else {
-        out.push(prefix | 27);
+        out.push(prefix | 0x1B);
         out.extend_from_slice(&arg.to_be_bytes());
     }
 }

@@ -65,7 +65,7 @@ pub fn decode_cold_segment_dir_v1(input: &[u8]) -> Result<Vec<ColdSegmentDirEntr
         });
     }
     let mut out = Vec::with_capacity(input.len() / 40);
-    for chunk in input.chunks_exact(40) {
+    for chunk in input.as_chunks::<40>().0 {
         let mut seg = [0u8; 32];
         seg.copy_from_slice(&chunk[0..32]);
         let file_len = u64::from_le_bytes(chunk[32..40].try_into().unwrap());

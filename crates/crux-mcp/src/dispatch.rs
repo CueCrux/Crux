@@ -127,9 +127,7 @@ pub type DenseProviderFactory = Arc<
 /// `corecruxd::main` threads the result into
 /// [`McpContext::with_revocation_enforced`].
 pub fn revocation_enforced_from_env() -> bool {
-    std::env::var("CRUX_PASSPORT_REVOCATION")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true)
+    std::env::var("CRUX_PASSPORT_REVOCATION").map_or(true, |v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 impl McpContext {
@@ -779,8 +777,7 @@ fn enforce_rcx_tool_capability(id: Option<serde_json::Value>, name: &str, ctx: &
 pub(crate) fn current_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

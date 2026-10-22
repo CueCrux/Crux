@@ -21,14 +21,14 @@ const DEBOUNCE_MS: u64 = 750;
 const POLL_INTERVAL_MS: u64 = 1_000;
 
 pub(crate) fn enabled_from_env() -> bool {
-    std::env::var(WATCH_ENV).ok().is_some_and(|v| {
+    std::env::var(WATCH_ENV).is_ok_and(|v| {
         let v = v.trim().to_ascii_lowercase();
         !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
     })
 }
 
 fn poll_enabled_from_env() -> bool {
-    std::env::var(WATCH_POLL_ENV).ok().is_some_and(|v| {
+    std::env::var(WATCH_POLL_ENV).is_ok_and(|v| {
         let v = v.trim().to_ascii_lowercase();
         !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
     })

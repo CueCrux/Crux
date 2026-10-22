@@ -30,8 +30,8 @@ pub const DELEGATION_MAX_TEXT_BYTES_PER_REQUEST: usize = 256 * 1024;
 
 const DELEGATION_MAX_ATTEMPTS_CEILING: usize = 5;
 const DELEGATION_MAX_BACKOFF: Duration = Duration::from_secs(1);
-const DELEGATION_MAX_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const DELEGATION_MAX_BREAKER_OPEN_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+const DELEGATION_MAX_TIMEOUT: Duration = Duration::from_mins(5);
+const DELEGATION_MAX_BREAKER_OPEN_FOR: Duration = Duration::from_hours(24);
 
 /// The premium lane the metered `/v1/compute/embed` door bills against. Must
 /// match `COMPUTE_EMBED_LANE_SLUG` on the provider side: the door rejects a
@@ -1270,7 +1270,7 @@ impl EmbeddingClient {
 
     /// Return the detected or configured dimensionality.
     pub fn dimensions(&self) -> usize {
-        self.detected_dims.lock().map(|d| *d).unwrap_or(0)
+        self.detected_dims.lock().map_or(0, |d| *d)
     }
 
     pub fn model(&self) -> &str {

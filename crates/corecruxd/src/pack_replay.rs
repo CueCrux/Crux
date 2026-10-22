@@ -1238,8 +1238,7 @@ impl ActivationGate {
     /// never race on process env.
     pub fn from_env() -> Self {
         let enforced = std::env::var(REPLAY_GATE_ENV)
-            .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false);
+            .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
         if enforced {
             Self::Enforced
         } else {

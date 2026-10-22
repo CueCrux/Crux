@@ -607,8 +607,7 @@ fn relation_record(
 fn current_micros() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_micros() as i64)
 }
 
 fn call_confidence_bp(call_count: usize) -> u16 {

@@ -221,7 +221,7 @@ pub fn read_and_verify_pack(path: &Path) -> Result<CruxPack, MemoryPackError> {
 
 /// Run the import against the daemon. Gated by `CRUX_MEMORY_IMPORT=1`.
 pub fn run_memory_import(args: &MemoryImportArgs) -> Result<serde_json::Value, MemoryPackError> {
-    if !std::env::var("CRUX_MEMORY_IMPORT").map(|v| v == "1").unwrap_or(false) {
+    if !std::env::var("CRUX_MEMORY_IMPORT").is_ok_and(|v| v == "1") {
         return Err(MemoryPackError::ImportDisabled);
     }
     let pack = read_and_verify_pack(&args.file)?;

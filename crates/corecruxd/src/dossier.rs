@@ -204,7 +204,7 @@ pub fn generate_auto(store: &corecrux_memory::FactStore, input: AutoInput<'_>) -
         },
     );
 
-    let dossier_id = format!("dsr_{}_{}", input.now_unix_ms, sanitise_id_token(input.agent_passport),);
+    let dossier_id = format!("dsr_{}_{}", input.now_unix_ms, sanitise_id_token(input.agent_passport));
     let mut d = Dossier {
         dossier_id: dossier_id.clone(),
         project_id: input.project_id.to_string(),

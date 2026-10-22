@@ -213,6 +213,7 @@ fn next_seq(store: &corecrux_memory::EntityStore, session_id: &str) -> u64 {
 /// `seq` minted there with [`next_seq`] cannot be minted twice: read under a
 /// separate lock, two concurrent opens both took `max + 1`, and the second
 /// overwrote the first's default `node_id`.
+#[allow(clippy::result_large_err)]
 async fn upsert_node(
     state: &AppState,
     actor: &str,

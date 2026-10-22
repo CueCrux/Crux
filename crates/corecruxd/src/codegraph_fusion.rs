@@ -30,7 +30,7 @@ pub(crate) struct CodeGraphBoostInput {
 }
 
 pub(crate) fn enabled_from_env() -> bool {
-    std::env::var(CODEGRAPH_FUSION_ENV).ok().is_some_and(|v| {
+    std::env::var(CODEGRAPH_FUSION_ENV).is_ok_and(|v| {
         let v = v.trim().to_ascii_lowercase();
         !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
     })

@@ -82,9 +82,13 @@ one step at a time, watching concurrent-run counts *and* queue-ejection events.
 ## Required checks the queue waits on
 
 Every one of these must fire on the `merge_group` event or the queue hangs
-(wired in PR #280): **Lint, Test, MSRV (1.88.0), Coverage** (`ci.yml`),
+(wired in PR #280): **Lint, Test, MSRV, Coverage** (`ci.yml`),
 **Build rustdoc** (`docs.yml`), **Cargo deny policy, Cargo audit, Licence
 check** (`audit.yml`), **Semver Compatibility** (`semver.yml`).
+
+The MSRV job's check name carries no version on purpose: a toolchain bump edits
+`rust-toolchain.toml` and the job's `toolchain:` input, never the required-check
+list.
 
 > **Caveat (OD-MQ-2):** the `ci:fallback` label escape hatch does **not** work
 > inside the queue — queue entries are not PRs and cannot be labelled. If the

@@ -217,8 +217,7 @@ fn federation_read_decision(state: &AppState) -> Option<crux_router::RouterDecis
 fn current_unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 fn rcx_refusal_response(decision: &crux_router::RouterDecision) -> Response {

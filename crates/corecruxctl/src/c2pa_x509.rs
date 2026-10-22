@@ -59,11 +59,11 @@ pub fn cert_status(opts: &StatusOptions) -> Result<CertStatusReport, Box<dyn std
     let leaf_cert_path = opts
         .leaf_cert_path
         .clone()
-        .map_or_else(|| PathBuf::from(DEFAULT_LEAF_CERT_PATH), |p| p);
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_LEAF_CERT_PATH));
     let root_anchor_path = opts
         .root_anchor_path
         .clone()
-        .map_or_else(|| PathBuf::from(DEFAULT_ROOT_ANCHOR_PATH), |p| p);
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT_ANCHOR_PATH));
     let mut notes: Vec<String> = Vec::new();
 
     let leaf_pem = match std::fs::read_to_string(&leaf_cert_path) {
@@ -473,8 +473,7 @@ fn summarise_cert(der: &[u8]) -> Result<CertSummary, Box<dyn std::error::Error +
     let not_after = format_validity(not_after_secs);
     let now_secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let days_to_expiry = (not_after_secs as i64 - now_secs as i64) / 86_400;
     let urgency = if days_to_expiry < 7 {
         "red"

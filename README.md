@@ -86,7 +86,7 @@ chmod +x crux
 CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR=./data ./crux
 ```
 
-**From source** (Rust 1.88+, `protobuf-compiler`):
+**From source** (Rust 1.99+, `protobuf-compiler`):
 
 ```bash
 git clone https://github.com/CueCrux/Crux.git && cd Crux
@@ -405,7 +405,7 @@ API surface: [`docs/developer-portal.md`](docs/developer-portal.md).
 | Path | Requirements |
 |---|---|
 | Docker | Docker or Docker Desktop. |
-| Build from source | Rust 1.88+, `protobuf-compiler`, and a C toolchain. |
+| Build from source | Rust 1.99+, `protobuf-compiler`, and a C toolchain. |
 | Shell examples | `curl`; `jq` recommended. |
 | Embeddings | Optional local or remote embedding endpoint. |
 

@@ -64,8 +64,7 @@ pub(super) async fn healthz(State(state): State<AppState>) -> impl IntoResponse 
 /// fully network-restrict them. Off by default (full detail).
 pub(super) fn public_probes_minimal() -> bool {
     std::env::var("CORECRUXD_PUBLIC_PROBES_MINIMAL")
-        .ok()
-        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 /// Build the `/readyz` failure response, suppressing per-check detail in minimal
@@ -454,8 +453,7 @@ fn rerank_endpoint_configured(state: &AppState) -> bool {
 fn rerank_endpoint_configured(_state: &AppState) -> bool {
     std::env::var("CORECRUXD_GPU1_BASE_URL")
         .or_else(|_| std::env::var("CRUX_GPU1_BASE_URL"))
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty())
+        .is_ok_and(|value| !value.trim().is_empty())
 }
 
 fn embedding_delegation_runtime_state(
@@ -620,7 +618,7 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
     });
     Json(serde_json::json!({
         "version": state.build.version,
-        "msrv": "1.88.0",
+        "msrv": "1.99.1",
         "product": product,
         "cloud_access": {
             "schema": cloud_access.schema,
@@ -704,7 +702,7 @@ pub(super) async fn get_admin_version(State(state): State<AppState>, headers: He
     Json(serde_json::json!({
         "version": state.build.version,
         "commit": state.build.commit,
-        "msrv": "1.88.0",
+        "msrv": "1.99.1",
         "passport": {
             // Daemon's local RCX passport identity. The public key is the
             // verification key for receipts minted by this daemon (e.g.
@@ -752,14 +750,11 @@ pub(super) async fn get_admin_version(State(state): State<AppState>, headers: He
 
 pub(super) fn sync_runtime_status() -> corecrux_memory::sync::SyncRuntimeStatus {
     let background_sync_enabled = std::env::var("CORECRUXD_SYNC_ENABLED")
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
     let remote_url = std::env::var("CORECRUXD_SYNC_REMOTE_URL")
         .ok()
         .filter(|value| !value.is_empty());
-    let api_key_configured = std::env::var("CORECRUXD_SYNC_API_KEY")
-        .ok()
-        .is_some_and(|value| !value.is_empty());
+    let api_key_configured = std::env::var("CORECRUXD_SYNC_API_KEY").is_ok_and(|value| !value.is_empty());
 
     corecrux_memory::sync::SyncRuntimeStatus::from_settings(
         background_sync_enabled,

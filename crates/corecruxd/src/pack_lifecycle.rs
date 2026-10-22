@@ -105,8 +105,7 @@ impl PackLifecycleState {
 /// arguments and tests never race on process env.
 pub fn default_install_state() -> PackLifecycleState {
     let staged = std::env::var(PACK_STAGING_ENV)
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
+        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
     if staged {
         PackLifecycleState::Staged
     } else {

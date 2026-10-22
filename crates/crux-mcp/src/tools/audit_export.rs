@@ -58,9 +58,7 @@ pub const EXPORT_DIR_ENV: &str = "CORECRUXD_AUDIT_EXPORT_DIR";
 pub const RESERVED_PREFIXES: &[&str] = &["__agent::", "__ops::", "__bootstrap__::", "__agent_session::"];
 
 fn feature_enabled() -> bool {
-    env::var(FEATURE_FLAG_ENV)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    env::var(FEATURE_FLAG_ENV).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 fn is_reserved(entity: &str) -> bool {

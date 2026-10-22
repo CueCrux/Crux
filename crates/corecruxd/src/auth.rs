@@ -146,9 +146,7 @@ struct AgentTokenHttpConfig {
 const HTTP_ACCEPT_AGENT_TOKENS_ENV: &str = "CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS";
 
 fn env_truthy(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+    std::env::var(name).is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
 }
 
 /// Build the agent-token HTTP config from env, or `None` if disabled / no tokens.
@@ -409,8 +407,7 @@ fn validate_hs256_secret(secret: &[u8]) -> Result<(), String> {
 
 fn weak_hs256_secret_allowed() -> bool {
     std::env::var(ALLOW_WEAK_HS256_SECRET_ENV)
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn parse_scopes(raw: &str) -> BTreeSet<String> {
@@ -1309,13 +1306,11 @@ impl HttpScopeContext {
     #[allow(clippy::result_large_err)]
     fn resolve_fact_tenant_on(&self, requested: Option<&str>) -> Result<String, ProblemResponse> {
         let resolved = self.resolve_authorized_tenant(requested)?;
-        let has_selector = requested.map(str::trim).filter(|value| !value.is_empty()).is_some()
+        let has_selector = requested.is_some_and(|value| !value.trim().is_empty())
             || self
                 .write_tenant_selector
                 .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_some();
+                .is_some_and(|value| !value.trim().is_empty());
         if matches!(self.tenants, TenantAllow::Any) && !has_selector {
             return Err(ProblemResponse(
                 ProblemDetails::forbidden("wildcard tenant token must select one tenant")

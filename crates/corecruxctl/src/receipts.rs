@@ -1514,11 +1514,11 @@ fn tsa_smoke_fail_v1(
 
 pub fn parse_hex_bytes_v1(raw: &str) -> Result<Vec<u8>, String> {
     let raw = raw.strip_prefix("0x").unwrap_or(raw);
-    if raw.is_empty() || raw.len() % 2 != 0 {
+    if raw.is_empty() || !raw.len().is_multiple_of(2) {
         return Err("hex value must contain an even number of digits".to_string());
     }
     let mut out = Vec::with_capacity(raw.len() / 2);
-    for chunk in raw.as_bytes().chunks_exact(2) {
+    for chunk in raw.as_bytes().as_chunks::<2>().0 {
         let hi = hex_val_v1(chunk[0])?;
         let lo = hex_val_v1(chunk[1])?;
         out.push((hi << 4) | lo);

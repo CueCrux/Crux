@@ -17,10 +17,14 @@
 //! Proto source files live in `proto/` at the repository root. Regenerate with
 //! `cargo build` (the build script runs `tonic-build` automatically).
 
+// Generated code: tonic-build marks client constructors `#[must_use]` on types
+// that are already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 pub mod dataplane_v1 {
     tonic::include_proto!("corecrux.dataplane.v1");
 }
 
+#[allow(clippy::double_must_use)]
 pub mod observe_v1 {
     tonic::include_proto!("corecrux.observe.v1");
 }

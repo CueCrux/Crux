@@ -444,10 +444,7 @@ pub fn load_witness_signing_key() -> Option<P256SigningKey> {
 ///    pre-R2 default, unchanged.
 /// 3. else `None` — no key, heads stay pending (unchanged).
 pub fn select_witness_signer(timeout: Duration) -> Option<Box<dyn WitnessSigner>> {
-    if std::env::var(ENV_WITNESS_VAULT_KEY)
-        .ok()
-        .is_some_and(|v| !v.trim().is_empty())
-    {
+    if std::env::var(ENV_WITNESS_VAULT_KEY).is_ok_and(|v| !v.trim().is_empty()) {
         match VaultTransitSigner::from_env(timeout) {
             Ok(signer) => {
                 tracing::info!("witness: signing via Vault Transit (private key stays off-host)");

@@ -56,7 +56,13 @@ pub struct DataPlanePool {
 // unconstructable in the Crux Daemon. They exist only so that code
 // paths behind `if let Some(pool) = ... { ... }` guards type-check without
 // requiring every caller to be gutted.
-#[allow(dead_code, unused_variables, clippy::unused_async, clippy::unused_self)]
+#[allow(
+    dead_code,
+    unused_variables,
+    clippy::unused_async,
+    clippy::unused_async_trait_impl,
+    clippy::unused_self
+)]
 impl DataPlanePool {
     pub fn default_gpu_id(&self) -> i32 {
         unreachable!()
