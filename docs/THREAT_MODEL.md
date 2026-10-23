@@ -133,6 +133,11 @@ for the Crux Daemon.
    with neither authentication rail configured permits anonymous access.
 5. Public `/v1/version` is redacted. Full operational version details live at
    `/v1/admin/version` behind `admin:read`.
+6. `GET /v1/receipts/signing-keys` is unauthenticated and serves only the
+   receipt-signing *public* key. It is discovery, not trust: a key fetched
+   from the daemon that signed a receipt proves nothing if that daemon or the
+   channel is compromised. Verifiers pin the key at enrolment (or cross-check
+   a witness) and treat a changed key as an alarm.
 
 ## Capability Token Trust and Revocation
 

@@ -95,8 +95,8 @@ pass "c. /verification signature_valid=true error_code=OK chain_position_checked
 code="$(api GET "/v1/observations/aggregate?kind=model_invocation&limit=500")"
 [ "$code" = 200 ] || fail "c. observations HTTP $code"
 jq --arg r "$RID" '[.observations[] | select(.payload.receipt_id == $r)]' resp.json > claims.json
-# A minter may choose receipt_id and the daemon does not refuse a repeat, so
-# one id can name two signed bodies. Exactly one distinct body, or stop.
+# Current daemons refuse a reused receipt_id, but a log an older daemon wrote
+# can hold two signed bodies under one id. Exactly one distinct body, or stop.
 n="$(jq '[.[].payload.body_cbor_hex] | unique | length' claims.json)"
 [ "$n" != 0 ] || fail "c. receipt not in mediation log"
 [ "$n" = 1 ] || fail "c. receipt id $RID claimed by $n distinct bodies"
@@ -123,8 +123,9 @@ else
   echo "SKIP  d. b3sum not installed: blake3 body_hash / key_id binding not checked"
 fi
 if [ -x "$CTL" ]; then
-  # corecruxctl has no generic `receipts verify` (ReceiptsCommand, corecruxctl
-  # main.rs:2190), and export-cose only takes a CROWN *retrieval* receipt
+  # `corecruxctl receipts verify-stream-receipt --keyring` verifies this
+  # receipt offline (crux-jev verify does the same from Python). What is still
+  # missing is COSE export: export-cose only takes a CROWN *retrieval* receipt
   # (CrownReceiptV1: snap-id, answer-id, query-hash, ...). Probe it so this
   # line flips when model_invocation export lands.
   python3 -c 'import sys,json; print(json.dumps({"receipt": json.load(open("record.json"))["payload"]}))' > receipt.json

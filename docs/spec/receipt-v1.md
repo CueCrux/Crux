@@ -58,6 +58,11 @@ corecruxctl receipts verify-stream-receipt record.json --keyring keyring.json \
 ```
 
 `keyring.json` is `{"v":1,"keys":[{"keyId":"<passport fingerprint>","pubKeyBase64":"<ed25519 public key>"}]}`.
+The daemon serves exactly this shape, unauthenticated, at
+`GET /v1/receipts/signing-keys` (each key also carries `publicKeyHex`,
+`alg: "ed25519"` and `use: "receipt-signing"`, which the keyring parser
+ignores). That route is key *discovery*, not trust: pin the key when you
+enrol the daemon, and treat a later change as an alarm rather than refetching.
 The command checks the daemon's own signature (nothing is re-signed and no key
 is read from the record) and exits non-zero unless the signature is valid, the
 body hash matches, the signed body names the tenant (`--tenant-id`, default
