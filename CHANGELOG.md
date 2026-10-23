@@ -13,6 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Crux Claude Code mod in setup.** `corecruxctl login` / `start` and
+  `crux-config-wizard init` now install `crux-desktop`, a Claude Code
+  function-hook mod that owns session continuity: a context block on the first
+  prompt, `save_session` (as `hook:session:<id>`) after every turn, before
+  compaction and at session end, a status-line entry and a `/crux` pane. The
+  installer writes the mod to `~/.claude/mods/crux-desktop`, adds it to
+  `CLAUDE_CODE_PLUGIN_DIRS` and `pluginConfigs` in `~/.claude/settings.json`,
+  and registers the daemon as a user-scope `crux` MCP server in
+  `~/.claude.json` (an existing server of that name is left alone). With the
+  mod installed, `hooks install` no longer wires the SessionStart banner or the
+  PreCompact save. New `corecruxctl mods install|uninstall|status` (and the
+  same under `crux-config-wizard mods`); opt out with `--no-mod`.
+
 - **`corecruxctl receipts verify-stream-receipt`** verifies a daemon stream
   receipt (`model_invocation`, `context_injected`, `stream_completed`,
   `stream_aborted`) offline from its observation record against a pinned
@@ -32,6 +45,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Claude Code setup no longer reaches for private or hosted endpoints.** The
+  `crux-coord` hook and the SessionStart banner defaulted to CueCrux's tailnet
+  daemon (`100.70.12.73`) and to `crux.cuecrux.com` when no endpoint was
+  configured; both now default to the loopback daemon, as the hook launcher
+  does, and `crux-coord` reads the endpoint `login` saved. The banner no longer
+  reports "degraded" for a loopback daemon with auth off, and sends no
+  `Authorization` header without a token.
+- **`workspace-cuecrux` leaves the default profile set.** `init
+  --profiles=all` wrote CueCrux's internal endpoints into every user's
+  CLAUDE.md; enable it with `crux-config-wizard add workspace-cuecrux`.
+- **Hook install works from native Windows.** Home and Claude config paths
+  fall back to `USERPROFILE` and honour `CLAUDE_CONFIG_DIR`; hook command paths
+  are shell-quoted and forward-slashed for Claude Code's hook shell; the
+  `crux-hook` and `jq` probes accept `.exe`. The Python banner stack stays a
+  Unix feature.
+- **`corecruxctl start`'s summary names the registered MCP endpoint** rather
+  than the HTTP URL relabelled as MCP.
 - **Passport-bound callers see and verify their own stream receipts.** With
   `CORECRUXD_AGENT_PASSPORTS=1` an agent token is confined to its own tenant,
   while the stream receipts it mints are signed under `local` and logged in
