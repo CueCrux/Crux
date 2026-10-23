@@ -7456,7 +7456,7 @@ fn build_zip_deterministic_round_trip() {
     let mut archive = zip::ZipArchive::new(cursor).expect("valid zip");
     assert_eq!(archive.len(), 2);
     let names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .map(|i| archive.by_index(i).unwrap().name().unwrap().to_string())
         .collect();
     assert!(names.contains(&"hello.txt".to_string()));
     assert!(names.contains(&"sub/nested.json".to_string()));
@@ -9101,6 +9101,9 @@ async fn version_public_view_is_redacted() {
     assert!(body["features"]["graph_expand"].is_boolean());
     assert!(body["features"]["self_observe"].is_boolean());
     assert!(body["features"]["mcp"].is_boolean());
+    // `crux-jev doctor` reads these two to say which Jev flag is missing.
+    assert!(body["capabilities"]["stream_receipts"]["enabled"].is_boolean());
+    assert!(body["capabilities"]["context_surface"]["enabled"].is_boolean());
     assert_eq!(body["sync"]["mode"], "local_only");
     assert_eq!(body["sync"]["configured"], false);
     assert_eq!(body["sync"]["remote_url_redacted"], false);
@@ -9601,8 +9604,7 @@ async fn workbench_command_ledger_is_not_a_sold_claim_without_a_producer() {
         "ledger:history must not survive the PRO_CAPABILITY_CLAIMS filter"
     );
 
-    // It appears in no catalogue, so it can never be reported as
-    // `contracted_external` by `pro_claim_placements`.
+    // It appears in no catalogue, so `pro_claim_placements` never places it.
     assert!(!crate::product::PRO_CAPABILITY_CLAIMS.contains(&"ledger:history"));
     assert!(!crate::product::DAEMON_IMPLEMENTED_PRO_CLAIMS.contains(&"ledger:history"));
     assert!(!crate::product::HOSTED_CONTROL_PLANE_PRO_CLAIMS.contains(&"ledger:history"));

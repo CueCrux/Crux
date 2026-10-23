@@ -416,6 +416,10 @@ def decide(
     request = {"model": model, "state": state, "questions": questions}
     raw, request_id = call(request)
     completed_at = _now()
+    if not isinstance(raw, dict) or "answers" not in raw or "model" not in raw:
+        # Nothing usable came back, so nothing can be recorded: a failure
+        # before any answer (crux-jev exit 1), named rather than a bare KeyError.
+        raise ValueError(f"Jev reply {request_id or '(no request id)'} carries no answers or model")
     answers, model_version = raw["answers"], raw["model"]
 
     decision = JevDecision(
@@ -577,8 +581,9 @@ def _signed_body(client: Any, receipt_id: str, blake3: Callable[[bytes], str]) -
     untrusted: the body's bytes must hash, here, to the verified
     ``payload_hash``.
 
-    A receipt id does not name one body: the daemon lets the minting caller
-    choose it and does not refuse a repeat. So the listed records claiming
+    Current daemons refuse a reused receipt id (409) and refuse receipt kinds
+    on the generic observation route, but an older daemon did neither, and the
+    listing is still untrusted input. So the listed records claiming
     ``receipt_id`` must all carry the same ``body_cbor_hex``; two distinct
     bodies raise :class:`TamperedRequest` rather than pick one. Fail closed:
     a junk record claiming the id blocks replay of the genuine one.

@@ -1,0 +1,36 @@
+# cargo-audit configuration (read by `cargo audit`, see .github/workflows/audit.yml).
+#
+# cargo-audit scans every package in Cargo.lock, optional features included.
+# cargo-deny (deny.toml) resolves the graph without optional features, so an
+# advisory against an off-by-default dependency fails here and not there.
+
+[advisories]
+ignore = [
+    # wasmtime 47.0.4, 2026-10-02 batch. wasmtime is reachable only through
+    # corecruxd's off-by-default `wasm-extensions` feature, which no CI job,
+    # release script or package builds, so none of this code ships. Every fix
+    # needs wasmtime >= 48.0.3 / 48.0.4, which requires Rust 1.95; the
+    # workspace pins 1.88 (rust-toolchain.toml, rust-version). Remove these
+    # and bump wasmtime when the toolchain moves to 1.95 or later, and before
+    # `wasm-extensions` is enabled in any shipped build.
+    "RUSTSEC-2026-0315",
+    "RUSTSEC-2026-0316",
+    "RUSTSEC-2026-0325",
+    "RUSTSEC-2026-0326",
+    "RUSTSEC-2026-0327",
+    # Same exposure, later batches (2026-10-06 .. 2026-10-21): fixed only in
+    # wasmtime >= 48.0.7 / 49.0.4, which need Rust 1.95+ as above.
+    "RUSTSEC-2026-0353",
+    "RUSTSEC-2026-0354",
+    "RUSTSEC-2026-0355",
+    "RUSTSEC-2026-0356",
+    "RUSTSEC-2026-0357",
+    "RUSTSEC-2026-0358",
+    "RUSTSEC-2026-0359",
+    "RUSTSEC-2026-0361",
+    "RUSTSEC-2026-0362",
+    "RUSTSEC-2026-0363",
+    "RUSTSEC-2026-0364",
+    "RUSTSEC-2026-0378",
+    "RUSTSEC-2026-0379",
+]
