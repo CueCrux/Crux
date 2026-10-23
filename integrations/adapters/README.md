@@ -8,6 +8,12 @@ provider-neutral `GET /v1/context` surface.
 | LangChain | `Document`, `SystemMessage`, `BaseRetriever` | `pip install 'cuecrux-adapters[langchain]'` |
 | LlamaIndex | `NodeWithScore`, `BaseRetriever` | `pip install 'cuecrux-adapters[llamaindex]'` |
 | CrewAI | `BaseTool`, context string | `pip install 'cuecrux-adapters[crewai]'` |
+| Jev decision receipts | `crux-jev` CLI, `decide()` | `pip install 'cuecrux-adapters[jev-verify]'` |
+
+> **Not on PyPI yet.** Neither `cuecrux-adapters` nor `cuecrux-client` is
+> published, so the `pip install` lines above do not resolve. Install both
+> from this repository:
+> `pip install -e sdks/python -e 'integrations/adapters[<extra>]'`.
 
 ## The rule these adapters follow
 
@@ -156,7 +162,10 @@ catches each one. Loosen a case and one of those breaks.
 Noul) about a `state` and keeps nothing. `crux_adapters.jev.decide` gives each
 call a record: Crux builds the state, Jev answers, the daemon signs a
 `model_invocation` receipt, and the decision is stored as a fact linked to that
-receipt. Needs `CORECRUXD_STREAM_RECEIPTS=1` and `CORECRUXD_CONTEXT_SURFACE=1`.
+receipt. Needs `CORECRUXD_STREAM_RECEIPTS=1` and `CORECRUXD_CONTEXT_SURFACE=1`
+(or `daemon: {stream_receipts: true, context_surface: true}` in the daemon's
+`config.yaml`). `crux-jev doctor` checks the whole setup, those flags and the
+token's scopes included, without spending a Jev call.
 Setup, a runnable guardrail example and receipt verification are in the
 [Jev decision receipts cookbook](../../docs/jev-decision-receipts.md).
 Non-Python callers can use the `crux-jev` command instead (JSON on stdin, receipt
@@ -211,13 +220,20 @@ crux_adapters/langchain.py   LangChain binding (Document, SystemMessage, BaseRet
 crux_adapters/llamaindex.py  LlamaIndex binding (NodeWithScore, BaseRetriever)
 crux_adapters/crewai.py      CrewAI binding (BaseTool, context string)
 crux_adapters/jev.py         Jev decision receipts (state, receipt, decision fact)
+crux_adapters/jev_cli.py     `crux-jev`: decide, doctor, pin-key, verify
+crux_adapters/jev_verify.py  offline receipt verification against a pinned key
+crux_adapters/jev_langchain.py  receipts for langchain-typesafe calls
 conformance/suite.py         the cases, and adapter discovery
 conformance/daemon.py        throwaway corecruxd for the live layer
 conformance/__main__.py      the runner; this is the gate
 tests/test_conformance.py    mapping layer + negative controls (CI)
 tests/test_jev.py            Jev wrapper over mocked HTTP (CI); opt-in live layers
+tests/test_jev_cli.py        crux-jev parsing, config order, exit codes, doctor
+tests/test_jev_verify.py     offline verification and key pinning
+tests/test_jev_langchain.py  the langchain-typesafe binding (needs that extra)
 examples/langchain_example.py
 examples/crewai_example.py
+examples/jev/                decide_example.py, the openssl receipt recipe, a fixture daemon
 ```
 
 ## Two framework-shape decisions worth knowing

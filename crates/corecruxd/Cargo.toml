@@ -67,7 +67,7 @@ tower = { workspace = true, features = ["limit", "load-shed", "util"] }
 tower-http = { version = "0.7.0", features = ["catch-panic", "cors", "limit", "timeout", "trace"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tracing-opentelemetry = { version = "0.33", optional = true }
+tracing-opentelemetry = { version = "0.34", optional = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 ureq = { workspace = true, features = ["json"] }
 opentelemetry = { version = "0.32", optional = true }

@@ -19,6 +19,7 @@
 //!   `get_bootstrap("patterns")` with `token_budget=500`, returns the result
 //!   as `additionalContext`.
 
+mod apply_patch_targets;
 pub mod cmds;
 pub mod config_audit;
 pub mod daemon_client;
