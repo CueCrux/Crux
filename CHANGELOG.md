@@ -11,6 +11,151 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Jev setup is checkable and configurable.** `crux-jev doctor` checks a
+  Jev integration end to end without spending a Jev call: `crux-jev`'s
+  configuration, the two daemon flags, the token's read scopes (naming the
+  `dev_scopes` literal-token trap when they fail), the published signing key
+  and the pinned keyring, each failure with its fix. The daemon reads
+  `daemon.stream_receipts` and `daemon.context_surface` from `config.yaml`
+  (the environment still wins), and `GET /v1/version` reports
+  `capabilities.stream_receipts`.
+- **`crux-jev verify --tenant` / `--actor`.** The signed body must name the
+  tenant (default `local`) and, when asked, the minting passport; the result
+  reports `tenant_id` and `actor_passport`.
+- **Crux Claude Code mod in setup.** `corecruxctl login` / `start` and
+  `crux-config-wizard init` now install `crux-desktop`, a Claude Code
+  function-hook mod that owns session continuity: a context block on the first
+  prompt, `save_session` (as `hook:session:<id>`) after every turn, before
+  compaction and at session end, a status-line entry and a `/crux` pane. The
+  installer writes the mod to `~/.claude/mods/crux-desktop`, adds it to
+  `CLAUDE_CODE_PLUGIN_DIRS` and `pluginConfigs` in `~/.claude/settings.json`,
+  and registers the daemon as a user-scope `crux` MCP server in
+  `~/.claude.json` (an existing server of that name is left alone). With the
+  mod installed, `hooks install` no longer wires the SessionStart banner or the
+  PreCompact save. New `corecruxctl mods install|uninstall|status` (and the
+  same under `crux-config-wizard mods`); opt out with `--no-mod`.
+
+- **`corecruxctl receipts verify-stream-receipt`** verifies a daemon stream
+  receipt (`model_invocation`, `context_injected`, `stream_completed`,
+  `stream_aborted`) offline from its observation record against a pinned
+  public keyring, checking the daemon's own signature over the canonical body.
+  It rejects other receipt classes signed by the same key (e.g. `usage_ping`)
+  on the signed `kind`, takes optional `--expect-receipt-id` / `--kind`
+  checks, and on success prints only fields decoded from the signed body —
+  the record's `payload.output_hash` and similar copies are unsigned.
+  Library entry point: `corecrux_receipts::verify_stream_receipt_payload_v1`.
+- **`GET /v1/receipts/signing-keys`** serves the daemon's receipt-signing
+  public key, unauthenticated, as an `Ed25519KeyRingV1` that
+  `verify-stream-receipt --keyring` reads unchanged (`keyId` is the passport
+  fingerprint receipts carry; also `publicKeyHex`, `alg`, `use`). Verifiers no
+  longer need `admin:read` on `/v1/admin/version`. Key discovery, not trust:
+  pin the key at enrolment.
+- `GET /v1/observations/aggregate` takes `chains=returned|all|none`.
+
+### Changed
+
+- **`crux-jev` fixes.**
+  - `pin-key` reads the `publicKeyHex` the signing-keys route actually serves
+    (it looked for `public_key_hex`), needs no token, and writes the keyring
+    atomically.
+  - `verify` checks every decision fact naming a receipt, so a later edited
+    version can no longer pass on the strength of an earlier good one.
+  - A request with `store_state: "false"` (a string, which is truthy) or an
+    unknown `state_layout` is refused with exit 2 instead of being coerced or
+    failing as exit 1.
+  - A Jev reply with no answers raises a named error rather than `KeyError`.
+- **Jev docs match the code.** The cookbook no longer claims a receipt proves
+  *when* a decision was made offline (the body's timestamps are
+  caller-supplied), documents the `dev_scopes` token and the `admin:*` scopes
+  in the default agent-token set, the `verify`/`pin-key` exit codes, and drops
+  the stale "receipt ids are not unique" and "no offline verifier" text.
+- **Claude Code setup no longer reaches for private or hosted endpoints.** The
+  `crux-coord` hook and the SessionStart banner defaulted to CueCrux's tailnet
+  daemon (`100.70.12.73`) and to `crux.cuecrux.com` when no endpoint was
+  configured; both now default to the loopback daemon, as the hook launcher
+  does, and `crux-coord` reads the endpoint `login` saved. The banner no longer
+  reports "degraded" for a loopback daemon with auth off, and sends no
+  `Authorization` header without a token.
+- **`workspace-cuecrux` leaves the default profile set.** `init
+  --profiles=all` wrote CueCrux's internal endpoints into every user's
+  CLAUDE.md; enable it with `crux-config-wizard add workspace-cuecrux`.
+- **Hook install works from native Windows.** Home and Claude config paths
+  fall back to `USERPROFILE` and honour `CLAUDE_CONFIG_DIR`; hook command paths
+  are shell-quoted and forward-slashed for Claude Code's hook shell; the
+  `crux-hook` and `jq` probes accept `.exe`. The Python banner stack stays a
+  Unix feature.
+- **`corecruxctl start`'s summary names the registered MCP endpoint** rather
+  than the HTTP URL relabelled as MCP.
+- **Passport-bound callers see and verify their own stream receipts.** With
+  `CORECRUXD_AGENT_PASSPORTS=1` an agent token is confined to its own tenant,
+  while the stream receipts it mints are signed under `local` and logged in
+  unscoped `mediation::<group>` sessions. `GET /v1/observations/aggregate`
+  now lists a daemon-signed receipt kind to the passport that minted it
+  (record `principal`), and `GET /v1/receipts/{id}/verification` lets a
+  `receipts:read` caller verify a stream receipt whose signed `actor_passport`
+  is its own passport, whatever `tenant_id` it asks under. Other kinds keep
+  session scoping; every other caller gets the same answer as for a missing
+  receipt.
+- **Agent tokens can verify receipts.** The default
+  `CORECRUXD_AGENT_TOKEN_HTTP_SCOPES` set gains `receipts:read`, so a token
+  that can mint a receipt (`sessions:write`) can also call
+  `GET /v1/receipts/{id}/verification`.
+- **Aggregate `chains` is bounded.** `GET /v1/observations/aggregate` now
+  reports chain status only for the sessions behind the returned records
+  (it covered every session log: ~7.3 MB and ~31 s for a 10-record answer on
+  a busy node). `?chains=all` restores the full map.
+
+### Security
+
+- **Stream receipt ids are unique.** `POST /v1/mediation/receipts` refuses a
+  stream-receipt draft whose `receipt_id` is already used (409
+  `RECEIPT_ID_CONFLICT`), and `/v1/receipts/{id}/verification` answers 409
+  `RECEIPT_ID_AMBIGUOUS` instead of the first match when a log holds more
+  than one body for an id, so a later mint cannot shadow an earlier receipt.
+- **Receipt kinds are reserved.** `POST /v1/sessions/{sid}/observations`
+  (and the batch route) refuse `model_invocation`, `context_injected`,
+  `stream_completed`, `stream_aborted` and `usage_ping` with 422
+  `RESERVED_OBSERVATION_KIND`; only the signing path writes them, so
+  `/v1/observations/aggregate?kind=model_invocation` no longer lists unsigned
+  imitations.
+
+## [0.5.65] - 2026-09-22
+
+### Added
+
+- **Memory parity.** Recall applies a match floor and reports honest misses
+  instead of padding weak hits (#791); a curated engram tier plus a memory
+  digest is rendered into `CLAUDE.md` and `AGENTS.md`, with engrams on by
+  default (#792); read-only native memory ingest as a projection (#787).
+- **Prompt-cache awareness.** A cache-invalidation ledger (#788), a monotone
+  MCP tool surface per session so the tool list stops churning the cache
+  (#789), and cold-context awareness (#790). The boot banner's Python renderer
+  gained the cold-cache line and a token fallback (#793).
+- **Proof-carrying adaptive packs, first steps.** The `pack.conformance.v1`
+  manifest format (#767) and shadow-corpus staging with a replay harness
+  (#768, #769).
+- **Extension lifecycle seams.** Staged activation (#763), a conformance hook
+  (#764), per-pack outcome events (#765), and atomic rollback to a pinned prior
+  build (#766).
+- **Delegated embedding has one payer per daemon** (#760).
+- An `escrow_recovery_code` fuzz target (#758) and an enforced-by lint for
+  load-bearing auth claims (#748).
+
+### Changed
+
+- Four Pro claims that had no gate in the daemon were withdrawn from sale
+  rather than advertised (#761).
+
+### Security
+
+- Unwedged the security gates: yanked crates replaced and two live advisories
+  resolved (#785). A failing scheduled security audit now notifies someone
+  instead of failing silently (#786).
+- Dependency bumps: blake3, syn, wat, crc32fast, uuid, and CI actions
+  (#749, #756, #771, #772, #773, #775, #776, #780, #781, #784).
+
 ### Fixed
 
 - **One tenant erasure could wedge every write on the shard.** `forget-tenants`
@@ -1277,7 +1422,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-deny` supply chain and licence audit in CI
 - `cargo-audit` CVE scanning in CI
 
-[unreleased]: https://github.com/CueCrux/Crux/compare/v0.5.63...HEAD
+[unreleased]: https://github.com/CueCrux/Crux/compare/v0.5.65...HEAD
+[0.5.65]: https://github.com/CueCrux/Crux/compare/v0.5.64...v0.5.65
 [0.5.64]: https://github.com/CueCrux/Crux/compare/v0.5.63...v0.5.64
 [0.5.63]: https://github.com/CueCrux/Crux/compare/v0.5.62...v0.5.63
 [0.5.62]: https://github.com/CueCrux/Crux/compare/v0.5.61...v0.5.62

@@ -29,20 +29,20 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use crate::paths::{executable_in, home_dir, on_path, shell_word};
+
 /// Boxed error type for the install path.
 pub type DynErr = Box<dyn std::error::Error + Send + Sync>;
 /// Where hook helper scripts are installed (stable, repo-independent).
 fn hooks_dir() -> Result<PathBuf, DynErr> {
-    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
-    Ok(Path::new(&home).join(".local").join("share").join("crux").join("hooks"))
+    Ok(home_dir()?.join(".local").join("share").join("crux").join("hooks"))
 }
 
 /// Where helper *binaries* the agent invokes directly live (on PATH). The
 /// scratchpad-survival helper lands here so `crux-scratchpad-persist --execplan`
 /// is callable from any shell, and the SessionEnd launcher mode execs it here.
 fn local_bin_dir() -> Result<PathBuf, DynErr> {
-    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
-    Ok(Path::new(&home).join(".local").join("bin"))
+    Ok(home_dir()?.join(".local").join("bin"))
 }
 
 /// The embedded launcher: sources the cuecrux env, maps it to the names each
@@ -192,27 +192,14 @@ const COORD_PY: &str = include_str!("../assets/hooks/crux-coord.py");
 /// Resolve the `crux-hook` binary (banner/context/pre-compact). `None` ⇒ install
 /// observe-only and note the banner needs the binary.
 fn locate_crux_hook() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("HOME") {
-        let p = Path::new(&home).join(".local").join("bin").join("crux-hook");
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    // PATH scan.
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let p = dir.join("crux-hook");
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    None
+    local_bin_dir()
+        .ok()
+        .and_then(|bin| executable_in(&bin, "crux-hook"))
+        .or_else(|| on_path("crux-hook"))
 }
 
 fn jq_present() -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join("jq").is_file()))
-        || std::env::var_os("HOME").is_some_and(|h| Path::new(&h).join(".local/bin/jq").is_file())
+    on_path("jq").is_some() || local_bin_dir().is_ok_and(|bin| executable_in(&bin, "jq").is_some())
 }
 
 #[cfg(unix)]
@@ -265,7 +252,10 @@ fn write_exec_on_change(path: &Path, body: &str) -> Result<(), DynErr> {
 /// get `NotFound` — the same guard-vs-exec split as above, one leg over. Callers
 /// that exec must use this path; `python3_present` is for gating alone.
 fn python3_path() -> Option<PathBuf> {
-    resolve_python3(std::env::var_os("PATH").as_deref(), std::env::var_os("HOME").as_deref())
+    resolve_python3(
+        std::env::var_os("PATH").as_deref(),
+        home_dir().ok().as_deref().map(Path::as_os_str),
+    )
 }
 
 /// The resolution itself, over explicit `PATH`/`HOME` so it is testable without
@@ -282,15 +272,15 @@ fn resolve_python3(path_var: Option<&OsStr>, home: Option<&OsStr>) -> Option<Pat
             p.is_file()
         }
     }
-    let on_path = path_var.and_then(|paths| {
-        std::env::split_paths(paths)
-            .map(|d| d.join("python3"))
-            .find(|p| runnable(p))
-    });
-    on_path.or_else(|| {
-        home.map(|h| Path::new(h).join(".local/bin/python3"))
-            .filter(|p| runnable(p))
-    })
+    // The Python stack (banner, statusline, coord) assumes POSIX paths — coord's
+    // own selftest fails on Windows — so it stays a Unix feature there; the
+    // shell hooks still install. The `.exe` probe below is for when it isn't.
+    if cfg!(windows) {
+        return None;
+    }
+    let find_in = |d: &Path| executable_in(d, "python3").filter(|p| runnable(p));
+    let on_path = path_var.and_then(|paths| std::env::split_paths(paths).find_map(|d| find_in(&d)));
+    on_path.or_else(|| home.and_then(|h| find_in(&Path::new(h).join(".local").join("bin"))))
 }
 
 /// Is `python3` findable and runnable? See [`python3_path`] — callers that go on
@@ -363,8 +353,7 @@ fn install_assets() -> Result<(PathBuf, PathBuf, bool), DynErr> {
 /// project dir (`<dir>/.claude/settings.local.json`, default cwd).
 fn settings_path(user: bool, project: Option<PathBuf>) -> Result<PathBuf, DynErr> {
     if user {
-        let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
-        return Ok(Path::new(&home).join(".claude").join("settings.json"));
+        return Ok(crate::paths::claude_config_dir()?.join("settings.json"));
     }
     let base = match project {
         Some(p) => p,
@@ -373,8 +362,11 @@ fn settings_path(user: bool, project: Option<PathBuf>) -> Result<PathBuf, DynErr
     Ok(base.join(".claude").join("settings.local.json"))
 }
 
+/// A launcher hook entry. Claude Code runs hook commands through a POSIX
+/// shell on every platform, so the path is shell-quoted (and forward-slashed
+/// on Windows) rather than pasted in as `Path::display` renders it.
 fn cmd(wrapper: &Path, args: &str) -> serde_json::Value {
-    serde_json::json!({ "type": "command", "command": format!("{} {args}", wrapper.display()) })
+    serde_json::json!({ "type": "command", "command": format!("{} {args}", shell_word(wrapper)) })
 }
 
 /// A `crux-coord <verb>` hook entry (absolute path; not routed via the wrapper,
@@ -382,7 +374,7 @@ fn cmd(wrapper: &Path, args: &str) -> serde_json::Value {
 fn coord(local_bin: &Path, verb: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "command",
-        "command": format!("{} {verb}", local_bin.join("crux-coord").display()),
+        "command": format!("{} {verb}", shell_word(&local_bin.join("crux-coord"))),
         "timeout": 6
     })
 }
@@ -407,31 +399,64 @@ const FILEMOD_MATCHER: &str = "Edit|Write|MultiEdit|NotebookEdit";
 /// so a normal `cargo test` costs one process that exits immediately.
 const BASH_MATCHER: &str = "Bash";
 
+/// Who owns session continuity: the context brief injected at session start,
+/// and the `save_session` written before compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuityOwner {
+    /// The classic hooks: the SessionStart banner and the PreCompact save.
+    Hooks,
+    /// The `crux-desktop` Claude Code mod ([`crate::mods_install`]). The banner
+    /// and PreCompact save are left out so nothing is injected or saved twice;
+    /// observe, filemod, coord, cost and scratchpad hooks are unaffected.
+    Mod,
+}
+
+/// Build the `hooks` block with the classic hooks owning continuity.
+#[cfg(test)]
+fn build_hooks_block(wrapper: &Path, local_bin: &Path, have_binary: bool, have_python: bool) -> serde_json::Value {
+    build_hooks_block_for(wrapper, local_bin, have_binary, have_python, ContinuityOwner::Hooks)
+}
+
 /// Build the `hooks` block. Observe runs on all five lifecycle events. The
 /// SessionStart banner prefers the Python banner stack (`crux-claude-banner`,
 /// gated on `python3`); absent python3, it falls back to the legacy wrapper
 /// `banner` mode (gated on the `crux-hook` binary). context-monitor + pre-compact
-/// remain `crux-hook` features.
-fn build_hooks_block(wrapper: &Path, local_bin: &Path, have_binary: bool, have_python: bool) -> serde_json::Value {
+/// remain `crux-hook` features. With [`ContinuityOwner::Mod`] there is no
+/// banner, and `PreCompact` is emitted empty so the merge strips any Crux
+/// PreCompact group an earlier install left behind.
+fn build_hooks_block_for(
+    wrapper: &Path,
+    local_bin: &Path,
+    have_binary: bool,
+    have_python: bool,
+    owner: ContinuityOwner,
+) -> serde_json::Value {
+    let hooks_own = owner == ContinuityOwner::Hooks;
     let mut session_start = vec![cmd(wrapper, "observe session_start")];
     let mut post_tool = vec![cmd(wrapper, "observe tool_use")];
     let mut map = serde_json::Map::new();
     // Banner first in SessionStart so its brief/card lands before observe.
     if have_python {
-        let banner = local_bin.join("crux-claude-banner");
-        session_start.insert(
-            0,
-            serde_json::json!({ "type": "command", "command": banner.display().to_string(), "timeout": 10 }),
-        );
+        if hooks_own {
+            let banner = local_bin.join("crux-claude-banner");
+            session_start.insert(
+                0,
+                serde_json::json!({ "type": "command", "command": shell_word(&banner), "timeout": 10 }),
+            );
+        }
         // Announce presence right after the banner: the banner reports the board,
         // this puts us on it. Without it every session reads "0 live sessions"
         // and concurrent writers stay invisible to each other.
         session_start.push(coord(local_bin, "announce"));
-    } else if have_binary {
+    } else if have_binary && hooks_own {
         session_start.insert(0, cmd(wrapper, "banner"));
     }
     if have_binary {
         post_tool.push(cmd(wrapper, "context"));
+    }
+    if !hooks_own {
+        map.insert("PreCompact".to_string(), serde_json::json!([]));
+    } else if have_binary {
         map.insert("PreCompact".to_string(), event(vec![cmd(wrapper, "precompact")]));
     }
     map.insert("SessionStart".to_string(), event(session_start));
@@ -546,7 +571,15 @@ fn merge_into_settings(
         let foreign = existing_arr.into_iter().filter(|g| !is_crux_managed(g));
         let mut merged = our_arr;
         merged.extend(foreign);
-        root["hooks"][event] = serde_json::Value::Array(merged);
+        if merged.is_empty() {
+            // An event we emitted empty (PreCompact when the mod owns it) and
+            // that holds nothing foreign: drop the key, not leave `[]` behind.
+            if let Some(h) = root["hooks"].as_object_mut() {
+                h.remove(event);
+            }
+        } else {
+            root["hooks"][event] = serde_json::Value::Array(merged);
+        }
     }
 
     // statusLine: set only when the key is absent; never overwrite an operator's.
@@ -569,16 +602,28 @@ fn merge_into_settings(
 
 /// Core install used by both the `hooks install` subcommand and `login`.
 /// Returns a human-readable summary.
+///
+/// Continuity goes to the `crux-desktop` mod when it is installed
+/// ([`crate::mods_install::is_installed`]); the classic banner and PreCompact
+/// save are then left out.
 pub fn install(user: bool, project: Option<PathBuf>) -> Result<String, DynErr> {
     let (wrapper, local_bin, have_binary) = install_assets()?;
     let have_python = python3_present();
     let target = settings_path(user, project)?;
-    let hooks = build_hooks_block(&wrapper, &local_bin, have_binary, have_python);
-    let statusline_cmd = local_bin.join("crux-statusline").display().to_string();
+    let owner = if crate::mods_install::is_installed() {
+        ContinuityOwner::Mod
+    } else {
+        ContinuityOwner::Hooks
+    };
+    let hooks = build_hooks_block_for(&wrapper, &local_bin, have_binary, have_python, owner);
+    let statusline_cmd = shell_word(&local_bin.join("crux-statusline"));
     let sl = merge_into_settings(&target, hooks, &statusline_cmd)?;
 
     let mut summary = format!("hooks installed → {}", target.display());
-    if have_python {
+    if owner == ContinuityOwner::Mod {
+        summary
+            .push_str(" (observe + coord; continuity handled by the crux-desktop mod: no banner, no PreCompact save)");
+    } else if have_python {
         summary.push_str(" (banner: crux-claude-banner + observe)");
     } else if have_binary {
         summary.push_str(
@@ -596,6 +641,17 @@ pub fn install(user: bool, project: Option<PathBuf>) -> Result<String, DynErr> {
     }
     summary.push_str("\n  restart Claude Code (new session) for hooks to take effect");
     Ok(summary)
+}
+
+/// Does `settings` (a Claude Code settings file) wire any Crux-managed hook?
+/// Read-only; a missing or unparsable file is "no".
+#[must_use]
+pub fn crux_hooks_wired(settings: &Path) -> bool {
+    std::fs::read_to_string(settings)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|root| root.get("hooks").and_then(|h| h.as_object()).cloned())
+        .is_some_and(|hooks| hooks.values().any(is_crux_managed))
 }
 
 /// `hooks status` — report whether the Crux hooks are wired in the target
@@ -651,11 +707,7 @@ pub const HOOK_ENV_VERSION: &str = "2";
 /// observe/filemod error logs (`~/.claude/hooks/`) rather than under the hooks
 /// *script* dir, because it is operator-facing state, not an installed asset.
 fn cost_state_path() -> Result<PathBuf, DynErr> {
-    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
-    Ok(Path::new(&home)
-        .join(".claude")
-        .join("hooks")
-        .join("crux-cost.state.json"))
+    Ok(home_dir()?.join(".claude").join("hooks").join("crux-cost.state.json"))
 }
 
 /// The last recorded outcome of the SessionEnd cost-capture hook, plus whether
@@ -844,7 +896,7 @@ impl InstallAudit {
             missing.push("statusLine not wired in settings.json");
         }
         Some(format!(
-            "{} — run `crux-config-wizard hooks install --user`",
+            "{} — run `corecruxctl hooks install --user`",
             missing.join(", ")
         ))
     }
@@ -931,7 +983,6 @@ mod tests {
         assert!(WRAPPER_SH.contains("crux-scratchpad-persist"));
     }
 
-    #[test]
     /// The destructive-command guard: a second PreToolUse group on Bash running
     /// `coord check`. Without it the coordination plane sees edits only, which
     /// is how a `git clean` destroyed a live peer's work on 2026-08-06.
@@ -1093,6 +1144,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn hooks_block_wires_opt_in_filemod_pre_and_post() {
         let w = Path::new("/x/crux-hook-env.sh");
         // Wiring is present regardless of the crux-hook binary (filemod is
@@ -1163,6 +1215,81 @@ mod tests {
         assert!(hooks[1]["command"].as_str().unwrap().ends_with("observe session_start"));
         // The legacy wrapper `banner` mode must NOT be wired when python3 is present.
         assert!(!h.to_string().contains("crux-hook-env.sh banner"));
+    }
+
+    /// With the mod owning continuity there is no banner of either kind and no
+    /// PreCompact save, while observe, coord, context, filemod, cost and
+    /// scratchpad stay exactly as the classic block wires them.
+    #[test]
+    fn mod_owner_drops_banner_and_precompact_only() {
+        let w = Path::new("/x/crux-hook-env.sh");
+        for have_python in [false, true] {
+            let h = build_hooks_block_for(w, Path::new(LB), true, have_python, ContinuityOwner::Mod);
+            let s = h.to_string();
+            assert!(!s.contains("crux-claude-banner"), "{s}");
+            assert!(!s.contains("crux-hook-env.sh banner"), "{s}");
+            assert!(!s.contains("precompact"), "{s}");
+            assert_eq!(
+                h["PreCompact"],
+                serde_json::json!([]),
+                "emitted empty so the merge strips it"
+            );
+            for kept in [
+                "observe session_start",
+                "observe tool_use",
+                " context",
+                "filemod pre",
+                " cost",
+                " scratchpad",
+            ] {
+                assert!(s.contains(kept), "{kept} must stay wired: {s}");
+            }
+            assert_eq!(s.contains("crux-coord announce"), have_python);
+        }
+    }
+
+    /// Installing the mod over existing classic wiring removes the banner and
+    /// the PreCompact group, keeps a foreign PreCompact hook, and drops the
+    /// event key entirely when nothing foreign is left.
+    #[test]
+    fn mod_owner_merge_strips_classic_continuity_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = Path::new("/x/crux-hook-env.sh");
+        let sl = "/x/.local/bin/crux-statusline";
+        let mod_block = || build_hooks_block_for(w, Path::new(LB), true, true, ContinuityOwner::Mod);
+
+        let only_ours = dir.path().join("a.json");
+        merge_into_settings(&only_ours, block(w), sl).unwrap();
+        merge_into_settings(&only_ours, mod_block(), sl).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&only_ours).unwrap()).unwrap();
+        assert!(v["hooks"].get("PreCompact").is_none(), "{}", v["hooks"]);
+        assert!(!v["hooks"]["SessionStart"].to_string().contains("crux-claude-banner"));
+        assert!(crux_hooks_wired(&only_ours));
+
+        let with_foreign = dir.path().join("b.json");
+        std::fs::write(
+            &with_foreign,
+            r#"{"hooks":{"PreCompact":[{"matcher":".*","hooks":[{"type":"command","command":"/opt/mine.sh"}]}]}}"#,
+        )
+        .unwrap();
+        merge_into_settings(&with_foreign, block(w), sl).unwrap();
+        merge_into_settings(&with_foreign, mod_block(), sl).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&with_foreign).unwrap()).unwrap();
+        let pc = v["hooks"]["PreCompact"].to_string();
+        assert!(pc.contains("/opt/mine.sh") && !pc.contains("precompact"), "{pc}");
+    }
+
+    #[test]
+    fn crux_hooks_wired_ignores_foreign_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!crux_hooks_wired(&dir.path().join("absent.json")));
+        let foreign = dir.path().join("f.json");
+        std::fs::write(
+            &foreign,
+            r#"{"hooks":{"Stop":[{"matcher":".*","hooks":[{"type":"command","command":"/opt/x"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(!crux_hooks_wired(&foreign));
     }
 
     fn block(w: &Path) -> serde_json::Value {
@@ -1366,12 +1493,15 @@ mod tests {
             !home.join(".local/share/crux/hooks/crux-hook-env.sh.bak").exists(),
             "no wrapper .bak"
         );
-        // The banner is wired first in SessionStart, statusLine set.
+        // The banner is wired first in SessionStart (the Python stack is
+        // Unix-only, see `resolve_python3`), statusLine set.
         let v: serde_json::Value = serde_json::from_str(&s2).unwrap();
-        assert!(v["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap()
-            .ends_with("/crux-claude-banner"));
+        if cfg!(unix) {
+            assert!(v["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("/crux-claude-banner"));
+        }
         assert!(v["statusLine"]["command"]
             .as_str()
             .unwrap()
