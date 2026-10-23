@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
+import uuid
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,6 +34,12 @@ from cuecrux_client.client import (  # noqa: E402
     _sse_event,
 )
 from cuecrux_client.errors import CueCruxError  # noqa: E402
+from cuecrux_client.types import StoreFact  # noqa: E402
+
+# Every character that breaks an unencoded path: a separator, a query and a
+# fragment start, an escape, a space and a non-ASCII character.
+AWKWARD = "repo:a/b?c=1#d%2F e·"
+AWKWARD_PATH = "repo%3Aa%2Fb%3Fc%3D1%23d%252F%20e%C2%B7"
 
 # Requests the stub server saw, oldest first.
 CALLS: list[dict[str, object]] = []
@@ -90,6 +98,23 @@ class _Handler(BaseHTTPRequestHandler):
             ).encode()
             self.send_response(404)
             self.send_header("Content-Type", "application/problem+json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if path == "/v1/facts" and call["method"] == "GET":
+            # Two rows, the second past the token_budget's hydration boundary:
+            # the daemon drops `value` and flags it (`http_fact_rows`,
+            # crates/corecruxd/src/http/facts.rs).
+            row = {"fact_id": "f_1", "entity": "e", "key": "k", "value": "v", "confidence": 1.0,
+                   "stored_at": "2026-09-22T00:00:00Z", "tokens": 3, "deleted": False, "version": 1}
+            trimmed = {k: v for k, v in row.items() if k != "value"}
+            body = json.dumps(
+                {"facts": [row, {**trimmed, "fact_id": "f_2", "value_omitted": True}], "total_tokens": 3}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -265,6 +290,66 @@ class WireShapeTest(unittest.TestCase):
         call = self.assertCall("POST", "/v1/memory/import")
         self.assertEqual(call["body"], {"tenant_id": "tenant", "pack": {"manifest": {}}, "dry_run": True})
 
+    # -- facts --
+
+    def test_query_facts_tolerates_a_budget_omitted_value(self) -> None:
+        result = self.client.query_facts(entity="e", token_budget=500)
+        self.assertEqual(self.assertCall("GET", "/v1/facts")["query"], "entity=e&token_budget=500")
+        full, omitted = result.facts
+        self.assertEqual((full.value, full.value_omitted), ("v", False))
+        self.assertEqual((omitted.fact_id, omitted.value, omitted.value_omitted), ("f_2", None, True))
+
+    # -- path values --
+
+    def test_path_values_are_sent_as_one_encoded_segment(self) -> None:
+        self.client.get_facts_by_entity(AWKWARD)
+        self.assertEqual(self.assertCall("GET", f"/v1/facts/entity/{AWKWARD_PATH}")["query"], "")
+        self.client.reject_candidate(AWKWARD, "dup")
+        self.assertCall("POST", f"/v1/memory/candidates/{AWKWARD_PATH}/reject")
+        self.client.verify_receipt("r/1", tenant_id="local")
+        self.assertCall("GET", "/v1/receipts/r%2F1/verification")
+
+    def test_plain_ids_are_unchanged(self) -> None:
+        self.client.get_facts_by_entity("jev:invoice-42_x.y~z")
+        self.assertCall("GET", "/v1/facts/entity/jev%3Ainvoice-42_x.y~z")
+
+    def test_dot_segments_are_encoded_not_resolved(self) -> None:
+        # Bare, httpx resolves them: /v1/facts/entity/.. would reach /v1/facts.
+        self.client.get_facts_by_entity("..")
+        self.assertCall("GET", "/v1/facts/entity/%2E%2E")
+        self.client.get_facts_by_entity(".")
+        self.assertCall("GET", "/v1/facts/entity/%2E")
+        self.client.reject_candidate("..", "dup")
+        self.assertCall("POST", "/v1/memory/candidates/%2E%2E/reject")
+        self.client.get_facts_by_entity("...")  # not a dot-segment
+        self.assertCall("GET", "/v1/facts/entity/...")
+
+    def test_non_string_ids_are_stringified(self) -> None:
+        receipt = uuid.UUID("12345678-1234-5678-1234-567812345678")
+        self.client.verify_receipt(receipt, tenant_id="local")
+        self.assertCall("GET", f"/v1/receipts/{receipt}/verification")
+        self.client.reject_candidate(42, "dup")
+        self.assertCall("POST", "/v1/memory/candidates/42/reject")
+
+    # -- observations --
+
+    def test_aggregate_observations_sends_only_the_filters_set(self) -> None:
+        self.client.aggregate_observations(kind="model_invocation", limit=1000)
+        call = self.assertCall("GET", "/v1/observations/aggregate")
+        self.assertEqual(sorted(str(call["query"]).split("&")), ["kind=model_invocation", "limit=1000"])
+
+    # -- receipts --
+
+    def test_verify_receipt_passes_the_tenant(self) -> None:
+        self.client.verify_receipt("r_1", tenant_id="local")
+        self.assertEqual(self.assertCall("GET", "/v1/receipts/r_1/verification")["query"], "tenant_id=local")
+
+    def test_post_mediation_receipt_sends_the_draft_untouched(self) -> None:
+        draft = {"kind": "model_invocation", "invocation_id": "i_1", "prompt_hash": "sha256:ab", "model_version": None}
+        self.client.post_mediation_receipt(draft)
+        # Posted as-is: an explicit null stays null rather than being dropped.
+        self.assertEqual(self.assertCall("POST", "/v1/mediation/receipts")["body"], draft)
+
     # -- extensions --
 
     def test_extension_routes(self) -> None:
@@ -379,6 +464,11 @@ class AsyncParityTest(unittest.TestCase):
                 await client.undo_consolidation("f_canon")
                 await client.local_ingest("t", "c", [])
                 await client.import_memory_pack("t", {}, dry_run=True)
+                await client.post_mediation_receipt({"kind": "model_invocation"})
+                await client.verify_receipt("r_1", tenant_id="local")
+                await client.aggregate_observations(kind="model_invocation")
+                await client.get_facts_by_entity(AWKWARD)
+                self.assertTrue((await client.query_facts(entity="e", token_budget=5)).facts[1].value_omitted)
                 await client.list_extensions()
                 self.assertIsNone(await client.get_extension("missing"))
                 self.assertFalse(await client.delete_extension("missing"))
@@ -397,6 +487,10 @@ class AsyncParityTest(unittest.TestCase):
         self.assertIn(("POST", "/v1/console/review/consolidations/undo"), seen)
         self.assertIn(("POST", "/v1/local/ingest"), seen)
         self.assertIn(("POST", "/v1/memory/import"), seen)
+        self.assertIn(("POST", "/v1/mediation/receipts"), seen)
+        self.assertIn(("GET", "/v1/receipts/r_1/verification"), seen)
+        self.assertIn(("GET", "/v1/observations/aggregate"), seen)
+        self.assertIn(("GET", f"/v1/facts/entity/{AWKWARD_PATH}"), seen)
         self.assertIn(("POST", "/v1/extensions/ext-1/tools/search/invoke"), seen)
         self.assertIn(("GET", "/v1/events/stream"), seen)
 
@@ -408,6 +502,29 @@ class AsyncParityTest(unittest.TestCase):
         async_only = surface(AsyncCueCruxClient) - surface(CueCruxClient)
         self.assertEqual(sync_only, set(), "sync client has methods the async client lacks")
         self.assertEqual(async_only, set(), "async client has methods the sync client lacks")
+
+
+@unittest.skipUnless(os.environ.get("CRUX_FIXTURE_URL"), "CRUX_FIXTURE_URL not set")
+class FixtureDaemon(unittest.TestCase):
+    """Against a real daemon: it must decode the segment back to the entity."""
+
+    def test_awkward_entity_round_trips(self) -> None:
+        token_file = os.environ.get("CRUX_TOKEN_FILE")
+        token = Path(token_file).read_text().strip() if token_file else None
+        with CueCruxClient(os.environ["CRUX_FIXTURE_URL"], token=token) as client:
+            entity = f"test-sdk-{uuid.uuid4().hex[:8]}:{AWKWARD}"
+            stored = client.store_fact(StoreFact(entity=entity, key="k", value="v"))
+            (fact,) = client.get_facts_by_entity(entity)
+            self.assertEqual((fact.fact_id, fact.entity), (stored.fact_id, entity))
+            # Control: the prefix before the "/" is a different entity with no facts.
+            self.assertEqual(client.get_facts_by_entity(entity.split("/")[0]), [])
+
+            # A literal ".." entity: sent bare it would read GET /v1/facts, i.e.
+            # other entities' facts (the one just stored among them).
+            stored = client.store_fact(StoreFact(entity="..", key=f"k-{uuid.uuid4().hex[:8]}", value="v"))
+            facts = client.get_facts_by_entity("..")
+            self.assertIn(stored.fact_id, [f.fact_id for f in facts])
+            self.assertEqual({f.entity for f in facts}, {".."})
 
 
 if __name__ == "__main__":

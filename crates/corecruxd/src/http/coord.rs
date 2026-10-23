@@ -32,8 +32,9 @@ pub(super) struct ActiveQuery {
 pub(super) struct AnnounceBody {
     pub session_id: String,
     pub project_id: String,
-    /// Announcing passport. Optional — resolved from the session binding
-    /// (authoritative) or the authenticated request passport when omitted.
+    /// Announcing passport. Optional and never a trust input: the session
+    /// binding is authoritative, otherwise the authenticated request passport
+    /// is used, and a value naming any other passport is refused.
     #[serde(default, alias = "passport_id", alias = "author_passport")]
     pub by_passport: Option<String>,
     #[serde(default)]
@@ -207,6 +208,13 @@ pub(super) async fn post_coord_announce(
         );
     }
 
+    // The caller's own passport: the verified token claim, an admin's
+    // passport-header override, or (auth-off/dev) the asserted header.
+    let caller_passport = match crate::auth::http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx.passport_id,
+        Err(problem) => return problem.into_response(),
+    };
+
     let now = now_unix_ms();
     let ttl_secs = body
         .ttl_seconds
@@ -214,21 +222,28 @@ pub(super) async fn post_coord_announce(
         .min(crate::coord::MAX_TTL_SECS);
 
     let mut store = state.fact_store.write().await;
-    // Passport resolution order: session binding (authoritative) → explicit
-    // body passport → authenticated request passport. Never anonymous.
-    let passport_id = crate::session_bindings::get_binding(&store, body.session_id.trim())
-        .map(|b| b.passport_id)
-        .or_else(|| body.by_passport.clone().filter(|p| !p.trim().is_empty()))
-        .or_else(|| {
-            crate::auth::http_scope_context(&state.auth, &headers)
-                .ok()
-                .and_then(|ctx| ctx.passport_id)
-        });
-    let Some(passport_id) = passport_id else {
-        return problem_response(
-            StatusCode::BAD_REQUEST,
-            "no passport: pass by_passport, bind the session, or authenticate with a passport header".to_string(),
-        );
+    // Passport resolution: session binding (authoritative) → the caller's own
+    // passport. `by_passport` is not a trust input (D5): an unbound session
+    // naming a passport the caller does not hold is refused, so an intent can
+    // never be attributed to someone else. Never anonymous.
+    let passport_id = match crate::session_bindings::get_binding(&store, body.session_id.trim()) {
+        Some(binding) => binding.passport_id,
+        None => {
+            let claimed = body.by_passport.as_deref().map(str::trim).filter(|p| !p.is_empty());
+            if claimed.is_some_and(|claimed| caller_passport.as_deref() != Some(claimed)) {
+                return problem_response(
+                    StatusCode::FORBIDDEN,
+                    "by_passport does not match the authenticated passport".to_string(),
+                );
+            }
+            let Some(passport_id) = caller_passport else {
+                return problem_response(
+                    StatusCode::BAD_REQUEST,
+                    "no passport: bind the session or authenticate with a passport".to_string(),
+                );
+            };
+            passport_id
+        }
     };
 
     let intent = CoordIntent {
@@ -719,12 +734,25 @@ mod tests {
                 .expect("seed peer punchcard");
         }
 
-        // Session B (unbound; explicit different passport) announces an
+        // Session B (unbound) announces as a different passport: an
         // overlapping file under A's directory + the same execplan slug.
-        let mut b = announce_body("bbbb", "proj");
-        b.by_passport = Some("other-passport".to_string());
-        b.paths = vec!["crates/corecruxd/src/coord.rs".to_string()];
-        let resp = post_coord_announce(StateExtract(state), HeaderMap::new(), JsonExtract(b))
+        let b = || {
+            let mut b = announce_body("bbbb", "proj");
+            b.by_passport = Some("other-passport".to_string());
+            b.paths = vec!["crates/corecruxd/src/coord.rs".to_string()];
+            b
+        };
+        // D5: by_passport alone is a claim, not an identity — with no caller
+        // passport behind it, the announce is refused and nothing is written.
+        let resp = post_coord_announce(StateExtract(state.clone()), HeaderMap::new(), JsonExtract(b()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // The caller asserts that passport as its own identity (auth-off
+        // mode's passport header), so by_passport now names the caller.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-passport-id", "other-passport".parse().expect("header"));
+        let resp = post_coord_announce(StateExtract(state), headers, JsonExtract(b()))
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -741,6 +769,88 @@ mod tests {
         // B's own lease would be excluded, but this lease belongs to B's
         // passport — so from B's announce it's self, not a conflict.
         assert!(!kinds.contains(&"lease"), "own lease not flagged: {kinds:?}");
+    }
+
+    const JWT_SECRET: &str = "coord-announce-test-secret-32-bytes-minimum";
+    const JWT_ISS: &str = "corecrux-coord-test";
+    const JWT_AUD: &str = "corecrux";
+
+    fn jwt_state() -> AppState {
+        let mut state = test_app_state(1);
+        state.auth = crate::auth::Authz::test_hs256(JWT_SECRET.as_bytes(), JWT_ISS, JWT_AUD);
+        state
+    }
+
+    /// Bearer headers for a verified HS256 token bound to `passport_id`.
+    fn jwt_headers(scopes: &str, passport_id: &str) -> HeaderMap {
+        let claims = json!({
+            "exp": now_unix_ms() / 1000 + 3_600,
+            "iss": JWT_ISS,
+            "aud": JWT_AUD,
+            "scope": scopes,
+            "tenant_id": "default",
+            "passport_id": passport_id,
+        });
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+        )
+        .expect("mint test JWT");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().expect("bearer header"),
+        );
+        headers
+    }
+
+    async fn announce_unbound(state: &AppState, headers: HeaderMap, by_passport: Option<&str>) -> (StatusCode, Value) {
+        let mut body = announce_body("unbound", "proj");
+        body.by_passport = by_passport.map(str::to_string);
+        let resp = post_coord_announce(StateExtract(state.clone()), headers, JsonExtract(body))
+            .await
+            .into_response();
+        let status = resp.status();
+        (status, body_json(resp).await)
+    }
+
+    /// D5: a verified caller cannot attribute an intent to a passport it does
+    /// not hold — the live repro announced as `personal-default` from an
+    /// unrelated token.
+    #[tokio::test]
+    async fn announce_rejects_a_by_passport_the_caller_does_not_hold() {
+        let state = jwt_state();
+        let (status, body) =
+            announce_unbound(&state, jwt_headers("facts:write", "agent-a"), Some("personal-default")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        {
+            let store = state.fact_store.read().await;
+            assert!(
+                crate::coord::list_intents(&store, Some("proj")).is_empty(),
+                "a refused announce must not write an intent"
+            );
+        }
+
+        // Positive control: the caller's own passport, named or implied.
+        for by_passport in [Some("agent-a"), None] {
+            let (status, body) = announce_unbound(&state, jwt_headers("facts:write", "agent-a"), by_passport).await;
+            assert_eq!(status, StatusCode::OK, "{by_passport:?}: {body}");
+            assert_eq!(body["intent"]["passport_id"], "agent-a");
+        }
+    }
+
+    /// The admin exception is the existing passport-header override: an
+    /// `admin:write` caller acts as another passport, and by_passport may then
+    /// name it.
+    #[tokio::test]
+    async fn admin_announces_for_another_passport_via_the_header_override() {
+        let state = jwt_state();
+        let mut headers = jwt_headers("admin:write", "operator");
+        headers.insert("x-corecrux-passport-id", "personal-default".parse().expect("header"));
+        let (status, body) = announce_unbound(&state, headers, Some("personal-default")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["intent"]["passport_id"], "personal-default");
     }
 
     #[tokio::test]

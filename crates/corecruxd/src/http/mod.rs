@@ -157,8 +157,8 @@ use crate::shard_map::RoutingTable;
 use crate::structured_log::{CorrelationIds, ErrorCode, StructuredOpLog};
 
 use crate::auth::{
-    describe_http_evidence, http_scope_context, require_http_any_scope, require_http_any_scope_for_tenant,
-    require_http_scopes, require_http_scopes_for_tenant, Authz,
+    describe_http_evidence, http_owner_passport_with_scopes, http_scope_context, require_http_any_scope,
+    require_http_any_scope_for_tenant, require_http_scopes, require_http_scopes_for_tenant, Authz,
 };
 use crate::control::{self, ValveDecision};
 use crate::dataplane_store::AppendError;
@@ -929,6 +929,11 @@ pub(crate) fn router_with_route_auth(
         )
         // Production hardening: version endpoint
         .route("/v1/version", get(self::health::get_version))
+        // Public receipt-signing keyring (key discovery for offline verifiers).
+        .route(
+            "/v1/receipts/signing-keys",
+            get(self::receipts::get_receipt_signing_keys_v1),
+        )
         .route("/v1/actions/enrich", axum::routing::post(self::actions::post_action_enrich))
         .route("/v1/workbench/contract", get(self::workbench::get_workbench_contract))
         .route("/v1/workbench/brief", get(self::workbench::get_agent_brief))

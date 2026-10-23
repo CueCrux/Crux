@@ -45,8 +45,8 @@ use super::*;
 use base64::Engine as _;
 use corecrux_memory::fact_store::StoreFact;
 use corecrux_memory::sync::{
-    apply_promoted_records, build_tenant_manifest, offboard_tenant_mirror, promotion_preview, sync_records_hash,
-    tenant_collection_page, SyncCollectionRecord, TenantManifestInput,
+    apply_promoted_records, build_tenant_manifest, check_promoted_records_tenant, offboard_tenant_mirror,
+    promotion_preview, sync_records_hash, tenant_collection_page, SyncCollectionRecord, TenantManifestInput,
 };
 use crux_sync::peer_handshake::{verify_peer_handshake, AuthenticatedPeer, NonceCache, PeerAuthError, PeerHandshake};
 use rand::TryRng as _;
@@ -422,19 +422,27 @@ async fn require_sync_read(state: &AppState, headers: &HeaderMap, tenant_id: &st
         .map_err(IntoResponse::into_response)
 }
 
+/// Authorize a sync write. `Ok` carries the caller's bound passport for
+/// per-record write checks; a mutually-authenticated sync peer has none.
 #[allow(clippy::result_large_err)]
-async fn require_sync_write(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<(), Response> {
+async fn require_sync_write(
+    state: &AppState,
+    headers: &HeaderMap,
+    tenant_id: &str,
+) -> Result<Option<String>, Response> {
     if state.sync_mutual_auth {
-        return require_sync_peer(state, headers, tenant_id, RCX_SYNC_PUSH_CAPABILITY).await;
+        return require_sync_peer(state, headers, tenant_id, RCX_SYNC_PUSH_CAPABILITY)
+            .await
+            .map(|()| None);
     }
 
     let ctx = crate::auth::http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)?;
     if ctx.has_scope("admin:write") {
-        return Ok(());
+        return Ok(ctx.passport_id);
     }
     // Scope discarded for the same reason as the read side above.
     require_http_scopes_for_tenant(&state.auth, headers, &["facts:write"], tenant_id)
-        .map(|_| ())
+        .map(|_| ctx.passport_id)
         .map_err(IntoResponse::into_response)
 }
 
@@ -520,9 +528,10 @@ pub(super) async fn post_promotion_confirm(
     if let Err(problem) = validate_tenant_id(&tenant_id) {
         return problem;
     }
-    if let Err(problem) = require_sync_write(&state, &headers, &tenant_id).await {
-        return problem;
-    }
+    let passport_id = match require_sync_write(&state, &headers, &tenant_id).await {
+        Ok(passport_id) => passport_id,
+        Err(problem) => return problem,
+    };
 
     let records = if req.records.is_empty() {
         let store = state.fact_store.read().await;
@@ -543,8 +552,23 @@ pub(super) async fn post_promotion_confirm(
         req.records
     };
 
+    // `require_sync_write` binds only the path tenant; the records are the
+    // caller's own. Refuse the batch when any record names another tenant, or
+    // an entity the caller's passport may not write, before the first apply.
+    if let Err(err) = check_promoted_records_tenant(&tenant_id, &records) {
+        return problem_response(StatusCode::FORBIDDEN, err);
+    }
     let applied = {
         let mut store = state.fact_store.write().await;
+        for fact in records.iter().filter_map(|record| record.fact.as_ref()) {
+            if let Err(err) = crux_mcp::category_enforce::check_passport_can_write_entity(
+                &store,
+                passport_id.as_deref(),
+                &fact.entity,
+            ) {
+                return problem_response(StatusCode::FORBIDDEN, err.to_string());
+            }
+        }
         apply_promoted_records(&mut store, &records, &format!("http:{}", state.node_id))
     };
 

@@ -910,6 +910,161 @@ async fn sync_promotion_confirm_applies_remote_records() {
         .starts_with("sync-promotion:http:node-a:"));
 }
 
+fn promotion_record(fact_id: &str, tenant_hash: &str, entity: &str) -> corecrux_memory::sync::SyncCollectionRecord {
+    let stored_at = chrono::Utc::now();
+    corecrux_memory::sync::SyncCollectionRecord {
+        collection: "facts".to_string(),
+        record_id: fact_id.to_string(),
+        entity: entity.to_string(),
+        key: "summary".to_string(),
+        identity_hash: "blake3:identity".to_string(),
+        content_hash: "blake3:content".to_string(),
+        value_hash: "blake3:test".to_string(),
+        updated_at: stored_at.to_rfc3339(),
+        deleted: false,
+        source_receipt: None,
+        semantic_profile_id: None,
+        local_semantic_profile_id: None,
+        fact: Some(corecrux_memory::fact_store::Fact {
+            fact_id: fact_id.to_string(),
+            tenant_hash: tenant_hash.to_string(),
+            entity: entity.to_string(),
+            key: "summary".to_string(),
+            value: "promoted".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            stored_at,
+            tokens: 1,
+            deleted: false,
+            version: 1,
+            supersedes: None,
+            private: false,
+            horizon_class: corecrux_memory::HorizonClass::None,
+            reverified_at: None,
+            superseded_by: None,
+            actor: None,
+            valid_from: None,
+            valid_to: None,
+            access_count: 0,
+            last_accessed_at: None,
+        }),
+    }
+}
+
+async fn confirm_promotion(
+    state: &AppState,
+    headers: HeaderMap,
+    records: Vec<corecrux_memory::sync::SyncCollectionRecord>,
+) -> Response {
+    super::sync::post_promotion_confirm(
+        State(state.clone()),
+        headers,
+        Path("business::acme".to_string()),
+        Json(super::sync::PromotionRequest {
+            allowlist: Vec::new(),
+            include_content: false,
+            confirm_hash: None,
+            records,
+        }),
+    )
+    .await
+}
+
+// QA audit M3 (cross-tenant promotion confirm): records are caller-supplied,
+// so one naming another tenant must refuse the whole batch before any apply.
+#[tokio::test]
+async fn sync_promotion_confirm_refuses_records_for_another_tenant() {
+    let state = test_app_state(1);
+    let own = || promotion_record("f_own", "default", "business::acme::note");
+
+    // Entity outside the path tenant's namespace, behind a valid record.
+    let resp = confirm_promotion(
+        &state,
+        HeaderMap::new(),
+        vec![
+            own(),
+            promotion_record("f_foreign_entity", "default", "business::other::note"),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Entity inside the namespace, but stamped for another tenant's partition.
+    let resp = confirm_promotion(
+        &state,
+        HeaderMap::new(),
+        vec![
+            own(),
+            promotion_record("f_foreign_stamp", "business::other", "business::acme::other"),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let store = state.fact_store.read().await;
+    for fact_id in ["f_own", "f_foreign_entity", "f_foreign_stamp"] {
+        assert!(store.get(fact_id).is_none(), "{fact_id} must not be applied");
+    }
+}
+
+#[tokio::test]
+async fn sync_promotion_confirm_accepts_path_tenant_stamp() {
+    let state = test_app_state(1);
+    let resp = confirm_promotion(
+        &state,
+        HeaderMap::new(),
+        vec![promotion_record(
+            "f_path_stamp",
+            "business::acme",
+            "business::acme::note",
+        )],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["applied_count"], 1);
+    assert!(state.fact_store.read().await.get("f_path_stamp").is_some());
+}
+
+#[tokio::test]
+async fn sync_promotion_confirm_checks_passport_category_per_record() {
+    let state = test_app_state(1);
+    {
+        let mut store = state.fact_store.write().await;
+        for (passport, category) in [("p_personal", "personal"), ("p_work", "work")] {
+            store.store(corecrux_memory::fact_store::StoreFact {
+                tenant_hash: "default".to_string(),
+                entity: format!("__passport__::{passport}"),
+                key: "record".to_string(),
+                value: serde_json::json!({ "category": category }).to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+        }
+    }
+
+    // `business::` has no category prefix, so it classifies as work.
+    let resp = confirm_promotion(
+        &state,
+        dev_scope_passport_headers("facts:write", "p_personal"),
+        vec![promotion_record("f_personal", "default", "business::acme::note")],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(state.fact_store.read().await.get("f_personal").is_none());
+
+    let resp = confirm_promotion(
+        &state,
+        dev_scope_passport_headers("facts:write", "p_work"),
+        vec![promotion_record("f_work", "default", "business::acme::note")],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(state.fact_store.read().await.get("f_work").is_some());
+}
+
 #[tokio::test]
 async fn sync_offboard_signs_wipe_receipt_and_stores_proof() {
     let mut state = test_app_state(1);
@@ -4385,6 +4540,9 @@ fn query_params(query: &str, token_budget: Option<usize>) -> QueryFactsParams {
 
 #[tokio::test]
 async fn query_facts_unmatched_topic_search_is_an_honest_miss_not_recency_filler() {
+    // Serialised with the flag-off test, which flips the floor env var
+    // process-wide; unlocked, this test can read the floor as disabled.
+    let _guard = crux_mcp::test_env_lock().lock().await;
     let state = match_floor_state().await;
     // Shares one incidental term ("status") with two stored facts, so the
     // pre-M1 OR-filter admitted them and ranked them by recency.
@@ -4407,6 +4565,9 @@ async fn query_facts_unmatched_topic_search_is_an_honest_miss_not_recency_filler
 
 #[tokio::test]
 async fn query_facts_relevant_topic_search_still_answers_and_is_labelled() {
+    // Serialised with the flag-off test, which flips the floor env var
+    // process-wide; unlocked, this test can read the floor as disabled.
+    let _guard = crux_mcp::test_env_lock().lock().await;
     let state = match_floor_state().await;
     let resp = facts::query_facts(
         State(state),
@@ -4426,6 +4587,9 @@ async fn query_facts_relevant_topic_search_still_answers_and_is_labelled() {
 
 #[tokio::test]
 async fn query_facts_entity_lookups_are_exempt_from_the_floor() {
+    // Serialised with the flag-off test, which flips the floor env var
+    // process-wide; unlocked, this test can read the floor as disabled.
+    let _guard = crux_mcp::test_env_lock().lock().await;
     let state = match_floor_state().await;
     // An address-shaped free-text query: the shape that already scored 1.00.
     let resp = facts::query_facts(
@@ -4475,6 +4639,9 @@ async fn query_facts_match_floor_flag_off_restores_the_pre_m1_path() {
 
 #[tokio::test]
 async fn query_facts_token_budget_governs_the_whole_http_response() {
+    // Serialised with the flag-off test, which flips the floor env var
+    // process-wide; unlocked, this test can read the floor as disabled.
+    let _guard = crux_mcp::test_env_lock().lock().await;
     let state = match_floor_state().await;
     for budget in [300usize, 600, 4000] {
         let resp = facts::query_facts(
@@ -7289,7 +7456,7 @@ fn build_zip_deterministic_round_trip() {
     let mut archive = zip::ZipArchive::new(cursor).expect("valid zip");
     assert_eq!(archive.len(), 2);
     let names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .map(|i| archive.by_index(i).unwrap().name().unwrap().to_string())
         .collect();
     assert!(names.contains(&"hello.txt".to_string()));
     assert!(names.contains(&"sub/nested.json".to_string()));
@@ -8934,6 +9101,9 @@ async fn version_public_view_is_redacted() {
     assert!(body["features"]["graph_expand"].is_boolean());
     assert!(body["features"]["self_observe"].is_boolean());
     assert!(body["features"]["mcp"].is_boolean());
+    // `crux-jev doctor` reads these two to say which Jev flag is missing.
+    assert!(body["capabilities"]["stream_receipts"]["enabled"].is_boolean());
+    assert!(body["capabilities"]["context_surface"]["enabled"].is_boolean());
     assert_eq!(body["sync"]["mode"], "local_only");
     assert_eq!(body["sync"]["configured"], false);
     assert_eq!(body["sync"]["remote_url_redacted"], false);
@@ -9434,8 +9604,7 @@ async fn workbench_command_ledger_is_not_a_sold_claim_without_a_producer() {
         "ledger:history must not survive the PRO_CAPABILITY_CLAIMS filter"
     );
 
-    // It appears in no catalogue, so it can never be reported as
-    // `contracted_external` by `pro_claim_placements`.
+    // It appears in no catalogue, so `pro_claim_placements` never places it.
     assert!(!crate::product::PRO_CAPABILITY_CLAIMS.contains(&"ledger:history"));
     assert!(!crate::product::DAEMON_IMPLEMENTED_PRO_CLAIMS.contains(&"ledger:history"));
     assert!(!crate::product::HOSTED_CONTROL_PLANE_PRO_CLAIMS.contains(&"ledger:history"));
@@ -17576,6 +17745,7 @@ async fn work_gate_receipt_session_is_not_generic_observation_surface() -> Resul
             kind: None,
             session_id: None,
             limit: None,
+            chains: None,
         }),
     )
     .await;
@@ -25657,4 +25827,398 @@ async fn attention_summary_requires_admin_read() {
     .into_response();
 
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// An agent token on the default HTTP scope set can mint a stream receipt
+/// (`sessions:write`) and must also be able to verify it (`receipts:read`).
+/// Before `receipts:read` joined the default set, the mint returned 201 and
+/// the verification of that same receipt returned 403.
+#[tokio::test]
+#[serial_test::serial]
+async fn default_scoped_agent_token_can_verify_the_receipt_it_minted() -> Result<(), Box<dyn std::error::Error>> {
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    const AGENT_TOKEN: &str = "fedcba9876543210fedcba9876543210fedcba9876543210";
+    let _secret = EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", SECRET);
+    let _issuer = EnvVarGuard::unset("CORECRUXD_JWT_ISS");
+    let _audience = EnvVarGuard::unset("CORECRUXD_JWT_AUD");
+    let _accept = EnvVarGuard::set("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS", "1");
+    let _tokens = EnvVarGuard::set("CRUX_AGENT_TOKENS", &format!("jev-agent:{AGENT_TOKEN}"));
+    let _scopes = EnvVarGuard::unset("CORECRUXD_AGENT_TOKEN_HTTP_SCOPES");
+    let _tenant = EnvVarGuard::unset("CORECRUXD_AGENT_TOKEN_HTTP_TENANT");
+    let _passport_flag = EnvVarGuard::unset("CORECRUXD_AGENT_PASSPORTS");
+    let _passport_map = EnvVarGuard::unset("CRUX_AGENT_PASSPORTS");
+
+    let mut state = test_app_state_with_auth(16, AuthMode::Off);
+    state.auth = crate::auth::Authz::from_env(AuthMode::JwtHs256).expect("agent-token auth config");
+    let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).expect("init key");
+    state.passport_fpr = key.passport_fpr().to_string();
+    state.passport_public_key_hex = key.public_key_hex().to_string();
+    state.stream_receipts_enabled = true;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {AGENT_TOKEN}"))?,
+    );
+
+    let minted = super::observations::post_mediation_receipt(
+        State(state.clone()),
+        headers.clone(),
+        Json(serde_json::json!({
+            "kind": "model_invocation",
+            "session_id": "s-agent-verify",
+            "invocation_id": "inv-agent-verify",
+            "prompt_hash": "blake3:prompt",
+        })),
+    )
+    .await;
+    assert_eq!(minted.status(), StatusCode::CREATED);
+    let receipt_id = json_body(minted).await["receipt_id"]
+        .as_str()
+        .expect("minted receipt id")
+        .to_string();
+
+    let verified = get_receipt_verification_v1(
+        State(state.clone()),
+        Path(receipt_id),
+        Query(TenantQuery {
+            tenant_id: "local".to_string(),
+        }),
+        headers,
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        verified.status(),
+        StatusCode::OK,
+        "default agent scopes include receipts:read"
+    );
+    let report = json_body(verified).await;
+    assert_eq!(report["error_code"], "OK");
+    assert_eq!(report["signature_valid"], true);
+    Ok(())
+}
+
+/// `GET /v1/receipts/signing-keys` is public under enforced route auth, and
+/// what it serves is a keyring the offline verifier reads unchanged and that
+/// verifies a receipt this daemon minted.
+#[tokio::test]
+async fn receipt_signing_keys_are_public_and_verify_a_minted_receipt() {
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).expect("init key");
+    state.passport_fpr = key.passport_fpr().to_string();
+    state.passport_public_key_hex = key.public_key_hex().to_string();
+    state.stream_receipts_enabled = true;
+    let app = router_with_route_auth(state.clone(), test_case_store(), RouteAuthMode::Enforce);
+
+    let get = |uri: &str| {
+        axum::http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .expect("request")
+    };
+    // Control: the same setup does enforce auth on the neighbouring route.
+    let guarded = app
+        .clone()
+        .oneshot(get("/v1/receipts/r_x/verification?tenant_id=local"))
+        .await
+        .expect("guarded response");
+    assert!(
+        matches!(guarded.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+        "verification needs a credential, got {}",
+        guarded.status()
+    );
+
+    let response = app
+        .oneshot(get("/v1/receipts/signing-keys"))
+        .await
+        .expect("keyring response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let keyring_json = json_body(response).await;
+    let entry = &keyring_json["keys"][0];
+    assert_eq!(entry["keyId"], key.passport_fpr());
+    assert_eq!(entry["publicKeyHex"], key.public_key_hex());
+    assert_eq!(entry["alg"], "ed25519");
+    assert_eq!(entry["use"], "receipt-signing");
+    assert_eq!(keyring_json["keys"].as_array().map(Vec::len), Some(1));
+    assert!(
+        !keyring_json.to_string().contains(
+            &std::fs::read_to_string(&state.passport_key_path)
+                .expect("seed")
+                .trim()
+                .to_string()
+        ),
+        "the private seed must never be served"
+    );
+
+    let keyring =
+        corecrux_receipts::Ed25519KeyRingV1::parse_json(&keyring_json.to_string()).expect("keyring parses unchanged");
+    let minted = super::stream_receipts::mint_stream_receipt(
+        &state,
+        "operator",
+        &super::stream_receipts::StreamReceiptDraft {
+            kind: "model_invocation".to_string(),
+            session_id: Some("s-keyring".to_string()),
+            invocation_id: Some("inv-keyring".to_string()),
+            prompt_hash: Some("blake3:prompt".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("mint");
+    let path = super::observations::observation_file_path(&state.data_dir, "mediation::s-keyring");
+    let text = std::fs::read_to_string(path).expect("read log");
+    let record: serde_json::Value = serde_json::from_str(text.lines().next().expect("one record")).expect("record");
+    assert_eq!(record["payload"]["receipt_id"], minted.receipt_id);
+    let verified = corecrux_receipts::verify_stream_receipt_payload_v1(
+        &record["payload"],
+        "local",
+        &keyring,
+        "2026-09-28T00:00:00Z",
+        &state.build,
+    )
+    .expect("verify");
+    assert!(verified.is_verified(), "{:?}", verified.report);
+}
+
+/// If the published key would not be the signing key (fingerprint and public
+/// key disagree), the route publishes nothing rather than a wrong key.
+#[tokio::test]
+async fn receipt_signing_keys_fail_closed_on_an_inconsistent_key() {
+    let mut state = test_app_state(16);
+    let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).expect("init key");
+    state.passport_public_key_hex = key.public_key_hex().to_string();
+    state.passport_fpr = format!("p_{}", "0".repeat(32));
+    let response = super::receipts::get_receipt_signing_keys_v1(State(state)).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// Host-crux shape (2026-09-29): agent tokens accepted over HTTP with
+/// `CORECRUXD_AGENT_PASSPORTS=1`, so an unmapped token is the passport
+/// `agent:<name>` confined to tenant `default`, while the stream receipts it
+/// mints are signed under tenant `local`. Returns the state and bearer
+/// headers for two such tokens, `jev-host` and `other-host`.
+fn passport_confined_agent_state() -> (AppState, HeaderMap, HeaderMap) {
+    const JEV_TOKEN: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718";
+    const OTHER_TOKEN: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a6978";
+    let mut state = test_app_state_with_auth(16, AuthMode::Off);
+    state.auth = crate::auth::Authz::from_env(AuthMode::JwtHs256).expect("agent-token auth config");
+    let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).expect("init key");
+    state.passport_fpr = key.passport_fpr().to_string();
+    state.passport_public_key_hex = key.public_key_hex().to_string();
+    state.stream_receipts_enabled = true;
+    let bearer = |token: &str| {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).expect("header"),
+        );
+        headers
+    };
+    (state, bearer(JEV_TOKEN), bearer(OTHER_TOKEN))
+}
+
+fn passport_confined_agent_env() -> Vec<EnvVarGuard> {
+    vec![
+        EnvVarGuard::set("CORECRUXD_JWT_HS256_SECRET", "0123456789abcdef0123456789abcdef"),
+        EnvVarGuard::unset("CORECRUXD_JWT_ISS"),
+        EnvVarGuard::unset("CORECRUXD_JWT_AUD"),
+        EnvVarGuard::set("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS", "1"),
+        EnvVarGuard::set(
+            "CRUX_AGENT_TOKENS",
+            "jev-host:a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718,other-host:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a6978",
+        ),
+        EnvVarGuard::unset("CORECRUXD_AGENT_TOKEN_HTTP_SCOPES"),
+        EnvVarGuard::set("CORECRUXD_AGENT_TOKEN_HTTP_TENANT", "*"),
+        EnvVarGuard::set("CORECRUXD_AGENT_PASSPORTS", "1"),
+        // Map an unrelated name so neither test token hits the builtin map:
+        // both stay the unmapped `agent:<name>` principal, confined to `default`.
+        EnvVarGuard::set("CRUX_AGENT_PASSPORTS", "unrelated:unrelated-pass:default"),
+    ]
+}
+
+async fn mint_model_invocation(state: &AppState, headers: &HeaderMap, session: &str) -> String {
+    let minted = super::observations::post_mediation_receipt(
+        State(state.clone()),
+        headers.clone(),
+        Json(serde_json::json!({
+            "kind": "model_invocation",
+            "session_id": session,
+            "invocation_id": format!("inv-{session}"),
+            "prompt_hash": "blake3:prompt",
+        })),
+    )
+    .await;
+    assert_eq!(minted.status(), StatusCode::CREATED);
+    json_body(minted).await["receipt_id"]
+        .as_str()
+        .expect("minted receipt id")
+        .to_string()
+}
+
+async fn verify_as(state: &AppState, headers: &HeaderMap, receipt_id: &str, tenant: &str) -> Response {
+    get_receipt_verification_v1(
+        State(state.clone()),
+        Path(receipt_id.to_string()),
+        Query(TenantQuery {
+            tenant_id: tenant.to_string(),
+        }),
+        headers.clone(),
+    )
+    .await
+    .into_response()
+}
+
+/// Regression B: a passport-confined agent token verifies the receipt it
+/// minted (tenant `local`, owner = its passport). Any other passport gets
+/// exactly what it gets for an id that does not exist, so nothing leaks.
+#[tokio::test]
+#[serial_test::serial]
+async fn passport_confined_agent_verifies_its_own_stream_receipt_only() {
+    let _env = passport_confined_agent_env();
+    let (state, jev, other) = passport_confined_agent_state();
+    let receipt_id = mint_model_invocation(&state, &jev, "s-own").await;
+
+    for tenant in ["local", "default"] {
+        let resp = verify_as(&state, &jev, &receipt_id, tenant).await;
+        assert_eq!(resp.status(), StatusCode::OK, "owner, tenant_id={tenant}");
+        let report = json_body(resp).await;
+        assert_eq!(report["error_code"], "OK");
+        assert_eq!(report["signature_valid"], true);
+    }
+
+    // Another passport: same answer as for a missing receipt, per tenant.
+    for tenant in ["local", "default"] {
+        let foreign = verify_as(&state, &other, &receipt_id, tenant).await.status();
+        let missing = verify_as(&state, &other, "r_does-not-exist", tenant).await.status();
+        assert_eq!(foreign, missing, "tenant_id={tenant}: no existence probe");
+        assert!(
+            matches!(foreign, StatusCode::NOT_FOUND | StatusCode::FORBIDDEN),
+            "tenant_id={tenant}: {foreign}"
+        );
+    }
+    assert_eq!(
+        verify_as(&state, &other, &receipt_id, "default").await.status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // Ambiguity follows the same rule: the owner of a claiming body learns
+    // of the conflict, a stranger still sees nothing.
+    let record = {
+        let path = super::observations::observation_file_path(&state.data_dir, "mediation::s-own");
+        let text = std::fs::read_to_string(path).expect("read log");
+        serde_json::from_str::<super::observations::ObservationRecordV1>(text.lines().next().expect("record"))
+            .expect("parse record")
+    };
+    super::observations::append_one(
+        &state,
+        "mediation::s-shadow",
+        &record.principal,
+        super::observations::PostObservationBody {
+            kind: record.kind.clone(),
+            provider: "test".to_string(),
+            client_ts: None,
+            payload: record.payload.clone(),
+        },
+        None,
+    )
+    .expect("append duplicate claim");
+    for tenant in ["local", "default"] {
+        let resp = verify_as(&state, &jev, &receipt_id, tenant).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "owner, tenant_id={tenant}");
+        assert_eq!(json_body(resp).await["code"], "RECEIPT_ID_AMBIGUOUS");
+        let foreign = verify_as(&state, &other, &receipt_id, tenant).await.status();
+        let missing = verify_as(&state, &other, "r_does-not-exist", tenant).await.status();
+        assert_eq!(foreign, missing, "stranger, tenant_id={tenant}");
+    }
+}
+
+/// Regression A: a passport-bound caller lists the stream receipts minted
+/// for it (unscoped `mediation::<group>` logs) and not another passport's.
+/// Ordinary kinds keep the session scoping: an unscoped `tool_use` record
+/// with the caller as principal stays invisible to it.
+#[tokio::test]
+#[serial_test::serial]
+async fn passport_bound_caller_lists_its_own_stream_receipts_only() {
+    let _env = passport_confined_agent_env();
+    let (state, jev, other) = passport_confined_agent_state();
+    let jev_receipt = mint_model_invocation(&state, &jev, "s-jev").await;
+    let other_receipt = mint_model_invocation(&state, &other, "s-other").await;
+
+    // Unscoped ordinary record naming the caller as principal: not widened.
+    super::observations::append_one(
+        &state,
+        "mediation::s-jev",
+        "agent:jev-host",
+        super::observations::PostObservationBody {
+            kind: "tool_use".to_string(),
+            provider: "test".to_string(),
+            client_ts: None,
+            payload: serde_json::json!({}),
+        },
+        None,
+    )
+    .expect("append ordinary record");
+    // Scoped ordinary record through the generic route: still visible.
+    let posted = super::observations::post_observation(
+        State(state.clone()),
+        jev.clone(),
+        Path("own-session".to_string()),
+        Json(super::observations::PostObservationBody {
+            kind: "tool_use".to_string(),
+            provider: "test".to_string(),
+            client_ts: None,
+            payload: serde_json::json!({}),
+        }),
+    )
+    .await;
+    assert_eq!(posted.status(), StatusCode::CREATED);
+
+    let aggregate = |headers: HeaderMap, kind: &'static str| {
+        let state = state.clone();
+        async move {
+            let resp = super::observations::get_observations_aggregate(
+                State(state),
+                headers,
+                Query(super::observations::AggregateObservationsQuery {
+                    since: None,
+                    provider: None,
+                    kind: Some(kind.to_string()),
+                    session_id: None,
+                    limit: Some(10),
+                    chains: None,
+                }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            json_body(resp).await
+        }
+    };
+    let receipt_ids = |body: &serde_json::Value| -> Vec<String> {
+        body["observations"]
+            .as_array()
+            .expect("observations")
+            .iter()
+            .filter_map(|o| o["payload"]["receipt_id"].as_str().map(str::to_string))
+            .collect()
+    };
+
+    let mine = aggregate(jev.clone(), "model_invocation").await;
+    assert_eq!(receipt_ids(&mine), vec![jev_receipt.clone()]);
+    let theirs = aggregate(other.clone(), "model_invocation").await;
+    assert_eq!(receipt_ids(&theirs), vec![other_receipt]);
+
+    let tools = aggregate(jev, "tool_use").await;
+    let sessions: Vec<&str> = tools["observations"]
+        .as_array()
+        .expect("observations")
+        .iter()
+        .filter_map(|o| o["session_id"].as_str())
+        .collect();
+    assert_eq!(sessions.len(), 1, "only the scoped record: {sessions:?}");
+    assert!(sessions[0].ends_with("::own-session"), "{sessions:?}");
+    assert!(aggregate(other, "tool_use").await["observations"]
+        .as_array()
+        .expect("observations")
+        .is_empty());
 }
