@@ -2698,7 +2698,7 @@ mod tests {
         let mut out = std::collections::BTreeMap::new();
         for index in 0..archive.len() {
             let mut file = archive.by_index(index).expect("zip entry");
-            let name = file.name().to_string();
+            let name = file.name().expect("utf-8 zip entry name").to_string();
             let mut buf = Vec::new();
             file.read_to_end(&mut buf).expect("read zip entry");
             out.insert(name, buf);
