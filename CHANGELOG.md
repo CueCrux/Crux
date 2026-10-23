@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Jev setup is checkable and configurable.** `crux-jev doctor` checks a
+  Jev integration end to end without spending a Jev call: `crux-jev`'s
+  configuration, the two daemon flags, the token's read scopes (naming the
+  `dev_scopes` literal-token trap when they fail), the published signing key
+  and the pinned keyring, each failure with its fix. The daemon reads
+  `daemon.stream_receipts` and `daemon.context_surface` from `config.yaml`
+  (the environment still wins), and `GET /v1/version` reports
+  `capabilities.stream_receipts`.
+- **`crux-jev verify --tenant` / `--actor`.** The signed body must name the
+  tenant (default `local`) and, when asked, the minting passport; the result
+  reports `tenant_id` and `actor_passport`.
 - **Crux Claude Code mod in setup.** `corecruxctl login` / `start` and
   `crux-config-wizard init` now install `crux-desktop`, a Claude Code
   function-hook mod that owns session continuity: a context block on the first
@@ -45,6 +56,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`crux-jev` fixes.**
+  - `pin-key` reads the `publicKeyHex` the signing-keys route actually serves
+    (it looked for `public_key_hex`), needs no token, and writes the keyring
+    atomically.
+  - `verify` checks every decision fact naming a receipt, so a later edited
+    version can no longer pass on the strength of an earlier good one.
+  - A request with `store_state: "false"` (a string, which is truthy) or an
+    unknown `state_layout` is refused with exit 2 instead of being coerced or
+    failing as exit 1.
+  - A Jev reply with no answers raises a named error rather than `KeyError`.
+- **Jev docs match the code.** The cookbook no longer claims a receipt proves
+  *when* a decision was made offline (the body's timestamps are
+  caller-supplied), documents the `dev_scopes` token and the `admin:*` scopes
+  in the default agent-token set, the `verify`/`pin-key` exit codes, and drops
+  the stale "receipt ids are not unique" and "no offline verifier" text.
 - **Claude Code setup no longer reaches for private or hosted endpoints.** The
   `crux-coord` hook and the SessionStart banner defaulted to CueCrux's tailnet
   daemon (`100.70.12.73`) and to `crux.cuecrux.com` when no endpoint was

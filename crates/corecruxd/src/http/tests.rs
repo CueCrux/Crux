@@ -9101,6 +9101,9 @@ async fn version_public_view_is_redacted() {
     assert!(body["features"]["graph_expand"].is_boolean());
     assert!(body["features"]["self_observe"].is_boolean());
     assert!(body["features"]["mcp"].is_boolean());
+    // `crux-jev doctor` reads these two to say which Jev flag is missing.
+    assert!(body["capabilities"]["stream_receipts"]["enabled"].is_boolean());
+    assert!(body["capabilities"]["context_surface"]["enabled"].is_boolean());
     assert_eq!(body["sync"]["mode"], "local_only");
     assert_eq!(body["sync"]["configured"], false);
     assert_eq!(body["sync"]["remote_url_redacted"], false);
