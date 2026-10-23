@@ -11,6 +11,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`corecruxctl receipts verify-stream-receipt`** verifies a daemon stream
+  receipt (`model_invocation`, `context_injected`, `stream_completed`,
+  `stream_aborted`) offline from its observation record against a pinned
+  public keyring, checking the daemon's own signature over the canonical body.
+  It rejects other receipt classes signed by the same key (e.g. `usage_ping`)
+  on the signed `kind`, takes optional `--expect-receipt-id` / `--kind`
+  checks, and on success prints only fields decoded from the signed body —
+  the record's `payload.output_hash` and similar copies are unsigned.
+  Library entry point: `corecrux_receipts::verify_stream_receipt_payload_v1`.
+- **`GET /v1/receipts/signing-keys`** serves the daemon's receipt-signing
+  public key, unauthenticated, as an `Ed25519KeyRingV1` that
+  `verify-stream-receipt --keyring` reads unchanged (`keyId` is the passport
+  fingerprint receipts carry; also `publicKeyHex`, `alg`, `use`). Verifiers no
+  longer need `admin:read` on `/v1/admin/version`. Key discovery, not trust:
+  pin the key at enrolment.
+- `GET /v1/observations/aggregate` takes `chains=returned|all|none`.
+
+### Changed
+
+- **Passport-bound callers see and verify their own stream receipts.** With
+  `CORECRUXD_AGENT_PASSPORTS=1` an agent token is confined to its own tenant,
+  while the stream receipts it mints are signed under `local` and logged in
+  unscoped `mediation::<group>` sessions. `GET /v1/observations/aggregate`
+  now lists a daemon-signed receipt kind to the passport that minted it
+  (record `principal`), and `GET /v1/receipts/{id}/verification` lets a
+  `receipts:read` caller verify a stream receipt whose signed `actor_passport`
+  is its own passport, whatever `tenant_id` it asks under. Other kinds keep
+  session scoping; every other caller gets the same answer as for a missing
+  receipt.
+- **Agent tokens can verify receipts.** The default
+  `CORECRUXD_AGENT_TOKEN_HTTP_SCOPES` set gains `receipts:read`, so a token
+  that can mint a receipt (`sessions:write`) can also call
+  `GET /v1/receipts/{id}/verification`.
+- **Aggregate `chains` is bounded.** `GET /v1/observations/aggregate` now
+  reports chain status only for the sessions behind the returned records
+  (it covered every session log: ~7.3 MB and ~31 s for a 10-record answer on
+  a busy node). `?chains=all` restores the full map.
+
+### Security
+
+- **Stream receipt ids are unique.** `POST /v1/mediation/receipts` refuses a
+  stream-receipt draft whose `receipt_id` is already used (409
+  `RECEIPT_ID_CONFLICT`), and `/v1/receipts/{id}/verification` answers 409
+  `RECEIPT_ID_AMBIGUOUS` instead of the first match when a log holds more
+  than one body for an id, so a later mint cannot shadow an earlier receipt.
+- **Receipt kinds are reserved.** `POST /v1/sessions/{sid}/observations`
+  (and the batch route) refuse `model_invocation`, `context_injected`,
+  `stream_completed`, `stream_aborted` and `usage_ping` with 422
+  `RESERVED_OBSERVATION_KIND`; only the signing path writes them, so
+  `/v1/observations/aggregate?kind=model_invocation` no longer lists unsigned
+  imitations.
+
 ## [0.5.65] - 2026-09-22
 
 ### Added

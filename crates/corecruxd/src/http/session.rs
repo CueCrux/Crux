@@ -520,6 +520,8 @@ pub async fn post_session(State(state): State<AppState>, headers: HeaderMap, bod
             "ce",
             latency,
             sealed.plan.capability_graph.len(),
+            sealed.plan.capability_graph_edges.len(),
+            sealed.plan.capability_graph_excluded.as_deref(),
             &sealed.plan.passport.tier,
             plan_bytes,
             encoding,
