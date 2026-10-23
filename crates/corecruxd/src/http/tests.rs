@@ -7456,7 +7456,7 @@ fn build_zip_deterministic_round_trip() {
     let mut archive = zip::ZipArchive::new(cursor).expect("valid zip");
     assert_eq!(archive.len(), 2);
     let names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .map(|i| archive.by_index(i).unwrap().name().unwrap().to_string())
         .collect();
     assert!(names.contains(&"hello.txt".to_string()));
     assert!(names.contains(&"sub/nested.json".to_string()));
