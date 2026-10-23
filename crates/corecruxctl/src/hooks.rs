@@ -19,7 +19,7 @@
 
 use std::path::PathBuf;
 
-use crux_config_wizard::hooks_install;
+use crux_config_wizard::{hooks_install, mods_install};
 
 type DynErr = Box<dyn std::error::Error + Send + Sync>;
 
@@ -44,6 +44,37 @@ pub fn run_install(user: bool, project: Option<PathBuf>, endpoint: Option<String
 /// `corecruxctl hooks status` — show whether Crux hooks are wired in the target.
 pub fn run_status(user: bool, project: Option<PathBuf>) -> Result<(), DynErr> {
     println!("{}", hooks_install::status(user, project)?);
+    Ok(())
+}
+
+/// Install the `crux-desktop` mod (and re-converge any classic hooks already
+/// wired, so the mod owns continuity). Used by `mods install` and `login`.
+pub fn install_mod(opts: &mods_install::ModOptions) -> Result<String, DynErr> {
+    mods_install::install(opts)
+}
+
+/// `corecruxctl mods install`.
+pub fn run_mods_install(server: Option<String>, mcp_url: Option<String>, no_mcp: bool) -> Result<(), DynErr> {
+    let opts = mods_install::ModOptions {
+        server,
+        mcp_url,
+        mcp_token: None,
+        skip_mcp: no_mcp,
+    }
+    .with_saved_endpoint();
+    println!("{}", install_mod(&opts)?);
+    Ok(())
+}
+
+/// `corecruxctl mods uninstall`.
+pub fn run_mods_uninstall() -> Result<(), DynErr> {
+    println!("{}", mods_install::uninstall()?);
+    Ok(())
+}
+
+/// `corecruxctl mods status`.
+pub fn run_mods_status() -> Result<(), DynErr> {
+    println!("{}", mods_install::status()?);
     Ok(())
 }
 /// Save / confirm the daemon endpoint the hooks resolve at runtime.

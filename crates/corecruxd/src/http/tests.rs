@@ -7456,7 +7456,7 @@ fn build_zip_deterministic_round_trip() {
     let mut archive = zip::ZipArchive::new(cursor).expect("valid zip");
     assert_eq!(archive.len(), 2);
     let names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .map(|i| archive.by_index(i).unwrap().name().unwrap().to_string())
         .collect();
     assert!(names.contains(&"hello.txt".to_string()));
     assert!(names.contains(&"sub/nested.json".to_string()));
@@ -9101,6 +9101,9 @@ async fn version_public_view_is_redacted() {
     assert!(body["features"]["graph_expand"].is_boolean());
     assert!(body["features"]["self_observe"].is_boolean());
     assert!(body["features"]["mcp"].is_boolean());
+    // `crux-jev doctor` reads these two to say which Jev flag is missing.
+    assert!(body["capabilities"]["stream_receipts"]["enabled"].is_boolean());
+    assert!(body["capabilities"]["context_surface"]["enabled"].is_boolean());
     assert_eq!(body["sync"]["mode"], "local_only");
     assert_eq!(body["sync"]["configured"], false);
     assert_eq!(body["sync"]["remote_url_redacted"], false);

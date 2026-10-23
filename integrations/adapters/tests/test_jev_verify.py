@@ -63,6 +63,9 @@ if HAVE_DEPS:
                 "schema": "cuecrux.receipt.body.v1",
                 "kind": "model_invocation",
                 "receipt_id": receipt_id,
+                # Every stream receipt a daemon mints is tenant `local`.
+                "tenant_id": "local",
+                "actor_passport": "passport:jev",
                 "model_version": "jev-1.13.0",
                 "provider": "typesafe",
                 "provider_request_id": "req_1",
@@ -97,9 +100,37 @@ class Verification(unittest.TestCase):
         self.signer = Signer()
         self.keyring = {self.signer.key_id: self.signer.public}
 
-    def _one(self, records: list[dict[str, Any]], facts: list[Any] | None = None, entity: str | None = None) -> Any:
-        (check,) = verify_receipts(_client(records), ["r_1"], self.keyring, entity=entity, facts_for=lambda _: facts or [])
+    def _one(
+        self, records: list[dict[str, Any]], facts: list[Any] | None = None, entity: str | None = None, **kwargs: Any
+    ) -> Any:
+        (check,) = verify_receipts(
+            _client(records), ["r_1"], self.keyring, entity=entity, facts_for=lambda _: facts or [], **kwargs
+        )
         return check
+
+    def test_receipt_signed_for_another_tenant_fails(self) -> None:
+        check = self._one([self.signer.record("r_1", tenant_id="work")])
+        self.assertFalse(check.checks["body_binds_tenant"])
+        self.assertFalse(check.verified)
+        self.assertTrue(self._one([self.signer.record("r_1", tenant_id="work")], tenant="work").verified)
+
+    def test_actor_is_checked_only_when_asked_and_then_strictly(self) -> None:
+        record = self.signer.record("r_1")
+        self.assertNotIn("body_actor_matches", self._one([record]).checks)
+        self.assertTrue(self._one([record], actor="passport:jev").verified)
+        other = self._one([record], actor="passport:someone-else")
+        self.assertFalse(other.checks["body_actor_matches"])
+        self.assertFalse(other.verified)
+        self.assertEqual(other.as_json()["actor_passport"], "passport:jev")
+
+    def test_a_later_edited_fact_naming_the_receipt_fails_it(self) -> None:
+        # The good version first, an edit naming the same receipt after it:
+        # checking only the first match would have passed.
+        edited = {"cls": {"type": "choice", "choice": "behaviour_regression", "confidence": 1.0}}
+        facts = [_fact("r_1"), _fact("r_1", answers=edited)]
+        check = self._one([self.signer.record("r_1")], facts, entity="e")
+        self.assertFalse(check.checks["fact_output_hash_recomputes"])
+        self.assertFalse(check.verified)
 
     def test_genuine_receipt_and_fact_verify(self) -> None:
         check = self._one([self.signer.record("r_1")], [_fact("r_1")], entity="e")
@@ -184,6 +215,27 @@ class Pinning(unittest.TestCase):
             self.assertEqual(list(load_keyring(path)), [old.key_id])
             pin_key(self._daemon(new.public), path, replace=True)
             self.assertEqual(list(load_keyring(path)), [new.key_id])
+
+    def test_the_signing_keys_route_is_read_in_the_shape_the_daemon_serves(self) -> None:
+        # GET /v1/receipts/signing-keys (receipts.rs) serves keyring v1 entries
+        # with `publicKeyHex` and `pubKeyBase64`; no admin route is touched.
+        signer = Signer()
+        paths: list[str] = []
+
+        def request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+            paths.append(path)
+            if path == "/v1/receipts/signing-keys":
+                return {"v": 1, "keys": [{"keyId": signer.key_id, "alg": "ed25519", "use": "sig",
+                                          "publicKeyHex": signer.public.hex(),
+                                          "pubKeyBase64": base64.b64encode(signer.public).decode()}]}
+            raise AssertionError(f"unexpected {path}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "k.json"
+            result = pin_key(SimpleNamespace(_request=request), path)
+            self.assertEqual(result["key_id"], signer.key_id)
+            self.assertEqual(paths, ["/v1/receipts/signing-keys"])
+            self.assertEqual([p.name for p in Path(tmp).iterdir()], ["k.json"], "no temp file left behind")
 
     def test_a_keyring_whose_key_id_does_not_match_its_key_is_rejected(self) -> None:
         signer = Signer()
