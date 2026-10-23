@@ -98,6 +98,11 @@ pub struct McpContext {
     /// daemon supplies this at wiring time; `None` (tests, stdio-only) keeps
     /// `query` BM25-only — bit-identical pre-existing behaviour.
     pub dense_provider_factory: Option<DenseProviderFactory>,
+    /// MCP Streamable HTTP `Mcp-Session-Id` for the current request, when the
+    /// transport supplied (or minted) one. prompt-cache M1 keys the monotone
+    /// offered-tool union by it so one client's surface can never shrink
+    /// mid-conversation; `None` (stdio, tests) falls back to the passport.
+    pub mcp_session_id: Option<String>,
 }
 
 /// Constructor for the dense re-rank provider on the MCP `query` path.
@@ -156,6 +161,7 @@ impl McpContext {
             agent_passport_map: crate::agent_passport::AgentPassportMap::empty(),
             revocation_enforced: false,
             dense_provider_factory: None,
+            mcp_session_id: None,
         }
     }
 
@@ -191,6 +197,7 @@ impl McpContext {
             agent_passport_map: crate::agent_passport::AgentPassportMap::empty(),
             revocation_enforced: false,
             dense_provider_factory: None,
+            mcp_session_id: None,
         }
     }
 
@@ -240,6 +247,7 @@ impl McpContext {
             agent_passport_map: self.agent_passport_map.clone(),
             revocation_enforced: self.revocation_enforced,
             dense_provider_factory: self.dense_provider_factory.clone(),
+            mcp_session_id: self.mcp_session_id.clone(),
         }
     }
 
@@ -273,6 +281,19 @@ impl McpContext {
     /// can run the CPU cosine re-rank (parity with `POST
     /// /v1/query/text-search`). Unset → BM25-only, the pre-existing
     /// behaviour.
+    /// Attach the MCP `Mcp-Session-Id` for this request (prompt-cache M1).
+    /// Set by the HTTP transport per request; tests use it to give each case
+    /// its own monotone offered set.
+    pub fn with_mcp_session_id(mut self, session_id: impl Into<String>) -> Self {
+        let session_id = session_id.into();
+        self.mcp_session_id = if session_id.trim().is_empty() {
+            None
+        } else {
+            Some(session_id)
+        };
+        self
+    }
+
     pub fn with_dense_provider_factory(mut self, factory: DenseProviderFactory) -> Self {
         self.dense_provider_factory = Some(factory);
         self
@@ -478,21 +499,29 @@ pub async fn dispatch(req: JsonRpcRequest, ctx: &McpContext, _agent: Option<&Age
 
         // ── Tool surface ───────────────────────────────────────────────
         "tools/list" => {
-            let result = tools::list_tools_json_for_context(ctx, current_unix_seconds()).await;
+            let (result, delta) = tools::list_tools_json_for_context_with_delta(ctx, current_unix_seconds()).await;
             // mcp-tool-usage-analytics M3: record the FINAL offered set so
             // usage analysis can split "offered but ignored" from "never
             // offered". Flag-gated, deduped per (passport, set-hash),
             // fire-and-forget — never on the response path's error flow.
+            //
+            // prompt-cache M1 adds `added`/`removed` to the body: with the
+            // monotone surface on, `removed` is always empty, and the M0 cache
+            // ledger reads that field to prove the daemon caused no prefix
+            // invalidation.
             if crate::ledger::ledger_enabled() {
-                let names: Vec<String> = result["tools"]
-                    .as_array()
-                    .map(|ts| ts.iter().filter_map(|t| t["name"].as_str().map(String::from)).collect())
-                    .unwrap_or_default();
                 let passport = crate::scope::agent_name(ctx.agent.as_ref())
                     .unwrap_or(crate::traces::ANON_PASSPORT)
                     .to_string();
-                let mode = tools::surface::ToolSurfaceMode::from_env().as_str();
-                crate::ledger::emit_tools_offered(ctx.daemon_base_url.clone(), &passport, &names, mode);
+                let mode = tools::surface::session_mode(&tools::surface_session_key(ctx)).as_str();
+                crate::ledger::emit_tools_offered(
+                    ctx.daemon_base_url.clone(),
+                    &passport,
+                    &delta.names,
+                    mode,
+                    &delta.added,
+                    &delta.removed,
+                );
             }
             JsonRpcResponse::success(req.id, result)
         }
@@ -746,7 +775,8 @@ fn enforce_rcx_tool_capability(id: Option<serde_json::Value>, name: &str, ctx: &
     ))
 }
 
-fn current_unix_seconds() -> u64 {
+/// Wall-clock seconds for request-scoped decisions (RCX validity, intent TTL).
+pub(crate) fn current_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -914,7 +944,12 @@ mod tests {
 
     #[tokio::test]
     async fn tools_list_filters_through_rcx_router() {
-        let ctx = rcx_ctx_with_capabilities(vec!["crux-mcp.store_fact"]);
+        // prompt-cache M1: the monotone offered set is process-global and keyed
+        // by MCP session (passport when absent), so a test asserting an EXACT
+        // listing has to own its key — otherwise another test's wider listing
+        // for `__anon__` is legitimately carried forward into this one.
+        let ctx = rcx_ctx_with_capabilities(vec!["crux-mcp.store_fact"])
+            .with_mcp_session_id("test-tools-list-filters-through-rcx-router");
         let resp = dispatch(rpc("tools/list", json!({})), &ctx, None).await;
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();

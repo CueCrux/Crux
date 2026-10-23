@@ -199,14 +199,14 @@ fn write_executable(path: &Path, bytes: &[u8]) -> Result<(), DynErr> {
 
 /// Wire one agent. Returns the lines `start` prints under "agent".
 ///
-/// Claude returns nothing to add: `login` already installed its hooks and
-/// registered the endpoint, so duplicating that work here would be the second
-/// implementation this milestone is meant to avoid.
+/// Claude returns nothing to add: `login` already installed the mod (which
+/// registers the user-scope MCP server) and the hooks, so duplicating that work
+/// here would be the second implementation this milestone is meant to avoid.
 pub fn wire(agent: Agent, mcp_url: &str) -> Result<Vec<String>, DynErr> {
     match agent {
         Agent::Claude => Ok(vec![
-            "Claude Code hooks + MCP endpoint wired by `login` (nothing further to do)".to_string(),
-            "restart Claude Code to pick up the hooks".to_string(),
+            "Claude Code mod, hooks and MCP server wired by `login` (see `corecruxctl mods status`)".to_string(),
+            "restart Claude Code to load them; `/crux` opens the Crux pane".to_string(),
         ]),
         Agent::Codex => wire_codex(),
         Agent::Cursor => wire_cursor(mcp_url),

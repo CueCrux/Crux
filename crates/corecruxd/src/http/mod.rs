@@ -56,6 +56,11 @@ pub mod invocation;
 mod legal_holds;
 mod local_ingest;
 mod memory_import;
+// Read-only projection over the harness-native memory store
+// (`~/.claude/projects/*/memory/*.md`). Default OFF: unset
+// `CORECRUXD_NATIVE_MEMORY_ROOT` makes every route 404 without touching disk.
+// ExecPlan `crux-memory-parity-and-codex-bridge-2026-09-17` M4.
+mod native_memory;
 pub(crate) mod observations;
 mod observe;
 mod observe_audit;
@@ -81,6 +86,7 @@ mod result_envelope;
 mod route_auth;
 mod routing;
 pub mod session;
+mod session_cache;
 mod storybook;
 mod stream_receipts;
 mod studio_library;
@@ -151,8 +157,8 @@ use crate::shard_map::RoutingTable;
 use crate::structured_log::{CorrelationIds, ErrorCode, StructuredOpLog};
 
 use crate::auth::{
-    describe_http_evidence, http_scope_context, require_http_any_scope, require_http_any_scope_for_tenant,
-    require_http_scopes, require_http_scopes_for_tenant, Authz,
+    describe_http_evidence, http_owner_passport_with_scopes, http_scope_context, require_http_any_scope,
+    require_http_any_scope_for_tenant, require_http_scopes, require_http_scopes_for_tenant, Authz,
 };
 use crate::control::{self, ValveDecision};
 use crate::dataplane_store::AppendError;
@@ -753,6 +759,19 @@ pub(crate) fn router_with_route_auth(
         .route("/v1/facts/bulk", axum::routing::put(self::facts::put_facts_bulk))
         .route("/v1/facts/aggregate", axum::routing::post(self::facts::post_aggregate))
         .route("/v1/memory/import", axum::routing::post(self::memory_import::post_memory_import))
+        // Native-memory bridge (memory-parity M4). Strictly read-only: these
+        // routes never write the memory directory and never write a fact. The
+        // static `native` segment is declared before `/v1/memory/{...}` style
+        // paths so it can never be shadowed.
+        .route("/v1/memory/native", get(self::native_memory::list_native_memory))
+        .route(
+            "/v1/memory/native/search",
+            get(self::native_memory::search_native_memory),
+        )
+        .route(
+            "/v1/memory/native/{slug}",
+            get(self::native_memory::get_native_memory),
+        )
         .route(
             "/v1/identity/links",
             axum::routing::post(self::identity_links::post_identity_link),
@@ -897,6 +916,12 @@ pub(crate) fn router_with_route_auth(
         )
         .route("/v1/sessions/active", get(self::session::get_active_sessions))
         .route("/v1/sessions/{sessionId}/plan", get(self::session::get_session_plan))
+        // Prompt-cache clock (M3 of crux-prompt-cache-1h-ttl-2026-09-17): how
+        // long this session's cached prefix stays warm, and what a lapse costs.
+        .route(
+            "/v1/sessions/{sessionId}/cache",
+            get(self::session_cache::get_session_cache),
+        )
         // Invocation verification (master-plan §8).
         .route(
             "/invocation/verify",
@@ -904,6 +929,11 @@ pub(crate) fn router_with_route_auth(
         )
         // Production hardening: version endpoint
         .route("/v1/version", get(self::health::get_version))
+        // Public receipt-signing keyring (key discovery for offline verifiers).
+        .route(
+            "/v1/receipts/signing-keys",
+            get(self::receipts::get_receipt_signing_keys_v1),
+        )
         .route("/v1/actions/enrich", axum::routing::post(self::actions::post_action_enrich))
         .route("/v1/workbench/contract", get(self::workbench::get_workbench_contract))
         .route("/v1/workbench/brief", get(self::workbench::get_agent_brief))
@@ -1239,6 +1269,48 @@ pub(crate) fn router_with_route_auth(
         .route(
             "/v1/extensions/{id}/tools/{tool_name}/invoke",
             axum::routing::post(self::extensions::invoke_extension_tool),
+        )
+        // Buyer-fit M5 staged-activation seam: staged / active /
+        // quarantined. A staged pack runs and is observed but commits
+        // nothing; a quarantined one is refused at dispatch.
+        .route(
+            "/v1/extensions/{id}/lifecycle",
+            axum::routing::post(self::extensions::set_extension_lifecycle),
+        )
+        // Buyer-fit M5 conformance hook: replay a staged pack's declared
+        // operations and report what each would have done. Evidence only —
+        // the pass/fail verdict belongs to proof-carrying-adaptive-packs.
+        .route(
+            "/v1/extensions/{id}/conformance",
+            axum::routing::post(self::extensions::run_extension_conformance),
+        )
+        // Buyer-fit M5 outcome-event seam: what became of the memory a pack
+        // wrote. Mostly derived from the store + audit tail; only
+        // judgements the daemon cannot know are recorded.
+        .route(
+            "/v1/extensions/{id}/outcomes",
+            get(self::extensions::list_extension_outcomes),
+        )
+        .route(
+            "/v1/extensions/{id}/outcomes",
+            axum::routing::post(self::extensions::record_extension_outcome),
+        )
+        // Shadow-corpus staging + replay (proof-carrying-adaptive-packs M1):
+        // the conformance hook's evidence, judged against the pack's signed
+        // envelope, ending in a stored verdict.
+        .route(
+            "/v1/extensions/{id}/replay",
+            axum::routing::post(self::extensions::run_extension_replay),
+        )
+        // Buyer-fit M5 atomic-rollback seam: the install record's own
+        // version chain is the pin ledger; a rollback is one write.
+        .route(
+            "/v1/extensions/{id}/pins",
+            get(self::extensions::list_extension_pins),
+        )
+        .route(
+            "/v1/extensions/{id}/rollback",
+            axum::routing::post(self::extensions::rollback_extension),
         )
         // Storybook readout — Phase 3 of the context graph.
         .route(

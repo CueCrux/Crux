@@ -14,13 +14,19 @@ the daemon `/v1/cost/report` endpoint (reader/store), and the console `cx-cost` 
 - `CostReport` / `COST_REPORT_SCHEMA` (`report.rs`) — the versioned wire contract (`crux.cost.report.v1`); readers reject stale shapes on the schema string.
 - `transcript::parse_file` / `parse_str` — ground-truth usage extraction from the JSONL.
 - `attribution::analyze` — the carried-cost apportionment model.
+- `cache::ledger` (`cache.rs`) — the prompt-cache invalidation ledger: which API turns re-wrote an already-cached prefix, and why. Feeds `Headline::{cache_hit_rate, rewrite_share, invalidation_tokens, cache_creation_5m, cache_creation_1h, invalidations}` and the `cache-thrash` lever.
 - `Lever` / `Severity` (`report.rs`) — the "what to do about it" advice entries.
-- `TOP_BLOCKS` / `MAX_EXECPLAN_SLUGS` (`lib.rs`) — report bounds; the slug bound is a sanity bound, not a precision cap (OD-30 v2).
+- `TOP_BLOCKS` / `MAX_EXECPLAN_SLUGS` / `MAX_INVALIDATIONS` (`lib.rs`) — report bounds; the slug bound is a sanity bound, not a precision cap (OD-30 v2).
 
 ## Test & verify
 - `cargo test -p crux-cost`
 - `lib.rs` tests build a structurally-real transcript fixture;
   `measured_and_headline_are_ground_truth` pins the measure step.
+- `tests/cache_ledger.rs` covers the cache ledger against a **synthetic** fixture
+  (`tests/fixtures/cache-invalidations.jsonl`) — no operator transcript reaches CI. The
+  real-corpus gate is opt-in:
+  `CRUX_COST_CACHE_CORPUS=~/.claude/projects cargo test -p crux-cost --test cache_ledger -- --ignored --nocapture`,
+  held to the frozen `drivew-host-claude-transcripts-2026-09` baseline pinned in that test.
 
 ## Local rules
 - **`CostReport` is a cross-binary contract**: `corecruxctl` produces it, `corecruxd`
@@ -29,4 +35,9 @@ the daemon `/v1/cost/report` endpoint (reader/store), and the console `cx-cost` 
   and handle both versions on the read side.
 - Headline numbers are always the transcript's real `usage`; chars/4 estimation exists
   only to *apportion* the measured spend. Never surface an estimate as a headline.
+- **One API call is several JSONL lines.** Claude Code writes one `assistant` record per
+  content block, each repeating the whole `usage` object and the same `message.id`.
+  `transcript.rs` clears the duplicates' usage at parse time (`Event::duplicate_api_line`);
+  anything summing `usage` per record multi-counts — by 193% on `cache_creation` across
+  `drivew-host-claude-transcripts-2026-09`.
 - Crate is `#![deny(clippy::unwrap_used)]` — keep it panic-free on malformed transcripts.

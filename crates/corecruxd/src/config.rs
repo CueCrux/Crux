@@ -473,6 +473,15 @@ pub struct Config {
     pub embed_delegate_url: Option<String>,
     pub embed_delegate_token: Option<RedactedSecret>,
     pub embed_delegate_dimensions: Option<usize>,
+    // Who pays when the provider meters the door (`CORECRUXD_CREDIT_METER=1`).
+    // One payer per daemon: the tenant that owns this daemon, not the tenant of
+    // whichever end-user request triggers an embed. Unset means "send no quote",
+    // which only an unmetered provider accepts.
+    pub embed_delegate_tenant: Option<String>,
+    // Optional override for the quote's `price_list_hash`. The provider only
+    // format-checks it, so the client derives one from the lane's pinned price
+    // when this is unset.
+    pub embed_delegate_price_list_hash: Option<String>,
     // Pure-Rust offline dense embedder (buyer-fit M3.2). Default ON: when no
     // external `embedding_url` is set, facts are embedded with the zero-dep
     // `LocalHashEmbedder` so dense recall works with no external service. Set
@@ -632,7 +641,9 @@ impl Config {
     pub(crate) fn validate_embedding_selection(&self) -> Result<(), &'static str> {
         let delegation_configured = self.embed_delegate_url.is_some()
             || self.embed_delegate_token.is_some()
-            || self.embed_delegate_dimensions.is_some();
+            || self.embed_delegate_dimensions.is_some()
+            || self.embed_delegate_tenant.is_some()
+            || self.embed_delegate_price_list_hash.is_some();
         if !delegation_configured {
             return Ok(());
         }
@@ -657,6 +668,13 @@ impl Config {
         }
         if self.embedding_model.trim().is_empty() {
             return Err("CORECRUXD_EMBEDDING_MODEL must be non-empty when embedding delegation is configured");
+        }
+        // A price-list hash without a tenant names no wallet, so it would be
+        // silently dropped. Fail closed rather than delegate unpaid.
+        if self.embed_delegate_price_list_hash.is_some() && self.embed_delegate_tenant.is_none() {
+            return Err(
+                "CORECRUXD_EMBED_DELEGATE_TENANT is required when CORECRUXD_EMBED_DELEGATE_PRICE_LIST_HASH is set",
+            );
         }
         Ok(())
     }
@@ -685,6 +703,12 @@ struct FileDaemonConfig {
     mcp_port: Option<u16>,
     mcp_enabled: Option<bool>,
     auth_mode: Option<String>,
+    /// `CORECRUXD_STREAM_RECEIPTS`: mint signed stream receipts
+    /// (`model_invocation` and friends). The environment wins.
+    stream_receipts: Option<bool>,
+    /// `CORECRUXD_CONTEXT_SURFACE`: serve `GET /v1/context`. The environment
+    /// wins.
+    context_surface: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1333,6 +1357,12 @@ pub fn load_config() -> Config {
             // validation fails closed instead of treating a typo as "unset"
             // and silently selecting the local embedder.
             .map(|value| value.trim().parse::<usize>().unwrap_or_default()),
+        embed_delegate_tenant: env_string("CORECRUXD_EMBED_DELEGATE_TENANT")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        embed_delegate_price_list_hash: env_string("CORECRUXD_EMBED_DELEGATE_PRICE_LIST_HASH")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
         local_embedder_enabled: env_default_on("CORECRUXD_LOCAL_EMBEDDER"),
         dense_model: std::env::var("CORECRUXD_DENSE_MODEL").ok().filter(|s| !s.is_empty()),
         semantic_dedup_threshold: {
@@ -1414,11 +1444,15 @@ pub fn load_config() -> Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(crate::coord::DEFAULT_PRESENCE_TTL_SECS)
             .clamp(60, crate::coord::MAX_TTL_SECS),
-        context_surface_enabled: env_bool("CORECRUXD_CONTEXT_SURFACE").unwrap_or(false),
+        context_surface_enabled: env_bool("CORECRUXD_CONTEXT_SURFACE")
+            .or(file_config.daemon.context_surface)
+            .unwrap_or(false),
         auto_capture_enabled: env_bool("CORECRUXD_AUTO_CAPTURE").unwrap_or(false),
         tenant_erasure_enabled: env_bool("CORECRUXD_TENANT_ERASURE").unwrap_or(false),
         local_ingest_enabled: env_default_on("CORECRUXD_LOCAL_INGEST"),
-        stream_receipts_enabled: env_bool("CORECRUXD_STREAM_RECEIPTS").unwrap_or(false),
+        stream_receipts_enabled: env_bool("CORECRUXD_STREAM_RECEIPTS")
+            .or(file_config.daemon.stream_receipts)
+            .unwrap_or(false),
         usage_receipts_enabled: env_bool("CORECRUXD_FEATURE_USAGE_RECEIPTS").unwrap_or(false),
         handoff_observations_enabled: env_bool("CORECRUXD_HANDOFF_OBSERVATIONS").unwrap_or(false),
         // Phase T (M1) opt-in submitter — the daemon's only outbound signal.
@@ -2273,6 +2307,34 @@ mod tests {
         clear_corecruxd_env();
     }
 
+    /// The two flags a Jev integration needs can live in config.yaml, so a
+    /// service unit or brew formula need not carry them; the environment
+    /// still wins either way.
+    #[test]
+    #[serial_test::serial]
+    fn stream_receipt_flags_read_from_yaml_and_env_wins() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+        clear_corecruxd_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.yaml");
+        std::fs::write(&path, "daemon:\n  stream_receipts: true\n  context_surface: true\n").unwrap();
+        std::env::set_var("CORECRUXD_CONFIG_PATH", &path);
+
+        let cfg = super::load_config();
+        assert!(cfg.stream_receipts_enabled);
+        assert!(cfg.context_surface_enabled);
+
+        std::env::set_var("CORECRUXD_CONTEXT_SURFACE", "0");
+        let cfg = super::load_config();
+        assert!(cfg.stream_receipts_enabled);
+        assert!(!cfg.context_surface_enabled, "the environment overrides the file");
+
+        std::env::remove_var("CORECRUXD_CONTEXT_SURFACE");
+        std::env::remove_var("CORECRUXD_CONFIG_PATH");
+    }
+
     #[test]
     #[serial_test::serial]
     fn load_config_reads_xdg_yaml_and_env_overrides() {
@@ -2688,6 +2750,63 @@ llm:
         let orphan_invalid_dimensions = super::load_config();
         assert_eq!(
             orphan_invalid_dimensions.validate_embedding_selection(),
+            Err("CORECRUXD_EMBED_DELEGATE_URL is required when embedding delegation is configured")
+        );
+
+        clear_corecruxd_env();
+    }
+
+    /// The payer names the wallet that funds this daemon's delegated
+    /// embedding. It is optional — omitting it sends no quote, which is what
+    /// an unmetered provider has always been sent.
+    #[test]
+    #[serial_test::serial]
+    fn load_config_embed_delegate_payer_is_optional_and_trimmed() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_corecruxd_env();
+
+        std::env::set_var("CORECRUXD_EMBED_DELEGATE_URL", "https://compute.example.test");
+        std::env::set_var("CORECRUXD_EMBED_DELEGATE_TOKEN", "secret");
+        std::env::set_var("CORECRUXD_EMBED_DELEGATE_DIMENSIONS", "768");
+        let unpaid = super::load_config();
+        assert!(unpaid.embed_delegate_tenant.is_none());
+        assert!(unpaid.validate_embedding_selection().is_ok());
+
+        std::env::set_var("CORECRUXD_EMBED_DELEGATE_TENANT", "  tenant-payer  ");
+        let paid = super::load_config();
+        assert_eq!(paid.embed_delegate_tenant.as_deref(), Some("tenant-payer"));
+        assert!(paid.validate_embedding_selection().is_ok());
+
+        clear_corecruxd_env();
+    }
+
+    /// A price-list hash with no tenant names no wallet, so it would be
+    /// silently dropped rather than change any billing. Fail closed instead.
+    #[test]
+    #[serial_test::serial]
+    fn embed_delegate_price_list_hash_requires_a_tenant() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_corecruxd_env();
+
+        std::env::set_var("CORECRUXD_EMBED_DELEGATE_URL", "https://compute.example.test");
+        std::env::set_var("CORECRUXD_EMBED_DELEGATE_TOKEN", "secret");
+        std::env::set_var("CORECRUXD_EMBED_DELEGATE_DIMENSIONS", "768");
+        std::env::set_var("CORECRUXD_EMBED_DELEGATE_PRICE_LIST_HASH", "blake3:aa");
+        let orphan_hash = super::load_config();
+        assert_eq!(
+            orphan_hash.validate_embedding_selection(),
+            Err("CORECRUXD_EMBED_DELEGATE_TENANT is required when CORECRUXD_EMBED_DELEGATE_PRICE_LIST_HASH is set")
+        );
+
+        // A payer setting alone still selects the fail-closed delegation
+        // profile, so a typo cannot fall through to the local embedder.
+        clear_corecruxd_env();
+        std::env::set_var("CORECRUXD_EMBED_DELEGATE_TENANT", "tenant-payer");
+        let orphan_tenant = super::load_config();
+        assert_eq!(
+            orphan_tenant.validate_embedding_selection(),
             Err("CORECRUXD_EMBED_DELEGATE_URL is required when embedding delegation is configured")
         );
 

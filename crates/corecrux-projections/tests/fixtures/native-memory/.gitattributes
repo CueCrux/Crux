@@ -1,0 +1,4 @@
+# The native-memory fixtures deliberately carry CRLF endings and one invalid
+# UTF-8 byte. Git must not normalise either, or the degradation tests in
+# `tests/native_memory_ingest.rs` become vacuous.
+* -text

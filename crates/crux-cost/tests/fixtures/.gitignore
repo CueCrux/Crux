@@ -1,0 +1,3 @@
+# The repo root ignores *.jsonl (transcripts are never committed). The fixtures
+# here are synthetic, hand-cut and redacted — no operator transcript reaches CI.
+!*.jsonl

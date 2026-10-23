@@ -146,38 +146,87 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
     // to check", which is the one thing a provenance signal must not be.
     let provenance = index.provenance_tally_for_reader_indices(hits.iter().map(|h| h.segment_index));
 
-    let mut inner = json!({
-        "results": results_json,
-        "total_candidates": result.total_candidates,
-        "coverage": {
-            "score": result.coverage.score,
-            "missing_tokens": result.coverage.missing_tokens,
-            "below_floor": result.coverage.below_floor,
-        },
-        "meta": {
-            "source_label": "local_tenant_index",
-            "provenance": provenance,
-            "score_space": score_space,
-            "score_merge_rule": score_merge_rule,
-            "mixed_profile_merge_rule": MIXED_PROFILE_MERGE_RULE,
-            "semantic_profile_id": null,
-            "local_semantic_profile_id": local_semantic_profile_id.clone(),
-            "local_semantic_profile": semantic_profile.clone(),
-            "embedding_fingerprint": embedding_fingerprint.clone(),
+    // M1 (memory-parity, `crux-memory-parity-and-codex-bridge-2026-09-17`):
+    // an empty hit list is an honest miss, said out loud. The BM25 lane already
+    // has its own relevance floor (`min_score` / `coverage.below_floor`), so
+    // there is nothing to re-rank here — what was missing is the marker and the
+    // affordance that tells the caller what to do instead.
+    let total_hits = results_json.len();
+    let compact = !unshaped;
+    // Build the payload at an arbitrary pointer count so the whole-response
+    // budget can search over it. `build_inner(total_hits)` is byte-identical to
+    // the pre-M1 payload.
+    let build_inner = |emitted: usize| -> Value {
+        let emitted = emitted.min(total_hits);
+        let match_marker = if emitted == 0 { "none" } else { "found" };
+        let mut inner = json!({
+            "results": results_json[..emitted],
+            "total_candidates": result.total_candidates,
+            "match": match_marker,
+            "suggest": (match_marker == "none").then_some(crate::recall_match::SUGGEST_NO_MATCH),
+            "coverage": {
+                "score": result.coverage.score,
+                "missing_tokens": result.coverage.missing_tokens,
+                "below_floor": result.coverage.below_floor,
+            },
+            "meta": {
+                "source_label": "local_tenant_index",
+                "provenance": provenance,
+                "score_space": score_space,
+                "score_merge_rule": score_merge_rule,
+                "mixed_profile_merge_rule": MIXED_PROFILE_MERGE_RULE,
+                "semantic_profile_id": null,
+                "local_semantic_profile_id": local_semantic_profile_id.clone(),
+                "local_semantic_profile": semantic_profile.clone(),
+                "embedding_fingerprint": embedding_fingerprint.clone(),
+                "emitted": emitted,
+                "capped": total_hits.saturating_sub(emitted),
+            }
+        });
+        // CRC-v1: reshape into the pointer-first envelope when negotiated;
+        // absent -> legacy payload unchanged.
+        if crate::crc_v1::enabled(params) {
+            inner = crate::crc_v1::wrap_query(inner);
         }
-    });
-    // CRC-v1: reshape into the pointer-first envelope when negotiated; absent →
-    // legacy payload unchanged.
-    if crate::crc_v1::enabled(params) {
-        inner = crate::crc_v1::wrap_query(inner);
-    }
+        inner
+    };
+    let inner = build_inner(total_hits);
     // M3: minified unconditionally (since CO-5). CO-4 holdout: the unshaped
     // control arm forces pretty so it pays the full (unshaped) cost.
-    let compact = !unshaped;
     let text = crate::payload::serialize_with(&inner, compact);
     crate::holdout::record_sample(unshaped, crate::token_estimate::estimate_tokens_str(&text));
     crate::holdout::sample_compaction(&params.to_string(), &inner); // CO-5 compaction-only
-    Ok(json!({ "content": [{ "type": "text", "text": text }] }))
+    let mut envelope = json!({ "content": [{ "type": "text", "text": text }] });
+    disclose_response_budget(&mut envelope, token_budget, total_hits);
+    Ok(envelope)
+}
+
+/// M1 whole-response budget DISCLOSURE for the pointer-tier search surfaces.
+///
+/// `query` / `query_scan` keep the measured pointer-tier budget contract
+/// (`budget / POINTER_TOKENS` pointers, CO-6 / QC.2): their token-savings ledger
+/// is calibrated on it, and re-cutting it here would rewrite another milestone's
+/// numbers. What M1 adds is honesty — the response now REPORTS its true
+/// end-to-end serialised cost and says `within_budget: false` when the envelope
+/// scaffolding pushed it past the caller's number, instead of leaving the
+/// overrun invisible. The fact-recall surfaces (`query_facts`, `GET /v1/facts`,
+/// `memory_view`), where the overrun was measured at 40x, do enforce the whole
+/// response.
+fn disclose_response_budget(envelope: &mut Value, token_budget: Option<usize>, pointers_emitted: usize) {
+    let Some(budget) = token_budget else { return };
+    let tokens = crate::token_estimate::estimate_tokens(envelope);
+    if let Some(map) = envelope.as_object_mut() {
+        map.insert(
+            "structuredContent".into(),
+            json!({"budget": {
+                "token_budget": budget,
+                "tokens_emitted": tokens,
+                "governs": "pointer_tier",
+                "pointers_emitted": pointers_emitted,
+                "within_budget": tokens <= budget as u64,
+            }}),
+        );
+    }
 }
 
 /// `query_scan` — metadata-only scan (no full content).
@@ -239,32 +288,50 @@ pub async fn handle_query_scan(params: &Value, ctx: &McpContext) -> Result<Value
         }));
     }
 
-    let mut inner = json!({
-        "scan": scan,
-        "total_candidates": result.total_candidates,
-        "tokens_returned": tokens_returned,
-        "budget_truncated": budget_truncated,
-        "meta": {
-            "source_label": "local_tenant_index",
-            "score_space": SCORE_SPACE_BM25_LEXICAL,
-            "score_merge_rule": SCORE_MERGE_RULE_SINGLE_SPACE,
-            "mixed_profile_merge_rule": MIXED_PROFILE_MERGE_RULE,
-            "semantic_profile_id": null,
-            "local_semantic_profile_id": local_semantic_profile_id.clone(),
-            "local_semantic_profile": semantic_profile.clone(),
-            "embedding_fingerprint": embedding_fingerprint.clone(),
-        }
-    });
-    if crate::crc_v1::enabled(params) {
-        inner = crate::crc_v1::wrap_scan(inner);
-    }
     // CO-4 live holdout: unshaped control arm forces pretty; record the cost.
     let unshaped = crate::holdout::request_is_control(&params.to_string());
     let compact = !unshaped;
+    let total_hits = scan.len();
+    // M1 (memory-parity, `crux-memory-parity-and-codex-bridge-2026-09-17`):
+    // an empty scan is an honest miss, said out loud — `match: "none"` plus the
+    // affordance that tells the caller what shape to ask in instead.
+    let build_inner = |emitted: usize| -> Value {
+        let emitted = emitted.min(total_hits);
+        let match_marker = if emitted == 0 { "none" } else { "found" };
+        let mut inner = json!({
+            "scan": scan[..emitted],
+            "total_candidates": result.total_candidates,
+            "tokens_returned": tokens_returned,
+            "budget_truncated": budget_truncated || emitted < total_hits,
+            "match": match_marker,
+            "suggest": (match_marker == "none").then_some(crate::recall_match::SUGGEST_NO_MATCH),
+            "meta": {
+                "source_label": "local_tenant_index",
+                "score_space": SCORE_SPACE_BM25_LEXICAL,
+                "score_merge_rule": SCORE_MERGE_RULE_SINGLE_SPACE,
+                "mixed_profile_merge_rule": MIXED_PROFILE_MERGE_RULE,
+                "semantic_profile_id": null,
+                "local_semantic_profile_id": local_semantic_profile_id.clone(),
+                "local_semantic_profile": semantic_profile.clone(),
+                "embedding_fingerprint": embedding_fingerprint.clone(),
+                "emitted": emitted,
+                "capped": total_hits.saturating_sub(emitted),
+            }
+        });
+        if crate::crc_v1::enabled(params) {
+            inner = crate::crc_v1::wrap_scan(inner);
+        }
+        inner
+    };
+    // Pointer-tier budget retained (see `disclose_response_budget`); M1 adds the
+    // honest miss marker and the end-to-end cost disclosure.
+    let inner = build_inner(total_hits);
     let text = crate::payload::serialize_with(&inner, compact);
     crate::holdout::record_sample(unshaped, crate::token_estimate::estimate_tokens_str(&text));
     crate::holdout::sample_compaction(&params.to_string(), &inner); // CO-5 compaction-only
-    Ok(json!({ "content": [{ "type": "text", "text": text }] }))
+    let mut envelope = json!({ "content": [{ "type": "text", "text": text }] });
+    disclose_response_budget(&mut envelope, token_budget, total_hits);
+    Ok(envelope)
 }
 
 /// `query_expand` — expand previously retrieved results by segment:doc_id.

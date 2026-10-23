@@ -159,6 +159,7 @@ pub(super) async fn post_build_pack(
         wasm_module_path: None,
         wasm_module_url: None,
         wasm_module_sha256: None,
+        conformance: None,
     };
 
     let bundle_hash = blake3_hash(&canonical_bytes(&body.studio));
@@ -737,6 +738,7 @@ mod tests {
             wasm_module_path: None,
             wasm_module_url: None,
             wasm_module_sha256: None,
+            conformance: None,
         };
         let bundle = blake3_hash(&canonical_bytes(&studio));
         manifest.hashes.bundle = Some(bundle.clone());

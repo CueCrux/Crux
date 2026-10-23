@@ -270,36 +270,83 @@ pub async fn handle_memory_view(args: &Value, ctx: &McpContext) -> Result<Value,
         .map(|f| fact_to_memory_json_id(f, id_ref, &alias_refs, pinned_ids.contains(&f.fact_id)))
         .collect();
 
-    let text = if selected.is_empty() {
-        "no memory visible".to_string()
-    } else {
-        selected
-            .iter()
-            .map(|f| {
-                let entity =
-                    scope::visible_entity_for_identity(f, id_ref, &alias_refs).unwrap_or_else(|| f.entity.clone());
-                let pinned = if pinned_ids.contains(&f.fact_id) {
-                    " [pinned]"
-                } else {
-                    ""
-                };
-                format!(
-                    "[{}] {} = {} (id={}, v{}){}",
-                    entity, f.key, f.value, f.fact_id, f.version, pinned
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    let lines: Vec<String> = selected
+        .iter()
+        .map(|f| {
+            let entity = scope::visible_entity_for_identity(f, id_ref, &alias_refs).unwrap_or_else(|| f.entity.clone());
+            let pinned = if pinned_ids.contains(&f.fact_id) {
+                " [pinned]"
+            } else {
+                ""
+            };
+            format!(
+                "[{}] {} = {} (id={}, v{}){}",
+                entity, f.key, f.value, f.fact_id, f.version, pinned
+            )
+        })
+        .collect();
 
-    Ok(json!({
-        "content": [{ "type": "text", "text": text }],
-        "structuredContent": {
-            "facts": facts_json,
-            "total_tokens": used_tokens,
-            "returned": selected.len(),
+    // M1 (memory-parity, `crux-memory-parity-and-codex-bridge-2026-09-17`):
+    // an empty view says `match: "none"` and points at the addressing shape that
+    // resolves, instead of the bare "no memory visible" that reads the same
+    // whether the entity is wrong or the store is empty.
+    if selected.is_empty() {
+        return Ok(json!({
+            "content": [{
+                "type": "text",
+                "text": format!("no memory visible. {}", crate::recall_match::SUGGEST_NO_MATCH)
+            }],
+            "structuredContent": {
+                "facts": [],
+                "total_tokens": 0,
+                "returned": 0,
+                "match": "none",
+                "suggest": crate::recall_match::SUGGEST_NO_MATCH,
+            }
+        }));
+    }
+
+    // M1: `token_budget` governs the WHOLE serialised response, not just the
+    // fact tier it used to cap.
+    let total = facts_json.len();
+    let render = |full: usize, emitted: usize| -> Value {
+        let emitted = emitted.min(total);
+        let full = full.min(emitted);
+        let mut facts = Vec::with_capacity(emitted);
+        facts.extend(facts_json[..full].iter().cloned());
+        for fact in &facts_json[full..emitted] {
+            let mut trimmed = fact.clone();
+            if let Some(map) = trimmed.as_object_mut() {
+                map.remove("value");
+                map.insert("value_omitted".into(), json!(true));
+            }
+            facts.push(trimmed);
         }
-    }))
+        json!({
+            "content": [{ "type": "text", "text": lines[..full].join("\n") }],
+            "structuredContent": {
+                "facts": facts,
+                "total_tokens": used_tokens,
+                "returned": emitted,
+            }
+        })
+    };
+    let (mut result, outcome) = crate::response_budget::fit(budget, total, render);
+    if let Some(map) = result.pointer_mut("/structuredContent").and_then(Value::as_object_mut) {
+        map.insert(
+            "budget".into(),
+            json!({
+                "token_budget": budget,
+                "tokens_emitted": outcome.tokens,
+                "governs": "whole_response",
+                "rows_hydrated": outcome.full,
+                "rows_emitted": outcome.emitted,
+                "rows_dropped": total.saturating_sub(outcome.emitted),
+                "within_budget": outcome.fits,
+            }),
+        );
+    }
+    Ok(result)
 }
 
 /// `memory_edit` — update the value of an existing fact. Requires an
@@ -915,9 +962,12 @@ mod tests {
         assert_eq!(city_rows.len(), 1, "default recall must collapse to the latest version");
         assert_eq!(city_rows[0]["value"], "Munich");
 
-        // include_superseded brings the retired version back, marked.
+        // include_superseded brings the retired version back, marked. 2000, not
+        // 500: since memory-parity M1 the budget governs the whole serialised
+        // response and two hydrated rows plus the envelope do not fit 500. This
+        // test asserts supersession visibility, not a budget boundary.
         let q2 = handle_query_facts(
-            &json!({"entity": "person:frank", "include_superseded": true, "token_budget": 500}),
+            &json!({"entity": "person:frank", "include_superseded": true, "token_budget": 2000}),
             &alice,
         )
         .await

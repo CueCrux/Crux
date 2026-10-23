@@ -317,6 +317,7 @@ mod tests {
                 cache_read_to_output_ratio: 100.0,
                 measured_context_total: ctx_per_turn * 10,
                 prefix_pct: 60.0,
+                ..crux_cost::Headline::default()
             },
             measured: crux_cost::Measured::default(),
             buckets: Vec::new(),

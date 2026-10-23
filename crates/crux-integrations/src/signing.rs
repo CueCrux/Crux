@@ -230,6 +230,7 @@ mod tests {
             wasm_module_path: None,
             wasm_module_url: None,
             wasm_module_sha256: None,
+            conformance: None,
         }
     }
 

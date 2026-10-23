@@ -10,9 +10,16 @@
 //! the daemon process.
 
 pub mod c2pa_signer_selector;
+pub mod conformance;
 pub mod signing;
 pub mod studio_index;
 
+pub use conformance::{
+    BehaviouralEnvelope, CompatibilityAssertions, ConformanceDeclarationError, DecayEnvelope, DeclaredCase,
+    ExpectedFactMutation, ExpectedMutations, ExpectedReceiptMutation, FactMutationOp, InvariantKind, InvariantTest,
+    MigrationAssertion, MigrationKind, PackConformance, ReceiptMutationKind, ReplayCorpus, UndoEnvelope,
+    PACK_CONFORMANCE_SCHEMA_V1,
+};
 pub use signing::{fingerprint_from_public_key, sign_manifest, TrustedKeyEntry, TrustedKeyring};
 pub use studio_index::{
     RcxTier, StudioEntryKind, StudioLibraryEntry, StudioLibraryIndex, STUDIO_LIBRARY_INDEX_SCHEMA_V1,
@@ -88,6 +95,8 @@ pub enum IntegrationError {
     InvalidPathComponent(String),
     #[error("invalid index schema '{0}'")]
     InvalidIndexSchema(String),
+    #[error("invalid conformance declaration: {0}")]
+    Conformance(#[from] conformance::ConformanceDeclarationError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -147,6 +156,18 @@ pub struct IntegrationManifest {
     /// daemon refuses to load a module whose on-disk bytes don't match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wasm_module_sha256: Option<String>,
+
+    /// `pack.conformance.v1` — what the pack declares it does, so a replay
+    /// can later prove whether it did that (M0 of
+    /// `proof-carrying-adaptive-packs-2026-07-13`). Only valid for the kinds
+    /// that execute (`ExternalTool`, `Wasm`); see
+    /// [`conformance::PackConformance`].
+    ///
+    /// Covered by [`Self::signing_payload`], so the declaration is inside the
+    /// publisher's signature rather than beside it. Skipped when absent, so a
+    /// manifest that predates the block hashes and verifies exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conformance: Option<conformance::PackConformance>,
 }
 
 /// One MCP-callable tool an external-tool extension exposes.
@@ -398,6 +419,14 @@ impl IntegrationAuditEvent {
     }
 }
 
+/// One pre-enable shadow replay of a staged pack against its declared,
+/// content-addressed corpus, ending in a verdict
+/// (`proof-carrying-adaptive-packs-2026-07-13` M1). Distinct from
+/// [`AUDIT_EXTENSION_CONFORMANCE_RUN`], which records the evidence a replay
+/// is built from and reaches no verdict — a reader has to be able to tell
+/// "the pack was observed" from "the pack was judged".
+pub const AUDIT_EXTENSION_REPLAY_RUN: &str = "extension_replay_run";
+
 pub const AUDIT_EXTENSION_INSTALL: &str = "extension_install";
 pub const AUDIT_EXTENSION_UNINSTALL: &str = "extension_uninstall";
 pub const AUDIT_EXTENSION_GRANT_ADDED: &str = "extension_grant_added";
@@ -406,6 +435,25 @@ pub const AUDIT_TRUSTED_KEY_ADDED: &str = "trusted_key_added";
 pub const AUDIT_TRUSTED_KEY_REMOVED: &str = "trusted_key_removed";
 pub const AUDIT_EXTENSION_INVOKE_OK: &str = "extension_invoke_ok";
 pub const AUDIT_EXTENSION_INVOKE_REJECTED: &str = "extension_invoke_rejected";
+/// A pack moved between lifecycle states (staged / active / quarantined).
+/// The `detail` carries `from`, `to`, and the operator's `reason`, so the
+/// audit tail alone answers "who took this pack live, and why was it put
+/// back" without replaying the install-record fact chain.
+pub const AUDIT_EXTENSION_LIFECYCLE: &str = "extension_lifecycle";
+/// A staged pack was dispatched: it ran, and its writes were observed
+/// rather than committed. Distinct from `extension_invoke_ok` precisely so
+/// "this call changed memory" and "this call only proved what it would
+/// change" are never conflated in the tail.
+pub const AUDIT_EXTENSION_INVOKE_STAGED: &str = "extension_invoke_staged";
+/// A staged pack's declared operations were replayed and observed. The
+/// `detail` carries the corpus id and the run's `observed_digest`, so the
+/// audit tail alone shows that a replay happened and which behaviour it
+/// saw, even if the run body itself is never persisted.
+pub const AUDIT_EXTENSION_CONFORMANCE_RUN: &str = "extension_conformance_run";
+/// A pinned prior pack build was atomically restored. The `detail` names
+/// the build moved from and to plus the operator's `reason`, so the trail
+/// answers why a pack's bytes changed, not only that they did.
+pub const AUDIT_EXTENSION_ROLLBACK: &str = "extension_rollback";
 pub const AUDIT_SUPPRESSED: &str = "audit_suppressed";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -475,6 +523,13 @@ struct ManifestSigningPayload<'a> {
     network: &'a NetworkAccess,
     data_access: &'a DataAccess,
     safety: &'a SafetyPolicy,
+    /// The conformance declaration is signed with the rest of the manifest:
+    /// a promise an attacker can edit after signing is not evidence. Appended
+    /// last and skipped when absent so every manifest written before the
+    /// block existed serialises to exactly the same bytes — and therefore to
+    /// the same `manifest_hash` and the same valid signature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conformance: Option<&'a conformance::PackConformance>,
 }
 
 impl IntegrationManifest {
@@ -609,6 +664,14 @@ impl IntegrationManifest {
             )));
         }
 
+        // Before the hash + signature checks: a malformed declaration is a
+        // problem with the pack regardless of who signed it, and the error
+        // pack authors need to read is "your envelope does not cover your
+        // declared writes", not "signature invalid".
+        if let Some(declaration) = &self.conformance {
+            declaration.validate(self)?;
+        }
+
         if let Some(expected) = &self.hashes.manifest {
             let actual = self.manifest_hash()?;
             if expected != &actual {
@@ -643,6 +706,7 @@ impl IntegrationManifest {
             network: &self.network,
             data_access: &self.data_access,
             safety: &self.safety,
+            conformance: self.conformance.as_ref(),
         };
         Ok(serde_json::to_vec(&payload)?)
     }
@@ -1153,6 +1217,7 @@ pub fn builtin_manifests() -> Vec<IntegrationManifest> {
             wasm_module_path: None,
             wasm_module_url: None,
             wasm_module_sha256: None,
+            conformance: None,
         },
         IntegrationManifest {
             schema: INTEGRATION_SCHEMA_V1.to_string(),
@@ -1176,6 +1241,7 @@ pub fn builtin_manifests() -> Vec<IntegrationManifest> {
             wasm_module_path: None,
             wasm_module_url: None,
             wasm_module_sha256: None,
+            conformance: None,
         },
         IntegrationManifest {
             schema: INTEGRATION_SCHEMA_V1.to_string(),
@@ -1204,6 +1270,7 @@ pub fn builtin_manifests() -> Vec<IntegrationManifest> {
             wasm_module_path: None,
             wasm_module_url: None,
             wasm_module_sha256: None,
+            conformance: None,
         },
         IntegrationManifest {
             schema: INTEGRATION_SCHEMA_V1.to_string(),
@@ -1232,6 +1299,7 @@ pub fn builtin_manifests() -> Vec<IntegrationManifest> {
             wasm_module_path: None,
             wasm_module_url: None,
             wasm_module_sha256: None,
+            conformance: None,
         },
         // Note: a `github.pr-facts` declarative recipe used to live here.
         // Removed in favour of the live GitHub indexer integration which
@@ -1502,6 +1570,7 @@ mod tests {
             wasm_module_path: None,
             wasm_module_url: None,
             wasm_module_sha256: None,
+            conformance: None,
         }
     }
 

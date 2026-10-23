@@ -46,6 +46,7 @@ pub mod learn;
 pub mod login;
 pub mod machine;
 pub mod memory;
+pub mod memory_distill;
 pub mod memory_pack;
 pub mod observe_ingest;
 pub mod openclaw;

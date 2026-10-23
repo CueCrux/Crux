@@ -5,13 +5,13 @@ build-backend = "hatchling.build"
 [project]
 name = "cuecrux-adapters"
 version = "0.1.0"
-description = "Framework adapters for the Crux Daemon context surface (LangChain, LlamaIndex, CrewAI)"
+description = "Framework adapters for the Crux Daemon context surface (LangChain, LlamaIndex, CrewAI) and Jev decision receipts"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
 # The adapters are thin wrappers over GET /v1/context and reuse the Python SDK
 # for auth, timeouts and error types rather than re-implementing them.
-dependencies = ["cuecrux-client>=0.3"]
+dependencies = ["cuecrux-client>=0.4"]
 
 [project.optional-dependencies]
 # One extra per framework: installing the LangChain adapter must not drag in
@@ -19,6 +19,20 @@ dependencies = ["cuecrux-client>=0.3"]
 langchain = ["langchain-core>=0.3"]
 llamaindex = ["llama-index-core>=0.11"]
 crewai = ["crewai>=0.80"]
+# crux_adapters.jev_langchain: receipts for Jev calls made by langchain-typesafe
+# (TypeSafeClassifier and its agent middleware). Alpha upstream; tested on 0.0.1a3.
+jev-langchain = ["langchain-typesafe[experimental]>=0.0.1a3,<0.0.2"]
+# crux_adapters.jev.replay: checks the signed receipt body's BLAKE3 against the
+# daemon-verified payload hash (hashlib has no BLAKE3). Without it replay refuses.
+jev-replay = ["blake3>=0.4,<2"]
+# crux-jev verify / crux_adapters.jev_verify: offline Ed25519 check of Jev
+# receipts against a pinned keyring, plus the BLAKE3 key-id binding.
+jev-verify = ["blake3>=0.4,<2", "cryptography>=42"]
+
+[project.scripts]
+# Record a Jev decision from any language: JSON request on stdin, JSON result
+# (answers + receipt id + fact id) on stdout. See crux_adapters/jev_cli.py.
+crux-jev = "crux_adapters.jev_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/CueCrux/Crux"

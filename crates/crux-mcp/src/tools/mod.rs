@@ -206,8 +206,9 @@ pub fn list_tools_with_flags(
                           catalog. Without `names`: returns the content-free engram manifest for \
                           your capability class (session discovery). With `names` \
                           (`name@version`, max 20): returns full engram content when your \
-                          capability class allows. Flag-gated by CORECRUXD_FEATURE_ENGRAM_MCP \
-                          (off by default)."
+                          capability class allows. This is the catalog behind the always-loaded \
+                          memory digest: a digest line names `<slug>`, and `<slug>@v1` resolves \
+                          its body. On by default; CORECRUXD_FEATURE_ENGRAM_MCP=0 disables it."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -410,10 +411,14 @@ pub fn list_tools_with_flags(
                     "query": {
                         "type": "string",
                         "description": "Optional search term to narrow the matching bootstrap facts."
+                    },
+                    "token_budget": {
+                        "type": "integer",
+                        "description": "Token ceiling for the returned facts. Pass on every call; 500 is the conventional cold-start budget."
                     }
                 },
                 "examples": [
-                    { "topic": "patterns" },
+                    { "topic": "patterns", "token_budget": 500 },
                     { "topic": "docs", "query": "integration" },
                     { "topic": "errors" }
                 ]
@@ -1543,8 +1548,9 @@ pub fn list_tools_with_flags(
                           Defaults to the caller's own passport (self-revoke); pass \
                           `target_passport` to revoke another. Authorized for: self, the \
                           passport's sponsor, or an elite-tier operator. Writes a receipted \
-                          revocation event. Access refusal is gated behind \
-                          CRUX_PASSPORT_REVOCATION=1."
+                          revocation event. Access is refused by default \
+                          (CRUX_PASSPORT_REVOCATION=0 disables it); sync and \
+                          operator-tier tools refuse a revoked passport regardless."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -1914,7 +1920,7 @@ pub fn list_tools_with_flags(
                 "properties": {
                     "session_id":    { "type": "string", "description": "Your bound session id (hex) — the one cuecrux_session minted." },
                     "project_id":    { "type": "string" },
-                    "by_passport":   { "type": "string", "description": "Optional; the session binding's passport wins when the session is bound." },
+                    "by_passport":   { "type": "string", "description": "Optional; the session binding's passport wins when the session is bound. On an unbound session it must name your own passport, or the announce is refused." },
                     "execplan_slug": { "type": "string" },
                     "milestone":     { "type": "string" },
                     "deploy_target": { "type": "string", "description": "Optional deploy-axis focus (e.g. \"deploy:crux\"). When a live peer announces the same target, the response overlaps[] carries a deploy_target warning — serialise the deploy, don't double-cut. Advisory only." },
@@ -2592,22 +2598,92 @@ pub fn list_tools_json_for_rcx_router(router: &RcxRouter, now_unix_seconds: u64)
     )
 }
 
-pub async fn list_tools_json_for_context(ctx: &McpContext, now_unix_seconds: u64) -> Value {
-    // The surface mode is a process flag (`CORECRUXD_TOOL_SURFACE`); the core
-    // takes it explicitly so tests can drive a mode without mutating env.
-    list_tools_json_for_context_with_mode(ctx, now_unix_seconds, surface::ToolSurfaceMode::from_env()).await
+/// The key a session's monotone offered set is filed under (prompt-cache M1):
+/// the MCP `Mcp-Session-Id` when the transport supplied one, else the caller's
+/// passport. Two clients sharing a passport with no session id share a union —
+/// documented fallback, and still monotone for both.
+pub fn surface_session_key(ctx: &McpContext) -> String {
+    match ctx.mcp_session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(session_id) => format!("mcp-session:{session_id}"),
+        None => {
+            let passport = passport::passport_key_name(ctx).unwrap_or_else(|| crate::traces::ANON_PASSPORT.to_string());
+            format!("passport:{passport}")
+        }
+    }
 }
 
-pub(crate) async fn list_tools_json_for_context_with_mode(
+pub async fn list_tools_json_for_context(ctx: &McpContext, now_unix_seconds: u64) -> Value {
+    list_tools_json_for_context_with_delta(ctx, now_unix_seconds).await.0
+}
+
+/// `tools/list` plus the per-session offered delta the ledger records.
+///
+/// The surface mode is read ONCE per session (prompt-cache M1) rather than from
+/// the environment on every request.
+pub async fn list_tools_json_for_context_with_delta(
+    ctx: &McpContext,
+    now_unix_seconds: u64,
+) -> (Value, surface::OfferedDelta) {
+    let mode = surface::session_mode(&surface_session_key(ctx));
+    list_tools_json_with_mode_and_delta(ctx, now_unix_seconds, mode).await
+}
+
+/// The names the next `tools/list` for this context WOULD offer, computed
+/// without recording them (prompt-cache M1). Used to decide whether an
+/// intent change actually warrants a `tools/list_changed` push.
+pub async fn preview_shaped_tool_names(ctx: &McpContext, now_unix_seconds: u64) -> Vec<String> {
+    let mode = surface::session_mode(&surface_session_key(ctx));
+    shape_surface(ctx, now_unix_seconds, mode)
+        .await
+        .shaped
+        .into_iter()
+        .map(|t| t.name)
+        .collect()
+}
+
+/// The authz-filtered, shaped surface for one request, plus the pre-authz
+/// catalogue the monotone union recovers definitions from.
+struct ShapedSurface {
+    shaped: Vec<ToolDefinition>,
+    catalogue: Vec<ToolDefinition>,
+    auth: Option<ToolAuthMetadata>,
+}
+
+/// Core `tools/list` computation, mode taken explicitly so tests can drive a
+/// mode and a clock without mutating process env.
+pub async fn list_tools_json_with_mode_and_delta(
     ctx: &McpContext,
     now_unix_seconds: u64,
     mode: surface::ToolSurfaceMode,
-) -> Value {
+) -> (Value, surface::OfferedDelta) {
+    let ShapedSurface {
+        shaped,
+        catalogue,
+        auth,
+    } = shape_surface(ctx, now_unix_seconds, mode).await;
+
+    // prompt-cache M1: fold this request's shape into the session's monotone
+    // union. The served set is never a proper subset of one this session
+    // already saw, so a re-list can never invalidate the client's cached
+    // prefix. A tool the authz filter dropped since the last listing (expired
+    // RCX token, tier change) stays advertised and is refused at `tools/call`
+    // by `enforce_rcx_tool_capability` with the existing
+    // `denied:capability_not_permitted` shape.
+    let shaped_names: Vec<String> = shaped.iter().map(|t| t.name.clone()).collect();
+    let delta = surface::merge_offered(&surface_session_key(ctx), mode, &shaped_names);
+    let tools = surface::project_to_names(&delta.names, shaped, &catalogue);
+    (tools_to_json(tools, auth), delta)
+}
+
+async fn shape_surface(ctx: &McpContext, now_unix_seconds: u64, mode: surface::ToolSurfaceMode) -> ShapedSurface {
     let auth = ctx
         .rcx_router
         .as_ref()
         .map(|router| ToolAuthMetadata::from_token(router.token()));
     let base_tools = list_tools_with_flags(ctx.agent_passports_enabled, ctx.passport_mint_requests_enabled);
+    // prompt-cache M1 keeps the PRE-authz catalogue so a tool the session was
+    // already offered can still be listed after its RCX capability lapses.
+    let mut catalogue = base_tools.clone();
     let mut tools = match ctx.rcx_router.as_ref() {
         // Local-tier install (no RCX capability token): the agent-passport
         // flag promotes `issue_passport`, while the independent mint-request
@@ -2616,6 +2692,7 @@ pub(crate) async fn list_tools_json_for_context_with_mode(
         Some(router) => filter_tools_for_rcx_router(base_tools, router, now_unix_seconds),
     };
     let mut extension_tools = extensions::list_extension_tools(ctx).await;
+    catalogue.extend(extension_tools.iter().cloned());
     if let Some(router) = ctx.rcx_router.as_ref() {
         let capabilities: Vec<McpToolCapability> = extension_tools
             .iter()
@@ -2641,7 +2718,11 @@ pub(crate) async fn list_tools_json_for_context_with_mode(
         surface::ToolSurfaceMode::Dynamic => {
             let passport_key =
                 passport::passport_key_name(ctx).unwrap_or_else(|| crate::traces::ANON_PASSPORT.to_string());
-            let intent = surface::current_intent(&passport_key);
+            // prompt-cache M1: the expiry clock is injected from the request
+            // rather than read from the wall clock, so the TTL edge is testable
+            // without sleeping an hour. Expiry now only stops the intent
+            // *boosting*; the monotone union below keeps what was offered.
+            let intent = surface::current_intent(&passport_key, now_unix_seconds as i64);
             // M4: blend the declared intent with the agent's recent tool-use.
             // Empty when tool-traces are disabled → intent-only behaviour.
             let trace_boosts = if crate::traces::traces_enabled() {
@@ -2654,7 +2735,11 @@ pub(crate) async fn list_tools_json_for_context_with_mode(
         }
         other => surface::apply_surface_mode(tools, other),
     };
-    tools_to_json(tools, auth)
+    ShapedSurface {
+        shaped: tools,
+        catalogue,
+        auth,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2855,7 +2940,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "cuecrux_session",    "output": "SessionPlan (see agents.cuecrux.com/schemas/SessionPlan.v1). Contains plan_id, session_id, passport, channels {bulk?, mcp}, capability_graph[], receipt {hash, signature?, signer_kid?, mode}, budget, minted_at, session_ttl_s." },
         { "tool": "autonomy_contract",  "output": "{ feature_enabled, passport_id, tier, token_id, token_hash, capabilities: [{name, allowed, scope, backend_id, mode, cost_credits, why_denied?}], summary: {total_tools, returned, allowed, denied, truncated_by_token_budget} }. Disabled when CORECRUXD_FEATURE_AUTONOMY_CONTRACT is off (feature_enabled=false, empty capabilities)." },
         { "tool": "reuse_check",        "output": "{ schema, verdict: 'reuse-candidate-found'|'nothing-found', candidates: [{kind: 'capability'|'retrieval_pointer', path, file_line, score|overlap_terms, ...}], retrieval_candidates: [{kind, result_id, rank, score, doc_length_tokens, path: null, file_line: null}], capability_candidates: [{kind, id, name, system, maturity, files, overlap_terms, path, file_line}], token_budget, tokens_returned, budget_truncated, guidance }. `file_line` comes from Features-lens `files` entries with a `<path>:<line>` suffix; retrieval hits are pointers (expand via query_expand). CAPABILITY_DENIED when CORECRUXD_FEATURE_REUSE_CHECK is off (default)." },
-        { "tool": "engram_resolve",     "output": "manifest mode: { schema, capability_class, engram_manifest }; resolve mode: { schema, capability_class, engrams: [{name, version, intent_bucket, content, prompt_hash, applicable_why}], engram_set_hash, manifest_hash }. CAPABILITY_DENIED when CORECRUXD_FEATURE_ENGRAM_MCP is off (default)." },
+        { "tool": "engram_resolve",     "output": "manifest mode: { schema, capability_class, engram_manifest }; resolve mode: { schema, capability_class, engrams: [{name, version, intent_bucket, content, prompt_hash, applicable_why}], engram_set_hash, manifest_hash }. CAPABILITY_DENIED when CORECRUXD_FEATURE_ENGRAM_MCP is explicitly set to 0/false/off; on by default." },
         { "tool": "query",              "output": "{ results: [{doc_id, score, segment_index, token_count}], coverage: {score, gaps, below_floor}, meta: {backend, took_ms, segments_searched} }" },
         { "tool": "query_scan",         "output": "{ results: [{doc_id, score, token_count}], meta: {took_ms, segments_searched} }" },
         { "tool": "query_expand",       "output": "{ results: [{doc_id, content, token_count}] }" },
@@ -3022,8 +3107,8 @@ pub async fn handle_get_agent_identity(_args: &Value, ctx: &McpContext) -> Resul
 
 /// Dispatch a tool call by name. Returns the MCP `content` array.
 pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
-    // passport-revocation M3: when enforcement is on (CRUX_PASSPORT_REVOCATION=1,
-    // default-off), a REVOKED passport is refused every tool except a tiny
+    // passport-revocation M3: when enforcement is on (default; CRUX_PASSPORT_REVOCATION=0
+    // disables it), a REVOKED passport is refused every tool except a tiny
     // read-only allowlist (so it can learn why — M4). The fact store is
     // in-process/in-memory, so the per-call passport read is a cheap
     // RwLock+indexed lookup; no TTL cache is used (it would only add revocation
@@ -3286,6 +3371,10 @@ mod tests {
     /// no env mutation): an anon agent that declared `audit_review` gets a
     /// surface = floor + audit-relevant tools, with irrelevant tools shaped out
     /// and the full set still far larger.
+    ///
+    /// prompt-cache M1 changed the tail: dropping the intent no longer collapses
+    /// the listing back to the floor. It stops *boosting*, and the session keeps
+    /// what it was already offered.
     #[tokio::test]
     async fn dynamic_listing_reshapes_by_declared_intent() {
         // This test asserts the *intent-only* dynamic shape. The trace
@@ -3294,32 +3383,70 @@ mod tests {
         // surface — pin the flag off (env-lock per crate rules).
         let _g = crate::test_env_lock().lock().await;
         std::env::set_var(crate::traces::FEATURE_FLAG_ENV, "0");
+        std::env::remove_var(surface::MONOTONE_ENV);
         let pk = crate::traces::ANON_PASSPORT;
         surface::clear_intent_for_test(pk);
         surface::record_intent(pk, "audit_review");
 
-        let ctx = test_ctx();
-        let json = list_tools_json_for_context_with_mode(&ctx, 0, surface::ToolSurfaceMode::Dynamic).await;
-        let names: Vec<&str> = json["tools"]
+        let ctx = test_ctx().with_mcp_session_id("test-dynamic-listing-reshapes");
+        let json = list_tools_json_with_mode_and_delta(&ctx, 0, surface::ToolSurfaceMode::Dynamic)
+            .await
+            .0;
+        let names: Vec<String> = json["tools"]
             .as_array()
             .expect("tools array")
             .iter()
-            .filter_map(|t| t["name"].as_str())
+            .filter_map(|t| t["name"].as_str().map(String::from))
             .collect();
 
-        assert!(names.contains(&"cuecrux_session"), "floor present");
-        assert!(names.contains(&"audit_config"), "audit intent surfaces audit tools");
+        assert!(names.iter().any(|n| n == "cuecrux_session"), "floor present");
         assert!(
-            !names.contains(&"github_search"),
+            names.iter().any(|n| n == "audit_config"),
+            "audit intent surfaces audit tools"
+        );
+        assert!(
+            !names.iter().any(|n| n == "github_search"),
             "irrelevant tool shaped out under dynamic"
         );
         assert!(names.len() < list_tools().len(), "dynamic surface smaller than full");
 
-        // With no intent, the same path collapses to the floor.
+        // prompt-cache M1: with the intent gone the surface is UNCHANGED, not
+        // collapsed to the floor. A shrinking re-list is what invalidates the
+        // client's cached prefix.
         surface::clear_intent_for_test(pk);
-        let json2 = list_tools_json_for_context_with_mode(&ctx, 0, surface::ToolSurfaceMode::Dynamic).await;
-        let n2 = json2["tools"].as_array().expect("tools array").len();
-        assert_eq!(n2, surface::CORE_FLOOR.len(), "no intent ⇒ floor only");
+        let (json2, delta2) = list_tools_json_with_mode_and_delta(&ctx, 0, surface::ToolSurfaceMode::Dynamic).await;
+        let names2: Vec<String> = json2["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(String::from))
+            .collect();
+        assert_eq!(names2, names, "losing the intent must not reshape the listing");
+        assert!(delta2.removed.is_empty(), "M1 invariant: `removed` is always empty");
+        assert!(!delta2.grew, "an unchanged listing is not a growth event");
+
+        // Rollback path: `CORECRUXD_SURFACE_MONOTONE=0` restores the pre-M1
+        // collapse for one release.
+        std::env::set_var(surface::MONOTONE_ENV, "0");
+        let ctx_off = test_ctx().with_mcp_session_id("test-dynamic-listing-reshapes-flag-off");
+        surface::record_intent(pk, "audit_review");
+        let before = list_tools_json_with_mode_and_delta(&ctx_off, 0, surface::ToolSurfaceMode::Dynamic)
+            .await
+            .0["tools"]
+            .as_array()
+            .expect("tools array")
+            .len();
+        surface::clear_intent_for_test(pk);
+        let after = list_tools_json_with_mode_and_delta(&ctx_off, 0, surface::ToolSurfaceMode::Dynamic)
+            .await
+            .0["tools"]
+            .as_array()
+            .expect("tools array")
+            .len();
+        assert!(before > after, "flag off ⇒ pre-M1 shrink is back");
+        assert_eq!(after, surface::CORE_FLOOR.len(), "flag off ⇒ no intent ⇒ floor only");
+
+        std::env::remove_var(surface::MONOTONE_ENV);
         std::env::remove_var(crate::traces::FEATURE_FLAG_ENV);
     }
 
@@ -3679,9 +3806,13 @@ mod tests {
                 token,
                 signing.verifying_key().to_bytes(),
             ))
-            .with_passport_mint_requests(true);
+            .with_passport_mint_requests(true)
+            // Own MCP session key: the prompt-cache M1 union is process-global.
+            .with_mcp_session_id("test-passport-mint-request-rcx-filtering");
 
-        let listed = list_tools_json_for_context_with_mode(&ctx, 1_776_989_601, surface::ToolSurfaceMode::Full).await;
+        let listed = list_tools_json_with_mode_and_delta(&ctx, 1_776_989_601, surface::ToolSurfaceMode::Full)
+            .await
+            .0;
         let names: Vec<&str> = listed["tools"]
             .as_array()
             .expect("tools array")

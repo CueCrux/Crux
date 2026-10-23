@@ -288,6 +288,7 @@ fn regen_studio_board_example() {
         wasm_module_path: None,
         wasm_module_url: None,
         wasm_module_sha256: None,
+        conformance: None,
     };
     // Signs + fills hashes.manifest; hashes.bundle is preserved.
     let publisher_fpr = manifest.publisher_passport_fpr.clone();

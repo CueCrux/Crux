@@ -19,6 +19,7 @@ pub mod decay;
 mod events;
 pub mod extraction;
 mod meta;
+pub mod native_memory;
 pub mod query;
 mod runner;
 pub mod session_plans_by_principal;
@@ -65,6 +66,14 @@ pub use meta::{
     store_projections_meta_v1, ProjectionCursorV1, ProjectionMetaV1, ProjectionModuleRefV1, ProjectionModuleStatusV1,
     ProjectionModuleVersionV1, ProjectionsMetaV1, PROJECTION_MODULES_LIST_SCHEMA_V1,
     PROJECTION_MODULE_VERSION_SCHEMA_V1,
+};
+pub use native_memory::{
+    ingest_native_memory, read_memory_body, redact_secret_shaped, resolve_roots, search_memories, DanglingEdgeV1,
+    EdgeOrigin, MemoryBodyV1, MemoryEdgeV1, MemoryIndexEntryV1, MemoryIndexSectionV1, MemoryIndexV1, MemorySearchHitV1,
+    MemoryWarningKind, MemoryWarningV1, NativeMemoryEntryV1, NativeMemoryError, NativeMemoryIngestOptions,
+    NativeMemoryIngestV1, DEFAULT_MAX_FILES, DEFAULT_MAX_FILE_BYTES, NATIVE_MEMORY_ENTITY_PREFIX,
+    NATIVE_MEMORY_FACT_KEY, NATIVE_MEMORY_INDEX_FILE, NATIVE_MEMORY_PROJECTION_ID, NATIVE_MEMORY_ROOT_ENV,
+    NATIVE_MEMORY_SOURCE, REDACTION_PLACEHOLDER,
 };
 pub use runner::{
     ColdSegmentGcOptionsV1, ColdSegmentGcProjectionReportV1, ColdSegmentGcReportV1, ProjectionFilesV1,

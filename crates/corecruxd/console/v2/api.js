@@ -15,7 +15,7 @@
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
 //
-// 195 read endpoints, generated from the route manifest.
+// 202 read endpoints, generated from the route manifest.
 
 /**
  * Append a plain query object to a path as a URL search string.
@@ -114,6 +114,8 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/mcp/tools': true,
   '/v1/mcp/tools/usage': true,
   '/v1/memory/candidates': true,
+  '/v1/memory/native': true,
+  '/v1/memory/native/search': true,
   '/v1/observations/aggregate': true,
   '/v1/openai/tools.json': true,
   '/v1/openapi.json': true,
@@ -133,6 +135,7 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/punchcards': true,
   '/v1/quota': true,
   '/v1/receipts/list': true,
+  '/v1/receipts/signing-keys': true,
   '/v1/relations': true,
   '/v1/relations/incoming': true,
   '/v1/repos': true,
@@ -408,6 +411,12 @@ const CruxApi = Object.freeze({
   extensionsByIdGrants(id, query) {
     return fetch(withQuery(`/v1/extensions/${encodeURIComponent(id)}/grants`, query), { credentials: 'same-origin' });
   },
+  extensionsByIdOutcomes(id, query) {
+    return fetch(withQuery(`/v1/extensions/${encodeURIComponent(id)}/outcomes`, query), { credentials: 'same-origin' });
+  },
+  extensionsByIdPins(id, query) {
+    return fetch(withQuery(`/v1/extensions/${encodeURIComponent(id)}/pins`, query), { credentials: 'same-origin' });
+  },
   facts(query) {
     return fetch(withQuery(`/v1/facts`, query), { credentials: 'same-origin' });
   },
@@ -485,6 +494,15 @@ const CruxApi = Object.freeze({
   },
   memoryCandidates(query) {
     return fetch(withQuery(`/v1/memory/candidates`, query), { credentials: 'same-origin' });
+  },
+  memoryNative(query) {
+    return fetch(withQuery(`/v1/memory/native`, query), { credentials: 'same-origin' });
+  },
+  memoryNativeSearch(query) {
+    return fetch(withQuery(`/v1/memory/native/search`, query), { credentials: 'same-origin' });
+  },
+  memoryNativeBySlug(slug, query) {
+    return fetch(withQuery(`/v1/memory/native/${encodeURIComponent(slug)}`, query), { credentials: 'same-origin' });
   },
   observationsAggregate(query) {
     return fetch(withQuery(`/v1/observations/aggregate`, query), { credentials: 'same-origin' });
@@ -609,6 +627,9 @@ const CruxApi = Object.freeze({
   receiptsList(query) {
     return fetch(withQuery(`/v1/receipts/list`, query), { credentials: 'same-origin' });
   },
+  receiptsSigningKeys(query) {
+    return fetch(withQuery(`/v1/receipts/signing-keys`, query), { credentials: 'same-origin' });
+  },
   receiptsByReceiptId(receiptId, query) {
     return fetch(withQuery(`/v1/receipts/${encodeURIComponent(receiptId)}`, query), { credentials: 'same-origin' });
   },
@@ -680,6 +701,9 @@ const CruxApi = Object.freeze({
   },
   sessionsActive(query) {
     return fetch(withQuery(`/v1/sessions/active`, query), { credentials: 'same-origin' });
+  },
+  sessionsBySessionIdCache(sessionId, query) {
+    return fetch(withQuery(`/v1/sessions/${encodeURIComponent(sessionId)}/cache`, query), { credentials: 'same-origin' });
   },
   sessionsBySessionIdObservations(sessionId, query) {
     return fetch(withQuery(`/v1/sessions/${encodeURIComponent(sessionId)}/observations`, query), { credentials: 'same-origin' });

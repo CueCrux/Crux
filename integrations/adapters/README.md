@@ -8,6 +8,12 @@ provider-neutral `GET /v1/context` surface.
 | LangChain | `Document`, `SystemMessage`, `BaseRetriever` | `pip install 'cuecrux-adapters[langchain]'` |
 | LlamaIndex | `NodeWithScore`, `BaseRetriever` | `pip install 'cuecrux-adapters[llamaindex]'` |
 | CrewAI | `BaseTool`, context string | `pip install 'cuecrux-adapters[crewai]'` |
+| Jev decision receipts | `crux-jev` CLI, `decide()` | `pip install 'cuecrux-adapters[jev-verify]'` |
+
+> **Not on PyPI yet.** Neither `cuecrux-adapters` nor `cuecrux-client` is
+> published, so the `pip install` lines above do not resolve. Install both
+> from this repository:
+> `pip install -e sdks/python -e 'integrations/adapters[<extra>]'`.
 
 ## The rule these adapters follow
 
@@ -150,6 +156,62 @@ negative controls — adapters that reorder, hide stale facts, strip metadata,
 reformat text, drop a section kind, or invent items — and asserts the suite
 catches each one. Loosen a case and one of those breaks.
 
+## Jev decision receipts
+
+[Jev](https://docs.typesafe.ai/) answers typed questions (Choice / Score /
+Noul) about a `state` and keeps nothing. `crux_adapters.jev.decide` gives each
+call a record: Crux builds the state, Jev answers, the daemon signs a
+`model_invocation` receipt, and the decision is stored as a fact linked to that
+receipt. Needs `CORECRUXD_STREAM_RECEIPTS=1` and `CORECRUXD_CONTEXT_SURFACE=1`
+(or `daemon: {stream_receipts: true, context_surface: true}` in the daemon's
+`config.yaml`). `crux-jev doctor` checks the whole setup, those flags and the
+token's scopes included, without spending a Jev call.
+Setup, a runnable guardrail example and receipt verification are in the
+[Jev decision receipts cookbook](../../docs/jev-decision-receipts.md).
+Non-Python callers can use the `crux-jev` command instead (JSON on stdin, receipt
+and fact ids on stdout; see the cookbook).
+
+```python
+from crux_adapters.jev import decide
+
+decision = decide(
+    client,
+    {"block": {"type": "noul", "instructions": "Should this command be blocked?"}},
+    entity="invoice:42",                 # retrieval scope + decision memory jev:invoice:42
+    token_budget=1000,                   # mandatory: bounds the retrieved context
+    untrusted={"tool_output": output},   # never mixed into trusted_context
+)                                        # Jev key: TYPESAFE_API_KEY, or pass jev=
+decision.answers["block"]["noul"], decision.receipt_id, decision.request_id
+```
+
+- **State**: `trusted_context` is the bundle text, in bundle order;
+  `untrusted_input` is whatever the caller passed, verbatim. Separating them
+  does not by itself make Jev resist injection. It makes the split visible
+  and hashed, so it can be measured.
+- **Receipt**: `prompt_hash` covers `{state, questions}`, `retrieval_set_hash`
+  covers the evidence (`[id, digest(text)]` per item) and `output_hash` covers
+  `{model, answers}`. Each is sha256 over compact JSON with key order
+  preserved, because Jev reads key order too: reordering a Choice's options
+  changes the prompt. The exact serialiser is in the cookbook's
+  [Canonical hashing](../../docs/jev-decision-receipts.md#canonical-hashing).
+- **Fact**: `jev:<entity>` / `decision:<request_id>`, with `source_receipt`.
+  The value holds the answers and the evidence list, so both hashes can be
+  recomputed from the fact alone and checked against the signed receipt.
+- **Failures are loud.** If the receipt or the fact is not written, the call
+  raises `DecisionNotRecorded`, and `.decision` still holds the answers.
+- **Replay** (`store_state=True`, then `crux_adapters.jev.replay`) checks the
+  stored request against the receipt's signed body before re-sending it, and
+  needs the `jev-replay` extra (BLAKE3); without it replay refuses with
+  `ImportError`. The packages are not on PyPI yet, so from this repository:
+  `pip install -e sdks/python -e 'integrations/adapters[jev-replay]'`.
+
+A receipt shows what was asked, of which model version, on what evidence, and
+what came back, **as the calling process reported it**: the daemon never talks
+to Jev, it signs the hashes it is sent, so it vouches for when and by whom a
+decision was recorded, not that Jev produced it (`provider_request_id` is what
+reconciles a receipt with TypeSafe's own logs). It does not show that the
+decision was right.
+
 ## Layout
 
 ```
@@ -157,12 +219,21 @@ crux_adapters/core.py        framework-free mapping; the shared behaviour
 crux_adapters/langchain.py   LangChain binding (Document, SystemMessage, BaseRetriever)
 crux_adapters/llamaindex.py  LlamaIndex binding (NodeWithScore, BaseRetriever)
 crux_adapters/crewai.py      CrewAI binding (BaseTool, context string)
+crux_adapters/jev.py         Jev decision receipts (state, receipt, decision fact)
+crux_adapters/jev_cli.py     `crux-jev`: decide, doctor, pin-key, verify
+crux_adapters/jev_verify.py  offline receipt verification against a pinned key
+crux_adapters/jev_langchain.py  receipts for langchain-typesafe calls
 conformance/suite.py         the cases, and adapter discovery
 conformance/daemon.py        throwaway corecruxd for the live layer
 conformance/__main__.py      the runner; this is the gate
 tests/test_conformance.py    mapping layer + negative controls (CI)
+tests/test_jev.py            Jev wrapper over mocked HTTP (CI); opt-in live layers
+tests/test_jev_cli.py        crux-jev parsing, config order, exit codes, doctor
+tests/test_jev_verify.py     offline verification and key pinning
+tests/test_jev_langchain.py  the langchain-typesafe binding (needs that extra)
 examples/langchain_example.py
 examples/crewai_example.py
+examples/jev/                decide_example.py, the openssl receipt recipe, a fixture daemon
 ```
 
 ## Two framework-shape decisions worth knowing

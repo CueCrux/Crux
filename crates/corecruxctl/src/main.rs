@@ -20,10 +20,10 @@ use corecruxctl::verify_escrow;
 use corecruxctl::{
     admin, agent_wiring, attest_companions, audit_export, audit_pack, c2pa_x509, code_chain, code_health,
     compaction_sync, config_bundle, cost, deploy_audit, evidence, explain, export, extensions, fixture_digest, gaps,
-    hooks, identity_cli, incident, ingest, inspect_receipt, learn, login, machine, memory, memory_pack, observe_ingest,
-    openclaw, output_verify, parity, projections, rebuild_companions, receipts, reconcile, redact_sweep,
-    repair_manifest, replay, repo, session_sync, shard, shardmap, smoke, snapshot, stage1_import, start, storage,
-    structured_log, studio, tooling_env, verify_store,
+    hooks, identity_cli, incident, ingest, inspect_receipt, learn, login, machine, memory, memory_distill, memory_pack,
+    observe_ingest, openclaw, output_verify, parity, projections, rebuild_companions, receipts, reconcile,
+    redact_sweep, repair_manifest, replay, repo, session_sync, shard, shardmap, smoke, snapshot, stage1_import, start,
+    storage, structured_log, studio, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -119,9 +119,13 @@ enum Command {
         /// `corecruxctl login` is expected to work offline.
         #[arg(long, default_value_t = false)]
         strict_verify: bool,
-        /// Skip installing the Claude Code hooks (banner + observe capture).
+        /// Skip installing the Claude Code hooks and mod.
         #[arg(long, default_value_t = false)]
         no_hooks: bool,
+        /// Skip the `crux-desktop` Claude Code mod; the classic hooks then keep
+        /// the SessionStart banner and PreCompact save.
+        #[arg(long, default_value_t = false)]
+        no_mod: bool,
         /// Skip registering this machine with the daemon.
         #[arg(long, default_value_t = false)]
         no_register: bool,
@@ -149,6 +153,14 @@ enum Command {
     Hooks {
         #[command(subcommand)]
         command: HooksCommand,
+    },
+
+    /// Install, remove or inspect the `crux-desktop` Claude Code mod (session
+    /// continuity, the `/crux` pane, and the daemon's MCP registration).
+    #[command(name = "mods")]
+    Mods {
+        #[command(subcommand)]
+        command: ModsCommand,
     },
 
     /// Register this machine with the daemon, or list registered machines.
@@ -1041,6 +1053,28 @@ enum HooksCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ModsCommand {
+    /// Install the mod into ~/.claude/mods, add it to CLAUDE_CODE_PLUGIN_DIRS,
+    /// and register the daemon as a user-scope MCP server. The endpoint and
+    /// token default to what `login` saved in ~/.config/cuecrux/env.
+    Install {
+        /// MCP server name the mod uses (default: keep the current setting, or `crux`).
+        #[arg(long)]
+        server: Option<String>,
+        /// Daemon MCP endpoint to register (default: the saved one, else loopback).
+        #[arg(long)]
+        mcp_url: Option<String>,
+        /// Don't touch ~/.claude.json.
+        #[arg(long, default_value_t = false)]
+        no_mcp: bool,
+    },
+    /// Remove the mod and its settings entries (the MCP server is kept).
+    Uninstall,
+    /// Show whether the mod is installed, current and on the plugin path.
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
 enum MachineCommand {
     /// Register (or refresh) this machine's record on the daemon.
     Register {
@@ -1433,6 +1467,52 @@ enum MemoryCommand {
         #[arg(long = "map-principal")]
         map_principal: Vec<String>,
         /// Verify + plan only; write nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+    /// Propose curated-tier engrams from the fact store (read-only).
+    ///
+    /// Prints candidates with the `fact_id` and date each came from. Nothing is
+    /// promoted: acceptance is `memory digest --accept …`.
+    Distill {
+        /// Harness-native memory roots (`:`-separated, `~` and one `*` segment
+        /// expand). Defaults to CORECRUXD_NATIVE_MEMORY_ROOT — the already
+        /// catalogued memories a proposal is de-duplicated against.
+        #[arg(long)]
+        native_root: Option<String>,
+        /// Facts to read per entity family.
+        #[arg(long, default_value_t = 500)]
+        top_k: usize,
+        /// Maximum proposals to print.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Render the always-loaded memory digest fragment.
+    ///
+    /// Seeds the curated tier from the harness-native memory store, accepts the
+    /// proposals named, renders one line per entry under the token budget, and
+    /// writes the fragment `crux-config-wizard` composes into CLAUDE.md and
+    /// AGENTS.md. Read-only against the memory store.
+    Digest {
+        /// Harness-native memory roots (see `memory distill`).
+        #[arg(long)]
+        native_root: Option<String>,
+        /// Write the fragment here (default `<cwd>/.crux/memory-digest.md`).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Token ceiling for the rendered digest.
+        #[arg(long, default_value_t = memory_distill::DIGEST_TOKEN_BUDGET)]
+        budget: usize,
+        /// Accept the first N ranked distillation proposals into the catalog.
+        #[arg(long, default_value_t = 0)]
+        accept: usize,
+        /// Accept one proposal by name (repeatable).
+        #[arg(long = "accept-name")]
+        accept_name: Vec<String>,
+        /// Facts to read per entity family when distilling.
+        #[arg(long, default_value_t = 500)]
+        top_k: usize,
+        /// Render and report without writing the fragment.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
@@ -2090,12 +2170,20 @@ enum StorageCommand {
         #[arg(long)]
         node_id: Option<String>,
     },
-    /// Report (and optionally repair) MANIFEST entries whose segment file is gone.
+    /// Report (and optionally repair) MANIFEST entries that no longer resolve.
     ///
-    /// One dangling entry makes the shard impossible to open, which fails every
-    /// write while reads carry on — see ExecPlan
-    /// `crux-erasure-manifest-repair-2026-08-08`. Repair appends `RemoveSegment`
-    /// tombstones; it never rewrites existing manifest bytes.
+    /// Two classes, both of which make the shard impossible to open and so fail
+    /// every write while reads carry on — see ExecPlan
+    /// `crux-erasure-manifest-repair-2026-08-08`:
+    ///
+    /// 1. a MANIFEST segment whose file is gone;
+    /// 2. a `directory/` run naming a segment the MANIFEST has already retired,
+    ///    which a segment scan alone reports as healthy.
+    ///
+    /// Repair appends `RemoveSegment` / `RemoveDirRun` tombstones; it never
+    /// rewrites existing manifest bytes. A run that also names live segments is
+    /// reported and left alone — dropping it would lose the directory entries
+    /// those streams resolve through.
     #[command(name = "repair-manifest")]
     RepairManifest {
         /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
@@ -2167,6 +2255,34 @@ enum ReceiptsCommand {
         /// Standard-base64 32-byte Ed25519 public key. Omit only for the fixed development key.
         #[arg(long)]
         pubkey_b64: Option<String>,
+    },
+
+    /// Verify a daemon stream receipt (e.g. `model_invocation`) offline against a pinned keyring.
+    ///
+    /// Checks the daemon's own ed25519 signature over the canonical body; exits non-zero unless
+    /// the signature is valid, the signed body names the tenant and receipt id, and its `kind` is
+    /// context_injected, stream_completed, stream_aborted or model_invocation (plus any
+    /// --expect-receipt-id / --kind). On success prints JSON of the fields decoded from the
+    /// SIGNED body: kind, receipt_id, tenant_id and, for model_invocation, invocation_id,
+    /// provider, model_id, model_version, provider_request_id, prompt_hash, retrieval_set_hash,
+    /// output_hash. Only these printed fields are signature-verified; the record's own
+    /// `payload.output_hash` etc. are unsigned copies.
+    #[command(name = "verify-stream-receipt")]
+    VerifyStreamReceipt {
+        /// Observation record JSON (one `/v1/observations/aggregate` entry) or its bare `payload`.
+        input: PathBuf,
+        /// Pinned public keyring JSON: `{"v":1,"keys":[{"keyId","pubKeyBase64"}]}`.
+        #[arg(long)]
+        keyring: PathBuf,
+        /// Tenant the signed body must name (local daemons mint stream receipts under `local`).
+        #[arg(long, default_value = "local")]
+        tenant_id: String,
+        /// Receipt id the signed body must name.
+        #[arg(long)]
+        expect_receipt_id: Option<String>,
+        /// Kind the signed body must carry (e.g. `model_invocation`).
+        #[arg(long)]
+        kind: Option<String>,
     },
 
     /// Seed a minimal receipt body+sig into a shard directory (offline, dev-only).
@@ -2794,6 +2910,7 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             no_verify,
             strict_verify,
             no_hooks,
+            no_mod,
             no_register,
         } => login::run(login::LoginArgs {
             url,
@@ -2802,6 +2919,7 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             no_verify,
             strict_verify,
             no_hooks,
+            no_mod,
             no_register,
         }),
         Command::Logout { url, all } => login::run_logout(login::LogoutArgs { url, all }),
@@ -2813,6 +2931,15 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 endpoint,
             } => hooks::run_install(user, project, endpoint),
             HooksCommand::Status { user, project } => hooks::run_status(user, project),
+        },
+        Command::Mods { command } => match command {
+            ModsCommand::Install {
+                server,
+                mcp_url,
+                no_mcp,
+            } => hooks::run_mods_install(server, mcp_url, no_mcp),
+            ModsCommand::Uninstall => hooks::run_mods_uninstall(),
+            ModsCommand::Status => hooks::run_mods_status(),
         },
         Command::Machine { command } => match command {
             MachineCommand::Register { url } => machine::run_register(url),
@@ -3592,6 +3719,23 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     "COSE_Sign1 verification OK: snap-id={} kid={} iss={} dev-key={} file={}",
                     report.snap_id, report.kid, report.issuer, report.development_key, report.input_path
                 );
+                Ok(())
+            }
+            ReceiptsCommand::VerifyStreamReceipt {
+                input,
+                keyring,
+                tenant_id,
+                expect_receipt_id,
+                kind,
+            } => {
+                let signed = receipts::verify_stream_receipt_file_v1(
+                    &input,
+                    &keyring,
+                    &tenant_id,
+                    expect_receipt_id.as_deref(),
+                    kind.as_deref(),
+                )?;
+                println!("{}", serde_json::to_string_pretty(&signed)?);
                 Ok(())
             }
             ReceiptsCommand::SeedMinimal {
@@ -4548,6 +4692,29 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     );
                     Ok(())
                 }
+                MemoryCommand::Distill {
+                    native_root,
+                    top_k,
+                    limit,
+                } => run_memory_distill(&client, native_root.as_deref(), top_k, limit),
+                MemoryCommand::Digest {
+                    native_root,
+                    out,
+                    budget,
+                    accept,
+                    accept_name,
+                    top_k,
+                    dry_run,
+                } => run_memory_digest(
+                    &client,
+                    native_root.as_deref(),
+                    out.as_deref(),
+                    budget,
+                    accept,
+                    &accept_name,
+                    top_k,
+                    dry_run,
+                ),
                 MemoryCommand::Export {
                     data_dir,
                     out,
@@ -5401,6 +5568,120 @@ fn rebuild_ccxi_from_segment(
     Ok(indexed)
 }
 
+// ── memory-parity M2/M3 runners ──────────────────────────────────────────────
+
+/// Resolve the harness-native memory roots and project them.
+///
+/// Read-only: `ingest_native_memory` opens files with `.read(true)` and nothing
+/// else. The memory directory is the operator's live store, loaded into the
+/// first user message of every concurrent session, so the discipline is
+/// structural rather than conventional.
+fn project_native_memory(
+    native_root: Option<&str>,
+) -> Result<corecrux_projections::native_memory::NativeMemoryIngestV1, Box<dyn std::error::Error + Send + Sync>> {
+    use corecrux_projections::native_memory as nm;
+    let spec = match native_root {
+        Some(spec) => spec.to_string(),
+        None => std::env::var(nm::NATIVE_MEMORY_ROOT_ENV).map_err(|_| {
+            format!(
+                "no memory root: pass --native-root or set {}",
+                nm::NATIVE_MEMORY_ROOT_ENV
+            )
+        })?,
+    };
+    let home = std::env::var("HOME").ok().map(PathBuf::from);
+    let roots = nm::resolve_roots(&spec, home.as_deref());
+    if roots.is_empty() {
+        return Err(format!("no readable memory root resolved from '{spec}'").into());
+    }
+    Ok(nm::ingest_native_memory(
+        &roots,
+        nm::NativeMemoryIngestOptions::default(),
+    ))
+}
+
+/// Read the fact families the distillation signals key on.
+///
+/// A failure on one family is reported and skipped rather than aborting: a
+/// daemon that will not serve `execplan:` facts can still yield incident
+/// proposals, and half a review queue beats none.
+fn collect_distillation_facts(client: &memory::MemoryClient, top_k: usize) -> Vec<memory::MemoryFact> {
+    let mut facts = Vec::new();
+    for prefix in ["incident:", "decision:", "execplan:"] {
+        match client.list_by_entity_prefix(prefix, top_k) {
+            Ok(mut rows) => facts.append(&mut rows),
+            Err(err) => eprintln!("warning: could not read '{prefix}' facts: {err}"),
+        }
+    }
+    facts
+}
+
+fn now_unix_ms() -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(1).max(1)
+}
+
+fn run_memory_distill(
+    client: &memory::MemoryClient,
+    native_root: Option<&str>,
+    top_k: usize,
+    limit: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ingest = project_native_memory(native_root)?;
+    let seeds = memory_distill::seed_engrams(&ingest, now_unix_ms());
+    let facts = collect_distillation_facts(client, top_k);
+    let options = memory_distill::DistillOptions {
+        existing: seeds,
+        max_proposals: limit,
+        ..memory_distill::DistillOptions::default()
+    };
+    let proposals = memory_distill::distill_proposals(&facts, &options);
+    println!("{}", serde_json::to_string_pretty(&proposals)?);
+    eprintln!(
+        "{} proposal(s) from {} fact(s); accept with `memory digest --accept N` or --accept-name <name>",
+        proposals.len(),
+        facts.len()
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_memory_digest(
+    client: &memory::MemoryClient,
+    native_root: Option<&str>,
+    out: Option<&std::path::Path>,
+    budget: usize,
+    accept: usize,
+    accept_names: &[String],
+    top_k: usize,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ingest = project_native_memory(native_root)?;
+    let facts = if accept > 0 || !accept_names.is_empty() {
+        collect_distillation_facts(client, top_k)
+    } else {
+        Vec::new()
+    };
+    let build = memory_distill::build_catalog(&ingest, &facts, accept, accept_names, now_unix_ms());
+    let render = memory_distill::render_catalog_digest(&build.catalog, budget);
+
+    let path = out.map_or_else(
+        || PathBuf::from(memory_distill::DIGEST_FRAGMENT_PATH),
+        std::path::Path::to_path_buf,
+    );
+    let written = if dry_run {
+        None
+    } else {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, &render.body)?;
+        Some(path.display().to_string())
+    };
+    let report = memory_distill::digest_report(&build, &render, &ingest, written);
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
 // ── tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -6198,6 +6479,40 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_receipts_verify_stream_receipt() {
+        let cli = Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "verify-stream-receipt",
+            "/tmp/record.json",
+            "--keyring",
+            "/tmp/keyring.json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Receipts {
+                command:
+                    ReceiptsCommand::VerifyStreamReceipt {
+                        input,
+                        keyring,
+                        tenant_id,
+                        expect_receipt_id,
+                        kind,
+                    },
+            } => {
+                assert_eq!(input, PathBuf::from("/tmp/record.json"));
+                assert_eq!(keyring, PathBuf::from("/tmp/keyring.json"));
+                assert_eq!(tenant_id, "local");
+                assert_eq!(expect_receipt_id, None);
+                assert_eq!(kind, None);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        // The keyring is the only trust input, so it is mandatory.
+        assert!(Cli::try_parse_from(["corecruxctl", "receipts", "verify-stream-receipt", "/tmp/record.json"]).is_err());
     }
 
     #[test]

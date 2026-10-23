@@ -20,6 +20,10 @@ corecrux-storage = { path = "../corecrux-storage" }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Zero-write gate (`tests/native_memory_ingest.rs`): the ExecPlan's M4 gate names
+# sha256 for the before/after content snapshot, so the test computes sha256 even
+# though the projection itself hashes with blake3.
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

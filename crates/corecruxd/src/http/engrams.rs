@@ -75,6 +75,18 @@ pub(super) struct UpsertEngramBody {
     pub intent_bucket: String,
     #[serde(default)]
     pub query_pattern: Option<String>,
+    /// One-line recall description. This is the only engram text the
+    /// always-loaded digest renders, so it is bounded to one line by
+    /// `validate_local_engram`.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// `fact_id` a distilled engram was proposed from (ExecPlan
+    /// `crux-memory-parity-and-codex-bridge-2026-09-17` M2 provenance).
+    #[serde(default)]
+    pub source_fact_id: Option<String>,
+    /// Date (`YYYY-MM-DD`) of that fact.
+    #[serde(default)]
+    pub source_fact_date: Option<String>,
     pub content: String,
     #[serde(default)]
     pub applicable_why: Option<String>,
@@ -199,6 +211,9 @@ pub(super) async fn upsert_engram(
         version: body.version,
         intent_bucket: body.intent_bucket,
         query_pattern: body.query_pattern,
+        description: body.description,
+        source_fact_id: body.source_fact_id,
+        source_fact_date: body.source_fact_date,
         content: body.content,
         applicable_why: body.applicable_why,
         capability_class_min: body.capability_class_min,

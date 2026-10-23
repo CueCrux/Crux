@@ -33,6 +33,23 @@ pub struct LocalEngram {
     pub intent_bucket: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_pattern: Option<String>,
+    /// One-line recall description, in the native memory store's voice: what
+    /// it is and why it matters. This is the only engram text that reaches the
+    /// always-loaded digest, so it is bounded hard and carries no body.
+    /// Absent on the pre-digest builtins; [`LocalEngram::digest_description`]
+    /// falls back to the first line of `content`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// For a distilled engram, the `fact_id` it was proposed from.
+    /// Seeded and builtin engrams leave it unset. The M2 gate of ExecPlan
+    /// `crux-memory-parity-and-codex-bridge-2026-09-17` requires every
+    /// distilled entry to carry this plus [`Self::source_fact_date`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_fact_id: Option<String>,
+    /// Date of the fact this engram was distilled from (`YYYY-MM-DD`), so a
+    /// recalled lesson is visibly dated rather than presented as timeless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_fact_date: Option<String>,
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applicable_why: Option<String>,
@@ -57,6 +74,49 @@ pub struct LocalEngram {
 
 fn default_enabled() -> bool {
     true
+}
+
+impl LocalEngram {
+    /// The one-line recall text this engram contributes to the always-loaded
+    /// digest: [`Self::description`] when set, else the first non-empty line
+    /// of `content`, with interior whitespace squeezed to single spaces and
+    /// wrapping quotes stripped.
+    ///
+    /// Squeezing happens here rather than at render time so that the digest
+    /// line is a pure function of the catalog — the byte-stability contract in
+    /// ExecPlan `crux-memory-parity-and-codex-bridge-2026-09-17` M3.
+    pub fn digest_description(&self) -> String {
+        let raw = match self.description.as_deref() {
+            Some(description) if !description.trim().is_empty() => description,
+            _ => self.content.lines().find(|line| !line.trim().is_empty()).unwrap_or(""),
+        };
+        squeeze_whitespace(raw)
+    }
+}
+
+/// Collapse all whitespace runs to single spaces, trim, and drop a pair of
+/// wrapping quotes. Shared by the digest line builder and the seeder.
+pub fn squeeze_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(ch);
+    }
+    let trimmed = out.trim();
+    let unquoted = if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    unquoted.trim().to_string()
 }
 
 /// Validate an operator-provided overlay before it can enter the protected
@@ -100,6 +160,16 @@ pub fn validate_local_engram(engram: &LocalEngram) -> Result<(), String> {
     safe_identifier(&engram.intent_bucket, "intent_bucket")?;
     bounded_nonempty(&engram.content, "content", 65_536)?;
     bounded_optional(engram.query_pattern.as_deref(), "query_pattern", 4_096)?;
+    // The description is prompt-prefix content in the digest: bounded to one
+    // line so a single entry cannot blow the digest budget on its own.
+    if let Some(description) = engram.description.as_deref() {
+        bounded_nonempty(description, "description", 1_024)?;
+        if description.contains('\n') || description.contains('\r') {
+            return Err("description must be a single line".to_string());
+        }
+    }
+    bounded_optional(engram.source_fact_id.as_deref(), "source_fact_id", 128)?;
+    bounded_optional(engram.source_fact_date.as_deref(), "source_fact_date", 32)?;
     bounded_optional(engram.applicable_why.as_deref(), "applicable_why", 8_192)?;
     bounded_optional(engram.generated_class.as_deref(), "generated_class", 128)?;
     bounded_optional(engram.source_chunk_set_hash.as_deref(), "source_chunk_set_hash", 256)?;
@@ -187,6 +257,9 @@ pub fn builtin_engrams() -> Vec<LocalEngram> {
             version: "v1".to_string(),
             intent_bucket: "investigation".to_string(),
             query_pattern: Some("audit|review|investigate|triage|bug|failure".to_string()),
+            description: Some("Before acting on an audit or triage, gather project context, latest facts, the route storyline and the last receipt.".to_string()),
+            source_fact_id: None,
+            source_fact_date: None,
             content: "Before acting, gather the active project context, the latest relevant facts, the route/storyline if code is involved, and the last verification or receipt touching the same object.".to_string(),
             applicable_why: Some("Local daemon baseline for agent investigation sessions.".to_string()),
             capability_class_min: None,
@@ -205,6 +278,9 @@ pub fn builtin_engrams() -> Vec<LocalEngram> {
             version: "v1".to_string(),
             intent_bucket: "developer_surface".to_string(),
             query_pattern: Some("route|api|handler|scope|openapi|storyline".to_string()),
+            description: Some("HTTP/gRPC work: read the route storyline, auth scopes, request shape and nearest tests before editing.".to_string()),
+            source_fact_id: None,
+            source_fact_date: None,
             content: "For HTTP/gRPC work, inspect the route storyline, route auth scopes, request/response shape, and nearest tests before editing. Record any scope drift or missing OpenAPI coverage separately from code style cleanup.".to_string(),
             applicable_why: Some("Useful when daemon API work touches handlers or MCP surfaces.".to_string()),
             capability_class_min: None,
@@ -223,6 +299,9 @@ pub fn builtin_engrams() -> Vec<LocalEngram> {
             version: "v1".to_string(),
             intent_bucket: "aggregation_count".to_string(),
             query_pattern: Some("count|list|how many|aggregate|enumerate".to_string()),
+            description: Some("Counting or listing from retrieval: expand nearby turns of a matching session before calling the count complete.".to_string()),
+            source_fact_id: None,
+            source_fact_date: None,
             content: "When multiple chunks from one session match an aggregation question, expand nearby turns from that session before concluding the count or list is complete.".to_string(),
             applicable_why: Some("Matches hosted MemoryCrux aggregation-session-expansion behavior.".to_string()),
             capability_class_min: None,
@@ -243,6 +322,12 @@ pub fn builtin_engrams() -> Vec<LocalEngram> {
             query_pattern: Some(
                 "implement|add|build|create|write|refactor|scaffold|feature|endpoint|component|module".to_string(),
             ),
+            description: Some(
+                "Take the highest rung that holds before writing code; never minimise away validation, security or accessibility."
+                    .to_string(),
+            ),
+            source_fact_id: None,
+            source_fact_date: None,
             content: "Before writing code, take the highest rung that holds: (1) does this need to exist at all — speculative need is skipped, said in one line; (2) does it already exist in this codebase — search first, reuse the existing helper/type/pattern; (3) stdlib covers it — use it; (4) a native platform feature covers it — prefer it over hand-rolled code; (5) an already-installed dependency covers it — use it, never add a new one for a few lines; (6) it fits in one line — one line; (7) only then write the minimum code that works. Understand the problem before climbing: trace every file the change touches. Never minimise away trust-boundary validation, data-loss error handling, security, accessibility, or anything explicitly requested. Non-trivial logic leaves one runnable check behind. Mark deliberate ceilings with a `crux-min:` comment naming the upgrade trigger.".to_string(),
             applicable_why: Some(
                 "The historical v1-profile replay (AuditCrux benchmarks/ponytail, corpus ponytail-fastapi-cd83fc1) observed lower pooled code volume and recorded total-token aggregates on Fable and Opus. All 96 cells left a non-empty diff, but the harness executed no generated patch or task test and one Opus baseline timed out, so it supports no functional-correctness or causal scaling claim.".to_string(),
@@ -281,6 +366,11 @@ pub fn build_engram_manifest(engrams: &[LocalEngram], tenant_id: &str, capabilit
                 "name": e.name,
                 "version": e.version,
                 "intent_bucket": e.intent_bucket,
+                // The digest renders this line verbatim, so `manifest_hash` —
+                // the digest's identity — must change when it changes.
+                "description": e.digest_description(),
+                "source_fact_id": &e.source_fact_id,
+                "source_fact_date": &e.source_fact_date,
                 "prompt_hash": prompt_hash(&e.content),
                 "applicable_why_hash": e.applicable_why.as_deref().map(prompt_hash),
                 "generated_class": &e.generated_class,
@@ -313,6 +403,7 @@ pub fn compute_engram_set_hash(engrams: &[LocalEngram]) -> serde_json::Value {
             json!({
                 "name": e.name,
                 "version": e.version,
+                "description": e.digest_description(),
                 "prompt_hash": prompt_hash(&e.content),
                 "applicable_why_hash": e.applicable_why.as_deref().map(prompt_hash),
             })
@@ -460,6 +551,9 @@ mod tests {
             version: "v1".to_string(),
             intent_bucket: "temporal_duration".to_string(),
             query_pattern: None,
+            description: None,
+            source_fact_id: None,
+            source_fact_date: None,
             content: "The docs store effective dates in the nearest Date header.".to_string(),
             applicable_why: Some("generated_inheritance=exact_chunk_hash".to_string()),
             capability_class_min: None,

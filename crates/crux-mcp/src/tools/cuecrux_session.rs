@@ -89,9 +89,18 @@ pub async fn handle_cuecrux_session(args: &Value, ctx: &McpContext) -> Result<Va
             body.insert("intent".into(), Value::String(intent.to_string()));
             // dynamic-tool-surface M2: persist the declared intent (keyed by
             // passport) so the next `tools/list` can shape the surface to the
-            // task. Stateless HTTP can't push `tools/list_changed`, so this is
-            // read on the subsequent listing rather than pushed now. No-op for
-            // surface mode `full`/`minimal`; harmless to record either way.
+            // task. No-op for surface mode `full`/`minimal`; harmless to
+            // record either way.
+            //
+            // The old note here — "stateless HTTP can't push
+            // `tools/list_changed`" — has been wrong since M3.5 added the
+            // `GET /mcp` SSE stream: `server.rs` pushes the notification to a
+            // registered session right after this call returns
+            // ([`crate::server`], `handle_mcp_post`). Since prompt-cache M1 it
+            // pushes only when the session's monotone offered set would
+            // actually GROW, because a re-list that returns the same set is a
+            // wasted round trip and one that returned fewer tools used to
+            // rewrite the client's whole cached prefix at 2x.
             let passport_key =
                 super::passport::passport_key_name(ctx).unwrap_or_else(|| crate::traces::ANON_PASSPORT.to_string());
             super::surface::record_intent(&passport_key, intent);

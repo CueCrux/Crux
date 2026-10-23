@@ -26,6 +26,7 @@
 //! headline numbers are always the transcript's real `usage`.
 
 pub mod attribution;
+pub mod cache;
 pub mod levers;
 pub mod models;
 pub mod report;
@@ -33,8 +34,8 @@ pub mod summary;
 pub mod transcript;
 
 pub use report::{
-    BlockCost, Bucket, CostReport, EffortBurn, Headline, Lever, Measured, ModelBreakdown, ModelBurn, Severity,
-    COST_REPORT_SCHEMA,
+    BlockCost, Bucket, CacheClass, CacheInvalidation, CostReport, EffortBurn, Headline, Lever, Measured,
+    ModelBreakdown, ModelBurn, Severity, ToolDeltaKind, COST_REPORT_SCHEMA,
 };
 pub use transcript::{normalize_model, ExecPlanSignal, SignalStrength, SYNTHETIC_MODEL};
 
@@ -51,6 +52,14 @@ pub const TOP_BLOCKS: usize = 25;
 /// emitting an unbounded list; real sessions top out well under it (observed max
 /// 16). Slugs beyond the bound are the lowest-evidence ones (ranked last).
 pub const MAX_EXECPLAN_SLUGS: usize = 25;
+
+/// Upper bound on the per-report `Headline::invalidations` list. A rewrite is a
+/// rare event — the whole 27-session `drivew-host-claude-transcripts-2026-09`
+/// corpus held 102, at most 14 in any one session — so this only guards against
+/// a pathological transcript emitting an unbounded list. The *totals*
+/// (`invalidation_tokens`, `rewrite_share`) are summed over every detected
+/// event, bound or not, so truncation never changes the headline shares.
+pub const MAX_INVALIDATIONS: usize = 200;
 
 /// Parse and analyze a transcript file into a [`CostReport`], with `source` set
 /// to the file name (corpus identity — QC.4).
@@ -246,6 +255,7 @@ mod tests {
             cache_read_to_output_ratio: 300.0,
             measured_context_total: 7_500_000,
             prefix_pct: 60.0,
+            ..Headline::default()
         };
         let buckets = vec![
             Bucket {

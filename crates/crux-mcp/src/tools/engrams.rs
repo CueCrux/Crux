@@ -15,7 +15,12 @@
 //! - **resolve mode** (`names: ["name@version", ...]`): returns full content
 //!   for each requested engram the caller's capability class may use.
 //!
-//! Flag-gated OFF by default via `CORECRUXD_FEATURE_ENGRAM_MCP`.
+//! Enabled by default since the curated tier was populated (ExecPlan
+//! `crux-memory-parity-and-codex-bridge-2026-09-17` M3); set
+//! `CORECRUXD_FEATURE_ENGRAM_MCP=0` to turn it off. It shipped off while the
+//! catalog held four builtins and nothing else — a manifest of four rows was
+//! not worth a tool. Now the manifest is the index behind the always-loaded
+//! digest, and an agent that reads a digest line has to be able to resolve it.
 
 use serde_json::{json, Value};
 
@@ -30,22 +35,24 @@ pub const FEATURE_FLAG_ENV: &str = "CORECRUXD_FEATURE_ENGRAM_MCP";
 
 /// Returns true if the engram MCP surface is enabled.
 ///
-/// Default-off (opt-in): an unset env var means disabled. Any value other
-/// than `""`/`0`/`false`/`off` (case-insensitive) enables it.
+/// Default-**on**: an unset env var means enabled, and only an explicit
+/// `0`/`false`/`off`/`no` (case-insensitive) turns it off. An empty value is
+/// treated as unset, which is what a shell that exports the variable without a
+/// value produces.
 pub fn engram_mcp_enabled() -> bool {
     match std::env::var(FEATURE_FLAG_ENV) {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
-            !matches!(v.as_str(), "" | "0" | "false" | "off")
+            !matches!(v.as_str(), "0" | "false" | "off" | "no")
         }
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
 fn feature_disabled_error() -> JsonRpcError {
     JsonRpcError {
         code: CAPABILITY_DENIED,
-        message: format!("engram MCP surface disabled (set {FEATURE_FLAG_ENV}=1 to enable; it is off by default)"),
+        message: format!("engram MCP surface disabled by {FEATURE_FLAG_ENV}; unset it or set it to 1 to re-enable (it is on by default)"),
         data: Some(json!({"flag": FEATURE_FLAG_ENV})),
     }
 }
@@ -128,11 +135,13 @@ async fn handle_inner(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcEr
 mod tests {
     use super::*;
 
+    /// The catalog is the index behind the always-loaded digest, so a digest
+    /// line an agent cannot resolve would be worse than no digest at all.
     #[test]
-    fn flag_defaults_off() {
+    fn flag_defaults_on() {
         // Do not set the env var anywhere in this test binary — parallel
         // tests share the process environment.
-        assert!(!engram_mcp_enabled());
+        assert!(engram_mcp_enabled());
     }
 
     #[tokio::test]

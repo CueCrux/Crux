@@ -32,6 +32,10 @@ pub(super) struct QueryFactsParams {
     /// returned — i.e. facts that were TRUE IN THE WORLD at `as_of`, regardless
     /// of when they were learned. Omitted ⇒ no valid-time filtering.
     pub as_of: Option<String>,
+    /// M1 match floor: include candidates that scored BELOW the floor. They are
+    /// then returned labelled `match_tier: "fallback"` — never passed off as
+    /// answers. Accepts `1`/`true`/`yes`/`on`. Defaults to false.
+    pub include_fallback: Option<String>,
 }
 
 /// Query parameters for the GET /v1/facts/export endpoint.
@@ -313,7 +317,17 @@ pub(super) fn query_visible_http_facts(
     // to an ordinary caller that shares the same anonymous principal.
     //
     // Internal callers never set a confidence floor; drop the count.
-    Ok(query_visible_http_facts_as_of_inner(store, q, ctx, tenant_hash, None, false)?.0)
+    Ok(query_visible_http_facts_as_of_inner(
+        store,
+        q,
+        ctx,
+        tenant_hash,
+        None,
+        false,
+        crux_mcp::recall_match::MatchPolicy::disabled(),
+        false,
+    )?
+    .0)
 }
 
 /// P2 confidence floor: drop facts whose recall-time EFFECTIVE confidence
@@ -371,18 +385,31 @@ fn take_within_budget(
 
 /// As [`query_visible_http_facts`] but with an optional bi-temporal `as_of`
 /// filter (M1): when set, only facts whose valid-time interval contains the
-/// instant are returned. `None` ⇒ identical to the plain variant. Returns the
-/// visible facts plus the P2 `filtered_below_threshold` count.
-pub(super) fn query_visible_http_facts_as_of(
+/// instant are returned. Adds the M1 match floor
+/// (ExecPlan `crux-memory-parity-and-codex-bridge-2026-09-17`). Returns the
+/// selected facts, the P2 below-confidence count, the match stats and the
+/// per-fact relevance scores aligned with the returned facts.
+pub(super) fn query_visible_http_facts_scored(
     store: &corecrux_memory::FactStore,
     q: &corecrux_memory::fact_store::FactQuery,
     ctx: &crate::auth::HttpScopeContext,
     tenant_hash: &str,
     as_of: Option<chrono::DateTime<chrono::Utc>>,
-) -> Result<(Vec<corecrux_memory::fact_store::Fact>, usize), corecrux_memory::embeddings::EmbeddingError> {
-    query_visible_http_facts_as_of_inner(store, q, ctx, tenant_hash, as_of, true)
+    policy: crux_mcp::recall_match::MatchPolicy,
+    keep_fallback: bool,
+) -> Result<
+    (
+        Vec<corecrux_memory::fact_store::Fact>,
+        usize,
+        crux_mcp::recall_match::MatchStats,
+        Vec<f64>,
+    ),
+    corecrux_memory::embeddings::EmbeddingError,
+> {
+    query_visible_http_facts_as_of_inner(store, q, ctx, tenant_hash, as_of, true, policy, keep_fallback)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn query_visible_http_facts_as_of_inner(
     store: &corecrux_memory::FactStore,
     q: &corecrux_memory::fact_store::FactQuery,
@@ -390,7 +417,17 @@ fn query_visible_http_facts_as_of_inner(
     tenant_hash: &str,
     as_of: Option<chrono::DateTime<chrono::Utc>>,
     allow_raw_admin_global: bool,
-) -> Result<(Vec<corecrux_memory::fact_store::Fact>, usize), corecrux_memory::embeddings::EmbeddingError> {
+    policy: crux_mcp::recall_match::MatchPolicy,
+    keep_fallback: bool,
+) -> Result<
+    (
+        Vec<corecrux_memory::fact_store::Fact>,
+        usize,
+        crux_mcp::recall_match::MatchStats,
+        Vec<f64>,
+    ),
+    corecrux_memory::embeddings::EmbeddingError,
+> {
     if allow_raw_admin_global && raw_admin_read(ctx) {
         // Run the floor filter/count over the FULL matched+ranked set, THEN
         // apply budget/top_k — so a below-floor row never consumes the window
@@ -407,7 +444,22 @@ fn query_visible_http_facts_as_of_inner(
             (None, false) => store.query(&unbounded).facts,
         };
         let filtered = drop_below_confidence_floor(&mut facts, q.min_effective_confidence);
-        return Ok((take_within_budget(facts, q.token_budget, q.top_k), filtered));
+        // M1 match floor. The raw-admin lane is BM25-ranked already, so the
+        // floor only filters and labels here — `apply_floor`'s sort is stable,
+        // so equal scores keep the BM25 order.
+        let mut scores: Vec<f64> = vec![0.0; facts.len()];
+        let mut stats = crux_mcp::recall_match::MatchStats::default();
+        if policy.enabled {
+            let shape = crux_mcp::recall_match::analyze(q.query.as_deref().unwrap_or(""));
+            scores = facts
+                .iter()
+                .map(|fact| crux_mcp::recall_match::score_fact(&shape, &fact.entity, &fact.key, &fact.value))
+                .collect();
+            stats = crux_mcp::recall_match::apply_floor(&mut facts, &mut scores, &policy, keep_fallback);
+        }
+        let selected = take_within_budget(facts, q.token_budget, q.top_k);
+        scores.truncate(selected.len());
+        return Ok((selected, filtered, stats, scores));
     }
 
     let agent_name = ctx.passport_id.as_deref();
@@ -458,30 +510,62 @@ fn query_visible_http_facts_as_of_inner(
             .then_with(|| right.stored_at.cmp(&left.stored_at))
     });
 
-    let selected = if let Some(budget) = q.token_budget {
+    // M1 match floor (ExecPlan `crux-memory-parity-and-codex-bridge-2026-09-17`).
+    // This lane has no ranker at all — it filtered on "ANY one query term appears
+    // somewhere" and then sorted by confidence and recency, which is exactly how a
+    // topic search with no real match came back as the store's most recent facts.
+    // Scoring runs over the FULL matched set, before the budget/top_k cut, so the
+    // best match can never be truncated away before it is scored. The
+    // confidence/recency order above survives as the stable tiebreak, so a
+    // flag-OFF run is byte-for-byte the pre-M1 ranking.
+    let mut scores: Vec<f64> = vec![0.0; results.len()];
+    let mut stats = crux_mcp::recall_match::MatchStats::default();
+    if policy.enabled {
+        let shape = crux_mcp::recall_match::analyze(q.query.as_deref().unwrap_or(""));
+        scores = results
+            .iter()
+            .map(|fact| {
+                let entity =
+                    crux_mcp::scope::visible_entity_for_agent(fact, agent_name).unwrap_or_else(|| fact.entity.clone());
+                crux_mcp::recall_match::score_fact(&shape, &entity, &fact.key, &fact.value)
+            })
+            .collect();
+        stats = crux_mcp::recall_match::apply_floor(&mut results, &mut scores, &policy, keep_fallback);
+    }
+
+    let (selected, selected_scores) = if let Some(budget) = q.token_budget {
         let mut used = 0usize;
         let mut selected = Vec::new();
-        for fact in results {
+        let mut selected_scores = Vec::new();
+        for (fact, score) in results.into_iter().zip(scores) {
             if used + fact.tokens > budget && !selected.is_empty() {
                 break;
             }
             used += fact.tokens;
             selected.push(fact);
+            selected_scores.push(score);
             if used >= budget {
                 break;
             }
         }
-        selected
+        (selected, selected_scores)
     } else {
         results.truncate(q.top_k);
-        results
+        scores.truncate(q.top_k);
+        (results, scores)
     };
 
-    let rendered = selected
-        .into_iter()
-        .filter_map(|fact| render_fact_for_http(fact, ctx))
-        .collect();
-    Ok((rendered, filtered_below_threshold))
+    // `render_fact_for_http` can drop a row (private/invisible); keep the score
+    // vector aligned by zipping through the same filter.
+    let mut rendered = Vec::with_capacity(selected.len());
+    let mut rendered_scores = Vec::with_capacity(selected.len());
+    for (fact, score) in selected.into_iter().zip(selected_scores) {
+        if let Some(fact) = render_fact_for_http(fact, ctx) {
+            rendered.push(fact);
+            rendered_scores.push(score);
+        }
+    }
+    Ok((rendered, filtered_below_threshold, stats, rendered_scores))
 }
 
 pub(super) fn scoped_session_id_for_http(ctx: &crate::auth::HttpScopeContext, session_id: &str) -> String {
@@ -763,6 +847,17 @@ pub(super) async fn query_facts(
             );
         }
     }
+    // M1 (memory-parity) — the match floor governs free-text SEARCH only.
+    // Addressed recall (`entity` / `entity_prefix`) and a query-less listing are
+    // exempt by construction: that is the shape that already resolved exactly
+    // and the plan's gate forbids regressing it.
+    let include_fallback = parse_query_flag(params.include_fallback.as_deref(), false);
+    let addressed = params.entity.is_some() || params.entity_prefix.is_some();
+    let match_policy = if addressed || params.query.is_none() {
+        crux_mcp::recall_match::MatchPolicy::disabled()
+    } else {
+        crux_mcp::recall_match::MatchPolicy::from_env()
+    };
     let q = corecrux_memory::fact_store::FactQuery {
         min_effective_confidence: params.min_effective_confidence,
         query: params.query,
@@ -792,31 +887,122 @@ pub(super) async fn query_facts(
         Err(response) => return response,
     };
     let store = state.fact_store.read().await;
-    let (facts, filtered_below_threshold) = match query_visible_http_facts_as_of(&store, &q, &ctx, &tenant_hash, as_of)
-    {
-        Ok(result) => result,
-        Err(err) => {
-            tracing::warn!(error = %err, "fact-query-embedding-delegation-failed");
-            if let Some(status) = store.delegation_status() {
-                return super::embedding_delegation_degraded_response(&status);
+    let (facts, filtered_below_threshold, match_stats, match_scores) =
+        match query_visible_http_facts_scored(&store, &q, &ctx, &tenant_hash, as_of, match_policy, include_fallback) {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::warn!(error = %err, "fact-query-embedding-delegation-failed");
+                if let Some(status) = store.delegation_status() {
+                    return super::embedding_delegation_degraded_response(&status);
+                }
+                return problem_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Fact query embedding failed; no fallback result was returned.",
+                );
             }
-            return problem_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Fact query embedding failed; no fallback result was returned.",
-            );
-        }
-    };
+        };
+    drop(store);
     let total_tokens = facts.iter().map(|fact| fact.tokens).sum::<usize>();
-    (
-        StatusCode::OK,
-        axum::Json(serde_json::json!({
-            "facts": facts,
+    // M1: label every row with the relevance that earned its place, so a caller
+    // can tell a scored match from filler without re-deriving it.
+    let rows: Vec<serde_json::Value> = facts
+        .iter()
+        .enumerate()
+        .map(|(ix, fact)| {
+            let mut row = serde_json::json!(fact);
+            if let (true, Some(score), Some(map)) = (match_stats.applied, match_scores.get(ix), row.as_object_mut()) {
+                map.insert(
+                    "match_score".into(),
+                    serde_json::json!((score * 1000.0).round() / 1000.0),
+                );
+                map.insert(
+                    "match_tier".into(),
+                    serde_json::json!(crux_mcp::recall_match::MatchTier::classify(*score, &match_policy).as_str()),
+                );
+            }
+            row
+        })
+        .collect();
+
+    // M1: `token_budget` governs the WHOLE serialised response, scaffolding
+    // included — not just the fact tier. `render` draws the body at any
+    // `(full, emitted)` hydration pair and `fit` picks the largest that fits.
+    let total_candidates = rows.len();
+    let render = |full: usize, emitted: usize| -> serde_json::Value {
+        let emitted = emitted.min(total_candidates);
+        let full = full.min(emitted);
+        let mut body = serde_json::json!({
+            "facts": http_fact_rows(&rows, full, emitted),
             "total_tokens": total_tokens,
             // P2: distinguishes "no facts" from "nothing above the floor".
             "filtered_below_threshold": filtered_below_threshold,
-        })),
-    )
-        .into_response()
+        });
+        if let Some(map) = body.as_object_mut() {
+            if match_stats.applied {
+                map.insert("match".into(), serde_json::json!(match_stats.marker()));
+                map.insert("match_floor".into(), serde_json::json!(match_stats.floor));
+                map.insert(
+                    "candidates_below_floor".into(),
+                    serde_json::json!(match_stats.below_floor),
+                );
+                if match_stats.is_miss() {
+                    map.insert(
+                        "suggest".into(),
+                        serde_json::json!(crux_mcp::recall_match::SUGGEST_NO_MATCH),
+                    );
+                }
+            }
+        }
+        body
+    };
+    let (mut body, outcome) = match q.token_budget {
+        Some(budget) => crux_mcp::response_budget::fit(budget, total_candidates, render),
+        None => (
+            render(total_candidates, total_candidates),
+            crux_mcp::response_budget::FitOutcome {
+                full: total_candidates,
+                emitted: total_candidates,
+                tokens: 0,
+                fits: true,
+            },
+        ),
+    };
+    if let (Some(budget), Some(map)) = (q.token_budget, body.as_object_mut()) {
+        map.insert(
+            "budget".into(),
+            serde_json::json!({
+                "token_budget": budget,
+                "tokens_emitted": outcome.tokens,
+                "governs": "whole_response",
+                "rows_hydrated": outcome.full,
+                "rows_emitted": outcome.emitted,
+                "rows_dropped": total_candidates.saturating_sub(outcome.emitted),
+                "within_budget": outcome.fits,
+            }),
+        );
+    }
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+/// Render the `facts` array at a hydration boundary (M1 whole-response budget).
+/// The first `full` rows are complete; rows in `full..emitted` drop `value` and
+/// are flagged `value_omitted` so they stay addressable by `fact_id` /
+/// `entity`+`key`; rows beyond `emitted` are dropped and disclosed in `budget`.
+/// `full == emitted == rows.len()` reproduces the pre-M1 array exactly.
+fn http_fact_rows(rows: &[serde_json::Value], full: usize, emitted: usize) -> Vec<serde_json::Value> {
+    let emitted = emitted.min(rows.len());
+    let full = full.min(emitted);
+    let mut out = Vec::with_capacity(emitted);
+    out.extend(rows[..full].iter().cloned());
+    for row in &rows[full..emitted] {
+        let mut trimmed = row.clone();
+        if let Some(map) = trimmed.as_object_mut() {
+            map.remove("value");
+            map.insert("value_omitted".into(), serde_json::json!(true));
+        }
+        out.push(trimmed);
+    }
+    out
 }
 
 /// `POST /v1/facts/aggregate` — deterministic, 0-LLM aggregate lane (buyer-fit

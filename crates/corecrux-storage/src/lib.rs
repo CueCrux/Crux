@@ -1332,6 +1332,14 @@ pub struct ShardStorage {
     next_segment_seq: u64,
     next_head_commit_id: u64,
 
+    /// Directory extents skipped by the most recent directory rebuild because
+    /// the manifest has retired the segment they name.
+    ///
+    /// Kept rather than only logged so the skip is *observable*: it is the
+    /// difference between a shard that opened cleanly and one that opened by
+    /// stepping over post-erasure debris, and a test can assert which happened.
+    directory_extents_skipped: usize,
+
     head: Option<HeadSegment>,
 }
 
@@ -1480,6 +1488,165 @@ pub fn encode_manifest_segment_removal_v1(segment_seq: u64) -> Vec<u8> {
         },
     )));
     out
+}
+
+/// A directory run that names segments the manifest no longer carries.
+///
+/// [`encode_manifest_segment_removal_v1`] retires the L0 run whose `run_id`
+/// equals the segment's seq, but a run can be published under a *different*
+/// id — `publish_dir_run_v1` increments `run_id` on a path collision — and
+/// higher-level runs merge extents across segments. Either way the run outlives
+/// the segment it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DanglingDirRunV1 {
+    pub level: u32,
+    pub run_id: u64,
+    pub relative_path: String,
+    /// Sequences this run names that are absent from the manifest.
+    pub absent_segment_seqs: Vec<u64>,
+    /// True when the run names *only* absent segments, so retiring it costs no
+    /// live directory entry. A mixed run must not be retired — the live extents
+    /// inside it are how those streams resolve to their segments.
+    pub wholly_absent: bool,
+}
+
+/// Report directory runs naming segments the manifest has retired.
+///
+/// Reads the manifest and the `directory/` files only — never
+/// `ShardStorage::open`, which is exactly what a shard in this state can no
+/// longer do.
+pub fn find_dangling_dir_runs(shard_dir: &Path) -> Result<Vec<DanglingDirRunV1>> {
+    let manifest_path = shard_dir.join("MANIFEST");
+    if !manifest_path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut manifest = File::open(&manifest_path).map_err(io_err)?;
+    let (state, _end) = load_manifest_records(&mut manifest)?;
+
+    let mut runs: Vec<DirRunMeta> = state.dir_runs.values().cloned().collect();
+    runs.sort_by(|a, b| {
+        a.key
+            .level
+            .cmp(&b.key.level)
+            .then_with(|| a.key.run_id.cmp(&b.key.run_id))
+    });
+
+    let mut out = Vec::new();
+    for run in runs {
+        let bytes = match std::fs::read(shard_dir.join(&run.relative_path)) {
+            Ok(b) => b,
+            // A run file that is gone is a different failure, and it is not this
+            // function's to diagnose; report only what can be read and decoded.
+            Err(_) => continue,
+        };
+        let Ok(decoded) = decode_dir_run_v1(&bytes) else {
+            continue;
+        };
+        let mut absent: Vec<u64> = Vec::new();
+        let mut present = 0usize;
+        for part in decoded.partitions {
+            for e in part {
+                if state.segments_by_seq.contains_key(&e.segment_seq) {
+                    present += 1;
+                } else if !absent.contains(&e.segment_seq) {
+                    absent.push(e.segment_seq);
+                }
+            }
+        }
+        if absent.is_empty() {
+            continue;
+        }
+        absent.sort_unstable();
+        out.push(DanglingDirRunV1 {
+            level: run.key.level,
+            run_id: run.key.run_id,
+            relative_path: run.relative_path.clone(),
+            absent_segment_seqs: absent,
+            wholly_absent: present == 0,
+        });
+    }
+    Ok(out)
+}
+
+/// Outcome of [`retire_dir_runs_in_manifest`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManifestRetireDirRunOutcomeV1 {
+    /// `(level, run_id)` pairs that were in the manifest and now carry a removal.
+    pub retired: Vec<(u32, u64)>,
+    /// Pairs that were not in the manifest — already retired, or never present.
+    pub not_present: Vec<(u32, u64)>,
+    pub manifest_end: u64,
+}
+
+/// Retire directory runs from a shard's MANIFEST without opening the shard.
+///
+/// The counterpart to [`retire_segments_in_manifest`] for the runs that
+/// function's `run_id == segment_seq` pairing misses. Same discipline: an
+/// append under the shard's exclusive `LOCK`, never a rewrite, so it is safe
+/// against a running daemon and a bad run leaves the shard no worse than it
+/// started.
+///
+/// Callers must retire only runs whose named segments are *all* absent
+/// (`DanglingDirRunV1::wholly_absent`) — retiring a mixed run drops the live
+/// extents inside it, and those are how their streams resolve.
+pub fn retire_dir_runs_in_manifest(
+    root: &Path,
+    shard_id: u32,
+    runs: &[(u32, u64)],
+) -> Result<ManifestRetireDirRunOutcomeV1> {
+    let paths = ShardPaths::for_root(root, shard_id);
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&paths.lock_path)
+        .map_err(io_err)?;
+    lock_file.try_lock_exclusive().map_err(io_err)?;
+
+    if !paths.manifest_path.exists() {
+        return Ok(ManifestRetireDirRunOutcomeV1 {
+            not_present: runs.to_vec(),
+            ..Default::default()
+        });
+    }
+
+    let (state, manifest_end) = {
+        let mut manifest = File::open(&paths.manifest_path).map_err(io_err)?;
+        load_manifest_records(&mut manifest)?
+    };
+
+    let mut out = ManifestRetireDirRunOutcomeV1 {
+        manifest_end,
+        ..Default::default()
+    };
+    let mut framed: Vec<u8> = Vec::new();
+    for &(level, run_id) in runs {
+        let key = DirRunKey { level, run_id };
+        if state.dir_runs.contains_key(&key) {
+            framed.extend_from_slice(&frame_manifest_record(&manifest::encode_manifest_remove_dir_run_v1(
+                key,
+            )));
+            out.retired.push((level, run_id));
+        } else {
+            out.not_present.push((level, run_id));
+        }
+    }
+    if framed.is_empty() {
+        return Ok(out);
+    }
+
+    let mut manifest = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&paths.manifest_path)
+        .map_err(io_err)?;
+    manifest.seek(SeekFrom::Start(manifest_end)).map_err(io_err)?;
+    manifest.write_all(&framed).map_err(io_err)?;
+    manifest.sync_all().map_err(io_err)?;
+
+    out.manifest_end = manifest_end + framed.len() as u64;
+    Ok(out)
 }
 impl ShardStorage {
     pub fn open(root: &Path, shard_id: u32, epoch: u64, options: ShardStorageOptions) -> Result<Self> {
@@ -1775,6 +1942,7 @@ impl ShardStorage {
             epoch,
             paths,
             _lock_file: lock_file,
+            directory_extents_skipped: 0,
             manifest_end,
             manifest,
             segments_by_seq,

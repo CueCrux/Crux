@@ -56,6 +56,12 @@ pub fn breakdown(events: &[Event]) -> Option<ModelBreakdown> {
     let mut saw_model = false;
 
     for (i, ev) in events.iter().enumerate() {
+        // A continuation line of an API call already counted: its usage was
+        // cleared at parse time, and counting it as a turn would put this axis
+        // on a different denominator from `Headline::assistant_turns`.
+        if ev.duplicate_api_line {
+            continue;
+        }
         let Some(model) = ev.model.as_deref() else {
             // A record with usage but no model still has to land somewhere, or
             // the breakdown stops reconciling against the measured total.

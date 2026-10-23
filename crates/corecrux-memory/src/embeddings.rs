@@ -9,6 +9,7 @@
 //! (Ollama, vLLM, llama.cpp, TEI, LiteLLM, etc.). When configured, facts are
 //! embedded at store time and queries use cosine similarity for ranking.
 
+use corecrux_billing::credit_meter::PinnedCreditQuote;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -31,6 +32,11 @@ const DELEGATION_MAX_ATTEMPTS_CEILING: usize = 5;
 const DELEGATION_MAX_BACKOFF: Duration = Duration::from_secs(1);
 const DELEGATION_MAX_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DELEGATION_MAX_BREAKER_OPEN_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The premium lane the metered `/v1/compute/embed` door bills against. Must
+/// match `COMPUTE_EMBED_LANE_SLUG` on the provider side: the door rejects a
+/// quote whose capability or credits disagree with the lane it prices.
+const DELEGATION_LANE_SLUG: &str = "dense_managed";
 
 /// Configuration for the embedding endpoint.
 #[derive(Debug, Clone)]
@@ -200,6 +206,84 @@ impl Embedder for EmbeddingClient {
     }
 }
 
+/// Who pays for delegated embedding: **one payer per daemon**.
+///
+/// A daemon is not a shared multi-tenant surface — it is owned by one business
+/// or individual, and that owner's wallet funds every embedding it delegates.
+/// The payer is therefore a property of the delegation *configuration*, not of
+/// whichever end-user request happens to trigger an embed. Threading a payer
+/// down from request context would make one daemon bill many wallets, which is
+/// not the product.
+///
+/// The lane and its price are **not** configurable here. The provider door
+/// rejects any quote whose capability or credits disagree with the
+/// `dense_managed` lane it prices, so exposing them as settings would only let
+/// an operator configure a guaranteed rejection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegatedEmbedPayer {
+    /// Tenant whose wallet is debited. The provider authorises the caller's
+    /// bearer credential against exactly this tenant, so it must be the tenant
+    /// the delegate token is scoped to.
+    tenant_id: String,
+    /// Format-checked (`blake3:<64-hex>`) but not resolved by the provider, so
+    /// it defaults to a hash derived from the lane's own pinned price.
+    price_list_hash: String,
+}
+
+impl DelegatedEmbedPayer {
+    pub fn new(tenant_id: impl Into<String>) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+            price_list_hash: default_price_list_hash(),
+        }
+    }
+
+    /// Override the derived price-list hash with one the provider published.
+    pub fn with_price_list_hash(mut self, price_list_hash: impl Into<String>) -> Self {
+        self.price_list_hash = price_list_hash.into();
+        self
+    }
+
+    pub fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+
+    pub fn price_list_hash(&self) -> &str {
+        &self.price_list_hash
+    }
+
+    /// Mint a quote for one delegated embed call.
+    ///
+    /// The operation id is **fresh every call**, and that is the whole reason
+    /// this is a code path rather than a config value: `CreditMeterStore::reserve`
+    /// keys on `(tenant_id, operation_id)` and answers `OperationAlreadySpent`
+    /// once that pair has settled, so a quote pinned in configuration would bill
+    /// the first embed and hard-fail every one after it.
+    pub fn mint_quote(&self) -> PinnedCreditQuote {
+        let operation = uuid::Uuid::new_v4();
+        PinnedCreditQuote::new(
+            format!("delegated-embed-quote-{operation}"),
+            self.tenant_id.clone(),
+            format!("delegated-embed-{operation}"),
+            rcx_capability_token::corecrux_lane_capability(DELEGATION_LANE_SLUG),
+            rcx_capability_token::corecrux_lane_credit_cost(DELEGATION_LANE_SLUG, 0),
+            self.price_list_hash.clone(),
+        )
+    }
+}
+
+/// Price-list hash derived from the lane price this build actually pins.
+///
+/// The provider only format-checks `price_list_hash`; it never resolves it
+/// against a published list. Deriving it keeps the env surface to the one thing
+/// an operator genuinely has to supply — the paying tenant — while still moving
+/// if the pinned price ever moves.
+fn default_price_list_hash() -> String {
+    let credits = rcx_capability_token::corecrux_lane_credit_cost(DELEGATION_LANE_SLUG, 0);
+    let canonical = format!("cuecrux.lane_price.v1:{DELEGATION_LANE_SLUG}={credits}");
+    format!("blake3:{}", blake3::hash(canonical.as_bytes()).to_hex())
+}
+
 /// Configuration for authenticated delegation to another CoreCrux daemon's
 /// `POST /v1/compute/embed` endpoint.
 ///
@@ -217,6 +301,10 @@ pub struct DelegatingEmbeddingConfig {
     pub initial_backoff: Duration,
     pub breaker_failure_threshold: u32,
     pub breaker_open_for: Duration,
+    /// Wallet that funds this daemon's delegated embedding, or `None` to send
+    /// no quote at all — the pre-metering wire shape, which an unmetered
+    /// provider still serves.
+    pub payer: Option<DelegatedEmbedPayer>,
 }
 
 impl std::fmt::Debug for DelegatingEmbeddingConfig {
@@ -231,6 +319,7 @@ impl std::fmt::Debug for DelegatingEmbeddingConfig {
             .field("initial_backoff", &self.initial_backoff)
             .field("breaker_failure_threshold", &self.breaker_failure_threshold)
             .field("breaker_open_for", &self.breaker_open_for)
+            .field("payer", &self.payer)
             .finish()
     }
 }
@@ -252,7 +341,15 @@ impl DelegatingEmbeddingConfig {
             initial_backoff: DELEGATION_DEFAULT_INITIAL_BACKOFF,
             breaker_failure_threshold: DELEGATION_DEFAULT_BREAKER_FAILURE_THRESHOLD,
             breaker_open_for: DELEGATION_DEFAULT_BREAKER_OPEN_FOR,
+            payer: None,
         }
+    }
+
+    /// Name the wallet that funds this daemon's delegated embedding. Without
+    /// it the client sends no quote, which a metered provider refuses.
+    pub fn with_payer(mut self, payer: DelegatedEmbedPayer) -> Self {
+        self.payer = Some(payer);
+        self
     }
 }
 
@@ -318,6 +415,10 @@ struct DelegatingEmbedRequest<'a> {
     texts: &'a [&'a str],
     #[serde(skip_serializing_if = "Option::is_none")]
     semantic_profile: Option<&'a SemanticProfile>,
+    /// Absent unless a payer is configured, so an unpaid client keeps sending
+    /// byte-identical requests to the ones it sent before metering existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credit_quote: Option<&'a PinnedCreditQuote>,
 }
 
 #[derive(Deserialize)]
@@ -332,11 +433,21 @@ struct DelegationProblemProfile {
     dimensions: usize,
 }
 
+/// The `expected_quote` extension a metered provider flattens onto its 400
+/// when the presented quote is missing or does not match the lane it prices.
+#[derive(Deserialize)]
+struct DelegationProblemExpectedQuote {
+    capability: Option<String>,
+    credits: Option<u64>,
+}
+
 #[derive(Deserialize)]
 struct DelegationProblemDetails {
     code: Option<String>,
+    detail: Option<String>,
     expected: Option<DelegationProblemProfile>,
     actual: Option<DelegationProblemProfile>,
+    expected_quote: Option<DelegationProblemExpectedQuote>,
 }
 
 fn semantic_profile_mismatch_from_problem(problem: DelegationProblemDetails) -> Option<EmbeddingError> {
@@ -350,6 +461,22 @@ fn semantic_profile_mismatch_from_problem(problem: DelegationProblemDetails) -> 
         expected_dimensions: expected.dimensions,
         got_model: actual.model,
         got_dimensions: actual.dimensions,
+    })
+}
+
+/// Turn a metered provider's quote rejection into a named error.
+///
+/// Without this the only real symptom of "this provider bills and this daemon
+/// has no payer configured" is a bare HTTP 400, which reads as a malformed
+/// request and sends the operator looking in the wrong place entirely.
+fn credit_quote_required_from_problem(problem: DelegationProblemDetails) -> Option<EmbeddingError> {
+    let expected = problem.expected_quote?;
+    Some(EmbeddingError::DelegationCreditQuoteRejected {
+        capability: expected.capability.unwrap_or_else(|| "unknown".to_string()),
+        credits: expected.credits.unwrap_or_default(),
+        detail: problem
+            .detail
+            .unwrap_or_else(|| "provider did not accept the presented credit quote".to_string()),
     })
 }
 
@@ -383,10 +510,15 @@ impl DelegationTransport for UreqDelegationTransport {
             .map_err(|err| EmbeddingError::Network(err.to_string()))?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
-            if status == 409 {
+            if status == 409 || status == 400 {
                 let problem = response.body_mut().read_json::<DelegationProblemDetails>();
                 if let Ok(problem) = problem {
-                    if let Some(err) = semantic_profile_mismatch_from_problem(problem) {
+                    let named = if status == 409 {
+                        semantic_profile_mismatch_from_problem(problem)
+                    } else {
+                        credit_quote_required_from_problem(problem)
+                    };
+                    if let Some(err) = named {
                         return Err(err);
                     }
                 }
@@ -498,9 +630,13 @@ impl DelegatingEmbedder {
                 max_bytes: DELEGATION_MAX_TEXT_BYTES_PER_REQUEST,
             });
         }
+        // One quote per logical call, minted here and reused by every transport
+        // retry below. Minting per attempt would pay twice for one embed; the
+        // shared operation id makes the meter's own replay guard the ceiling.
+        let quote = self.config.payer.as_ref().map(DelegatedEmbedPayer::mint_quote);
         let permit = self.acquire_permit()?;
         let result = self
-            .send_with_retries(texts)
+            .send_with_retries(texts, quote.as_ref())
             .and_then(|response| self.validate_and_pin_response(texts.len(), response));
         match result {
             Ok(embeddings) => {
@@ -593,10 +729,14 @@ impl DelegatingEmbedder {
         }
     }
 
-    fn send_with_retries(&self, texts: &[&str]) -> Result<DelegatingEmbedResponse, EmbeddingError> {
+    fn send_with_retries(
+        &self,
+        texts: &[&str],
+        quote: Option<&PinnedCreditQuote>,
+    ) -> Result<DelegatingEmbedResponse, EmbeddingError> {
         let mut backoff = self.config.initial_backoff;
         for attempt in 0..self.config.max_attempts {
-            match self.send_once(texts) {
+            match self.send_once(texts, quote) {
                 Ok(response) => return Ok(response),
                 Err(err) => {
                     let attempts_exhausted = attempt + 1 >= self.config.max_attempts;
@@ -613,11 +753,16 @@ impl DelegatingEmbedder {
         ))
     }
 
-    fn send_once(&self, texts: &[&str]) -> Result<DelegatingEmbedResponse, EmbeddingError> {
+    fn send_once(
+        &self,
+        texts: &[&str],
+        quote: Option<&PinnedCreditQuote>,
+    ) -> Result<DelegatingEmbedResponse, EmbeddingError> {
         let profile = self.semantic_profile();
         let body = DelegatingEmbedRequest {
             texts,
             semantic_profile: Some(&profile),
+            credit_quote: quote,
         };
         let value = serde_json::to_value(&body).map_err(|err| EmbeddingError::Serialize(err.to_string()))?;
         self.transport.send(&self.endpoint, &self.config.bearer_token, value)
@@ -823,6 +968,14 @@ fn validate_delegating_config(config: &DelegatingEmbeddingConfig) -> Result<(), 
         return Err(EmbeddingError::Configuration(
             "embedding delegate breaker cooldown must be between 1ns and 24h".to_string(),
         ));
+    }
+    if let Some(payer) = config.payer.as_ref() {
+        // Validated with the provider's own rule rather than a second copy of
+        // it: a payer that mints quotes the door will refuse must fail at
+        // startup, not on the first embed of a live workload.
+        payer.mint_quote().validate().map_err(|err| {
+            EmbeddingError::Configuration(format!("embedding delegate payer would mint an invalid quote: {err}"))
+        })?;
     }
     Ok(())
 }
@@ -1228,6 +1381,15 @@ pub enum EmbeddingError {
     DelegationBatchTooLarge { count: usize, max_count: usize },
     #[error("embedding delegation batch is {bytes} bytes, over the {max_bytes}-byte logical-call cap")]
     DelegationPayloadTooLarge { bytes: usize, max_bytes: usize },
+    #[error(
+        "embedding delegation provider rejected the credit quote for {capability} ({credits} credits): {detail}; \
+         set CORECRUXD_EMBED_DELEGATE_TENANT to the tenant whose wallet pays for this daemon's embedding"
+    )]
+    DelegationCreditQuoteRejected {
+        capability: String,
+        credits: u64,
+        detail: String,
+    },
 }
 
 impl EmbeddingError {
@@ -1610,6 +1772,240 @@ mod tests {
         assert_eq!(requests[0].body["semantic_profile"]["model"], "provider-a");
         assert_eq!(requests[0].body["semantic_profile"]["dimensions"], 2);
         Ok(())
+    }
+
+    // ── Delegated embedding: who pays ──────────────────────────────────
+    //
+    // One payer per daemon. These tests pin the four properties the payer
+    // design rests on: no payer means the pre-metering wire shape; a payer
+    // means a quote whose tenant comes from configuration and never from the
+    // call; the operation id is fresh per logical call but stable across a
+    // call's retries; and both of those together settle against the real
+    // meter store rather than tripping its replay guard.
+
+    fn paying_delegation_config(model: &str, dimensions: usize, tenant: &str) -> DelegatingEmbeddingConfig {
+        delegation_config(model, dimensions).with_payer(DelegatedEmbedPayer::new(tenant))
+    }
+
+    fn quote_from_request(request: &MockDelegationRequest) -> PinnedCreditQuote {
+        serde_json::from_value(request.body["credit_quote"].clone()).expect("credit quote on the delegated request")
+    }
+
+    /// Without a configured payer the request body is exactly what it was
+    /// before metering existed — an unmetered provider keeps working, and the
+    /// meter-off contract (C2) is not something the client can break.
+    #[test]
+    fn delegating_embedder_without_a_payer_sends_no_quote() -> Result<(), EmbeddingError> {
+        let profile = delegation_profile("provider-a", 2, "tokenizer-a");
+        let provider = MockDelegationProvider::new(vec![delegation_response(profile, vec![vec![0.25, 0.75]])]);
+        let embedder = mock_delegating_embedder(delegation_config("provider-a", 2), provider.clone())?;
+
+        embedder.embed_batch(&["alpha"])?;
+
+        let requests = provider.requests()?;
+        assert_eq!(requests.len(), 1);
+        let keys = requests[0]
+            .body
+            .as_object()
+            .expect("object body")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["texts", "semantic_profile"]);
+        Ok(())
+    }
+
+    /// The quote carries the lane the provider prices, at the price the
+    /// provider pins. A capability or credit figure that disagrees is refused
+    /// by `begin_embed_credit_spend`, so these are not cosmetic.
+    #[test]
+    fn delegating_embedder_quote_matches_the_priced_lane() -> Result<(), EmbeddingError> {
+        let profile = delegation_profile("provider-a", 2, "tokenizer-a");
+        let provider = MockDelegationProvider::new(vec![delegation_response(profile, vec![vec![0.25, 0.75]])]);
+        let embedder = mock_delegating_embedder(
+            paying_delegation_config("provider-a", 2, "tenant-payer"),
+            provider.clone(),
+        )?;
+
+        embedder.embed_batch(&["alpha"])?;
+
+        let quote = quote_from_request(&provider.requests()?[0]);
+        assert_eq!(quote.tenant_id, "tenant-payer");
+        assert_eq!(
+            quote.capability,
+            rcx_capability_token::corecrux_lane_capability("dense_managed")
+        );
+        assert_eq!(
+            quote.credits,
+            rcx_capability_token::corecrux_lane_credit_cost("dense_managed", 0)
+        );
+        assert!(quote.validate().is_ok(), "the provider validates with this same rule");
+        Ok(())
+    }
+
+    /// The payer is a property of the daemon, not of the work. Two calls with
+    /// different texts — the only per-call input the delegating client has —
+    /// bill the same wallet.
+    #[test]
+    fn delegating_embedder_bills_the_configured_payer_regardless_of_the_call() -> Result<(), EmbeddingError> {
+        let profile = delegation_profile("provider-a", 2, "tokenizer-a");
+        let provider = MockDelegationProvider::new(vec![
+            delegation_response(profile.clone(), vec![vec![0.25, 0.75]]),
+            delegation_response(profile, vec![vec![0.5, 0.5], vec![0.1, 0.9]]),
+        ]);
+        let embedder = mock_delegating_embedder(
+            paying_delegation_config("provider-a", 2, "tenant-payer"),
+            provider.clone(),
+        )?;
+
+        embedder.embed_batch(&["alpha"])?;
+        embedder.embed_batch(&["beta", "gamma"])?;
+
+        let requests = provider.requests()?;
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert_eq!(quote_from_request(request).tenant_id, "tenant-payer");
+        }
+        Ok(())
+    }
+
+    /// Fresh operation id per logical call. This is the whole reason the payer
+    /// mints in code rather than sitting in configuration: a static quote would
+    /// bill the first embed and then fail every one after with
+    /// `OperationAlreadySpent`.
+    #[test]
+    fn delegating_embedder_mints_a_fresh_operation_id_per_call() -> Result<(), EmbeddingError> {
+        let profile = delegation_profile("provider-a", 2, "tokenizer-a");
+        let provider = MockDelegationProvider::new(vec![
+            delegation_response(profile.clone(), vec![vec![0.25, 0.75]]),
+            delegation_response(profile, vec![vec![0.5, 0.5]]),
+        ]);
+        let embedder = mock_delegating_embedder(
+            paying_delegation_config("provider-a", 2, "tenant-payer"),
+            provider.clone(),
+        )?;
+
+        embedder.embed_batch(&["alpha"])?;
+        embedder.embed_batch(&["beta"])?;
+
+        let requests = provider.requests()?;
+        let first = quote_from_request(&requests[0]);
+        let second = quote_from_request(&requests[1]);
+        assert_ne!(first.operation_id, second.operation_id);
+        assert_ne!(first.quote_id, second.quote_id);
+        Ok(())
+    }
+
+    /// Retries within one logical call reuse one operation id, so a transport
+    /// retry after a provider-side failure cannot pay twice for one embed. The
+    /// meter's own replay guard is then the ceiling on double-billing.
+    #[test]
+    fn delegating_embedder_retry_reuses_one_operation_id() -> Result<(), EmbeddingError> {
+        let profile = delegation_profile("provider-a", 2, "tokenizer-a");
+        let provider = MockDelegationProvider::new(vec![
+            MockDelegationResponse::Failure(EmbeddingError::Network("transient".to_string())),
+            delegation_response(profile, vec![vec![0.25, 0.75]]),
+        ]);
+        let embedder = mock_delegating_embedder(
+            paying_delegation_config("provider-a", 2, "tenant-payer"),
+            provider.clone(),
+        )?;
+
+        embedder.embed_batch(&["alpha"])?;
+
+        let requests = provider.requests()?;
+        assert_eq!(requests.len(), 2, "the first attempt failed and was retried");
+        assert_eq!(
+            quote_from_request(&requests[0]).operation_id,
+            quote_from_request(&requests[1]).operation_id
+        );
+        Ok(())
+    }
+
+    /// The end of the P1 finding: two delegated calls, driven quote-first
+    /// through the *real* meter store, both settle. A configuration-pinned
+    /// quote would fail the second reserve with `OperationAlreadySpent`.
+    #[test]
+    fn minted_quotes_settle_twice_against_the_real_meter() -> Result<(), EmbeddingError> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut meter = corecrux_billing::credit_meter::CreditMeterStore::open(dir.path().join("credit-meter.jsonl"))
+            .expect("open meter");
+        meter
+            .seed_comped_wallet("tenant-payer", 2, "seed-payer-test")
+            .expect("seed");
+
+        let payer = DelegatedEmbedPayer::new("tenant-payer");
+        for call in 0..2 {
+            let quote = payer.mint_quote();
+            quote.validate().expect("minted quote is valid");
+            let reservation = meter
+                .reserve(&quote.tenant_id, &quote.operation_id, quote.credits, "payload-hash")
+                .unwrap_or_else(|err| panic!("call {call} reserve failed: {err}"));
+            meter
+                .spend(
+                    &quote.tenant_id,
+                    &reservation.reservation_id,
+                    &format!("crxspend_test_{call}"),
+                )
+                .unwrap_or_else(|err| panic!("call {call} spend failed: {err}"));
+        }
+
+        assert_eq!(meter.available_balance("tenant-payer"), 0, "two calls, two credits");
+        Ok(())
+    }
+
+    /// A metered provider's quote refusal must arrive as a named error. A bare
+    /// `UpstreamStatus { status: 400 }` reads as a malformed request and sends
+    /// the operator hunting in the wrong place.
+    #[test]
+    fn provider_quote_refusal_is_a_named_error() {
+        // The exact body `credit_quote_problem` flattens onto its 400.
+        let body = serde_json::json!({
+            "type": "https://errors.cuecrux.com/bad-request",
+            "title": "Bad Request",
+            "status": 400,
+            "detail": "credit_quote is required when CORECRUXD_CREDIT_METER=1",
+            "quote": null,
+            "expected_quote": {
+                "tenant_id": "tenant-payer",
+                "capability": "corecrux.lane.dense_managed",
+                "credits": 1,
+            },
+        });
+        let problem: DelegationProblemDetails = serde_json::from_value(body).expect("problem body");
+
+        let err = credit_quote_required_from_problem(problem).expect("named error");
+        assert!(matches!(
+            &err,
+            EmbeddingError::DelegationCreditQuoteRejected { capability, credits, .. }
+                if capability == "corecrux.lane.dense_managed" && *credits == 1
+        ));
+        assert!(err.to_string().contains("CORECRUXD_EMBED_DELEGATE_TENANT"));
+        assert!(!err.delegation_retryable(), "a payment refusal must never be retried");
+    }
+
+    /// A 400 that is not about credit stays a plain upstream status, so this
+    /// mapping cannot swallow an unrelated validation failure.
+    #[test]
+    fn non_credit_bad_request_is_not_reported_as_a_quote_refusal() {
+        let problem: DelegationProblemDetails = serde_json::from_value(serde_json::json!({
+            "status": 400,
+            "detail": "texts must not contain an empty item",
+        }))
+        .expect("problem body");
+        assert!(credit_quote_required_from_problem(problem).is_none());
+    }
+
+    /// A payer whose price-list hash the provider would reject aborts at
+    /// construction, not on the first embed of a live workload.
+    #[test]
+    fn payer_minting_an_invalid_quote_fails_config_validation() {
+        let config = delegation_config("provider-a", 2)
+            .with_payer(DelegatedEmbedPayer::new("tenant-payer").with_price_list_hash("not-a-blake3-ref"));
+        assert!(matches!(
+            validate_delegating_config(&config),
+            Err(EmbeddingError::Configuration(message)) if message.contains("price_list_hash")
+        ));
     }
 
     #[test]

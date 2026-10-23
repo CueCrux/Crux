@@ -455,7 +455,22 @@ pub fn offered_set_hash(tool_names: &[String]) -> String {
 
 /// Build the observation body for one offered-surface event. Pure so the
 /// field mapping is unit-testable.
-pub fn build_tools_offered_body(passport: &str, tool_names: &[String], surface_mode: &str, set_hash: &str) -> Value {
+///
+/// `added`/`removed` are the transition against the PREVIOUS listing for the
+/// same MCP session (prompt-cache M1). With the monotone surface on
+/// (`CORECRUXD_SURFACE_MONOTONE`, default on) `removed` is always empty; the
+/// M0 cache-invalidation ledger reads exactly that to attribute — or clear —
+/// the daemon of a `tool_delta` prefix invalidation, which on corpus
+/// `drivew-host-claude-transcripts-2026-09` cost 311,754 rewritten tokens in a
+/// single event.
+pub fn build_tools_offered_body(
+    passport: &str,
+    tool_names: &[String],
+    surface_mode: &str,
+    set_hash: &str,
+    added: &[String],
+    removed: &[String],
+) -> Value {
     json!({
         "kind": OFFERED_EVENT_KIND,
         "provider": PROVIDER,
@@ -465,6 +480,8 @@ pub fn build_tools_offered_body(passport: &str, tool_names: &[String], surface_m
             "count": tool_names.len(),
             "surface_mode": surface_mode,
             "set_hash": set_hash,
+            "added": added,
+            "removed": removed,
         },
     })
 }
@@ -490,7 +507,14 @@ pub fn offered_set_is_new(passport: &str, set_hash: &str) -> bool {
 /// Flag-gated, deduped, fire-and-forget emission of one offered-surface
 /// event. Call from the `tools/list` serve path with the FINAL (shaped,
 /// authz-filtered) tool names.
-pub fn emit_tools_offered(daemon_base_url: Option<String>, passport: &str, tool_names: &[String], surface_mode: &str) {
+pub fn emit_tools_offered(
+    daemon_base_url: Option<String>,
+    passport: &str,
+    tool_names: &[String],
+    surface_mode: &str,
+    added: &[String],
+    removed: &[String],
+) {
     if !ledger_enabled() {
         return;
     }
@@ -498,7 +522,7 @@ pub fn emit_tools_offered(daemon_base_url: Option<String>, passport: &str, tool_
     if !offered_set_is_new(passport, &set_hash) {
         return;
     }
-    let body = build_tools_offered_body(passport, tool_names, surface_mode, &set_hash);
+    let body = build_tools_offered_body(passport, tool_names, surface_mode, &set_hash, added, removed);
     emit(daemon_base_url, passport, body);
 }
 
@@ -731,7 +755,8 @@ mod tests {
     fn tools_offered_body_maps_fields() {
         let names = vec!["query_facts".to_string(), "store_fact".to_string()];
         let hash = offered_set_hash(&names);
-        let body = build_tools_offered_body("alice", &names, "full", &hash);
+        let added = vec!["store_fact".to_string()];
+        let body = build_tools_offered_body("alice", &names, "full", &hash, &added, &[]);
         assert_eq!(body["kind"], OFFERED_EVENT_KIND);
         assert_eq!(body["provider"], PROVIDER);
         assert_eq!(body["payload"]["passport"], "alice");
@@ -739,6 +764,13 @@ mod tests {
         assert_eq!(body["payload"]["surface_mode"], "full");
         assert_eq!(body["payload"]["tools"][1], "store_fact");
         assert!(body["payload"]["set_hash"].as_str().unwrap().starts_with("blake3:"));
+        // prompt-cache M1: the transition fields the M0 cache ledger reads.
+        assert_eq!(body["payload"]["added"][0], "store_fact");
+        assert_eq!(
+            body["payload"]["removed"],
+            serde_json::json!([]),
+            "removed must serialise as an empty array, not null"
+        );
     }
 
     #[test]

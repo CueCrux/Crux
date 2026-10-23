@@ -266,7 +266,10 @@ mod tests {
 
     #[tokio::test]
     async fn dynamic_extension_tools_are_grant_and_rcx_filtered() {
-        let ctx = rcx_ctx(vec!["crux-extension.ext.example.quote.daily"]);
+        // Own MCP session key: the prompt-cache M1 monotone union is
+        // process-global and would otherwise carry another test's listing in.
+        let ctx = rcx_ctx(vec!["crux-extension.ext.example.quote.daily"])
+            .with_mcp_session_id("test-dynamic-extension-tools-rcx-filtered");
         seed_extension_and_grant(&ctx).await;
 
         let listed = crate::tools::list_tools_json_for_context(&ctx, 1_776_989_601).await;

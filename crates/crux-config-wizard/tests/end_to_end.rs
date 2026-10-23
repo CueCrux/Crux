@@ -23,7 +23,7 @@ fn full_init_regenerate_loop() {
     let workspace = dir.path();
 
     let bundled = load_bundled_profiles().expect("bundled profiles parse");
-    assert_eq!(bundled.len(), 13, "13 bundled profiles expected");
+    assert_eq!(bundled.len(), 14, "14 bundled profiles expected");
 
     // init with all defaults.
     let mut cfg = AgentProfileConfig::new(workspace_fingerprint(workspace));
@@ -41,6 +41,8 @@ fn full_init_regenerate_loop() {
 
     // Both targets land 10 sections: 9 shared profiles, plus exactly one of the
     // target-split pair (claude-5 → CLAUDE.md, agent-harness-parity → AGENTS.md).
+    // `memory-digest` is one of the shared nine and lands in both, which is the
+    // point of it: the same curated index reaches Claude Code and Codex.
     for t in [Target::ClaudeMd, Target::AgentsMd] {
         let r = compose_file(workspace, t, &enabled, false, false).unwrap();
         assert!(r.wrote);

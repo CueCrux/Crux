@@ -1484,4 +1484,71 @@ mod tests {
             "the credit meter log must contain hashes, never caller text"
         );
     }
+
+    // ── 12–13: the delegating client's own quotes, against this door ─────
+    //
+    // Rows 1–11 hand-build the quote in the test. What no row asserted is that
+    // the only real client of this door can produce one the door accepts — the
+    // gap the P1 finding named. These two drive `DelegatedEmbedPayer`, the
+    // exact minting the delegating embedder ships, through the live handler.
+
+    /// 12 — two sequential delegated calls both settle. A quote pinned in
+    /// configuration would bill the first and fail the second with
+    /// `OperationAlreadySpent`; a per-call mint does not.
+    #[tokio::test]
+    async fn client_minted_quotes_settle_on_two_sequential_delegated_calls() {
+        let state = metered_provider_state(10);
+        set_embedder(&state, Box::<corecrux_memory::embeddings::LocalHashEmbedder>::default()).await;
+        let payer = corecrux_memory::embeddings::DelegatedEmbedPayer::new(TEST_TENANT);
+
+        let mut spend_receipts = Vec::new();
+        for (call, expected_balance) in [(0usize, 9), (1usize, 8)] {
+            let response = post_compute_embed(
+                State(state.clone()),
+                scoped_passport_headers(COMPUTE_EMBED_SCOPE, "delegating-client"),
+                Json(metered_request("alpha", payer.mint_quote())),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "call {call} must settle");
+            let body = json_body(response).await;
+            assert_eq!(body["credits_spent"], 1);
+            assert_eq!(body["wallet_balance"], expected_balance);
+            spend_receipts.push(
+                body["credit_spend_receipt"]
+                    .as_str()
+                    .expect("spend receipt id")
+                    .to_string(),
+            );
+        }
+
+        assert_ne!(spend_receipts[0], spend_receipts[1], "each call mints its own spend");
+        assert_eq!(available_credits(&state), 8, "two calls, two credits");
+    }
+
+    /// 13 — one payer per daemon: the wallet debited is the configured tenant,
+    /// not anything carried by the request that triggered the embed.
+    #[tokio::test]
+    async fn client_minted_quote_bills_the_configured_payer_not_the_calling_context() {
+        let state = metered_provider_state(10);
+        set_embedder(&state, Box::<corecrux_memory::embeddings::LocalHashEmbedder>::default()).await;
+        let payer = corecrux_memory::embeddings::DelegatedEmbedPayer::new(TEST_TENANT);
+
+        for caller in ["end-user-a", "end-user-b"] {
+            let quote = payer.mint_quote();
+            assert_eq!(quote.tenant_id, TEST_TENANT);
+            let response = post_compute_embed(
+                State(state.clone()),
+                scoped_passport_headers(COMPUTE_EMBED_SCOPE, caller),
+                Json(metered_request("alpha", quote)),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "caller {caller} must settle");
+        }
+
+        assert_eq!(
+            available_credits(&state),
+            8,
+            "both calls debited the configured payer's wallet"
+        );
+    }
 }

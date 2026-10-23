@@ -55,6 +55,10 @@ pub(crate) const KDF_CONTEXT: &str = "cuecrux crux-escrow 2026-08-01 recovery-co
 /// Domain separation for the transcription checksum.
 const CHECKSUM_CONTEXT: &str = "cuecrux crux-escrow 2026-08-01 recovery-code checksum v1";
 /// Domain separation for per-share integrity tags.
+///
+/// `fuzz/fuzz_targets/escrow_recovery_code.rs` keeps its own copy so it can tag arbitrary
+/// bodies and reach reconstruction; change this and change that, or the target quietly
+/// stops covering everything below the integrity gate. It fails loudly if they diverge.
 const SHARE_TAG_CONTEXT: &str = "cuecrux crux-escrow 2026-08-01 escrow share tag v1";
 
 /// Bytes of BLAKE3 output kept as a share's integrity tag.

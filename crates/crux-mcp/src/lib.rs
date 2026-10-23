@@ -46,6 +46,8 @@ pub mod oauth;
 pub mod otel;
 pub mod payload;
 pub mod protocol;
+pub mod recall_match;
+pub mod response_budget;
 pub mod scope;
 pub mod server;
 pub mod sse;
