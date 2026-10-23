@@ -32,20 +32,34 @@ crux-config-wizard add eu-ai-act
 crux-config-wizard remove audit-soc2
 ```
 
-## The 8 bundled profiles
+## The 14 bundled profiles
 
-| Name | Risk | Source signal |
-|---|---|---|
-| `memory-practices` | low | Crux daemon §11 (session boot, `token_budget`, fact-storage conventions). |
-| `token-conservation` | low | Insights report friction #1 — 9 sessions blocked by output-token exhaustion. |
-| `execplan-discipline` | low | Insights big win — M1..Mn pattern in 15+ sessions. |
-| `code-grounding` | low | Insights friction — 22 buggy_code + 15 wrong_approach events. |
-| `pre-deploy-gate` | medium | Insights friction — 978 wasted compute hours from prerequisite mismatches. |
-| `eu-ai-act` | high | EU AI Act Reg. 2024/1689 Art. 9, 10, 12, 13, 14, 15. Engineering best practice; not a legal opinion. |
-| `audit-soc2` | medium | General audit hygiene — commit_sha attribution, write-agent isolation, retention. |
-| `workspace-cuecrux` | low | CueCrux workspace specifics — ExecPlan paths, daemon ports, Chainguard, JobClaw/MirrorClaw. |
+| Name | Risk | Default | What it carries |
+|---|---|---|---|
+| `memory-practices` | low | yes | Crux memory + retrieval discipline and tool routing. |
+| `memory-digest` | medium | yes | Always-loaded curated-memory index, one line per engram. |
+| `claude-5` | low | yes | Response shape for Claude 5 generation models (CLAUDE.md only). |
+| `agent-harness-parity` | low | yes | The AGENTS.md counterpart of `claude-5` for non-Claude harnesses. |
+| `execplan-discipline` | low | yes | ExecPlans for multi-milestone work; the workspace-green milestone gate. |
+| `code-grounding` | low | yes | Cite the source for any claim that names code. |
+| `scratchpad-survival` | low | yes | Archive durable work out of the ephemeral session scratchpad. |
+| `boot-banner` | low | yes | The boot-banner channel contract (statusline, agent brief, first-reply card). |
+| `pre-deploy-gate` | medium | yes | Preflight discipline before production deploys. |
+| `eu-ai-act` | high | yes | EU AI Act Reg. 2024/1689 Art. 9–15 posture. Engineering practice, not a legal opinion. |
+| `audit-soc2` | medium | yes | Audit hygiene: commit_sha attribution, write-agent isolation, retention. |
+| `code-minimalism` | low | no | Write the least code that actually works. |
+| `token-conservation` | low | no | Fixed output caps for pre-Claude-5 models; superseded by `claude-5`. |
+| `workspace-cuecrux` | low | no | CueCrux-internal endpoints and conventions. Only for the CueCrux monorepo. |
 
-For the CueCrux workspace, the recommended set is all 8 (default for `init --profiles=all`). Other workspaces pick whichever subset matches their posture.
+`init --profiles=all` enables the 11 defaults. `workspace-cuecrux` is not one of them because it names CueCrux's private daemon; enable it with `crux-config-wizard add workspace-cuecrux` inside the CueCrux workspace. Other workspaces pick whichever subset matches their posture.
+
+## Claude Code hooks, mod and skills
+
+Unless `--no-hooks` is passed, `init` also sets up Claude Code for the user (`regenerate --hooks` refreshes it):
+
+- **Mod** (`--no-mod` to skip): the `crux-desktop` mod, which owns session continuity. It loads Crux context into the first prompt and saves the session after every turn, before compaction and at session end. It also registers the daemon as a user-scope `crux` MCP server. Manage it with `crux-config-wizard mods install|uninstall|status` (or `corecruxctl mods …`). See [integrations/claude-code/README.md](../integrations/claude-code/README.md#the-crux-mod-session-continuity).
+- **Hooks**: observe capture, file-modification ledger, coordination, cost and scratchpad hooks in `~/.claude/settings.json`. When the mod is installed, the SessionStart banner and PreCompact save are left out, since the mod does that work.
+- **Skills** (`--no-skills` to skip): the bundled skills in `~/.claude/skills/`.
 
 ## How it works
 
@@ -75,10 +89,7 @@ Profile-version drift, content drift, and missing/extra profiles are all detecte
 
 ## Drift detection
 
-After `init`, the wizard records the chosen profiles + their versions as both:
-
-- `.crux/agent-profile.toml` (committed file).
-- A Crux fact at `entity="agent-config:<workspace-fingerprint>"`, `key="profile:enabled"`.
+After `init`, the wizard records the chosen profiles and their versions in `.crux/agent-profile.toml` (a committed file).
 
 The `crux-claude-hooks session-start` lifecycle hook calls `crux_config_wizard::drift::check_workspace(cwd)` on every Claude session boot. If the workspace's `CLAUDE.md` is out of date — version mismatch, content drift, or hand-edited managed sections — the hook surfaces an `additionalContext` advisory:
 
@@ -199,13 +210,15 @@ The file is meant to be committed. The fingerprint is a stable hash of the works
 cargo test -p crux-config-wizard
 ```
 
-14 lib + 3 end-to-end tests cover:
+The lib and end-to-end tests cover:
 
 - Frontmatter parsing (round-trip, missing fields, invalid version, default targets).
 - Config TOML save/load + atomic write + workspace fingerprint stability.
 - Composer fresh-write, idempotent regenerate, manual-section preservation, drift refusal without `--force`, drift acceptance with `--force`, disabled profile removal, unbalanced-marker rejection.
 - End-to-end init → regenerate → add → remove loop.
-- Bundled profiles parse cleanly and include all 8 defaults.
+- Bundled profiles parse cleanly and include all 11 defaults.
+- Hooks: block shape, merge idempotency, foreign-hook preservation, and the banner and PreCompact save stepping aside when the mod owns continuity.
+- Mod: files, `CLAUDE_CODE_PLUGIN_DIRS` and `pluginConfigs` merge, MCP registration (foreign same-name server left alone, token refresh, project-scope shadow warning), uninstall and status.
 
 The `crux-claude-hooks session-start` integration test exercises the drift advisory via the hook's standard input/output.
 

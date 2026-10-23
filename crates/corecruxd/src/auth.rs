@@ -182,12 +182,17 @@ fn build_agent_http_config() -> Option<AgentTokenHttpConfig> {
     })
 }
 
+/// Scopes an accepted agent token carries when `CORECRUXD_AGENT_TOKEN_HTTP_SCOPES`
+/// is unset. `receipts:read` is here because `sessions:write` can already mint
+/// signed receipts (`POST /v1/mediation/receipts`): an agent that can mint a
+/// receipt must also be able to verify it (`GET /v1/receipts/{id}/verification`).
 fn default_agent_http_scopes() -> BTreeSet<String> {
     [
         "admin:read",
         "admin:write",
         "facts:write",
         "query:read",
+        "receipts:read",
         "sessions:read",
         "sessions:write",
     ]
@@ -1808,6 +1813,35 @@ pub fn require_http_scopes_for_tenant(
 
     require_tenant_allowed(&ctx.tenants, tenant_id)?;
     Ok(TenantScope(tenant_id.to_string()))
+}
+
+/// The caller's bound passport, when it holds every scope in `required` and
+/// is authorized for at least one tenant — *which* tenant is not checked.
+///
+/// For owner-scoped reads whose object carries its own tenant that the caller
+/// may not be confined to: a passport-confined agent token (tenant `default`)
+/// verifying a stream receipt the daemon signed under tenant `local` for that
+/// same passport. The scope check is not bypassed; only the tenant match is
+/// replaced by the caller's ownership, which the handler must establish.
+/// `None` under `AuthMode::Off` (tenant gates already pass there) and for any
+/// caller without a bound passport.
+pub fn http_owner_passport_with_scopes(auth: &Authz, headers: &HeaderMap, required: &[&str]) -> Option<String> {
+    if auth.mode == AuthMode::Off {
+        return None;
+    }
+    let ctx = http_ctx(auth, headers).ok()?;
+    if !missing_scopes(&ctx.scopes, required).is_empty() {
+        return None;
+    }
+    match &ctx.tenants {
+        TenantAllow::Any => {}
+        TenantAllow::Only(set) if !set.is_empty() => {}
+        TenantAllow::Only(_) | TenantAllow::Missing => return None,
+    }
+    http_scope_context(auth, headers)
+        .ok()?
+        .passport_id
+        .filter(|passport| !passport.trim().is_empty())
 }
 
 #[allow(clippy::result_large_err, dead_code)]
@@ -4925,12 +4959,13 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
             "admin:write",
             "facts:write",
             "query:read",
+            "receipts:read",
             "sessions:read",
             "sessions:write",
         ] {
             assert!(scopes.contains(expected), "missing {expected}");
         }
-        assert_eq!(scopes.len(), 6, "scope set must not silently grow");
+        assert_eq!(scopes.len(), 7, "scope set must not silently grow");
     }
 
     // ── JWKS: key selection + verification rejections ──────────────────────

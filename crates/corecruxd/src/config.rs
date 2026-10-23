@@ -703,6 +703,12 @@ struct FileDaemonConfig {
     mcp_port: Option<u16>,
     mcp_enabled: Option<bool>,
     auth_mode: Option<String>,
+    /// `CORECRUXD_STREAM_RECEIPTS`: mint signed stream receipts
+    /// (`model_invocation` and friends). The environment wins.
+    stream_receipts: Option<bool>,
+    /// `CORECRUXD_CONTEXT_SURFACE`: serve `GET /v1/context`. The environment
+    /// wins.
+    context_surface: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1438,11 +1444,15 @@ pub fn load_config() -> Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(crate::coord::DEFAULT_PRESENCE_TTL_SECS)
             .clamp(60, crate::coord::MAX_TTL_SECS),
-        context_surface_enabled: env_bool("CORECRUXD_CONTEXT_SURFACE").unwrap_or(false),
+        context_surface_enabled: env_bool("CORECRUXD_CONTEXT_SURFACE")
+            .or(file_config.daemon.context_surface)
+            .unwrap_or(false),
         auto_capture_enabled: env_bool("CORECRUXD_AUTO_CAPTURE").unwrap_or(false),
         tenant_erasure_enabled: env_bool("CORECRUXD_TENANT_ERASURE").unwrap_or(false),
         local_ingest_enabled: env_default_on("CORECRUXD_LOCAL_INGEST"),
-        stream_receipts_enabled: env_bool("CORECRUXD_STREAM_RECEIPTS").unwrap_or(false),
+        stream_receipts_enabled: env_bool("CORECRUXD_STREAM_RECEIPTS")
+            .or(file_config.daemon.stream_receipts)
+            .unwrap_or(false),
         usage_receipts_enabled: env_bool("CORECRUXD_FEATURE_USAGE_RECEIPTS").unwrap_or(false),
         handoff_observations_enabled: env_bool("CORECRUXD_HANDOFF_OBSERVATIONS").unwrap_or(false),
         // Phase T (M1) opt-in submitter — the daemon's only outbound signal.
@@ -2295,6 +2305,34 @@ mod tests {
 
         // Clean up
         clear_corecruxd_env();
+    }
+
+    /// The two flags a Jev integration needs can live in config.yaml, so a
+    /// service unit or brew formula need not carry them; the environment
+    /// still wins either way.
+    #[test]
+    #[serial_test::serial]
+    fn stream_receipt_flags_read_from_yaml_and_env_wins() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+        clear_corecruxd_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.yaml");
+        std::fs::write(&path, "daemon:\n  stream_receipts: true\n  context_surface: true\n").unwrap();
+        std::env::set_var("CORECRUXD_CONFIG_PATH", &path);
+
+        let cfg = super::load_config();
+        assert!(cfg.stream_receipts_enabled);
+        assert!(cfg.context_surface_enabled);
+
+        std::env::set_var("CORECRUXD_CONTEXT_SURFACE", "0");
+        let cfg = super::load_config();
+        assert!(cfg.stream_receipts_enabled);
+        assert!(!cfg.context_surface_enabled, "the environment overrides the file");
+
+        std::env::remove_var("CORECRUXD_CONTEXT_SURFACE");
+        std::env::remove_var("CORECRUXD_CONFIG_PATH");
     }
 
     #[test]

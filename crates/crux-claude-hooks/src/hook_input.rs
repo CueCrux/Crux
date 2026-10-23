@@ -10,7 +10,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 /// Common envelope received on every hook event.
@@ -18,7 +18,7 @@ use serde_json::Value;
 pub struct HookInput {
     #[serde(default)]
     pub session_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub transcript_path: String,
     #[serde(default)]
     pub cwd: String,
@@ -44,6 +44,13 @@ pub struct HookInput {
     // SessionStart fields
     #[serde(default)]
     pub source: Option<String>,
+}
+
+fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 impl HookInput {
@@ -109,6 +116,22 @@ mod tests {
             .unwrap();
         assert_eq!(input.session_id, "abc");
         assert_eq!(input.tool_name.as_deref(), Some("Bash"));
+    }
+
+    #[test]
+    fn nullable_transcript_path_deserialises_as_empty() {
+        let payload = json!({
+            "session_id": "codex",
+            "transcript_path": null,
+            "hook_event_name": "PreToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {"command": "*** Begin Patch\n*** Add File: x\n+x\n*** End Patch"}
+        });
+        let input = HookInput::read_from(std::io::Cursor::new(payload.to_string()))
+            .unwrap()
+            .unwrap();
+        assert!(input.transcript_path.is_empty());
+        assert_eq!(input.tool_name.as_deref(), Some("apply_patch"));
     }
 
     #[test]

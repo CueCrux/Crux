@@ -70,13 +70,18 @@ serialiser fails CI.
 
 ## What a receipt proves, and what it does not
 
-A receipt proves that this daemon, with this key, at this time, recorded that
-a decision was made with these inputs and outputs: which model version, which
-request id, which retrieved evidence, which answers. Change one byte of the
-body and verification fails.
+A receipt proves that this daemon, with this key, recorded that a decision
+was made with these inputs and outputs: which model version, which request id,
+which retrieved evidence, which answers. Change one byte of the body and
+verification fails.
 
 It does **not** prove:
 
+- **when the decision was made, offline.** `created_at`, `started_at` and
+  `completed_at` in the signed body are supplied by the minting caller, so they
+  are signed but not attested by the daemon. The online
+  `/v1/receipts/{id}/verification` places the receipt in the daemon's
+  observation chain; `crux-jev verify` and the openssl recipe below do not.
 - **that the decision was correct.** A confident wrong answer gets a valid
   receipt too.
 - **that the agent acted on it.** The receipt records the verdict, not what
@@ -95,13 +100,39 @@ It does **not** prove:
 
 ## Setup
 
-**Daemon.** Two flags, both off by default:
+**Check it first.** `crux-jev doctor` runs every check below without
+spending a Jev call, and names the fix for each one that fails: the
+configuration `crux-jev` reads, the two daemon flags, the token's read
+scopes, the published signing key and the pinned keyring. Exit 0 means ready.
+
+**Daemon.** Two flags, both off by default. Set them in the daemon's
+environment (its systemd unit, launchd plist or `brew services` file):
 
 ```bash
 export CORECRUXD_STREAM_RECEIPTS=1   # POST /v1/mediation/receipts signs model_invocation drafts
 export CORECRUXD_CONTEXT_SURFACE=1   # GET /v1/context; 404s when off, so off cannot look empty
 corecruxd
 ```
+
+or in its `config.yaml` (`$XDG_CONFIG_HOME/crux/config.yaml`, or
+`CORECRUXD_CONFIG_PATH`; the environment wins where both are set):
+
+```yaml
+daemon:
+  stream_receipts: true
+  context_surface: true
+```
+
+`GET /v1/version` reports both under `capabilities`, which is what `doctor`
+reads.
+
+**Auth.** The packaged default is `CORECRUXD_AUTH_MODE=dev_scopes`, where
+the bearer token *is* the comma-separated scope list. Under it, the token
+`crux-jev` needs is the literal string
+`query:read,facts:write,sessions:write,receipts:read`. An `rcxct_…` token
+written by `corecruxctl login` is read as one unknown scope and gets 403.
+Under `jwt_hs256`, mint a token with exactly the four scopes below for tenant
+`local`.
 
 With auth on, the token needs these scopes:
 
@@ -111,6 +142,16 @@ With auth on, the token needs these scopes:
 | `facts:write` | the `/v1/mediation/*` route gate, `PUT /v1/facts` |
 | `sessions:write` | the mediation receipt handler |
 | `receipts:read` | `GET /v1/receipts/{id}/verification` |
+
+An MCP agent token accepted over HTTP (`CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS=1`)
+with the default `CORECRUXD_AGENT_TOKEN_HTTP_SCOPES` carries all four; before
+this release the default set lacked `receipts:read`, so such a token could
+mint a receipt but not verify it. That default set also carries `admin:read`
+and `admin:write`, so for a token that only records decisions, narrow it:
+`CORECRUXD_AGENT_TOKEN_HTTP_SCOPES=query:read,facts:write,sessions:write,receipts:read`. A token confined to one tenant
+(`CORECRUXD_AGENT_PASSPORTS=1`) can verify and list the receipts minted for
+its own passport even though they are signed under tenant `local`; it cannot
+see anyone else's.
 
 Fact writes from a passport-bearing token also need that passport registered
 with a category.
@@ -229,6 +270,115 @@ export RID=r_… PROMPT_HASH=sha256:…
 For your own daemon, set `CRUX_BASE_URL` and `CRUX_TOKEN_FILE` instead of
 sourcing `fixture.env`.
 
+## From another language: `crux-jev`
+
+Callers that are not Python get the same receipt and fact, with the same
+hashing, from the `crux-jev` command that the adapters install. It takes one
+JSON request on stdin and prints one JSON result on stdout. Neither secrets nor
+state ever appear in argv.
+
+```bash
+echo '{"entity": "paracrux:ci-triage",
+       "questions": {"failure_class": {"type": "choice", "instructions": "Classify the root cause",
+                                       "criteria": {"runner_infra": "the machine failed",
+                                                    "behaviour_regression": "a product test failed"}}},
+       "untrusted": "##[error]The runner has received a shutdown signal.",
+       "token_budget": 400}' | crux-jev
+```
+
+The result carries `recorded`, `answers`, `model_version`, `request_id`,
+`receipt_id`, `fact_id`, the three hashes and `context_items`. Exit codes:
+
+| Code | Meaning |
+|---|---|
+| 0 | recorded |
+| 3 | Jev answered but the decision was **not** recorded; the answers are still printed, so a guardrail must fail closed |
+| 2 | bad request or missing configuration |
+| 1 | retrieval or Jev failed before any answer |
+
+Configuration is read from the environment, then from files, so that it
+survives sandboxes (such as Codex) that strip variables named like `*KEY*`
+or `*TOKEN*`:
+
+| Setting | Sources, first match wins |
+|---|---|
+| Daemon URL | `CRUX_BASE_URL`, then `CRUX_HTTP_URL`, then `CRUX_HTTP_URL` in the env file |
+| Daemon token | the file named by `CRUX_TOKEN_FILE`, then `CRUX_AGENT_TOKEN`, then `CRUX_AGENT_TOKEN` in the env file |
+| Jev key | `TYPESAFE_API_KEY`, then the file named by `JEV_CREDENTIAL_FILE`, then `~/.config/typesafe/api_key` |
+
+The env file is `CRUX_ENV_FILE`, or `~/.config/cuecrux/env` if that is unset.
+Run `crux-jev --help` for the full request schema.
+
+### The measured state layout: `state_layout="split-v1"`
+
+`decide(..., state_layout="split-v1", untrusted_source="ci-log")` (or
+`"state_layout": "split-v1"` in a `crux-jev` request) sends Jev this state:
+
+```json
+{"policy": "…", "trusted_context": […], "untrusted_inputs": {"source": "ci-log", "content": …}}
+```
+
+This is the `split` arm of the AuditCrux injection benchmark (run
+`jev-injection-live-20260928T212018Z`: corpus `fixture-jev-injection-v1`,
+`jev-1.13.0`, 50 attack and 15 control cases). The injections tested flipped
+18% of verdicts with the flat layout and none with `split-v1`. None of the 15
+benign controls was over-blocked.
+
+Most of that gain comes from the policy line, `UNTRUSTED_POLICY_V1`, which is
+byte-identical to the benchmark's text. Edit it and the result no longer
+applies, so re-measure first.
+
+The default layout is still `v0` (`{trusted_context, untrusted_input}`), so
+existing prompt hashes and behaviour do not change under current callers. Use
+`split-v1` whenever the untrusted input could carry instructions.
+
+### Verifying without trusting the daemon: `crux-jev verify`
+
+`crux-jev verify` checks receipts using only a pinned public key. It needs no
+`receipts:read`, and it never asks the daemon to vouch for its own records.
+It uses the `jev-verify` extra (`blake3` and `cryptography`).
+
+```bash
+crux-jev pin-key --from-pem daemon.pub.pem     # out of band: the stronger option
+crux-jev pin-key                               # or fetch it: trust on first use, from the public
+                                               # GET /v1/receipts/signing-keys (no token needed;
+                                               # older daemons: /v1/admin/version, admin:read)
+crux-jev verify --entity paracrux:ci-triage r_… r_…
+crux-jev verify --actor passport:ci-bot r_…    # also require the minting passport
+```
+
+The keyring is `CRUX_RECEIPT_KEYRING`, or
+`~/.config/cuecrux/receipt-keyring.json` if that is unset. It uses
+`corecruxctl`'s Ed25519 keyring v1 format, so the same file works with
+`corecruxctl receipts verify-stream-receipt --keyring`. `pin-key` refuses to
+replace a pinned key with a different one unless you pass `--replace`, because
+a changed signing key is exactly what a pin exists to catch.
+
+For each receipt, `verify` checks all of the following:
+
+- exactly one signed body claims the id;
+- the Ed25519 signature verifies with a pinned key;
+- the key id is BLAKE3-bound to that key;
+- the body binds the id, `kind: model_invocation`, the schema and the tenant
+  (`local` unless `--tenant` says otherwise);
+- with `--actor`, the body names that `actor_passport`. Without it, any
+  caller who can mint on the same daemon produces receipts that pass; the
+  result reports `actor_passport` either way.
+
+With `--entity`, it also checks that every decision fact under `jev:<entity>`
+naming the receipt matches it: each one's output hash recomputes from its
+answers, and its hashes and request id equal the signed ones. An edited
+version stored after a good one fails the receipt.
+
+Exit codes: 0 when everything verifies, 4 when any receipt fails, 2 on a
+usage or configuration error (or no keyring), 1 when the daemon cannot be
+reached. A second body under the same id makes the check fail closed, with
+"2 distinct bodies claim this id".
+
+`pin-key` exits 0 when the key is pinned (or already was), 4 when the daemon
+now signs with a different key (re-run with `--replace` only for an expected
+rotation), 2 on bad arguments, and 1 when the key cannot be fetched.
+
 ## Verifying a receipt
 
 **Online**, from the daemon that signed it. Stream receipts are minted under
@@ -251,7 +401,7 @@ live in the mediation observation log:
 ```bash
 crux "/v1/observations/aggregate?kind=model_invocation&limit=500" \
   | jq --arg r "$RID" '[.observations[] | select(.payload.receipt_id == $r) | .payload]' > claims.json
-# One distinct body, or stop: the daemon does not keep receipt ids unique.
+# One distinct body, or stop: older daemons did not keep receipt ids unique.
 [ "$(jq '[.[].body_cbor_hex] | unique | length' claims.json)" = 1 ] \
   && jq '.[0]' claims.json > receipt.json \
   || echo "STOP: $RID is claimed by no body or by several distinct bodies" >&2
@@ -262,13 +412,18 @@ openssl pkeyutl -verify -pubin -inkey "$CRUX_DAEMON_PUBKEY_PEM" -rawin -in body.
 grep -qaF "$PROMPT_HASH" body.cbor && echo "prompt_hash is in the signed body"
 ```
 
-A minting caller may choose a stream receipt's `receipt_id`, and the daemon
-does not refuse a repeat, so one id can name two signed bodies; taking the
-first match could check the wrong one. Refuse instead of picking.
+A minting caller may choose a stream receipt's `receipt_id`. Daemons from
+this release refuse a reused id (409 `RECEIPT_ID_CONFLICT`) and `/verification`
+answers 409 `RECEIPT_ID_AMBIGUOUS` rather than picking when a log still holds
+two bodies for one id; older daemons did neither, so one id could name two
+signed bodies. Keep the check above either way: refuse instead of picking.
 
 `openssl pkeyutl -rawin` needs OpenSSL 3. The fixture writes the public key as
-`daemon.pub.pem`. For another daemon, an operator reads it from
-`GET /v1/admin/version` (`admin:read`) as `.passport.public_key_hex`:
+`daemon.pub.pem`. For another daemon, read it from the unauthenticated
+`GET /v1/receipts/signing-keys` as `.keys[0].publicKeyHex` (older daemons:
+`GET /v1/admin/version`, `admin:read`, as `.passport.public_key_hex`). Pin it
+at enrolment; a key fetched from the daemon that signed the receipt is
+discovery, not trust:
 
 ```bash
 { printf '302a300506032b6570032100'; printf '%s' "$PUBKEY_HEX"; } \
@@ -369,7 +524,9 @@ can write facts could rewrite both facts to agree with each other):
    (`GET /v1/receipts/{id}/verification`: `signature_valid` and
    `error_code: OK`).
 3. The signed body is read from `GET /v1/observations/aggregate?kind=model_invocation`.
-   Anyone with `sessions:write` can add records to that listing, so nothing
+   On older daemons anyone with `sessions:write` could add records of that
+   kind to the listing (current daemons refuse the stream-receipt kinds on the
+   generic observation route with 422 `RESERVED_OBSERVATION_KIND`), so nothing
    in a listed record is taken on trust: `replay` hashes the listed
    `body_cbor_hex` bytes with BLAKE3 itself and requires them to equal the
    `payload_hash` the daemon just verified. Every listed record claiming the
@@ -392,13 +549,11 @@ What is still trusted: the daemon itself, twice. Its `/verification` does the
 Ed25519 check (replay does not hold the public key), and it signs whatever
 hashes a caller with receipt-minting scopes (`facts:write` +
 `sessions:write`) sends, so such a caller can mint a matching receipt for
-forged facts. Nor does the daemon keep receipt ids unique yet: a caller with
-those scopes may choose an id already in use, which is why replay and the
-offline recipe refuse an id claimed by more than one body. For a check that
-trusts only the public key, verify the receipt offline as in
-[Verifying a receipt](#verifying-a-receipt) and compare the hashes in the body
-yourself. A dedicated offline verifier CLI is proposed in a separate change;
-until it lands, use the openssl check above. Replay only searches the daemon's
+forged facts. Current daemons refuse a reused receipt id; replay and the
+offline checks still refuse an id claimed by more than one body, for logs an
+older daemon wrote. For a check that trusts only the public key, use
+`crux-jev verify` (above) or the openssl recipe in
+[Verifying a receipt](#verifying-a-receipt). Replay only searches the daemon's
 newest 1000 `model_invocation` observations (the route's cap); an older
 receipt raises `LookupError` rather than being skipped.
 
