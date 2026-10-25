@@ -124,7 +124,7 @@ tree-sitter-cpp = "=0.23.4"
 tree-sitter-c-sharp = "=0.23.5"
 tree-sitter-ruby = "=0.23.1"
 tree-sitter-swift = "=0.7.3"
-tree-sitter-php = "=0.24.2"
+tree-sitter-php = "=0.25.1"
 
 [dev-dependencies]
 rcgen = { workspace = true }
