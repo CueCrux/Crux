@@ -70,7 +70,7 @@ tracing = { workspace = true }
 tracing-opentelemetry = { version = "0.34", optional = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 ureq = { workspace = true, features = ["json"] }
-opentelemetry = { version = "0.32", optional = true }
+opentelemetry = { version = "0.33", optional = true }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { version = "0.33", features = ["grpc-tonic"], optional = true }
 uuid = { workspace = true, features = ["v4"] }
