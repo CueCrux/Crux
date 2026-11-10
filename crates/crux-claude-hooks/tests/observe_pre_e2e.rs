@@ -276,12 +276,24 @@ fn run_enforcement_wrapper(
         command.env_remove("CRUX_AGENT_TOKEN");
     }
     let mut child = command.spawn().expect("spawn enforcement wrapper");
-    child
+    let written = child
         .stdin
         .take()
         .expect("wrapper stdin")
-        .write_all(input.to_string().as_bytes())
-        .expect("write wrapper input");
+        .write_all(input.to_string().as_bytes());
+    // The wrapper's fail-open paths (invalid agent name, no selected token)
+    // exit before anything reads stdin, so this write races the child's exit
+    // and can land on a closed pipe. Codex's hook runner ignores exactly that
+    // error, so the fixture does too. Any other write failure still fails the
+    // test, and a hook that should have run but never read its input is caught
+    // by the callers' status, output and mock-probe assertions.
+    if let Err(error) = written {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "write wrapper input: {error}"
+        );
+    }
     child.wait_with_output().expect("wait for enforcement wrapper")
 }
 
