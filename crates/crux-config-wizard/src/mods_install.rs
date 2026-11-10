@@ -45,7 +45,7 @@ const PLUGIN_DIRS_ENV: &str = "CLAUDE_CODE_PLUGIN_DIRS";
 
 /// The mod's files, relative to its folder. `.claude-plugin/types/` and
 /// `tsconfig.json` are editor scaffolding `/plugin-types` writes on demand, so
-/// they are not shipped.
+/// they are not shipped. Nor is `tests/`, the `claude plugin test` suite.
 const FILES: &[(&str, &str)] = &[
     (
         ".claude-plugin/plugin.json",

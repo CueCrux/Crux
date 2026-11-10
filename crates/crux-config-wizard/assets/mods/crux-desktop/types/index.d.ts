@@ -4,6 +4,8 @@ export type CruxHealth = {
   mode: string | null
   checkedAt: number
   error?: string
+  /** The server whose call the permission layer refused, when that is why Crux is unreachable. */
+  blockedServer?: string
 }
 
 export type CruxCall = { id: string; tool: string; at: number; isOk: boolean }

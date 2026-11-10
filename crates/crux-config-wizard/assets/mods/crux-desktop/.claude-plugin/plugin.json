@@ -1,6 +1,6 @@
 {
   "name": "crux-desktop",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": { "name": "CueCrux" },
   "description": "Crux Daemon continuity for Claude Code: loads context at start, saves the session each turn and before compaction, and shows a live Crux pane",
   "types": "./types/index.d.ts",

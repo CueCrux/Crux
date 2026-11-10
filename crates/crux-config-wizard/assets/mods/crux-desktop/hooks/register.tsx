@@ -12,6 +12,13 @@ import type { CruxCall, CruxHealth, CruxSave } from '../types'
 const FALLBACK_SERVERS = ['crux', 'Crux Daemon']
 const PANE = 'crux'
 const HEALTH_EVERY_MS = 5 * 60 * 1000
+// MCP servers connect after session.start, so the first look waits and the
+// next ones back off: each entry is the wait before one startup attempt.
+const STARTUP_PROBES_MS = [1500, 5000, 15000, 45000]
+// The daemon tools this mod calls on its own. Where the permission mode reviews
+// calls no prompt asked for (auto mode), each needs an allow rule in settings.
+const MOD_TOOLS = ['sync_status', 'get_session', 'get_bootstrap', 'save_session']
+const CONNECTING = 'Crux … connecting'
 // Bounds on daemon work that sits in front of the user: the continuity block
 // delays the first prompt, and session.end has one short budget for every hook.
 const CONTINUITY_TIMEOUT_MS = 4000
@@ -39,7 +46,28 @@ const jsonOf = (r: McpToolResult): Record<string, unknown> | null => {
 
 const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
 
-const errorText = (err: unknown) => clip(err instanceof Error ? err.message : String(err), 200)
+const messageOf = (err: unknown) => (err instanceof Error ? err.message : String(err))
+
+const errorText = (err: unknown) => clip(messageOf(err), 200)
+
+// The settings rules that let this mod reach the daemon on server `s`.
+const allowRules = (s: string) => MOD_TOOLS.map(t => `${toolPrefix(s)}${t}`)
+
+// True for the engine's refusal of a `$.mcp.call` (a permission mode or rule
+// said no), as opposed to a server that is missing or a daemon that is down.
+const isRefusal = (message: string) =>
+  /\brefused\b/i.test(message) && /\$\.mcp\.call|classifier|permission/i.test(message)
+
+const blockedHelp = (s: string) =>
+  `Claude Code's permission check refused this mod's background calls to "${s}" ` +
+  `(auto mode refuses calls that no prompt asked for). To allow them, add these to ` +
+  `permissions.allow in ~/.claude/settings.json: ${allowRules(s).join(', ')}`
+
+// A failed call's reason, naming the rule to add when it was a refusal.
+const explain = (s: string, tool: string, message: string) =>
+  isRefusal(message)
+    ? `refused by Claude Code permissions; allow ${toolPrefix(s)}${tool} in permissions.allow`
+    : clip(message, 200)
 
 // Module variables reset on hot reload; the server is re-resolved on demand.
 // `candidates` is fixed at register time from the plugin's `server` option: a
@@ -56,50 +84,106 @@ async function within<T>($: EngineInterface, ms: number, work: Promise<T>): Prom
 }
 
 async function call($: EngineInterface, tool: string, args?: Record<string, unknown>) {
-  if (server === null) await probe($)
-  if (server === null) throw new Error('no Crux MCP server connected')
-  const r = await $.mcp.call(server, tool, args)
-  if (r.isError) throw new Error(clip(textOf(r), 200))
+  let h: CruxHealth | null = null
+  if (server === null) h = await probe($)
+  if (server === null) {
+    throw new Error(
+      h?.blockedServer
+        ? 'blocked by Claude Code permissions; run /crux status'
+        : (h?.error ?? 'no Crux MCP server connected'),
+    )
+  }
+  const target = server
+  let r: McpToolResult
+  try {
+    r = await $.mcp.call(target, tool, args)
+  } catch (err) {
+    throw new Error(explain(target, tool, messageOf(err)))
+  }
+  if (r.isError) throw new Error(explain(target, tool, textOf(r)))
   return r
 }
 
-// Finds the first connected Crux server and records its health.
-async function probe($: EngineInterface): Promise<CruxHealth> {
+// Finds the first connected Crux server and records its health. A quiet probe
+// (a startup attempt with more to come) leaves a plain miss unrecorded, so the
+// status reads "connecting" rather than "offline" while servers are still
+// coming up; a refusal is always recorded, since waiting will not change it.
+async function probe($: EngineInterface, options: { isQuiet?: boolean } = {}): Promise<CruxHealth> {
   const checkedAt = await $.clock.now()
   const order = server ? [server, ...candidates.filter(c => c !== server)] : candidates
   let lastError = `no Crux MCP server connected (tried ${candidates.map(c => `"${c}"`).join(', ')})`
+  // The first candidate whose call the permission layer refused, if any.
+  let blocked: { server: string; reason: string } | null = null
   for (const candidate of order) {
+    let failure: string
     try {
       const r = await $.mcp.call(candidate, 'sync_status')
-      if (r.isError) {
-        lastError = clip(textOf(r), 200)
-        continue
+      if (!r.isError) {
+        const s = jsonOf(r) ?? {}
+        server = candidate
+        const h: CruxHealth = {
+          server: candidate,
+          facts: typeof s.local_fact_count === 'number' ? s.local_fact_count : null,
+          mode: typeof s.mode === 'string' ? s.mode : null,
+          checkedAt,
+        }
+        await update($, health, () => h)
+        showStatus($, h, await read($, lastSave))
+        return h
       }
-      const s = jsonOf(r) ?? {}
-      server = candidate
-      const h: CruxHealth = {
-        server: candidate,
-        facts: typeof s.local_fact_count === 'number' ? s.local_fact_count : null,
-        mode: typeof s.mode === 'string' ? s.mode : null,
-        checkedAt,
-      }
-      await update($, health, () => h)
-      showStatus($, h, await read($, lastSave))
-      return h
+      failure = textOf(r)
     } catch (err) {
-      lastError = errorText(err)
+      failure = messageOf(err)
     }
+    lastError = clip(failure, 200)
+    if (blocked === null && isRefusal(failure)) blocked = { server: candidate, reason: failure }
   }
   server = null
-  const h: CruxHealth = { server: null, facts: null, mode: null, checkedAt, error: lastError }
+  const h: CruxHealth =
+    blocked === null
+      ? { server: null, facts: null, mode: null, checkedAt, error: lastError }
+      : {
+          server: null,
+          facts: null,
+          mode: null,
+          checkedAt,
+          error: clip(blocked.reason, 400),
+          blockedServer: blocked.server,
+        }
+  if (options.isQuiet && blocked === null) {
+    if ((await read($, health)) === null) $.ui.status(CONNECTING)
+    return h
+  }
   await update($, health, () => h)
   showStatus($, h, await read($, lastSave))
   return h
 }
 
+// Looks for the daemon after startup, backing off until it answers, the
+// permission layer refuses, or the attempts run out (the last one records
+// "offline").
+function probeAtStartup($: EngineInterface, attempt = 0) {
+  const wait = STARTUP_PROBES_MS[attempt]
+  if (wait === undefined) return
+  $.clock.after(wait, () => {
+    const isLast = attempt === STARTUP_PROBES_MS.length - 1
+    void probe($, { isQuiet: !isLast }).then(h => {
+      if (!h.server && !h.blockedServer) probeAtStartup($, attempt + 1)
+    })
+  })
+}
+
+// The periodic check. A refusal is not retried on a timer: every attempt is one
+// more review, and the next save, Refresh or /crux status looks again anyway.
+async function recheck($: EngineInterface) {
+  const h = await read($, health)
+  if (h?.blockedServer) return
+  await probe($)
+}
+
 function showStatus($: EngineInterface, h: CruxHealth | null, s: CruxSave | null) {
   if (!h) return $.ui.status(undefined)
-  if (!h.server) return $.ui.status('Crux ○ offline')
+  if (!h.server) return $.ui.status(h.blockedServer ? 'Crux ○ blocked by permissions' : 'Crux ○ offline')
   const facts = h.facts === null ? '' : ` · ${h.facts.toLocaleString('en-GB')} facts`
   const saved = s === null ? '' : s.isOk ? ' · saved' : ' · save failed'
   $.ui.status(`Crux ●${facts}${saved}`)
@@ -202,8 +286,10 @@ export const register: Register = (on, options) => {
       name: 'crux',
       description: 'Crux Daemon: open the pane, or `save` / `status`',
     })
-    void probe($)
-    $.clock.every(HEALTH_EVERY_MS, () => void probe($))
+    // No probe yet: no MCP server has connected this early (see STARTUP_PROBES_MS).
+    if ((await read($, health)) === null) $.ui.status(CONNECTING)
+    probeAtStartup($)
+    $.clock.every(HEALTH_EVERY_MS, () => void recheck($))
     return next(e)
   })
 
@@ -261,7 +347,9 @@ export const register: Register = (on, options) => {
       return {
         text: h.server
           ? `Crux connected via "${h.server}" · ${h.facts ?? '?'} facts · ${h.mode ?? 'unknown mode'}`
-          : `Crux offline: ${h.error}`,
+          : h.blockedServer
+            ? `Crux blocked: ${blockedHelp(h.blockedServer)}`
+            : `Crux offline: ${h.error}`,
       }
     }
     const opened = await $.ui.open({ id: PANE, title: 'Crux' })
@@ -294,10 +382,24 @@ export const register: Register = (on, options) => {
               <Text color="green">●</Text> Connected via “{h.server}”
             </Text>
           )}
-          {h !== null && h.server === null && (
+          {h !== null && h.server === null && !h.blockedServer && (
             <Text>
               <Text color="red">○</Text> Offline: {h.error}
             </Text>
+          )}
+          {h !== null && h.server === null && h.blockedServer && (
+            <Box flexDirection="column">
+              <Text>
+                <Text color="red">○</Text> Blocked by Claude Code permissions
+              </Text>
+              <Text dimColor>
+                Auto mode refuses background calls that no prompt asked for. Add these to permissions.allow in
+                ~/.claude/settings.json, then press Refresh:
+              </Text>
+              {allowRules(h.blockedServer).map(rule => (
+                <Text dimColor>{rule}</Text>
+              ))}
+            </Box>
           )}
           {h?.server && (
             <Text dimColor>

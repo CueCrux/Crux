@@ -4666,6 +4666,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Concurrent observe step opens no longer share a `seq`.** The seq was minted
   under a read lock and stored under a later write lock, so two racing opens
   could both take `max + 1` and drop a step from the audit chain. (#814)
+- **`crux-desktop` mod no longer reads "offline" when Claude Code's permissions
+  are what stopped it.** In auto permission mode the mod's background calls to
+  the daemon are refused unless an allow rule covers them, and the mod showed
+  that as `Crux ○ offline` with a cut-off error. It now shows
+  `Crux ○ blocked by permissions`, and `/crux status` and the pane name the four
+  rules to add to `permissions.allow` in `~/.claude/settings.json`
+  (`mcp__<server>__sync_status`, `get_session`, `get_bootstrap`,
+  `save_session`). A blocked mod no longer retries on its five-minute timer. The
+  installer does not add the rules.
+- **`crux-desktop` mod no longer opens every session as "offline".** It looked
+  for the daemon before any MCP server had connected and then waited five
+  minutes. It now shows `Crux … connecting`, looks after 1.5 s and backs off
+  (5 s, 15 s, 45 s) before reporting offline. Mod version 0.2.1.
 
 ### Security
 
