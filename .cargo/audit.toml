@@ -33,4 +33,24 @@ ignore = [
     "RUSTSEC-2026-0364",
     "RUSTSEC-2026-0378",
     "RUSTSEC-2026-0379",
+    # Same exposure, 2026-10-29 batch, all denial-of-service class. The
+    # patched releases are wasmtime >= 48.0.8 / 49.0.5 / 50.0.1, which need
+    # Rust 1.95 / 1.96 / 1.97; the workspace still pins 1.88. Remove these when
+    # PR #840 (toolchain 1.99.1 + wasmtime 49) lands with wasmtime >= 49.0.5;
+    # its branch is on 49.0.4 today, which does not fix them.
+    #
+    # 0422: panic when the host calls a guest function through a `TypedFunc`
+    # typed with `I31` / `NoneRef`. wasm_host.rs uses neither type.
+    "RUSTSEC-2026-0422",
+    # 0423: type confusion when the host builds a `StructType` whose supertype
+    # belongs to a second `Engine`. Not reachable from a guest; wasm_host.rs
+    # creates one engine and no struct types.
+    "RUSTSEC-2026-0423",
+    # 0424: unbounded host memory when borrowed resources move between
+    # components. Component-model only, and corecruxd does not enable
+    # wasmtime's `component-model` feature (it builds `cranelift` + `runtime`).
+    # Unlike the entries above, one fix builds on Rust 1.88: wasmtime 36.0.20
+    # (LTS), an eleven-major downgrade. The others are 48.0.8+ / 49.0.5+ /
+    # 50.0.1+ (Rust 1.95+). Remove with 0422 / 0423.
+    "RUSTSEC-2026-0424",
 ]
