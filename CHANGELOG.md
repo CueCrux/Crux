@@ -166,6 +166,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caller's own passport (403 otherwise); an admin acts for another passport
   through the existing passport-header override. **Behaviour change:** an
   unbound announce naming a passport the caller doesn't hold is refused. (#812)
+- **Late-October RustSec advisories.** Lockfile bumps: `crypto-bigint` 0.7.5 →
+  0.7.11 (RUSTSEC-2026-0387, timing variability in operations meant to be
+  constant-time; it sits under `p256`) and `pulldown-cmark` 0.13.3 → 0.13.6
+  (RUSTSEC-2026-0414 and RUSTSEC-2026-0433; a build-time dependency of
+  `prost-build`, not in any binary). Three wasmtime 47.0.4 advisories,
+  RUSTSEC-2026-0422, RUSTSEC-2026-0423 and RUSTSEC-2026-0424, are **ignored,
+  not fixed**, in `.cargo/audit.toml`: wasmtime is compiled only with
+  `corecruxd`'s off-by-default `wasm-extensions` feature, which no release
+  builds, and the patched 48 / 49 / 50 releases need Rust 1.95 or later.
 
 ## [0.5.65] - 2026-09-22
 
