@@ -42,6 +42,20 @@ A project can define its own `crux` MCP server (in `.mcp.json` or under
 one, and the installer says so. Point the mod at a different server with
 `corecruxctl mods install --server <name>`.
 
+**Auto permission mode.** In auto mode Claude Code reviews tool calls that no
+prompt asked for, and it refuses the mod's own background calls to the daemon
+unless an allow rule covers them. The status line then reads
+`Crux ○ blocked by permissions`, and `/crux status` and the pane list the rules
+to add to `permissions.allow` in `~/.claude/settings.json`. For the installer's
+default server they are `mcp__crux__sync_status`, `mcp__crux__get_session`,
+`mcp__crux__get_bootstrap` and `mcp__crux__save_session`. The installer does not
+add them. While blocked the mod does not retry on a timer; it looks again on the
+next save, on Refresh in the pane, or on `/crux status`.
+
+At session start the status line reads `Crux … connecting` while the MCP servers
+come up. The mod looks for the daemon 1.5 s after start and then backs off (5 s,
+15 s, 45 s) before it reports `Crux ○ offline`.
+
 ## How it works
 
 ```
